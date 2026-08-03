@@ -253,8 +253,12 @@ describe("ResourceUseGate", () => {
           _tag: "Left",
           left: { _tag: "ResourceRetired" },
         });
-        const continuing = yield* gate.joinIfBusy("accepted-continuation");
-        expect(Option.isSome(continuing)).toBe(true);
+        expect(
+          yield* Effect.either(gate.joinIfBusy("late-continuation")),
+        ).toMatchObject({
+          _tag: "Left",
+          left: { _tag: "ResourceRetired" },
+        });
         expect(yield* Effect.either(gate.acquire("late-after-transfer"))).toMatchObject({
           _tag: "Left",
           left: { _tag: "ResourceRetired" },
@@ -264,7 +268,6 @@ describe("ResourceUseGate", () => {
         yield* Effect.yieldNow();
         expect(Option.isNone(yield* Fiber.poll(retirement))).toBe(true);
         yield* release;
-        if (Option.isSome(continuing)) yield* continuing.value;
         expect(yield* Fiber.join(retirement)).toBe(true);
       }),
     );

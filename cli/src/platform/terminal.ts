@@ -8,11 +8,13 @@ import { Effect, Layer, Option } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
-  DaemonSpawnerTag,
-  BunDetachedSpawnProcess,
+  DaemonDiscovery,
+  DaemonLauncher,
+  BunDetachedChildProcessSpawner,
+  ChildProcessSpawner,
   makeAcnJitRuntime,
-  makeLocalDaemonSpawner,
-  SpawnProcess,
+  makeLocalDaemonDiscovery,
+  makeLocalDaemonLauncher,
 } from "@magnitudedev/sdk"
 import type {
   Platform,
@@ -69,7 +71,7 @@ const terminalCapabilities: TerminalCapabilities = {
 }
 
 export interface TerminalPlatformOptions {
-  readonly spawnCommand: Option.Option<ReadonlyArray<string>>
+  readonly launchCommand: Option.Option<ReadonlyArray<string>>
   readonly publicationTimeoutMs: Option.Option<number>
   readonly debug: boolean
   readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
@@ -80,21 +82,30 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions): 
     options.effectLoggingLayer,
     () => makeCliEffectLoggingLayer({ debug: options.debug }),
   )
-  const spawner = await Effect.runPromise(
-    makeLocalDaemonSpawner({
+  const launcherOptions = {
       ...Option.match(options.publicationTimeoutMs, {
         onNone: () => ({}),
         onSome: (publicationTimeoutMs) => ({ publicationTimeoutMs }),
       }),
       ...(options.debug ? { debug: true } : {}),
+    }
+  const discovery = await Effect.runPromise(
+    makeLocalDaemonDiscovery({
+      ...(options.debug ? { debug: true } : {}),
     }).pipe(
-      Effect.provideService(SpawnProcess, BunDetachedSpawnProcess),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+    ),
+  )
+  const launcher = await Effect.runPromise(
+    makeLocalDaemonLauncher(launcherOptions).pipe(
+      Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     ),
   )
   const acn = await Effect.runPromise(
-    makeAcnJitRuntime({ spawnCommand: options.spawnCommand }).pipe(
-      Effect.provideService(DaemonSpawnerTag, spawner),
+    makeAcnJitRuntime({ launchCommand: options.launchCommand }).pipe(
+      Effect.provideService(DaemonDiscovery, discovery),
+      Effect.provideService(DaemonLauncher, launcher),
     ),
   )
   const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)

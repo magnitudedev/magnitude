@@ -75,7 +75,7 @@ export function AcnBootstrapScreen({
 
   if (state._tag === "Failed") {
     const title =
-      state.stage === "AcquireAcn" ||
+      state.stage === "InstallDaemon" ||
       state.stage === "PrepareLocalInference"
         ? "Magnitude failed to install"
         : "Magnitude failed to start";

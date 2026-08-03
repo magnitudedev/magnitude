@@ -3,12 +3,14 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import * as NodePath from "path"
 import * as NodeOs from "os"
 import { Cause, Effect, Layer, Option, Schedule } from "effect"
-import { AcnShutdown } from "./acn-shutdown"
+import { AcnServiceLifecycle } from "./service-lifecycle"
 import {
   type AcnRegistration,
+  type RegisteredAcnInstance,
   readRegistrationOwnership,
   registrationIsOwnedBy,
   registrationPath,
+  writeInstanceAtomic,
   writeRegistrationAtomic,
 } from "./daemon-registration"
 import { ACN_OWNER_ID } from "./identity"
@@ -20,6 +22,7 @@ export interface DaemonLifecycleOptions {
   readonly ownershipCheckIntervalMs?: number
   readonly ownershipCheckTimeoutMs?: number
   readonly dataDir: string
+  readonly instance: RegisteredAcnInstance
 }
 
 export const defaultDataDir = (): string =>
@@ -39,16 +42,22 @@ export const DaemonLifecycleLive = (
 ): Layer.Layer<
   never,
   never,
-  AcnShutdown | HttpServer.HttpServer | FileSystem.FileSystem
+  | AcnServiceLifecycle
+  | HttpServer.HttpServer
+  | FileSystem.FileSystem
 > =>
   Layer.scopedDiscard(
     Effect.gen(function* () {
-      const shutdown = yield* AcnShutdown
+      const lifecycle = yield* AcnServiceLifecycle
       const server = yield* HttpServer.HttpServer
       const fs = yield* FileSystem.FileSystem
       const url = getServerUrl(server.address)
       const registrationPath_ = registrationPath(options.dataDir)
       const ownerId = ACN_OWNER_ID
+      yield* writeInstanceAtomic(
+        options.dataDir,
+        { ...options.instance.record, url: Option.some(url) },
+      ).pipe(Effect.orDie)
 
       const registerDaemon = Effect.fn("acn.register")(function* () {
         const registration: AcnRegistration = {
@@ -126,7 +135,7 @@ export const DaemonLifecycleLive = (
               ...observed,
             })
           )
-          yield* shutdown.request({ reason: "ownership-lost" })
+          yield* lifecycle.beginStopping({ reason: "ownership-lost" })
         }
       )
 
@@ -139,7 +148,7 @@ export const DaemonLifecycleLive = (
             ).pipe(
               Effect.annotateLogs({ cause: Cause.pretty(cause) }),
               Effect.andThen(
-                shutdown.request({
+                lifecycle.beginStopping({
                   reason: "fatal",
                   detail: "registry ownership watchdog failed",
                 })

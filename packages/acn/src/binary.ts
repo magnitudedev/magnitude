@@ -1,6 +1,7 @@
 import { Command, Options } from "@effect/cli"
 import * as PlatformCommand from "@effect/platform/Command"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
+import { FetchHttpClient } from "@effect/platform"
 import { Console, Data, Effect, Layer } from "effect"
 import { launchAcnServer } from "./server"
 import { killAllAcns } from "./kill-all"
@@ -64,7 +65,7 @@ const doctor = Command.make("doctor", {}, () =>
   ),
 ).pipe(Command.withDescription("Verify packaged ACN runtime dependencies"))
 
-const killAll = Command.make("kill-all", {}, () => killAllAcns).pipe(
+const killAll = Command.make("kill-all", { dataDir }, ({ dataDir }) => killAllAcns(dataDir)).pipe(
   Command.withDescription("Terminate all registered ACN processes"),
 )
 
@@ -78,5 +79,7 @@ const cli = Command.run(acn, {
   version: ACN_VERSION,
 })
 
-const program = cli(process.argv).pipe(Effect.provide(BunContext.layer))
+const program = cli(process.argv).pipe(
+  Effect.provide(Layer.merge(BunContext.layer, FetchHttpClient.layer)),
+)
 BunRuntime.runMain(program)

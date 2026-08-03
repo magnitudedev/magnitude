@@ -1,14 +1,25 @@
 import * as FileSystem from "@effect/platform/FileSystem"
+import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type { PlatformError } from "@effect/platform/Error"
 import { Data, Effect, Option, Schema, Scope } from "effect"
 import type * as ParseResult from "effect/ParseResult"
 import * as NodePath from "node:path"
+import {
+  AcnOwnerIdSchema,
+  AcnProcessStartIdentitySchema,
+  type AcnOwnerId,
+} from "@magnitudedev/acn-protocol"
+import {
+  currentProcessStartIdentity,
+  readProcessStartIdentity,
+} from "./process-identity"
 
 const OwnerSchema = Schema.Struct({
-  id: Schema.String,
+  id: AcnOwnerIdSchema,
   pid: Schema.Number,
   version: Schema.String,
   startedAt: Schema.Number,
+  processStartIdentity: AcnProcessStartIdentitySchema,
 })
 
 type Owner = typeof OwnerSchema.Type
@@ -27,15 +38,6 @@ const hasPlatformErrorReason = (
 ): boolean =>
   Option.exists(platformErrorReason(cause), (reason) => reason === expected)
 
-const isAlive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (cause) {
-    return !(cause instanceof Error && "code" in cause && cause.code === "ESRCH")
-  }
-}
-
 const failure =
   (operation: string) =>
   (cause: PlatformError | ParseResult.ParseError) =>
@@ -49,22 +51,31 @@ const failure =
  */
 export const acquireAcnMachineOwnership = (input: {
   readonly dataDir: string
-  readonly id: string
+  readonly id: AcnOwnerId
   readonly version: string
 }): Effect.Effect<
   void,
   AcnMachineOwnershipFailed,
-  FileSystem.FileSystem | Scope.Scope
+  FileSystem.FileSystem | CommandExecutor.CommandExecutor | Scope.Scope
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const directory = NodePath.join(input.dataDir, "acn")
     const path = NodePath.join(directory, "owner")
+    const processStartIdentity = yield* currentProcessStartIdentity.pipe(
+      Effect.mapError((cause) =>
+        new AcnMachineOwnershipFailed({
+          operation: "inspect current ACN process",
+          reason: cause.reason,
+        }),
+      ),
+    )
     const owner: Owner = {
       id: input.id,
       pid: process.pid,
       version: input.version,
       startedAt: Date.now(),
+      processStartIdentity,
     }
     const encoded = yield* Schema.encode(Schema.parseJson(OwnerSchema))(owner).pipe(
       Effect.mapError(failure("encode owner record")),
@@ -76,7 +87,11 @@ export const acquireAcnMachineOwnership = (input: {
         Effect.option,
       )
 
-    const acquire: Effect.Effect<void, AcnMachineOwnershipFailed> = Effect.suspend(() =>
+    const acquire: Effect.Effect<
+      void,
+      AcnMachineOwnershipFailed,
+      CommandExecutor.CommandExecutor
+    > = Effect.suspend(() =>
       Effect.gen(function* () {
         yield* fs.makeDirectory(directory, { recursive: true }).pipe(
           Effect.mapError(failure("create ACN ownership directory")),
@@ -100,7 +115,22 @@ export const acquireAcnMachineOwnership = (input: {
         if (linked) return
 
         const observed = yield* readOwner(path)
-        if (Option.exists(observed, (owner) => isAlive(owner.pid))) {
+        const observedIsAlive = yield* Option.match(observed, {
+          onNone: () => Effect.succeed(false),
+          onSome: (owner) => readProcessStartIdentity(owner.pid).pipe(
+            Effect.mapError((cause) =>
+              new AcnMachineOwnershipFailed({
+                operation: "inspect incumbent ACN process",
+                reason: cause.reason,
+              }),
+            ),
+            Effect.map((identity) => Option.exists(
+              identity,
+              (value) => value === owner.processStartIdentity,
+            )),
+          ),
+        })
+        if (observedIsAlive) {
           yield* Effect.sleep("100 millis")
           return yield* acquire
         }

@@ -5,7 +5,6 @@ import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { Effect, Exit, FiberId, Layer, Option, Schema, Stream } from "effect"
-import { makeJitDaemonCoordinator, type JitDaemonProvider } from "./index"
 import { recoveringProtocolLayer } from "./recovering-protocol"
 import { RecoveryExhausted, SubscriptionProtocolViolation } from "./errors"
 import {
@@ -13,6 +12,10 @@ import {
   isInterruptedExit,
   type RecoveringStreamProtocol,
 } from "./recovering-stream-protocol"
+import {
+  AcnOwnerIdSchema,
+  type AcnEndpoint,
+} from "@magnitudedev/acn-protocol"
 
 const { RpcClientError: TransportError } = RpcClientError
 
@@ -92,30 +95,63 @@ const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
   return { client, calls: () => calls }
 }
 
-// ─── Fake provider ───────────────────────────────────────────────────────────
+// ─── Fake access ───────────────────────────────────────────────────────────
 
-const makeFakeProvider = (options: {
-  readonly discover: ReadonlyArray<Option.Option<string>>
-  readonly spawnUrl?: string
+const makeFakeEndpointAccess = (options: {
+  readonly current: ReadonlyArray<Option.Option<string>>
+  readonly startUrl?: string
 }) => {
-  let discoverCalls = 0
-  let spawnCalls = 0
-  const provider: JitDaemonProvider<never> = {
-    discover: () =>
-      Effect.sync(() => {
-        const result = options.discover[Math.min(discoverCalls, options.discover.length - 1)]
-        discoverCalls++
-        return Option.map(result, (url) => ({ url }))
-      }),
-    spawn: () =>
-      Effect.suspend(() => {
-        spawnCalls++
-        return options.spawnUrl !== undefined
-          ? Effect.succeed({ url: options.spawnUrl })
-          : Effect.fail("spawn disabled in test" as never)
-      }),
+  let currentCalls = 0
+  let startCalls = 0
+  let selected: AcnEndpoint | null = null
+  const fallbackStartUrl = options.current.find(Option.isSome)?.value ?? "http://started"
+  const endpoint = (url: string, id: string = url): AcnEndpoint => ({
+    id: AcnOwnerIdSchema.make(id),
+    version: "1.0.0",
+    url,
+  })
+  const readCurrent = () => Effect.sync(() => {
+    const result = options.current[Math.min(currentCalls, options.current.length - 1)]
+    currentCalls++
+    return Option.map(result, (url) => endpoint(url))
+  })
+  const start = Effect.sync(() => {
+    startCalls++
+    const url = options.startUrl ?? fallbackStartUrl
+    return endpoint(url, `${url}#start-${startCalls}`)
+  })
+  const access = {
+    endpoint: Effect.suspend(() => {
+      if (selected !== null) return Effect.succeed(selected)
+      return readCurrent().pipe(
+        Effect.flatMap(
+          Option.match({
+            onSome: Effect.succeed,
+            onNone: () => start,
+          }),
+        ),
+        Effect.tap((value) => Effect.sync(() => { selected = value })),
+      )
+    }),
+    recover: (failed: AcnEndpoint) => Effect.suspend(() => {
+      if (selected !== null && selected.id !== failed.id) {
+        return Effect.succeed(selected)
+      }
+      selected = null
+      return readCurrent().pipe(
+        Effect.flatMap(
+          Option.match({
+            onSome: (current) => current.id !== failed.id
+              ? Effect.succeed(current)
+              : start,
+            onNone: () => start,
+          }),
+        ),
+        Effect.tap((value) => Effect.sync(() => { selected = value })),
+      )
+    }),
   }
-  return { provider, discoverCalls: () => discoverCalls, spawnCalls: () => spawnCalls }
+  return { access, currentCalls: () => currentCalls, startCalls: () => startCalls }
 }
 
 // ─── Fake resident stream policy ─────────────────────────────────────────────
@@ -145,24 +181,29 @@ const fakeStreamProtocol: RecoveringStreamProtocol = {
   isExitWithoutTermination: isCleanOrInterruptedExit,
 }
 
-const classifyInfraError = (error: never): RpcClientError.RpcClientError =>
+const classifyInfraError = (
+  error: never,
+): RpcClientError.RpcClientError =>
   new TransportError({ reason: "Unknown", message: "infra failure", cause: new Error(String(error)) })
 
 // ─── Client under test ───────────────────────────────────────────────────────
 
 const withClient = <A, E>(
-  provider: JitDaemonProvider<never>,
+  access: {
+    readonly endpoint: Effect.Effect<AcnEndpoint>
+    readonly recover: (failed: AcnEndpoint) => Effect.Effect<AcnEndpoint>
+  },
   http: HttpClient.HttpClient,
   use: (client: FakeClient) => Effect.Effect<A, E>,
 ): Promise<A> =>
   Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
-        const coordinator = yield* makeJitDaemonCoordinator(provider)
         const client = yield* RpcClient.make(FakeRpcs).pipe(
           Effect.provide(
             recoveringProtocolLayer<never>({
-              coordinator,
+              endpoint: access.endpoint,
+              recover: access.recover,
               rpcPath: "/rpc",
               streamProtocol: fakeStreamProtocol,
               isEndpointRetirementExit: isInterruptedExit,
@@ -209,43 +250,43 @@ const collectEvents = (client: FakeClient) =>
 
 describe("recovering protocol — operation contract", () => {
   it("dispatches optimistically against a discovered daemon (no spawn)", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({ discover: [Option.some("http://daemon-1")] })
+    const { access, startCalls } = makeFakeEndpointAccess({ current: [Option.some("http://daemon-1")] })
     const { client, calls } = makeFakeHttp([
       { kind: "lines", make: (id) => [exitMessage("Ping", id, Exit.succeed("pong"))] },
     ])
 
-    const result = await withClient(provider, client, (c) =>
+    const result = await withClient(access, client, (c) =>
       c.Ping({ value: "ping" })
     )
 
     expect(result).toBe("pong")
     expect(calls()).toBe(1)
-    expect(spawnCalls()).toBe(0)
+    expect(startCalls()).toBe(0)
   })
 
   it("recovers a unary op across a daemon death: respawn + re-issue, caller never sees it", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [Option.some("http://dead-daemon"), Option.none()],
-      spawnUrl: "http://fresh-daemon",
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some("http://dead-daemon"), Option.none()],
+      startUrl: "http://fresh-daemon",
     })
     const { client, calls } = makeFakeHttp([
       { kind: "refuse" },
       { kind: "lines", make: (id) => [exitMessage("Ping", id, Exit.succeed("pong"))] },
     ])
 
-    const result = await withClient(provider, client, (c) =>
+    const result = await withClient(access, client, (c) =>
       c.Ping({ value: "ping" })
     )
 
     expect(result).toBe("pong")
     expect(calls()).toBe(2)
-    expect(spawnCalls()).toBe(1)
+    expect(startCalls()).toBe(1)
   })
 
   it("reissues a unary demand when root retirement wins admission", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [Option.some("http://retiring-daemon"), Option.none()],
-      spawnUrl: "http://fresh-daemon",
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some("http://retiring-daemon"), Option.none()],
+      startUrl: "http://fresh-daemon",
     })
     const { client, calls } = makeFakeHttp([
       {
@@ -255,18 +296,18 @@ describe("recovering protocol — operation contract", () => {
       { kind: "lines", make: (id) => [exitMessage("Ping", id, Exit.succeed("pong"))] },
     ])
 
-    const result = await withClient(provider, client, (c) => c.Ping({ value: "ping" }))
+    const result = await withClient(access, client, (c) => c.Ping({ value: "ping" }))
 
     expect(result).toBe("pong")
     expect(calls()).toBe(2)
-    expect(spawnCalls()).toBe(1)
+    expect(startCalls()).toBe(1)
   })
 
   it("surfaces a fatal error after two consecutive failures without progress (crash loop)", async () => {
-    const { provider } = makeFakeProvider({ discover: [Option.some("http://zombie")] })
+    const { access } = makeFakeEndpointAccess({ current: [Option.some("http://zombie")] })
     const { client, calls } = makeFakeHttp([{ kind: "refuse" }])
 
-    const outcome = await withClient(provider, client, (c) =>
+    const outcome = await withClient(access, client, (c) =>
       Effect.flip(c.Ping({ value: "ping" }))
     )
 
@@ -279,7 +320,7 @@ describe("recovering protocol — operation contract", () => {
   })
 
   it("surfaces a bad HTTP status as transport exhaustion with a typed cause", async () => {
-    const { provider } = makeFakeProvider({ discover: [Option.some("http://broken-daemon")] })
+    const { access } = makeFakeEndpointAccess({ current: [Option.some("http://broken-daemon")] })
     const statusClient = HttpClient.make((request) =>
       Effect.succeed(
         HttpClientResponse.fromWeb(
@@ -289,7 +330,7 @@ describe("recovering protocol — operation contract", () => {
       ),
     )
 
-    const outcome = await withClient(provider, statusClient, (c) =>
+    const outcome = await withClient(access, statusClient, (c) =>
       Effect.flip(c.Ping({ value: "ping" }))
     )
 
@@ -300,10 +341,10 @@ describe("recovering protocol — operation contract", () => {
   })
 
   it("surfaces resolution failure as fatal with the infra error in cause", async () => {
-    const { provider } = makeFakeProvider({ discover: [Option.none()] })
+    const { access } = makeFakeEndpointAccess({ current: [Option.none()] })
     const { client } = makeFakeHttp([{ kind: "refuse" }])
 
-    const outcome = await withClient(provider, client, (c) =>
+    const outcome = await withClient(access, client, (c) =>
       Effect.flip(c.Ping({ value: "ping" }))
     )
 
@@ -311,9 +352,9 @@ describe("recovering protocol — operation contract", () => {
   })
 
   it("treats a stream body ending without an exit as death and re-issues invisibly", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [Option.some("http://daemon-1"), Option.none()],
-      spawnUrl: "http://daemon-2",
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some("http://daemon-1"), Option.none()],
+      startUrl: "http://daemon-2",
     })
     const { client, calls } = makeFakeHttp([
       { kind: "lines", make: (id) => [chunkMessage(id, [{ event: "changed", path: "first" }])] },
@@ -326,17 +367,17 @@ describe("recovering protocol — operation contract", () => {
       },
     ])
 
-    const paths = await withClient(provider, client, collectEvents)
+    const paths = await withClient(access, client, collectEvents)
 
     expect(paths).toEqual(["first", "second"])
     expect(calls()).toBe(2)
-    expect(spawnCalls()).toBe(1)
+    expect(startCalls()).toBe(1)
   })
 
   it("surfaces a stream exit without the authoritative terminal control", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [Option.some("http://draining-daemon")],
-      spawnUrl: "http://fresh-daemon",
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some("http://draining-daemon")],
+      startUrl: "http://fresh-daemon",
     })
     const { client, calls } = makeFakeHttp([
       {
@@ -348,7 +389,7 @@ describe("recovering protocol — operation contract", () => {
       },
     ])
 
-    const outcome = await withClient(provider, client, (c) =>
+    const outcome = await withClient(access, client, (c) =>
       Effect.flip(Stream.runCollect(c.Watch({ path: "/watched" }))),
     )
 
@@ -357,13 +398,13 @@ describe("recovering protocol — operation contract", () => {
       SubscriptionProtocolViolation,
     )
     expect(calls()).toBe(1)
-    expect(spawnCalls()).toBe(0)
+    expect(startCalls()).toBe(0)
   })
 
   it("does not treat an unframed server interrupt as daemon retirement", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [Option.some("http://draining-daemon")],
-      spawnUrl: "http://fresh-daemon",
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some("http://draining-daemon")],
+      startUrl: "http://fresh-daemon",
     })
     const { client, calls } = makeFakeHttp([
       {
@@ -375,7 +416,7 @@ describe("recovering protocol — operation contract", () => {
       },
     ])
 
-    const outcome = await withClient(provider, client, (c) =>
+    const outcome = await withClient(access, client, (c) =>
       Effect.flip(Stream.runCollect(c.Watch({ path: "/watched" }))),
     )
 
@@ -384,26 +425,26 @@ describe("recovering protocol — operation contract", () => {
       SubscriptionProtocolViolation,
     )
     expect(calls()).toBe(1)
-    expect(spawnCalls()).toBe(0)
+    expect(startCalls()).toBe(0)
   })
 
   it("surfaces a domain error on a stream to the consumer without re-issuing", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({ discover: [Option.some("http://daemon-1")] })
+    const { access, startCalls } = makeFakeEndpointAccess({ current: [Option.some("http://daemon-1")] })
     const { client, calls } = makeFakeHttp([
       { kind: "lines", make: (id) => [endOfStream(id)] },
     ])
 
-    const outcome = await withClient(provider, client, (c) =>
+    const outcome = await withClient(access, client, (c) =>
       Effect.flip(Stream.runCollect(c.Watch({ path: "/watched" })))
     )
 
     expect(outcome).toBeInstanceOf(FakeError)
     expect(calls()).toBe(1)
-    expect(spawnCalls()).toBe(0)
+    expect(startCalls()).toBe(0)
   })
 
   it("consumes keepalives so they never reach the consumer", async () => {
-    const { provider } = makeFakeProvider({ discover: [Option.some("http://daemon-1")] })
+    const { access } = makeFakeEndpointAccess({ current: [Option.some("http://daemon-1")] })
     const { client } = makeFakeHttp([
       {
         kind: "lines",
@@ -415,17 +456,17 @@ describe("recovering protocol — operation contract", () => {
       },
     ])
 
-    const paths = await withClient(provider, client, collectEvents)
+    const paths = await withClient(access, client, collectEvents)
     expect(paths).toEqual(["real"])
   })
 
   it("parks after authoritative termination and resumes on a discovered successor", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [
         Option.some("http://daemon-1"),
         Option.some("http://daemon-2"),
       ],
-      spawnUrl: "http://must-not-spawn",
+      startUrl: "http://must-not-spawn",
     })
     const { client, calls } = makeFakeHttp([
       {
@@ -444,20 +485,20 @@ describe("recovering protocol — operation contract", () => {
       },
     ])
 
-    const paths = await withClient(provider, client, collectEvents)
+    const paths = await withClient(access, client, collectEvents)
     expect(paths).toEqual(["before", "after"])
     expect(calls()).toBe(2)
-    expect(spawnCalls()).toBe(0)
+    expect(startCalls()).toBe(0)
   })
 
   it("a stream that made progress recovers again on a later, separate death", async () => {
-    const { provider, spawnCalls } = makeFakeProvider({
-      discover: [
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [
         Option.some("http://daemon-1"),
         Option.none(),
         Option.none(),
       ],
-      spawnUrl: "http://daemon-n",
+      startUrl: "http://daemon-n",
     })
     const { client, calls } = makeFakeHttp([
       { kind: "lines", make: (id) => [chunkMessage(id, [{ event: "changed", path: "one" }])] },
@@ -471,10 +512,10 @@ describe("recovering protocol — operation contract", () => {
       },
     ])
 
-    const paths = await withClient(provider, client, collectEvents)
+    const paths = await withClient(access, client, collectEvents)
 
     expect(paths).toEqual(["one", "two", "three"])
     expect(calls()).toBe(3)
-    expect(spawnCalls()).toBe(2)
+    expect(startCalls()).toBe(2)
   })
 })

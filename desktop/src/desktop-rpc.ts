@@ -1,6 +1,12 @@
 import { Rpc, RpcClient, RpcClientError, RpcGroup } from "@effect/rpc"
 import { Option, Schema } from "effect"
 import { MenuActionSchema, type MenuAction } from "@magnitudedev/client-common/src/types/menu-action"
+import {
+  DaemonLaunchEventSchema,
+  DaemonStatusSchema,
+  type DaemonLaunchEvent,
+  type DaemonStatus,
+} from "@magnitudedev/sdk"
 
 export type { MenuAction }
 
@@ -25,20 +31,21 @@ export interface OpenFileOptions {
 }
 
 export const DesktopRpcs = RpcGroup.make(
-  Rpc.make("DaemonDiscover", {
+  Rpc.make("DaemonCurrent", {
     payload: Unit,
-    success: Schema.NullOr(Schema.String),
+    success: Schema.NullOr(DaemonStatusSchema),
     error: DesktopRpcError,
   }),
-  Rpc.make("DaemonSpawn", {
+  Rpc.make("DaemonLaunch", {
     payload: Schema.Struct({
       command: Schema.optionalWith(Schema.Array(Schema.String), {
         as: "Option",
         exact: true,
       }),
     }),
-    success: Schema.String,
+    success: DaemonLaunchEventSchema,
     error: DesktopRpcError,
+    stream: true,
   }),
   Rpc.make("StorageGet", {
     payload: Schema.Struct({ key: Schema.String }),
@@ -94,9 +101,14 @@ export type DesktopPlatform = "darwin" | "win32" | "linux"
 
 export interface DesktopApi {
   readonly platform: DesktopPlatform
-  readonly daemon: {
-    discover(): Promise<string | null>
-    spawn(command: Option.Option<ReadonlyArray<string>>): Promise<string>
+  readonly daemonDiscovery: {
+    current(): Promise<DaemonStatus | null>
+  }
+  readonly daemonLauncher: {
+    launch(
+      command: Option.Option<ReadonlyArray<string>>,
+      onEvent: (event: DaemonLaunchEvent) => void,
+    ): Promise<void>
   }
   readonly onMenuAction: (cb: (action: MenuAction) => void) => () => void
   readonly quit: () => void

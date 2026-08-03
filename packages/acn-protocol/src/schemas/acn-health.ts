@@ -1,3 +1,4 @@
+import { FSM } from "@magnitudedev/utils";
 import { Schema } from "effect";
 import { AcnOwnerIdSchema } from "../acn-registry";
 
@@ -38,34 +39,62 @@ export const StartupBackendSchema = Schema.Union(
 )
 export type StartupBackend = typeof StartupBackendSchema.Type
 
+export const AcnInstallingActivitySchema = Schema.TaggedStruct("Installing", {
+  phase: AcnInstallationPhaseSchema,
+  plan: AcnInstallationPlanSchema,
+});
+export type AcnInstallingActivity = typeof AcnInstallingActivitySchema.Type;
+
 export const AcnStartupActivitySchema = Schema.Union(
   Schema.Literal("WaitingForOwnership", "Resolving", "Starting"),
   Schema.TaggedStruct("PreparingBackend", { backend: StartupBackendSchema }),
+  AcnInstallingActivitySchema,
 );
 export type AcnStartupActivity = typeof AcnStartupActivitySchema.Type;
 
-export const AcnHealthStateSchema = Schema.Union(
-  Schema.TaggedStruct("Starting", {
-    activity: AcnStartupActivitySchema,
-    progress: Schema.optionalWith(AcnStartupProgressSchema, {
-      as: "Option",
-      exact: true,
-    }),
-  }),
-  Schema.TaggedStruct("Installing", {
-    phase: AcnInstallationPhaseSchema,
-    plan: AcnInstallationPlanSchema,
-    progress: Schema.optionalWith(AcnStartupProgressSchema, {
-      as: "Option",
-      exact: true,
-    }),
-  }),
-  Schema.TaggedStruct("Ready", {}),
-  Schema.TaggedStruct("Failed", {
-    message: NonEmptyString,
-    retryable: Schema.Boolean,
-  })
+export const AcnStoppingReasonSchema = Schema.Literal(
+  "idle",
+  "ownership-lost",
+  "peer-request",
+  "icn-exited",
+  "signal",
+  "startup-failed",
+  "fatal",
 );
+export type AcnStoppingReason = typeof AcnStoppingReasonSchema.Type;
+
+export class AcnStarting extends Schema.TaggedClass<AcnStarting>()("Starting", {
+  activity: AcnStartupActivitySchema,
+  progress: Schema.optionalWith(AcnStartupProgressSchema, {
+    as: "Option",
+    exact: true,
+  }),
+}) {}
+
+export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {}) {}
+
+export class AcnStopping extends Schema.TaggedClass<AcnStopping>()("Stopping", {
+  reason: AcnStoppingReasonSchema,
+  safeDetail: Schema.optionalWith(NonEmptyString, {
+    as: "Option",
+    exact: true,
+  }),
+}) {}
+
+export const AcnServiceLifecycleFsm = FSM.defineFSM(
+  {
+    Starting: AcnStarting,
+    Ready: AcnReady,
+    Stopping: AcnStopping,
+  },
+  {
+    Starting: ["Ready", "Stopping"],
+    Ready: ["Stopping"],
+    Stopping: [],
+  } as const,
+);
+
+export const AcnHealthStateSchema = Schema.Union(AcnStarting, AcnReady, AcnStopping);
 export type AcnHealthState = typeof AcnHealthStateSchema.Type;
 
 export const AcnHealthResponseSchema = Schema.Struct({

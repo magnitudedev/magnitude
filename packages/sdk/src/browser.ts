@@ -1,19 +1,21 @@
 /**
  * Browser-safe SDK entry.
  *
- * Renderer builds resolve `@magnitudedev/sdk` here. The only daemon lifecycle
- * dependency exposed to browser code is `DaemonSpawner`; concrete browser
- * behavior is provided by `makeRemoteDaemonSpawner`.
+ * Renderer builds resolve `@magnitudedev/sdk` here. Daemon discovery and
+ * launch are delegated to the host over HTTP.
  */
-export { DaemonSpawnerTag } from "./daemon-spawner"
-export type { DaemonSpawner } from "./daemon-spawner"
-export { makeRemoteDaemonSpawner } from "./remote-spawner"
+export { DaemonDiscovery, DaemonStatusSchema } from "./acn-jit/daemon-discovery"
+export type { DaemonStatus } from "./acn-jit/daemon-discovery"
+export { DaemonLauncher, DaemonLaunchEventSchema } from "./acn-jit/daemon-launcher"
+export type { DaemonLaunchEvent } from "./acn-jit/daemon-launcher"
+export { makeRemoteDaemonDiscovery, makeRemoteDaemonLauncher } from "./acn-jit/remote-daemon"
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
 export type { AcnJitRuntime, AcnJitRuntimeOptions } from "./acn-jit/acn-recovering-client"
 export {
   NoDaemon,
+  DaemonDiscoveryFailed,
   DaemonSpawnFailed,
   BinaryNotFound,
   BinaryVersionMismatch,

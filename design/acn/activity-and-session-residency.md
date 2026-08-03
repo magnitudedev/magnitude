@@ -2,7 +2,7 @@
 applies_to:
   - packages/acn/src/activity-tracker.ts
   - packages/acn/src/resource-use-gate.ts
-  - packages/acn/src/acn-shutdown.ts
+  - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/acn-subscription-protocol.ts
   - packages/acn/src/agent-runtime.ts

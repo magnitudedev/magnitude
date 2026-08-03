@@ -3,7 +3,7 @@ import { Effect, Fiber, Layer, Option, Queue, Scope, Stream } from "effect"
 import type { AgentIntrospection, CodingAgentSession } from "@magnitudedev/agent"
 import type { DisplayViewShape } from "@magnitudedev/acn-protocol"
 import { AcnActivityTrackerLive } from "../activity-tracker"
-import { AcnShutdownLive } from "../acn-shutdown"
+import { AcnServiceLifecycleLive } from "../service-lifecycle"
 import { AgentRuntime, type AgentRuntimeApi } from "../agent-runtime"
 import type { RuntimeEntry } from "../session-types"
 import { AcnDisplayViewIntrospector, AcnDisplayViewIntrospectorLive } from "./display-views"
@@ -123,8 +123,8 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
 
       const runtimeLayer = Layer.succeed(AgentRuntime, runtime)
       const withActivity = Layer.provideMerge(
-        AcnActivityTrackerLive(),
-        Layer.merge(runtimeLayer, AcnShutdownLive),
+        AcnActivityTrackerLive,
+        Layer.merge(runtimeLayer, AcnServiceLifecycleLive()),
       )
       const withDisplay = Layer.provideMerge(AcnDisplayViewIntrospectorLive, withActivity)
       return Layer.provideMerge(AcnIntrospectorLive, withDisplay)

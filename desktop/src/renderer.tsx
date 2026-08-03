@@ -2,11 +2,11 @@
  * Desktop renderer entry — spec §5.2
  *
  * Reads `window.__magnitudeDesktop`, creates the DesktopPlatform,
- * creates the AgentClient AtomRpc tag with the desktop DaemonSpawner, and mounts App
+ * creates the AgentClient AtomRpc tag with the desktop daemon services, and mounts App
  * inside PlatformProvider + RegistryProvider + AgentClientProvider.
  *
- * Daemon discovery and spawn remain lazy. The SDK coordinator ensures an
- * endpoint when the first ACN RPC consumer mounts.
+ * ACN selection remains lazy. The client lifecycle selects an endpoint when
+ * the first RPC consumer mounts.
  *
  * On window close, interrupts the renderer stream and notifies main (§5.6).
  */

@@ -3,13 +3,13 @@
  *
  * Responsibilities:
  * 1. Bundle path discovery — find the magnitude-acn binary
- * 2. Daemon lifecycle — discover/spawn via the Effect-native SDK spawner
+ * 2. Daemon discovery and launch via separate Effect-native services
  * 3. OS shell integration — BrowserWindow, preload, menu shortcuts
  *
  * The main process does NOT proxy ACN RPC traffic. It exposes desktop
- * platform actions and daemon lifecycle through DesktopRpcs over Electron IPC;
+ * platform actions and daemon boundaries through DesktopRpcs over Electron IPC;
  * the renderer SDK opens the ACN RPC connection directly to the endpoint
- * returned by that spawner.
+ * returned by that service.
  */
 import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, type MenuItemConstructorOptions } from "electron"
 import * as nodePath from "node:path"
@@ -28,27 +28,30 @@ import { makeElectronRpcServerLayer } from "./electron-rpc"
 
 // SDK imports — these run in the main process (Node)
 import {
-  makeLocalDaemonSpawner,
-  runDaemonSpawn,
-  SpawnProcess,
+  makeLocalDaemonDiscovery,
+  makeLocalDaemonLauncher,
+  ChildProcessSpawner,
   DaemonSpawnFailed,
   captureSpawnDiagnostics,
   type DaemonError,
-  type DaemonSpawner,
+  type DaemonDiscovery as DaemonDiscoveryService,
+  type DaemonLauncher as DaemonLauncherService,
 } from "@magnitudedev/sdk"
+import type { DaemonStatus } from "@magnitudedev/sdk"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
-let daemonSpawnerPromise: Promise<DaemonSpawner> | null = null
+let daemonDiscoveryPromise: Promise<DaemonDiscoveryService> | null = null
+let daemonLauncherPromise: Promise<DaemonLauncherService> | null = null
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
 
 /**
- * Node-compatible spawn function for makeLocalDaemonSpawner.
+ * Node-compatible child process spawner for the local daemon launcher.
  * Uses child_process.spawn (NOT Bun.spawn) because Electron's main process is Node.
  */
-const nodeSpawn: SpawnProcess = {
+const nodeSpawn: ChildProcessSpawner = {
   spawn: (command) =>
     Effect.try({
       try: () => {
@@ -138,7 +141,7 @@ function storageRemove(key: string): void {
 /**
  * Find the magnitude-acn binary path.
  * In production, it's bundled in process.resourcesPath.
- * In development, let the SDK or source spawn command resolve the binary.
+ * In development, let the SDK or source launch command resolve the binary.
  */
 function findBinaryPath(): Option.Option<string> {
   // Check for bundled binary in resources (production)
@@ -347,7 +350,7 @@ function createWindow(): void {
   })
 }
 
-function defaultSpawnCommand(): Option.Option<ReadonlyArray<string>> {
+function defaultLaunchCommand(): Option.Option<ReadonlyArray<string>> {
   const isDev = !app.isPackaged
   const acnSourcePath = nodePath.resolve(__dirname, "..", "..", "..", "packages", "acn", "src", "binary.ts")
   return isDev
@@ -355,41 +358,40 @@ function defaultSpawnCommand(): Option.Option<ReadonlyArray<string>> {
     : Option.none()
 }
 
-async function getDaemonSpawner(): Promise<DaemonSpawner> {
-  if (daemonSpawnerPromise) return daemonSpawnerPromise
-
+function localDaemonOptions() {
   const binaryPath = findBinaryPath()
-  daemonSpawnerPromise = makeLocalDaemonSpawner({
+  return {
     ...Option.match(binaryPath, {
       onNone: () => ({}),
       onSome: (path) => ({ binaryPath: path }),
     }),
-  }).pipe(
-    Effect.provideService(SpawnProcess, nodeSpawn),
+  }
+}
+
+async function getDaemonDiscovery(): Promise<DaemonDiscoveryService> {
+  daemonDiscoveryPromise ??= makeLocalDaemonDiscovery().pipe(
     Effect.provide(nodePlatformLayer),
     Effect.runPromise,
   )
-  return daemonSpawnerPromise
+  return daemonDiscoveryPromise
 }
 
-const daemonSpawner = Effect.promise(getDaemonSpawner)
-
-const discoverDaemonUrl: Effect.Effect<
-  Option.Option<string>,
-  DaemonError
-> = daemonSpawner.pipe(Effect.flatMap((spawner) => spawner.discover()))
-
-function spawnDaemon(
-  command: Option.Option<ReadonlyArray<string>>,
-): Effect.Effect<string, DaemonError> {
-  return daemonSpawner.pipe(
-    Effect.flatMap((spawner) =>
-      runDaemonSpawn(
-        spawner.spawn(Option.orElse(command, defaultSpawnCommand)),
-      ),
-    ),
+async function getDaemonLauncher(): Promise<DaemonLauncherService> {
+  daemonLauncherPromise ??= makeLocalDaemonLauncher(localDaemonOptions()).pipe(
+    Effect.provideService(ChildProcessSpawner, nodeSpawn),
+    Effect.provide(nodePlatformLayer),
+    Effect.runPromise,
   )
+  return daemonLauncherPromise
 }
+
+const daemonDiscovery = Effect.promise(getDaemonDiscovery)
+const daemonLauncher = Effect.promise(getDaemonLauncher)
+
+const currentAcn: Effect.Effect<
+  Option.Option<DaemonStatus>,
+  DaemonError
+> = daemonDiscovery.pipe(Effect.flatMap((discovery) => discovery.current()))
 
 function messageFromUnknown(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
@@ -415,10 +417,20 @@ const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpc
   })
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
-  DaemonDiscover: () => daemonRpc(discoverDaemonUrl).pipe(
+  DaemonCurrent: () => daemonRpc(currentAcn).pipe(
     Effect.map(Option.getOrNull),
   ),
-  DaemonSpawn: ({ command }) => daemonRpc(spawnDaemon(command)),
+  DaemonLaunch: ({ command }) => Stream.unwrap(
+    daemonLauncher.pipe(
+      Effect.map((launcher) =>
+        launcher
+          .launch(Option.orElse(command, defaultLaunchCommand))
+          .pipe(Stream.mapError((error) => new DesktopRpcError({
+            message: formatDaemonError(error),
+          }))),
+      ),
+    ),
+  ),
   StorageGet: ({ key }) => Effect.sync(() => storageGet(key)),
   StorageSet: ({ key, value }) => Effect.sync(() => storageSet(key, value)).pipe(Effect.as({})),
   StorageRemove: ({ key }) => Effect.sync(() => storageRemove(key)).pipe(Effect.as({})),
@@ -467,7 +479,7 @@ function startDesktopRpcServer(): void {
 }
 
 app.whenReady().then(() => {
-  // 1. Resolve the login shell environment before any lazy ACN spawn.
+  // 1. Resolve the login shell environment before any lazy ACN launch.
   inheritLoginShellEnv()
 
   // 2. Start the desktop RPC server BEFORE creating any window, regardless of
@@ -478,8 +490,8 @@ app.whenReady().then(() => {
   // 3. Set up application menu
   Menu.setApplicationMenu(buildMenu())
 
-  // 4. Create the window without touching daemon lifecycle. The renderer's
-  // shared SDK coordinator discovers or spawns on first RPC demand.
+  // 4. Create the window without touching ACN process state. The shared client
+  // lifecycle selects or starts an ACN on first RPC demand.
   createWindow()
 })
 

@@ -5,8 +5,9 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
-import { MagnitudeRpcs, SessionNotFound } from "@magnitudedev/acn-protocol"
-import { DaemonSpawnerTag, type DaemonSpawner } from "./daemon-spawner"
+import { AcnOwnerIdSchema, MagnitudeRpcs, SessionNotFound } from "@magnitudedev/acn-protocol"
+import { DaemonDiscovery, type DaemonDiscovery as DaemonDiscoveryService } from "./daemon-discovery"
+import { DaemonLauncher, type DaemonLauncher as DaemonLauncherService } from "./daemon-launcher"
 import { makeAcnJitRuntime } from "./acn-recovering-client"
 import { DaemonSpawnFailed } from "./errors"
 import type { AcnClient } from "../protocol"
@@ -60,39 +61,51 @@ const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
   return { client, calls: () => calls }
 }
 
-const makeFakeSpawner = (options: {
-  readonly discover: ReadonlyArray<Option.Option<string>>
-  readonly spawnUrl?: string
+const makeFakeProcesses = (options: {
+  readonly current: ReadonlyArray<Option.Option<string>>
+  readonly startUrl?: string
 }) => {
-  let discoverCalls = 0
-  let spawnCalls = 0
-  const spawner: DaemonSpawner = {
-    discover: () => Effect.sync(() => {
-      const result = options.discover[Math.min(discoverCalls, options.discover.length - 1)]
-      discoverCalls++
-      return result
+  const endpoint = (url: string) => ({
+    id: AcnOwnerIdSchema.make(url),
+    version: SDK_VERSION,
+    url,
+  })
+  let currentCalls = 0
+  let startCalls = 0
+  const discovery: DaemonDiscoveryService = {
+    current: () => Effect.sync(() => {
+      const result = options.current[Math.min(currentCalls, options.current.length - 1)]
+      currentCalls++
+      return Option.map(result, (url) => ({
+        ...endpoint(url),
+        pid: 123,
+        state: { _tag: "Ready" as const },
+      }))
     }),
-    spawn: () =>
+  }
+  const launcher: DaemonLauncherService = {
+    launch: () =>
       Stream.suspend(() => {
-        spawnCalls++
-        return options.spawnUrl === undefined
+        startCalls++
+        return options.startUrl === undefined
           ? Stream.fail(
-              new DaemonSpawnFailed({ reason: "spawn disabled in test" }),
+              new DaemonSpawnFailed({ reason: "start disabled in test" }),
             )
-          : Stream.succeed({ _tag: "Ready", url: options.spawnUrl })
+          : Stream.succeed({ _tag: "Ready", endpoint: endpoint(options.startUrl) })
       }),
   }
-  return { spawner, discoverCalls: () => discoverCalls, spawnCalls: () => spawnCalls }
+  return { services: { discovery, launcher }, currentCalls: () => currentCalls, startCalls: () => startCalls }
 }
 
 const withClient = <A, E>(
-  spawner: DaemonSpawner,
+  services: { readonly discovery: DaemonDiscoveryService; readonly launcher: DaemonLauncherService },
   http: HttpClient.HttpClient,
   use: (client: AcnClient) => Effect.Effect<A, E>,
 ): Promise<A> =>
   Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const runtime = yield* makeAcnJitRuntime().pipe(
-      Effect.provideService(DaemonSpawnerTag, spawner),
+      Effect.provideService(DaemonDiscovery, services.discovery),
+      Effect.provideService(DaemonLauncher, services.launcher),
     )
     const client = yield* RpcClient.make(MagnitudeRpcs).pipe(
       Effect.provide(runtime.protocolLayer.pipe(
@@ -131,39 +144,49 @@ const collectPaths = (client: AcnClient) =>
 
 describe("AcnJitRuntime", () => {
   it("performs read-only discovery without starting a daemon", async () => {
-    const { spawner, discoverCalls, spawnCalls } = makeFakeSpawner({
-      discover: [Option.some("http://daemon")],
+    const { services, currentCalls, startCalls } = makeFakeProcesses({
+      current: [Option.some("http://daemon")],
     })
     const runtime = await Effect.runPromise(
       makeAcnJitRuntime().pipe(
-        Effect.provideService(DaemonSpawnerTag, spawner),
+        Effect.provideService(DaemonDiscovery, services.discovery),
+        Effect.provideService(DaemonLauncher, services.launcher),
       ),
     )
 
     expect(await Effect.runPromise(runtime.startup.prepare)).toEqual({
       _tag: "Ready",
-      endpoint: "http://daemon",
-      version: SDK_VERSION,
+      endpoint: {
+        id: "http://daemon",
+        url: "http://daemon",
+        version: SDK_VERSION,
+      },
     })
     expect(await Effect.runPromise(runtime.startup.state.get)).toEqual({
       _tag: "Ready",
-      endpoint: "http://daemon",
-      version: SDK_VERSION,
+      endpoint: {
+        id: "http://daemon",
+        url: "http://daemon",
+        version: SDK_VERSION,
+      },
     })
-    expect(discoverCalls()).toBe(1)
-    expect(spawnCalls()).toBe(0)
+    expect(currentCalls()).toBe(1)
+    expect(startCalls()).toBe(0)
   })
 
-  it("performs startup demand once and shares one coordinator across protocol consumers", async () => {
-    const { spawner, discoverCalls, spawnCalls } = makeFakeSpawner({
-      discover: [Option.some("http://daemon")],
+  it("performs startup demand once and shares one selected endpoint", async () => {
+    const { services, currentCalls, startCalls } = makeFakeProcesses({
+      current: [Option.some("http://daemon")],
     })
     const { client: http } = makeFakeHttp([
       { kind: "lines", make: (id) => [exitMessage("CheckFileExists", id, Exit.succeed(true))] },
     ])
 
     const runtime = await Effect.runPromise(
-      makeAcnJitRuntime().pipe(Effect.provideService(DaemonSpawnerTag, spawner)),
+      makeAcnJitRuntime().pipe(
+        Effect.provideService(DaemonDiscovery, services.discovery),
+        Effect.provideService(DaemonLauncher, services.launcher),
+      ),
     )
     const call = Effect.scoped(RpcClient.make(MagnitudeRpcs).pipe(
       Effect.provide(runtime.protocolLayer.pipe(
@@ -174,30 +197,30 @@ describe("AcnJitRuntime", () => {
 
     expect(await Effect.runPromise(call)).toBe(true)
     expect(await Effect.runPromise(call)).toBe(true)
-    expect(discoverCalls()).toBe(1)
-    expect(spawnCalls()).toBe(0)
+    expect(currentCalls()).toBe(1)
+    expect(startCalls()).toBe(0)
   })
 
-  it("recovers finite work through the same coordinator", async () => {
-    const { spawner, spawnCalls } = makeFakeSpawner({
-      discover: [Option.some("http://dead"), Option.none()],
-      spawnUrl: "http://fresh",
+  it("recovers finite work through the client lifecycle owner", async () => {
+    const { services, startCalls } = makeFakeProcesses({
+      current: [Option.some("http://dead"), Option.none()],
+      startUrl: "http://fresh",
     })
     const { client, calls } = makeFakeHttp([
       { kind: "refuse" },
       { kind: "lines", make: (id) => [exitMessage("CheckFileExists", id, Exit.succeed(true))] },
     ])
 
-    const result = await withClient(spawner, client, (acn) =>
+    const result = await withClient(services, client, (acn) =>
       acn.CheckFileExists({ cwd: "/project", path: "/x" }),
     )
     expect(result).toBe(true)
     expect(calls()).toBe(2)
-    expect(spawnCalls()).toBe(1)
+    expect(startCalls()).toBe(1)
   })
 
   it("automatically exposes payloads while consuming subscription controls", async () => {
-    const { spawner } = makeFakeSpawner({ discover: [Option.some("http://daemon")] })
+    const { services } = makeFakeProcesses({ current: [Option.some("http://daemon")] })
     const { client } = makeFakeHttp([{ kind: "lines", make: (id) => [
       chunkMessage(id, [{ _tag: "keepalive" }]),
       chunkMessage(id, [
@@ -207,13 +230,13 @@ describe("AcnJitRuntime", () => {
       endOfStream(id),
     ] }])
 
-    expect(await withClient(spawner, client, collectPaths)).toEqual(["/real"])
+    expect(await withClient(services, client, collectPaths)).toEqual(["/real"])
   })
 
   it("parks on terminated and reconnects to a successor without spawning", async () => {
-    const { spawner, spawnCalls } = makeFakeSpawner({
-      discover: [Option.some("http://old"), Option.some("http://new")],
-      spawnUrl: "http://must-not-spawn",
+    const { services, startCalls } = makeFakeProcesses({
+      current: [Option.some("http://old"), Option.some("http://new")],
+      startUrl: "http://must-not-start",
     })
     const { client } = makeFakeHttp([
       { kind: "lines", make: (id) => [
@@ -226,7 +249,7 @@ describe("AcnJitRuntime", () => {
       ] },
     ])
 
-    expect(await withClient(spawner, client, collectPaths)).toEqual(["/before", "/after"])
-    expect(spawnCalls()).toBe(0)
+    expect(await withClient(services, client, collectPaths)).toEqual(["/before", "/after"])
+    expect(startCalls()).toBe(0)
   })
 })

@@ -13,7 +13,7 @@ export type DecodedStreamChunk =
 
 /**
  * Extension point for a daemon-specific stream wire protocol. Generic JIT RPC
- * recovery owns retries and endpoint generations; it never interprets the
+ * recovery owns retries and exact endpoint identities; it never interprets the
  * daemon's control values itself.
  */
 export interface RecoveringStreamProtocol {

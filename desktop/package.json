@@ -10,6 +10,7 @@
   "dependencies": {
     "@effect/rpc": "0.75.1",
     "@magnitudedev/client-common": "workspace:*",
+    "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/web": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
     "@effect/platform": "^0.96.1",

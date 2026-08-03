@@ -14,6 +14,7 @@ import {
   Context,
   Effect,
   Exit,
+  Fiber,
   Layer,
   Option,
   Runtime,
@@ -47,7 +48,6 @@ import {
 } from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
 import {
-  AcnActivityTracker,
   AcnActivityTrackerLive,
   AcnRpcDemandLive,
 } from "./activity-tracker"
@@ -83,17 +83,23 @@ import {
   makeHealthResponse,
 } from "./identity"
 import { MirroredStateChangesLive } from "./mirrored-state"
-import { AcnShutdown, AcnShutdownLive } from "./acn-shutdown"
 import { acquireAcnMachineOwnership } from "./machine-ownership"
 import {
   readRegistrationOwnership,
+  removeExactInstance,
   registrationIsOwnedBy,
   registrationPath,
+  writeInstanceAtomic,
 } from "./daemon-registration"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
-import { AcnStartupState } from "./startup-state"
-import { makeAcnStartupState } from "./startup-state"
+import {
+  AcnServiceLifecycle,
+  makeAcnServiceLifecycle,
+  type AcnServiceLifecycleApi,
+} from "./service-lifecycle"
+import { removePeerAcns } from "./peer-acn"
+import { currentProcessStartIdentity } from "./process-identity"
 
 export interface AcnServerOptions {
   readonly register?: boolean
@@ -105,6 +111,15 @@ const CORS_ALLOWED_HEADERS =
   "Content-Type, Content-Length, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
 const LOCAL_HTTP_ORIGIN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
+
+const closeScopeBounded = (scope: Scope.CloseableScope) =>
+  Effect.gen(function* () {
+    const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkDaemon)
+    yield* Effect.raceFirst(
+      Fiber.await(closing),
+      Effect.sleep("1 second"),
+    ).pipe(Effect.asVoid)
+  })
 
 function isAllowedCorsOrigin(origin: string): boolean {
   return (
@@ -152,7 +167,7 @@ const OptionsRouteHandler = (request: HttpServerRequest.HttpServerRequest) => {
 
 const AcnProcessHandlersLive = Layer.scopedDiscard(
   Effect.gen(function* () {
-    const shutdown = yield* AcnShutdown
+    const lifecycle = yield* AcnServiceLifecycle
     const runtime = yield* Effect.runtime<never>()
 
     const uncaughtExceptionHandler = (error: Error) => {
@@ -162,7 +177,7 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
           yield* Effect.logError("Uncaught exception in ACN process").pipe(
             Effect.annotateLogs({ error: error.stack ?? String(error) })
           )
-          yield* shutdown.request({
+          yield* lifecycle.beginStopping({
             reason: "fatal",
             detail: error.stack ?? String(error),
           })
@@ -181,7 +196,7 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
           yield* Effect.logError(
             "Unhandled promise rejection in ACN process"
           ).pipe(Effect.annotateLogs({ reason: message }))
-          yield* shutdown.request({
+          yield* lifecycle.beginStopping({
             reason: "fatal",
             detail: message,
           })
@@ -192,7 +207,7 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
     const requestSignalShutdown = (signal: NodeJS.Signals) => {
       Runtime.runPromise(
         runtime,
-        shutdown.request({ reason: "signal", detail: signal })
+        lifecycle.beginStopping({ reason: "signal", detail: signal })
       ).catch(() => undefined)
     }
     const sigintHandler = () => requestSignalShutdown("SIGINT")
@@ -228,7 +243,7 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
   ).pipe(Layer.provideMerge(storageLayer))
 
   const withActivity = Layer.provideMerge(
-    AcnActivityTrackerLive("30 minutes", false),
+    AcnActivityTrackerLive,
     storageServices
   )
   const withSubscriptions = Layer.provideMerge(
@@ -351,12 +366,11 @@ const AcnDebugServicesLayer = (dataDir: string) => {
 
 const makeAcnInfrastructure = (
   options: AcnServerOptions,
-  startup: AcnStartupState
+  lifecycle: AcnServiceLifecycleApi,
 ) => {
   const dataDir = options.dataDir ?? defaultDataDir()
   return Layer.mergeAll(
-    Layer.succeed(AcnStartupState, startup),
-    AcnShutdownLive,
+    Layer.succeed(AcnServiceLifecycle, lifecycle),
     Layer.succeed(
       GlobalStorage,
       GlobalStorage.of(makeGlobalStorage({ root: dataDir }))
@@ -373,7 +387,7 @@ const makeAcnInfrastructure = (
 }
 
 /**
- * Runs one ACN generation until its shutdown coordinator is requested. Scope
+ * Runs one ACN process until its lifecycle enters Stopping. Scope
  * closure then stops HTTP, disposes sessions, and reaps the private ICN.
  */
 export const launchAcnServer = (options: AcnServerOptions = {}) =>
@@ -381,18 +395,49 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     Effect.gen(function* () {
       const dataDir = options.dataDir ?? defaultDataDir()
       const debug = options.debug === true
-      const startup = yield* makeAcnStartupState()
-      yield* startup.starting("WaitingForOwnership", Option.none())
+      const processStartIdentity = yield* currentProcessStartIdentity.pipe(
+        Effect.provide(
+          BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
+        ),
+        Effect.orDie,
+      )
+      const instanceRecord = {
+        id: ACN_OWNER_ID,
+        version: ACN_VERSION,
+        url: Option.none<string>(),
+        pid: process.pid,
+        processStartIdentity,
+      }
+      const publishedInstancePath = yield* writeInstanceAtomic(
+        dataDir,
+        instanceRecord,
+      ).pipe(
+        Effect.provide(BunFileSystem.layer),
+        Effect.orDie,
+      )
+      const instance = {
+        path: publishedInstancePath,
+        record: instanceRecord,
+      }
+      yield* Effect.addFinalizer(() =>
+        removeExactInstance(instance).pipe(
+          Effect.provide(BunFileSystem.layer),
+          Effect.ignore,
+        ),
+      )
+      const lifecycle = yield* makeAcnServiceLifecycle()
       const applicationScope = yield* Scope.make()
-      yield* Effect.addFinalizer(() => Scope.close(applicationScope, Exit.void))
+      const closeApplicationScope = yield* Effect.cached(
+        closeScopeBounded(applicationScope),
+      )
+      yield* Effect.addFinalizer(() => closeApplicationScope)
 
       const infrastructure = yield* Layer.buildWithScope(
-        makeAcnInfrastructure(options, startup),
+        makeAcnInfrastructure(options, lifecycle),
         applicationScope
       )
       const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
       const server = Context.get(infrastructure, HttpServer.HttpServer)
-      const shutdown = Context.get(infrastructure, AcnShutdown)
 
       yield* router.addGlobalMiddleware((responseEffect) =>
         Effect.gen(function* () {
@@ -404,14 +449,26 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       yield* router.add(
         "GET",
         "/health",
-        startup.get.pipe(
+        lifecycle.state.pipe(
           Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
           Effect.flatMap(encodeHealthResponse),
           Effect.flatMap(HttpServerResponse.json),
           Effect.orDie
         )
       )
-      yield* router.add("POST", "/rpc", startup.rpc)
+      yield* router.add("POST", "/rpc", lifecycle.dispatchRpc)
+      yield* router.add(
+        "POST",
+        "/shutdown",
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest
+          if (request.headers["x-magnitude-acn-id"] !== ACN_OWNER_ID) {
+            return HttpServerResponse.empty({ status: 409 })
+          }
+          yield* lifecycle.beginStopping({ reason: "peer-request" })
+          return HttpServerResponse.empty({ status: 202 })
+        }),
+      )
       yield* server
         .serve(router.asHttpEffect())
         .pipe(Effect.provide(infrastructure))
@@ -422,28 +479,52 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
             register: options.register ?? false,
             debug,
             dataDir,
+            instance,
           }),
           AcnProcessHandlersLive
         ),
         applicationScope
       ).pipe(Effect.provide(infrastructure))
 
+      if (options.register ?? false) {
+        yield* removePeerAcns(dataDir, ACN_OWNER_ID).pipe(
+          Effect.provide(infrastructure),
+          Effect.tapError((error) =>
+            lifecycle.beginStopping({
+              reason: "startup-failed",
+              detail: `Unable to remove ACN peer ${error.id}: ${error.reason}`,
+            }),
+          ),
+        )
+      }
+
       const ownership = yield* Effect.raceFirst(
         acquireAcnMachineOwnership({
           dataDir,
           id: ACN_OWNER_ID,
           version: ACN_VERSION,
-        }).pipe(Effect.as(true)),
-        shutdown.await.pipe(Effect.as(false))
+        }).pipe(
+          Effect.timeoutOption("10 seconds"),
+          Effect.flatMap(
+            Option.match({
+              onSome: () => Effect.succeed(true),
+              onNone: () => lifecycle.beginStopping({
+                reason: "startup-failed",
+                detail: "Timed out acquiring active ACN ownership",
+              }).pipe(Effect.as(false)),
+            }),
+          ),
+        ),
+        lifecycle.awaitStopping.pipe(Effect.as(false))
       ).pipe(Effect.provide(infrastructure))
       if (!ownership) {
-        const request = yield* shutdown.await
+        const request = yield* lifecycle.awaitStopping
         yield* Effect.logInfo(
           "ACN retired before acquiring active runtime ownership"
         ).pipe(
           Effect.annotateLogs({
             reason: request.reason,
-            detail: request.detail ?? null,
+            detail: Option.getOrNull(request.safeDetail),
           })
         )
         return
@@ -453,13 +534,13 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
           registrationPath(dataDir)
         ).pipe(Effect.provide(infrastructure))
         if (!registrationIsOwnedBy(registration, ACN_OWNER_ID)) {
-          yield* shutdown.request({ reason: "ownership-lost" })
+          yield* lifecycle.beginStopping({ reason: "ownership-lost" })
           return
         }
       }
-      const pendingShutdown = yield* shutdown.current
-      if (Option.isSome(pendingShutdown)) return
-      yield* startup.starting("Resolving", Option.none())
+      const currentLifecycle = yield* lifecycle.state
+      if (currentLifecycle._tag === "Stopping") return
+      yield* lifecycle.reportStarting("Resolving", Option.none())
 
       const application = Effect.gen(function* () {
         const builtServices = yield* debug
@@ -515,18 +596,21 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
           )
         }
 
-        yield* startup.ready(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+        yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
         return {
           subscriptions: Context.get(applicationContext, AcnSubscriptions),
           icn: Context.get(applicationContext, IcnProcess),
-          activity: Context.get(applicationContext, AcnActivityTracker),
         }
       })
 
-      const { subscriptions, icn, activity } = yield* application.pipe(
+      const { subscriptions, icn } = yield* application.pipe(
+        Effect.timeout("5 minutes"),
         Effect.tapErrorCause((cause) =>
-          startup
-            .failed("Magnitude could not prepare local inference", true)
+          lifecycle
+            .beginStopping({
+              reason: "startup-failed",
+              detail: "Magnitude could not prepare local inference",
+            })
             .pipe(
               Effect.zipRight(
                 Effect.logError("ACN application startup failed").pipe(
@@ -536,24 +620,19 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
             )
         )
       )
-      yield* activity.ready
-      const request = yield* shutdown.await
+      const request = yield* lifecycle.awaitStopping
       yield* Effect.logInfo("ACN shutdown requested").pipe(
         Effect.annotateLogs({
           reason: request.reason,
-          detail: request.detail ?? null,
+          detail: Option.getOrNull(request.safeDetail),
         })
       )
-      // Linearize shutdown against RPC admission before any application
-      // finalizer begins. Existing exact leases remain releasable while HTTP
-      // and session scopes drain.
-      yield* activity.gate.closeAdmission
       yield* subscriptions.terminate
       // Close consumers before the owned ICN. Layer finalizer ordering stops
       // observation fibers and HTTP admission before the ICN finalizer sends
       // its termination signal, so graceful drain cannot be prolonged by new
       // internal requests.
-      yield* Scope.close(applicationScope, Exit.void)
-      yield* icn.shutdownResult.pipe(Effect.orDie)
+      yield* closeApplicationScope
+      yield* icn.shutdown.pipe(Effect.orDie)
     })
   )

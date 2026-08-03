@@ -95,6 +95,7 @@ export const makeAcnSubscriptionProtocol = (
               requestId: request.id,
               values: [control],
             }),
+          close: protocol.end(clientId),
         })
         const previous = yield* Ref.modify(finalizers, (all) => {
           const client = new Map(all.get(clientId) ?? [])

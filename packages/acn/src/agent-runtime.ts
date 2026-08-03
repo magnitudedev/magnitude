@@ -19,7 +19,7 @@ import {
   type SessionError,
 } from "@magnitudedev/acn-protocol"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
-import { AcnShutdown } from "./acn-shutdown"
+import { AcnServiceLifecycle } from "./service-lifecycle"
 import { AcnActivityTracker } from "./activity-tracker"
 import { AgentFactory } from "./agent-factory"
 import {
@@ -148,7 +148,7 @@ export const makeAgentRuntimeLive = (
       const store = yield* SessionStore
       const runtimeOptions = yield* SessionRuntimeOptionsStore
       const rootActivity = yield* Effect.serviceOption(AcnActivityTracker)
-      const shutdown = yield* Effect.serviceOption(AcnShutdown)
+      const lifecycle = yield* Effect.serviceOption(AcnServiceLifecycle)
       const managerScope = yield* Effect.scope
       const entries = yield* Ref.make(new Map<string, ResidentGeneration>())
       const starts = yield* Ref.make(new Map<string, StartDeferred>())
@@ -185,45 +185,44 @@ export const makeAgentRuntimeLive = (
         sessionId: string,
         generation: number,
         gate: ResourceUseGate,
-      ): Effect.Effect<Effect.Effect<void>> =>
-        Effect.gen(function* () {
-          const rootLease = yield* Option.match(rootActivity, {
-            onNone: () => Effect.succeed(Option.none<Effect.Effect<void>>()),
-            onSome: (activity) =>
-              activity.gate
-                .joinIfBusy(`session-work:${sessionId}:${generation}`)
-                .pipe(
-                  Effect.catchTag("ResourceRetired", () =>
-                    Effect.die(new Error("ACN retired while session work started")),
-                  ),
-                ),
-          })
-          if (Option.isSome(rootActivity) && Option.isNone(rootLease)) {
-            return yield* Effect.die(
-              new Error(`Session ${sessionId} became working without ACN demand`),
-            )
-          }
-
-          const sessionLease = yield* gate
-            .joinIfBusy(`continuing-work:${sessionId}:${generation}`)
-            .pipe(
-              Effect.catchTag("ResourceRetired", () =>
-                Effect.die(new Error(`Retired session ${sessionId} became working`)),
-              ),
-            )
-          if (Option.isNone(sessionLease)) {
-            if (Option.isSome(rootLease)) yield* rootLease.value
-            return yield* Effect.die(
-              new Error(`Session ${sessionId} became working without admitted session use`),
-            )
-          }
-
-          return yield* Effect.succeed(
-            sessionLease.value.pipe(
-              Effect.zipRight(Option.isSome(rootLease) ? rootLease.value : Effect.void),
+      ): Effect.Effect<Effect.Effect<void>> => {
+        const requireBusy = (
+          source: Pick<ResourceUseGate, "joinIfBusy">,
+          label: string,
+          missingMessage: string,
+        ) =>
+          source.joinIfBusy(label).pipe(
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.die(new Error(missingMessage)),
+                onSome: Effect.succeed,
+              }),
             ),
           )
-        })
+
+        return Effect.gen(function* () {
+          let releaseRoot = Effect.void
+          if (Option.isSome(rootActivity)) {
+            releaseRoot = yield* requireBusy(
+              rootActivity.value,
+              `session-work:${sessionId}:${generation}`,
+              `Session ${sessionId} became working without ACN demand`,
+            )
+          }
+
+          const releaseSession = yield* requireBusy(
+            gate,
+            `continuing-work:${sessionId}:${generation}`,
+            `Session ${sessionId} became working without admitted session use`,
+          ).pipe(Effect.onError(() => releaseRoot))
+
+          return yield* Effect.succeed(
+            releaseSession.pipe(Effect.zipRight(releaseRoot)),
+          )
+        }).pipe(
+          Effect.catchTag("ResourceRetired", () => Effect.interrupt),
+        )
+      }
 
       const makeWorkBridge = (
         sessionId: string,
@@ -579,8 +578,8 @@ export const makeAgentRuntimeLive = (
                 cause: String(closeExit.cause),
               }),
             )
-            if (Option.isSome(shutdown)) {
-              yield* shutdown.value.request({
+            if (Option.isSome(lifecycle)) {
+              yield* lifecycle.value.beginStopping({
                 reason: "fatal",
                 detail: `session ${sessionId} generation ${generation} scope close failed`,
               })
@@ -609,9 +608,9 @@ export const makeAgentRuntimeLive = (
           }
           return true
         })
-        return Option.match(shutdown, {
+        return Option.match(lifecycle, {
           onNone: () => retire,
-          onSome: (coordinator) =>
+          onSome: (serviceLifecycle) =>
             Effect.raceFirst(
               retire,
               Effect.sleep(options.retirementShutdownTimeout ?? "15 seconds").pipe(
@@ -621,13 +620,13 @@ export const makeAgentRuntimeLive = (
                   ),
                 ),
                 Effect.zipRight(
-                  coordinator.request({
+                  serviceLifecycle.beginStopping({
                     reason: "fatal",
                     detail: `session ${sessionId} generation ${generation} retirement stalled`,
                   }),
                 ),
                 // The retirement result remains authoritative. Requesting a
-                // controlled process replacement must not roll this gate back
+                // ACN shutdown must not roll this gate back
                 // and admit work into a partially closed generation.
                 Effect.zipRight(Effect.never),
               ),

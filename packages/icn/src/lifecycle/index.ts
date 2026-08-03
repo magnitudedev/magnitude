@@ -10,6 +10,7 @@ import {
   IcnStartupRecord,
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
+import { FSM } from "@magnitudedev/utils";
 import { dirname, join } from "node:path";
 import {
   Context,
@@ -26,6 +27,7 @@ import {
   Schema,
   Scope,
   Stream,
+  SubscriptionRef,
 } from "effect";
 import { installationLoaderEnvironment } from "./installation-environment.js";
 import {
@@ -364,6 +366,52 @@ export interface IcnExit {
   readonly diagnostic: string;
 }
 
+export class IcnProcessStarting extends Schema.TaggedClass<IcnProcessStarting>()(
+  "Starting",
+  {},
+) {}
+
+export class IcnProcessReady extends Schema.TaggedClass<IcnProcessReady>()(
+  "Ready",
+  {},
+) {}
+
+export class IcnProcessStopping extends Schema.TaggedClass<IcnProcessStopping>()(
+  "Stopping",
+  {},
+) {}
+
+export class IcnProcessExited extends Schema.TaggedClass<IcnProcessExited>()(
+  "Exited",
+  {
+    code: Schema.Number,
+    expected: Schema.Boolean,
+  },
+) {}
+
+export const IcnProcessLifecycleFsm = FSM.defineFSM(
+  {
+    Starting: IcnProcessStarting,
+    Ready: IcnProcessReady,
+    Stopping: IcnProcessStopping,
+    Exited: IcnProcessExited,
+  },
+  {
+    Starting: ["Ready", "Stopping", "Exited"],
+    Ready: ["Stopping", "Exited"],
+    Stopping: ["Exited"],
+    Exited: [],
+  } as const,
+)
+
+export const IcnProcessLifecycleState = Schema.Union(
+  IcnProcessStarting,
+  IcnProcessReady,
+  IcnProcessStopping,
+  IcnProcessExited,
+)
+export type IcnProcessLifecycleState = typeof IcnProcessLifecycleState.Type
+
 export interface IcnProcessService {
   readonly pid: number;
   readonly origin: URL;
@@ -372,10 +420,11 @@ export interface IcnProcessService {
   readonly binary: ResolvedIcnBinary;
   readonly startup: IcnStartupRecord;
   readonly diagnosticTail: Effect.Effect<string>;
+  readonly lifecycle: Effect.Effect<IcnProcessLifecycleState>;
+  readonly lifecycleChanges: Stream.Stream<IcnProcessLifecycleState>;
   readonly exit: Effect.Effect<IcnExit, IcnLifecycleError>;
   readonly unexpectedExit: Effect.Effect<never, IcnLifecycleError>;
   readonly shutdown: Effect.Effect<void, IcnLifecycleError>;
-  readonly shutdownResult: Effect.Effect<void, IcnLifecycleError>;
 }
 
 export class IcnProcess extends Context.Tag("@magnitudedev/icn/IcnProcess")<
@@ -511,8 +560,11 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       IcnLifecycleError
     >();
     const exited = yield* Deferred.make<IcnExit, IcnLifecycleError>();
-    const stopping = yield* Ref.make(false);
-    const shutdownResult = yield* Deferred.make<void, IcnLifecycleError>();
+    const lifecycle = yield* SubscriptionRef.make<IcnProcessLifecycleState>(
+      new IcnProcessStarting({}),
+    );
+    const lifecycleLock = yield* Effect.makeSemaphore(1);
+    const shutdownCompletion = yield* Deferred.make<void, IcnLifecycleError>();
 
     yield* process.stdout.pipe(
       Stream.decodeText(),
@@ -587,7 +639,19 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       Effect.flatMap((code) =>
         Ref.get(output).pipe(
           Effect.flatMap((diagnostic) =>
-            Deferred.succeed(exited, { code, diagnostic })
+            lifecycleLock.withPermits(1)(Effect.gen(function* () {
+              const current = yield* SubscriptionRef.get(lifecycle)
+              if (current._tag !== "Exited") {
+                yield* SubscriptionRef.set(
+                  lifecycle,
+                  IcnProcessLifecycleFsm.transition(current, "Exited", {
+                    code,
+                    expected: current._tag === "Stopping",
+                  }),
+                )
+              }
+              yield* Deferred.succeed(exited, { code, diagnostic })
+            })),
           )
         )
       ),
@@ -712,6 +776,35 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       }),
       Effect.catchAll((error) => withDiagnostic(error, output))
     );
+    yield* lifecycleLock.withPermits(1)(
+      Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(lifecycle)
+        if (current._tag === "Exited") {
+          return yield* withDiagnostic(
+            lifecycleError(
+              "readiness",
+              "exited-before-ready",
+              `ICN exited with ${current.code} before readiness completed`,
+            ),
+            output,
+          )
+        }
+        if (current._tag !== "Starting") {
+          return yield* withDiagnostic(
+            lifecycleError(
+              "readiness",
+              "readiness-failed",
+              "ICN stopped while readiness was being committed",
+            ),
+            output,
+          )
+        }
+        yield* SubscriptionRef.set(
+          lifecycle,
+          IcnProcessLifecycleFsm.transition(current, "Ready", {}),
+        )
+      }),
+    );
 
     const performShutdown = Effect.gen(function* () {
       const alreadyExited = yield* Deferred.isDone(exited);
@@ -758,14 +851,33 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         }
       }
     });
-    const shutdown = Effect.gen(function* () {
-      const alreadyStopping = yield* Ref.getAndSet(stopping, true);
-      if (alreadyStopping) return yield* Deferred.await(shutdownResult);
-
-      const result = yield* performShutdown.pipe(Effect.exit);
-      yield* Deferred.done(shutdownResult, result);
-      return yield* Deferred.await(shutdownResult);
-    });
+    const shutdown = Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const shouldStart = yield* lifecycleLock.withPermits(1)(
+          Effect.gen(function* () {
+            const current = yield* SubscriptionRef.get(lifecycle)
+            if (current._tag === "Exited") {
+              yield* Deferred.succeed(shutdownCompletion, undefined)
+              return false
+            }
+            if (current._tag === "Stopping") return false
+            yield* SubscriptionRef.set(
+              lifecycle,
+              IcnProcessLifecycleFsm.transition(current, "Stopping", {}),
+            )
+            return true
+          }),
+        );
+        if (shouldStart) {
+          yield* performShutdown.pipe(
+            Effect.exit,
+            Effect.flatMap((result) => Deferred.done(shutdownCompletion, result)),
+            Effect.forkDaemon,
+          );
+        }
+        return yield* restore(Deferred.await(shutdownCompletion));
+      }),
+    );
     yield* Effect.addFinalizer(() =>
       shutdown.pipe(Effect.ignore)
     );
@@ -782,12 +894,15 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         binary,
         startup,
         diagnosticTail: Ref.get(output),
+        lifecycle: SubscriptionRef.get(lifecycle),
+        lifecycleChanges: lifecycle.changes,
         exit,
         unexpectedExit: exit.pipe(
           Effect.flatMap(({ code }) =>
-            Ref.get(stopping).pipe(
-              Effect.flatMap((expected) =>
-                expected
+            SubscriptionRef.get(lifecycle).pipe(
+              Effect.flatMap((state) =>
+                (state._tag === "Stopping" ||
+                  (state._tag === "Exited" && state.expected))
                   ? Effect.never
                   : Effect.fail(
                       lifecycleError(
@@ -801,7 +916,6 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
           )
         ),
         shutdown,
-        shutdownResult: Deferred.await(shutdownResult),
       }),
     };
   });

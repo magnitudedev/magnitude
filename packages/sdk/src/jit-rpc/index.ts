@@ -1,5 +1,3 @@
-export * from "./daemon-provider"
-export * from "./daemon-resolver"
 export * from "./errors"
 export * from "./recovering-protocol"
 export * from "./recovering-stream-protocol"

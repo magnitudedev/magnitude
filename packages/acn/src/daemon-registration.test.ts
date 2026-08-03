@@ -2,17 +2,21 @@ import { describe, expect, it } from "vitest";
 import * as FileSystem from "@effect/platform/FileSystem";
 import { BunFileSystem } from "@effect/platform-bun";
 import { Effect, Option } from "effect";
-import { AcnOwnerIdSchema } from "@magnitudedev/acn-protocol";
+import {
+  AcnOwnerIdSchema,
+  AcnProcessStartIdentitySchema,
+} from "@magnitudedev/acn-protocol";
 import { mkdtemp } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
-  listRegisteredAcns,
+  listAcnInstances,
   readRegistration,
   readRegistrationOwnership,
   registrationIsOwnedBy,
   registrationPath,
   writeRegistrationAtomic,
+  writeInstanceAtomic,
   type AcnRegistration,
 } from "./daemon-registration";
 
@@ -90,18 +94,17 @@ describe("daemon registration", () => {
     );
   });
 
-  it("lists registered ACNs", async () => {
+  it("lists every published ACN instance", async () => {
     const dir = await mkdtemp(join(tmpdir(), "magnitude-acn-"));
-    await run(
-      writeRegistrationAtomic(registrationPath(dir), registration("owner-1"))
-    );
-    const registrations = await run(listRegisteredAcns(dir));
+    await run(writeInstanceAtomic(dir, {
+      id: AcnOwnerIdSchema.make("owner-1"),
+      version: "1.0.0",
+      url: Option.some("http://127.0.0.1:1234"),
+      pid: 1234,
+      processStartIdentity: AcnProcessStartIdentitySchema.make("process-1"),
+    }));
+    const instances = await run(listAcnInstances(dir));
 
-    expect(registrations.map((entry) => entry.registration.id)).toEqual([
-      "owner-1",
-    ]);
-    expect(registrations.map((entry) => entry.path)).toEqual([
-      registrationPath(dir),
-    ]);
+    expect(instances.map((entry) => entry.record.id)).toEqual(["owner-1"]);
   });
 });

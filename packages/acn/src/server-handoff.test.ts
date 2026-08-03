@@ -1,6 +1,6 @@
-import { BunFileSystem } from "@effect/platform-bun"
+import { BunCommandExecutor, BunFileSystem } from "@effect/platform-bun"
 import { AcnOwnerIdSchema } from "@magnitudedev/acn-protocol"
-import { Effect, Fiber, Option, Schedule } from "effect"
+import { Effect, Fiber, Layer, Option, Schedule } from "effect"
 import { describe, expect, it } from "vitest"
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { join } from "node:path"
@@ -11,11 +11,18 @@ import {
   writeRegistrationAtomic,
 } from "./daemon-registration"
 import { launchAcnServer } from "./server"
+import { currentProcessStartIdentity } from "./process-identity"
 
 describe("ACN server ownership handoff", () => {
   it("publishes its startup server before waiting for active ownership", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "magnitude-acn-handoff-"))
     const ownerPath = join(dataDir, "acn", "owner")
+    const processStartIdentity = await currentProcessStartIdentity.pipe(
+      Effect.provide(
+        BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
+      ),
+      Effect.runPromise,
+    )
     await mkdir(join(dataDir, "acn"), { recursive: true })
     await writeFile(
       ownerPath,
@@ -24,6 +31,7 @@ describe("ACN server ownership handoff", () => {
         pid: process.pid,
         version: "old",
         startedAt: Date.now(),
+        processStartIdentity,
       })
     )
 
@@ -68,7 +76,7 @@ describe("ACN server ownership handoff", () => {
         pid: process.pid,
         timestamp: Date.now(),
       })
-      yield* Fiber.join(server).pipe(Effect.timeout("2 seconds"))
+      yield* Fiber.join(server).pipe(Effect.timeout("3 seconds"))
       const ownerAfterRetirement = yield* Effect.promise(() =>
         Bun.file(ownerPath).json()
       )

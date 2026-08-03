@@ -1,10 +1,22 @@
 import { Schema } from "effect"
 
+const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
+const PositiveSafeInteger = Schema.Number.pipe(
+  Schema.int(),
+  Schema.positive(),
+  Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+)
 export const AcnOwnerIdSchema = Schema.String.pipe(
   Schema.minLength(1),
   Schema.brand("AcnOwnerId")
 )
 export type AcnOwnerId = typeof AcnOwnerIdSchema.Type
+
+export const AcnProcessStartIdentitySchema = Schema.String.pipe(
+  Schema.minLength(1),
+  Schema.brand("AcnProcessStartIdentity"),
+)
+export type AcnProcessStartIdentity = typeof AcnProcessStartIdentitySchema.Type
 
 export const AcnRegistrationSchema = Schema.Struct({
   id: AcnOwnerIdSchema,
@@ -14,6 +26,25 @@ export const AcnRegistrationSchema = Schema.Struct({
   timestamp: Schema.Number,
 })
 export type AcnRegistration = Schema.Schema.Type<typeof AcnRegistrationSchema>
+
+export const AcnEndpointSchema = Schema.Struct({
+  id: AcnOwnerIdSchema,
+  version: NonEmptyString,
+  url: NonEmptyString,
+})
+export type AcnEndpoint = Schema.Schema.Type<typeof AcnEndpointSchema>
+
+export const AcnInstanceRecordSchema = Schema.Struct({
+  id: AcnOwnerIdSchema,
+  version: NonEmptyString,
+  url: Schema.optionalWith(NonEmptyString, {
+    as: "Option",
+    exact: true,
+  }),
+  pid: PositiveSafeInteger,
+  processStartIdentity: AcnProcessStartIdentitySchema,
+})
+export type AcnInstanceRecord = Schema.Schema.Type<typeof AcnInstanceRecordSchema>
 
 /**
  * Stable cross-version projection used only to determine whether an ACN

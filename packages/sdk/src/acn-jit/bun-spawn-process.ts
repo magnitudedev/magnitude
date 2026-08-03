@@ -1,6 +1,6 @@
 import { Effect, Option } from "effect"
 import { DaemonSpawnFailed } from "./errors"
-import type { SpawnProcess } from "./local-daemon-spawner"
+import type { ChildProcessSpawner } from "./local-daemon"
 import { captureSpawnDiagnostics } from "./spawn-diagnostic"
 
 const chunks = (
@@ -27,7 +27,7 @@ const chunks = (
  * While the client remains alive, stdout and stderr are continuously drained
  * into a bounded diagnostic tail for startup failures.
  */
-export const BunDetachedSpawnProcess: SpawnProcess = {
+export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
   spawn: (command) =>
     Effect.try({
       try: () => {

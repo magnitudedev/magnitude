@@ -21,9 +21,8 @@ import {
   IcnPreparationReporter,
 } from "@magnitudedev/icn";
 import { ACN_VERSION } from "../version";
-import { AcnShutdown } from "../acn-shutdown";
 import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
-import { AcnStartupState } from "../startup-state";
+import { AcnServiceLifecycle } from "../service-lifecycle";
 
 const artifactProgress = (
   artifact: "Base" | "Accelerator",
@@ -113,13 +112,13 @@ const makeSupervision = () =>
   Layer.scopedDiscard(
     Effect.gen(function* () {
       const icnProcess = yield* IcnProcess;
-      const shutdown = yield* AcnShutdown;
+      const lifecycle = yield* AcnServiceLifecycle;
       yield* icnProcess.unexpectedExit.pipe(
         Effect.catchAll((error) =>
           Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
             Effect.annotateLogs({ cause: error.message }),
             Effect.zipRight(
-              shutdown.request({ reason: "icn-exited", detail: error.message })
+              lifecycle.beginStopping({ reason: "icn-exited", detail: error.message })
             )
           )
         ),
@@ -132,7 +131,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const preparation = Layer.effect(
     IcnPreparationReporter,
     Effect.gen(function* () {
-      const startup = yield* AcnStartupState;
+      const lifecycle = yield* AcnServiceLifecycle;
       const state = yield* Ref.make<{
         readonly plan: Option.Option<AcnInstallationPlan>;
         readonly installationRequired: boolean;
@@ -145,7 +144,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
           Effect.gen(function* () {
             switch (event._tag) {
               case "Resolving":
-                return yield* startup.starting("Resolving", Option.none());
+                return yield* lifecycle.reportStarting("Resolving", Option.none());
               case "Planned":
                 return yield* Ref.update(state, (current) => ({
                   ...current,
@@ -168,9 +167,12 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                   ...current,
                   installationRequired: true,
                 });
-                return yield* startup.installing(
-                  "DownloadingInferenceEngine",
-                  current.plan.value,
+                return yield* lifecycle.reportStarting(
+                  {
+                    _tag: "Installing",
+                    phase: "DownloadingInferenceEngine",
+                    plan: current.plan.value,
+                  },
                   Option.some(
                     artifactProgress(
                       event.artifact,
@@ -183,21 +185,24 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
               case "Starting": {
                 const current = yield* Ref.get(state);
                 if (!current.installationRequired) {
-                  return yield* startup.starting("Starting", Option.none());
+                  return yield* lifecycle.reportStarting("Starting", Option.none());
                 }
                 if (Option.isNone(current.plan)) {
                   return yield* Effect.dieMessage(
                     "ICN installation started without an installation plan"
                   );
                 }
-                return yield* startup.installing(
-                  "StartingMagnitude",
-                  current.plan.value,
+                return yield* lifecycle.reportStarting(
+                  {
+                    _tag: "Installing",
+                    phase: "StartingMagnitude",
+                    plan: current.plan.value,
+                  },
                   Option.none()
                 );
               }
               case "PreparingBackend":
-                return yield* startup.starting({
+                return yield* lifecycle.reportStarting({
                   _tag: "PreparingBackend",
                   backend: event.backend,
                 }, Option.none());
