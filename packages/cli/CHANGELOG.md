@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.30
+
+### Patch Changes
+
+- [`72dbf86`](https://github.com/magnitudedev/magnitude/commit/72dbf8693d76d0c2083704a2a4dcc187b1920b3a) Thanks [@anerli](https://github.com/anerli)! - daemon fixes
+
 ## 0.0.1-alpha.29
 
 ### Patch Changes
