@@ -15,6 +15,7 @@
       "@magnitudedev/roles": ["./packages/roles/src"],
       "@magnitudedev/roles/constants": ["./packages/roles/src/constants"],
       "@magnitudedev/event-core": ["./packages/event-core/src"],
+      "@magnitudedev/effect-query": ["./packages/effect-query/src"],
 
       "@magnitudedev/ai": ["./packages/ai/src"],
       "@magnitudedev/providers": ["./packages/providers/src"],

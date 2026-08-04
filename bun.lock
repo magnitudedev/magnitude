@@ -233,6 +233,18 @@
         "@types/bun": "latest",
       },
     },
+    "packages/effect-query": {
+      "name": "@magnitudedev/effect-query",
+      "version": "0.0.1",
+      "dependencies": {
+        "@effect-atom/atom": "^0.5.3",
+        "effect": "^3.21.2",
+      },
+      "devDependencies": {
+        "@types/bun": "latest",
+        "vitest": "^3.2.4",
+      },
+    },
     "packages/event-core": {
       "name": "@magnitudedev/event-core",
       "version": "0.0.1",
@@ -836,6 +848,8 @@
     "@magnitudedev/desktop": ["@magnitudedev/desktop@workspace:desktop"],
 
     "@magnitudedev/dom-extract": ["@magnitudedev/dom-extract@workspace:packages/dom-extract"],
+
+    "@magnitudedev/effect-query": ["@magnitudedev/effect-query@workspace:packages/effect-query"],
 
     "@magnitudedev/event-core": ["@magnitudedev/event-core@workspace:packages/event-core"],
 

@@ -4,6 +4,7 @@ applies_to:
   - desktop/**
   - web/**
   - packages/client-common/**
+  - packages/effect-query/**
   - packages/sdk/**
   - packages/acn/**
   - packages/acn-protocol/**
