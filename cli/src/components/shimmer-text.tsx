@@ -1,5 +1,5 @@
 import { TextAttributes } from '@opentui/core'
-import React, { useMemo, useSyncExternalStore } from 'react'
+import React, { useMemo } from 'react'
 
 import { useTheme } from '../hooks/use-theme'
 import {
@@ -8,9 +8,8 @@ import {
   convertRgbToHsl,
   formatRgbToHex,
   parseHexColorToRgb,
-  subscribeAnimationTick,
-  getAnimationTickSnapshot,
 } from '@magnitudedev/client-common'
+import { useAnimationStep } from '../hooks/use-animation-time'
 
 const buildPaletteFromPrimaryColor = (
   primaryColor: string,
@@ -92,12 +91,11 @@ export const ShimmerText = ({
   primaryColor?: string
 }) => {
   const theme = useTheme()
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
+  const animationPhase = useAnimationStep(true, interval)
   const chars = text.split('')
   const numChars = chars.length
 
-  // Derive animation phase from tick store (80ms per tick)
-  const animationPhase = tick % numChars
+  const normalizedAnimationPhase = numChars === 0 ? 0 : animationPhase % numChars
 
   const palette = useMemo(() => {
     if (colors && colors.length > 0) {
@@ -124,7 +122,7 @@ export const ShimmerText = ({
   let currentText = ''
 
   chars.forEach((char, index) => {
-    const phase = (animationPhase - index + numChars) % numChars
+    const phase = (normalizedAnimationPhase - index + numChars) % numChars
     const charColor = generatedColors[phase]
     const charAttr = attributes[phase]
 

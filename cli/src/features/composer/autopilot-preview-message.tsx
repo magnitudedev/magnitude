@@ -1,7 +1,7 @@
-import { memo, useSyncExternalStore } from 'react'
+import { memo } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../../hooks/use-theme'
-import { subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 
 interface AutopilotPreviewMessageProps {
   content: string
@@ -15,8 +15,7 @@ export const AutopilotPreviewMessage = memo(function AutopilotPreviewMessage({
   duration = 3000,
 }: AutopilotPreviewMessageProps) {
   const theme = useTheme()
-  // Use tick for re-renders; compute progress from wall clock
-  useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
+  useAnimationStep(true, 80)
   const now = Date.now()
   const progress = Math.min(1, (now - startTime) / duration)
 

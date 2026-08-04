@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, test, vi } from 'vitest'
 /**
  * Drives the hook as a state machine with mocked React primitives.
  * The hook only uses useRef and useSyncExternalStore; mocking them lets us
- * assert the subscription choice (live tick vs noop) per lifecycle phase,
+ * assert the subscription choice (live clock vs noop) per lifecycle phase,
  * which a server render cannot exercise.
  */
 
@@ -27,18 +27,18 @@ vi.mock('react', async () => {
   }
 })
 
-let tick = 0
+let animationTime = 0
 
 vi.mock('@magnitudedev/client-common', async () => {
   const actual = await vi.importActual<typeof import('@magnitudedev/client-common')>('@magnitudedev/client-common')
   return {
     ...actual,
-    subscribeAnimationTick: () => () => {},
-    getAnimationTickSnapshot: () => tick,
+    subscribeAnimationClock: () => () => {},
+    getAnimationTimeSnapshot: () => animationTime,
   }
 })
 
-import { subscribeAnimationTick, subscribeAnimationNoop } from '@magnitudedev/client-common'
+import { subscribeAnimationClock, subscribeAnimationNoop } from '@magnitudedev/client-common'
 import { useStreamingReveal } from './use-streaming-reveal'
 
 function render(
@@ -51,14 +51,14 @@ function render(
   return useStreamingReveal(content, isStreaming, isInterrupted, initialDisplayedLength)
 }
 
-const isLive = () => chosenSubscribe === subscribeAnimationTick
+const isLive = () => chosenSubscribe === subscribeAnimationClock
 const isNoop = () => chosenSubscribe === subscribeAnimationNoop
 
 beforeEach(() => {
   refs.length = 0
   refIdx = 0
   chosenSubscribe = null
-  tick = 100
+  animationTime = 8_000
 })
 
 describe('useStreamingReveal', () => {
@@ -92,20 +92,20 @@ describe('useStreamingReveal', () => {
     expect(isLive()).toBe(true)
 
     // Ticks advance the reveal while streaming
-    tick++
+    animationTime += 80
     let state = render(content, true)
     expect(state.displayedContent.length).toBeGreaterThan(0)
     expect(state.displayedContent.length).toBeLessThan(content.length)
     expect(isLive()).toBe(true)
 
     // Stream ends mid-reveal — linear drain keeps the subscription
-    tick++
+    animationTime += 80
     state = render(content, false)
     expect(isLive()).toBe(true)
 
     // Drain to completion
     for (let i = 0; i < 20 && state.isCatchingUp; i++) {
-      tick++
+      animationTime += 80
       state = render(content, false)
     }
     expect(state.displayedContent).toBe(content)
@@ -128,7 +128,7 @@ describe('useStreamingReveal', () => {
     state = render(grown, false)
     expect(isLive()).toBe(true)
     for (let i = 0; i < 20 && state.isCatchingUp; i++) {
-      tick++
+      animationTime += 80
       state = render(grown, false)
     }
     expect(state.displayedContent).toBe(grown)
@@ -138,7 +138,7 @@ describe('useStreamingReveal', () => {
 
   test('interrupt snaps to full content without subscribing', () => {
     render('', true)
-    tick++
+    animationTime += 80
     const state = render('interrupted content', true, true)
     expect(state.displayedContent).toBe('interrupted content')
     expect(isNoop()).toBe(true)

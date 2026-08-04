@@ -19,7 +19,7 @@ import type {
 } from "@magnitudedev/sdk"
 import { ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
-import { spinnerFrameForTick, useSpinnerFrame } from "../../hooks/use-spinner-frame"
+import { spinnerFrameAt, useSpinnerFrame } from "../../hooks/use-spinner-frame"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
@@ -166,7 +166,7 @@ const OnboardingSetupCard = ({
   cardWidth,
   title,
   hardware,
-  spinnerFrame = spinnerFrameForTick(0),
+  spinnerFrame = spinnerFrameAt(0),
   children,
 }: {
   readonly cardWidth: number

@@ -15,8 +15,8 @@ vi.mock('@magnitudedev/client-common', async () => {
   )
   return {
     ...actual,
-    subscribeAnimationTick: () => () => {},
-    getAnimationTickSnapshot: () => 0,
+    subscribeAnimationClock: () => () => {},
+    getAnimationTimeSnapshot: () => 0,
   }
 })
 

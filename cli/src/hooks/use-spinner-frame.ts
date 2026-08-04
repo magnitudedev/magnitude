@@ -1,10 +1,16 @@
-import { useAnimationTick } from "./use-animation-tick"
+import { animationStep } from '@magnitudedev/client-common'
+import { useAnimationStep } from './use-animation-time'
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const
 
-export const spinnerFrameForTick = (tick: number): string =>
-  SPINNER_FRAMES[tick % SPINNER_FRAMES.length]!
+const SPINNER_FRAME_MS = 80
+
+export const spinnerFrameAt = (timeMs: number): string =>
+  SPINNER_FRAMES[animationStep(timeMs, SPINNER_FRAME_MS) % SPINNER_FRAMES.length]!
+
+export const spinnerFrameForStep = (step: number): string =>
+  SPINNER_FRAMES[step % SPINNER_FRAMES.length]!
 
 export function useSpinnerFrame(active = true): string {
-  return spinnerFrameForTick(useAnimationTick(active))
+  return spinnerFrameForStep(useAnimationStep(active, SPINNER_FRAME_MS))
 }

@@ -1,5 +1,8 @@
-import { memo, useCallback, useMemo, useState, useSyncExternalStore } from 'react'
-import { subscribeAnimationTick, getAnimationTickSnapshot, useAgentClient, useSettingsState } from '@magnitudedev/client-common'
+import { memo, useCallback, useMemo, useState } from 'react'
+import {
+  useAgentClient,
+  useSettingsState,
+} from '@magnitudedev/client-common'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
@@ -8,6 +11,7 @@ import type { CloudUsageResponse, UsagePeriod } from '@magnitudedev/sdk'
 import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
 import { authSourceAtom } from '../../state/cli-atoms'
 import { hasCloudUsageAuth } from './usage-auth'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 
 interface UsageOverlayProps {
   isVisible: boolean
@@ -201,9 +205,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   const error = Result.isFailure(result) ? 'Failed to load usage data' : null
   const data = Result.isSuccess(result) ? result.value.data : null
 
-  // Loading dots animation via tick store (400ms ≈ 5 ticks per step)
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  const loadingTick = isVisible && cloudConfigured && data === null ? tick : 0
+  const loadingStep = useAnimationStep(isVisible && cloudConfigured && data === null, 400)
 
   const periodIndex = PERIODS.findIndex(p => p.id === period)
 
@@ -254,7 +256,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
         )}
         {cloudConfigured && !error && !data && (
           <text style={{ fg: theme.muted }}>
-            <span attributes={TextAttributes.DIM}>Loading{'.'.repeat((loadingTick % 3) + 1)}</span>
+            <span attributes={TextAttributes.DIM}>Loading{'.'.repeat((loadingStep % 3) + 1)}</span>
           </text>
         )}
         {cloudConfigured && !error && data && (

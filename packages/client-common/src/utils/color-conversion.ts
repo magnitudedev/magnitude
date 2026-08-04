@@ -92,3 +92,19 @@ export const formatRgbToHex = (r: number, g: number, b: number): string => {
       .padStart(2, '0')
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`
 }
+
+export const interpolateHexColor = (
+  from: string,
+  to: string,
+  amount: number,
+): string => {
+  const fromRgb = parseHexColorToRgb(from)
+  const toRgb = parseHexColorToRgb(to)
+  if (fromRgb === null || toRgb === null) return amount < 0.5 ? from : to
+  const t = clampRange(amount, 0, 1)
+  return formatRgbToHex(
+    fromRgb.r + (toRgb.r - fromRgb.r) * t,
+    fromRgb.g + (toRgb.g - fromRgb.g) * t,
+    fromRgb.b + (toRgb.b - fromRgb.b) * t,
+  )
+}

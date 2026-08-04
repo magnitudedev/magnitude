@@ -1,10 +1,10 @@
-import { memo, useState, useCallback, useMemo, useRef, useSyncExternalStore } from 'react'
+import { memo, useState, useCallback, useMemo, useRef } from 'react'
 import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { AtomRef } from '@effect-atom/atom-react'
 import { Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
-import { subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 
 import { Button } from '../../components/button'
 import { RecentChatEntry } from './recent-chat-entry'
@@ -42,12 +42,12 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
   const scrolledSinceLoad = useRef(false)
   const lastScrollTop = useRef(0)
 
-  // Infinite scroll: use animation tick for polling (150ms ≈ 2 ticks).
+  // Infinite scroll: sample the shared animation clock every 160ms.
   // This is event-source-driven polling, not a reaction to state.
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  const lastPollTickRef = useRef(0)
-  if (hasMore && tick !== lastPollTickRef.current && tick % 2 === 0) {
-    lastPollTickRef.current = tick
+  const pollStep = useAnimationStep(hasMore, 160)
+  const lastPollStepRef = useRef(pollStep)
+  if (hasMore && pollStep !== lastPollStepRef.current) {
+    lastPollStepRef.current = pollStep
     if (!isLoading) {
       const result = Option.match(scrollboxAtomRef.value, {
         onNone: () => false,

@@ -4,6 +4,8 @@ import { TextAttributes } from '@opentui/core'
 import type { DisplayRootStatus, InterruptedMessage, ModelInstanceId } from '@magnitudedev/sdk'
 import {
   displayRootStatusElapsedMs,
+  animationPulse,
+  interpolateHexColor,
   modelReleaseReasonLabel,
   rootDetailSegments,
   slate,
@@ -12,14 +14,11 @@ import {
 } from '@magnitudedev/client-common'
 import { useTheme } from '../../hooks/use-theme'
 import { red } from '../../utils/theme'
-import { spinnerFrameForTick } from '../../hooks/use-spinner-frame'
-import { useAnimationTick } from '../../hooks/use-animation-tick'
+import { spinnerFrameForStep } from '../../hooks/use-spinner-frame'
+import { useAnimationStep, useAnimationTime } from '../../hooks/use-animation-time'
 import { Button } from '../../components/button'
 
-const ACTIVE_PULSE_COLORS = [
-  slate[100], slate[200], slate[300], slate[400], slate[500],
-  slate[400], slate[300], slate[200],
-] as const
+const ACTIVE_PULSE_DURATION_MS = 1_200
 
 const LOW_MEMORY_MODEL_STOPPED_MESSAGE =
   'Model stopped · Low memory - close memory-intensive apps and try again'
@@ -52,9 +51,15 @@ export const ActivityRail = memo(function ActivityRail({
     : Option.getOrThrow(modelLoadActivity.instance).lifecycle
   const active = status?._tag === 'Working'
   const stabilizedDetail = useStabilizedRootDetail(status)
-  const modelAnimated = modelLifecycle?._tag === 'Loading' || modelLifecycle?._tag === 'Stopping'
-  const tick = useAnimationTick(modelAnimated || active)
-  const pulseColor = ACTIVE_PULSE_COLORS[Math.floor(tick / 4) % ACTIVE_PULSE_COLORS.length]
+  const pulseAnimated = modelLifecycle?._tag === 'Stopping'
+    || (active && modelLifecycle?._tag !== 'Loading')
+  const animationTime = useAnimationTime(pulseAnimated)
+  const loadingSpinnerStep = useAnimationStep(modelLifecycle?._tag === 'Loading', 80)
+  const pulseColor = interpolateHexColor(
+    slate[500],
+    slate[200],
+    animationPulse(animationTime, ACTIVE_PULSE_DURATION_MS),
+  )
 
   if (modelLoadActivity !== null && modelLifecycle !== null) {
     const instance = Option.getOrThrow(modelLoadActivity.instance)
@@ -90,7 +95,7 @@ export const ActivityRail = memo(function ActivityRail({
       return (
         <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
           <text>
-            <span style={{ fg: theme.primary }}>{spinnerFrameForTick(tick)}</span>
+            <span style={{ fg: theme.primary }}>{spinnerFrameForStep(loadingSpinnerStep)}</span>
             {' '}
             <span style={{ fg: theme.foreground }}>Loading model</span>
             <span style={{ fg: theme.muted }}>{` · ${percentage}%`}</span>
