@@ -518,9 +518,13 @@ For every domain:
 
 ## Related domain contracts
 
-- [Operation ownership](../acn/operation-ownership.md)
+- [Operation ownership](./operation-ownership.md)
 - [Mirrored state](../misc/mirrored-state.md)
-- [Shared ACN startup and upgrades](../acn/jit-daemon-coordination.md)
-- [ACN and session lifetime](../acn/activity-and-session-residency.md)
+- [JIT ACN spawning](../acn/lifecycle/jit-spawning.md)
+- [ACN client lifecycle](../acn/lifecycle/client-lifecycle.md)
+- [ACN service lifecycle](../acn/lifecycle/service-lifecycle.md)
+- [Session runtime lifecycle](../acn/lifecycle/session-runtime.md)
+- [ACN subscriptions](../acn/subscriptions.md)
+- [Root work activity](../agent/work-activity.md)
 - [ICN process lifecycle](../icn/lifecycle.md)
 - [Canonical model slots and instances](../icn/model-instance-lifecycle.md)

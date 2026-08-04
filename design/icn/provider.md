@@ -51,6 +51,10 @@ catalog failures. Such a snapshot is `Degraded`, including when every successful
 an empty model list; an empty result does not turn a partial provider failure into aggregate
 unavailability.
 
+Catalog refresh is catalog-owned shared work. Equivalent callers join one refresh; conflicting
+targeted refreshes serialize. Every Effect `Exit` publishes a terminal Ready, Degraded, or
+Unavailable snapshot before releasing ownership, so caller loss cannot strand `Refreshing`.
+
 The target ID groups every serving configuration of the same standalone package or speculative
 pair into one product model. Provider model IDs continue to distinguish configurations.
 
