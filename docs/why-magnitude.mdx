@@ -1,19 +1,27 @@
 ---
 title: Why Magnitude
-description: "The easiest way to code with local models"
+description: "The best way to code with open models"
 icon: compass
 ---
 
-Magnitude is an open source coding agent and inference engine built for local models. It handles the difficult parts of choosing, configuring, and running them so you can focus on your code.
+Install Magnitude, choose a model recommended for your machine, and start coding.
 
-- **Automatic model setup.** Magnitude detects and profiles your hardware, recommends configurations that fit, and handles downloading and setup.
+## Local model coding without the setup
 
-- **Local inference built for coding agents.** Magnitude starts and manages its Rust inference engine for you, so there is no model server or set of llama.cpp options to configure.
+Local coding normally means finding a model, choosing a quantization, installing a runtime, tuning it for your hardware, connecting it to an agent, and keeping the stack working.
 
-- **Consistent behavior across models.** It normalizes reasoning, tool use, chat templates, and conversation history so different local models work consistently with the coding agent.
+Magnitude handles that setup for you. It profiles your hardware, recommends model configurations that fit, then downloads, configures, and runs the model you choose. There is no separate model server or set of runtime options to configure.
 
-- **A complete coding agent.** Magnitude can inspect and edit your codebase, run commands, work with files and images, manage long conversations, and delegate work to other agents.
+## Switch models without rebuilding your setup
 
-- **Local by default, cloud when you need it.** Run local models for free, add Magnitude Cloud for larger open models with zero data retention.
+Local models use different reasoning formats, tool-call formats, chat templates, and conversation-history conventions. Magnitude handles those differences automatically, so switching models does not require reconfiguring the agent or connecting a different runtime.
 
-- **Open source.** Magnitude is available under the [Apache 2.0 license](https://github.com/magnitudedev/magnitude/blob/main/LICENSE).
+Local and cloud models appear together in the same model menu and use the same conversation interface. Run models entirely on your machine, or switch to Magnitude Cloud when you need a model too large for your hardware.
+
+## A complete coding agent
+
+Magnitude can inspect and edit your codebase, run commands, work with files and images, manage long conversations, and delegate work to other agents.
+
+## Open source
+
+Magnitude is available under the [Apache 2.0 license](https://github.com/magnitudedev/magnitude/blob/main/LICENSE).

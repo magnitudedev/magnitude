@@ -29,7 +29,7 @@ export function StartupHeader({
   const details = (
     <box style={{ flexDirection: 'column', minWidth: 0, flexShrink: 1 }}>
       <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Magnitude</text>
-      <text style={{ fg: theme.muted }}>The easiest way to code with local models</text>
+      <text style={{ fg: theme.muted }}>The best way to code with local models</text>
       <box style={{ height: 1, flexShrink: 0 }} />
       <text wrapMode="none">
         <span style={{ fg: theme.muted }}>Current directory: </span>
