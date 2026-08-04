@@ -1,10 +1,10 @@
 ---
-title: Inference Engine
+title: Local Inference
 description: "How Magnitude configures and manages local inference"
 icon: cpu
 ---
 
-Magnitude runs local models on an inference engine built in Rust on top of llama.cpp. You do not need to start a model server or configure llama.cpp yourself.
+Magnitude includes and manages everything required to run local models. You do not need to install a separate model server or configure a runtime yourself.
 
 ## Managed automatically
 
@@ -38,3 +38,7 @@ The model remains selected after a low-memory stop. Close memory-intensive appli
 ## Consistent behavior across models
 
 Local models use different reasoning formats, tool-call formats, chat templates, and conversation-history conventions. Magnitude normalizes those differences into one interface for the coding agent, so switching models does not require reconfiguring the rest of the system.
+
+## Implementation
+
+Magnitude's local inference runtime is written in Rust on top of llama.cpp. It is packaged with Magnitude and managed as part of the application rather than installed, configured, or started as a separate model server.
