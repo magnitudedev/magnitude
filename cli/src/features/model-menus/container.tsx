@@ -760,7 +760,8 @@ const qualityLabel = ({ fidelityRank }: LocalModelCatalogCandidate): string =>
   fidelityRank >= 75 ? "Near original" : fidelityRank >= 55 ? "Very high" : fidelityRank >= 45 ? "High" : "Reduced"
 
 const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
-  if (candidate.download._tag === "NotDownloaded") return "Available"
+  if (candidate.download._tag === "NotDownloaded"
+    || candidate.download._tag === "Cancelled") return "Available"
   if (candidate.download._tag === "Downloading") {
     return `Downloading ${Math.round(candidate.download.completedBytes / Math.max(1, candidate.download.totalBytes) * 100)}%`
   }
@@ -851,7 +852,9 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "cancel") {
-      modelActions.cancel(detail.targetId)
+      if (detail.download._tag === "Downloading") {
+        modelActions.cancel(detail.download.attemptIds)
+      }
       return
     }
     if (action === "select") {
@@ -916,7 +919,7 @@ const CatalogMenu = memo(function CatalogMenu({
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
       if (cursor.download._tag === "Downloading") {
-        modelActions.cancel(cursor.targetId)
+        modelActions.cancel(cursor.download.attemptIds)
         key.preventDefault()
       } else if (cursor.download._tag === "Downloaded") {
         setPendingDeleteId(cursor.id)

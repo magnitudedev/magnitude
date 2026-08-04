@@ -2,6 +2,7 @@ import {
   Context,
   Deferred,
   Effect,
+  Exit,
   Layer,
   Option,
   Ref,
@@ -34,6 +35,7 @@ import {
   type MirroredSnapshot,
   type ModelFailure,
   type ModelInstanceId,
+  type ModelLoadAdmission,
   type ModelLoadResult,
   type ModelLoadPlan,
   type ModelSlot,
@@ -98,6 +100,9 @@ export interface ModelSlotControllerApi {
     favorite: boolean,
   ) => Effect.Effect<void, ModelPreferenceMutationFailed>
   readonly loadModel: (slotId: SlotId) => Effect.Effect<ModelLoadResult, LocalInferenceError>
+  readonly admitModelLoad: (
+    slotId: SlotId,
+  ) => Effect.Effect<ModelLoadAdmission, LocalInferenceError>
   readonly previewModelLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopModel: (instanceId: ModelInstanceId) => Effect.Effect<void, LocalInferenceError>
 }
@@ -132,6 +137,7 @@ interface ModelLoadCommand {
   readonly configuration: LocalProviderOffering["configuration"]
   readonly instanceId: ModelInstanceId
   readonly result: Deferred.Deferred<ModelLoadResult, LocalInferenceError>
+  readonly admission: Deferred.Deferred<void, LocalInferenceError>
 }
 
 type ModelLoadClaim =
@@ -695,6 +701,9 @@ export const ModelSlotControllerLive: Layer.Layer<
         Effect.annotateLogs({ instanceId: command.instanceId, error: String(error) }),
       )),
     ), scope)
+    yield* observedInstances.refresh.pipe(
+      Effect.mapError((error) => failure("refresh_model_instances_failed", error)),
+    )
     const remainsCurrent = yield* commandLock.withPermits(1)(
       commandIsCurrent(command),
     )
@@ -706,14 +715,26 @@ export const ModelSlotControllerLive: Layer.Layer<
       )
       return yield* reject(command.requestedBy, "The selected local model changed while loading")
     }
+    const published = yield* rebuild
+    const publishedSlot = published.snapshot.state.slots[slotKey(command.requestedBy)]
+    if (publishedSlot._tag !== "ConfiguredLocal"
+      || !Option.exists(publishedSlot.instance, ({ id }) => id === command.instanceId)) {
+      return yield* failure(
+        "model_load_admission_not_published",
+        "The admitted model instance was not published to its slot",
+        false,
+      )
+    }
+    yield* Deferred.succeed(command.admission, undefined)
     const result = yield* awaitReadyInstance(command.instanceId)
     yield* rebuild
     return result
   })
 
-  const loadModel: ModelSlotControllerApi["loadModel"] = (slotId) => Effect.gen(function* () {
+  const admitModelLoad: ModelSlotControllerApi["admitModelLoad"] = (slotId) => Effect.gen(function* () {
     yield* rebuild
     const candidateResult = yield* Deferred.make<ModelLoadResult, LocalInferenceError>()
+    const candidateAdmission = yield* Deferred.make<void, LocalInferenceError>()
     const claim: ModelLoadClaim = yield* commandLock.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(aggregate)
       const key = slotKey(slotId)
@@ -750,6 +771,7 @@ export const ModelSlotControllerLive: Layer.Layer<
         configuration: loadTarget.value.configuration,
         instanceId: ModelInstanceIdSchema.make(crypto.randomUUID()),
         result: candidateResult,
+        admission: candidateAdmission,
       }
       const currentCommands = yield* Ref.get(loadCommands)
       const existing = currentCommands.get(candidate.configuration.id)
@@ -778,16 +800,21 @@ export const ModelSlotControllerLive: Layer.Layer<
       )
       return { _tag: "Owner" as const, command: candidate }
     }))
-    if (claim._tag === "Complete") return claim.result
+    if (claim._tag === "Complete") {
+      return {
+        instanceId: claim.result.instanceId,
+      }
+    }
     if (claim._tag === "Observe") {
-      const result = yield* awaitReadyInstance(claim.instanceId)
-      yield* rebuild
-      return result
+      return {
+        instanceId: claim.instanceId,
+      }
     }
     yield* rebuild
     if (claim._tag === "Owner") {
       yield* Effect.forkIn(Effect.gen(function* () {
         const result = yield* Effect.exit(runLoadCommand(claim.command))
+        yield* Deferred.done(claim.command.admission, Exit.asVoid(result))
         yield* Deferred.done(claim.command.result, result)
         yield* commandLock.withPermits(1)(
           Ref.update(loadCommands, (current) => {
@@ -800,7 +827,27 @@ export const ModelSlotControllerLive: Layer.Layer<
         )
       }), scope)
     }
-    return yield* Deferred.await(claim.command.result)
+    yield* Deferred.await(claim.command.admission)
+    const current = yield* SubscriptionRef.get(aggregate)
+    const admittedSlot = current.snapshot.state.slots[slotKey(slotId)]
+    if (admittedSlot._tag !== "ConfiguredLocal"
+      || !Option.exists(admittedSlot.instance, ({ id }) => id === claim.command.instanceId)) {
+      return yield* failure(
+        "model_load_admission_not_published",
+        "The admitted model instance was not published to its slot",
+        false,
+      )
+    }
+    return {
+      instanceId: claim.command.instanceId,
+    }
+  })
+
+  const loadModel: ModelSlotControllerApi["loadModel"] = (slotId) => Effect.gen(function* () {
+    const admission = yield* admitModelLoad(slotId)
+    const result = yield* awaitReadyInstance(admission.instanceId)
+    yield* rebuild
+    return result
   })
 
   const previewModelLoad: ModelSlotControllerApi["previewModelLoad"] = (slotId) =>
@@ -1015,6 +1062,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       ensureLocalModelReady(slotId, providerModelId),
     updateModelSlot,
     setModelFavorite,
+    admitModelLoad,
     loadModel,
     previewModelLoad,
     stopModel,

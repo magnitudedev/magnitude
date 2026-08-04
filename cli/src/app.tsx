@@ -471,7 +471,7 @@ function CliAppContent(
               error={
                 setupView.phase === "Ready"
                   ? completionMutationError
-                  : assignmentMutationError ?? loadMutationError
+                  : cancelDownloadError ?? assignmentMutationError ?? loadMutationError
               }
               operation={{
                 _tag: "Activating",

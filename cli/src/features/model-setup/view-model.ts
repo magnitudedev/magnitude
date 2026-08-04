@@ -75,6 +75,7 @@ export const deriveOnboardingModelSetupView = ({
   if (candidate?.download._tag === "Failed") {
     return { _tag: "DownloadFailed", candidate }
   }
+  if (candidate?.download._tag === "Cancelled") return { _tag: "Choosing" }
   if (candidate?.download._tag === "Downloading") {
     return { _tag: "Downloading", candidate }
   }

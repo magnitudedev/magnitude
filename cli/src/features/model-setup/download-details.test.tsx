@@ -3,6 +3,7 @@ import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
+import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
 import { makeCatalogCandidate, GIB } from "../local-inference/test-fixtures"
 
 const keyboard = vi.hoisted(() => ({
@@ -34,6 +35,7 @@ const candidate = makeCatalogCandidate({
   downloadBytes: 30 * GIB,
   download: {
     _tag: "Downloading",
+    attemptIds: [DownloadAttemptIdSchema.make("download_qwen")],
     stage: "downloading",
     completedBytes: 19 * GIB,
     totalBytes: 30 * GIB,
@@ -130,6 +132,7 @@ test("shows failed-download actions in the details pane", async () => {
     downloadBytes: 30 * GIB,
     download: {
       _tag: "Failed",
+      attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
       completedBytes: 19 * GIB,
       totalBytes: 30 * GIB,
       failure: {

@@ -5,6 +5,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   CatalogCandidateIdSchema,
+  DownloadAttemptIdSchema,
   ModelOfferingTargetIdSchema,
   ProviderModelIdSchema,
   RecommendationIdSchema,
@@ -328,6 +329,7 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
     displayName: "Remote Model",
     download: {
       _tag: "Downloading",
+      attemptIds: [DownloadAttemptIdSchema.make("download_remote")],
       stage: "downloading",
       completedBytes: 8 * GIB,
       totalBytes: 16 * GIB,
@@ -393,6 +395,7 @@ test("keeps the chosen row highlighted and locks navigation while download detai
     downloadBytes: 16 * GIB,
     download: {
       _tag: "Downloading",
+      attemptIds: [DownloadAttemptIdSchema.make("download_remote")],
       stage: "downloading",
       completedBytes: 8 * GIB,
       totalBytes: 16 * GIB,
@@ -574,6 +577,7 @@ test("excludes unrelated failed downloads and unusable installed models", async 
           displayName: "Unrelated Failed Download",
           download: {
             _tag: "Failed" as const,
+            attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
             completedBytes: 4 * GIB,
             totalBytes: 16 * GIB,
             failure: {

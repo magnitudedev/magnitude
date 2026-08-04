@@ -267,6 +267,9 @@ export const ModelPackageLocalStateSchema = Schema.Union(
     totalBytes: NonNegativeSafeInteger,
     failure: ModelFailureSchema,
   }),
+  Schema.TaggedStruct("DownloadCancelled", {
+    attemptId: DownloadAttemptIdSchema,
+  }),
   Schema.TaggedStruct("Installed", { path: NonEmptyString }),
 )
 export type ModelPackageLocalState = typeof ModelPackageLocalStateSchema.Type
@@ -410,21 +413,33 @@ export const LocalModelDownloadSchema = Schema.Union(
     totalBytes: NonNegativeSafeInteger,
   }),
   Schema.TaggedStruct("Downloading", {
+    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
     stage: ModelDownloadStageSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
     bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Failed", {
+    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
     failure: ModelFailureSchema,
+  }),
+  Schema.TaggedStruct("Cancelled", {
+    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
   }),
   Schema.TaggedStruct("Downloaded", {
     installedBytes: NonNegativeSafeInteger,
   }),
 )
 export type LocalModelDownload = typeof LocalModelDownloadSchema.Type
+
+export const ModelDownloadAdmissionSchema = Schema.Struct({
+  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+})
+export type ModelDownloadAdmission = typeof ModelDownloadAdmissionSchema.Type
 
 export const LocalModelPreparationSchema = Schema.Union(
   Schema.TaggedStruct("NotDownloaded", {}),
@@ -795,6 +810,11 @@ export const ModelLoadResultSchema = Schema.Union(
   }),
 )
 export type ModelLoadResult = typeof ModelLoadResultSchema.Type
+
+export const ModelLoadAdmissionSchema = Schema.Struct({
+  instanceId: ModelInstanceIdSchema,
+})
+export type ModelLoadAdmission = typeof ModelLoadAdmissionSchema.Type
 
 export const ModelSlotActionSchema = Schema.Literal("Load", "Stop", "RetryLoad")
 export type ModelSlotAction = typeof ModelSlotActionSchema.Type

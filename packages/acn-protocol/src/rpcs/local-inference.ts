@@ -2,10 +2,12 @@ import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
 import {
+  DownloadAttemptIdSchema,
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
+  ModelDownloadAdmissionSchema,
   ModelInstanceIdSchema,
-  ModelLoadResultSchema,
+  ModelLoadAdmissionSchema,
   ModelLoadPlanSchema,
   ModelOfferingTargetIdSchema,
   SlotIdSchema,
@@ -24,12 +26,14 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
 
 export const DownloadModel = Rpc.make("DownloadModel", {
   payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
-  success: Schema.Struct({}),
+  success: ModelDownloadAdmissionSchema,
   error: LocalInferenceError,
 })
 
 export const CancelModelDownload = Rpc.make("CancelModelDownload", {
-  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
+  payload: Schema.Struct({
+    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
@@ -48,7 +52,7 @@ export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
 
 export const LoadModel = Rpc.make("LoadModel", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
-  success: ModelLoadResultSchema,
+  success: ModelLoadAdmissionSchema,
   error: LocalInferenceError,
 })
 

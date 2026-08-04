@@ -390,26 +390,33 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
                 retryable: false,
               })
             }
-            yield* localModelPackages.acquireTarget(target)
-            return {}
+            const attemptIds = yield* localModelPackages.admitTarget(target)
+            const snapshot = yield* localModels.refresh
+            const admitted = new Set(attemptIds)
+            const published = snapshot.state.models.find((model) => model.targetId === targetId)
+            const admissionIsPublished = published?.download._tag === "Downloaded"
+              || (published?.download._tag === "Downloading"
+                && published.download.attemptIds.every((attemptId) => admitted.has(attemptId)))
+              || ((published?.download._tag === "Failed"
+                || published?.download._tag === "Cancelled")
+                && published.download.attemptIds.some((attemptId) => admitted.has(attemptId)))
+            if (!admissionIsPublished) {
+              return yield* new LocalModelMutationFailed({
+                code: "model_download_admission_not_published",
+                message: "The admitted model download was not published to local-model state",
+                retryable: true,
+              })
+            }
+            return {
+              attemptIds,
+            }
           }),
         ),
 
-      CancelModelDownload: ({ targetId }) =>
+      CancelModelDownload: ({ attemptIds }) =>
         observeRpcDefects(
           "CancelModelDownload",
-          Effect.gen(function* () {
-            const target = yield* localModels.target(targetId)
-            if (!target) {
-              return yield* new LocalModelMutationFailed({
-                code: "local_model_not_found",
-                message: `Local model ${targetId} was not found`,
-                retryable: false,
-              })
-            }
-            yield* localModelPackages.cancelTargetDownload(target)
-            return {}
-          }),
+          localModelPackages.cancelAttempts(attemptIds).pipe(Effect.as({})),
         ),
 
       DismissModelDownloadFailure: ({ targetId }) =>
@@ -438,7 +445,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       LoadModel: ({ slotId }) =>
         observeRpcDefects(
           "LoadModel",
-          modelSlots.loadModel(slotId),
+          modelSlots.admitModelLoad(slotId),
         ),
 
       PreviewModelLoad: ({ slotId }) =>

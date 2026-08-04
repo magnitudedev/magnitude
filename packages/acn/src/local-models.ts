@@ -84,6 +84,10 @@ const aggregateDownload = (
       Option.toArray(bytesPerSecond))
     return {
       _tag: "Downloading",
+      attemptIds: downloading.map(({ attemptId }) => attemptId) as [
+        typeof downloading[number]["attemptId"],
+        ...Array<typeof downloading[number]["attemptId"]>,
+      ],
       stage,
       completedBytes,
       totalBytes,
@@ -94,6 +98,8 @@ const aggregateDownload = (
   }
   const failed = packageEntries.flatMap((entry) =>
     entry?.localState._tag === "DownloadFailed" ? [entry.localState] : [])[0]
+  const failedAttemptIds = packageEntries.flatMap((entry) =>
+    entry?.localState._tag === "DownloadFailed" ? [entry.localState.attemptId] : [])
   const failedBytes = installedBytes + packages.reduce((total, modelPackage, index) => {
     const entry = packageEntries[index]
     if (!entry
@@ -101,8 +107,33 @@ const aggregateDownload = (
     return total + entry.localState.completedBytes
   }, 0)
   return failed
-    ? { _tag: "Failed", completedBytes: failedBytes, totalBytes, failure: failed.failure }
-    : { _tag: "NotDownloaded", completedBytes, totalBytes }
+    ? {
+        _tag: "Failed",
+        attemptIds: failedAttemptIds as [
+          typeof failedAttemptIds[number],
+          ...Array<typeof failedAttemptIds[number]>,
+        ],
+        completedBytes: failedBytes,
+        totalBytes,
+        failure: failed.failure,
+      }
+    : (() => {
+        const cancelledAttemptIds = packageEntries.flatMap((entry) =>
+          entry?.localState._tag === "DownloadCancelled"
+            ? [entry.localState.attemptId]
+            : [])
+        return cancelledAttemptIds.length > 0
+          ? {
+              _tag: "Cancelled" as const,
+              attemptIds: cancelledAttemptIds as [
+                typeof cancelledAttemptIds[number],
+                ...Array<typeof cancelledAttemptIds[number]>,
+              ],
+              completedBytes,
+              totalBytes,
+            }
+          : { _tag: "NotDownloaded" as const, completedBytes, totalBytes }
+      })()
 }
 
 export const preparationFromReconciliationFailure = (
@@ -193,6 +224,7 @@ export interface LocalModelsApi {
   readonly target: (
     targetId: ModelOfferingTargetId,
   ) => Effect.Effect<ModelOfferingTarget | undefined, LocalInferenceError>
+  readonly refresh: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
@@ -427,6 +459,7 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
+    refresh: project.pipe(Effect.zipRight(mirror.get)),
     target: (targetId) => Effect.gen(function* () {
       const recommendationState = (yield* recommendations.snapshot).state
       const recommendation = recommendationState._tag === "Ready"
