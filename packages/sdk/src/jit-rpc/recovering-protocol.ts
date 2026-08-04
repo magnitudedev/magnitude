@@ -41,8 +41,6 @@ export interface RecoveringProtocolOptions<InfraError> {
   readonly streamProtocol: RecoveringStreamProtocol
   readonly isEndpointRetirementExit?: (exit: ResponseExitEncoded["exit"]) => boolean
   readonly classifyInfraError: (error: InfraError) => RpcClientError.RpcClientError
-  /** Bound for establishing an RPC response with the selected process. */
-  readonly responseStartTimeoutMs?: number
 }
 
 export const makeRecoveringProtocol = <InfraError>(
@@ -96,9 +94,6 @@ export const makeRecoveringProtocol = <InfraError>(
                     body,
                   })
                   .pipe(
-                    Effect.timeout(
-                      `${options.responseStartTimeoutMs ?? 2_000} millis`,
-                    ),
                     Effect.mapError(
                       () =>
                         new TransportRequestFailed({
