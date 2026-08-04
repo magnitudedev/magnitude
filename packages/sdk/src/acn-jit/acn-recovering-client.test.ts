@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
+import { Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { Rpc, RpcClient } from "@effect/rpc"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientError from "@effect/platform/HttpClientError"
@@ -38,7 +38,11 @@ const extractRequestId = (request: HttpClientRequest.HttpClientRequest): string 
 
 type Attempt =
   | { readonly kind: "refuse" }
-  | { readonly kind: "lines"; readonly make: (requestId: string) => ReadonlyArray<unknown> }
+  | {
+      readonly kind: "lines"
+      readonly delay?: `${number} millis`
+      readonly make: (requestId: string) => ReadonlyArray<unknown>
+    }
 
 const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
   let calls = 0
@@ -55,7 +59,8 @@ const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
       }
       const requestId = extractRequestId(request)
       const body = `${attempt.make(requestId).map((line) => JSON.stringify(line)).join("\n")}\n`
-      return Effect.succeed(HttpClientResponse.fromWeb(request, new Response(body)))
+      const response = Effect.succeed(HttpClientResponse.fromWeb(request, new Response(body)))
+      return attempt.delay === undefined ? response : response.pipe(Effect.delay(attempt.delay))
     }),
   )
   return { client, calls: () => calls }
@@ -197,6 +202,52 @@ describe("AcnJitRuntime", () => {
 
     expect(await Effect.runPromise(call)).toBe(true)
     expect(await Effect.runPromise(call)).toBe(true)
+    expect(currentCalls()).toBe(1)
+    expect(startCalls()).toBe(0)
+  })
+
+  it("keeps the selected endpoint Ready while a healthy unary response is slow", async () => {
+    const { services, currentCalls, startCalls } = makeFakeProcesses({
+      current: [Option.some("http://daemon")],
+      startUrl: "http://must-not-start",
+    })
+    const { client: http, calls } = makeFakeHttp([
+      {
+        kind: "lines",
+        delay: "2200 millis",
+        make: (id) => [exitMessage("CheckFileExists", id, Exit.succeed(true))],
+      },
+      { kind: "lines", make: (id) => [exitMessage("CheckFileExists", id, Exit.succeed(true))] },
+    ])
+
+    const { result, stateWhilePending } = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const runtime = yield* makeAcnJitRuntime().pipe(
+        Effect.provideService(DaemonDiscovery, services.discovery),
+        Effect.provideService(DaemonLauncher, services.launcher),
+      )
+      yield* runtime.startup.prepare
+      const client = yield* RpcClient.make(MagnitudeRpcs).pipe(
+        Effect.provide(runtime.protocolLayer.pipe(
+          Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
+        )),
+      )
+      const request = yield* client.CheckFileExists({ cwd: "/project", path: "/x" }).pipe(Effect.fork)
+      yield* Effect.sleep("2050 millis")
+      const stateWhilePending = yield* runtime.startup.state.get
+      const result = yield* Fiber.join(request)
+      return { result, stateWhilePending }
+    })))
+
+    expect(result).toBe(true)
+    expect(stateWhilePending).toEqual({
+      _tag: "Ready",
+      endpoint: {
+        id: "http://daemon",
+        url: "http://daemon",
+        version: SDK_VERSION,
+      },
+    })
+    expect(calls()).toBe(1)
     expect(currentCalls()).toBe(1)
     expect(startCalls()).toBe(0)
   })

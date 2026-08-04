@@ -72,7 +72,11 @@ const extractRequestId = (request: HttpClientRequest.HttpClientRequest): string 
 
 type Attempt =
   | { readonly kind: "refuse" }
-  | { readonly kind: "lines"; readonly make: (requestId: string) => ReadonlyArray<unknown> }
+  | {
+      readonly kind: "lines"
+      readonly delay?: `${number} millis`
+      readonly make: (requestId: string) => ReadonlyArray<unknown>
+    }
 
 const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
   let calls = 0
@@ -89,7 +93,10 @@ const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
       }
       const requestId = extractRequestId(request)
       const text = attempt.make(requestId).map((line) => JSON.stringify(line)).join("\n") + "\n"
-      return Effect.succeed(HttpClientResponse.fromWeb(request, new Response(text, { status: 200 })))
+      const response = Effect.succeed(
+        HttpClientResponse.fromWeb(request, new Response(text, { status: 200 })),
+      )
+      return attempt.delay === undefined ? response : response.pipe(Effect.delay(attempt.delay))
     })
   )
   return { client, calls: () => calls }
@@ -253,6 +260,28 @@ describe("recovering protocol — operation contract", () => {
     const { access, startCalls } = makeFakeEndpointAccess({ current: [Option.some("http://daemon-1")] })
     const { client, calls } = makeFakeHttp([
       { kind: "lines", make: (id) => [exitMessage("Ping", id, Exit.succeed("pong"))] },
+    ])
+
+    const result = await withClient(access, client, (c) =>
+      c.Ping({ value: "ping" })
+    )
+
+    expect(result).toBe("pong")
+    expect(calls()).toBe(1)
+    expect(startCalls()).toBe(0)
+  })
+
+  it("does not recover or replay a healthy unary request because its response is slow", async () => {
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some("http://daemon-1")],
+      startUrl: "http://must-not-start",
+    })
+    const { client, calls } = makeFakeHttp([
+      {
+        kind: "lines",
+        delay: "2100 millis",
+        make: (id) => [exitMessage("Ping", id, Exit.succeed("pong"))],
+      },
     ])
 
     const result = await withClient(access, client, (c) =>
