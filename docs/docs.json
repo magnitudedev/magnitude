@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "The easiest way to code with local models",
+    "description": "Code with local models, zero setup",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"
