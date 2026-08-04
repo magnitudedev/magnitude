@@ -1,9 +1,5 @@
 import { TextAttributes } from '@opentui/core'
-import { useSyncExternalStore } from 'react'
-import {
-  getAnimationTickSnapshot,
-  subscribeAnimationTick,
-} from '@magnitudedev/client-common'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 import { useTheme } from '../../hooks/use-theme'
 
 interface ContextUsageProps {
@@ -43,16 +39,12 @@ export function ContextUsage({
   isCompacting = false,
 }: ContextUsageProps) {
   const theme = useTheme()
-  const tick = useSyncExternalStore(
-    subscribeAnimationTick,
-    getAnimationTickSnapshot,
-    getAnimationTickSnapshot,
-  )
+  const animationStep = useAnimationStep(isCompacting, 240)
   const display = formatContextUsage(tokenUsage, hardCap)
 
   if (!isCompacting) return <text style={{ fg: theme.muted }}>{display}</text>
 
-  const frame = Math.floor(tick / 3) % 6
+  const frame = animationStep % 6
   const active = (index: number) =>
     index <= frame && frame <= index + 2 ? TextAttributes.NONE : TextAttributes.DIM
 

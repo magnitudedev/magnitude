@@ -1,10 +1,5 @@
-import { useRef, useSyncExternalStore } from 'react'
-import {
-  subscribeAnimationTick,
-  subscribeAnimationNoop,
-  getAnimationTickSnapshot,
-  getAnimationTickFrozenSnapshot,
-} from '@magnitudedev/client-common'
+import { useRef } from 'react'
+import { useAnimationStep } from './use-animation-time'
 
 export interface StreamingRevealResult {
   displayedContent: string
@@ -13,14 +8,14 @@ export interface StreamingRevealResult {
 }
 
 /**
- * Streaming reveal animation — tick-driven, no useEffect.
+ * Streaming reveal animation — clock-driven, no useEffect.
  *
- * Uses the shared animation tick store for the reveal animation.
- * Refs hold mutable state (previous content/streaming, start tick, displayed length).
- * The tick subscription via useSyncExternalStore drives re-renders,
+ * Uses the shared animation clock for the reveal animation.
+ * Refs hold mutable state (previous content/streaming, animation step, displayed length).
+ * The clock subscription via useSyncExternalStore drives re-renders,
  * during which we read refs and compute the new displayed length.
  * No useState, no useEffect — refs are updated during render (safe because
- * they don't trigger re-renders; the tick store does).
+ * they don't trigger re-renders; the animation clock does).
  */
 export function useStreamingReveal(
   content: string,
@@ -29,12 +24,12 @@ export function useStreamingReveal(
   initialDisplayedLength?: number,
 ): StreamingRevealResult {
   const stateRef = useRef({
-    startTick: null as number | null,
+    lastRevealStep: null as number | null,
     prevContent: '',
     prevIsStreaming: false,
     // Completed content mounts fully revealed; a mid-stream mount starts from
     // the requested prefix (the fresh-stream-start transition below re-applies
-    // this and records the start tick).
+    // this and records the initial reveal step).
     displayedLength: isStreaming
       ? Math.max(0, Math.min(initialDisplayedLength ?? 0, content.length))
       : content.length,
@@ -42,25 +37,21 @@ export function useStreamingReveal(
 
   const s = stateRef.current
 
-  // Subscribe to the shared tick only while animating. Completed messages pay
-  // nothing per tick, and the interval stops when no component is animating.
+  // Subscribe to the shared clock only while animating. Completed messages pay
+  // nothing per frame, and the interval stops when no component is animating.
   // Entering animation is prop-driven (isStreaming flips / content grows), so
-  // no tick is needed to start ticking; the render where the reveal catches up
+  // no clock frame is needed to start; the render where the reveal catches up
   // computes needsTicks false and unsubscribes on commit.
-  const needsTicks = !isInterrupted && (isStreaming || s.displayedLength < content.length)
+  const needsClock = !isInterrupted && (isStreaming || s.displayedLength < content.length)
 
-  const currentTick = useSyncExternalStore(
-    needsTicks ? subscribeAnimationTick : subscribeAnimationNoop,
-    needsTicks ? getAnimationTickSnapshot : getAnimationTickFrozenSnapshot,
-    needsTicks ? getAnimationTickSnapshot : getAnimationTickFrozenSnapshot,
-  )
+  const revealStep = useAnimationStep(needsClock, 80)
 
   // Handle state transitions — update refs during render (safe, no re-render trigger)
   if (s.prevContent !== content || s.prevIsStreaming !== isStreaming) {
     if (!s.prevIsStreaming && isStreaming) {
       // Fresh stream start
       s.displayedLength = Math.max(0, Math.min(initialDisplayedLength ?? 0, content.length))
-      s.startTick = currentTick
+      s.lastRevealStep = revealStep
     } else if (content.length < s.prevContent.length) {
       // Content shrunk
       s.displayedLength = Math.min(s.displayedLength, content.length)
@@ -84,18 +75,15 @@ export function useStreamingReveal(
     s.displayedLength = content.length
   }
 
-  // Reveal animation — derive from tick
+  // Preserve the reveal's 80ms cadence while the shared clock renders at 30 FPS.
   if ((isStreaming || s.displayedLength < content.length) && !isInterrupted) {
     const target = content.length
-    if (s.displayedLength < target) {
+    if (s.displayedLength < target && s.lastRevealStep !== revealStep) {
+      s.lastRevealStep = revealStep
       if (isStreaming) {
-        // Advance only once ticks have passed since stream start — the render
-        // that starts the stream (currentTick === startTick) reveals nothing.
-        if (s.startTick !== null && currentTick !== s.startTick) {
-          const remaining = target - s.displayedLength
-          const speed = Math.max(1, Math.floor(remaining * 0.15))
-          s.displayedLength = Math.min(target, s.displayedLength + speed)
-        }
+        const remaining = target - s.displayedLength
+        const speed = Math.max(1, Math.floor(remaining * 0.15))
+        s.displayedLength = Math.min(target, s.displayedLength + speed)
       } else {
         // Linear drain when not streaming — must not require a prior stream
         // start, or a never-streamed component whose content grew would keep

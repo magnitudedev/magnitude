@@ -1,5 +1,5 @@
-import React, { useSyncExternalStore } from 'react'
-import { subscribeAnimationTick, getAnimationTickSnapshot } from '@magnitudedev/client-common'
+import React from 'react'
+import { useAnimationStep } from '../hooks/use-animation-time'
 
 const FRAME_MS = 80
 const WAVE_CHARS = 3
@@ -40,9 +40,8 @@ interface MiniWaveProps {
 }
 
 export const MiniWave = ({ color }: MiniWaveProps) => {
-  const tick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
-  // 80ms per tick, 0.3 phase increment per frame → tick * 0.3
-  const phase = tick * 0.3
+  const frame = useAnimationStep(true, FRAME_MS)
+  const phase = frame * 0.3
   const waveText = computeWave(phase)
 
   return <span fg={color}>{waveText}</span>

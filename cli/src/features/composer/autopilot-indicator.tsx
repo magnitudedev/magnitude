@@ -1,8 +1,8 @@
 import { memo, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { Button } from '../../components/button'
-import { spinnerFrameForTick } from '../../hooks/use-spinner-frame'
-import { useAnimationTick } from '../../hooks/use-animation-tick'
+import { spinnerFrameForStep } from '../../hooks/use-spinner-frame'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 import { useTheme } from '../../hooks/use-theme'
 import { blue, slate } from '@magnitudedev/client-common'
 
@@ -25,17 +25,16 @@ export const AutopilotIndicator = memo(function AutopilotIndicator({
 }: AutopilotIndicatorProps) {
   const theme = useTheme()
   const [hovered, setHovered] = useState(false)
-  const tick = useAnimationTick(enabled || generating)
+  const animationStep = useAnimationStep(enabled || generating, generating ? 80 : 240)
 
-  // Derive animation from tick (80ms per tick)
   const iconContent = generating
-    ? spinnerFrameForTick(tick)
+    ? spinnerFrameForStep(animationStep)
     : '●'
 
   const iconColor = generating
     ? theme.foreground
     : enabled
-      ? PULSE_BLUE_SHADES[Math.floor(tick / 3) % PULSE_BLUE_SHADES.length]
+      ? PULSE_BLUE_SHADES[animationStep % PULSE_BLUE_SHADES.length]
       : slate[600]
 
   const textColor = hovered ? theme.foreground : enabled ? theme.foreground : theme.muted

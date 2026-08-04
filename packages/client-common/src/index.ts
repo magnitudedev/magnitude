@@ -18,7 +18,7 @@ export * from './platform/platform-context'
 
 // Stores
 export * from './stores/tick-store'
-export * from './stores/animation-tick-store'
+export * from './stores/animation-clock-store'
 export * from './stores/system-message-store'
 export * from './stores/ephemeral-message-store'
 

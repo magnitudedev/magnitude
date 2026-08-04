@@ -1,13 +1,20 @@
 import { TextAttributes } from '@opentui/core'
-import { blue, red, slate, subscribeAnimationTick, getAnimationTickSnapshot, findSlotProfile, type SlotProfiles } from '@magnitudedev/client-common'
+import {
+  blue,
+  findSlotProfile,
+  red,
+  slate,
+  type SlotProfiles,
+} from '@magnitudedev/client-common'
 import { Atom, useAtomMount } from '@effect-atom/atom-react'
 import { Effect, Option } from 'effect'
-import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useLocalWidth } from '../../hooks/use-local-width'
 import { Button } from '../../components/button'
 import { computeWorkerElapsedMs, formatWorkerTimer, isWorkerResumed } from '../../utils/task-list-worker-timer'
 import { BOX_CHARS } from '../../utils/ui-constants'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 import { formatTokensCompact } from '@magnitudedev/client-common'
 import {
   computeInheritedVisualStatusMap,
@@ -358,7 +365,7 @@ export function TaskList({
   const [expanded, setExpanded] = useState(false)
   const [expandHovered, setExpandHovered] = useState(false)
   const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null)
-  // now is derived from animation tick below
+  // now is sampled from the shared animation clock below
   const taskScrollRef = useRef<any>(null)
 
   const box = useLocalWidth()
@@ -387,11 +394,13 @@ export function TaskList({
     [actors, visibleAllTasks]
   )
 
-  // Timer tick — use animation tick store for re-renders (no useEffect)
-  const animTick = useSyncExternalStore(subscribeAnimationTick, getAnimationTickSnapshot, getAnimationTickSnapshot)
   const nowRef = useRef(Date.now())
-  const tickDivisor = needsFastTick ? 3 : 13
-  if (animTick % tickDivisor === 0) nowRef.current = Date.now()
+  const timerStep = useAnimationStep(true, needsFastTick ? 240 : 1_040)
+  const lastTimerStepRef = useRef(-1)
+  if (timerStep !== lastTimerStepRef.current) {
+    lastTimerStepRef.current = timerStep
+    nowRef.current = Date.now()
+  }
   const now = nowRef.current
 
   const handleHoverEnd = useCallback(() => setHoveredTaskId(null), [])

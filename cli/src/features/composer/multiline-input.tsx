@@ -10,14 +10,8 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
 } from 'react'
-import {
-  subscribeAnimationTick,
-  subscribeAnimationNoop,
-  getAnimationTickSnapshot,
-  getAnimationTickFrozenSnapshot,
-} from '@magnitudedev/client-common'
+import { useAnimationStep } from '../../hooks/use-animation-time'
 
 import {
   CONTROL_CHAR_REGEX,
@@ -280,22 +274,18 @@ export function InputCursor({
   blinkInterval = 500,
   bold = false,
 }: CursorIndicatorProps) {
-  // Blink derives from the shared animation tick (80ms) — no timers.
-  // The tick only runs while the cursor is actually blinking; idle cursors
+  // Blink derives from the shared animation clock — no component timer.
+  // The clock only runs while the cursor is actually blinking; idle cursors
   // pay nothing (noop subscription).
   const blinking = shouldBlink && focused && visible
-  const tick = useSyncExternalStore(
-    blinking ? subscribeAnimationTick : subscribeAnimationNoop,
-    blinking ? getAnimationTickSnapshot : getAnimationTickFrozenSnapshot,
-    blinking ? getAnimationTickSnapshot : getAnimationTickFrozenSnapshot,
-  )
+  const blinkStep = useAnimationStep(blinking, 80)
   // Restart the blink phase whenever blink state re-engages.
   const blinkKey = `${visible}:${focused}:${shouldBlink}`
-  const blinkStartRef = useRef({ key: '', tick: 0 })
+  const blinkStartRef = useRef({ key: '', step: 0 })
   if (blinkStartRef.current.key !== blinkKey) {
-    blinkStartRef.current = { key: blinkKey, tick }
+    blinkStartRef.current = { key: blinkKey, step: blinkStep }
   }
-  const elapsedMs = (tick - blinkStartRef.current.tick) * 80
+  const elapsedMs = (blinkStep - blinkStartRef.current.step) * 80
   const isBlinkHidden = blinking && elapsedMs > blinkDelay
     ? Math.floor((elapsedMs - blinkDelay) / blinkInterval) % 2 === 1
     : false
