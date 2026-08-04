@@ -379,7 +379,11 @@ const makeAcnInfrastructure = (
     BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
     BunPath.layer,
     FetchHttpClient.layer,
-    BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 255 }),
+    // Finite unary RPCs may legitimately run for the full duration of model
+    // download or loading. Bun counts an in-flight handler that has not yet
+    // emitted response bytes as idle, so any non-zero server timeout would
+    // turn operation duration into a connection reset.
+    BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 0 }),
     HttpLayerRouter.layer,
     RpcSerialization.layerNdjson,
     TracingLayer
