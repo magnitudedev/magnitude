@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.31
+
+### Patch Changes
+
+- [`7a49f4a`](https://github.com/magnitudedev/magnitude/commit/7a49f4ae329713d9955aed3951eb6d1caf9cfdf2) Thanks [@anerli](https://github.com/anerli)! - download/load endpoint termination fixes
+
 ## 0.0.1-alpha.30
 
 ### Patch Changes
