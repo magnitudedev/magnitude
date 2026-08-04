@@ -18,7 +18,7 @@ export const FOLDER_TREE_BUDGET_TOKENS = 1_000
 export const MAX_VCS_STATUS_LINES = 20
 
 /** Max tokens for a resolved ref in an inspect block */
-export const TRUNCATION_TOKEN_LIMIT = 25_000
+export const TRUNCATION_TOKEN_LIMIT = 10_000
 
 /** Character equivalent of TRUNCATION_TOKEN_LIMIT */
 export const TRUNCATION_CHAR_LIMIT = TRUNCATION_TOKEN_LIMIT * CHARS_PER_TOKEN_UPPER
