@@ -75,6 +75,15 @@ and sparse-index dimensions and top-K. It also reports native hybrid and recurre
 classifications. These are facts, not an estimate: the binding payload contains no token rates,
 efficiency constants, uncertainty bounds, or confidence labels.
 
+Native device identity discovery is proportional to the distinct devices in one workload
+extraction, not to its tensor or layer count. The extraction-local cache contains only backend type,
+backend name, and physical device identity. Free memory, available capacity, and other mutable
+device observations remain live and are never retained by the binding.
+
+Native planning has one process-wide concurrency policy: available CPU parallelism capped at 12.
+The shared planner semaphore is authoritative across all requests. Request-local stream
+backpressure uses the same resolved value and does not define a second concurrency limit.
+
 ## ICN workload calculation
 
 `icn-hardware` charges always-active operations and row lookups by their native operation bytes.
@@ -174,8 +183,9 @@ measurements. These identities are cache inputs, not cache schema versions.
 
 Capacity assessment and execution assessment are distinct operations. Capacity assessment contains
 only compatibility and memory fit. Complete execution assessment adds mandatory measured
-performance. Calibration, workload, arithmetic, or decoding failure fails execution assessment; it
-cannot change capacity facts into incompatibility or a successful empty result.
+performance. Calibration, workload, arithmetic, or decoding failure produces a typed operational
+failure for that target's execution assessment; it cannot change capacity facts into
+incompatibility, abort completed sibling targets, or create a successful empty result.
 
 Preview caches the composite profile assessment through the model-management cache. A complete
 batch cache hit is checked from the target identity before remote sparse-header materialization, so
@@ -210,5 +220,8 @@ replans, and installed-model runtime timing remains authoritative for observed p
 - Malformed native values and incomplete MoE metadata fail execution assessment. Missing exact
   operation calibration uses a conservative same-device fallback and lowers confidence.
 - Remote sparse and complete local forms of the same artifact produce identical model workloads.
+- Native device identity discovery is bounded by distinct devices per extraction, while mutable
+  capacity stays uncached.
+- Native planner concurrency is governed by one process-wide limit across all requests.
 - Recommendation policy consumes only a complete estimate point matching the exact selected product
   context. Clients present the selected evidence but never reinterpret workload or throughput.

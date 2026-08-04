@@ -10,6 +10,7 @@ import {
   OfferingAssessmentIdSchema,
   type FitsOfferingAssessment,
   type LocalInferenceError,
+  type ModelFailure,
   type ModelOfferingTarget,
   type ModelOfferingTargetId,
   type ModelServingConfiguration,
@@ -53,7 +54,15 @@ export type LocalModelAssessmentResult =
       readonly targetId: ModelOfferingTargetId
       readonly assessments: readonly LocalModelAssessment[]
     }
+  | { readonly _tag: "AssessmentFailed"; readonly failure: ModelFailure }
   | { readonly _tag: "InvalidTarget"; readonly message: string }
+
+export const localModelAssessmentFailure = (
+  results: readonly LocalModelAssessmentResult[],
+): ModelFailure | undefined => {
+  const failed = results.find((result) => result._tag === "AssessmentFailed")
+  return failed?.failure
+}
 
 export const formatLocalModelEvaluationFailure = (error: unknown): string => {
   try {
@@ -82,12 +91,17 @@ export const formatLocalModelEvaluationFailure = (error: unknown): string => {
     : structured
 }
 
-const failure = (operation: string, error: unknown) =>
+const failure = (operation: string, message: string) =>
   new LocalModelMutationFailed({
     code: operation,
-    message: formatLocalModelEvaluationFailure(error),
+    message,
     retryable: true,
   })
+
+const logEvaluationFailure = (operation: string, error: unknown) =>
+  Effect.logWarning(`Local model ${operation} failed`).pipe(
+    Effect.annotateLogs({ detail: formatLocalModelEvaluationFailure(error) })
+  )
 
 const memoryAssessmentFromIcn = (
   memory: Extract<OfferingAssessment, { readonly _tag: "Fits" }>["memory"][number],
@@ -127,6 +141,21 @@ const assessmentFromIcn = (
         limitingResource: String(assessment.limitingResource),
       } as const)
     : Effect.succeed({ _tag: "InvalidTarget", message: assessment.failure.message })
+
+export const localModelAssessmentResultFromIcn = (
+  result: AssessModelResult,
+): Effect.Effect<LocalModelAssessmentResult, ParseResult.ParseError> =>
+  result._tag === "InvalidTarget"
+    ? Effect.succeed({ _tag: "InvalidTarget", message: result.failure.message })
+    : result._tag === "AssessmentFailed"
+      ? Effect.succeed({ _tag: "AssessmentFailed", failure: result.failure })
+      : Effect.gen(function* () {
+          return {
+            _tag: "Assessed" as const,
+            targetId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
+            assessments: yield* Effect.all(result.profiles.map(assessmentFromIcn)),
+          }
+        })
 
 export interface LocalModelEvaluationsApi {
   readonly assessMany: (
@@ -210,18 +239,16 @@ export const LocalModelEvaluationsLive: Layer.Layer<
           })
           continue
         }
-        if (result._tag === "InvalidTarget") {
-          results.push({ _tag: "InvalidTarget", message: result.failure.message })
-          continue
-        }
-        results.push({
-          _tag: "Assessed",
-          targetId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
-          assessments: yield* Effect.all(result.profiles.map(assessmentFromIcn)),
-        })
+        results.push(yield* localModelAssessmentResultFromIcn(result))
       }
       return results
-    }).pipe(Effect.mapError((error) => failure("assess_model_failed", error)))
+    }).pipe(
+      Effect.tapError((error) => logEvaluationFailure("assessment", error)),
+      Effect.mapError(() => failure(
+        "assess_model_failed",
+        "Local model assessment could not be completed.",
+      )),
+    )
 
   const assessMany: LocalModelEvaluationsApi["assessMany"] = (requests) =>
     assessManyWithProgress(requests, () => Effect.void)
@@ -233,6 +260,9 @@ export const LocalModelEvaluationsLive: Layer.Layer<
       Effect.flatMap((results) => {
         const result = results[0]
         if (result?._tag === "Assessed") return Effect.succeed(result)
+        if (result?._tag === "AssessmentFailed") {
+          return Effect.fail(new LocalModelMutationFailed(result.failure))
+        }
         return Effect.fail(new LocalModelMutationFailed({
           code: "model_target_invalid",
           message: result?.message ?? "ICN returned no assessment result",
@@ -280,9 +310,18 @@ export const LocalModelEvaluationsLive: Layer.Layer<
         configuration,
         assessment: yield* fitAssessment(result.assessment),
       }
-    }).pipe(Effect.mapError((error) =>
-      error instanceof LocalModelMutationFailed
-        ? error
-        : failure("fit_model_failed", error))),
+    }).pipe(
+      Effect.tapError((error) =>
+        error instanceof LocalModelMutationFailed
+          ? Effect.void
+          : logEvaluationFailure("fitting", error)),
+      Effect.mapError((error) =>
+        error instanceof LocalModelMutationFailed
+          ? error
+          : failure(
+              "fit_model_failed",
+              "The model could not be fitted to this machine.",
+            )),
+    ),
   })
 }))

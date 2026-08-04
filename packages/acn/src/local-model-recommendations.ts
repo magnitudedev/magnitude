@@ -11,6 +11,7 @@ import {
 import { createHash } from "node:crypto"
 import {
   CatalogCandidateIdSchema,
+  LocalModelMutationFailed,
   LocalModelCatalogCandidateMetadataSchema,
   ModelFailureSchema,
   ModelServingConfigurationSchema,
@@ -29,7 +30,10 @@ import {
   type ProviderModelId,
 } from "@magnitudedev/ai/provider/model"
 import { makeObservedState } from "./mirrored-state"
-import { LocalModelEvaluations } from "./local-model-evaluations"
+import {
+  localModelAssessmentFailure,
+  LocalModelEvaluations,
+} from "./local-model-evaluations"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import {
   assembleRecommendationCatalogCandidates,
@@ -54,6 +58,26 @@ type RecommendationState =
       readonly failure: ModelFailure
       readonly progress: readonly LocalModelRecommendationProgressStep[]
     }
+
+export const localModelRecommendationFailure = (
+  error: {
+    readonly message: string
+    readonly retryable?: boolean
+  } | undefined,
+): ModelFailure =>
+  error instanceof LocalModelMutationFailed
+    ? {
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+      }
+    : {
+        code: "recommendations_unavailable",
+        message:
+          error?.message.trim() ||
+          "Local model recommendations are temporarily unavailable",
+        retryable: error?.retryable ?? true,
+      }
 
 export interface LocalModelRecommendationsApi {
   readonly snapshot: Effect.Effect<{
@@ -450,6 +474,10 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   yield* publishProgress(progress)
                 })
             )
+            const assessmentFailure = localModelAssessmentFailure(results)
+            if (assessmentFailure) {
+              return yield* new LocalModelMutationFailed(assessmentFailure)
+            }
             progress = yield* completeStep(
               progress,
               "analysis",
@@ -559,10 +587,9 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
           Effect.catchAllCause((cause) =>
             Effect.gen(function* () {
               const failure = Cause.failureOption(cause)
-              const message = Option.match(failure, {
-                onNone: () => "",
-                onSome: (error) => error.message.trim() || String(error).trim(),
-              })
+              const reportedFailure = localModelRecommendationFailure(
+                Option.getOrUndefined(failure)
+              )
               const failedAtMs = Date.now()
               const failedProgress = (yield* Ref.get(progressRef)).map((step) =>
                 step.status._tag === "Running"
@@ -577,10 +604,10 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                           failedAtMs - step.status.startedAtMs
                         ),
                         failure: {
-                          code: "recommendations_unavailable",
+                          ...reportedFailure,
                           message:
-                            message || "This step could not be completed",
-                          retryable: true,
+                            reportedFailure.message ||
+                            "This step could not be completed",
                         },
                       },
                     }
@@ -590,17 +617,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               yield* mirror.setIfChanged(
                 {
                   _tag: "Failed",
-                  failure: {
-                    code: "recommendations_unavailable",
-                    message:
-                      message ||
-                      "Local model recommendations are temporarily unavailable",
-                    retryable: Option.match(failure, {
-                      onNone: () => true,
-                      onSome: (error) =>
-                        "retryable" in error ? error.retryable : true,
-                    }),
-                  },
+                  failure: reportedFailure,
                   progress: failedProgress,
                 },
                 equivalent

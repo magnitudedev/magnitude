@@ -526,6 +526,12 @@ pub enum AssessModelResult {
         profiles: Vec<OfferingAssessment>,
     },
     #[serde(rename_all = "camelCase")]
+    AssessmentFailed {
+        request_id: ModelAssessmentRequestId,
+        target_id: ModelOfferingTargetId,
+        failure: ModelFailure,
+    },
+    #[serde(rename_all = "camelCase")]
     InvalidTarget {
         request_id: ModelAssessmentRequestId,
         failure: ModelFailure,

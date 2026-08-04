@@ -120,6 +120,16 @@ export const AssessModelResult = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
+    S.TaggedStruct("AssessmentFailed", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      requestId: S.suspend(
+        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
+      ),
+      targetId: S.suspend((): S.Schema<ModelOfferingTargetId, ModelOfferingTargetIdEncoded> => ModelOfferingTargetId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
     S.TaggedStruct("InvalidTarget", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
       requestId: S.suspend(

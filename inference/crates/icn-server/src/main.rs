@@ -682,8 +682,33 @@ struct NativeHardwareAssessor {
     gate: Arc<tokio::sync::Mutex<()>>,
     assessment_work_gates:
         Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>>,
-    planning_slots: Arc<tokio::sync::Semaphore>,
+    planning_gate: PlanningGate,
     calibration: Arc<tokio::sync::Mutex<CalibrationCache>>,
+}
+
+#[derive(Clone)]
+struct PlanningGate {
+    concurrency: usize,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl PlanningGate {
+    fn new(concurrency: usize) -> Self {
+        Self {
+            concurrency,
+            slots: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+        }
+    }
+
+    const fn concurrency(&self) -> usize {
+        self.concurrency
+    }
+
+    async fn acquire(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        Arc::clone(&self.slots).acquire_owned().await
+    }
 }
 
 #[derive(Default)]
@@ -711,13 +736,13 @@ fn native_assessor_services(
         native_executor: Arc::clone(&native_executor),
         gate: Arc::new(tokio::sync::Mutex::new(())),
         assessment_work_gates: Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
-        planning_slots: Arc::new(tokio::sync::Semaphore::new(planner_concurrency())),
+        planning_gate: PlanningGate::new(planner_concurrency()),
         calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
     });
     (assessor, native_executor)
 }
 
-const MODEL_ASSESSMENT_CONCURRENCY: usize = 12;
+const MAX_PLANNING_CONCURRENCY: usize = 12;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -737,6 +762,78 @@ enum PlanningOperation {
         calibration: llama_cpp_2::model::params::fit::FitCalibration,
     },
 }
+
+impl PlanningOperation {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::Execution { .. } => "execution",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IsolatedWorkerOutcome {
+    Deadline,
+    InvalidResponse,
+    OutputBound,
+    ProcessFailure,
+}
+
+impl IsolatedWorkerOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::InvalidResponse => "invalid_response",
+            Self::OutputBound => "output_bound",
+            Self::ProcessFailure => "process_failure",
+        }
+    }
+
+    const fn public_failure(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Deadline => (
+                "planner_timeout",
+                "Hardware assessment took longer than five minutes.",
+            ),
+            Self::InvalidResponse => (
+                "planner_invalid_response",
+                "The native hardware assessment returned an invalid response.",
+            ),
+            Self::OutputBound => (
+                "planner_output_limit",
+                "The native hardware assessment exceeded its output limit.",
+            ),
+            Self::ProcessFailure => (
+                "planner_process_failed",
+                "The native hardware assessment process failed.",
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IsolatedWorkerFailure {
+    outcome: IsolatedWorkerOutcome,
+    message: String,
+}
+
+impl IsolatedWorkerFailure {
+    fn new(outcome: IsolatedWorkerOutcome, message: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for IsolatedWorkerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for IsolatedWorkerFailure {}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -778,8 +875,10 @@ impl TemplateAssessor for NativeTemplateAssessor {
     }
 }
 
+const PLANNING_WORKER_TIMEOUT_SECONDS: u64 = 5 * 60;
 #[cfg(not(test))]
-const PLANNING_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const PLANNING_WORKER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(PLANNING_WORKER_TIMEOUT_SECONDS);
 #[cfg(not(test))]
 const MAX_PLANNING_WORKER_OUTPUT_BYTES: usize = 1024 * 1024;
 const LOW_MEMORY_FAILURE_CODE: &str = "low_memory";
@@ -1065,7 +1164,19 @@ impl NativeHardwareAssessor {
                 .collect()
         };
         let calibration = if estimate_performance {
-            Some(self.fit_calibration().await?)
+            Some(self.fit_calibration().await.map_err(|_| {
+                tracing::warn!(
+                    model.id = %id.0,
+                    operation = "calibration",
+                    outcome = "calibration_failure",
+                    "native planner prerequisite failed"
+                );
+                InventoryError::ModelOperation {
+                    code: "performance_calibration_failed".to_owned(),
+                    message: "Hardware performance calibration failed.".to_owned(),
+                    retryable: true,
+                }
+            })?)
         } else {
             None
         };
@@ -1083,32 +1194,78 @@ impl NativeHardwareAssessor {
                 PlanningOperation::Capacity
             },
         };
-        let permit = Arc::clone(&self.planning_slots)
-            .acquire_owned()
-            .await
-            .map_err(|_| InventoryError::Internal("native planner pool closed".to_owned()))?;
+        let operation = request.operation.as_str();
+        let profile_count = request.defaults.len();
+        let queue_started = std::time::Instant::now();
+        let permit = match self.planning_gate.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    model.id = %id.0,
+                    operation,
+                    profile_count,
+                    queue_microseconds = u64::try_from(queue_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    worker_microseconds = 0_u64,
+                    outcome = "pool_closed",
+                    "native planner completed"
+                );
+                return Err(InventoryError::ModelOperation {
+                    code: "planner_unavailable".to_owned(),
+                    message: "The hardware assessment service is unavailable.".to_owned(),
+                    retryable: true,
+                });
+            }
+        };
+        let queue_microseconds =
+            u64::try_from(queue_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let worker_launcher = self.worker_launcher.clone();
-        let response = match spawn_blocking_traced(move || {
+        let worker_started = std::time::Instant::now();
+        let worker_result = spawn_blocking_traced(move || {
             let _permit = permit;
             run_isolated_planning(request, &worker_launcher)
         })
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                return Err(InventoryError::Internal(format!(
-                    "hardware assessment failed for {}: {error:#}",
-                    id.0
-                )));
-            }
-            Err(error) => {
-                return Err(InventoryError::Internal(format!(
-                    "hardware assessment task failed for {}: {error}",
-                    id.0
-                )));
-            }
+        .await;
+        let worker_microseconds =
+            u64::try_from(worker_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let outcome = match &worker_result {
+            Ok(Ok(_)) => "success",
+            Ok(Err(error)) => error
+                .downcast_ref::<IsolatedWorkerFailure>()
+                .map_or("worker_error", |failure| failure.outcome.as_str()),
+            Err(_) => "task_failure",
         };
-        Ok(response)
+        tracing::info!(
+            model.id = %id.0,
+            operation,
+            profile_count,
+            queue_microseconds,
+            worker_microseconds,
+            outcome,
+            "native planner completed"
+        );
+        match worker_result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                let (code, message) = error.downcast_ref::<IsolatedWorkerFailure>().map_or(
+                    (
+                        "assessment_failed",
+                        "The native hardware assessment failed.",
+                    ),
+                    |failure| failure.outcome.public_failure(),
+                );
+                Err(InventoryError::ModelOperation {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                    retryable: true,
+                })
+            }
+            Err(_) => Err(InventoryError::ModelOperation {
+                code: "planner_task_failed".to_owned(),
+                message: "The hardware assessment task failed.".to_owned(),
+                retryable: true,
+            }),
+        }
     }
 
     async fn assess_resolved_capacity_plans_with_hardware(
@@ -1822,18 +1979,37 @@ impl ModelEvaluator for NativeModelEvaluator {
                                 ))),
                             };
                             match resolved {
-                                Ok(resolved) => AssessModelResult::Assessed {
-                                    request_id,
-                                    target_id: resolved.target_id.clone(),
-                                    profiles: self
+                                Ok(resolved) => {
+                                    match self
                                         .assess_profiles(
                                             &resolved,
                                             &item.profiles,
                                             reserve_bytes,
                                             &environment,
                                         )
-                                        .await?,
-                                },
+                                        .await
+                                    {
+                                        Ok(profiles) => AssessModelResult::Assessed {
+                                            request_id,
+                                            target_id: resolved.target_id.clone(),
+                                            profiles,
+                                        },
+                                        Err(InventoryError::ModelOperation {
+                                            code,
+                                            message,
+                                            retryable,
+                                        }) => AssessModelResult::AssessmentFailed {
+                                            request_id,
+                                            target_id: resolved.target_id.clone(),
+                                            failure: DomainModelFailure {
+                                                code,
+                                                message,
+                                                retryable,
+                                            },
+                                        },
+                                        Err(error) => return Err(error),
+                                    }
+                                }
                                 Err(error) => AssessModelResult::InvalidTarget {
                                     request_id,
                                     failure: DomainModelFailure {
@@ -1847,7 +2023,7 @@ impl ModelEvaluator for NativeModelEvaluator {
                         Ok::<_, InventoryError>((index, result))
                     }
                 })
-                .buffer_unordered(MODEL_ASSESSMENT_CONCURRENCY)
+                .buffer_unordered(self.assessor.planning_gate.concurrency())
                 .collect::<Vec<_>>()
                 .await;
             let mut results = evaluated.into_iter().collect::<Result<Vec<_>, _>>()?;
@@ -1916,7 +2092,8 @@ impl ModelEvaluator for NativeModelEvaluator {
 }
 
 fn planner_concurrency() -> usize {
-    std::thread::available_parallelism().map_or(1, |cores| cores.get().clamp(1, 16))
+    std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get().min(MAX_PLANNING_CONCURRENCY))
 }
 
 fn assess_planning_request_with_backend(
@@ -2137,67 +2314,182 @@ where
     Request: serde::Serialize,
     Response: serde::de::DeserializeOwned,
 {
-    use std::io::Write as _;
-
+    let encoded_request = request
+        .map(serde_json::to_vec)
+        .transpose()
+        .with_context(|| format!("failed to encode isolated {operation} request"))?;
     let mut child = worker_launcher.command(role)?;
-    if request.is_some() {
+    if encoded_request.is_some() {
         child.stdin(Stdio::piped());
     }
     child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child
         .spawn()
         .with_context(|| format!("failed to start isolated {operation}"))?;
-    if let Some(request) = request {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .with_context(|| format!("isolated {operation} stdin was unavailable"))?;
-        serde_json::to_writer(stdin, request)
-            .with_context(|| format!("failed to encode isolated {operation} request"))?;
+    let output_bound_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_bounded_worker_output_reader(
         child
-            .stdin
+            .stdout
             .take()
-            .with_context(|| format!("isolated {operation} stdin was unavailable"))?
-            .flush()
-            .with_context(|| format!("failed to flush isolated {operation} request"))?;
-    }
+            .with_context(|| format!("isolated {operation} stdout was unavailable"))?,
+        Arc::clone(&output_bound_exceeded),
+    );
+    let stderr_reader = spawn_bounded_worker_output_reader(
+        child
+            .stderr
+            .take()
+            .with_context(|| format!("isolated {operation} stderr was unavailable"))?,
+        Arc::clone(&output_bound_exceeded),
+    );
+    let stdin_writer = encoded_request
+        .map(|request| {
+            let stdin = child
+                .stdin
+                .take()
+                .with_context(|| format!("isolated {operation} stdin was unavailable"))?;
+            Ok::<_, anyhow::Error>(spawn_worker_input_writer(stdin, request))
+        })
+        .transpose()?;
     let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if child
+    let (status, forced_outcome) = loop {
+        if output_bound_exceeded.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .with_context(|| format!("failed to reap isolated {operation}"))?;
+            break (status, Some(IsolatedWorkerOutcome::OutputBound));
+        }
+        if let Some(status) = child
             .try_wait()
             .with_context(|| format!("failed to observe isolated {operation}"))?
-            .is_some()
         {
-            break;
+            break (status, None);
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("isolated {operation} exceeded its time bound");
+            let status = child
+                .wait()
+                .with_context(|| format!("failed to reap isolated {operation}"))?;
+            break (status, Some(IsolatedWorkerOutcome::Deadline));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdin_result = stdin_writer
+        .map(|writer| join_worker_input_writer(writer, operation))
+        .transpose();
+    let stdout = join_worker_output_reader(stdout_reader, operation, "stdout")?;
+    let stderr = join_worker_output_reader(stderr_reader, operation, "stderr")?;
+    let forced_outcome = forced_outcome.or_else(|| {
+        output_bound_exceeded
+            .load(Ordering::Relaxed)
+            .then_some(IsolatedWorkerOutcome::OutputBound)
+    });
+    if let Some(outcome) = forced_outcome {
+        return Err(IsolatedWorkerFailure::new(
+            outcome,
+            format!("isolated {operation} ended with {}", outcome.as_str()),
+        )
+        .into());
     }
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to await isolated {operation}"))?;
-    if output.stdout.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
-        || output.stderr.len() > MAX_PLANNING_WORKER_OUTPUT_BYTES
-    {
-        anyhow::bail!("isolated {operation} exceeded its output bound");
+    if !status.success() {
+        return Err(IsolatedWorkerFailure::new(
+            IsolatedWorkerOutcome::ProcessFailure,
+            format!(
+                "isolated {operation} exited with {}: {}",
+                status,
+                String::from_utf8_lossy(&stderr)
+                    .trim()
+                    .chars()
+                    .take(4_096)
+                    .collect::<String>()
+            ),
+        )
+        .into());
     }
-    if !output.status.success() {
-        anyhow::bail!(
-            "isolated {operation} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .take(4_096)
-                .collect::<String>()
-        );
+    stdin_result?;
+    serde_json::from_slice(&stdout).map_err(|error| {
+        IsolatedWorkerFailure::new(
+            IsolatedWorkerOutcome::InvalidResponse,
+            format!("isolated {operation} returned invalid JSON: {error}"),
+        )
+        .into()
+    })
+}
+
+#[cfg(not(test))]
+fn spawn_worker_input_writer(
+    mut stdin: std::process::ChildStdin,
+    request: Vec<u8>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    use std::io::Write as _;
+
+    std::thread::spawn(move || {
+        stdin.write_all(&request)?;
+        stdin.flush()
+    })
+}
+
+#[cfg(not(test))]
+fn join_worker_input_writer(
+    writer: std::thread::JoinHandle<std::io::Result<()>>,
+    operation: &str,
+) -> anyhow::Result<()> {
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("isolated {operation} stdin writer panicked"))?
+        .with_context(|| format!("failed to write isolated {operation} request"))
+}
+
+#[cfg(not(test))]
+fn spawn_bounded_worker_output_reader<Reader>(
+    reader: Reader,
+    output_bound_exceeded: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    Reader: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        read_bounded_worker_output(
+            reader,
+            MAX_PLANNING_WORKER_OUTPUT_BYTES,
+            &output_bound_exceeded,
+        )
+    })
+}
+
+fn read_bounded_worker_output<Reader>(
+    mut reader: Reader,
+    limit: usize,
+    output_bound_exceeded: &AtomicBool,
+) -> std::io::Result<Vec<u8>>
+where
+    Reader: std::io::Read,
+{
+    let mut retained = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&chunk[..read.min(remaining)]);
+        if read > remaining {
+            output_bound_exceeded.store(true, Ordering::Relaxed);
+        }
     }
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("isolated {operation} returned invalid JSON"))
+}
+
+#[cfg(not(test))]
+fn join_worker_output_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    operation: &str,
+    stream: &str,
+) -> anyhow::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("isolated {operation} {stream} reader panicked"))?
+        .with_context(|| format!("failed to read isolated {operation} {stream}"))
 }
 
 fn run_template_worker(authority: NativeRuntimeAuthority) -> anyhow::Result<()> {
@@ -4446,6 +4738,60 @@ mod tests {
     use super::*;
     use icn_contracts::ModelInventory as _;
 
+    #[test]
+    fn isolated_worker_failures_retain_structured_outcomes() {
+        assert_eq!(PLANNING_WORKER_TIMEOUT_SECONDS, 300);
+        for (outcome, expected, public_code, public_message) in [
+            (
+                IsolatedWorkerOutcome::Deadline,
+                "deadline",
+                "planner_timeout",
+                "Hardware assessment took longer than five minutes.",
+            ),
+            (
+                IsolatedWorkerOutcome::InvalidResponse,
+                "invalid_response",
+                "planner_invalid_response",
+                "The native hardware assessment returned an invalid response.",
+            ),
+            (
+                IsolatedWorkerOutcome::OutputBound,
+                "output_bound",
+                "planner_output_limit",
+                "The native hardware assessment exceeded its output limit.",
+            ),
+            (
+                IsolatedWorkerOutcome::ProcessFailure,
+                "process_failure",
+                "planner_process_failed",
+                "The native hardware assessment process failed.",
+            ),
+        ] {
+            let error = anyhow::Error::new(IsolatedWorkerFailure::new(outcome, "failure"));
+            assert_eq!(
+                error
+                    .downcast_ref::<IsolatedWorkerFailure>()
+                    .map(|failure| failure.outcome.as_str()),
+                Some(expected)
+            );
+            assert_eq!(outcome.public_failure(), (public_code, public_message));
+        }
+    }
+
+    #[test]
+    fn worker_output_is_drained_but_retained_only_to_its_bound() {
+        let output_bound_exceeded = AtomicBool::new(false);
+        let output = read_bounded_worker_output(
+            std::io::Cursor::new(b"0123456789"),
+            4,
+            &output_bound_exceeded,
+        )
+        .expect("read bounded output");
+
+        assert_eq!(output, b"0123");
+        assert!(output_bound_exceeded.load(Ordering::Relaxed));
+    }
+
     fn test_model_instance_allocation() -> icn_contracts::models::ModelInstanceAllocation {
         icn_contracts::models::ModelInstanceAllocation {
             context_window_tokens: 1,
@@ -4637,7 +4983,7 @@ mod tests {
             assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
-            planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            planning_gate: PlanningGate::new(1),
             calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
         };
 
@@ -4798,7 +5144,7 @@ mod tests {
             assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
-            planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            planning_gate: PlanningGate::new(1),
             calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
         };
         let snapshot = HardwareSnapshot {
@@ -4968,7 +5314,7 @@ mod tests {
             assessment_work_gates: Arc::new(tokio::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
-            planning_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            planning_gate: PlanningGate::new(1),
             calibration: Arc::new(tokio::sync::Mutex::new(CalibrationCache::default())),
         });
         let profile = ModelPreviewProfile {

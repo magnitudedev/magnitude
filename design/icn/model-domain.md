@@ -259,6 +259,9 @@ Candidate records contain assessment facts; recommendation membership and intent
 portfolio. Onboarding presents installed models and selected portfolio entries, not every
 compatible candidate. Complete execution assessments always contain measured performance.
 Operational failure remains a failed refresh and is never published as an empty ready result.
+If ICN reports an operational assessment failure for any valid catalog target, ACN publishes the
+recommendation lifecycle as failed with that safe typed failure. It does not discard the failed
+target and publish a partial or empty ready portfolio.
 
 ### Provider offering
 

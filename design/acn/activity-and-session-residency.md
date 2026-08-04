@@ -27,6 +27,7 @@ applies_to:
   - packages/agent/src/events.ts
   - packages/agent/src/display/**
   - packages/agent/src/display-view/**
+  - packages/agent/src/model/model-request-activity.ts
   - packages/agent/src/model/model-resolver.ts
   - packages/agent/src/index.ts
   - packages/agent/src/execution/execution-manager.ts
@@ -36,8 +37,9 @@ applies_to:
   - packages/agent/src/projections/compaction.ts
   - packages/agent/src/projections/agent-lifecycle.ts
   - packages/agent/src/display-view/semantic.ts
-  - packages/client-common/src/utils/actor-work.ts
-  - packages/client-common/src/utils/model-request-progress.ts
+  - packages/client-common/src/utils/actor-status.ts
+  - packages/client-common/src/hooks/use-stabilized-root-detail.ts
+  - packages/client-common/src/utils/root-detail.ts
   - packages/agent/tests/session-work-status.test.ts
   - cli/src/**
   - desktop/src/**
@@ -56,6 +58,14 @@ server, registration, and private ICN are ready.
 
 Finite RPCs keep ACN alive for the full request. Work that continues after a request—such as an
 agent turn or model operation—keeps its own claim until it finishes.
+
+Elapsed RPC response time does not imply ACN failure and cannot trigger process replacement. A
+finite request remains bound to its selected ACN until it completes, the caller cancels it, the
+transport concretely fails, or ACN authoritatively retires.
+
+ACN's loopback HTTP server has no connection-idle deadline. Bun considers a request idle while its
+handler is still running but has not emitted response bytes, so a non-zero server idle timeout would
+silently impose an operation-duration deadline on unary RPCs such as model download and loading.
 
 Operation cancellation follows semantic ownership rather than the initiating transport. Shared
 work admitted by a domain service is owned in that service's scope; losing one request cancels only
@@ -120,17 +130,17 @@ Retirement does not wait for that fiber's downstream finalizers: the generation 
 late event from being published, while cleanup completes asynchronously.
 
 Active local-model request progress is transient session-runtime state, not an app event or chat
-message. It is keyed by fork and included in every live display snapshot, so a reconnect sees the
-current request while it remains active. It disappears when generation begins or the request
-stream ends and is never written to session history. Clients may delay rendering briefly to avoid
-flashing short prefills, but they do not infer token progress or preserve a second copy.
+message. It is keyed by fork and composed into the corresponding actor's live display status, so a
+reconnect sees the current request while it remains active. It disappears when generation begins
+or the request stream ends and is never written to session history. Clients do not infer token
+progress or preserve a second server-state copy.
 
-Model-request progress enters the event engine as timestamped ambient observations through one
+Model-request progress enters the event engine as ambient observations through one
 progress sink shared by ACN preparation and provider execution. A display-owned projection reduces
 those observations into the current per-fork request activity. Display views
 read that projection through the normal projection-consumer path, so activity changes invalidate
 and rematerialize snapshots without an app event or a separately merged runtime stream. Projection
-evaluation never reads a clock; observation time is fixed at ambient ingress.
+evaluation never reads a clock.
 
 The CLI timeline follows appended tail content while the user remains attached to the bottom. New
 messages do not reposition a short page: they occupy the next available rows, and the viewport moves
@@ -145,12 +155,28 @@ One blank terminal row separates history from the rail above it. No full blank r
 activity label. Instead, the terminal-background label begins with a cyan `┏━` branch whose
 downstroke meets the composer's left border on the immediately following row. The composer's own
 top padding provides separation from the editor without an additional connector row. This makes
-the activity a header of the input rather than part of conversation history. Root-model loading,
-conversation prefill, and model response activity share that same stable label. Model loading is shown
-immediately. Request preparation and prefill use a short anti-flicker delay. Once generation begins,
-the row becomes the composable Working display, including thinking, tools, advisor activity, and
-worker counts. Manual history detachment never moves or hides the live rail and never causes the
-rail to force the history back to its tail.
+the activity a header of the input rather than part of conversation history. A root turn displays
+the composable `Working · elapsed` row immediately. Its optional secondary detail is waiting for
+model, prefill, or thinking. Chatting, tool execution, delegated work, and later gaps have no
+secondary detail. Prefill includes live completed, total, and cached token counts. Model loading
+replaces the whole Working row and is shown
+immediately with its authoritative percentage and animated Braille spinner. Manual history
+detachment never moves or hides the live rail and never causes the rail to force the history back
+to its tail.
+
+Clients stabilize only changes between Working detail tags. A different ordinary tag must remain current
+for 150 milliseconds before it replaces the displayed tag; another change restarts that settling
+window, allowing extremely brief details to be skipped. Payload changes within the same tag,
+especially prefill token counts, remain live and do not restart the window. Waiting for model is
+eligible only before the current turn begins substantive model activity and appears only after that
+condition has lasted for one second from the authoritative turn start. Observing prefill or generation
+permanently ends that initial-wait phase for the turn, including any gap between prefill and thinking.
+Each chained turn receives its own wait threshold. Starting a new chain, leaving Working, model loading,
+model stopping, low-memory failure, and interruption bypass ordinary stabilization. Stabilization never
+changes or delays the chain timer. Only the visible secondary keyword pulses; token counts, Working, and
+the timer remain stable. The terminal samples the dot and keyword's shared eased pulse at its 30 FPS
+render cadence. Discrete animations use the same clock but declare their own frame duration, so increasing
+pulse smoothness does not speed up spinners, blinking, shimmer, or streaming reveal.
 
 When the root work chain becomes stable, the transient rail is replaced at the same tail position by
 a durable work summary immediately after the chain's final assistant, tool, or worker output and
@@ -250,18 +276,19 @@ selection.
 Loading also presents a dim Stop control immediately adjacent to its progress. The action carries
 only the exact model-instance identity from the slot. Any source of stopping—Hardware, the rail,
 replacement, or model policy—transitions the exact bound native instance to `Stopping`, so the
-rail renders one muted stopping state without retaining the initiating action.
+rail renders a pulsing square, `Stopping model`, and the authoritative release reason without
+retaining the initiating action. User stop, idle timeout, replacement, and memory pressure are
+presented respectively as user requested, idle timeout, model replacement, and low memory.
 
 Local request preparation publishes preparing activity before acquiring the selected model. Its
-request identifier remains absent until ICN accepts the native request, and that handoff preserves
-the activity start time. If preparation or provider start fails, orchestration clears the activity;
-after provider acceptance the provider owns all later progress and clearing. Consequently a long
-model load satisfies the client's anti-flicker delay and the rail transitions directly into
-conversation loading when the slot becomes ready.
+request identifier remains absent until ICN accepts the native request. If preparation or provider
+start fails, orchestration clears the activity; after provider acceptance the provider owns all
+later progress and clearing.
 
-Root work is a durable phase machine. A root turn begins in a waiting-for-model phase. The execution
-adapter records one generation-start event for the turn before its first semantic thinking,
-assistant-message, or tool-input event; this moves the root into working and starts the clock.
+Root work is a durable phase machine. A root turn opens the active chain immediately and fixes its
+wall-clock start time. The execution adapter records one generation-start event for the turn before
+its first semantic thinking, assistant-message, or tool-input event; this starts the separate
+productive interval.
 A chain-continuing outcome closes that productive interval and returns to waiting-for-model before
 the next turn. An active worker keeps the productive clock running across that root-model wait; if
 the final worker settles before generation begins, the clock pauses until generation. A terminal
@@ -269,11 +296,11 @@ root outcome either completes the chain or moves to waiting-for-workers, whose e
 productive until the final root worker settles. Interrupts close the current interval without
 manufacturing time for a wait-only turn.
 
-The root projection owns accumulated productive milliseconds and the current running interval.
-Display snapshots expose that authoritative state, and clients only add the current clock delta
-while that interval is open. Transient request progress controls loading and prefill copy but never
-owns, reconstructs, or adjusts the work timer. This keeps live and replayed completed timing
-identical even when a chain crosses several model requests.
+The root projection owns the chain start, accumulated productive milliseconds, and the current
+productive interval. While Working, clients derive elapsed wall time from the unchanged chain start,
+including admission, loading, prefill, retry waits, and chained turns. The durable completed summary
+continues to use productive time only. Transient request progress controls prefill copy but never
+owns, reconstructs, or adjusts either clock.
 
 Completed root turns attribute the selected model display name independently from optional native
 decode telemetry. Work summaries therefore identify both local and cloud models. A summary includes
@@ -281,16 +308,15 @@ decode tokens per second only when every contributing request in the chain suppl
 measurement; clients never estimate missing cloud throughput.
 
 Clients distinguish an active root chain from an open productive interval. Authoritative model
-loading and request progress takes precedence when present. When a root is waiting for a provider
-that exposes no granular request progress and no worker keeps the productive interval open, clients
-show a generic model-wait state rather than presenting the paused accumulated duration as a running
-Working timer. Providers do not receive synthetic progress for presentation purposes.
+loading replaces the Working presentation while present. Otherwise an active chain always displays
+Working with its running chain timer; a provider wait without granular progress uses the required
+pending-response activity. Providers do not receive synthetic progress for presentation purposes.
 
-Thinking activity follows the semantic response lifecycle. Thinking start opens the activity,
-thinking chunks refine its copy, and thinking end closes it immediately unless another
-independently active derived activity takes precedence. Assistant-message start and streamed answer
-text also close stale or interleaved thinking activity, so the live rail never claims the model is
-thinking while it is actively emitting its answer. The lifecycle projection stores only the
+Thinking activity follows the semantic response lifecycle. Thinking start opens the activity and
+thinking end closes it unless another independently active derived activity takes precedence.
+Assistant-message start and streamed answer text close stale or interleaved thinking activity, so
+the live rail never claims the model is thinking while it is actively
+emitting its answer. The lifecycle projection stores only the
 authoritative response and tool lifecycle fields; display activity is derived from those fields at
 the display-view boundary rather than retained as a second synchronized copy. Clients never infer
 or retain thinking state from rendered text.
