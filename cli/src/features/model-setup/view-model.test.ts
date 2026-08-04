@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
+  DownloadAttemptIdSchema,
   ModelInstanceIdSchema,
   ModelSlotConfiguredLocal,
   PRIMARY_SLOT_ID,
@@ -142,6 +143,7 @@ describe("deriveOnboardingModelSetupView", () => {
     const candidate = makeCatalogCandidate({
       download: {
         _tag: "Failed",
+        attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
         completedBytes: 16,
         totalBytes: 16,
         failure: { code: "interrupted", message: "Download was interrupted", retryable: true },

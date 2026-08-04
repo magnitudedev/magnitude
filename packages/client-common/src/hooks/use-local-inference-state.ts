@@ -6,6 +6,7 @@ import {
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
   type ModelInstanceId,
+  type DownloadAttemptId,
   type ModelOfferingTargetId,
   type ProviderModelIdentity,
   type SlotId,
@@ -53,8 +54,8 @@ export function useLocalModelActions() {
         payload: { targetId },
         reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
       }), [download]),
-    cancel: useCallback((targetId: ModelOfferingTargetId) => cancel({
-      payload: { targetId },
+    cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => cancel({
+      payload: { attemptIds },
       reactivityKeys: [LocalModelsMirror.id],
     }), [cancel]),
     dismissFailure: useCallback((targetId: ModelOfferingTargetId) => dismiss({

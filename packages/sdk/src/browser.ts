@@ -77,8 +77,10 @@ export {
   LocalModelsMirror,
   OnboardingMirror,
   ModelOfferingTargetIdSchema,
+  DownloadAttemptIdSchema,
   CatalogCandidateIdSchema,
   ModelServingConfigurationIdSchema,
+  ModelInstanceIdSchema,
   RecommendationIdSchema,
   LocalModelsStateSchema,
 } from "@magnitudedev/acn-protocol"
@@ -92,6 +94,7 @@ export {
 } from "@magnitudedev/ai/provider/model"
 
 export type {
+  DownloadAttemptId,
   ModelOfferingTargetId,
   CatalogCandidateId,
   RecommendationId,

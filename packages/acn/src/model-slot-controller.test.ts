@@ -12,6 +12,7 @@ import {
 } from "effect"
 import {
   CatalogCandidateIdSchema,
+  DownloadAttemptIdSchema,
   ModelOfferingTargetIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
@@ -255,8 +256,10 @@ const makeHarness = (options: {
       installedPackageIds: Effect.succeed(
         new Set((options.projectedInstalled ?? options.installed) === false ? [] : [packageId]),
       ),
-      acquireTarget: () => Effect.void,
-      cancelTargetDownload: () => Effect.void,
+      admitTarget: () => Effect.succeed([
+        DownloadAttemptIdSchema.make("test-download"),
+      ]),
+      cancelAttempts: () => Effect.void,
       dismissTargetFailure: () => Effect.void,
       removeTargetPackages: () => Effect.void,
     })),
@@ -434,6 +437,28 @@ describe("ModelSlotController load admission", () => {
         yield* Fiber.join(loading)
         expect(yield* Ref.get(harness.loadCalls)).toBe(1)
         expect(yield* Ref.get(harness.previewCalls)).toBe(0)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("acknowledges the exact published instance before it becomes Ready", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness()
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        const admitting = yield* controller.admitModelLoad(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* Deferred.await(harness.loadEntered)
+        yield* Deferred.succeed(harness.releaseLoad, undefined)
+
+        const admission = yield* Fiber.join(admitting)
+        const snapshot = yield* controller.snapshot
+        expect(snapshot.state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          instance: Option.some({
+            id: admission.instanceId,
+            lifecycle: { _tag: "Loading" },
+          }),
+        })
       }).pipe(Effect.provide(harness.layer))
     })))
   })

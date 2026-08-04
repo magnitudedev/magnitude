@@ -16,6 +16,7 @@ import {
   type DownloadAttempt,
   type DownloadAttemptId,
   type LocalInferenceError,
+  type ModelDownloadAdmission,
   type ModelPackage,
   type ModelPackageEntry,
   type ModelPackageId,
@@ -91,39 +92,8 @@ type PackageAcquisition =
     }> }
   | { readonly _tag: "Failed"; readonly attemptId: DownloadAttemptId; readonly completedBytes: number
       readonly totalBytes: number; readonly failure: LocalModelMutationFailed }
-  | { readonly _tag: "Cancelled" }
+  | { readonly _tag: "Cancelled"; readonly attemptId: DownloadAttemptId }
   | { readonly _tag: "Installed"; readonly path: string }
-
-export type ExactAttemptDecision =
-  | { readonly _tag: "Wait" }
-  | { readonly _tag: "Complete" }
-  | { readonly _tag: "Fail"; readonly failure: LocalModelMutationFailed }
-
-export const exactAttemptDecision = (
-  attempt: DownloadAttempt,
-): ExactAttemptDecision => {
-  switch (attempt._tag) {
-    case "Pending":
-    case "Downloading":
-      return { _tag: "Wait" }
-    case "Completed":
-      return { _tag: "Complete" }
-    case "Failed":
-      return {
-        _tag: "Fail",
-        failure: new LocalModelMutationFailed(attempt.failure),
-      }
-    case "Cancelled":
-      return {
-        _tag: "Fail",
-        failure: new LocalModelMutationFailed({
-          code: "local_model_download_cancelled",
-          message: "The selected local model download was cancelled",
-          retryable: true,
-        }),
-      }
-  }
-}
 
 const packageAcquisition = (
   modelPackage: ModelPackage,
@@ -138,7 +108,9 @@ const packageAcquisition = (
   if (attempt._tag === "Pending" || attempt._tag === "Downloading") {
     return { _tag: "Downloading", attempt }
   }
-  if (attempt._tag === "Cancelled") return { _tag: "Cancelled" }
+  if (attempt._tag === "Cancelled") {
+    return { _tag: "Cancelled", attemptId: attempt.id }
+  }
   if (attempt._tag === "Failed") {
     return {
       _tag: "Failed",
@@ -155,11 +127,11 @@ export interface LocalModelPackagesApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
-  readonly acquireTarget: (
+  readonly admitTarget: (
     target: ModelOfferingTarget,
-  ) => Effect.Effect<void, LocalInferenceError>
-  readonly cancelTargetDownload: (
-    target: ModelOfferingTarget,
+  ) => Effect.Effect<ModelDownloadAdmission["attemptIds"], LocalInferenceError>
+  readonly cancelAttempts: (
+    attemptIds: ModelDownloadAdmission["attemptIds"],
   ) => Effect.Effect<void, LocalInferenceError>
   readonly dismissTargetFailure: (
     target: ModelOfferingTarget,
@@ -277,6 +249,10 @@ export const LocalModelPackagesLive: Layer.Layer<
                     },
                   }
             case "Cancelled":
+              return {
+                _tag: "DownloadCancelled",
+                attemptId: acquisition.attemptId,
+              }
             case "NotInstalled":
               return { _tag: "NotInstalled" }
           }
@@ -322,55 +298,26 @@ export const LocalModelPackagesLive: Layer.Layer<
   const targetPackages = (target: ModelOfferingTarget) =>
     target._tag === "Package" ? [target.package] : [target.target, target.draft]
 
-  const awaitAttempt = (
-    attemptId: DownloadAttemptId,
-  ): Effect.Effect<void, LocalInferenceError> => Effect.gen(function* () {
-    const native = yield* client.models.getModelDownload({
-      path: { attempt_id: attemptId },
-    }).pipe(
-      Effect.mapError((error) => mutationFailure("get_model_download_failed", error)),
-    )
-    yield* downloads.observeAttempt(native)
-    const attempt = yield* downloadAttemptFromIcn(native).pipe(
-      Effect.mapError((error) => mutationFailure("decode_model_download_attempt_failed", error)),
-    )
-    const decision = exactAttemptDecision(attempt)
-    switch (decision._tag) {
-      case "Complete":
-        return
-      case "Fail":
-        return yield* decision.failure
-      case "Wait":
-        yield* Effect.sleep("250 millis")
-        return yield* awaitAttempt(attemptId)
-    }
-  })
-
   return LocalModelPackages.of({
     snapshot: mirror.get,
     changes: mirror.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
-    acquireTarget: (target) => Effect.gen(function* () {
+    admitTarget: (target) => Effect.gen(function* () {
       const attemptIds = yield* Effect.forEach(
         targetPackages(target),
         startDownload,
         { concurrency: "unbounded" },
       )
-      yield* Effect.forEach(
-        attemptIds,
-        awaitAttempt,
-        { concurrency: "unbounded", discard: true },
-      )
+      yield* project
+      const [first, ...rest] = attemptIds
+      if (first === undefined) {
+        return yield* Effect.die("A model target must contain at least one package")
+      }
+      return [first, ...rest]
     }),
-    cancelTargetDownload: (target) => Effect.gen(function* () {
-      const entries = (yield* mirror.get).state.entries
-      const attempts = targetPackages(target).flatMap((modelPackage) => {
-        const state = entries.find((entry) =>
-          entry.package.id === modelPackage.id)?.localState
-        return state?._tag === "Downloading" ? [state.attemptId] : []
-      })
-      yield* Effect.forEach(attempts, (attemptId) => client.models.cancelModelDownload({
+    cancelAttempts: (attemptIds) => Effect.gen(function* () {
+      yield* Effect.forEach(attemptIds, (attemptId) => client.models.cancelModelDownload({
         path: { attempt_id: attemptId },
       }).pipe(
         Effect.mapError((error) => mutationFailure("cancel_model_download_failed", error)),
