@@ -1,4 +1,5 @@
 import React, { memo, useMemo } from 'react'
+import { stripTrailingLineBreaks } from '@magnitudedev/client-common'
 import { useStreamingReveal } from '../../../hooks/use-streaming-reveal'
 import { useTheme } from '../../../hooks/use-theme'
 import { buildMarkdownColorPalette } from '../../../utils/theme'
@@ -22,10 +23,11 @@ export const AssistantMessage = memo(function AssistantMessage({
   const theme = useTheme()
   const markdownPalette = useMemo(() => buildMarkdownColorPalette(theme), [theme])
   const { displayedContent, showCursor } = useStreamingReveal(content, isStreaming, isInterrupted)
+  const displayContent = stripTrailingLineBreaks(displayedContent)
   const box = useLocalWidth()
   const contentWidth = box.width ?? 79
   const codeBlockWidth = Math.max(20, contentWidth - 2)
-  const { blocks, pendingText } = useStreamingMarkdownCache(displayedContent, {
+  const { blocks, pendingText } = useStreamingMarkdownCache(displayContent, {
     palette: markdownPalette,
     codeBlockWidth,
     streaming: isStreaming,
