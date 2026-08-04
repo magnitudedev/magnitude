@@ -6,6 +6,15 @@ export const LIST_BULLET_GLYPH = '• '
 /** Max number of lines to show in collapsed previews */
 export const PREVIEW_LINE_CAP = 3
 
+/**
+ * Returns the presentation form of text without terminal line breaks. During
+ * streaming this acts as a suffix buffer: line breaks are rendered normally
+ * as soon as later content makes them internal.
+ */
+export function stripTrailingLineBreaks(content: string): string {
+  return content.replace(/[\r\n]+$/u, '')
+}
+
 export function wrapTextToVisualLines(text: string, maxWidth: number): string[] {
   const safeWidth = Math.max(1, Math.floor(maxWidth))
   const segments = text.split('\n')
