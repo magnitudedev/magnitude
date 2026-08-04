@@ -84,61 +84,62 @@ describe('useStreamingReveal', () => {
     expect(isNoop()).toBe(true)
   })
 
-  test('reveals during streaming, drains after stream end, then unsubscribes', () => {
-    const content = 'x'.repeat(40)
+  test('catches up proportionally on every animation frame, then snaps on completion', () => {
+    const content = 'x'.repeat(100)
 
     // Stream starts empty, content arrives
     render('', true)
     expect(isLive()).toBe(true)
 
-    // Ticks advance the reveal while streaming
-    animationTime += 80
+    // Each shared animation frame reveals 15% of the remaining content.
+    animationTime += 33
     let state = render(content, true)
-    expect(state.displayedContent.length).toBeGreaterThan(0)
-    expect(state.displayedContent.length).toBeLessThan(content.length)
+    expect(state.displayedContent.length).toBe(15)
     expect(isLive()).toBe(true)
 
-    // Stream ends mid-reveal — linear drain keeps the subscription
-    animationTime += 80
+    animationTime += 33
+    state = render(content, true)
+    expect(state.displayedContent.length).toBe(27)
+
+    // Normal completion reveals the authoritative response immediately.
     state = render(content, false)
-    expect(isLive()).toBe(true)
-
-    // Drain to completion
-    for (let i = 0; i < 20 && state.isCatchingUp; i++) {
-      animationTime += 80
-      state = render(content, false)
-    }
     expect(state.displayedContent).toBe(content)
     expect(state.isCatchingUp).toBe(false)
-
-    // Caught up and idle — next render unsubscribes
-    state = render(content, false)
     expect(isNoop()).toBe(true)
     expect(state.showCursor).toBe(false)
   })
 
-  test('drains content growth on a component that never streamed', () => {
+  test('does not reveal more than once within one animation frame', () => {
+    render('', true)
+    animationTime += 33
+
+    let state = render('x'.repeat(100), true)
+    expect(state.displayedContent.length).toBe(15)
+
+    state = render('x'.repeat(120), true)
+    expect(state.displayedContent.length).toBe(15)
+
+    animationTime += 33
+    state = render('x'.repeat(120), true)
+    expect(state.displayedContent.length).toBe(30)
+  })
+
+  test('snaps content growth on a component that is not streaming', () => {
     const initial = 'short'
     let state = render(initial, false)
     expect(state.displayedContent).toBe(initial)
     expect(isNoop()).toBe(true)
 
-    // Content grows without a streaming phase — must reveal and re-quiesce
     const grown = initial + '!'.repeat(30)
     state = render(grown, false)
-    expect(isLive()).toBe(true)
-    for (let i = 0; i < 20 && state.isCatchingUp; i++) {
-      animationTime += 80
-      state = render(grown, false)
-    }
     expect(state.displayedContent).toBe(grown)
-    state = render(grown, false)
     expect(isNoop()).toBe(true)
+    expect(state.showCursor).toBe(false)
   })
 
   test('interrupt snaps to full content without subscribing', () => {
     render('', true)
-    animationTime += 80
+    animationTime += 33
     const state = render('interrupted content', true, true)
     expect(state.displayedContent).toBe('interrupted content')
     expect(isNoop()).toBe(true)
