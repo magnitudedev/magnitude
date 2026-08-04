@@ -26,6 +26,12 @@ applies_to:
 One data root has one canonical ACN. Every ACN is visible, every lifecycle is authoritative, and
 no cooperative shutdown or child operation may retain process ownership indefinitely.
 
+> **Known safety gap:** the current registry, launch, recovery, and replacement implementation does
+> not make these guarantees convergent under independent different-version clients. The complete
+> failure taxonomy and required replacement protocol are tracked in
+> [ACN coordination safety](../../specs/26-08-03/acn-coordination-safety.md). Until that cutover is
+> complete, this document describes the intended guarantees rather than fully satisfied invariants.
+
 ## Boundaries
 
 ```text
@@ -160,7 +166,9 @@ process that is draining.
 
 ## Finite failure behavior
 
-Every cross-process phase has a deadline or an independently enforceable fallback:
+Every process-coordination and removal phase has a deadline or an independently enforceable
+fallback. An admitted RPC operation is not a process-coordination phase: its domain or caller owns
+its completion, and elapsed response time is not evidence that ACN died.
 
 | Phase | Bound / terminal behavior |
 | --- | --- |
@@ -168,7 +176,7 @@ Every cross-process phase has a deadline or an independently enforceable fallbac
 | spawn election | bounded wait; stale election quarantine |
 | candidate publication | deadline; terminate and reap exact candidate |
 | ACN ownership acquisition | deadline; candidate stops |
-| RPC response start | deadline; recover against a different ACN |
+| RPC operation | no transport deadline; concrete transport failure or authoritative retirement recovers |
 | subscription shutdown writes | detach first; concurrent bounded sends and closes |
 | application finalizers | bounded scope close |
 | peer shutdown | POST -> SIGINT -> SIGKILL, each bounded |
@@ -198,6 +206,12 @@ Transport failure retries finite work once through recovery. Domain failure and 
 do not trigger ACN recovery. Resident subscriptions recover only after their terminal control or a
 liveness/transport failure. Recovery never knowingly selects the exact failed ACN ID.
 
+RPC duration never triggers recovery. Once a request is dispatched to the selected ACN, it remains
+bound to that endpoint until it completes, the caller cancels it, the transport concretely fails,
+or ACN authoritatively retires. A connection refusal or reset, process exit, malformed or
+prematurely ended response, or authoritative retirement may initiate recovery; absence of a
+response by an arbitrary deadline may not.
+
 The CLI may call `prepare` before rendering to avoid a blank bootstrap frame. Other clients may
 render immediately and observe the same state. `retry` re-enters selection through the same client
 lifecycle owner; it does not create a second path.
@@ -209,6 +223,7 @@ lifecycle owner; it does not create a second path.
 - Every client has one selected endpoint authority.
 - Discovery, launch, and child spawning contain no recovery or replacement policy.
 - `/health`, RPC admission, and shutdown read one ACN lifecycle authority.
-- A failed or hung ACN can delay recovery only by explicit finite bounds.
+- Concrete ACN transport failure and authoritative retirement enter bounded recovery.
+- Operation duration cannot reject a live ACN or authorize a replacement owner.
 - ACN shutdown cannot be blocked by client backpressure.
 - A hung ICN operation cannot prevent bounded ICN termination or ACN replacement.

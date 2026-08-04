@@ -1159,6 +1159,32 @@
             "type": "object",
             "required": [
               "requestId",
+              "targetId",
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "requestId": {
+                "$ref": "#/components/schemas/ModelAssessmentRequestId"
+              },
+              "targetId": {
+                "$ref": "#/components/schemas/ModelOfferingTargetId"
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "AssessmentFailed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "requestId",
               "failure",
               "_tag"
             ],

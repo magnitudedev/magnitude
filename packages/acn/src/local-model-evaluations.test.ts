@@ -1,9 +1,66 @@
+import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
 
-import { formatLocalModelEvaluationFailure } from "./local-model-evaluations"
+import {
+  formatLocalModelEvaluationFailure,
+  localModelAssessmentFailure,
+  localModelAssessmentResultFromIcn,
+} from "./local-model-evaluations"
+
+describe("localModelAssessmentResultFromIcn", () => {
+  it("preserves a typed assessment failure without native diagnostics", () => {
+    const result = Effect.runSync(localModelAssessmentResultFromIcn({
+      _tag: "AssessmentFailed",
+      requestId: "assessment-0",
+      targetId: "target-0",
+      failure: {
+        code: "planner_timeout",
+        message: "Hardware assessment took longer than five minutes.",
+        retryable: true,
+      },
+    }))
+
+    expect(result).toEqual({
+      _tag: "AssessmentFailed",
+      failure: {
+        code: "planner_timeout",
+        message: "Hardware assessment took longer than five minutes.",
+        retryable: true,
+      },
+    })
+    expect(JSON.stringify(result)).not.toContain("isolated native planner")
+  })
+})
+
+describe("localModelAssessmentFailure", () => {
+  it("returns the first operational failure in a batch", () => {
+    expect(localModelAssessmentFailure([{
+      _tag: "InvalidTarget",
+      message: "Invalid package",
+    }, {
+      _tag: "AssessmentFailed",
+      failure: {
+        code: "planner_timeout",
+        message: "Hardware assessment took longer than five minutes.",
+        retryable: true,
+      },
+    }])).toEqual({
+      code: "planner_timeout",
+      message: "Hardware assessment took longer than five minutes.",
+      retryable: true,
+    })
+  })
+
+  it("does not classify invalid targets as operational failures", () => {
+    expect(localModelAssessmentFailure([{
+      _tag: "InvalidTarget",
+      message: "Invalid package",
+    }])).toBeUndefined()
+  })
+})
 
 describe("formatLocalModelEvaluationFailure", () => {
-  it("preserves structured remote error details", () => {
+  it("preserves structured remote error details for internal diagnostics", () => {
     const detail = formatLocalModelEvaluationFailure({
       _tag: "GeneratedClientRemoteError",
       operationId: "assessModels",

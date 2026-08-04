@@ -58,6 +58,14 @@ backend selection, worker generation, system-memory reserve, available physical/
 worker footprint, selected parallel sequences, physical context allocation, eviction latency,
 status, and stable error diagnostics.
 
+Isolated native planning reports semaphore queue duration separately from worker duration, together
+with operation kind, profile count, and a bounded terminal outcome. This distinction makes scheduler
+saturation, native planning latency, deadlines, process failures, and response failures observable
+without exposing model paths or request payloads.
+Native worker stdout and stderr are concurrently drained into bounded retention so pipe capacity
+cannot become hidden planner latency. Public assessment failures contain only stable codes and safe
+messages; native diagnostics remain private and bounded.
+
 Instrumentation must never record prompts, generated or reasoning text, image contents,
 authorization values, request headers, token arrays, tool arguments, full request structures, or
 query strings. Function instrumentation therefore skips arguments by default and opts safe fields
@@ -80,3 +88,5 @@ operation boundaries instead.
 - Trace and log providers flush during graceful shutdown.
 - With OTLP disabled, ICN remains functional and retains standard-error diagnostics.
 - Collector failure never changes an HTTP or inference domain result.
+- Native planner diagnostics distinguish queue time from worker time and identify bounded terminal
+  outcomes without recording model paths or assessment payloads.

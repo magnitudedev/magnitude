@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
+  LocalModelMutationFailed,
   PRIMARY_SLOT_ID,
   ProviderModelCatalogEntrySchema,
   SECONDARY_SLOT_ID,
@@ -11,7 +12,10 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { LocalModelEvaluations } from "./local-model-evaluations"
+import {
+  localModelAssessmentFailure,
+  LocalModelEvaluations,
+} from "./local-model-evaluations"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
@@ -136,6 +140,10 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
         }]
       : [])
     const assessed = yield* evaluations.assessMany(assessmentRequests)
+    const assessmentFailure = localModelAssessmentFailure(assessed)
+    if (assessmentFailure) {
+      return yield* new LocalModelMutationFailed(assessmentFailure)
+    }
     let assessmentIndex = 0
     const entries = configured.map((offering, index) => {
       const { target, profile } = offering.configuration

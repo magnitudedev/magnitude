@@ -88,8 +88,17 @@ Each profile produces one complete result:
   or
 - `Incompatible`, with a specific artifact or native-engine diagnostic.
 
-Invalid or incomplete targets are per-target results. Operational failures fail the request.
+Invalid or incomplete targets are `InvalidTarget` per-target results. Once a target identity is
+valid, a planner deadline, process failure, malformed response, output-bound violation, or
+performance-calibration failure is an `AssessmentFailed` per-target result with a stable safe code,
+message, and retryability. Such a failure does not erase completed sibling results or become model
+incompatibility. Failure to capture the shared request environment remains a request-wide failure.
 Assessment never installs, configures, offers, selects, or loads a model.
+
+An isolated planner has a five-minute watchdog. This is an operational safety bound, not an
+expected latency target. ICN terminates and reaps a worker that reaches the deadline. Worker stdout
+and stderr are drained while it runs, retained only to a fixed bound, and never exposed through the
+assessment result. Exceeding either output bound terminates the worker as a distinct failure.
 
 Memory accounting is evidence, not a categorical label. Every domain reports its capacity,
 required allocation, compatibility reserve, warning reserve, and remaining compatible headroom.
@@ -231,3 +240,5 @@ currently fits.
 - Loading reassesses the exact configuration it realizes.
 - Deleting assessment caches changes only latency and recomputation.
 - Assessing release-catalog targets never requires network access or a remote-header cache.
+- One target-specific operational failure cannot fail or discard other results in the same batch.
+- Planner diagnostics never cross the assessment API; callers receive stable typed failures.
