@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.33
+
+### Patch Changes
+
+- [`76f39df`](https://github.com/magnitudedev/magnitude/commit/76f39df010704575e8881e04e21d7fe8d45c4360) Thanks [@anerli](https://github.com/anerli)! - fix: preserve logic shard paths
+
 ## 0.0.1-alpha.32
 
 ### Patch Changes
