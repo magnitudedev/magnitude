@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.34
+
+### Patch Changes
+
+- [`f76256c`](https://github.com/magnitudedev/magnitude/commit/f76256c00739bf172e6d6a91da922345cba52e08) Thanks [@anerli](https://github.com/anerli)! - fix timeouts
+
 ## 0.0.1-alpha.33
 
 ### Patch Changes
