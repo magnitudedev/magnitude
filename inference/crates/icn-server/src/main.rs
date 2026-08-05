@@ -3272,7 +3272,9 @@ impl From<InventoryError> for ModelTransitionFailure {
 }
 
 impl NativeModelInstanceController {
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    // TMP: Approximate client-aware model residency until presence can select
+    // the connected 60-minute and disconnected 10-minute policies dynamically.
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
     fn load_failure(error: InventoryError) -> DomainModelFailure {
         let (code, retryable) = match &error {
