@@ -87,11 +87,11 @@ accelerator/CPU product policy continues without claiming CUDA succeeded.
 
 ## Startup preparation
 
-For a selected CUDA installation, ICN starts an isolated backend-preparation worker before ICN
-publishes readiness. The worker loads the exact installation and runs the model-free calibration
-operations. Their existing untimed warmup launches and synchronization prove that the backend can
-execute and trigger PTX JIT before timed samples. The resulting calibration is retained for that
-ICN process and reused by model assessment.
+For a selected CUDA installation, ICN starts its persistent planning worker and establishes hardware
+calibration before publishing readiness. A valid persisted record is reused. On a miss, that worker
+runs the model-free operations. Untimed launches and synchronization prove backend execution and may
+trigger PTX JIT before timed samples. The worker remains alive for later assessments, preserving its
+process-local CUDA context and modules. The result is persisted and injected into the assessor.
 
 ACN projects this operation through startup state without owning it:
 
@@ -110,8 +110,8 @@ ACN projects this operation through startup state without owning it:
 
 The TUI remains responsive and shows the phase under `Starting Magnitude`. It does not fabricate a
 percentage for opaque driver JIT work. The NVIDIA driver may reuse its disk JIT cache, but Magnitude
-does not depend on or manage that cache. Preparation runs on each CUDA ICN startup; warm driver
-caches make repeated execution inexpensive.
+does not depend on or manage that cache. Worker initialization runs on every CUDA ICN startup;
+calibration measurement runs only on a cache miss.
 
 Preparation failure is a CUDA execution/startup failure with its retained native diagnostic. It is
 never rewritten as insufficient model memory, model incompatibility, unavailable performance, or
@@ -119,8 +119,8 @@ never rewritten as insufficient model memory, model incompatibility, unavailable
 
 ## Result integrity
 
-Once preparation succeeds, compatibility and memory fit remain independent from performance.
-Complete execution assessment always includes measured performance. A calibration, workload, or
+Once preparation succeeds, compatibility and memory capacity remain independent from performance.
+Complete execution assessment always includes measured performance. A hardware-calibration, workload, or
 estimator failure fails the assessment operation and is never rewritten as incompatibility or a
 successful empty recommendation result.
 

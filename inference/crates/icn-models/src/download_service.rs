@@ -8,12 +8,13 @@ use futures_util::future::BoxFuture;
 use getrandom::fill;
 use icn_contracts::models::{
     DownloadAttempt, DownloadAttemptId, ModelDownloads, ModelDownloadsResponse, ModelFailure,
-    ModelPackage, StartModelDownloadRequest, StartModelDownloadResponse,
+    ModelOfferingTarget, ModelPackage, StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{DownloadStage, InventoryError, ModelDownloadEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::inventory::ModelManager;
+use crate::package_service::offering_target_id;
 
 #[derive(Clone)]
 pub struct ManagedModelDownloads {
@@ -261,33 +262,59 @@ impl ModelDownloads for ManagedModelDownloads {
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>> {
         Box::pin(async move {
             let _start_guard = self.starts.lock().await;
-            if let Some(attempt) = self
-                .records
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("download registry lock poisoned".to_owned())
-                })?
-                .values()
-                .find(|record| {
-                    record.package.id == request.package.id
-                        && matches!(
-                            record.attempt,
-                            DownloadAttempt::Pending { .. } | DownloadAttempt::Downloading { .. }
-                        )
-                })
-                .map(|record| record.attempt.clone())
-            {
-                return Ok(StartModelDownloadResponse { attempt });
-            }
-            let stream = self
-                .manager
-                .start_package_download(request.package.clone())
-                .await?;
-            let id = random_attempt_id()?;
-            let attempt = DownloadAttempt::Pending {
-                id: id.clone(),
-                package_id: request.package.id.clone(),
+            let packages = match &request.target {
+                ModelOfferingTarget::Package { package } => vec![package.clone()],
+                ModelOfferingTarget::SpeculativeDecodingPair { target, draft, .. } => {
+                    vec![target.clone(), draft.clone()]
+                }
             };
+            let target_id = offering_target_id(
+                &packages
+                    .iter()
+                    .map(|package| &package.id)
+                    .collect::<Vec<_>>(),
+            );
+            let active = {
+                let existing = self.records.read().map_err(|_| {
+                    InventoryError::Internal("download registry lock poisoned".to_owned())
+                })?;
+                packages
+                    .iter()
+                    .map(|package| {
+                        existing
+                            .values()
+                            .find(|record| {
+                                record.package.id == package.id
+                                    && matches!(
+                                        record.attempt,
+                                        DownloadAttempt::Pending { .. }
+                                            | DownloadAttempt::Downloading { .. }
+                                    )
+                            })
+                            .map(|record| record.attempt.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let missing = packages
+                .iter()
+                .zip(&active)
+                .filter_map(|(package, attempt)| attempt.is_none().then_some(package.clone()))
+                .collect::<Vec<_>>();
+            let new_attempts = missing
+                .iter()
+                .map(|package| {
+                    let id = random_attempt_id()?;
+                    let attempt = DownloadAttempt::Pending {
+                        id: id.clone(),
+                        package_id: package.id.clone(),
+                    };
+                    Ok((id, attempt))
+                })
+                .collect::<Result<Vec<_>, InventoryError>>()?;
+            let streams = self.manager.start_target_downloads(missing.clone()).await?;
+            let mut admitted = active.into_iter().flatten().collect::<Vec<_>>();
+            for ((package, (id, attempt)), stream) in
+                missing.into_iter().zip(new_attempts).zip(streams)
             {
                 let mut records = self.records.write().map_err(|_| {
                     InventoryError::Internal("download registry lock poisoned".to_owned())
@@ -302,14 +329,19 @@ impl ModelDownloads for ManagedModelDownloads {
                     id.clone(),
                     AttemptRecord {
                         attempt: attempt.clone(),
-                        package: request.package.clone(),
+                        package: package.clone(),
                         sequence,
                     },
                 );
                 persist_records(&self.path, &records);
+                drop(records);
+                tokio::spawn(self.clone().consume(id, package, stream));
+                admitted.push(attempt);
             }
-            tokio::spawn(self.clone().consume(id, request.package, stream));
-            Ok(StartModelDownloadResponse { attempt })
+            Ok(StartModelDownloadResponse {
+                target_id,
+                attempts: admitted,
+            })
         })
     }
 
@@ -342,7 +374,7 @@ impl ModelDownloads for ManagedModelDownloads {
                 })?
                 .get(&id)
                 .map(|record| record.attempt.clone())
-                .ok_or_else(|| InventoryError::NotFound(id.0))
+                .ok_or(InventoryError::NotFound(id.0))
         })
     }
 

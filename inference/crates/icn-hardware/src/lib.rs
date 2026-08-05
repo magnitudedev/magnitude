@@ -1,4 +1,4 @@
-//! Model-free memory fitting over the exact pinned llama.cpp `common/fit` path.
+//! Model assessment over the exact pinned llama.cpp native-planning path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, NulError};
@@ -6,39 +6,40 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use icn_contracts::{CacheType, FlashAttention as FitFlashAttention, GpuLayers, SplitMode};
+pub use icn_contracts::{
+    CacheType, FlashAttention as PlanningFlashAttention, GpuLayers, SplitMode,
+};
 use llama_cpp_2::context::params::{
     FlashAttentionPolicy, KvCacheType, LlamaContextParams, LlamaContextType,
 };
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::params::fit::{
-    FitCalibration, FitCalibrationMetric, FitDecodeWorkload, FitDecodeWorkloadAssessment,
+    FitCalibration as HardwareCalibration, FitCalibrationMetric as HardwareCalibrationMetric,
+    FitDecodeWorkload as DecodeWorkload, FitDecodeWorkloadAssessment as DecodeWorkloadAssessment,
     FitDeviceEstimate, FitDeviceKind, FitMemoryEstimate, FitStatus, FitTensorWorkloadKind,
 };
 use llama_cpp_2::model::params::fit::{FitReport, FitReportError};
 
 use icn_contracts::{
     ExecutionIntent, GenerationPerformanceAssessment, GenerationPerformanceConfidence,
-    GenerationSpeedPoint, HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceId,
-    HardwareDeviceKind, HardwareDeviceMemoryAssessment, HardwareDeviceMemoryLimit,
-    HardwareDeviceMemoryLimitKind, HardwareMemory, HardwareMemoryDomain,
-    HardwareMemoryDomainAssessment, HardwareMemoryDomainKind, HardwareProfile,
-    HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory, MemoryAccountant,
-    MemoryAccounting, MemoryAccountingError, MemoryBreakdown, MemoryCharge, MemoryChargeOwner,
-    MemoryLocation, MemoryTopology, ModelExecutionAssessment, MtpConfig, MtpSource,
-    NativeDeviceIdentity, NativeDeviceLocator,
+    HardwareAssessment, HardwareDeficit, HardwareDevice, HardwareDeviceId, HardwareDeviceKind,
+    HardwareDeviceMemoryAssessment, HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitKind,
+    HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
+    HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory,
+    MemoryAccountant, MemoryAccounting, MemoryAccountingError, MemoryBreakdown, MemoryCharge,
+    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelExecutionAssessment, MtpConfig,
+    MtpSource, NativeDeviceIdentity, NativeDeviceLocator,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
-pub const GENERATION_PERFORMANCE_CONTEXTS: [u32; 4] = [8_192, 32_768, 100_000, 200_000];
 /// Canonical identity for physical system memory in topology and plan assessments.
 use icn_contracts::MemoryDomainId;
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// The system-memory policy shared by stable fitting, load admission, and runtime supervision.
+/// The system-memory policy shared by model assessment, load admission, and runtime supervision.
 ///
 /// Each reserve is the larger of a fraction of physical memory and an absolute floor. Keeping
 /// these values in the hardware layer gives every caller one authoritative policy.
@@ -95,20 +96,20 @@ fn cache_type_into_native(cache_type: CacheType) -> KvCacheType {
     }
 }
 
-fn flash_attention_into_native(policy: FitFlashAttention) -> FlashAttentionPolicy {
+fn flash_attention_into_native(policy: PlanningFlashAttention) -> FlashAttentionPolicy {
     match policy {
-        FitFlashAttention::Auto => FlashAttentionPolicy::Auto,
-        FitFlashAttention::Disabled => FlashAttentionPolicy::Disabled,
-        FitFlashAttention::Enabled => FlashAttentionPolicy::Enabled,
+        PlanningFlashAttention::Auto => FlashAttentionPolicy::Auto,
+        PlanningFlashAttention::Disabled => FlashAttentionPolicy::Disabled,
+        PlanningFlashAttention::Enabled => FlashAttentionPolicy::Enabled,
     }
 }
 
 /// Inputs that affect llama.cpp's model, context, and compute estimates.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct FitOptions {
+pub struct PlanningOptions {
     /// Context length. `None` requests the model's trained context length.
     pub context_tokens: Option<NonZeroU32>,
-    /// Minimum context length allowed when fitting. `u32::MAX` preserves the full context.
+    /// Minimum context length allowed during native planning. `u32::MAX` preserves full context.
     pub minimum_context_tokens: u32,
     /// One margin to broadcast or one value per `llama_max_devices()`, in bytes.
     pub margins_bytes: Vec<u64>,
@@ -133,7 +134,7 @@ pub struct FitOptions {
     /// V-cache data type.
     pub cache_type_v: CacheType,
     /// Flash Attention policy.
-    pub flash_attention: FitFlashAttention,
+    pub flash_attention: PlanningFlashAttention,
     /// Whether K/Q/V operations and KV memory may be offloaded.
     pub offload_kqv: bool,
     /// Whether host tensor operations may be offloaded.
@@ -143,7 +144,7 @@ pub struct FitOptions {
     /// Whether sequences share a unified KV cache.
     pub kv_unified: bool,
     /// Native context role.
-    pub context_type: FitContextType,
+    pub context_type: PlanningContextType,
     /// Recurrent-state rollback snapshots retained per sequence.
     pub recurrent_snapshots: u32,
     /// Maximum logits outputs allocated by the context.
@@ -157,7 +158,7 @@ pub struct FitOptions {
 /// Native context role used by no-allocation planning.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FitContextType {
+pub enum PlanningContextType {
     /// Ordinary target inference context.
     #[default]
     Target,
@@ -165,7 +166,7 @@ pub enum FitContextType {
     Mtp,
 }
 
-impl Default for FitOptions {
+impl Default for PlanningOptions {
     fn default() -> Self {
         Self {
             context_tokens: None,
@@ -181,12 +182,12 @@ impl Default for FitOptions {
             use_mlock: false,
             cache_type_k: CacheType::F16,
             cache_type_v: CacheType::F16,
-            flash_attention: FitFlashAttention::Auto,
+            flash_attention: PlanningFlashAttention::Auto,
             offload_kqv: true,
             operation_offload: true,
             swa_full: false,
             kv_unified: false,
-            context_type: FitContextType::Target,
+            context_type: PlanningContextType::Target,
             recurrent_snapshots: 0,
             maximum_outputs: None,
             threads: None,
@@ -195,33 +196,33 @@ impl Default for FitOptions {
     }
 }
 
-/// Request for a no-allocation model fit.
+/// Request for no-allocation native model planning.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct FitRequest {
+pub struct PlanningRequest {
     /// GGUF file to inspect.
     pub model: PathBuf,
     /// Planning parameters.
-    pub options: FitOptions,
+    pub options: PlanningOptions,
 }
 
 /// Validation, backend, or native bridge failure.
 #[derive(Debug, thiserror::Error)]
-pub enum EstimateError {
+pub enum NativePlanningError {
     /// The model path is not a regular file.
     #[error("model does not exist or is not a file: {0}")]
     InvalidModel(PathBuf),
     /// The model path contains an interior NUL byte.
     #[error("model path contains an interior NUL byte: {0}")]
     ModelPathNul(#[from] NulError),
-    /// Invalid fit option.
-    #[error("invalid fit options: {0}")]
+    /// Invalid native-planning option.
+    #[error("invalid native-planning options: {0}")]
     InvalidOptions(String),
     /// llama.cpp backend initialization failed.
     #[error("failed to initialize llama.cpp: {0}")]
     Backend(#[source] llama_cpp_2::LlamaCppError),
-    /// Structured fit bridge failed.
+    /// Structured native-planning bridge failed.
     #[error(transparent)]
-    Fit(#[from] FitReportError),
+    NativeBridge(#[from] FitReportError),
 }
 
 /// Stable Magnitude capacity policy. It intentionally uses total capacity,
@@ -496,8 +497,6 @@ fn topology_fingerprint(domains: &[HardwareMemoryDomain]) -> String {
                             device.native_index,
                             &device.backend,
                             &device.physical_id,
-                            &device.name,
-                            &device.description,
                             &device.kind,
                             device
                                 .memory_limit
@@ -680,7 +679,7 @@ pub struct AssessedExecutionPlan {
     pub projector_memory: Vec<llama_cpp_2::mtmd::MtmdDeviceMemoryEstimate>,
 }
 
-/// Process-local backend plan. Its fitted native parameters are consumed directly by loading and
+/// Process-local backend plan. Its selected native parameters are consumed directly by loading and
 /// are never serialized or persisted.
 pub struct BackendLoadPlan {
     pub assessed: AssessedExecutionPlan,
@@ -691,13 +690,13 @@ pub struct BackendLoadPlan {
 #[derive(Debug, thiserror::Error)]
 pub enum AssessmentError {
     #[error(transparent)]
-    Estimate(#[from] EstimateError),
+    Planning(#[from] NativePlanningError),
     #[error("projector assessment requires the icn-hardware mtmd feature")]
     ProjectorUnsupported,
     #[cfg(feature = "mtmd")]
     #[error("projector preflight failed: {0}")]
     Projector(#[from] llama_cpp_2::mtmd::MtmdPreflightError),
-    #[error("the native estimator omitted required memory measurements")]
+    #[error("the native planner omitted required memory measurements")]
     MissingMeasurements,
     #[error(
         "{owner:?} native device is absent from the supplied memory topology: backend={backend:?}, physical_id={physical_id:?}, native_index={native_index}"
@@ -734,7 +733,7 @@ fn assess_intent_with_decode_workload(
     Ok(plan_and_assess(backend, topology, requested, true)?.0)
 }
 
-/// Plan a load and retain the exact fitted native parameter object that produced its assessment.
+/// Plan a load and retain the exact native parameter object that produced its assessment.
 pub fn plan_load_with_backend(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
@@ -760,9 +759,9 @@ pub fn plan_load_with_backend(
     let native_mtp = match requested.mtp {
         MtpConfig::Disabled { .. } => None,
         MtpConfig::Enabled { .. } => Some(
-            plan_fit_with_backend(
+            resolve_native_plan(
                 backend,
-                &fit_request(&assessed.plan, true)?,
+                &planning_request(&assessed.plan, true)?,
                 Some(&native),
                 false,
             )?
@@ -782,9 +781,8 @@ fn plan_and_assess(
     requested: &ExecutionIntent,
     capture_decode_workload: bool,
 ) -> Result<(AssessedExecutionPlan, Option<NativeParameterPlan>), AssessmentError> {
-    let target_request = fit_request(requested, false)?;
-    let target_fit =
-        plan_fit_with_backend(backend, &target_request, None, capture_decode_workload)?;
+    let target_request = planning_request(requested, false)?;
+    let target_fit = resolve_native_plan(backend, &target_request, None, capture_decode_workload)?;
     let text_report = target_fit.report.clone();
     if text_report.status == FitStatus::Error {
         return Ok((
@@ -831,7 +829,7 @@ fn plan_and_assess(
     }
 
     let fallback_plan = (text_report.status == FitStatus::Success)
-        .then(|| assessed_intent(requested, &text_report, Measurement::Fitted));
+        .then(|| assessed_intent(requested, &text_report, Measurement::Selected));
     let fallback = fallback_plan
         .as_ref()
         .map(|plan| {
@@ -839,7 +837,7 @@ fn plan_and_assess(
             capacity_summary(
                 topology,
                 &text_report.devices,
-                Measurement::Fitted,
+                Measurement::Selected,
                 mtp_report.as_ref().map(|report| report.devices.as_slice()),
                 mtp_includes_model(plan),
                 &projector_memory,
@@ -888,7 +886,10 @@ fn plan_and_assess(
     ))
 }
 
-fn fit_request(plan: &ExecutionIntent, mtp_context: bool) -> Result<FitRequest, AssessmentError> {
+fn planning_request(
+    plan: &ExecutionIntent,
+    mtp_context: bool,
+) -> Result<PlanningRequest, AssessmentError> {
     let (model, cache_type_k, cache_type_v, context_type, recurrent_snapshots, maximum_outputs) =
         if mtp_context {
             let MtpConfig::Enabled {
@@ -908,7 +909,7 @@ fn fit_request(plan: &ExecutionIntent, mtp_context: bool) -> Result<FitRequest, 
                 model,
                 *cache_type_k,
                 *cache_type_v,
-                FitContextType::Mtp,
+                PlanningContextType::Mtp,
                 0,
                 NonZeroU32::new(plan.max_sequences),
             )
@@ -928,14 +929,14 @@ fn fit_request(plan: &ExecutionIntent, mtp_context: bool) -> Result<FitRequest, 
                 plan.model_path.clone(),
                 plan.execution.cache_type_k,
                 plan.execution.cache_type_v,
-                FitContextType::Target,
+                PlanningContextType::Target,
                 snapshots,
                 outputs,
             )
         };
-    Ok(FitRequest {
+    Ok(PlanningRequest {
         model,
-        options: FitOptions {
+        options: PlanningOptions {
             context_tokens: NonZeroU32::new(plan.physical_context_size),
             minimum_context_tokens: plan.physical_context_size,
             margins_bytes: vec![0],
@@ -969,10 +970,10 @@ fn estimate_mtp_report(
 ) -> Result<Option<FitReport>, AssessmentError> {
     match plan.mtp {
         MtpConfig::Disabled { .. } => Ok(None),
-        MtpConfig::Enabled { .. } => Ok(Some(estimate_linked_with_backend(
+        MtpConfig::Enabled { .. } => Ok(Some(assess_linked_model_with_backend(
             backend,
-            &fit_request(plan, true)?,
-            &fit_request(plan, false)?,
+            &planning_request(plan, true)?,
+            &planning_request(plan, false)?,
         )?)),
     }
 }
@@ -1001,15 +1002,15 @@ pub fn assess_with_backend(
 }
 
 fn generation_performance(
-    decode_workload: &FitDecodeWorkloadAssessment,
+    decode_workload: &DecodeWorkloadAssessment,
     devices: &[FitDeviceEstimate],
     topology: &MemoryTopology,
-    calibration: &FitCalibration,
-    configured_context_tokens: u32,
+    calibration: &HardwareCalibration,
+    context_tokens: u32,
 ) -> Result<GenerationPerformanceAssessment, PerformanceEstimateFailure> {
     let workload = match decode_workload {
-        FitDecodeWorkloadAssessment::Available { workload } => workload,
-        FitDecodeWorkloadAssessment::Unavailable { reason } => {
+        DecodeWorkloadAssessment::Available { workload } => workload,
+        DecodeWorkloadAssessment::Unavailable { reason } => {
             return Err(PerformanceEstimateFailure::new(
                 "native_workload_unavailable",
                 reason.clone(),
@@ -1021,8 +1022,7 @@ fn generation_performance(
     estimate_generation_performance(
         workload,
         calibration,
-        configured_context_tokens,
-        &GENERATION_PERFORMANCE_CONTEXTS,
+        context_tokens,
         cross_memory_domain_placement,
     )
 }
@@ -1044,12 +1044,12 @@ impl PerformanceEstimateFailure {
 
 #[derive(Clone, Copy)]
 struct CalibrationSelection<'a> {
-    metric: &'a FitCalibrationMetric,
+    metric: &'a HardwareCalibrationMetric,
     exact: bool,
 }
 
 fn workload_crosses_memory_domains(
-    workload: &FitDecodeWorkload,
+    workload: &DecodeWorkload,
     devices: &[FitDeviceEstimate],
     topology: &MemoryTopology,
 ) -> Result<bool, PerformanceEstimateFailure> {
@@ -1064,7 +1064,7 @@ fn workload_crosses_memory_domains(
             return Err(PerformanceEstimateFailure::new(
                 "workload_device_unresolved",
                 format!(
-                    "native workload device {backend}/{} is absent from the fit topology",
+                    "native workload device {backend}/{} is absent from the hardware topology",
                     device_id.as_deref().unwrap_or("<unknown>")
                 ),
             ));
@@ -1101,7 +1101,9 @@ fn workload_crosses_memory_domains(
     Ok(domains.len() > 1)
 }
 
-fn validate_calibration(calibration: &FitCalibration) -> Result<(), PerformanceEstimateFailure> {
+fn validate_calibration(
+    calibration: &HardwareCalibration,
+) -> Result<(), PerformanceEstimateFailure> {
     if calibration.method != llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD {
         return Err(PerformanceEstimateFailure::new(
             "unsupported_calibration_schema",
@@ -1147,7 +1149,7 @@ fn validate_calibration(calibration: &FitCalibration) -> Result<(), PerformanceE
 }
 
 fn calibration_for<'a>(
-    calibration: &'a FitCalibration,
+    calibration: &'a HardwareCalibration,
     backend_type: i32,
     backend: &str,
     device_id: &Option<String>,
@@ -1168,7 +1170,7 @@ fn calibration_for<'a>(
             });
         }
         if metric.routed == routed
-            && same_operation_fallback.is_none_or(|current: &FitCalibrationMetric| {
+            && same_operation_fallback.is_none_or(|current: &HardwareCalibrationMetric| {
                 metric.bytes_per_second < current.bytes_per_second
             })
         {
@@ -1176,7 +1178,7 @@ fn calibration_for<'a>(
         }
         if routed
             && !metric.routed
-            && dense_fallback.is_none_or(|current: &FitCalibrationMetric| {
+            && dense_fallback.is_none_or(|current: &HardwareCalibrationMetric| {
                 let metric_exact_type = metric.tensor_type == tensor_type;
                 let current_exact_type = current.tensor_type == tensor_type;
                 metric_exact_type && !current_exact_type
@@ -1233,12 +1235,12 @@ fn active_routed_bytes(
     })
 }
 
-fn operation_seconds(bytes: u64, metric: &FitCalibrationMetric) -> f64 {
+fn operation_seconds(bytes: u64, metric: &HardwareCalibrationMetric) -> f64 {
     bytes as f64 / metric.bytes_per_second + metric.launch_microseconds / 1_000_000.0
 }
 
 fn deepseek4_attention_state_bytes(
-    workload: &FitDecodeWorkload,
+    workload: &DecodeWorkload,
     layer: &llama_cpp_2::model::params::fit::FitKvLayerWorkload,
 ) -> Result<u64, PerformanceEstimateFailure> {
     if workload.architecture != "deepseek4" || layer.compression_ratio == 0 {
@@ -1317,11 +1319,54 @@ fn deepseek4_attention_state_bytes(
     })
 }
 
+#[derive(Clone, Copy)]
+struct AttentionRow {
+    tensor_type: i32,
+    bytes_per_token: u64,
+}
+
+#[derive(Clone, Copy)]
+enum AttentionRows {
+    None,
+    Conventional {
+        key: AttentionRow,
+        value: AttentionRow,
+    },
+    Mla {
+        latent: AttentionRow,
+    },
+}
+
+fn attention_rows(layer: &llama_cpp_2::model::params::fit::FitKvLayerWorkload) -> AttentionRows {
+    match layer.attention {
+        llama_cpp_2::model::params::fit::FitAttentionWorkload::None => AttentionRows::None,
+        llama_cpp_2::model::params::fit::FitAttentionWorkload::Conventional { key, value } => {
+            AttentionRows::Conventional {
+                key: AttentionRow {
+                    tensor_type: key.tensor_type,
+                    bytes_per_token: key.bytes_per_token,
+                },
+                value: AttentionRow {
+                    tensor_type: value.tensor_type,
+                    bytes_per_token: value.bytes_per_token,
+                },
+            }
+        }
+        llama_cpp_2::model::params::fit::FitAttentionWorkload::Mla { latent } => {
+            AttentionRows::Mla {
+                latent: AttentionRow {
+                    tensor_type: latent.tensor_type,
+                    bytes_per_token: latent.bytes_per_token,
+                },
+            }
+        }
+    }
+}
+
 fn estimate_generation_performance(
-    workload: &FitDecodeWorkload,
-    calibration: &FitCalibration,
-    configured_context_tokens: u32,
-    requested_contexts: &[u32],
+    workload: &DecodeWorkload,
+    calibration: &HardwareCalibration,
+    context_tokens: u32,
     cross_memory_domain_placement: bool,
 ) -> Result<GenerationPerformanceAssessment, PerformanceEstimateFailure> {
     if workload.method != llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD {
@@ -1349,10 +1394,10 @@ fn estimate_generation_performance(
             ));
         }
     }
-    if configured_context_tokens == 0 || requested_contexts.is_empty() {
+    if context_tokens == 0 {
         return Err(PerformanceEstimateFailure::new(
-            "invalid_context_curve",
-            "no non-zero occupied context depths were requested",
+            "invalid_context",
+            "the assessed context must be non-zero",
         ));
     }
 
@@ -1458,20 +1503,6 @@ fn estimate_generation_performance(
         confidence = GenerationPerformanceConfidence::Low;
     }
 
-    let mut contexts = requested_contexts
-        .iter()
-        .map(|context| (*context).min(configured_context_tokens))
-        .filter(|context| *context > 0)
-        .collect::<Vec<_>>();
-    contexts.sort_unstable();
-    contexts.dedup();
-    if contexts.is_empty() {
-        return Err(PerformanceEstimateFailure::new(
-            "invalid_context_curve",
-            "requested occupied context depths resolve to zero",
-        ));
-    }
-
     let mut expected_efficiency = if has_routed_tensors {
         ROUTED_DECODE_EFFICIENCY
     } else {
@@ -1493,102 +1524,138 @@ fn estimate_generation_performance(
     if cross_memory_domain_placement {
         expected_efficiency *= CROSS_DOMAIN_PLACEMENT_EFFICIENCY;
     }
-    let mut points = Vec::with_capacity(contexts.len());
-    for context_tokens in contexts {
-        let mut kv_bytes_read_per_token = 0_u64;
-        let mut kv_seconds = 0.0_f64;
-        let mut kv_uncertainty_seconds = 0.0_f64;
-        for layer in &workload.kv_layers {
-            if layer.recurrent {
-                let state_bytes = layer
-                    .recurrent_conv_bytes
-                    .checked_add(layer.recurrent_state_bytes)
-                    .and_then(|bytes| bytes.checked_mul(RECURRENT_STATE_READ_WRITE_MULTIPLIER))
-                    .ok_or_else(|| {
-                        PerformanceEstimateFailure::new(
-                            "workload_overflow",
-                            "recurrent-state traffic calculation overflowed",
-                        )
-                    })?;
-                if state_bytes == 0 {
-                    confidence = GenerationPerformanceConfidence::Low;
-                    continue;
-                }
-                let selection = calibration_for(
-                    calibration,
-                    layer.backend_type,
-                    &layer.backend,
-                    &layer.device_id,
-                    layer.recurrent_type,
-                    false,
-                )?;
-                if !selection.exact {
-                    confidence = GenerationPerformanceConfidence::Low;
-                }
-                if !selection.metric.stable {
-                    confidence = GenerationPerformanceConfidence::Low;
-                }
-                let seconds = operation_seconds(state_bytes, selection.metric);
-                kv_seconds += seconds;
-                kv_uncertainty_seconds +=
-                    seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+    let mut kv_bytes_read_per_token = 0_u64;
+    let mut kv_seconds = 0.0_f64;
+    let mut kv_uncertainty_seconds = 0.0_f64;
+    for layer in &workload.kv_layers {
+        if layer.recurrent {
+            let state_bytes = layer
+                .recurrent_conv_bytes
+                .checked_add(layer.recurrent_state_bytes)
+                .and_then(|bytes| bytes.checked_mul(RECURRENT_STATE_READ_WRITE_MULTIPLIER))
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "recurrent-state traffic calculation overflowed",
+                    )
+                })?;
+            if state_bytes == 0 {
+                confidence = GenerationPerformanceConfidence::Low;
                 continue;
             }
-
-            let specialized_attention = layer.compression_ratio > 0 || layer.sparse_index;
-            if layer.key_bytes_per_token == 0
-                && layer.value_bytes_per_token == 0
-                && !specialized_attention
-            {
-                continue;
-            }
-            if layer.key_bytes_per_token == 0
-                && layer.value_bytes_per_token == 0
-                && specialized_attention
-            {
+            let selection = calibration_for(
+                calibration,
+                layer.backend_type,
+                &layer.backend,
+                &layer.device_id,
+                layer.recurrent_type,
+                false,
+            )?;
+            if !selection.exact {
                 confidence = GenerationPerformanceConfidence::Low;
             }
-            if (layer.key_bytes_per_token == 0) != (layer.value_bytes_per_token == 0)
-                && !specialized_attention
-            {
-                return Err(PerformanceEstimateFailure::new(
-                    "invalid_native_workload",
-                    format!("KV layer {} has incomplete row bytes", layer.layer),
-                ));
+            if !selection.metric.stable {
+                confidence = GenerationPerformanceConfidence::Low;
             }
+            let seconds = operation_seconds(state_bytes, selection.metric);
+            kv_seconds += seconds;
+            kv_uncertainty_seconds += seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+            continue;
+        }
 
-            let stored_tokens = if layer.compression_ratio > 0 {
-                context_tokens.div_ceil(layer.compression_ratio)
+        let specialized_attention = layer.compression_ratio > 0 || layer.sparse_index;
+        let attention_rows = attention_rows(layer);
+        if matches!(attention_rows, AttentionRows::None) {
+            if specialized_attention {
+                confidence = GenerationPerformanceConfidence::Low;
+            } else {
+                continue;
+            }
+        }
+
+        let stored_tokens = if layer.compression_ratio > 0 {
+            context_tokens.div_ceil(layer.compression_ratio)
+        } else {
+            context_tokens
+        };
+        let attended_tokens = if layer.sparse_index && workload.indexer_top_k > 0 {
+            stored_tokens.min(workload.indexer_top_k)
+        } else if layer.sliding_window_tokens > 0 {
+            context_tokens.min(layer.sliding_window_tokens)
+        } else {
+            stored_tokens
+        };
+        let calibration_tensor_type = match attention_rows {
+            AttentionRows::None => None,
+            AttentionRows::Conventional { key, .. } => Some(key.tensor_type),
+            AttentionRows::Mla { latent } => Some(latent.tensor_type),
+        };
+        let rows = match attention_rows {
+            AttentionRows::None => [None, None],
+            AttentionRows::Conventional { key, value } => [Some(key), Some(value)],
+            AttentionRows::Mla { latent } => [Some(latent), None],
+        };
+        for row in rows.into_iter().flatten() {
+            let tensor_type = row.tensor_type;
+            let row_bytes = row.bytes_per_token;
+            let bytes = row_bytes
+                .checked_mul(u64::from(attended_tokens))
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "KV traffic calculation overflowed",
+                    )
+                })?;
+            kv_bytes_read_per_token =
+                kv_bytes_read_per_token.checked_add(bytes).ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "KV traffic accounting overflowed",
+                    )
+                })?;
+            let selection = calibration_for(
+                calibration,
+                layer.backend_type,
+                &layer.backend,
+                &layer.device_id,
+                tensor_type,
+                false,
+            )?;
+            if !selection.exact {
+                confidence = GenerationPerformanceConfidence::Low;
+            }
+            if !selection.metric.stable {
+                confidence = GenerationPerformanceConfidence::Low;
+            }
+            let seconds = operation_seconds(bytes, selection.metric);
+            kv_seconds += seconds;
+            kv_uncertainty_seconds += seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
+        }
+
+        if layer.sparse_index {
+            let index_depth = if layer.compression_ratio > 0 {
+                stored_tokens
             } else {
                 context_tokens
             };
-            let attended_tokens = if layer.sparse_index && workload.indexer_top_k > 0 {
-                stored_tokens.min(workload.indexer_top_k)
-            } else if layer.sliding_window_tokens > 0 {
-                context_tokens.min(layer.sliding_window_tokens)
+            let index_bytes = layer
+                .indexer_bytes_per_token
+                .checked_mul(u64::from(index_depth))
+                .ok_or_else(|| {
+                    PerformanceEstimateFailure::new(
+                        "workload_overflow",
+                        "sparse-index traffic calculation overflowed",
+                    )
+                })?;
+            if index_bytes == 0 {
+                confidence = GenerationPerformanceConfidence::Low;
             } else {
-                stored_tokens
-            };
-            for (tensor_type, row_bytes) in [
-                (layer.key_type, layer.key_bytes_per_token),
-                (layer.value_type, layer.value_bytes_per_token),
-            ] {
-                if row_bytes == 0 {
-                    continue;
-                }
-                let bytes = row_bytes
-                    .checked_mul(u64::from(attended_tokens))
+                kv_bytes_read_per_token = kv_bytes_read_per_token
+                    .checked_add(index_bytes)
                     .ok_or_else(|| {
                         PerformanceEstimateFailure::new(
                             "workload_overflow",
-                            "KV traffic calculation overflowed",
-                        )
-                    })?;
-                kv_bytes_read_per_token =
-                    kv_bytes_read_per_token.checked_add(bytes).ok_or_else(|| {
-                        PerformanceEstimateFailure::new(
-                            "workload_overflow",
-                            "KV traffic accounting overflowed",
+                            "sparse-index traffic accounting overflowed",
                         )
                     })?;
                 let selection = calibration_for(
@@ -1596,7 +1663,12 @@ fn estimate_generation_performance(
                     layer.backend_type,
                     &layer.backend,
                     &layer.device_id,
-                    tensor_type,
+                    calibration_tensor_type.ok_or_else(|| {
+                        PerformanceEstimateFailure::new(
+                            "invalid_native_workload",
+                            "sparse attention has no attention storage type",
+                        )
+                    })?,
                     false,
                 )?;
                 if !selection.exact {
@@ -1605,129 +1677,74 @@ fn estimate_generation_performance(
                 if !selection.metric.stable {
                     confidence = GenerationPerformanceConfidence::Low;
                 }
-                let seconds = operation_seconds(bytes, selection.metric);
+                let seconds = operation_seconds(index_bytes, selection.metric);
                 kv_seconds += seconds;
                 kv_uncertainty_seconds +=
                     seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
             }
+        }
 
-            if layer.sparse_index {
-                let index_depth = if layer.compression_ratio > 0 {
-                    stored_tokens
-                } else {
-                    context_tokens
-                };
-                let index_bytes = layer
-                    .indexer_bytes_per_token
-                    .checked_mul(u64::from(index_depth))
-                    .ok_or_else(|| {
-                        PerformanceEstimateFailure::new(
-                            "workload_overflow",
-                            "sparse-index traffic calculation overflowed",
-                        )
-                    })?;
-                if index_bytes == 0 {
+        let attention_state_bytes = deepseek4_attention_state_bytes(workload, layer)?;
+        if attention_state_bytes > 0 {
+            if layer.attention_head_size == 0 {
+                confidence = GenerationPerformanceConfidence::Low;
+            } else {
+                let selection = calibration_for(
+                    calibration,
+                    layer.backend_type,
+                    &layer.backend,
+                    &layer.device_id,
+                    layer.attention_state_type,
+                    false,
+                )?;
+                if !selection.exact {
                     confidence = GenerationPerformanceConfidence::Low;
-                } else {
-                    kv_bytes_read_per_token = kv_bytes_read_per_token
-                        .checked_add(index_bytes)
-                        .ok_or_else(|| {
-                            PerformanceEstimateFailure::new(
-                                "workload_overflow",
-                                "sparse-index traffic accounting overflowed",
-                            )
-                        })?;
-                    let selection = calibration_for(
-                        calibration,
-                        layer.backend_type,
-                        &layer.backend,
-                        &layer.device_id,
-                        layer.key_type,
-                        false,
-                    )?;
-                    if !selection.exact {
-                        confidence = GenerationPerformanceConfidence::Low;
-                    }
-                    if !selection.metric.stable {
-                        confidence = GenerationPerformanceConfidence::Low;
-                    }
-                    let seconds = operation_seconds(index_bytes, selection.metric);
-                    kv_seconds += seconds;
-                    kv_uncertainty_seconds +=
-                        seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
                 }
-            }
-
-            let attention_state_bytes = deepseek4_attention_state_bytes(workload, layer)?;
-            if attention_state_bytes > 0 {
-                if layer.attention_head_size == 0 {
+                if !selection.metric.stable {
                     confidence = GenerationPerformanceConfidence::Low;
-                } else {
-                    let selection = calibration_for(
-                        calibration,
-                        layer.backend_type,
-                        &layer.backend,
-                        &layer.device_id,
-                        layer.attention_state_type,
-                        false,
-                    )?;
-                    if !selection.exact {
-                        confidence = GenerationPerformanceConfidence::Low;
-                    }
-                    if !selection.metric.stable {
-                        confidence = GenerationPerformanceConfidence::Low;
-                    }
-                    let seconds = operation_seconds(attention_state_bytes, selection.metric);
-                    kv_seconds += seconds;
-                    kv_uncertainty_seconds +=
-                        seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
                 }
+                let seconds = operation_seconds(attention_state_bytes, selection.metric);
+                kv_seconds += seconds;
+                kv_uncertainty_seconds +=
+                    seconds * selection.metric.relative_spread.clamp(0.0, 1.0);
             }
         }
-        let raw_seconds = weight_seconds + kv_seconds;
-        if !raw_seconds.is_finite() || raw_seconds <= 0.0 {
-            return Err(PerformanceEstimateFailure::new(
-                "invalid_estimate",
-                "generation calculation produced a non-finite token time",
-            ));
-        }
-        let observed_spread = (weight_uncertainty_seconds + kv_uncertainty_seconds) / raw_seconds;
-        let mut uncertainty = (observed_spread * CALIBRATION_SPREAD_WEIGHT)
-            .clamp(MINIMUM_UNCERTAINTY, MAXIMUM_CALIBRATION_UNCERTAINTY);
-        if has_routed_tensors {
-            uncertainty = (uncertainty + ROUTING_UNCERTAINTY).min(MAXIMUM_ROUTED_UNCERTAINTY);
-        }
-        if cross_memory_domain_placement {
-            uncertainty = (uncertainty + CROSS_DOMAIN_PLACEMENT_UNCERTAINTY)
-                .min(MAXIMUM_CROSS_DOMAIN_UNCERTAINTY);
-        }
-        let lower_tokens_per_second = expected_efficiency * (1.0 - uncertainty) / raw_seconds;
-        let expected_tokens_per_second = expected_efficiency / raw_seconds;
-        let upper_tokens_per_second =
-            (expected_efficiency * (1.0 + uncertainty * UPPER_BOUND_UNCERTAINTY_WEIGHT)).min(1.0)
-                / raw_seconds;
-        if [
-            lower_tokens_per_second,
-            expected_tokens_per_second,
-            upper_tokens_per_second,
-        ]
-        .iter()
-        .any(|rate| !rate.is_finite() || *rate <= 0.0)
-        {
-            return Err(PerformanceEstimateFailure::new(
-                "invalid_estimate",
-                "generation calculation produced a non-finite token rate",
-            ));
-        }
-        points.push(GenerationSpeedPoint {
-            context_tokens,
-            kv_bytes_read_per_token,
-            lower_tokens_per_second,
-            expected_tokens_per_second,
-            upper_tokens_per_second,
-        });
     }
-
+    let raw_seconds = weight_seconds + kv_seconds;
+    if !raw_seconds.is_finite() || raw_seconds <= 0.0 {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_estimate",
+            "generation calculation produced a non-finite token time",
+        ));
+    }
+    let observed_spread = (weight_uncertainty_seconds + kv_uncertainty_seconds) / raw_seconds;
+    let mut uncertainty = (observed_spread * CALIBRATION_SPREAD_WEIGHT)
+        .clamp(MINIMUM_UNCERTAINTY, MAXIMUM_CALIBRATION_UNCERTAINTY);
+    if has_routed_tensors {
+        uncertainty = (uncertainty + ROUTING_UNCERTAINTY).min(MAXIMUM_ROUTED_UNCERTAINTY);
+    }
+    if cross_memory_domain_placement {
+        uncertainty = (uncertainty + CROSS_DOMAIN_PLACEMENT_UNCERTAINTY)
+            .min(MAXIMUM_CROSS_DOMAIN_UNCERTAINTY);
+    }
+    let lower_tokens_per_second = expected_efficiency * (1.0 - uncertainty) / raw_seconds;
+    let expected_tokens_per_second = expected_efficiency / raw_seconds;
+    let upper_tokens_per_second =
+        (expected_efficiency * (1.0 + uncertainty * UPPER_BOUND_UNCERTAINTY_WEIGHT)).min(1.0)
+            / raw_seconds;
+    if [
+        lower_tokens_per_second,
+        expected_tokens_per_second,
+        upper_tokens_per_second,
+    ]
+    .iter()
+    .any(|rate| !rate.is_finite() || *rate <= 0.0)
+    {
+        return Err(PerformanceEstimateFailure::new(
+            "invalid_estimate",
+            "generation calculation produced a non-finite token rate",
+        ));
+    }
     Ok(GenerationPerformanceAssessment {
         confidence,
         workload: GENERATION_PERFORMANCE_WORKLOAD.to_owned(),
@@ -1736,13 +1753,17 @@ fn estimate_generation_performance(
         expert_count: workload.expert_count,
         expert_used_count: workload.expert_used_count,
         cross_memory_domain_placement,
-        points,
+        context_tokens,
+        kv_bytes_read_per_token,
+        lower_tokens_per_second,
+        expected_tokens_per_second,
+        upper_tokens_per_second,
     })
 }
 
 /// Assess several product profiles for one model. The requested no-allocation model is
 /// constructed once and llama.cpp constructs an exact context graph for every profile.
-/// Upstream fitting is invoked only for profiles whose requested plan does not fit and
+/// Native placement selection is invoked only for profiles whose requested plan does not fit and
 /// whose exact tensor storage could still fit across the available memory domains.
 pub fn assess_profiles_with_backend(
     backend: &LlamaBackend,
@@ -1760,7 +1781,7 @@ pub fn assess_execution_profiles_with_backend(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
-    calibration: &FitCalibration,
+    calibration: &HardwareCalibration,
 ) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
     assess_profiles_impl(backend, topology, requested, Some(calibration))?
         .into_iter()
@@ -1785,14 +1806,14 @@ fn assess_profiles_impl(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
-    calibration: Option<&FitCalibration>,
+    calibration: Option<&HardwareCalibration>,
 ) -> Result<Vec<ProfileAssessment>, AssessmentError> {
     if requested.is_empty() {
         return Ok(Vec::new());
     }
     let requests = requested
         .iter()
-        .map(|intent| fit_request(intent, false))
+        .map(|intent| planning_request(intent, false))
         .collect::<Result<Vec<_>, _>>()?;
     if requests
         .iter()
@@ -1826,7 +1847,8 @@ fn assess_profiles_impl(
             &margins,
         ),
     }
-    .map_err(EstimateError::Fit)?;
+    .map_err(NativePlanningError::NativeBridge)?;
+    let aggregate_stable_capacity = topology.aggregate_stable_capacity();
     requested
         .iter()
         .zip(reports)
@@ -1852,7 +1874,7 @@ fn assess_profiles_impl(
                                 &report.devices,
                                 topology,
                                 calibration,
-                                report.fitted.resolved_context_tokens,
+                                intent.context_size,
                             )
                         })
                         .transpose()
@@ -1867,7 +1889,7 @@ fn assess_profiles_impl(
             // Every load must store every tensor exactly once in some physical memory
             // domain. llama_model_size is the native model's exact tensor storage, so
             // exceeding aggregate stable capacity is a proof of non-fit, not an estimate.
-            if report.model.tensor_bytes > preferred.usable_capacity_bytes {
+            if report.model.tensor_bytes > aggregate_stable_capacity {
                 let hardware = HardwareAssessment::DoesNotFit {
                     profile: hardware_profile(intent, &preferred),
                     memory: HardwareDeficit {
@@ -1898,7 +1920,7 @@ fn assess_profiles_impl(
                             &assessed.text_report.devices,
                             topology,
                             calibration,
-                            assessed.text_report.fitted.resolved_context_tokens,
+                            intent.context_size,
                         )
                     })
                     .transpose()
@@ -1920,7 +1942,7 @@ fn assess_profiles_impl(
 #[derive(Clone, Copy)]
 enum Measurement {
     Initial,
-    Fitted,
+    Selected,
 }
 
 #[cfg(feature = "mtmd")]
@@ -1950,9 +1972,9 @@ fn projector_memory(plan: &ExecutionIntent) -> Result<Vec<ProjectorMemory>, Asse
             image_max_tokens: projector.image_max_tokens,
             media_marker: CString::new(mtmd_default_marker()).expect("native marker has no NUL"),
             flash_attention: match plan.execution.flash_attention {
-                FitFlashAttention::Auto => FlashAttentionPolicy::Auto,
-                FitFlashAttention::Disabled => FlashAttentionPolicy::Disabled,
-                FitFlashAttention::Enabled => FlashAttentionPolicy::Enabled,
+                PlanningFlashAttention::Auto => FlashAttentionPolicy::Auto,
+                PlanningFlashAttention::Disabled => FlashAttentionPolicy::Disabled,
+                PlanningFlashAttention::Enabled => FlashAttentionPolicy::Enabled,
             },
             ..MtmdContextParams::default()
         };
@@ -1975,7 +1997,7 @@ struct CapacitySummary {
     device_constraints: Vec<HardwareDeviceMemoryAssessment>,
 }
 
-fn fit_memory_charge(
+fn native_memory_charge(
     owner: MemoryChargeOwner,
     device: &FitDeviceEstimate,
     estimate: FitMemoryEstimate,
@@ -2136,13 +2158,13 @@ fn capacity_summary(
     for device in devices {
         let estimate = match measurement {
             Measurement::Initial => device.initial,
-            Measurement::Fitted => device.fitted,
+            Measurement::Selected => device.fitted,
         };
         let Some(estimate) = estimate else {
             continue;
         };
         accountant
-            .record(fit_memory_charge(
+            .record(native_memory_charge(
                 MemoryChargeOwner::Target,
                 device,
                 estimate,
@@ -2156,7 +2178,7 @@ fn capacity_summary(
                 continue;
             };
             accountant
-                .record(fit_memory_charge(
+                .record(native_memory_charge(
                     MemoryChargeOwner::Mtp,
                     device,
                     estimate,
@@ -2181,7 +2203,7 @@ fn assessed_intent(
 ) -> ExecutionIntent {
     let configuration = match measurement {
         Measurement::Initial => report.requested,
-        Measurement::Fitted => report.fitted,
+        Measurement::Selected => report.fitted,
     };
     let mut plan = requested.clone();
     plan.physical_context_size = configuration.resolved_context_tokens;
@@ -2223,26 +2245,26 @@ fn fits_assessment(
 /// Estimate a model using an already initialized llama.cpp backend.
 ///
 /// The backend reference is an explicit lifetime proof for callers such as ICN;
-/// the pinned C fitting function itself uses global backend registration.
+/// the pinned native planner itself uses global backend registration.
 ///
 /// # Errors
 ///
-/// Returns [`EstimateError`] for invalid options or bridge/report failures.
-pub fn estimate_with_backend(
+/// Returns [`NativePlanningError`] for invalid options or bridge/report failures.
+pub fn assess_model_with_backend(
     backend: &LlamaBackend,
-    request: &FitRequest,
-) -> Result<FitReport, EstimateError> {
-    Ok(plan_fit_with_backend(backend, request, None, false)?.report)
+    request: &PlanningRequest,
+) -> Result<FitReport, NativePlanningError> {
+    Ok(resolve_native_plan(backend, request, None, false)?.report)
 }
 
 /// Estimate an MTP model/context linked to the exact target execution context.
-pub fn estimate_linked_with_backend(
+pub fn assess_linked_model_with_backend(
     backend: &LlamaBackend,
-    request: &FitRequest,
-    target: &FitRequest,
-) -> Result<FitReport, EstimateError> {
-    let target = plan_fit_with_backend(backend, target, None, false)?;
-    Ok(plan_fit_with_backend(backend, request, Some(&target.native), false)?.report)
+    request: &PlanningRequest,
+    target: &PlanningRequest,
+) -> Result<FitReport, NativePlanningError> {
+    let target = resolve_native_plan(backend, target, None, false)?;
+    Ok(resolve_native_plan(backend, request, Some(&target.native), false)?.report)
 }
 
 pub struct NativeParameterPlan {
@@ -2254,14 +2276,14 @@ pub struct NativeParameterPlan {
 }
 
 /// Exact native parameter objects used only for MTP capability preflight. Construction lives
-/// beside ordinary fit/load planning so speculative discovery cannot drift from runtime defaults.
+/// beside ordinary load planning so speculative discovery cannot drift from runtime defaults.
 pub struct MtpPreflightParameters {
     pub model_params: std::pin::Pin<Box<LlamaModelParams>>,
     pub target_context: LlamaContextParams,
     pub draft_context: LlamaContextParams,
 }
 
-struct NativeFitPlan {
+struct NativePlanAssessment {
     native: NativeParameterPlan,
     report: FitReport,
 }
@@ -2299,8 +2321,8 @@ pub fn mtp_preflight_parameters(
         cache_type_k: CacheType::F16,
         cache_type_v: CacheType::F16,
     };
-    let target = native_parameter_plan(&fit_request(&preflight, false)?)?;
-    let draft = native_parameter_plan(&fit_request(&preflight, true)?)?;
+    let target = native_parameter_plan(&planning_request(&preflight, false)?)?;
+    let draft = native_parameter_plan(&planning_request(&preflight, true)?)?;
     Ok(MtpPreflightParameters {
         model_params: target.model_params,
         target_context: target.context_params,
@@ -2308,15 +2330,17 @@ pub fn mtp_preflight_parameters(
     })
 }
 
-/// Build native parameters from intent without fitting. Intended for native parity tooling; model
-/// serving must use [`plan_load_with_backend`] so fitted placement is retained.
+/// Build native parameters from intent without placement selection. Intended for native parity
+/// tooling; model serving uses [`plan_load_with_backend`] so selected placement is retained.
 pub fn native_parameters_for_intent(
     intent: &ExecutionIntent,
 ) -> Result<NativeParameterPlan, AssessmentError> {
-    Ok(native_parameter_plan(&fit_request(intent, false)?)?)
+    Ok(native_parameter_plan(&planning_request(intent, false)?)?)
 }
 
-fn native_parameter_plan(request: &FitRequest) -> Result<NativeParameterPlan, EstimateError> {
+fn native_parameter_plan(
+    request: &PlanningRequest,
+) -> Result<NativeParameterPlan, NativePlanningError> {
     validate(request)?;
     let (threads, threads_batch) = native_thread_counts(&request.options);
     Ok(NativeParameterPlan {
@@ -2328,12 +2352,12 @@ fn native_parameter_plan(request: &FitRequest) -> Result<NativeParameterPlan, Es
     })
 }
 
-fn plan_fit_with_backend(
+fn resolve_native_plan(
     _backend: &LlamaBackend,
-    request: &FitRequest,
+    request: &PlanningRequest,
     linked_target: Option<&NativeParameterPlan>,
     capture_decode_workload: bool,
-) -> Result<NativeFitPlan, EstimateError> {
+) -> Result<NativePlanAssessment, NativePlanningError> {
     let mut native = native_parameter_plan(request)?;
     let model_path = path_c_string(&request.model)?;
     let max_devices = llama_cpp_2::max_devices();
@@ -2341,21 +2365,22 @@ fn plan_fit_with_backend(
 
     let report = if let Some(target) = linked_target {
         let target_path = path_c_string(&target.model)?;
+        let linked = llama_cpp_2::model::params::fit::LinkedFitTarget {
+            model_path: &target_path,
+            model_params: target.model_params.as_ref().get_ref(),
+            context_params: &target.context_params,
+        };
         native
             .model_params
             .as_mut()
             .fit_params_report_linked(
                 &model_path,
                 &mut native.context_params,
-                llama_cpp_2::model::params::fit::LinkedFitTarget {
-                    model_path: &target_path,
-                    model_params: target.model_params.as_ref().get_ref(),
-                    context_params: &target.context_params,
-                },
+                linked,
                 &mut margins,
                 request.options.minimum_context_tokens,
             )
-            .map_err(EstimateError::Fit)?
+            .map_err(NativePlanningError::NativeBridge)?
     } else if capture_decode_workload {
         native
             .model_params
@@ -2366,7 +2391,7 @@ fn plan_fit_with_backend(
                 &mut margins,
                 request.options.minimum_context_tokens,
             )
-            .map_err(EstimateError::Fit)?
+            .map_err(NativePlanningError::NativeBridge)?
     } else {
         native
             .model_params
@@ -2377,13 +2402,13 @@ fn plan_fit_with_backend(
                 &mut margins,
                 request.options.minimum_context_tokens,
             )
-            .map_err(EstimateError::Fit)?
+            .map_err(NativePlanningError::NativeBridge)?
     };
 
-    Ok(NativeFitPlan { native, report })
+    Ok(NativePlanAssessment { native, report })
 }
 
-fn native_model_params(options: &FitOptions) -> Result<LlamaModelParams, EstimateError> {
+fn native_model_params(options: &PlanningOptions) -> Result<LlamaModelParams, NativePlanningError> {
     let params = LlamaModelParams::default()
         .with_gpu_layers(match options.gpu_layers {
             GpuLayers::Auto => llama_cpp_2::model::params::LlamaGpuLayers::Auto,
@@ -2401,12 +2426,12 @@ fn native_model_params(options: &FitOptions) -> Result<LlamaModelParams, Estimat
     match &options.tensor_split {
         Some(weights) => params
             .with_tensor_split(weights)
-            .map_err(|error| EstimateError::InvalidOptions(error.to_string())),
+            .map_err(|error| NativePlanningError::InvalidOptions(error.to_string())),
         None => Ok(params),
     }
 }
 
-fn native_context_params(options: &FitOptions) -> LlamaContextParams {
+fn native_context_params(options: &PlanningOptions) -> LlamaContextParams {
     let (threads, threads_batch) = native_thread_counts(options);
     LlamaContextParams::default()
         .with_n_ctx(options.context_tokens)
@@ -2421,8 +2446,8 @@ fn native_context_params(options: &FitOptions) -> LlamaContextParams {
         .with_swa_full(options.swa_full)
         .with_kv_unified(options.kv_unified)
         .with_context_type(match options.context_type {
-            FitContextType::Target => LlamaContextType::Default,
-            FitContextType::Mtp => LlamaContextType::Mtp,
+            PlanningContextType::Target => LlamaContextType::Default,
+            PlanningContextType::Mtp => LlamaContextType::Mtp,
         })
         .with_n_rs_seq(options.recurrent_snapshots)
         .with_n_outputs_max(options.maximum_outputs)
@@ -2430,7 +2455,7 @@ fn native_context_params(options: &FitOptions) -> LlamaContextParams {
         .with_n_threads_batch(threads_batch.get().min(i32::MAX as u32) as i32)
 }
 
-fn native_thread_counts(options: &FitOptions) -> (NonZeroU32, NonZeroU32) {
+fn native_thread_counts(options: &PlanningOptions) -> (NonZeroU32, NonZeroU32) {
     let threads = options.threads.unwrap_or_else(|| {
         NonZeroU32::new(llama_cpp_2::model::params::fit::default_math_threads())
             .expect("native math-thread default is positive")
@@ -2439,28 +2464,28 @@ fn native_thread_counts(options: &FitOptions) -> (NonZeroU32, NonZeroU32) {
     (threads, threads_batch)
 }
 
-fn validate(request: &FitRequest) -> Result<(), EstimateError> {
+fn validate(request: &PlanningRequest) -> Result<(), NativePlanningError> {
     if !request.model.is_file() {
-        return Err(EstimateError::InvalidModel(request.model.clone()));
+        return Err(NativePlanningError::InvalidModel(request.model.clone()));
     }
     let options = &request.options;
     if options.minimum_context_tokens == 0 {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "minimum context must be greater than zero".to_owned(),
         ));
     }
     if options.batch_tokens == 0 || options.micro_batch_tokens == 0 {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "batch and micro-batch sizes must be greater than zero".to_owned(),
         ));
     }
     if options.micro_batch_tokens > options.batch_tokens {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "micro-batch size must not exceed batch size".to_owned(),
         ));
     }
     if options.sequence_count == 0 {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "sequence count must be greater than zero".to_owned(),
         ));
     }
@@ -2468,12 +2493,12 @@ fn validate(request: &FitRequest) -> Result<(), EstimateError> {
         .maximum_outputs
         .is_some_and(|outputs| outputs.get() > options.batch_tokens)
     {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "maximum outputs must not exceed batch size".to_owned(),
         ));
     }
     if options.margins_bytes.is_empty() {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "at least one memory margin is required".to_owned(),
         ));
     }
@@ -2483,23 +2508,23 @@ fn validate(request: &FitRequest) -> Result<(), EstimateError> {
                 .iter()
                 .any(|weight| !weight.is_finite() || *weight < 0.0)
     }) {
-        return Err(EstimateError::InvalidOptions(
+        return Err(NativePlanningError::InvalidOptions(
             "tensor_split must contain finite, non-negative weights".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn expand_margins(values: &[u64], count: usize) -> Result<Vec<usize>, EstimateError> {
+fn expand_margins(values: &[u64], count: usize) -> Result<Vec<usize>, NativePlanningError> {
     if values.len() != 1 && values.len() != count {
-        return Err(EstimateError::InvalidOptions(format!(
+        return Err(NativePlanningError::InvalidOptions(format!(
             "provide one memory margin to broadcast or exactly {count}; received {}",
             values.len()
         )));
     }
     let convert = |value: u64| {
         usize::try_from(value).map_err(|_| {
-            EstimateError::InvalidOptions(format!(
+            NativePlanningError::InvalidOptions(format!(
                 "memory margin {value} does not fit this target's usize"
             ))
         })
@@ -2510,7 +2535,7 @@ fn expand_margins(values: &[u64], count: usize) -> Result<Vec<usize>, EstimateEr
     values.iter().copied().map(convert).collect()
 }
 
-fn path_c_string(path: &Path) -> Result<CString, EstimateError> {
+fn path_c_string(path: &Path) -> Result<CString, NativePlanningError> {
     Ok(CString::new(path.to_string_lossy().as_bytes())?)
 }
 
@@ -2810,6 +2835,8 @@ mod tests {
         let mut changed = devices.into_iter().rev().collect::<Vec<_>>();
         changed[0].free_bytes = Some(1);
         changed[1].free_bytes = Some(2);
+        changed[0].name = "renamed device".to_owned();
+        changed[0].description = "changed presentation description".to_owned();
         let second = hardware_snapshot_from_devices(
             changed,
             CapacityPolicy::default(),
@@ -3042,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn fit_capacity_uses_exact_physical_identity_across_backend_views() {
+    fn assessment_capacity_uses_exact_physical_identity_across_backend_views() {
         let device = |index, backend: &str, required_bytes| FitDeviceEstimate {
             index,
             kind: FitDeviceKind::Accelerator,
@@ -3107,7 +3134,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_fit_keeps_an_explicit_zero_byte_system_domain() {
+    fn dedicated_assessment_keeps_an_explicit_zero_byte_system_domain() {
         let device =
             |index, kind, name: &str, device_id, total_bytes, required_bytes| FitDeviceEstimate {
                 index,
@@ -3183,7 +3210,7 @@ mod tests {
     }
 
     #[test]
-    fn integrated_gpu_and_host_share_one_fit_capacity_domain() {
+    fn integrated_gpu_and_host_share_one_assessment_capacity_domain() {
         let device = |index, kind, backend_type, name: &str, total_bytes, required_bytes| {
             FitDeviceEstimate {
                 index,
@@ -3267,8 +3294,8 @@ mod tests {
     }
 
     #[test]
-    fn host_accelerator_and_cpu_share_one_fit_capacity_domain() {
-        let fit = |index, kind, backend: &str, required_bytes| FitDeviceEstimate {
+    fn host_accelerator_and_cpu_share_one_assessment_capacity_domain() {
+        let device_estimate = |index, kind, backend: &str, required_bytes| FitDeviceEstimate {
             index,
             kind,
             backend_type: 0,
@@ -3316,8 +3343,8 @@ mod tests {
         let summary = capacity_summary(
             &topology,
             &[
-                fit(0, FitDeviceKind::Accelerator, "BLAS", 4_000),
-                fit(1, FitDeviceKind::Host, "CPU", 5_000),
+                device_estimate(0, FitDeviceKind::Accelerator, "BLAS", 4_000),
+                device_estimate(1, FitDeviceKind::Host, "CPU", 5_000),
             ],
             Measurement::Initial,
             None,
@@ -3839,8 +3866,8 @@ mod tests {
         tensor_type: i32,
         routed: bool,
         bytes_per_second: f64,
-    ) -> FitCalibrationMetric {
-        FitCalibrationMetric {
+    ) -> HardwareCalibrationMetric {
+        HardwareCalibrationMetric {
             backend_type: 2,
             backend: backend.to_owned(),
             device_id: Some(device_id.to_owned()),
@@ -3855,8 +3882,8 @@ mod tests {
         }
     }
 
-    fn calibration(metrics: Vec<FitCalibrationMetric>) -> FitCalibration {
-        FitCalibration {
+    fn calibration(metrics: Vec<HardwareCalibrationMetric>) -> HardwareCalibration {
+        HardwareCalibration {
             method: llama_cpp_2::model::params::fit::FIT_CALIBRATION_METHOD.to_owned(),
             metrics,
             elapsed_microseconds: 1,
@@ -3893,15 +3920,26 @@ mod tests {
         backend: &str,
         device_id: &str,
     ) -> llama_cpp_2::model::params::fit::FitKvLayerWorkload {
+        use llama_cpp_2::model::params::fit::{FitAttentionRowWorkload, FitAttentionWorkload};
         llama_cpp_2::model::params::fit::FitKvLayerWorkload {
             layer,
             backend_type: 2,
             backend: backend.to_owned(),
             device_id: Some(device_id.to_owned()),
-            key_type: 1,
-            value_type: 1,
-            key_bytes_per_token: row_bytes,
-            value_bytes_per_token: row_bytes,
+            attention: if row_bytes == 0 {
+                FitAttentionWorkload::None
+            } else {
+                FitAttentionWorkload::Conventional {
+                    key: FitAttentionRowWorkload {
+                        tensor_type: 1,
+                        bytes_per_token: row_bytes,
+                    },
+                    value: FitAttentionRowWorkload {
+                        tensor_type: 1,
+                        bytes_per_token: row_bytes,
+                    },
+                }
+            },
             attention_head_size: row_bytes as u32,
             attention_state_type: 1,
             sliding_window_tokens,
@@ -3920,8 +3958,8 @@ mod tests {
         kv_layers: Vec<llama_cpp_2::model::params::fit::FitKvLayerWorkload>,
         expert_count: u32,
         expert_used_count: u32,
-    ) -> FitDecodeWorkload {
-        FitDecodeWorkload {
+    ) -> DecodeWorkload {
+        DecodeWorkload {
             method: llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD.to_owned(),
             architecture: "test".to_owned(),
             expert_count,
@@ -4163,22 +4201,14 @@ mod tests {
         u64,
         u64,
         bool,
-        Vec<GenerationSpeedPoint>,
+        GenerationPerformanceAssessment,
     ) {
-        let GenerationPerformanceAssessment {
-            confidence,
-            always_active_weight_bytes,
-            routed_expert_weight_bytes,
-            cross_memory_domain_placement,
-            points,
-            ..
-        } = assessment;
         (
-            confidence,
-            always_active_weight_bytes,
-            routed_expert_weight_bytes,
-            cross_memory_domain_placement,
-            points,
+            assessment.confidence,
+            assessment.always_active_weight_bytes,
+            assessment.routed_expert_weight_bytes,
+            assessment.cross_memory_domain_placement,
+            assessment,
         )
     }
 
@@ -4199,22 +4229,47 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let (confidence, always_bytes, routed_bytes, hybrid, points) = estimated_parts(
-            estimate_generation_performance(&workload, &calibration, 20, &[10, 20], false).unwrap(),
+        let short = estimate_generation_performance(&workload, &calibration, 10, false).unwrap();
+        let (confidence, always_bytes, routed_bytes, hybrid, long) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 20, false).unwrap(),
         );
         assert_eq!(confidence, GenerationPerformanceConfidence::High);
         assert_eq!(always_bytes, 800);
         assert_eq!(routed_bytes, 0);
         assert!(!hybrid);
-        assert_eq!(points.len(), 2);
-        assert_eq!(points[0].kv_bytes_read_per_token, 200);
-        assert_eq!(points[1].kv_bytes_read_per_token, 400);
-        assert!((points[0].expected_tokens_per_second - 0.82).abs() < 1e-12);
-        assert!((points[1].expected_tokens_per_second - (0.82 / 1.2)).abs() < 1e-12);
-        assert!(points.iter().all(|point| {
-            point.lower_tokens_per_second <= point.expected_tokens_per_second
-                && point.expected_tokens_per_second <= point.upper_tokens_per_second
-        }));
+        assert_eq!(short.context_tokens, 10);
+        assert_eq!(short.kv_bytes_read_per_token, 200);
+        assert_eq!(long.context_tokens, 20);
+        assert_eq!(long.kv_bytes_read_per_token, 400);
+        assert!((short.expected_tokens_per_second - 0.82).abs() < 1e-12);
+        assert!((long.expected_tokens_per_second - (0.82 / 1.2)).abs() < 1e-12);
+        assert!(long.lower_tokens_per_second <= long.expected_tokens_per_second);
+        assert!(long.expected_tokens_per_second <= long.upper_tokens_per_second);
+    }
+
+    #[test]
+    fn estimator_returns_the_exact_assessed_context_above_200k() {
+        let workload = workload(
+            vec![tensor(
+                "output.weight",
+                FitTensorWorkloadKind::AlwaysActive,
+                800,
+                800,
+                1,
+                "Metal",
+                "MTL0",
+            )],
+            vec![kv_layer(0, 10, 0, false, "Metal", "MTL0")],
+            0,
+            0,
+        );
+        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+
+        let assessment =
+            estimate_generation_performance(&workload, &calibration, 262_144, false).unwrap();
+
+        assert_eq!(assessment.context_tokens, 262_144);
+        assert_eq!(assessment.kv_bytes_read_per_token, 5_242_880);
     }
 
     #[test]
@@ -4239,7 +4294,7 @@ mod tests {
         let calibration = calibration(vec![metric]);
 
         let (confidence, ..) = estimated_parts(
-            estimate_generation_performance(&workload, &calibration, 20, &[20], false).unwrap(),
+            estimate_generation_performance(&workload, &calibration, 20, false).unwrap(),
         );
 
         assert_eq!(confidence, GenerationPerformanceConfidence::Low);
@@ -4263,7 +4318,7 @@ mod tests {
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
         let (_, always_bytes, _, _, _) = estimated_parts(
-            estimate_generation_performance(&workload, &calibration, 10, &[10], false).unwrap(),
+            estimate_generation_performance(&workload, &calibration, 10, false).unwrap(),
         );
         assert_eq!(always_bytes, 100);
     }
@@ -4299,14 +4354,14 @@ mod tests {
             calibration_metric("Metal", "MTL0", 1, false, 1_000.0),
             calibration_metric("Metal", "MTL0", 1, true, 1_000.0),
         ]);
-        let (confidence, always_bytes, routed_bytes, _, points) = estimated_parts(
-            estimate_generation_performance(&workload, &calibration, 10, &[10], false).unwrap(),
+        let (confidence, always_bytes, routed_bytes, _, estimate) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 10, false).unwrap(),
         );
         assert_eq!(confidence, GenerationPerformanceConfidence::Moderate);
         assert_eq!(always_bytes, 400);
         assert_eq!(routed_bytes, 800);
         // 400 always-active + 200 selected expert + 100 KV bytes at 1,000 B/s.
-        assert!((points[0].expected_tokens_per_second - (0.75 / 0.7)).abs() < 1e-12);
+        assert!((estimate.expected_tokens_per_second - (0.75 / 0.7)).abs() < 1e-12);
     }
 
     #[test]
@@ -4329,12 +4384,11 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let (_, _, _, _, points) = estimated_parts(
-            estimate_generation_performance(&workload, &calibration, 20, &[10, 20], false).unwrap(),
-        );
-        assert_eq!(points[0].kv_bytes_read_per_token, 200);
-        assert_eq!(points[1].kv_bytes_read_per_token, 300);
-        assert!(points[1].expected_tokens_per_second < points[0].expected_tokens_per_second);
+        let short = estimate_generation_performance(&workload, &calibration, 10, false).unwrap();
+        let long = estimate_generation_performance(&workload, &calibration, 20, false).unwrap();
+        assert_eq!(short.kv_bytes_read_per_token, 200);
+        assert_eq!(long.kv_bytes_read_per_token, 300);
+        assert!(long.expected_tokens_per_second < short.expected_tokens_per_second);
     }
 
     #[test]
@@ -4358,13 +4412,13 @@ mod tests {
             calibration_metric("Metal", "MTL0", 2, false, 500.0),
             calibration_metric("CPU", "CPU", 1, false, 500.0),
         ]);
-        let (confidence, _, _, hybrid, points) = estimated_parts(
-            estimate_generation_performance(&workload, &calibration, 10, &[10], true).unwrap(),
+        let (confidence, _, _, hybrid, estimate) = estimated_parts(
+            estimate_generation_performance(&workload, &calibration, 10, true).unwrap(),
         );
         assert_eq!(confidence, GenerationPerformanceConfidence::Low);
         assert!(hybrid);
         // Unknown Metal type 7 uses the slower same-operation fallback (type 2 at 500 B/s).
-        assert!((points[0].expected_tokens_per_second - (0.82 * 0.88 / 0.4)).abs() < 1e-12);
+        assert!((estimate.expected_tokens_per_second - (0.82 * 0.88 / 0.4)).abs() < 1e-12);
     }
 
     #[test]
@@ -4400,12 +4454,12 @@ mod tests {
                 expert_used_count,
             )
         };
-        let rate = |workload: &FitDecodeWorkload| {
+        let rate = |workload: &DecodeWorkload| {
             estimated_parts(
-                estimate_generation_performance(workload, &calibration, 10, &[10], false).unwrap(),
+                estimate_generation_performance(workload, &calibration, 10, false).unwrap(),
             )
-            .4[0]
-                .expected_tokens_per_second
+            .4
+            .expected_tokens_per_second
         };
 
         let baseline = rate(&make_workload(100, 1));
@@ -4430,16 +4484,16 @@ mod tests {
             0,
         );
         let dense_only = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let error = estimate_generation_performance(&invalid_moe, &dense_only, 10, &[10], false)
+        let error = estimate_generation_performance(&invalid_moe, &dense_only, 10, false)
             .expect_err("invalid expert metadata must fail");
         assert_eq!(error.code, "invalid_expert_metadata");
 
-        let valid_moe = FitDecodeWorkload {
+        let valid_moe = DecodeWorkload {
             expert_used_count: 2,
             ..invalid_moe
         };
         let (confidence, _, _, _, _) = estimated_parts(
-            estimate_generation_performance(&valid_moe, &dense_only, 10, &[10], false)
+            estimate_generation_performance(&valid_moe, &dense_only, 10, false)
                 .expect("dense calibration should provide a conservative routed fallback"),
         );
         assert_eq!(confidence, GenerationPerformanceConfidence::Low);
@@ -4466,7 +4520,7 @@ mod tests {
             false,
             f64::NAN,
         ));
-        let error = estimate_generation_performance(&dense, &malformed, 10, &[10], false)
+        let error = estimate_generation_performance(&dense, &malformed, 10, false)
             .expect_err("every calibration metric must be validated before use");
         assert_eq!(error.code, "invalid_calibration");
     }
@@ -4503,15 +4557,15 @@ mod tests {
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
 
         let base = estimated_parts(
-            estimate_generation_performance(&base, &calibration, 10, &[10], false).unwrap(),
+            estimate_generation_performance(&base, &calibration, 10, false).unwrap(),
         );
         let with_nextn = estimated_parts(
-            estimate_generation_performance(&with_nextn, &calibration, 10, &[10], false).unwrap(),
+            estimate_generation_performance(&with_nextn, &calibration, 10, false).unwrap(),
         );
         assert_eq!(base.1, with_nextn.1);
         assert_eq!(
-            base.4[0].expected_tokens_per_second,
-            with_nextn.4[0].expected_tokens_per_second
+            base.4.expected_tokens_per_second,
+            with_nextn.4.expected_tokens_per_second
         );
     }
 
@@ -4549,19 +4603,20 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
+        let recurrent_short =
+            estimate_generation_performance(&recurrent, &calibration, 10, false).unwrap();
         let recurrent = estimated_parts(
-            estimate_generation_performance(&recurrent, &calibration, 20, &[10, 20], false)
-                .unwrap(),
+            estimate_generation_performance(&recurrent, &calibration, 20, false).unwrap(),
         );
         let dense = estimated_parts(
-            estimate_generation_performance(&dense, &calibration, 20, &[10], false).unwrap(),
+            estimate_generation_performance(&dense, &calibration, 20, false).unwrap(),
         );
 
         assert_eq!(
-            recurrent.4[0].expected_tokens_per_second,
-            recurrent.4[1].expected_tokens_per_second
+            recurrent_short.expected_tokens_per_second,
+            recurrent.4.expected_tokens_per_second
         );
-        assert!(recurrent.4[0].expected_tokens_per_second < dense.4[0].expected_tokens_per_second);
+        assert!(recurrent.4.expected_tokens_per_second < dense.4.expected_tokens_per_second);
     }
 
     #[test]
@@ -4585,7 +4640,13 @@ mod tests {
         compressed.kv_layers[0].compression_ratio = 4;
         compressed.kv_layers[0].sparse_index = true;
         compressed.kv_layers[0].indexer_bytes_per_token = 2;
-        compressed.kv_layers[0].value_bytes_per_token = 0;
+        compressed.kv_layers[0].attention =
+            llama_cpp_2::model::params::fit::FitAttentionWorkload::Mla {
+                latent: llama_cpp_2::model::params::fit::FitAttentionRowWorkload {
+                    tensor_type: 1,
+                    bytes_per_token: 4,
+                },
+            };
         let calibration = calibration(vec![calibration_metric(
             "CUDA",
             "GPU0",
@@ -4593,21 +4654,16 @@ mod tests {
             false,
             1_000_000.0,
         )]);
-        let (confidence, _, _, _, points) = estimated_parts(
-            estimate_generation_performance(
-                &compressed,
-                &calibration,
-                4_000,
-                &[1_000, 4_000],
-                false,
-            )
-            .unwrap(),
+        let short =
+            estimate_generation_performance(&compressed, &calibration, 1_000, false).unwrap();
+        let (confidence, _, _, _, long) = estimated_parts(
+            estimate_generation_performance(&compressed, &calibration, 4_000, false).unwrap(),
         );
 
         assert_eq!(confidence, GenerationPerformanceConfidence::Moderate);
-        assert_eq!(points[0].kv_bytes_read_per_token, 1_500);
-        assert_eq!(points[1].kv_bytes_read_per_token, 4_048);
-        assert!(points[1].expected_tokens_per_second < points[0].expected_tokens_per_second);
+        assert_eq!(short.kv_bytes_read_per_token, 1_500);
+        assert_eq!(long.kv_bytes_read_per_token, 4_048);
+        assert!(long.expected_tokens_per_second < short.expected_tokens_per_second);
     }
 
     #[test]
@@ -4637,28 +4693,32 @@ mod tests {
             false,
             1_000_000.0,
         )]);
+        let generic_short =
+            estimate_generation_performance(&generic, &calibration, 1_000, false).unwrap();
         let generic = estimated_parts(
-            estimate_generation_performance(&generic, &calibration, 4_000, &[1_000, 4_000], false)
-                .unwrap(),
+            estimate_generation_performance(&generic, &calibration, 4_000, false).unwrap(),
         );
+        let deepseek_short =
+            estimate_generation_performance(&deepseek, &calibration, 1_000, false).unwrap();
         let deepseek = estimated_parts(
-            estimate_generation_performance(&deepseek, &calibration, 4_000, &[1_000, 4_000], false)
-                .unwrap(),
+            estimate_generation_performance(&deepseek, &calibration, 4_000, false).unwrap(),
         );
 
         assert_eq!(
-            generic.4[0].kv_bytes_read_per_token,
-            deepseek.4[0].kv_bytes_read_per_token
+            generic_short.kv_bytes_read_per_token,
+            deepseek_short.kv_bytes_read_per_token
         );
         assert_eq!(
-            generic.4[1].kv_bytes_read_per_token,
-            deepseek.4[1].kv_bytes_read_per_token
+            generic.4.kv_bytes_read_per_token,
+            deepseek.4.kv_bytes_read_per_token
         );
-        assert!(deepseek.4[0].expected_tokens_per_second < generic.4[0].expected_tokens_per_second);
-        let short_penalty = 1.0 / deepseek.4[0].expected_tokens_per_second
-            - 1.0 / generic.4[0].expected_tokens_per_second;
-        let long_penalty = 1.0 / deepseek.4[1].expected_tokens_per_second
-            - 1.0 / generic.4[1].expected_tokens_per_second;
+        assert!(
+            deepseek_short.expected_tokens_per_second < generic_short.expected_tokens_per_second
+        );
+        let short_penalty = 1.0 / deepseek_short.expected_tokens_per_second
+            - 1.0 / generic_short.expected_tokens_per_second;
+        let long_penalty = 1.0 / deepseek.4.expected_tokens_per_second
+            - 1.0 / generic.4.expected_tokens_per_second;
         assert!((short_penalty - long_penalty).abs() < f64::EPSILON * 16.0);
     }
 
@@ -4689,13 +4749,11 @@ mod tests {
             false,
             1_000_000.0,
         )]);
-        let (_, _, _, _, points) = estimated_parts(
-            estimate_generation_performance(&sparse, &calibration, 2_000, &[1_000, 2_000], false)
-                .unwrap(),
-        );
+        let short = estimate_generation_performance(&sparse, &calibration, 1_000, false).unwrap();
+        let long = estimate_generation_performance(&sparse, &calibration, 2_000, false).unwrap();
 
-        assert_eq!(points[0].kv_bytes_read_per_token, 6_096);
-        assert_eq!(points[1].kv_bytes_read_per_token, 8_096);
+        assert_eq!(short.kv_bytes_read_per_token, 6_096);
+        assert_eq!(long.kv_bytes_read_per_token, 8_096);
     }
 
     #[test]
@@ -4718,11 +4776,10 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let (_, _, _, _, points) = estimated_parts(
-            estimate_generation_performance(&hybrid, &calibration, 20, &[10, 20], false).unwrap(),
-        );
-        assert_eq!(points[0].kv_bytes_read_per_token, 100);
-        assert_eq!(points[1].kv_bytes_read_per_token, 200);
+        let short = estimate_generation_performance(&hybrid, &calibration, 10, false).unwrap();
+        let long = estimate_generation_performance(&hybrid, &calibration, 20, false).unwrap();
+        assert_eq!(short.kv_bytes_read_per_token, 100);
+        assert_eq!(long.kv_bytes_read_per_token, 200);
     }
 
     #[test]
@@ -4742,16 +4799,16 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let (confidence, _, _, _, points) = estimated_parts(
-            estimate_generation_performance(&recurrent, &calibration, 20, &[10, 20], false)
-                .unwrap(),
+        let short = estimate_generation_performance(&recurrent, &calibration, 10, false).unwrap();
+        let (confidence, _, _, _, long) = estimated_parts(
+            estimate_generation_performance(&recurrent, &calibration, 20, false).unwrap(),
         );
         assert_eq!(confidence, GenerationPerformanceConfidence::Moderate);
-        assert_eq!(points[0].kv_bytes_read_per_token, 0);
-        assert_eq!(points[1].kv_bytes_read_per_token, 0);
+        assert_eq!(short.kv_bytes_read_per_token, 0);
+        assert_eq!(long.kv_bytes_read_per_token, 0);
         assert_eq!(
-            points[0].expected_tokens_per_second,
-            points[1].expected_tokens_per_second
+            short.expected_tokens_per_second,
+            long.expected_tokens_per_second
         );
     }
 
@@ -4772,35 +4829,11 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let (_, _, _, _, points) = estimated_parts(
-            estimate_generation_performance(&no_attention, &calibration, 20, &[10, 20], false)
-                .unwrap(),
-        );
-        assert_eq!(points[0].kv_bytes_read_per_token, 0);
-        assert_eq!(points[1].kv_bytes_read_per_token, 0);
-    }
-
-    #[test]
-    fn incomplete_kv_rows_are_rejected() {
-        let mut incomplete = workload(
-            vec![tensor(
-                "output.weight",
-                FitTensorWorkloadKind::AlwaysActive,
-                100,
-                100,
-                1,
-                "Metal",
-                "MTL0",
-            )],
-            vec![kv_layer(0, 0, 0, false, "Metal", "MTL0")],
-            0,
-            0,
-        );
-        incomplete.kv_layers[0].value_bytes_per_token = 8;
-        let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let error = estimate_generation_performance(&incomplete, &calibration, 20, &[10], false)
-            .expect_err("native K/V row metadata must be jointly present or absent");
-        assert_eq!(error.code, "invalid_native_workload");
+        let short =
+            estimate_generation_performance(&no_attention, &calibration, 10, false).unwrap();
+        let long = estimate_generation_performance(&no_attention, &calibration, 20, false).unwrap();
+        assert_eq!(short.kv_bytes_read_per_token, 0);
+        assert_eq!(long.kv_bytes_read_per_token, 0);
     }
 
     #[test]
@@ -4823,7 +4856,7 @@ mod tests {
             0,
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
-        let error = estimate_generation_performance(&duplicate, &calibration, 10, &[10], false)
+        let error = estimate_generation_performance(&duplicate, &calibration, 10, false)
             .expect_err("duplicate KV layer identities must fail");
         assert_eq!(error.code, "invalid_native_workload");
     }
@@ -4846,8 +4879,13 @@ mod tests {
         );
         let calibration = calibration(vec![calibration_metric("Metal", "MTL0", 1, false, 1_000.0)]);
 
-        dense.kv_layers[0].key_bytes_per_token = u64::MAX;
-        let error = estimate_generation_performance(&dense, &calibration, 2, &[2], false)
+        let llama_cpp_2::model::params::fit::FitAttentionWorkload::Conventional { key, .. } =
+            &mut dense.kv_layers[0].attention
+        else {
+            panic!("fixture must use conventional attention");
+        };
+        key.bytes_per_token = u64::MAX;
+        let error = estimate_generation_performance(&dense, &calibration, 2, false)
             .expect_err("KV byte overflow must fail");
         assert_eq!(error.code, "workload_overflow");
     }

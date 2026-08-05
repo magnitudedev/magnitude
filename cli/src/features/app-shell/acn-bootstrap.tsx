@@ -26,9 +26,7 @@ const STARTING_PHASE_LABELS: Readonly<Record<Extract<AcnStartingPhase, string>, 
 const startingPhaseLabel = (phase: AcnStartingPhase): string =>
   typeof phase === "string"
     ? STARTING_PHASE_LABELS[phase]
-    : phase.backend._tag === "Cuda"
-      ? `Preparing CUDA backend for ${phase.backend.hardwareLabel}`
-      : "Preparing local inference"
+    : `Preparing ${{ Cpu: "CPU", Metal: "Metal", Cuda: "CUDA", Vulkan: "Vulkan" }[phase.backend._tag]} backend for ${phase.backend.hardwareLabel}`
 
 const INSTALLATION_PANEL_WIDTH = 64;
 const PROGRESS_BAR_WIDTH = 36;

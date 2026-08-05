@@ -79,6 +79,32 @@ test("renders CUDA backend preparation with its hardware label", async () => {
   }
 })
 
+test("renders Metal backend preparation on a Mac", async () => {
+  const view = await testRender(
+    <AcnBootstrapScreen
+      state={{
+        _tag: "Starting",
+        phase: {
+          _tag: "PreparingBackend",
+          backend: { _tag: "Metal", hardwareLabel: "Apple M4 Max" },
+        },
+      }}
+      onRetry={() => undefined}
+      onQuit={() => undefined}
+    />,
+    { width: 91, height: 13 },
+  )
+
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toContain(
+      "Preparing Metal backend for Apple M4 Max",
+    )
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 const keyEvent = (name: string, ctrl = false) =>
   new KeyEvent({
     name,

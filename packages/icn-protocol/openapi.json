@@ -528,46 +528,6 @@
         }
       }
     },
-    "/v1/models/fit": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "fitModels",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FitModelsRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Automatically selected target profiles",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FitModelsResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Automatic fitting operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/models/installed": {
       "get": {
         "tags": [
@@ -1144,39 +1104,13 @@
               "profiles": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/OfferingAssessment"
+                  "$ref": "#/components/schemas/ModelAssessment"
                 }
               },
               "_tag": {
                 "type": "string",
                 "enum": [
                   "Assessed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "targetId",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "targetId": {
-                "$ref": "#/components/schemas/ModelOfferingTargetId"
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "AssessmentFailed"
                 ]
               }
             }
@@ -2257,160 +2191,6 @@
         },
         "additionalProperties": false
       },
-      "FitModelResult": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "targetId",
-              "configuration",
-              "assessment",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "targetId": {
-                "$ref": "#/components/schemas/ModelOfferingTargetId"
-              },
-              "configuration": {
-                "$ref": "#/components/schemas/ModelServingConfiguration"
-              },
-              "assessment": {
-                "$ref": "#/components/schemas/OfferingAssessment"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Fitted"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "targetId",
-              "limitingResource",
-              "deficitBytes",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "targetId": {
-                "$ref": "#/components/schemas/ModelOfferingTargetId"
-              },
-              "limitingResource": {
-                "type": "string"
-              },
-              "deficitBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DoesNotFit"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "InvalidTarget"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "FitModelTarget": {
-        "type": "object",
-        "required": [
-          "requestId",
-          "target"
-        ],
-        "properties": {
-          "requestId": {
-            "$ref": "#/components/schemas/ModelAssessmentRequestId"
-          },
-          "target": {
-            "$ref": "#/components/schemas/ModelTargetInput"
-          }
-        },
-        "additionalProperties": false
-      },
-      "FitModelsRequest": {
-        "type": "object",
-        "required": [
-          "targets",
-          "capacityPolicy",
-          "minimumContextLength",
-          "maximumContextLength"
-        ],
-        "properties": {
-          "targets": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FitModelTarget"
-            }
-          },
-          "capacityPolicy": {
-            "$ref": "#/components/schemas/CapacityPolicy"
-          },
-          "minimumContextLength": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "maximumContextLength": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
-      "FitModelsResponse": {
-        "type": "object",
-        "required": [
-          "environmentId",
-          "results"
-        ],
-        "properties": {
-          "environmentId": {
-            "$ref": "#/components/schemas/AssessmentEnvironmentId"
-          },
-          "results": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FitModelResult"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
       "FlashAttentionResponse": {
         "type": "string",
         "enum": [
@@ -3214,7 +2994,61 @@
               "type": {
                 "type": "string",
                 "enum": [
+                  "cpu"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "hardwareLabel",
+              "type"
+            ],
+            "properties": {
+              "hardwareLabel": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "metal"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "hardwareLabel",
+              "type"
+            ],
+            "properties": {
+              "hardwareLabel": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
                   "cuda"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "hardwareLabel",
+              "type"
+            ],
+            "properties": {
+              "hardwareLabel": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "vulkan"
                 ]
               }
             }
@@ -3501,6 +3335,119 @@
         },
         "additionalProperties": false
       },
+      "ModelAssessment": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "profile",
+              "configurationId",
+              "assessmentId",
+              "memory",
+              "performance",
+              "_tag"
+            ],
+            "properties": {
+              "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "configurationId": {
+                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              },
+              "assessmentId": {
+                "$ref": "#/components/schemas/ModelAssessmentId"
+              },
+              "memory": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MemoryAssessment"
+                }
+              },
+              "performance": {
+                "$ref": "#/components/schemas/PerformanceEvidence"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Fits"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "profile",
+              "configurationId",
+              "assessmentId",
+              "memory",
+              "limitingResource",
+              "deficitBytes",
+              "_tag"
+            ],
+            "properties": {
+              "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "configurationId": {
+                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              },
+              "assessmentId": {
+                "$ref": "#/components/schemas/ModelAssessmentId"
+              },
+              "memory": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MemoryAssessment"
+                }
+              },
+              "limitingResource": {
+                "type": "string"
+              },
+              "deficitBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DoesNotFit"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "profile",
+              "configurationId",
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "configurationId": {
+                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Incompatible"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelAssessmentId": {
+        "type": "string"
+      },
       "ModelAssessmentRequestId": {
         "type": "string"
       },
@@ -3584,6 +3531,15 @@
           "sizeBytes": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "tensorStorageBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exact encoded tensor storage, when bounded GGUF inspection succeeded.",
             "minimum": 0
           },
           "sha256": {
@@ -4506,119 +4462,6 @@
         },
         "additionalProperties": false
       },
-      "OfferingAssessment": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "profile",
-              "configurationId",
-              "assessmentId",
-              "memory",
-              "performance",
-              "_tag"
-            ],
-            "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
-              },
-              "assessmentId": {
-                "$ref": "#/components/schemas/OfferingAssessmentId"
-              },
-              "memory": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/MemoryAssessment"
-                }
-              },
-              "performance": {
-                "$ref": "#/components/schemas/PerformanceEvidence"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Fits"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "profile",
-              "configurationId",
-              "assessmentId",
-              "memory",
-              "limitingResource",
-              "deficitBytes",
-              "_tag"
-            ],
-            "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
-              },
-              "assessmentId": {
-                "$ref": "#/components/schemas/OfferingAssessmentId"
-              },
-              "memory": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/MemoryAssessment"
-                }
-              },
-              "limitingResource": {
-                "type": "string"
-              },
-              "deficitBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DoesNotFit"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "profile",
-              "configurationId",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Incompatible"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "OfferingAssessmentId": {
-        "type": "string"
-      },
       "PerformanceConfidence": {
         "type": "string",
         "enum": [
@@ -4768,7 +4611,6 @@
           "checkpointId",
           "targetId",
           "target",
-          "eligibleServingProfiles",
           "displayName",
           "description",
           "license",
@@ -4791,12 +4633,6 @@
           },
           "target": {
             "$ref": "#/components/schemas/ModelOfferingTarget"
-          },
-          "eligibleServingProfiles": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ServingProfile"
-            }
           },
           "displayName": {
             "type": "string"
@@ -5071,22 +4907,29 @@
       "StartModelDownloadRequest": {
         "type": "object",
         "required": [
-          "package"
+          "target"
         ],
         "properties": {
-          "package": {
-            "$ref": "#/components/schemas/ModelPackage"
+          "target": {
+            "$ref": "#/components/schemas/ModelOfferingTarget"
           }
         }
       },
       "StartModelDownloadResponse": {
         "type": "object",
         "required": [
-          "attempt"
+          "target_id",
+          "attempts"
         ],
         "properties": {
-          "attempt": {
-            "$ref": "#/components/schemas/DownloadAttempt"
+          "target_id": {
+            "$ref": "#/components/schemas/ModelOfferingTargetId"
+          },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DownloadAttempt"
+            }
           }
         }
       },

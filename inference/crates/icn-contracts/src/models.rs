@@ -1,4 +1,4 @@
-//! Transport-neutral local-model package, evaluation, download, and residency contracts.
+//! Transport-neutral local-model package, assessment, download, and residency contracts.
 
 use std::path::PathBuf;
 
@@ -23,7 +23,7 @@ string_id!(SpeculativeDecodingPairId);
 string_id!(ModelAssessmentRequestId);
 string_id!(ModelOfferingTargetId);
 string_id!(ModelServingConfigurationId);
-string_id!(OfferingAssessmentId);
+string_id!(ModelAssessmentId);
 string_id!(AssessmentEnvironmentId);
 string_id!(RecommendableModelId);
 string_id!(ModelInstanceId);
@@ -185,6 +185,9 @@ pub struct ModelFile {
     pub path: PathBuf,
     pub role: ModelFileRole,
     pub size_bytes: u64,
+    /// Exact encoded tensor storage, when bounded GGUF inspection succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor_storage_bytes: Option<u64>,
     pub sha256: String,
 }
 
@@ -354,7 +357,6 @@ pub struct RecommendableModel {
     pub checkpoint_id: String,
     pub target_id: ModelOfferingTargetId,
     pub target: ModelOfferingTarget,
-    pub eligible_serving_profiles: Vec<ServingProfile>,
     pub display_name: String,
     pub description: String,
     pub license: String,
@@ -464,12 +466,12 @@ pub struct PerformanceEvidence {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum OfferingAssessment {
+pub enum ModelAssessment {
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
         configuration_id: ModelServingConfigurationId,
-        assessment_id: OfferingAssessmentId,
+        assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         performance: PerformanceEvidence,
     },
@@ -477,7 +479,7 @@ pub enum OfferingAssessment {
     DoesNotFit {
         profile: ServingProfile,
         configuration_id: ModelServingConfigurationId,
-        assessment_id: OfferingAssessmentId,
+        assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,
         deficit_bytes: u64,
@@ -490,7 +492,7 @@ pub enum OfferingAssessment {
     },
 }
 
-impl OfferingAssessment {
+impl ModelAssessment {
     #[must_use]
     pub fn is_valid_for(&self, topology: &crate::MemoryTopology) -> bool {
         match self {
@@ -523,13 +525,7 @@ pub enum AssessModelResult {
     Assessed {
         request_id: ModelAssessmentRequestId,
         target_id: ModelOfferingTargetId,
-        profiles: Vec<OfferingAssessment>,
-    },
-    #[serde(rename_all = "camelCase")]
-    AssessmentFailed {
-        request_id: ModelAssessmentRequestId,
-        target_id: ModelOfferingTargetId,
-        failure: ModelFailure,
+        profiles: Vec<ModelAssessment>,
     },
     #[serde(rename_all = "camelCase")]
     InvalidTarget {
@@ -548,59 +544,8 @@ pub struct AssessModelsResponse {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FitModelTarget {
-    pub request_id: ModelAssessmentRequestId,
-    pub target: ModelTargetInput,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FitModelsRequest {
-    pub targets: Vec<FitModelTarget>,
-    pub capacity_policy: CapacityPolicy,
-    pub minimum_context_length: u32,
-    pub maximum_context_length: u32,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum FitModelResult {
-    #[serde(rename_all = "camelCase")]
-    Fitted {
-        request_id: ModelAssessmentRequestId,
-        target_id: ModelOfferingTargetId,
-        configuration: ModelServingConfiguration,
-        assessment: OfferingAssessment,
-    },
-    #[serde(rename_all = "camelCase")]
-    DoesNotFit {
-        request_id: ModelAssessmentRequestId,
-        target_id: ModelOfferingTargetId,
-        limiting_resource: String,
-        deficit_bytes: u64,
-    },
-    #[serde(rename_all = "camelCase")]
-    InvalidTarget {
-        request_id: ModelAssessmentRequestId,
-        failure: ModelFailure,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FitModelsResponse {
-    pub environment_id: AssessmentEnvironmentId,
-    pub results: Vec<FitModelResult>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadRequest {
-    pub package: ModelPackage,
+    pub target: ModelOfferingTarget,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -645,7 +590,8 @@ pub enum DownloadAttempt {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadResponse {
-    pub attempt: DownloadAttempt,
+    pub target_id: ModelOfferingTargetId,
+    pub attempts: Vec<DownloadAttempt>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -786,15 +732,11 @@ pub trait RecommendableModelCatalogProvider: Send + Sync + 'static {
     fn catalog(&self) -> BoxFuture<'_, Result<RecommendableModelCatalog, InventoryError>>;
 }
 
-pub trait ModelEvaluator: Send + Sync + 'static {
+pub trait ModelAssessor: Send + Sync + 'static {
     fn assess(
         &self,
         request: AssessModelsRequest,
     ) -> BoxFuture<'_, Result<AssessModelsResponse, InventoryError>>;
-    fn fit(
-        &self,
-        request: FitModelsRequest,
-    ) -> BoxFuture<'_, Result<FitModelsResponse, InventoryError>>;
 }
 
 pub trait ModelDownloads: Send + Sync + 'static {

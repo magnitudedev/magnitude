@@ -8,6 +8,8 @@ import {
   type ModelInstanceId,
   type DownloadAttemptId,
   type ModelOfferingTargetId,
+  type ModelServingConfigurationId,
+  type ProviderModelId,
   type ProviderModelIdentity,
   type SlotId,
   type SlotSelection,
@@ -49,9 +51,9 @@ export function useLocalModelActions() {
   const deleteModel = useAtomSet(client.mutation("DeleteLocalModel"))
 
   return {
-    download: useCallback((targetId: ModelOfferingTargetId) =>
+    download: useCallback((configurationId: ModelServingConfigurationId) =>
       download({
-        payload: { targetId },
+        payload: { configurationId },
         reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
       }), [download]),
     cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => cancel({

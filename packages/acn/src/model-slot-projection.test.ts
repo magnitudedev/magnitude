@@ -13,7 +13,7 @@ import {
   ReasoningEffortSchema,
 } from "@magnitudedev/sdk"
 import {
-  localModelAvailability,
+  localModelSlotAvailability,
   modelSlotActions,
   projectModelInstance,
   selectableModelCapabilities,
@@ -79,7 +79,7 @@ describe("model slot projection", () => {
         retryable: true,
       },
     }
-    expect(localModelAvailability(catalogUnavailable, true, false)).toEqual({
+    expect(localModelSlotAvailability(catalogUnavailable, true, false)).toEqual({
       _tag: "Unavailable",
       failure: {
         code: "local_model_not_installed",

@@ -263,7 +263,10 @@ export function OnboardingModelChooser({
     ? Option.none<string>()
     : Option.fromNullable(selections.find((selection) =>
       operation._tag === "Downloading" || operation._tag === "DownloadFailed"
-      ? selection.model.catalogCandidateIds.includes(operation.candidate.id)
+      ? selection.kind === "recommendation"
+        && selection.recommendation._tag === "Recommended"
+        && selection.recommendation.value.candidate.configurationId
+          === operation.candidate.configurationId
       : Option.contains(selection.providerModelId, operation.providerModelId))?.id)
   const selectedIndex = selectedInferenceIndex(
     selections,
@@ -313,8 +316,7 @@ export function OnboardingModelChooser({
     ) {
       const candidate = selection.recommendation.value.candidate
       onDownload({
-        targetId: candidate.targetId,
-        providerModelId: candidate.providerModelId,
+        configurationId: candidate.configurationId,
         displayName: candidate.displayName,
         reasoningEffort: Option.getOrElse(
           selection.reasoningEffort,

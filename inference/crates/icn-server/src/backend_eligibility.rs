@@ -30,6 +30,10 @@ fn cuda() -> CudaEligibility {
     }
 }
 
+pub(crate) fn probe_cuda() -> CudaEligibility {
+    cuda()
+}
+
 fn classify_vulkan_instance_error(error: vk::Result) -> VulkanEligibility {
     if error == vk::Result::ERROR_INCOMPATIBLE_DRIVER {
         VulkanEligibility::Absent {
@@ -82,19 +86,26 @@ fn vulkan() -> VulkanEligibility {
     }
 }
 
+pub(crate) fn probe_vulkan() -> VulkanEligibility {
+    vulkan()
+}
+
+pub(crate) fn probe_metal() -> MetalEligibility {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        MetalEligibility::Usable
+    } else {
+        MetalEligibility::Absent {
+            diagnostic: "Metal requires Apple Silicon".to_owned(),
+        }
+    }
+}
+
 pub(crate) fn probe() -> BackendEligibilityReport {
-    let metal = cfg!(all(target_os = "macos", target_arch = "aarch64"));
     BackendEligibilityReport {
         schema_version: 1,
-        cuda: cuda(),
-        vulkan: vulkan(),
-        metal: if metal {
-            MetalEligibility::Usable
-        } else {
-            MetalEligibility::Absent {
-                diagnostic: "Metal requires Apple Silicon".to_owned(),
-            }
-        },
+        cuda: probe_cuda(),
+        vulkan: probe_vulkan(),
+        metal: probe_metal(),
     }
 }
 

@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import {
   RecommendationIdSchema,
-  type FitsOfferingAssessment,
+  type FitsModelAssessment,
   type Recommendation,
   type RecommendableModel,
   type ServingProfile,
@@ -16,7 +16,7 @@ const DOWNLOAD_UTILITY_BYTES = 16 * 1024 ** 3
 export interface RecommendationCandidate {
   readonly model: RecommendableModel
   readonly profile: ServingProfile
-  readonly assessment: FitsOfferingAssessment
+  readonly assessment: FitsModelAssessment
   readonly artifactId: string
   readonly checkpointId: string
   readonly capability:

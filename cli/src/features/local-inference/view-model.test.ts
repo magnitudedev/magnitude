@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
-  CatalogCandidateIdSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
+  ModelServingConfigurationIdSchema,
+  ProviderModelIdSchema,
   RecommendationIdSchema,
 } from "@magnitudedev/sdk"
 import {
@@ -55,14 +56,14 @@ describe("local inference selection view model", () => {
         estimatedRemainingMs: Option.none(),
       },
       {
-        id: "analysis",
+        id: "assessment",
         status: { _tag: "Running", startedAtMs: 2_000 },
         completedItems: Option.some(8),
         totalItems: Option.some(28),
         estimatedRemainingMs: Option.some(5_000),
       },
       {
-        id: "analysis",
+        id: "assessment",
         status: {
           _tag: "Completed",
           startedAtMs: 2_000,
@@ -87,15 +88,15 @@ describe("local inference selection view model", () => {
         metadata: "",
       },
       {
-        id: "analysis",
+        id: "assessment",
         state: "running",
-        label: "Evaluating models for this machine",
+        label: "Assessing models for this machine",
         metadata: " · 8/28 · about 5s left",
       },
       {
-        id: "analysis",
+        id: "assessment",
         state: "completed",
-        label: "Evaluated 20 models for this machine",
+        label: "Assessed 20 models for this machine",
         metadata: " · 8s",
       },
     ])
@@ -104,7 +105,7 @@ describe("local inference selection view model", () => {
   it("keeps cache reuse and recommendation timing out of presentation", () => {
     expect(localInferenceProgressLines([
       {
-        id: "analysis",
+        id: "assessment",
         status: {
           _tag: "Completed",
           startedAtMs: 1_000,
@@ -129,9 +130,9 @@ describe("local inference selection view model", () => {
       },
     ])).toEqual([
       {
-        id: "analysis",
+        id: "assessment",
         state: "completed",
-        label: "Evaluated 20 models for this machine",
+        label: "Assessed 20 models for this machine",
         metadata: "",
       },
       {
@@ -280,7 +281,6 @@ describe("local inference selection view model", () => {
   it("keeps recommendations actionable without duplicating target state", () => {
     const model = makeModel({
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-      preparation: { _tag: "NotDownloaded" },
     })
     const selections = selectionsFor(makeView({
       models: [model],
@@ -297,10 +297,13 @@ describe("local inference selection view model", () => {
       intent: "balanced" | "best_quality" | "fastest" | "lightweight",
       index: number,
     ) => {
-      const candidateId = CatalogCandidateIdSchema.make(`candidate_${index}`)
+      const targetId = ModelOfferingTargetIdSchema.make(`target_${index}`)
       return makeRecommendation({
         id: RecommendationIdSchema.make(`recommendation_${intent}`),
-        candidate: makeCatalogCandidate({ id: candidateId }),
+        candidate: makeCatalogCandidate({
+          targetId,
+          configurationId: ModelServingConfigurationIdSchema.make(`configuration_${index}`),
+        }),
         intent,
         explanation: `${intent} explanation`,
       })
@@ -308,10 +311,8 @@ describe("local inference selection view model", () => {
     const intents = ["fastest", "lightweight", "best_quality", "balanced"] as const
     const models = intents.map((intent, index) => makeModel({
       targetId: ModelOfferingTargetIdSchema.make(`target_${index}`),
-      catalogCandidateIds: [CatalogCandidateIdSchema.make(`candidate_${index}`)],
       displayName: `${intent} model`,
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-      preparation: { _tag: "NotDownloaded" },
     }))
     const selections = selectionsFor(makeView({
       ready: false,
@@ -328,18 +329,26 @@ describe("local inference selection view model", () => {
     ])
   })
 
-  it("exposes the target preparation failure", () => {
-    const model = makeModel({
-      preparation: {
-        _tag: "Unavailable",
-        providerModelIds: [],
-        failure: { code: "does_not_fit", message: "Requires more memory", retryable: false },
-      },
+  it("exposes an assessed capacity failure", () => {
+    const recommendation = makeRecommendation({
+      candidate: makeCatalogCandidate({
+        availability: {
+          _tag: "Unavailable",
+          failure: {
+            code: "insufficient_resources",
+            message: "This configuration does not fit",
+            retryable: true,
+          },
+        },
+      }),
     })
     const selection = selectionsFor(makeView({
-      models: [model],
-      ready: false,
+      models: [makeModel({
+        offerings: [],
+        download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 1 },
+      })],
+      recommendations: [recommendation],
     }))[0]!
-    expect(selectionCapacityWarning(selection)).toBe("Requires more memory")
+    expect(selectionCapacityWarning(selection)).toBe("This configuration does not fit")
   })
 })

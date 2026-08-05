@@ -111,7 +111,7 @@ export const modelSlotActions = (
   })
 }
 
-export const localModelAvailability = (
+export const localModelSlotAvailability = (
   catalogAvailability: ModelSlotAvailability,
   offeringExists: boolean,
   installed: boolean,

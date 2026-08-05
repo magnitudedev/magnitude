@@ -5,6 +5,7 @@ import {
   DownloadAttemptIdSchema,
   ModelInstanceIdSchema,
   ModelOfferingTargetIdSchema,
+  ModelServingConfigurationIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
   type LocalModelDownload,
@@ -27,11 +28,11 @@ const replacementAttempt = DownloadAttemptIdSchema.make("attempt_replacement")
 const instanceId = ModelInstanceIdSchema.make("instance_admitted")
 const replacementInstanceId = ModelInstanceIdSchema.make("instance_replacement")
 const providerModelId = ProviderModelIdSchema.make("model_test")
+const configurationId = ModelServingConfigurationIdSchema.make("configuration_test")
 const submission = {
   _tag: "DownloadThenLoad" as const,
   choice: {
-    targetId,
-    providerModelId,
+    configurationId,
     displayName: "Test model",
     reasoningEffort: ReasoningEffortSchema.make("none"),
   },
@@ -68,6 +69,8 @@ describe("OnboardingModelMachine", () => {
       cancellationRequested: false,
     })
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
+      providerModelId,
+      targetId,
       attemptIds: [admittedAttempt],
     })
     const requesting = OnboardingModelMachine.transition(
@@ -91,12 +94,17 @@ describe("OnboardingModelMachine", () => {
   it("does not permit cancellation failure to transition directly to successful cancellation", () => {
     const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "Assigning", {
       submission,
+      providerModelId,
       cancellationRequested: false,
     })
     const loading = OnboardingModelMachine.transition(admitting, "AdmittingLoad", {
+      providerModelId,
       cancellationRequested: false,
     })
-    const admitted = OnboardingModelMachine.transition(loading, "LoadAdmitted", { instanceId })
+    const admitted = OnboardingModelMachine.transition(loading, "LoadAdmitted", {
+      providerModelId,
+      instanceId,
+    })
     const requesting = OnboardingModelMachine.transition(admitted, "RequestingLoadStop", {})
     const failed = OnboardingModelMachine.transition(requesting, "LoadStopFailed", {})
 
@@ -118,6 +126,8 @@ describe("OnboardingModelMachine", () => {
     })
 
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
+      providerModelId,
+      targetId,
       attemptIds: [admittedAttempt],
     })
     const requesting = requestOnboardingCancellation(admitted)
@@ -233,7 +243,7 @@ describe("admitted model observation", () => {
     const [staleCorrelation, stale] = reduceLoadObservation(
       initialObservationCorrelation,
       slotsState(replacementInstanceId, "Ready"),
-      submission,
+      providerModelId,
       instanceId,
     )
     expect(Option.isNone(stale)).toBe(true)
@@ -241,7 +251,7 @@ describe("admitted model observation", () => {
     const [seenCorrelation, loading] = reduceLoadObservation(
       staleCorrelation,
       slotsState(instanceId, "Loading"),
-      submission,
+      providerModelId,
       instanceId,
     )
     expect(seenCorrelation.exactIdentitySeen).toBe(true)
@@ -250,7 +260,7 @@ describe("admitted model observation", () => {
     const [, superseded] = reduceLoadObservation(
       seenCorrelation,
       slotsState(replacementInstanceId, "Ready"),
-      submission,
+      providerModelId,
       instanceId,
     )
     expect(Option.getOrNull(superseded)).toBe("Superseded")

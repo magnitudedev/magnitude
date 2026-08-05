@@ -34,7 +34,6 @@ pub(crate) fn identity() -> IcnBinaryIdentity {
             "model_catalog",
             "model_installed",
             "model_assessment",
-            "model_fit",
             "model_downloads",
             "model_residency",
             "chat_streaming",

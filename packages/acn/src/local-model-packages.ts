@@ -37,17 +37,19 @@ import { makeObservedState } from "./mirrored-state"
 import {
   downloadAttemptFromIcn,
   modelPackageFromIcn,
-  modelPackageToIcn,
+  offeringTargetToIcn,
   packageInspectionFromIcn,
   recommendableModelFromIcn,
 } from "./local-model-icn-adapter"
 
-const mutationFailure = <Failure>(operation: string, error: Failure) =>
-  new LocalModelMutationFailed({
-    code: operation,
-    message: error instanceof Error ? error.message : String(error),
-    retryable: true,
-  })
+export const localModelPackageMutationFailure = <Failure>(operation: string, error: Failure) =>
+  error instanceof LocalModelMutationFailed
+    ? error
+    : new LocalModelMutationFailed({
+        code: operation,
+        message: error instanceof Error ? error.message : String(error),
+        retryable: true,
+      })
 
 const packagesInCatalog = (
   catalog: readonly RecommendableModel[],
@@ -128,6 +130,7 @@ export interface LocalModelPackagesApi {
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
   readonly admitTarget: (
+    targetId: ModelOfferingTargetId,
     target: ModelOfferingTarget,
   ) => Effect.Effect<ModelDownloadAdmission["attemptIds"], LocalInferenceError>
   readonly cancelAttempts: (
@@ -283,18 +286,6 @@ export const LocalModelPackagesLive: Layer.Layer<
     Effect.forkScoped,
   )
 
-  const startDownload = (modelPackage: ModelPackage) => Effect.gen(function* () {
-    const nativePackage = yield* modelPackageToIcn(modelPackage)
-    const { attempt } = yield* client.models.startModelDownload({
-      payload: { package: nativePackage },
-    })
-    yield* downloads.observeAttempt(attempt)
-    yield* storage.config.clearDismissedDownloadFailure(
-      ModelPackageIdSchema.make(modelPackage.id),
-    )
-    return DownloadAttemptIdSchema.make(attempt.id)
-  }).pipe(Effect.mapError((error) => mutationFailure("start_model_download_failed", error)))
-
   const targetPackages = (target: ModelOfferingTarget) =>
     target._tag === "Package" ? [target.package] : [target.target, target.draft]
 
@@ -303,27 +294,41 @@ export const LocalModelPackagesLive: Layer.Layer<
     changes: mirror.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
-    admitTarget: (target) => Effect.gen(function* () {
-      const attemptIds = yield* Effect.forEach(
-        targetPackages(target),
-        startDownload,
-        { concurrency: "unbounded" },
-      )
+    admitTarget: (targetId, target) => Effect.gen(function* () {
+      const nativeTarget = yield* offeringTargetToIcn(target)
+      const response = yield* client.models.startModelDownload({
+        payload: { target: nativeTarget },
+      })
+      if (response.target_id !== targetId) {
+        return yield* new LocalModelMutationFailed({
+          code: "model_download_target_identity_mismatch",
+          message: "ICN admitted a different model target than requested.",
+          retryable: false,
+        })
+      }
+      yield* Effect.forEach(response.attempts, downloads.observeAttempt, { discard: true })
+      yield* Effect.forEach(targetPackages(target), (modelPackage) =>
+        storage.config.clearDismissedDownloadFailure(ModelPackageIdSchema.make(modelPackage.id)),
+      { discard: true })
       yield* project
+      const attemptIds = response.attempts.map((attempt) => DownloadAttemptIdSchema.make(attempt.id))
       const [first, ...rest] = attemptIds
       if (first === undefined) {
         return yield* Effect.die("A model target must contain at least one package")
       }
-      return [first, ...rest]
-    }),
+      return [first, ...rest] as ModelDownloadAdmission["attemptIds"]
+    }).pipe(Effect.mapError((error) =>
+      localModelPackageMutationFailure("start_model_download_failed", error))),
     cancelAttempts: (attemptIds) => Effect.gen(function* () {
       yield* Effect.forEach(attemptIds, (attemptId) => client.models.cancelModelDownload({
         path: { attempt_id: attemptId },
       }).pipe(
-        Effect.mapError((error) => mutationFailure("cancel_model_download_failed", error)),
+        Effect.mapError((error) =>
+          localModelPackageMutationFailure("cancel_model_download_failed", error)),
       ), { concurrency: "unbounded", discard: true })
       yield* downloads.refresh.pipe(
-        Effect.mapError((error) => mutationFailure("refresh_model_downloads_failed", error)),
+        Effect.mapError((error) =>
+          localModelPackageMutationFailure("refresh_model_downloads_failed", error)),
       )
       yield* project
     }),
@@ -333,7 +338,8 @@ export const LocalModelPackagesLive: Layer.Layer<
       { concurrency: "unbounded", discard: true },
     ).pipe(
       Effect.tap(() => project),
-      Effect.mapError((error) => mutationFailure("dismiss_model_download_failure_failed", error)),
+      Effect.mapError((error) =>
+        localModelPackageMutationFailure("dismiss_model_download_failure_failed", error)),
     ),
     removeTargetPackages: (target, retainedPackageIds = new Set()) => Effect.gen(function* () {
       const installedIds = yield* installed.get.pipe(Effect.map(({ state }) =>
@@ -344,12 +350,14 @@ export const LocalModelPackagesLive: Layer.Layer<
         (modelPackage) => client.models.removeInstalledModel({
           path: { package_id: modelPackage.id },
         }).pipe(
-          Effect.mapError((error) => mutationFailure("remove_installed_model_failed", error)),
+          Effect.mapError((error) =>
+            localModelPackageMutationFailure("remove_installed_model_failed", error)),
         ),
         { concurrency: 1, discard: true },
       )
       yield* installed.refresh.pipe(
-        Effect.mapError((error) => mutationFailure("refresh_installed_models_failed", error)),
+        Effect.mapError((error) =>
+          localModelPackageMutationFailure("refresh_installed_models_failed", error)),
       )
     }),
   })

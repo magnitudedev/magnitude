@@ -10,13 +10,12 @@ use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
     CatalogDiagnostic, ModelFailure, ModelOfferingTarget, ModelOfferingTargetId, ModelPackage,
     ModelPackageSource, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedModelTarget, ServingProfile,
+    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedModelTarget,
 };
 use icn_contracts::{
-    ContentId, HardwareAssessment, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
-    ModelComponent, ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent,
-    ResolvedModel,
+    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
+    InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
+    ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -586,7 +585,6 @@ fn materialize_planner_target<'a>(
         created: 0,
         name: package_identity,
         supported_parameters: Vec::new(),
-        serving_configuration: None,
         availability: ModelAvailability::Available { ready_at: 0 },
         source,
         location: ModelLocation::Directory {
@@ -602,9 +600,6 @@ fn materialize_planner_target<'a>(
             },
         },
         properties: artifact.properties.clone(),
-        hardware: HardwareAssessment::NotAssessed {
-            reason: "release planner input".to_owned(),
-        },
         operations: Vec::new(),
         updated_at: 0,
     };
@@ -746,13 +741,6 @@ fn recommendable_model(
         checkpoint_id: declaration.id.clone(),
         target_id: offering_target_id(&[&package.id]),
         target: ModelOfferingTarget::Package { package },
-        eligible_serving_profiles: declaration
-            .contexts
-            .iter()
-            .map(|context_length| ServingProfile {
-                context_length: *context_length,
-            })
-            .collect(),
         display_name: declaration.display_name.clone(),
         description: declaration.description.clone(),
         license: declaration.license.clone(),

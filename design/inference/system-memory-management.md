@@ -23,10 +23,10 @@ applies_to:
 
 # System memory management
 
-ICN uses one memory-safety policy for model fitting, load admission, and serving-time eviction. Fitting
-decides what a machine can normally serve, admission decides whether it is safe to load now, and
-eviction protects the machine when conditions change. These decisions must use the same physical
-memory domains and peak-memory evidence.
+ICN uses one memory-safety policy for model assessment, load admission, and serving-time eviction.
+Assessment decides what a machine can normally serve, admission decides whether it is safe to load
+now, and eviction protects the machine when conditions change. These decisions must use the same
+physical memory domains and peak-memory evidence.
 
 ## Policy
 
@@ -54,16 +54,16 @@ Stable compatibility ignores current activity:
 
 ```text
 compatible iff M + max(product reserve, S) <= T
-tight fit iff compatible and M + W > T
+capacity warning iff compatible and M + W > T
 ```
 
 Assessment publishes the factual byte accounting for every physical memory domain: capacity,
 required allocation, compatibility reserve, warning reserve, and remaining compatible headroom.
 It does not persist presentation categories such as comfortable, tight, or too large. ACN and
 clients derive compatibility and warning presentation directly from those quantities; catalog
-availability is not a second fit signal.
+availability is not a second capacity signal.
 
-Internal fitting assessments name the post-reserve quantity `usable_capacity_bytes`. The term
+Internal capacity assessments name the post-reserve quantity `usable_capacity_bytes`. The term
 `available` is reserved for live observations such as `current_available_bytes`; it never denotes
 cached compatibility capacity.
 
@@ -176,7 +176,7 @@ Neither ACN nor the client stores it in canonical model state or evaluates it in
 
 Frozen-topology candidate assessments are cached as disposable derived evidence and shared by
 preview and load. Live hardware polling therefore reruns only the fresh admission selection when
-stable fitting evidence is unchanged. Catalog fitting and recommendation work does not rerun for
+stable assessment evidence is unchanged. Catalog assessment and recommendation work does not rerun for
 availability-only hardware changes.
 
 The menu's state-appropriate Actions load or Stop the selected model without destructive

@@ -27,6 +27,11 @@ const choice = {
   displayName: "Qwen Test",
   reasoningEffort: TEST_REASONING_EFFORT,
 }
+const downloadChoice = {
+  configurationId: TEST_CONFIGURATION_ID,
+  displayName: "Qwen Test",
+  reasoningEffort: TEST_REASONING_EFFORT,
+}
 
 describe("deriveModelSetupActive", () => {
   it("preserves server-required and explicitly forced setup", () => {
@@ -131,7 +136,7 @@ describe("deriveOnboardingModelSetupView", () => {
       active: true,
       submission: {
         _tag: "DownloadThenLoad",
-        choice: { ...choice, targetId: TEST_TARGET_ID },
+        choice: downloadChoice,
       },
       submitting: true,
       ...state,
@@ -148,14 +153,14 @@ describe("deriveOnboardingModelSetupView", () => {
         totalBytes: 16,
         failure: { code: "interrupted", message: "Download was interrupted", retryable: true },
       },
-      preparation: { _tag: "NotDownloaded" },
+      availability: { _tag: "NotDownloaded" },
     })
     const base = makeView({ models: [makeModel({ download: candidate.download })] })
     const view = deriveOnboardingModelSetupView({
       active: true,
       submission: {
         _tag: "DownloadThenLoad",
-        choice: { ...choice, targetId: TEST_TARGET_ID },
+        choice: downloadChoice,
       },
       submitting: false,
       ...base,

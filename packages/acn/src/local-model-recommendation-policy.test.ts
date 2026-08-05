@@ -1,12 +1,13 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
+  AssessmentEnvironmentIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelFileIdSchema,
   ModelOfferingTargetIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
-  OfferingAssessmentIdSchema,
+  ModelAssessmentIdSchema,
   RecommendableModelIdSchema,
   type Recommendation,
 } from "@magnitudedev/acn-protocol"
@@ -67,6 +68,7 @@ const candidate = (input: {
             path: `${input.id}.gguf`,
             role: "weights",
             sizeBytes: downloadBytes,
+            tensorStorageBytes: Option.none(),
             sha256: "a".repeat(64),
           }],
           relationships: [],
@@ -79,7 +81,6 @@ const candidate = (input: {
           },
         },
       },
-      eligibleServingProfiles: [profile],
       displayName: input.id,
       description: "Test fixture",
       license: "test",
@@ -104,7 +105,8 @@ const candidate = (input: {
       _tag: "Fits",
       profile,
       configurationId,
-      assessmentId: OfferingAssessmentIdSchema.make(`assessment_${input.id}_${context}`),
+      assessmentId: ModelAssessmentIdSchema.make(`assessment_${input.id}_${context}`),
+      environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
       memory: [{
         memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("memory"),
         capacityBytes,
@@ -169,7 +171,7 @@ describe("local model multicriteria recommendation policy", () => {
     expect(selectRecommendationPortfolio([slow])).toEqual([])
   })
 
-  it("keeps fitting candidates below the recommendation speed floor in the compatible catalog", () => {
+  it("keeps compatible candidates below the recommendation speed floor in the catalog", () => {
     const slow = candidate({
       id: "slow",
       score: 80,

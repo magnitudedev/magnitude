@@ -6,21 +6,23 @@ import type {
   LocalModelsState,
   ModelInstanceId,
   ModelOfferingTargetId,
+  ModelServingConfigurationId,
   ModelSlotsState,
   ProviderModelId,
   ReasoningEffort,
 } from "@magnitudedev/sdk"
 
-export interface OnboardingModelChoice {
-  readonly providerModelId: ProviderModelId
+interface OnboardingModelChoiceBase {
   readonly displayName: string
   readonly reasoningEffort: ReasoningEffort
 }
 
-export type OnboardingLoadModelChoice = OnboardingModelChoice
+export interface OnboardingLoadModelChoice extends OnboardingModelChoiceBase {
+  readonly providerModelId: ProviderModelId
+}
 
-export interface OnboardingDownloadModelChoice extends OnboardingModelChoice {
-  readonly targetId: ModelOfferingTargetId
+export interface OnboardingDownloadModelChoice extends OnboardingModelChoiceBase {
+  readonly configurationId: ModelServingConfigurationId
 }
 
 export type OnboardingModelSubmission =
@@ -29,9 +31,14 @@ export type OnboardingModelSubmission =
 
 type SubmissionProps = { readonly submission: OnboardingModelSubmission }
 type DownloadProps = SubmissionProps & {
+  readonly providerModelId: ProviderModelId
+  readonly targetId: ModelOfferingTargetId
   readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
 }
-type LoadProps = SubmissionProps & { readonly instanceId: ModelInstanceId }
+type LoadProps = SubmissionProps & {
+  readonly providerModelId: ProviderModelId
+  readonly instanceId: ModelInstanceId
+}
 
 export class OnboardingIdle extends Data.TaggedClass("Idle")<{}> {}
 export class OnboardingAdmittingDownload extends Data.TaggedClass("AdmittingDownload")<
@@ -48,10 +55,10 @@ export class OnboardingDownloadCancellationFailed extends Data.TaggedClass(
   "DownloadCancellationFailed",
 )<DownloadProps> {}
 export class OnboardingAssigning extends Data.TaggedClass("Assigning")<
-  SubmissionProps & { readonly cancellationRequested: boolean }
+  SubmissionProps & { readonly providerModelId: ProviderModelId; readonly cancellationRequested: boolean }
 > {}
 export class OnboardingAdmittingLoad extends Data.TaggedClass("AdmittingLoad")<
-  SubmissionProps & { readonly cancellationRequested: boolean }
+  SubmissionProps & { readonly providerModelId: ProviderModelId; readonly cancellationRequested: boolean }
 > {}
 export class OnboardingLoadAdmitted extends Data.TaggedClass("LoadAdmitted")<LoadProps> {}
 export class OnboardingRequestingLoadStop extends Data.TaggedClass("RequestingLoadStop")<LoadProps> {}
@@ -119,6 +126,29 @@ export const resetOnboardingOperation = (
 export const onboardingSubmission = (
   state: OnboardingModelOperation,
 ): OnboardingModelSubmission | null => state._tag === "Idle" ? null : state.submission
+
+export const onboardingProviderModelId = (
+  state: OnboardingModelOperation,
+): Option.Option<ProviderModelId> => {
+  if (state._tag === "Idle") return Option.none()
+  if (state.submission._tag === "Load") return Option.some(state.submission.choice.providerModelId)
+  switch (state._tag) {
+    case "DownloadAdmitted":
+    case "RequestingDownloadCancellation":
+    case "AwaitingDownloadCancellation":
+    case "DownloadCancellationFailed":
+    case "Assigning":
+    case "AdmittingLoad":
+    case "LoadAdmitted":
+    case "RequestingLoadStop":
+    case "AwaitingLoadStop":
+    case "LoadStopFailed":
+    case "Completing":
+      return Option.some(state.providerModelId)
+    case "AdmittingDownload":
+      return Option.none()
+  }
+}
 
 export const onboardingCancellationPending = (state: OnboardingModelOperation): boolean => {
   switch (state._tag) {
@@ -224,13 +254,13 @@ export type LoadObservation = "Ready" | "Failed" | "Stopped" | "Superseded"
 export const reduceLoadObservation = (
   correlation: ObservationCorrelation,
   state: ModelSlotsState,
-  submission: OnboardingModelSubmission,
+  providerModelId: ProviderModelId,
   instanceId: ModelInstanceId,
 ): readonly [ObservationCorrelation, Option.Option<LoadObservation>] => {
   const primary = state.slots.primary
   if (primary._tag !== "ConfiguredLocal"
     || primary.selection.providerId !== "local"
-    || primary.selection.providerModelId !== submission.choice.providerModelId) {
+    || primary.selection.providerModelId !== providerModelId) {
     return correlation.exactIdentitySeen
       ? [correlation, Option.some("Superseded")]
       : [correlation, Option.none()]
@@ -281,7 +311,7 @@ export const observeAdmittedDownload = <E, R>(
 
 export const observeAdmittedLoad = <E, R>(
   results: Stream.Stream<Result.Result<{ readonly state: ModelSlotsState }, E>, never, R>,
-  submission: OnboardingModelSubmission,
+  providerModelId: ProviderModelId,
   instanceId: ModelInstanceId,
   accept: (observation: LoadObservation) => boolean = () => true,
 ): Effect.Effect<LoadObservation, never, R> => results.pipe(
@@ -290,7 +320,7 @@ export const observeAdmittedLoad = <E, R>(
     ? Option.some(result.value.state)
     : Option.none()),
   Stream.mapAccum(initialObservationCorrelation, (correlation, state) => {
-    const [next, observation] = reduceLoadObservation(correlation, state, submission, instanceId)
+    const [next, observation] = reduceLoadObservation(correlation, state, providerModelId, instanceId)
     return [next, Option.filter(observation, accept)] as const
   }),
   Stream.filterMap((observation) => observation),

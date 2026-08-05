@@ -330,6 +330,7 @@ mod tests {
                 path: PathBuf::from(path),
                 role: ModelFileRole::Weights,
                 size_bytes: 1,
+                tensor_storage_bytes: None,
                 sha256,
             }],
             relationships: Vec::new(),

@@ -6,7 +6,7 @@ use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use icn_contracts::{
     DeletePlan, DeletedModel, InventoryError, InventoryModel, ModelAvailability, ModelId,
-    ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel, ServingProfile,
+    ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
 use crate::download::blob_key;
@@ -16,7 +16,6 @@ use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
 impl ModelInventory for ModelManager {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
         Box::pin(async move {
-            self.ensure_model_inventory().await?;
             let mut models = self
                 .models
                 .read()
@@ -171,15 +170,6 @@ impl ModelInventory for ModelManager {
             Ok(ResolvedModel { model, components })
         })
     }
-
-    fn configure_serving(
-        &self,
-        id: &ModelId,
-        profile: ServingProfile,
-    ) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
-        let id = id.clone();
-        Box::pin(async move { self.configure_serving_model(&id, profile).await })
-    }
 }
 
 fn plan_interrupted_delete(
@@ -276,7 +266,6 @@ pub(crate) fn reconcile_tombstones(root: &Path) -> Result<(), InventoryError> {
             created: manifest.created_at,
             name: manifest.repository.clone(),
             supported_parameters: Vec::new(),
-            serving_configuration: None,
             availability: ModelAvailability::Available {
                 ready_at: manifest.ready_at,
             },
@@ -294,9 +283,6 @@ pub(crate) fn reconcile_tombstones(root: &Path) -> Result<(), InventoryError> {
                 },
             },
             properties: icn_contracts::InventoryProperties::Pending,
-            hardware: icn_contracts::HardwareAssessment::NotAssessed {
-                reason: "deleted".to_owned(),
-            },
             operations: Vec::new(),
             updated_at: manifest.ready_at,
         };

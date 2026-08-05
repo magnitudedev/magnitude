@@ -26,11 +26,12 @@ type ActivatingView = Extract<OnboardingModelSetupView, { readonly _tag: "Activa
 
 const activatingView = (
   choice: OnboardingModelSubmission["choice"],
+  providerModelId: ProviderModelId,
   phase: ActivatingView["phase"],
   failure: string | null = null,
 ): ActivatingView => ({
   _tag: "Activating",
-  providerModelId: choice.providerModelId,
+  providerModelId,
   displayName: choice.displayName,
   reasoningEffort: choice.reasoningEffort,
   phase,
@@ -53,12 +54,14 @@ export const deriveModelSetupActive = ({
 export const deriveOnboardingModelSetupView = ({
   active,
   submission,
+  providerModelId,
   submitting,
   models,
   slots,
 }: {
   readonly active: boolean
   readonly submission: OnboardingModelSubmission | null
+  readonly providerModelId: Option.Option<ProviderModelId>
   readonly submitting: boolean
   readonly models: LocalModelsState
   readonly slots: ModelSlotsState
@@ -69,8 +72,8 @@ export const deriveOnboardingModelSetupView = ({
   const choice = submission.choice
   const candidate = submission._tag === "DownloadThenLoad"
     && models.recommendations._tag === "Ready"
-    ? models.recommendations.catalog.find(({ targetId }) =>
-        targetId === submission.choice.targetId)
+    ? models.recommendations.catalog.find(({ configurationId }) =>
+        configurationId === submission.choice.configurationId)
     : undefined
   if (candidate?.download._tag === "Failed") {
     return { _tag: "DownloadFailed", candidate }
@@ -82,16 +85,23 @@ export const deriveOnboardingModelSetupView = ({
 
   const primary = slots.slots.primary
   const lifecycle = primary._tag === "ConfiguredLocal"
-    && primary.selection.providerModelId === choice.providerModelId
+    && Option.contains(providerModelId, primary.selection.providerModelId)
     ? Option.getOrNull(Option.map(primary.instance, ({ lifecycle }) => lifecycle))
     : null
-  if (lifecycle?._tag === "Loading"
-    || lifecycle?._tag === "Stopping"
-    || lifecycle?._tag === "Ready") {
-    return activatingView(choice, lifecycle._tag)
-  }
-  if (lifecycle?._tag === "Failed") {
-    return activatingView(choice, "Failed", lifecycle.failure.message)
+  if (primary._tag === "ConfiguredLocal") {
+    if (lifecycle?._tag === "Loading"
+      || lifecycle?._tag === "Stopping"
+      || lifecycle?._tag === "Ready") {
+      return activatingView(choice, primary.selection.providerModelId, lifecycle._tag)
+    }
+    if (lifecycle?._tag === "Failed") {
+      return activatingView(
+        choice,
+        primary.selection.providerModelId,
+        "Failed",
+        lifecycle.failure.message,
+      )
+    }
   }
   if (lifecycle?._tag === "Stopped") return { _tag: "Choosing" }
 
@@ -99,7 +109,10 @@ export const deriveOnboardingModelSetupView = ({
   if (submission._tag === "DownloadThenLoad" && candidate !== undefined) {
     return { _tag: "Downloading", candidate }
   }
-  return activatingView(choice, "Loading")
+  return Option.match(providerModelId, {
+    onNone: () => ({ _tag: "Choosing" as const }),
+    onSome: (id) => activatingView(choice, id, "Loading"),
+  })
 }
 
 export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView): string | null => {

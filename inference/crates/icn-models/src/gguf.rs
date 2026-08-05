@@ -32,6 +32,7 @@ pub struct GgufInspection {
     pub base_models: Vec<String>,
     pub modalities: Vec<String>,
     pub tensor_count: u64,
+    pub tensor_storage_bytes: u64,
     pub header_bytes: u64,
     pub fingerprint_material: Vec<u8>,
     pub execution_role: Option<GgufExecutionRole>,
@@ -105,6 +106,7 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     }
 
     let mut derived_parameter_count = 0_u64;
+    let mut tensor_storage_bytes = 0_u64;
     for _ in 0..tensor_count {
         let _name = reader.string()?;
         let dimensions = reader.u32()?;
@@ -112,15 +114,24 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
             return Err(GgufError::Invalid("tensor dimension count is invalid"));
         }
         let mut elements = 1_u64;
+        let mut shape = Vec::with_capacity(dimensions as usize);
         for _ in 0..dimensions {
+            let dimension = reader.u64()?;
+            shape.push(dimension);
             elements = elements
-                .checked_mul(reader.u64()?)
+                .checked_mul(dimension)
                 .ok_or(GgufError::Invalid("tensor element count overflow"))?;
         }
         derived_parameter_count = derived_parameter_count
             .checked_add(elements)
             .ok_or(GgufError::Invalid("model parameter count overflow"))?;
-        let _tensor_type = reader.u32()?;
+        let tensor_type = reader.u32()?;
+        let stored = llama_cpp_2::gguf::tensor_storage_bytes(tensor_type, &shape).ok_or(
+            GgufError::Invalid("tensor storage shape or type is invalid"),
+        )?;
+        tensor_storage_bytes = tensor_storage_bytes
+            .checked_add(stored)
+            .ok_or(GgufError::Invalid("tensor storage bytes overflow"))?;
         let _offset = reader.u64()?;
     }
 
@@ -215,6 +226,7 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
         base_models,
         modalities,
         tensor_count,
+        tensor_storage_bytes,
         header_bytes,
         fingerprint_material,
         execution_role,

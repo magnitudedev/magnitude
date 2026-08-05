@@ -66,7 +66,7 @@ import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { makeModelConfigurationLayer } from "./model-configuration"
 import { makeAcnIcn } from "./icn"
 import { LocalModelAutoSetupLive } from "./local-model-auto-setup"
-import { LocalModelEvaluationsLive } from "./local-model-evaluations"
+import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
@@ -302,7 +302,7 @@ const addLocalInferenceServices = <A, E, R>(
   )
   const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
   const withEvaluations = Layer.provideMerge(
-    LocalModelEvaluationsLive,
+    LocalModelAssessmentsLive,
     withPackages
   )
   const withOfferings = Layer.provideMerge(

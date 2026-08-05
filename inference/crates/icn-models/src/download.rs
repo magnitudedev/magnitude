@@ -12,8 +12,8 @@ use hf_hub::HFError;
 use icn_contracts::models::ModelPackage;
 use icn_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress, DownloadStage,
-    HardwareAssessment, Integrity, InventoryError, InventoryModel, InventoryProperties,
-    ModelAvailability, ModelComponent, ModelDownloadEvent, ModelLocation, ModelSource,
+    Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
+    ModelComponent, ModelDownloadEvent, ModelLocation, ModelSource,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -243,40 +243,69 @@ struct DownloadError {
 }
 
 impl ModelManager {
-    pub(crate) async fn start_package_download(
+    pub(crate) async fn start_target_downloads(
         &self,
-        package: ModelPackage,
-    ) -> Result<DownloadEventStream, InventoryError> {
-        let key = package_download_key(&package);
-        let package = ValidatedDownloadPackage::new(package)?;
-        let mut operations = self.operations.lock().await;
-        if let Some(operation) = operations.get(&key) {
-            return Ok(operation.subscribe());
+        packages: Vec<ModelPackage>,
+    ) -> Result<Vec<DownloadEventStream>, InventoryError> {
+        let packages = packages
+            .into_iter()
+            .map(|package| {
+                let package_id = package.id.clone();
+                let key = package_download_key(&package);
+                ValidatedDownloadPackage::new(package).map(|package| (package_id, key, package))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut resolved_packages = Vec::with_capacity(packages.len());
+        for (package_id, key, package) in packages {
+            let installed = match self.installed_package(&package_id).await {
+                Ok((_package, resolved)) => Some(resolved.model),
+                Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => None,
+                Err(error) => return Err(error),
+            };
+            resolved_packages.push((key, package, installed));
         }
-
-        let operation_id = random_id("download")?;
-        let (repository, revision) = package.repository_revision();
-        let initial = ModelDownloadEvent::Resolving {
-            operation_id: operation_id.clone(),
-            repository: repository.to_owned(),
-            revision: revision.to_owned(),
-        };
-        let (sender, _receiver) = watch::channel(initial);
-        let operation = Arc::new(DownloadOperation {
-            sender,
-            cancelled: AtomicBool::new(false),
-        });
-        let stream = operation.subscribe();
-        operations.insert(key.clone(), Arc::clone(&operation));
+        let mut operations = self.operations.lock().await;
+        let mut streams = Vec::with_capacity(resolved_packages.len());
+        let mut admitted = Vec::new();
+        for (key, package, installed) in resolved_packages {
+            if let Some(operation) = operations.get(&key) {
+                streams.push(operation.subscribe());
+                continue;
+            }
+            let operation_id = random_id("download")?;
+            if let Some(model) = installed {
+                let (_sender, receiver) = watch::channel(ModelDownloadEvent::Ready {
+                    operation_id,
+                    model: Box::new(model),
+                });
+                streams.push(watch_stream(receiver));
+                continue;
+            }
+            let (repository, revision) = package.repository_revision();
+            let initial = ModelDownloadEvent::Resolving {
+                operation_id: operation_id.clone(),
+                repository: repository.to_owned(),
+                revision: revision.to_owned(),
+            };
+            let (sender, _receiver) = watch::channel(initial);
+            let operation = Arc::new(DownloadOperation {
+                sender,
+                cancelled: AtomicBool::new(false),
+            });
+            streams.push(operation.subscribe());
+            admitted.push((key.clone(), operation_id, package, Arc::clone(&operation)));
+            operations.insert(key, operation);
+        }
         drop(operations);
-
-        let manager = self.clone();
-        tokio::spawn(async move {
-            manager
-                .run_download(key, operation_id, package, operation)
-                .await;
-        });
-        Ok(stream)
+        for (key, operation_id, package, operation) in admitted {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager
+                    .run_download(key, operation_id, package, operation)
+                    .await;
+            });
+        }
+        Ok(streams)
     }
 
     pub(crate) async fn cancel_package_download(
@@ -453,7 +482,6 @@ impl ModelManager {
             created: started_at,
             name: repository.clone(),
             supported_parameters: Vec::new(),
-            serving_configuration: None,
             availability: ModelAvailability::Downloading {
                 operation_id: operation_id.to_owned(),
                 stage: DownloadStage::Queued,
@@ -477,9 +505,6 @@ impl ModelManager {
                 },
             },
             properties: InventoryProperties::Pending,
-            hardware: HardwareAssessment::NotAssessed {
-                reason: "model_not_ready".to_owned(),
-            },
             operations: Vec::new(),
             updated_at: started_at,
         };
@@ -1696,11 +1721,15 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inventory::InventoryConfig;
+    use crate::package_service::package_from_resolved;
     use icn_contracts::models::{
         ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelPackageId,
         ModelPackageProperties, ModelPackageSource,
     };
-    use icn_contracts::{ComponentRelationship, ComponentRole};
+    use icn_contracts::{
+        ComponentRelationship, ComponentRole, ModelId, ResolvedComponent, ResolvedModel,
+    };
 
     fn model_component(contents: &[u8]) -> ModelComponent {
         let digest = format!("{:x}", Sha256::digest(contents));
@@ -1727,6 +1756,7 @@ mod tests {
                 path: PathBuf::from(path),
                 role: ModelFileRole::Weights,
                 size_bytes: contents.len() as u64,
+                tensor_storage_bytes: None,
                 sha256,
             }],
             relationships: Vec::new(),
@@ -1738,6 +1768,92 @@ mod tests {
                 maximum_context_length: 1,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn installed_package_admission_does_not_create_an_upstream_operation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("models");
+        let cache_root = directory.path().join("cache");
+        let manager = ModelManager::open(
+            InventoryConfig::with_roots(root, cache_root).expect("inventory config"),
+        )
+        .await
+        .expect("model manager");
+        manager
+            .ensure_installed_model_inventory()
+            .await
+            .expect("initial inventory");
+
+        let contents = b"installed model contents";
+        let path = directory.path().join("model.gguf");
+        tokio::fs::write(&path, contents)
+            .await
+            .expect("installed model");
+        let component = model_component(contents);
+        let model = InventoryModel {
+            id: ModelId("model_installed".to_owned()),
+            content_id: content_id(std::slice::from_ref(&component)),
+            created: 1,
+            name: "installed".to_owned(),
+            supported_parameters: Vec::new(),
+            availability: ModelAvailability::Available { ready_at: 1 },
+            source: ModelSource::HuggingFace {
+                repository: "owner/repository".to_owned(),
+                requested_revision: "a".repeat(40),
+                commit: "a".repeat(40),
+                metadata: None,
+            },
+            location: ModelLocation::File {
+                path: path.clone(),
+                component: component.clone(),
+                integrity: Integrity::Verified {
+                    method: "sha256".to_owned(),
+                },
+            },
+            properties: InventoryProperties::Pending,
+            operations: Vec::new(),
+            updated_at: 1,
+        };
+        let resolved = ResolvedModel {
+            model: model.clone(),
+            components: vec![ResolvedComponent {
+                path,
+                role: ComponentRole::Weights,
+                shard_index: None,
+                relationship: None,
+            }],
+        };
+        let package = package_from_resolved(&resolved).expect("installed package");
+        manager
+            .models
+            .write()
+            .expect("inventory lock")
+            .insert(model.id.clone(), model.clone());
+        let installed = manager
+            .build_installed_package_snapshot(&manager.models.read().expect("inventory lock"))
+            .expect("installed package snapshot");
+        *manager
+            .installed_packages
+            .write()
+            .expect("installed package snapshot lock") = installed;
+
+        let mut streams = manager
+            .start_target_downloads(vec![package])
+            .await
+            .expect("admission");
+        let event = streams
+            .pop()
+            .expect("download stream")
+            .next()
+            .await
+            .expect("ready event");
+
+        assert!(matches!(
+            event,
+            ModelDownloadEvent::Ready { model: ready, .. } if ready.id == model.id
+        ));
+        assert!(manager.operations.lock().await.is_empty());
     }
 
     #[test]
@@ -1934,6 +2050,7 @@ mod tests {
             path: PathBuf::from("projector.gguf"),
             role: ModelFileRole::Projector,
             size_bytes: 18,
+            tensor_storage_bytes: None,
             sha256: projector_sha,
         });
         package

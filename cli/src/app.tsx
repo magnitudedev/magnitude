@@ -390,6 +390,7 @@ function CliAppContent(
     const setupView = deriveOnboardingModelSetupView({
       active: true,
       submission: onboardingSetup.submission,
+      providerModelId: onboardingSetup.providerModelId,
       submitting: Result.isWaiting(onboardingSetup.workflowResult),
       models,
       slots,
@@ -415,8 +416,7 @@ function CliAppContent(
                 onCancel: cancelOnboardingModelSetup,
                 onRetry: () =>
                   downloadOnboardingModel({
-                    targetId: setupView.candidate.targetId,
-                    providerModelId: setupView.candidate.providerModelId,
+                    configurationId: setupView.candidate.configurationId,
                     displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
                       setupView.candidate.capabilities.reasoning.defaultEffort,
@@ -445,8 +445,7 @@ function CliAppContent(
                 onChooseAnother: cancelOnboardingModelSetup,
                 onRetry: () =>
                   downloadOnboardingModel({
-                    targetId: setupView.candidate.targetId,
-                    providerModelId: setupView.candidate.providerModelId,
+                    configurationId: setupView.candidate.configurationId,
                     displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
                       setupView.candidate.capabilities.reasoning.defaultEffort,

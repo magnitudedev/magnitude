@@ -21,12 +21,31 @@ import type {
   ModelOfferingTarget as NativeModelOfferingTarget,
   ModelPackageInspection as NativeModelPackageInspection,
   ModelPackage as NativeModelPackage,
-  ModelPackageOperand,
   ModelServingConfiguration as NativeModelServingConfiguration,
   ModelTargetInput,
   RecommendableModel as NativeRecommendableModel,
   ServingProfile as NativeServingProfile,
 } from "@magnitudedev/icn-protocol/schemas"
+
+const normalizeModelPackageFromIcn = (
+  modelPackage: NativeModelPackage,
+) => ({
+  ...modelPackage,
+  files: modelPackage.files.map((file) => ({
+    ...file,
+    tensorStorageBytes: Option.flatMap(file.tensorStorageBytes, Option.fromNullable),
+  })),
+})
+
+const normalizeOfferingTargetFromIcn = (
+  target: NativeModelOfferingTarget,
+) => target._tag === "Package"
+  ? { ...target, package: normalizeModelPackageFromIcn(target.package) }
+  : {
+      ...target,
+      target: normalizeModelPackageFromIcn(target.target),
+      draft: normalizeModelPackageFromIcn(target.draft),
+    }
 import {
   ModelOfferingTarget as NativeModelOfferingTargetSchema,
   ModelPackage as NativeModelPackageSchema,
@@ -36,12 +55,14 @@ import {
 export const modelPackageFromIcn = (
   modelPackage: NativeModelPackage,
 ): Effect.Effect<ModelPackage, ParseResult.ParseError> =>
-  Schema.validate(ModelPackageSchema)(modelPackage)
+  Schema.validate(ModelPackageSchema)(normalizeModelPackageFromIcn(modelPackage))
 
 export const modelPackageToIcn = (
   modelPackage: ModelPackage,
 ): Effect.Effect<NativeModelPackage, ParseResult.ParseError> =>
-  Schema.validate(NativeModelPackageSchema)(modelPackage)
+  Schema.encode(ModelPackageSchema)(modelPackage).pipe(
+    Effect.flatMap(Schema.decodeUnknown(NativeModelPackageSchema)),
+  )
 
 export const packageInspectionFromIcn = (
   inspection: NativeModelPackageInspection,
@@ -60,12 +81,14 @@ export const servingProfileToIcn = (profile: ServingProfile): NativeServingProfi
 export const offeringTargetFromIcn = (
   target: NativeModelOfferingTarget,
 ): Effect.Effect<ModelOfferingTarget, ParseResult.ParseError> =>
-  Schema.validate(ModelOfferingTargetSchema)(target)
+  Schema.validate(ModelOfferingTargetSchema)(normalizeOfferingTargetFromIcn(target))
 
 export const offeringTargetToIcn = (
   target: ModelOfferingTarget,
 ): Effect.Effect<NativeModelOfferingTarget, ParseResult.ParseError> =>
-  Schema.validate(NativeModelOfferingTargetSchema)(target)
+  Schema.encode(ModelOfferingTargetSchema)(target).pipe(
+    Effect.flatMap(Schema.decodeUnknown(NativeModelOfferingTargetSchema)),
+  )
 
 export const modelServingConfigurationToIcn = (
   configuration: ModelServingConfiguration,
@@ -81,7 +104,10 @@ export const modelServingConfigurationToIcn = (
 export const recommendableModelFromIcn = (
   model: NativeRecommendableModel,
 ): Effect.Effect<RecommendableModel, ParseResult.ParseError> =>
-  Schema.validate(RecommendableModelSchema)(model)
+  Schema.validate(RecommendableModelSchema)({
+    ...model,
+    target: normalizeOfferingTargetFromIcn(model.target),
+  })
 
 export const downloadAttemptFromIcn = (
   attempt: NativeDownloadAttempt,
@@ -97,16 +123,20 @@ export const targetToIcn = (
   target: ModelOfferingTarget,
   installedPackageIds: ReadonlySet<string>,
 ): Effect.Effect<ModelTargetInput, ParseResult.ParseError> => {
-  const operand = (modelPackage: ModelPackage): ModelPackageOperand =>
+  const operand = (modelPackage: ModelPackage) =>
     installedPackageIds.has(modelPackage.id)
-      ? { _tag: "Installed", packageId: modelPackage.id }
-      : { _tag: "SourceBacked", package: modelPackage }
-  const input = target._tag === "Package"
-    ? { _tag: "Package" as const, package: operand(target.package) }
-    : {
-        _tag: "SpeculativeDecodingPair" as const,
-        target: operand(target.target),
-        draft: operand(target.draft),
-      }
-  return Schema.validate(NativeModelTargetInputSchema)(input)
+      ? Effect.succeed({ _tag: "Installed" as const, packageId: modelPackage.id })
+      : Schema.encode(ModelPackageSchema)(modelPackage).pipe(
+          Effect.map((encoded) => ({ _tag: "SourceBacked" as const, package: encoded })),
+        )
+  return Effect.gen(function* () {
+    const input = target._tag === "Package"
+      ? { _tag: "Package" as const, package: yield* operand(target.package) }
+      : {
+          _tag: "SpeculativeDecodingPair" as const,
+          target: yield* operand(target.target),
+          draft: yield* operand(target.draft),
+        }
+    return yield* Schema.decodeUnknown(NativeModelTargetInputSchema)(input)
+  })
 }

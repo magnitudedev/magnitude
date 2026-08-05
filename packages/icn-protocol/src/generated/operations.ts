@@ -137,35 +137,6 @@ export const createChatCompletionOperation = {
   ],
 } as const
 
-export const fitModelsOperation = {
-  operationId: "fitModels",
-  transport: "http",
-  method: "POST",
-  path: "/v1/models/fit",
-  group: "models",
-  successes: [
-    {
-      status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.FitModelsResponse, Schemas.FitModelsResponseEncoded> => Schemas.FitModelsResponse,
-      ),
-      mediaType: "application/json",
-    },
-  ],
-  errors: [
-    {
-      status: 500,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-  payload: S.suspend(
-    (): S.Schema<Schemas.FitModelsRequest, Schemas.FitModelsRequestEncoded> => Schemas.FitModelsRequest,
-  ),
-  payloadMediaType: "application/json",
-  payloadRequired: true,
-} as const
-
 export const getHardwareOperation = {
   operationId: "getHardware",
   transport: "http",

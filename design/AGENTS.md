@@ -1,13 +1,24 @@
-# Design documents
+# Design
 
-THESE ARE NOT PLANS. THESE ARE NOT SPECS. THESE ARE NOT WHATEVER YOU DECIDE THEM TO BE.
-THESE ARE CONCISE, HUMAN-READABLE, SOURCES OF TRUTH.
-CHANGING DESIGN REPRESENTS A DELTA IN INTENDED FUNCTIONALITY OR ARCHITECTURE.
-DESIGN MUST ONLY BE CHANGED WITH HUMAN APPROVAL.
+## Design Content
 
-The documents in this directory are the high-level source of truth for Magnitude's architecture and behavior. They describe the system that should exist, independently of the current implementation.
+These design documents are the high-level source of truth for Magnitude's product and code. They
+describe definitions, models, and policies that represent the desired semantic shape of the
+codebase. Any difference between design and code is a contradiction.
 
-A design document should be sufficient for a capable engineer to reproduce the intended architecture, invariants, behavior, boundaries, and failure semantics without first reading the code. It should remain durable as files, types, functions, and internal implementation details change.
+These documents are meant to be durable and serve as a stable source of truth. They should not be coupled to specific code files, code snippets, or code in general.
+
+Design documents should be terse, high signal, structured with appropriate Markdown, and organized
+clearly within the knowledge base.
+
+## Design Maintenance
+
+Every design document must serve as a high signal source of truth.
+
+Do NOT haphazardly extend sections or add new sections without user approval.
+
+Each document must have a clear, cohesive scope. Split or reorganize a document when it becomes
+unwieldy.
 
 ## What belongs here
 

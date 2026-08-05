@@ -19,7 +19,7 @@ Two subsystem documents carry the detailed policies:
 
 - [KV state reuse](./kv.md) describes standard llama.cpp sequence-state reuse and its safety boundary.
 - [Scheduler design](./scheduler.md) describes admission, batching, request state transitions, fairness, and failure handling.
-- [System memory management](./system-memory-management.md) relates fitting, load admission, and
+- [System memory management](./system-memory-management.md) relates model assessment, load admission, and
   pressure eviction through one safety policy.
 
 ## Influences
@@ -56,8 +56,8 @@ IPC proxy / API caller
 ```
 
 `NativeBackend` is the process-lifetime capability proving that llama.cpp's global backend is
-initialized. Persistent ICN may use a model-free capability for inventory assessment, but resident
-loading initializes a distinct capability only inside a disposable inference worker.
+initialized. A persistent planning worker owns the capability used for calibration and assessment;
+resident loading initializes a distinct capability inside a disposable inference worker.
 `LlamaCompletionBackend` is the worker-local resident-model handle; persistent ICN publishes a
 bounded IPC proxy for it. Preparing a load starts the named executor thread, creates a fresh
 worker-process-local backend plan on that thread, and returns a `PreparedModelLoad` only after the
@@ -88,11 +88,11 @@ One executor thread exclusively owns each model's mutable native resources. This
 Persistent ICN owns no resident native executor. One disposable worker owns exactly one
 resident-backend capability and its executor; worker exit reclaims the complete resident topology.
 The resident executor exclusively owns model, context, and scheduler mutation. Load-time MTP
-selection, fit planning, and model construction occur inside that worker from the serialized
-execution intent. The selected MTP configuration remains part of the execution intent passed to fitting, so
+selection, allocation planning, and model construction occur inside that worker from the serialized
+execution intent. The selected MTP configuration remains part of the execution intent passed to allocation planning, so
 target and draft memory are assessed together. A serving-process preflight must never initialize a
-temporary backend. Model-free preview and inventory assessment use isolated worker processes; each
-worker creates one backend capability for its own complete process lifetime. Worker capability
+temporary backend. Model assessment uses the persistent planning worker; each inference worker
+creates one backend capability for its complete process lifetime. Worker capability
 construction is installation-bound: the persistent service transfers its verified installation
 authority to every installed worker, which registers and validates that exact runtime before
 initialization. Knowing the executable path is not native-runtime authority.

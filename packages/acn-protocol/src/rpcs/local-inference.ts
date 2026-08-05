@@ -10,6 +10,7 @@ import {
   ModelLoadAdmissionSchema,
   ModelLoadPlanSchema,
   ModelOfferingTargetIdSchema,
+  ModelServingConfigurationIdSchema,
   SlotIdSchema,
 } from "../schemas/model-state"
 import { defineMirroredState } from "./mirrored-state"
@@ -25,7 +26,7 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
 })
 
 export const DownloadModel = Rpc.make("DownloadModel", {
-  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
+  payload: Schema.Struct({ configurationId: ModelServingConfigurationIdSchema }),
   success: ModelDownloadAdmissionSchema,
   error: LocalInferenceError,
 })

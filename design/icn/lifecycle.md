@@ -14,7 +14,7 @@ applies_to:
   - packages/acn/src/model-*.ts
   - packages/acn/src/provider-model-catalog.ts
   - packages/acn/src/local-model-packages.ts
-  - packages/acn/src/local-model-evaluations.ts
+  - packages/acn/src/local-model-assessments.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - inference/scripts/**
@@ -56,19 +56,23 @@ adopt an ICN started by another process. A model is not a public process resourc
 service starts without a loaded model and privately creates or destroys a disposable inference
 worker behind model-centric load, replace, and unload operations.
 
-The service process may own bounded, private native children. Planner workers are short-lived and
-metadata-only. The inference worker owns the one resident model topology and lives only for that
-residency generation. Both use the same verified executable, communicate only with their parent
-over private standard I/O, expose no listener or public lifecycle, and terminate with their request,
-residency, or parent. The service passes its verified installation authority to every native child.
-Each installed child registers and validates backend modules from that exact installation before
-native initialization, request decoding, or inference handshake; executable-relative, current-
-directory, and compiled build-tree discovery cannot satisfy installed-worker readiness. Explicit
-development tooling may name build-tree authority, but it is never inferred by an installed
-worker. ACN still owns and observes exactly one ICN service child.
+Model assessment is bounded work in a supervised, demand-created pool of persistent planning
+workers. Startup creates only the calibration worker. Cold backend initialization is serialized;
+initialized workers run distinct target batches concurrently and retain process-local backend
+state. A worker is replaced after a deadline, protocol, or process failure. The
+private inference worker owns one resident model topology and lives only
+for that residency generation. It uses the same verified executable, communicates only with ICN
+over private standard I/O, exposes no listener or public lifecycle, and terminates with its
+residency or parent. ICN passes its verified installation authority to the worker, which registers
+and validates backend modules from that exact installation before native initialization, request
+decoding, or inference handshake. Executable-relative, current-directory, and compiled build-tree
+discovery cannot satisfy installed-worker readiness. Explicit development tooling may name
+build-tree authority, but it is never inferred by an installed worker. ACN still owns and observes
+exactly one ICN service child.
 
-The hardware, fitting, and inventory meanings exposed through this boundary are defined by
-[hardware fitting](./hardware-fitting.md) and [model management](./model-management.md). This
+The hardware, assessment, and inventory meanings exposed through this boundary are defined by
+[hardware calibration and model assessment](./calibration-model-assessment.md) and
+[model catalog and acquisition](../model-management/catalog-and-acquisition.md). This
 document defines ownership, process lifetime, transport, and the Bun-facing package contract.
 
 ## Ownership boundary
@@ -94,7 +98,7 @@ implementation of an ICN operation and no hand-written HTTP client, SSE parser, 
 endpoint-specific transport error mapper.
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
-inspection, model fitting, the pinned inference runtime, active-model state, and inference request
+inspection, model assessment, the pinned inference runtime, active-model state, and inference request
 execution. `@magnitudedev/icn` acquires a release-manifest base plus an optional concrete accelerator
 pack; ICN is not downloaded from a model repository or selected from a user-installed runtime.
 The installation carries one hardware-independent planner-input bundle. Native startup validates
@@ -145,7 +149,7 @@ response metadata.
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
 and identity, hardware, live Hugging Face discovery, recommendable catalog, installed packages,
-assessment, automatic fitting, downloads, exact configuration load, exact model-instance Stop, template
+assessment, downloads, exact configuration load, exact model-instance Stop, template
 application, model properties, and streamed chat completion. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
 
@@ -165,7 +169,7 @@ watch before refreshing current state. An explicit exact-instance check preserve
 instead of authorizing from a cached snapshot. ACN is the only consumer; native instance types
 are not a client-facing product mirror. Instance identity, allocation, release, and failure
 semantics are defined by
-[local model instance lifecycle](./model-instance-lifecycle.md), not by the hardware API.
+[model instance lifecycle](../model-management/instance-lifecycle.md), not by the hardware API.
 
 Chat's `[DONE]` sentinel and download's successful EOF are OpenAPI extension semantics consumed by
 the generator. They are not ICN-specific parser branches.
@@ -188,7 +192,7 @@ External caches or directories participate only when they are supplied explicitl
 import/source roots. ACN supplies no such roots for the product-managed ICN.
 
 Per-request context length belongs to an explicit model serving configuration supplied to
-assessment, fitting, and load. ACN persists that configuration inside a provider offering; ICN owns
+assessment and load. ACN persists that configuration inside a provider offering; ICN owns
 its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,
 or process-launch field. Native sequence capacity, physical context allocation, batching, GPU
 placement, KV policy, projector, draft, and MTP selection are ICN-owned plan resolution. This
@@ -251,8 +255,8 @@ Ready -- unexpected child exit --> DependencyFailed --> ACN termination
 ```
 
 Only `Ready` publishes `IcnProcess`; only that capability permits construction of `IcnClient`.
-The process service exposes immutable child identity and exit observation. Starting, stopping, and failed states are lifecycle
-observations and errors, not partially usable clients.
+The process service exposes immutable child identity and exit observation. Starting, stopping, and
+failed states are lifecycle observations and errors, not partially usable clients.
 
 ### Startup
 
@@ -273,8 +277,11 @@ Startup is one scoped acquisition:
 7. Publish `IcnProcess`, construct `IcnClient` from it, and begin continuous exit supervision.
 
 ICN's HTTP listener is created before it emits the startup record. Its readiness response is
-successful only after storage, inventory recovery, native runtime registration, and API state are
-usable; it does not perform an inventory-wide model inspection. Startup retry applies only to
+successful only after storage, inventory recovery, native runtime registration, normalized
+topology, an operational planning-worker pool, complete hardware calibration for every enabled assessment
+backend, and API state are usable. Hardware calibration is loaded from validated disposable evidence
+or measured by the bounded pool before readiness; it is never deferred to an assessment request. Startup does not
+perform an inventory-wide model inspection or model assessment. Startup retry applies only to
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
@@ -327,7 +334,7 @@ backstops, not child adoption or sharing.
 
 ## Model instance lifecycle
 
-The singleton starts with no model instances. Catalog, installed-package, assessment, fitting,
+The singleton starts with no model instances. Catalog, installed-package, assessment,
 download, and deletion remain available in that state. ICN's `ModelInstanceController` owns
 physical instance admission, native workers, backends, exact-instance leases, lifecycle
 publication, and terminal cleanup. ACN owns product slots and explicit load/Stop policy. A slot is
@@ -341,7 +348,7 @@ native sequence capacity from one through four whose full-context allocation fit
 memory policy. That resolved capacity belongs to residency execution evidence and may differ across
 cold loads of the same configuration.
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
-ICN reassesses the exact plan and streams typed progress through resolution, assessment,
+ICN resolves the exact allocation plan and streams typed progress through resolution, planning,
 unload/replacement, loading, verification, and ready or failed termination. Loading percentage
 begins only after the exact native plan is prepared and prior residency is released. ICN estimates
 total progress from the prepared plan's semantic phase sequence and phase-duration estimates,
@@ -352,19 +359,19 @@ same configuration uses a new identity. Reusing an active identity for another c
 conflict. Concurrent incompatible mutations are serialized by `ModelInstanceController`; they
 never rely on ACN-side locking. Ready state carries the actual selected parallelism, physical
 context allocation, and memory-domain allocation. Hardware snapshots do not own that evidence.
-The ICN composition root creates no resident native backend before readiness. Each resident load
-creates one private `inference-worker` child; that child initializes its own process-lifetime
+The ICN composition root initializes native discovery and the calibration planning worker before
+hardware calibration and readiness. Additional persistent planning workers are created on demand.
+Each resident load creates one private `inference-worker` child; that child initializes its own process-lifetime
 native-backend capability, prepares and loads exactly one topology, and owns the executor until it
-exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Isolated
-planner and template workers remain separate metadata-only children with one backend for their
-private process lifetime. All three worker kinds receive native-runtime authority from the same
-immutable worker-launch capability. An inference-worker handshake proves that its native runtime
-has already initialized.
+exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Template
+inspection remains a separate metadata-only child. Worker kinds receive native-runtime authority
+from the same immutable worker-launch capability. An inference-worker handshake proves that its
+native runtime has already initialized.
 
-The persistent process also supplies an isolated planner with the exact hardware snapshot for its
-assessment environment and supplies an inference worker with the exact snapshot used for load
-selection. A worker validates and consumes that snapshot's memory topology; it does not rediscover
-memory sharing or reinterpret native allocation locations independently.
+The persistent process uses the exact assessment-environment snapshot for resident planning and
+supplies an inference worker with the exact snapshot used for load selection. A worker validates
+and consumes that snapshot's memory topology; it does not rediscover memory sharing or reinterpret
+native allocation locations independently.
 
 Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
 core dumps and run a dedicated parent-liveness watchdog; Linux additionally requests
@@ -450,6 +457,7 @@ The lifecycle conforms when:
 - constructing `IcnClient` without `IcnProcess` is impossible in the Effect dependency graph;
 - ACN cannot become ready when its ICN binary is absent, incompatible, or unready;
 - launch is model-free and changing the active model never replaces the ICN process;
+- ICN readiness proves an operational planning-worker pool and complete hardware calibration for every enabled assessment backend;
 - loopback binding has no probe-then-bind race and readiness proves child instance identity;
 - every bootstrap record produced by ICN is accepted by its generated Bun schema, and generated
   contract drift fails validation;
@@ -457,7 +465,7 @@ The lifecycle conforms when:
 - `@magnitudedev/icn` contains no hand-written streaming transport logic or redundant runtime
   facade;
 - ACN contains no ICN command service, mutation proxy, or mirror-copy service;
-- no Bun implementation duplicates hardware, model inspection, fitting, downloading, inventory, or
+- no Bun implementation duplicates hardware, model inspection, assessment, downloading, inventory, or
   pinned-runtime management;
 - the public local provider ID is exactly `local`, and its bound model streams through the scoped
   ordinary generated chat client rather than an endpoint URL adapter;
@@ -471,7 +479,7 @@ The lifecycle conforms when:
   eviction, inference-worker loss, or ICN process exit;
 - replacement, load, and Stop serialize through native mutation authority and cannot
   invalidate an admitted inference lease;
-- product model-download, activation, deletion, hardware, and fit operations reach ICN only through
+- product model-download, activation, deletion, hardware, and assessment operations reach ICN only through
   the generated client, with no alternate model-repository or host-inspection path in ACN;
 - interrupting a consumer stream closes its response without terminating ICN;
 - an unexpected ICN service exit causes the owning ACN to fail closed without an in-process
@@ -484,4 +492,4 @@ The lifecycle conforms when:
 - lifecycle and transport failures remain typed and retain bounded, redacted diagnostics; and
 - generated-artifact checks, package tests, native signal tests, and release smoke tests prove the
   shipped ACN and ICN identities are compatible; candidate validation additionally requires local
-  model preparation to complete through the packaged isolated planner.
+  model preparation to complete through the packaged resident planner.

@@ -238,7 +238,7 @@ Changing the effective template, template-selection inputs, inspector version, s
 version, or pinned llama.cpp behavior invalidates the cached result.
 
 Reasoning persistence is part of the artifact-inspection index in the
-[model-management cache](./model-management.md#model-derived-cache). The reasoning detector defines
+[model-management cache](../model-management/catalog-and-acquisition.md#concurrency-and-recovery). The reasoning detector defines
 the typed result and a stable semantic-policy identity included in the inspection evidence; it does
 not own a reasoning-specific cache or filesystem layout. Local inventory inspection and remote
 preview reuse the same index whenever the artifact, effective template, and policy evidence match.

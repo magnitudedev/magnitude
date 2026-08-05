@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
-use icn_contracts::models::ModelPackageId;
+use icn_contracts::models::{
+    InstalledModelPackage, InstalledModelPackagesResponse, ModelAssessment, ModelPackageId,
+};
 use icn_contracts::{
-    CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, HardwareAssessment,
-    Integrity, InventoryError, InventoryHardwareAssessor, InventoryModel, InventoryProperties,
-    LocalDeclaration, ModelAvailability, ModelComponent, ModelId, ModelLocation, ModelOperation,
-    ModelSource, ReasoningCapability, ServingConfiguration, ServingProfile, TemplateAssessor,
+    CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, Integrity,
+    InventoryError, InventoryModel, InventoryProperties, LocalDeclaration, ModelAvailability,
+    ModelComponent, ModelId, ModelLocation, ModelOperation, ModelSource, ReasoningCapability,
+    TemplateAssessor,
 };
 use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -42,13 +44,37 @@ pub(crate) struct CachedModelInspection {
 struct InventoryCache {
     models: BTreeMap<ModelId, InventoryModel>,
     evidence: BTreeMap<ModelId, CacheEvidence>,
+    installed: InstalledPackageSnapshot,
 }
 
 type HydratedInventory = (
     BTreeMap<ModelId, InventoryModel>,
     BTreeMap<ModelId, CacheEvidence>,
+    InstalledPackageSnapshot,
 );
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InstalledPackageRecord {
+    pub(crate) installed: InstalledModelPackage,
+    pub(crate) model: InventoryModel,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InstalledPackageSnapshot {
+    pub(crate) records: BTreeMap<ModelPackageId, InstalledPackageRecord>,
+}
+
+impl InstalledPackageSnapshot {
+    pub(crate) fn response(&self) -> InstalledModelPackagesResponse {
+        InstalledModelPackagesResponse {
+            packages: self
+                .records
+                .values()
+                .map(|record| record.installed.clone())
+                .collect(),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
     pub root: PathBuf,
@@ -104,14 +130,22 @@ pub struct ModelManager {
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) template_assessor: Option<Arc<dyn TemplateAssessor>>,
-    hardware_assessor: Arc<RwLock<Option<Arc<dyn InventoryHardwareAssessor>>>>,
     pub(crate) cache: ModelCache,
-    pub(crate) package_digests:
-        Arc<RwLock<BTreeMap<PathBuf, (u64, std::time::SystemTime, String)>>>,
-    pub(crate) package_models: Arc<RwLock<BTreeMap<ModelPackageId, ModelId>>>,
+    pub(crate) package_digests: Arc<RwLock<BTreeMap<PathBuf, (u64, SystemTime, String)>>>,
+    pub(crate) installed_packages: Arc<RwLock<InstalledPackageSnapshot>>,
+    pub(crate) model_assessments: Arc<RwLock<BTreeMap<String, ModelAssessment>>>,
     cache_evidence: Arc<RwLock<BTreeMap<ModelId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
+    reconciliation_running: Arc<AtomicBool>,
+}
+
+struct ReconciliationLease(Arc<AtomicBool>);
+
+impl Drop for ReconciliationLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Clone for ModelManager {
@@ -124,13 +158,14 @@ impl Clone for ModelManager {
             operations: Arc::clone(&self.operations),
             download_slots: Arc::clone(&self.download_slots),
             template_assessor: self.template_assessor.clone(),
-            hardware_assessor: Arc::clone(&self.hardware_assessor),
             cache: self.cache.clone(),
             package_digests: Arc::clone(&self.package_digests),
-            package_models: Arc::clone(&self.package_models),
+            installed_packages: Arc::clone(&self.installed_packages),
+            model_assessments: Arc::clone(&self.model_assessments),
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
+            reconciliation_running: Arc::clone(&self.reconciliation_running),
         }
     }
 }
@@ -139,83 +174,6 @@ impl ModelManager {
     #[must_use]
     pub fn derived_cache(&self) -> &ModelCache {
         &self.cache
-    }
-
-    pub(crate) async fn configure_serving_model(
-        &self,
-        id: &ModelId,
-        profile: ServingProfile,
-    ) -> Result<InventoryModel, InventoryError> {
-        if profile.context_length == 0 || profile.parallel_sequences == 0 {
-            return Err(InventoryError::InvalidRequest(
-                "serving profile values must be positive".to_owned(),
-            ));
-        }
-        self.ensure_model_inventory().await?;
-        let current = self
-            .models
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-            .get(id)
-            .cloned()
-            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-        if !matches!(current.availability, ModelAvailability::Available { .. }) {
-            return Err(InventoryError::NotReady(id.0.clone()));
-        }
-        if current
-            .serving_configuration
-            .as_ref()
-            .is_some_and(|configuration| configuration.profile == profile)
-        {
-            return Ok(current);
-        }
-        let assessor = self
-            .hardware_assessor
-            .read()
-            .map_err(|_| InventoryError::Internal("hardware assessor lock poisoned".to_owned()))?
-            .clone()
-            .ok_or_else(|| {
-                InventoryError::Internal("inventory hardware assessor is not configured".to_owned())
-            })?;
-        let resolved = icn_contracts::ResolvedModel {
-            components: crate::service::resolve_components(&self.config.root, &current)?,
-            model: current,
-        };
-        let assessment = assessor.assess_serving(resolved, profile.clone()).await?;
-        if !matches!(assessment, HardwareAssessment::Fits { .. }) {
-            return Err(InventoryError::NotReady(
-                "serving profile does not fit the available hardware".to_owned(),
-            ));
-        }
-        let _guard = self.ensure_gate.lock().await;
-        let mut models = self
-            .models
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-            .clone();
-        let model = models
-            .get_mut(id)
-            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-        if !matches!(model.availability, ModelAvailability::Available { .. }) {
-            return Err(InventoryError::NotReady(id.0.clone()));
-        }
-        model.serving_configuration = Some(ServingConfiguration { profile });
-        model.hardware = assessment;
-        model.updated_at = now();
-        let updated = model.clone();
-
-        let evidence = self
-            .cache_evidence
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
-            .clone();
-        persist_inventory_index(&self.cache, &models, &evidence);
-        *self
-            .models
-            .write()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? = models;
-        self.ensure_generation.fetch_add(1, Ordering::Release);
-        Ok(updated)
     }
 
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
@@ -246,7 +204,7 @@ impl ModelManager {
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
         let cache = ModelCache::new(&config.cache_root);
-        let (models, cache_evidence) = load_inventory_index(&cache);
+        let (models, cache_evidence, installed_packages) = load_inventory_index(&cache);
         let manager = Self {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
@@ -255,25 +213,50 @@ impl ModelManager {
             models: Arc::new(RwLock::new(models)),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             template_assessor,
-            hardware_assessor: Arc::new(RwLock::new(None)),
             cache,
             package_digests: Arc::new(RwLock::new(BTreeMap::new())),
-            package_models: Arc::new(RwLock::new(BTreeMap::new())),
+            installed_packages: Arc::new(RwLock::new(installed_packages)),
+            model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
             cache_evidence: Arc::new(RwLock::new(cache_evidence)),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
+            reconciliation_running: Arc::new(AtomicBool::new(false)),
         };
+        manager.request_installed_model_reconciliation();
+        manager.start_installed_model_reconciler();
         Ok(manager)
     }
 
-    pub fn set_hardware_assessor(
-        &self,
-        assessor: Arc<dyn InventoryHardwareAssessor>,
-    ) -> Result<(), InventoryError> {
-        *self.hardware_assessor.write().map_err(|_| {
-            InventoryError::Internal("hardware assessor lock poisoned".to_owned())
-        })? = Some(assessor);
-        Ok(())
+    fn start_installed_model_reconciler(&self) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Startup reconciliation was requested before this activity was admitted.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                manager.request_installed_model_reconciliation();
+            }
+        });
+    }
+
+    pub(crate) fn request_installed_model_reconciliation(&self) {
+        if self
+            .reconciliation_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let reconciliation = self.clone();
+        tokio::spawn(async move {
+            let _lease = ReconciliationLease(Arc::clone(&reconciliation.reconciliation_running));
+            let result = reconciliation.ensure_installed_model_inventory().await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "installed-model reconciliation failed");
+            }
+        });
     }
 
     pub(crate) fn cached_model_inspection(
@@ -295,35 +278,18 @@ impl ModelManager {
     }
 
     pub async fn ensure_model_inventory(&self) -> Result<(), InventoryError> {
-        self.ensure_model_inventory_with_hardware(true).await
+        self.reconcile_model_inventory().await
     }
 
     pub(crate) async fn ensure_installed_model_inventory(&self) -> Result<(), InventoryError> {
-        self.ensure_model_inventory_with_hardware(false).await
+        self.reconcile_model_inventory().await
     }
 
-    async fn ensure_model_inventory_with_hardware(
-        &self,
-        assess_hardware: bool,
-    ) -> Result<(), InventoryError> {
+    async fn reconcile_model_inventory(&self) -> Result<(), InventoryError> {
         let observed_generation = self.ensure_generation.load(Ordering::Acquire);
         let _guard = self.ensure_gate.lock().await;
         if self.ensure_generation.load(Ordering::Acquire) != observed_generation {
-            let hardware_is_current = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .values()
-                .filter(|model| matches!(model.properties, InventoryProperties::Inspected { .. }))
-                .all(|model| {
-                    matches!(
-                        model.hardware,
-                        HardwareAssessment::Fits { .. } | HardwareAssessment::DoesNotFit { .. }
-                    )
-                });
-            if !assess_hardware || hardware_is_current {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let live_models = self
@@ -332,7 +298,7 @@ impl ModelManager {
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
             .clone();
         let mut attempt = 0_u8;
-        let (discovered, next_evidence) = loop {
+        let (discovered, next_evidence, installed_packages) = loop {
             let config = self.config.clone();
             let cache = self.cache.clone();
             let template_assessor = self.template_assessor.clone();
@@ -347,44 +313,11 @@ impl ModelManager {
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
-            let mut discovered = scan_result.models;
-            let (assessor, hardware_key, memory_topology) = if assess_hardware {
-                let has_inspected = discovered
-                    .values()
-                    .any(|model| matches!(model.properties, InventoryProperties::Inspected { .. }));
-                let assessor = self
-                    .hardware_assessor
-                    .read()
-                    .map_err(|_| {
-                        InventoryError::Internal("hardware assessor lock poisoned".to_owned())
-                    })?
-                    .clone();
-                let hardware_key = match assessor.as_ref() {
-                    Some(assessor) => {
-                        let snapshot = assessor.snapshot().await?;
-                        let topology = icn_contracts::MemoryTopology::from_snapshot(&snapshot)
-                            .ok_or_else(|| {
-                                InventoryError::Internal(
-                                    "hardware snapshot has an invalid memory topology".to_owned(),
-                                )
-                            })?;
-                        (assessor.cache_key(&snapshot)?, Some(topology))
-                    }
-                    None if has_inspected => {
-                        return Err(InventoryError::Internal(
-                            "inventory hardware assessor is not configured".to_owned(),
-                        ));
-                    }
-                    None => (String::new(), None),
-                };
-                (assessor, hardware_key.0, hardware_key.1)
-            } else {
-                (None, String::new(), None)
-            };
+            let discovered = scan_result.models;
 
             let mut next_evidence = BTreeMap::new();
 
-            for model in discovered.values_mut() {
+            for model in discovered.values() {
                 if !is_cacheable_model(model)? {
                     continue;
                 }
@@ -401,90 +334,23 @@ impl ModelManager {
                             ))
                         })?,
                 };
-                if assess_hardware
-                    && matches!(model.properties, InventoryProperties::Inspected { .. })
-                {
-                    let assessment_key = hardware_key_for_profile(
-                        &hardware_key,
-                        model
-                            .serving_configuration
-                            .as_ref()
-                            .map(|value| &value.profile),
-                    )?;
-                    model.hardware = self
-                        .cache
-                        .read_hardware_assessment(
-                            &model.content_id,
-                            &assessment_key,
-                            memory_topology
-                                .as_ref()
-                                .expect("hardware assessment has a topology"),
-                        )
-                        .unwrap_or(HardwareAssessment::NotAssessed {
-                            reason: "cache_miss".to_owned(),
-                        });
-                    if !matches!(
-                        model.hardware,
-                        HardwareAssessment::Fits { .. } | HardwareAssessment::DoesNotFit { .. }
-                    ) {
-                        let resolved = icn_contracts::ResolvedModel {
-                            model: model.clone(),
-                            components: crate::service::resolve_components(
-                                &self.config.root,
-                                model,
-                            )?,
-                        };
-                        let assessor = assessor
-                            .as_ref()
-                            .expect("hardware inventory reconciliation requires an assessor");
-                        let assessment = match model.serving_configuration.as_ref() {
-                            Some(configuration) => {
-                                assessor
-                                    .assess_serving(resolved, configuration.profile.clone())
-                                    .await?
-                            }
-                            None => assessor.assess(resolved).await?,
-                        };
-                        model.hardware = assessment;
-                    }
-                    self.cache.write_hardware_assessment(
-                        &model.content_id,
-                        &assessment_key,
-                        &model.hardware,
-                    );
-                    if model.serving_configuration.is_none()
-                        && let HardwareAssessment::Fits { profile, .. } = &model.hardware
-                    {
-                        let serving_profile = ServingProfile {
-                            context_length: profile.context_length,
-                            parallel_sequences: 1,
-                        };
-                        model.serving_configuration = Some(ServingConfiguration {
-                            profile: serving_profile,
-                        });
-                    }
-                    let assessment_key = hardware_key_for_profile(
-                        &hardware_key,
-                        model
-                            .serving_configuration
-                            .as_ref()
-                            .map(|value| &value.profile),
-                    )?;
-                    self.cache.write_hardware_assessment(
-                        &model.content_id,
-                        &assessment_key,
-                        &model.hardware,
-                    );
-                }
                 next_evidence.insert(model.id.clone(), evidence);
             }
+
+            let package_manager = self.clone();
+            let package_models = discovered.clone();
+            let installed_packages = tokio::task::spawn_blocking(move || {
+                package_manager.build_installed_package_snapshot(&package_models)
+            })
+            .await
+            .map_err(|error| InventoryError::Internal(error.to_string()))??;
 
             if inventory_snapshot_is_current(
                 &self.config.root,
                 &discovered,
                 &scan_result.observations,
             ) {
-                break (discovered, next_evidence);
+                break (discovered, next_evidence, installed_packages);
             }
             attempt += 1;
             if attempt >= 3 {
@@ -495,7 +361,12 @@ impl ModelManager {
             }
         };
 
-        persist_inventory_index(&self.cache, &discovered, &next_evidence);
+        persist_inventory_index(
+            &self.cache,
+            &discovered,
+            &next_evidence,
+            &installed_packages,
+        );
         *self
             .models
             .write()
@@ -506,6 +377,9 @@ impl ModelManager {
             .write()
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
             next_evidence;
+        *self.installed_packages.write().map_err(|_| {
+            InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+        })? = installed_packages;
         self.ensure_generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -584,7 +458,7 @@ impl ModelManager {
 
     pub(crate) async fn complete_and_publish_model(
         &self,
-        mut model: InventoryModel,
+        model: InventoryModel,
     ) -> Result<InventoryModel, InventoryError> {
         let _guard = self.ensure_gate.lock().await;
         let evidence = is_cacheable_model(&model)?
@@ -595,57 +469,6 @@ impl ModelManager {
                 })
             })
             .transpose()?;
-        if matches!(model.availability, ModelAvailability::Available { .. }) {
-            let assessor = self
-                .hardware_assessor
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("hardware assessor lock poisoned".to_owned())
-                })?
-                .clone()
-                .ok_or_else(|| {
-                    InventoryError::Internal(
-                        "inventory hardware assessor is not configured".to_owned(),
-                    )
-                })?;
-            let snapshot = assessor.snapshot().await?;
-            let hardware_key = assessor.cache_key(&snapshot)?;
-            let resolved = icn_contracts::ResolvedModel {
-                model: model.clone(),
-                components: crate::service::resolve_components(&self.config.root, &model)?,
-            };
-            let assessment = match model.serving_configuration.as_ref() {
-                Some(configuration) => {
-                    assessor
-                        .assess_serving(resolved, configuration.profile.clone())
-                        .await?
-                }
-                None => assessor.assess(resolved).await?,
-            };
-            model.hardware = assessment;
-            if model.serving_configuration.is_none()
-                && let HardwareAssessment::Fits { profile, .. } = &model.hardware
-            {
-                model.serving_configuration = Some(ServingConfiguration {
-                    profile: ServingProfile {
-                        context_length: profile.context_length,
-                        parallel_sequences: 1,
-                    },
-                });
-            }
-            let assessment_key = hardware_key_for_profile(
-                &hardware_key,
-                model
-                    .serving_configuration
-                    .as_ref()
-                    .map(|value| &value.profile),
-            )?;
-            self.cache.write_hardware_assessment(
-                &model.content_id,
-                &assessment_key,
-                &model.hardware,
-            );
-        }
         let mut models = self
             .models
             .read()
@@ -662,7 +485,14 @@ impl ModelManager {
         } else {
             cache.remove(&model.id);
         }
-        persist_inventory_index(&self.cache, &models, &cache);
+        let installed = self
+            .installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?
+            .clone();
+        persist_inventory_index(&self.cache, &models, &cache, &installed);
         *self
             .models
             .write()
@@ -673,6 +503,7 @@ impl ModelManager {
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
             cache;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.request_installed_model_reconciliation();
         Ok(model)
     }
 
@@ -690,7 +521,15 @@ impl ModelManager {
             .clone();
         models.remove(id);
         cache.remove(id);
-        persist_inventory_index(&self.cache, &models, &cache);
+        let mut installed = self
+            .installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?
+            .clone();
+        installed.records.retain(|_, record| record.model.id != *id);
+        persist_inventory_index(&self.cache, &models, &cache, &installed);
         *self
             .models
             .write()
@@ -700,20 +539,11 @@ impl ModelManager {
             .write()
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
             cache;
+        *self.installed_packages.write().map_err(|_| {
+            InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+        })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
         Ok(())
-    }
-}
-
-fn hardware_key_for_profile(
-    base: &str,
-    profile: Option<&ServingProfile>,
-) -> Result<String, InventoryError> {
-    match profile {
-        None => Ok(base.to_owned()),
-        Some(profile) => serde_json::to_vec(&(base, profile))
-            .map(|bytes| fingerprint(&bytes))
-            .map_err(|error| InventoryError::Internal(error.to_string())),
     }
 }
 
@@ -767,19 +597,26 @@ fn inventory_snapshot_is_current(
 
 fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
     let Some(mut index) = cache.read_inventory() else {
-        return (BTreeMap::new(), BTreeMap::new());
+        return (
+            BTreeMap::new(),
+            BTreeMap::new(),
+            InstalledPackageSnapshot::default(),
+        );
     };
     let raw_models = recover_map::<InventoryModel>(index.remove("models"), MAX_SCAN_ENTRIES);
     let raw_evidence = recover_map::<CacheEvidence>(index.remove("evidence"), MAX_SCAN_ENTRIES);
+    let installed = index
+        .remove("installed")
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let mut models = BTreeMap::new();
-    for (raw_id, mut model) in raw_models {
+    for (raw_id, model) in raw_models {
         let Ok(id) = ModelId::parse(raw_id) else {
             continue;
         };
         if model.id != id {
             continue;
         }
-        model.serving_configuration = None;
         models.insert(id, model);
     }
     let mut evidence = BTreeMap::new();
@@ -792,25 +629,19 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
         }
         evidence.insert(id, entry);
     }
-    (models, evidence)
+    (models, evidence, installed)
 }
 
 fn persist_inventory_index(
     cache: &ModelCache,
     models: &BTreeMap<ModelId, InventoryModel>,
     evidence: &BTreeMap<ModelId, CacheEvidence>,
+    installed: &InstalledPackageSnapshot,
 ) {
-    let models = models
-        .iter()
-        .map(|(id, model)| {
-            let mut cached = model.clone();
-            cached.serving_configuration = None;
-            (id.clone(), cached)
-        })
-        .collect();
     cache.write_inventory(&InventoryCache {
-        models,
+        models: models.clone(),
         evidence: evidence.clone(),
+        installed: installed.clone(),
     });
 }
 
@@ -958,7 +789,7 @@ fn scan(
     }
     scan_interrupted(config, &mut discovered)?;
 
-    let (mut cached_models, cached_evidence) =
+    let (mut cached_models, cached_evidence, _) =
         load_inventory_index(&ModelCache::new(&config.cache_root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
     // that independently survived durable schema validation.
@@ -1287,7 +1118,6 @@ fn scan_interrupted(
             created: manifest.started_at,
             name: manifest.repository.clone(),
             supported_parameters: Vec::new(),
-            serving_configuration: None,
             availability: ModelAvailability::Interrupted {
                 completed_bytes,
                 total_bytes,
@@ -1312,9 +1142,6 @@ fn scan_interrupted(
                 },
             },
             properties: InventoryProperties::Pending,
-            hardware: HardwareAssessment::NotAssessed {
-                reason: "model_not_ready".to_owned(),
-            },
             operations: Vec::new(),
             updated_at: manifest.updated_at,
         };
@@ -1402,10 +1229,6 @@ fn reuse_inspection(
                 .into_iter()
                 .collect(),
             _ => unreachable!("only terminal discovery records are reusable"),
-        };
-        // Hardware has an independent cache key and is restored only after that key is checked.
-        model.hardware = HardwareAssessment::NotAssessed {
-            reason: "cache_validation_pending".to_owned(),
         };
         model
     })
@@ -1592,14 +1415,10 @@ pub(crate) fn build_model(
         created,
         name: inspected.name,
         supported_parameters: inspected.supported_parameters,
-        serving_configuration: None,
         availability: ModelAvailability::Available { ready_at },
         source,
         location,
         properties: inspected.properties,
-        hardware: HardwareAssessment::NotAssessed {
-            reason: "not_requested".to_owned(),
-        },
         operations,
         updated_at: ready_at,
     })
@@ -1657,14 +1476,10 @@ fn unavailable_model(
             .unwrap_or("local model")
             .to_owned(),
         supported_parameters: Vec::new(),
-        serving_configuration: None,
         availability,
         source,
         location,
         properties: InventoryProperties::Unavailable { reason: message },
-        hardware: HardwareAssessment::NotAssessed {
-            reason: "artifact_unavailable".to_owned(),
-        },
         operations: deletable
             .then_some(ModelOperation::Delete)
             .into_iter()
@@ -2043,14 +1858,10 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use futures_util::future::BoxFuture;
     use icn_contracts::models::{InstalledModelPackages, ModelPackageInspection};
     use icn_contracts::{
-        CapabilityEvidence, HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment,
-        HardwareMemoryDomainKind, HardwareProfile, HardwareProvider, HardwareRecommendation,
-        HardwareSnapshot, HardwareSystemMemory, InventoryHardwareAssessor, MemoryDomainId,
-        ModelInventory, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
-        ResolvedModel, TemplateAssessment, TemplateCapabilities,
+        CapabilityEvidence, ModelInventory, ReasoningControlDomain, ReasoningDelimiters,
+        ReasoningVisibility, TemplateAssessment, TemplateCapabilities,
     };
 
     #[test]
@@ -2123,81 +1934,6 @@ mod tests {
         }
     }
 
-    struct CountingHardwareAssessor(AtomicUsize);
-
-    impl HardwareProvider for CountingHardwareAssessor {
-        fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
-            Box::pin(async {
-                Ok(HardwareSnapshot {
-                    captured_at: 1,
-                    platform: "test".to_owned(),
-                    architecture: "test".to_owned(),
-                    system_product_name: None,
-                    cpu_model: None,
-                    logical_cores: 1,
-                    system_memory: HardwareSystemMemory {
-                        total_bytes: 2,
-                        current_available_bytes: 2,
-                        warning_reserve_bytes: 0,
-                        assess_reserve_bytes: 0,
-                        abort_reserve_bytes: 0,
-                    },
-                    native_build: "test".to_owned(),
-                    enabled_backends: vec!["cpu".to_owned()],
-                    topology_fingerprint: "test".to_owned(),
-                    memory_domains: vec![HardwareMemoryDomain {
-                        id: MemoryDomainId::system(),
-                        kind: HardwareMemoryDomainKind::System,
-                        total_capacity_bytes: 2,
-                        stable_capacity_bytes: 2,
-                        current_free_bytes: Some(2),
-                        shares_system_memory: true,
-                        devices: Vec::new(),
-                    }],
-                })
-            })
-        }
-    }
-
-    impl InventoryHardwareAssessor for CountingHardwareAssessor {
-        fn cache_key(&self, _snapshot: &HardwareSnapshot) -> Result<String, InventoryError> {
-            Ok("hardware-v1".to_owned())
-        }
-
-        fn assess(
-            &self,
-            _model: ResolvedModel,
-        ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
-            Box::pin(async move {
-                self.0.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(HardwareAssessment::Fits {
-                    profile: HardwareProfile {
-                        context_length: 4096,
-                        acceleration: "cpu".to_owned(),
-                        device: "test".to_owned(),
-                    },
-                    memory: HardwareMemory {
-                        domains: vec![HardwareMemoryDomainAssessment {
-                            memory_domain: MemoryDomainId::system(),
-                            model_bytes: 1,
-                            context_bytes: 0,
-                            compute_bytes: 0,
-                            auxiliary_bytes: 0,
-                            required_bytes: 1,
-                            usable_capacity_bytes: 2,
-                            margin_bytes: 1,
-                        }],
-                        device_constraints: Vec::new(),
-                        required_bytes: 1,
-                        usable_capacity_bytes: 2,
-                        headroom_bytes: 1,
-                    },
-                    recommendation: HardwareRecommendation::Recommended,
-                })
-            })
-        }
-    }
-
     fn write_minimal_gguf(path: &Path) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
@@ -2227,7 +1963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_packages_skip_hardware_assessment() {
+    async fn installed_package_listing_reports_discovered_package() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
         let source = temporary.path().join("source");
@@ -2244,29 +1980,67 @@ mod tests {
         )
         .await
         .unwrap();
-        let hardware = Arc::new(CountingHardwareAssessor(AtomicUsize::new(0)));
-        manager.set_hardware_assessor(hardware.clone()).unwrap();
-
+        manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
 
         assert_eq!(installed.packages.len(), 1);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 0);
-        assert!(
-            manager
-                .models
-                .read()
-                .unwrap()
-                .values()
-                .all(|model| { matches!(model.hardware, HardwareAssessment::NotAssessed { .. }) })
-        );
-
         let assessed = manager.list().await.unwrap();
         assert_eq!(assessed.len(), 1);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
-        assert!(matches!(
-            assessed[0].hardware,
-            HardwareAssessment::Fits { .. }
-        ));
+    }
+
+    #[tokio::test]
+    async fn installed_package_reconciliation_refreshes_external_sources_after_startup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let source = temporary.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        write_minimal_gguf(&source.join("first.gguf"));
+
+        let mut config =
+            InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
+        config.model_sources.push(source.clone());
+        let manager = ModelManager::open_with_template_assessor(
+            config,
+            Some(Arc::new(CompleteTemplateAssessor::default())),
+        )
+        .await
+        .unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        assert_eq!(manager.list_installed().await.unwrap().packages.len(), 1);
+
+        write_minimal_gguf_with_string_metadata(
+            &source.join("second.gguf"),
+            &[("general.name", "second")],
+        );
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let packages = manager.list_installed().await.unwrap().packages;
+
+        assert_eq!(packages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn installed_package_query_never_waits_for_reconciliation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manager = ModelManager::open(
+            InventoryConfig::with_roots(
+                temporary.path().join("store"),
+                temporary.path().join("cache"),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let _reconciliation = manager.ensure_gate.lock().await;
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.list_installed(),
+        )
+        .await
+        .expect("snapshot query must not wait for reconciliation")
+        .unwrap();
+
+        assert!(snapshot.packages.is_empty());
     }
 
     #[tokio::test]
@@ -2298,6 +2072,7 @@ mod tests {
         .await
         .unwrap();
 
+        manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
 
         assert_eq!(installed.packages.len(), 2);
@@ -2372,7 +2147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_is_complete_shared_and_reuses_valid_durable_evidence() {
+    async fn list_is_complete_shared_and_reuses_inspection_evidence() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
         let cache_root = temporary.path().join("cache");
@@ -2389,9 +2164,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(manager.models.read().unwrap().is_empty());
-        let hardware = Arc::new(CountingHardwareAssessor(AtomicUsize::new(0)));
-        manager.set_hardware_assessor(hardware.clone()).unwrap();
-
+        manager.ensure_model_inventory().await.unwrap();
         let (first, second) = tokio::join!(manager.list(), manager.list());
         let first = first.unwrap();
         assert_eq!(first, second.unwrap());
@@ -2404,17 +2177,8 @@ mod tests {
             first[0].properties,
             InventoryProperties::Inspected { .. }
         ));
-        assert!(matches!(first[0].hardware, HardwareAssessment::Fits { .. }));
-        let serving = first[0]
-            .serving_configuration
-            .as_ref()
-            .expect("available models have a serving configuration");
-        assert_eq!(serving.profile.context_length, 4096);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
         let persisted_bytes = fs::read(cache_root.join("indexes/inventory.json")).unwrap();
-        let persisted_text = String::from_utf8(persisted_bytes.clone()).unwrap();
-        assert!(!persisted_text.contains("serving_configuration"));
         let persisted: serde_json::Value = serde_json::from_slice(&persisted_bytes).unwrap();
         assert!(persisted.get("version").is_none());
 
@@ -2422,11 +2186,9 @@ mod tests {
             ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
-        reopened.set_hardware_assessor(hardware.clone()).unwrap();
         let warm = reopened.list().await.unwrap();
         assert_eq!(warm.len(), 1);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 1);
 
         // A changed identity is the only candidate enriched on the next reconciliation.
         fs::OpenOptions::new()
@@ -2435,10 +2197,10 @@ mod tests {
             .unwrap()
             .write_all(&[0])
             .unwrap();
+        reopened.ensure_model_inventory().await.unwrap();
         let changed = reopened.list().await.unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2458,12 +2220,11 @@ mod tests {
             delay: true,
             ..CompleteTemplateAssessor::default()
         });
-        let hardware = Arc::new(CountingHardwareAssessor(AtomicUsize::new(0)));
         let manager =
             ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
-        manager.set_hardware_assessor(hardware.clone()).unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list().await.unwrap().len(), 2);
         assert!(template.max_active.load(AtomicOrdering::SeqCst) > 1);
 
@@ -2482,10 +2243,9 @@ mod tests {
             ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
-        reopened.set_hardware_assessor(hardware.clone()).unwrap();
+        reopened.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(reopened.list().await.unwrap().len(), 2);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
 
         let inspection_dir = cache_root.join("indexes/inspections/artifacts");
         let one_inspection = fs::read_dir(&inspection_dir)
@@ -2500,19 +2260,17 @@ mod tests {
             ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
-        corrupted.set_hardware_assessor(hardware.clone()).unwrap();
+        corrupted.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(corrupted.list().await.unwrap().len(), 2);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
 
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
         let uncached = ModelManager::open_with_template_assessor(config, Some(template.clone()))
             .await
             .unwrap();
-        uncached.set_hardware_assessor(hardware.clone()).unwrap();
+        uncached.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
-        assert_eq!(hardware.0.load(AtomicOrdering::SeqCst), 2);
     }
 }

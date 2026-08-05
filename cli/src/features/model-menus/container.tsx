@@ -74,7 +74,7 @@ const EMPTY_MODEL_ACTIONS = [
 
 interface ModelsMenuProps {
   readonly openRoot: (root: ModelMenuRoot) => void
-  readonly openCatalogDetail: (candidateId: string) => void
+  readonly openCatalogDetail: (providerModelId: string) => void
   readonly setRootSwitchingEnabled: (enabled: boolean) => void
 }
 
@@ -142,8 +142,8 @@ export function ModelMenusContainer({
     setAtRootLevel(true)
     setMenu({ open: true, root })
   }, [setMenu])
-  const openCatalogDetail = useCallback((candidateId: string) => {
-    setCatalogDetailId(candidateId)
+  const openCatalogDetail = useCallback((providerModelId: string) => {
+    setCatalogDetailId(providerModelId)
     setAtRootLevel(false)
     setMenu({ open: true, root: "catalog" })
   }, [setMenu])
@@ -414,15 +414,14 @@ const ModelsMenu = memo(function ModelsMenu({
       onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
     })
   }
-  const calibratingRequirementFor = (model: LocalModel): string => {
-    const candidate = localCatalogCandidates.find(({ id }) =>
-      model.catalogCandidateIds.includes(id))
+  const assessingRequirementFor = (model: LocalModel): string => {
+    const candidate = localCatalogCandidates.find(({ targetId }) => targetId === model.targetId)
     return candidate ? formatBytes(requiredMemoryBytes(candidate.memory)) : "—"
   }
-  const calibrating = Option.match(localSnapshot, {
+  const assessing = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModel[],
     onSome: (models) => models.models.filter((model) =>
-      model.download._tag === "Downloaded" && model.preparation._tag === "Preparing"),
+      model.download._tag === "Downloaded" && model.assessment._tag === "Assessing"),
   })
   const primarySlot = Option.match(slotsSnapshot, {
     onNone: () => null,
@@ -436,13 +435,15 @@ const ModelsMenu = memo(function ModelsMenu({
   const detailLocalModel = detailIsLocal && detail
     ? Option.match(localSnapshot, {
         onNone: () => undefined,
-        onSome: (models) => models.models.find(({ preparation }) =>
-          (preparation._tag === "Available" || preparation._tag === "Unavailable")
-          && preparation.providerModelIds.includes(detail.providerModelId)),
+        onSome: (models) => models.models.find(({ offerings }) =>
+          offerings.some(({ providerModelId }) => providerModelId === detail.providerModelId)),
       })
     : undefined
-  const detailCatalogCandidate = detailLocalModel
-    ? localCatalogCandidates.find(({ id }) => detailLocalModel.catalogCandidateIds.includes(id))
+  const detailCatalogCandidate = detailLocalModel && detail
+    ? localCatalogCandidates.find(({ configurationId }) =>
+        detailLocalModel.offerings.some((offering) =>
+          offering.providerModelId === detail.providerModelId
+          && offering.configurationId === configurationId))
     : undefined
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
@@ -508,7 +509,7 @@ const ModelsMenu = memo(function ModelsMenu({
         onSome: slotActions.stop,
       })
     }
-    else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.id)
+    else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.configurationId)
   }, [choose, detail, detailCatalogCandidate, openCatalogDetail, primarySlot, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
@@ -672,9 +673,9 @@ const ModelsMenu = memo(function ModelsMenu({
           <text style={{ fg: theme.muted, width: 9 }}>CONTEXT</text>
           <text style={{ fg: theme.muted, width: 23 }}>STATUS</text>
         </box>
-        {calibrating.map((model, index) => (
+        {assessing.map((model, index) => (
           <box
-            key={`calibrating:${model.targetId}`}
+            key={`assessing:${model.targetId}`}
             style={{
               flexDirection: "row",
               width: "100%",
@@ -684,9 +685,9 @@ const ModelsMenu = memo(function ModelsMenu({
             <text style={{ width: 2 }}> </text>
             <text style={{ width: 2 }}> </text>
             <text style={{ fg: theme.foreground, flexGrow: 1 }}>{model.displayName}</text>
-            <text style={{ fg: theme.muted, width: 14 }}>{calibratingRequirementFor(model)}</text>
+            <text style={{ fg: theme.muted, width: 14 }}>{assessingRequirementFor(model)}</text>
             <text style={{ fg: theme.muted, width: 9 }}>{formatContextWindow(model.maximumContextLength)}</text>
-            <text style={{ fg: theme.primary, width: 23 }}>Calibrating</text>
+            <text style={{ fg: theme.primary, width: 23 }}>Assessing</text>
           </box>
         ))}
         {eligible.length === 0 ? (
@@ -706,7 +707,7 @@ const ModelsMenu = memo(function ModelsMenu({
           const focused = index === cursorIndex
           const active = providerModelKey(model) === selectedKey
           const favorite = currentFavoriteKeys.has(providerModelKey(model))
-          const rowIndex = calibrating.length + index
+          const rowIndex = assessing.length + index
           return (
             <Button
               key={providerModelKey(model)}
@@ -766,8 +767,7 @@ const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
     return `Downloading ${Math.round(candidate.download.completedBytes / Math.max(1, candidate.download.totalBytes) * 100)}%`
   }
   if (candidate.download._tag === "Failed") return "Download failed"
-  if (candidate.preparation._tag === "Preparing") return "Calibrating"
-  if (candidate.preparation._tag === "Unavailable") return "Unavailable"
+  if (candidate.availability._tag === "Unavailable") return "Unavailable"
   return "Installed"
 }
 
@@ -796,7 +796,7 @@ const CatalogMenu = memo(function CatalogMenu({
   )
   const recommendationFor = useCallback((candidate: LocalModelCatalogCandidate) =>
     Option.fromNullable(recommendations.find((recommendation) =>
-      recommendation.candidate.id === candidate.id)), [recommendations])
+      recommendation.candidate.configurationId === candidate.configurationId)), [recommendations])
   const candidates = [...catalogCandidates].sort((left, right) => {
     const leftInstalled = left.download._tag === "Downloaded"
     const rightInstalled = right.download._tag === "Downloaded"
@@ -805,9 +805,10 @@ const CatalogMenu = memo(function CatalogMenu({
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
-  const cursorIndex = Math.max(0, candidates.findIndex(({ id }) => id === cursorId))
+  const cursorIndex = Math.max(0, candidates.findIndex(({ configurationId }) =>
+    configurationId === cursorId))
   const cursor = candidates[cursorIndex]
-  const detail = candidates.find(({ id }) => id === detailId) ?? null
+  const detail = candidates.find(({ configurationId }) => configurationId === detailId) ?? null
   const progress = Option.match(snapshot, {
     onNone: () => [],
     onSome: (models) => localInferenceProgressLines(models.recommendations.progress),
@@ -819,7 +820,7 @@ const CatalogMenu = memo(function CatalogMenu({
     const actions: ("primary" | "cancel" | "select")[] = []
     if (detail.download._tag === "Downloading") actions.push("cancel")
     else if (detail.download._tag === "Downloaded") {
-      if (detail.preparation._tag === "Available") actions.push("select")
+      if (detail.availability._tag === "Available") actions.push("select")
     }
     else actions.push("primary")
     return actions
@@ -830,20 +831,26 @@ const CatalogMenu = memo(function CatalogMenu({
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
       || candidate.download._tag === "Downloaded") return
-    void modelActions.download(candidate.targetId)
+    void modelActions.download(candidate.configurationId)
   }, [modelActions])
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.preparation._tag !== "Available") return
+    if (candidate.availability._tag !== "Available") return
+    const providerModelId = Option.flatMap(snapshot, ({ models }) => Option.fromNullable(
+      models.find(({ targetId }) => targetId === candidate.targetId)
+        ?.offerings.find(({ configurationId }) => configurationId === candidate.configurationId)
+        ?.providerModelId,
+    ))
+    if (Option.isNone(providerModelId)) return
     void slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
-      providerModelId: candidate.providerModelId,
+      providerModelId: providerModelId.value,
       reasoningEffort: Option.getOrElse(
         candidate.capabilities.reasoning.defaultEffort,
         () => ReasoningEffortSchema.make("none"),
       ),
     })
-  }, [slotActions])
+  }, [slotActions, snapshot])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
@@ -888,7 +895,7 @@ const CatalogMenu = memo(function CatalogMenu({
         && !key.meta
         && !key.option
       if (confirmsDelete) {
-        const candidate = candidates.find(({ id }) => id === pendingDeleteId)
+        const candidate = candidates.find(({ configurationId }) => configurationId === pendingDeleteId)
         if (candidate?.download._tag === "Downloaded") modelActions.delete(candidate.targetId)
         setPendingDeleteId(null)
         key.preventDefault()
@@ -902,19 +909,19 @@ const CatalogMenu = memo(function CatalogMenu({
     }
     if ((key.name === "up" || key.name === "k") && candidates.length > 0) {
       key.preventDefault()
-      setCursorId(candidates[Math.max(0, cursorIndex - 1)]!.id)
+      setCursorId(candidates[Math.max(0, cursorIndex - 1)]!.configurationId)
     } else if ((key.name === "down" || key.name === "j") && candidates.length > 0) {
       key.preventDefault()
-      setCursorId(candidates[Math.min(candidates.length - 1, cursorIndex + 1)]!.id)
+      setCursorId(candidates[Math.min(candidates.length - 1, cursorIndex + 1)]!.configurationId)
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
       detailActionCursor.reset()
-      setDetailId(cursor.id)
+      setDetailId(cursor.configurationId)
       setRootSwitchingEnabled(false)
     } else if (key.name === "d" && cursor) {
       key.preventDefault()
       primaryAction(cursor)
-    } else if (key.name === "s" && cursor && cursor.preparation._tag === "Available") {
+    } else if (key.name === "s" && cursor && cursor.availability._tag === "Available") {
       key.preventDefault()
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
@@ -922,7 +929,7 @@ const CatalogMenu = memo(function CatalogMenu({
         modelActions.cancel(cursor.download.attemptIds)
         key.preventDefault()
       } else if (cursor.download._tag === "Downloaded") {
-        setPendingDeleteId(cursor.id)
+        setPendingDeleteId(cursor.configurationId)
         key.preventDefault()
       }
     }
@@ -1032,19 +1039,19 @@ const CatalogMenu = memo(function CatalogMenu({
           </text>
         ) : candidates.map((candidate, index) => {
           const focused = index === cursorIndex
-          const pendingDelete = pendingDeleteId === candidate.id
+          const pendingDelete = pendingDeleteId === candidate.configurationId
           return (
             <Button
-              key={candidate.id}
+              key={candidate.configurationId}
               onClick={() => {
                 setPendingDeleteId(null)
                 detailActionCursor.reset()
-                setDetailId(candidate.id)
+                setDetailId(candidate.configurationId)
                 setRootSwitchingEnabled(false)
               }}
               onMouseOver={() => {
-                setCursorId(candidate.id)
-                if (pendingDeleteId !== candidate.id) setPendingDeleteId(null)
+                setCursorId(candidate.configurationId)
+                if (pendingDeleteId !== candidate.configurationId) setPendingDeleteId(null)
               }}
               style={{
                 flexDirection: "row",

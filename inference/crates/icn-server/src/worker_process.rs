@@ -52,8 +52,7 @@ impl NativeWorkerArgs {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NativeWorkerRole {
-    BackendPreparation,
-    Planner,
+    Planning,
     Template,
     Inference,
 }
@@ -61,8 +60,7 @@ pub(crate) enum NativeWorkerRole {
 impl NativeWorkerRole {
     fn subcommand(self) -> &'static str {
         match self {
-            Self::BackendPreparation => "prepare-backend-worker",
-            Self::Planner => "plan-worker",
+            Self::Planning => "planning-worker",
             Self::Template => "template-worker",
             Self::Inference => "inference-worker",
         }
@@ -150,11 +148,7 @@ mod tests {
     fn every_worker_role_uses_the_same_runtime_command_boundary() {
         let launcher = NativeWorkerLauncher::development();
         for (role, expected_subcommand) in [
-            (
-                NativeWorkerRole::BackendPreparation,
-                "prepare-backend-worker",
-            ),
-            (NativeWorkerRole::Planner, "plan-worker"),
+            (NativeWorkerRole::Planning, "planning-worker"),
             (NativeWorkerRole::Template, "template-worker"),
             (NativeWorkerRole::Inference, "inference-worker"),
         ] {

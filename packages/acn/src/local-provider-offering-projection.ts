@@ -13,9 +13,8 @@ import {
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import {
-  localModelAssessmentFailure,
-  LocalModelEvaluations,
-} from "./local-model-evaluations"
+  LocalModelAssessments,
+} from "./local-model-assessments"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
@@ -87,10 +86,10 @@ export class LocalProviderOfferingProjection extends Context.Tag("LocalProviderO
 export const LocalProviderOfferingProjectionLive: Layer.Layer<
   LocalProviderOfferingProjection,
   never,
-  IcnCatalog | IcnHardware | LocalModelEvaluations | LocalModelPackages | LocalProviderOfferings
+  IcnCatalog | IcnHardware | LocalModelAssessments | LocalModelPackages | LocalProviderOfferings
 > = Layer.scoped(LocalProviderOfferingProjection, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
-  const evaluations = yield* LocalModelEvaluations
+  const assessments = yield* LocalModelAssessments
   const hardware = yield* IcnHardware
   const packages = yield* LocalModelPackages
   const offerings = yield* LocalProviderOfferings
@@ -135,15 +134,12 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
       && entries.every((entry) => entry?.inspection._tag === "Inspected"))
     const assessmentRequests = configured.flatMap((offering, index) => inspectable[index]
       ? [{
+          targetId: offering.targetId,
           target: offering.configuration.target,
           profiles: [offering.configuration.profile],
         }]
       : [])
-    const assessed = yield* evaluations.assessMany(assessmentRequests)
-    const assessmentFailure = localModelAssessmentFailure(assessed)
-    if (assessmentFailure) {
-      return yield* new LocalModelMutationFailed(assessmentFailure)
-    }
+    const assessed = yield* assessments.assess(assessmentRequests, () => Effect.void)
     let assessmentIndex = 0
     const entries = configured.map((offering, index) => {
       const { target, profile } = offering.configuration
@@ -221,13 +217,13 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
     )),
   )
 
-  yield* project
-  yield* Stream.mergeAll([
-    offerings.changes,
-    catalog.changes.pipe(Stream.map(() => undefined)),
-    packages.changes.pipe(Stream.map(() => undefined)),
-    hardware.fittingChanges.pipe(Stream.map(() => undefined)),
-  ], { concurrency: "unbounded" }).pipe(
+  yield* Stream.make(undefined).pipe(
+    Stream.concat(Stream.mergeAll([
+      offerings.changes,
+      catalog.changes.pipe(Stream.map(() => undefined)),
+      packages.changes.pipe(Stream.map(() => undefined)),
+      hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
+    ], { concurrency: "unbounded" })),
     Stream.runForEach(() => project),
     Effect.forkScoped,
   )

@@ -143,7 +143,19 @@ pub enum IcnStartupProgressRecordType {
     rename_all_fields = "camelCase"
 )]
 pub enum IcnStartupBackend {
+    Cpu {
+        #[serde(rename = "hardwareLabel")]
+        hardware_label: String,
+    },
+    Metal {
+        #[serde(rename = "hardwareLabel")]
+        hardware_label: String,
+    },
     Cuda {
+        #[serde(rename = "hardwareLabel")]
+        hardware_label: String,
+    },
+    Vulkan {
         #[serde(rename = "hardwareLabel")]
         hardware_label: String,
     },
