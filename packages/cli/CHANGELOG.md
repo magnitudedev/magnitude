@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.32
+
+### Patch Changes
+
+- [`041bd76`](https://github.com/magnitudedev/magnitude/commit/041bd764075fbad1965afebeb7881a4046e74003) Thanks [@anerli](https://github.com/anerli)! - fix: ensure hardware calibration during ICN startup and other calibration issues
+
 ## 0.0.1-alpha.31
 
 ### Patch Changes

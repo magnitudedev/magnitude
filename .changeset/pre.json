@@ -37,7 +37,8 @@
     "@magnitudedev/sdk": "0.0.1",
     "@magnitudedev/utils": "0.0.1",
     "@magnitudedev/version": "0.0.1",
-    "@magnitudedev/icn-protocol": "0.0.1"
+    "@magnitudedev/icn-protocol": "0.0.1",
+    "@magnitudedev/effect-query": "0.0.1"
   },
   "changesets": [
     "blue-candles-lie",
@@ -76,6 +77,7 @@
     "solid-keys-laugh",
     "sparkly-boats-live",
     "swift-wings-cough",
+    "tender-canyons-smoke",
     "tired-wasps-strive"
   ]
 }
