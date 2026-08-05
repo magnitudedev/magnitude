@@ -83,7 +83,7 @@ const chooserView = () => {
         targetId: remoteTargetId,
         configurationId: ModelServingConfigurationIdSchema.make(remoteProviderModelId),
         displayName: "Remote Model",
-        profile: { contextLength: 200_000 },
+        profile: { contextLength: 100_000 },
         estimatedTokensPerSecond: 36.2,
       }),
     })],
@@ -162,7 +162,7 @@ test("renders compact installed and downloadable rows with an informational deta
     expect(frame).toContain("Enter select")
     await act(async () => press("down"))
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("~36 tok/s at 200K ctx")
+    expect(view.captureCharFrame()).toContain("~36 tok/s at 100K ctx")
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -680,7 +680,7 @@ test("stacks the informational pane without clipping actions on narrower termina
     expect(frame).toContain("Load")
     expect(frame).toContain("Remote Model")
     expect(frame).toMatch(/Remote Model\s+Balanced/)
-    expect(frame).toContain("Q4_K_M · 17.2 GB · 200K ctx")
+    expect(frame).toContain("Q4_K_M · 17.2 GB · 100K ctx")
     expect(frame).toContain("Balanced local inference.")
     expect(frame).toContain("Test CPU")
     expect(frame).toContain("Test GPU · 24 GiB VRAM · CUDA")

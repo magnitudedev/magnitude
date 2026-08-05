@@ -37,7 +37,7 @@ Advancing that lock is an explicit development operation.
 Catalog generation resolves only locked revisions through production package construction,
 inspection, template analysis, and native planning. It emits a self-contained planner-input bundle
 and proves that compact planner inputs yield the same native assessments as their source metadata
-at every standard profile. Any unresolved entry, incomplete coverage, integrity mismatch, or
+at the 100K catalog profile. Any unresolved entry, incomplete coverage, integrity mismatch, or
 assessment mismatch fails generation or ICN readiness.
 
 Runtime catalog use performs no upstream discovery and does not follow mutable revisions. Adding a
