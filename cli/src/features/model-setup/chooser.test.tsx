@@ -43,7 +43,7 @@ vi.mock("../../hooks/use-theme", () => ({
 const { OnboardingModelChooser, OnboardingModelPreparation } = await import("./chooser")
 
 const onLoad = vi.fn()
-const onDownload = vi.fn()
+const onSelectConfiguration = vi.fn()
 const onContinue = vi.fn()
 const onSkip = vi.fn()
 
@@ -62,7 +62,7 @@ const press = (name: string) => keyboard.handler?.(new KeyEvent({
 
 beforeEach(() => {
   onLoad.mockClear()
-  onDownload.mockClear()
+  onSelectConfiguration.mockClear()
   onContinue.mockClear()
   onSkip.mockClear()
 })
@@ -96,7 +96,7 @@ const chooserProps = (state: ReturnType<typeof chooserView>) => ({
   catalog: state.catalog,
   slots: state.slots,
   onLoad,
-  onDownload,
+  onSelectConfiguration,
 })
 
 const chooserViewWithInventory = (installedCount: number, downloadCount: number) => {
@@ -187,7 +187,48 @@ test("loads a stored model without invoking download", async () => {
       displayName: "Installed Model",
       reasoningEffort: "none",
     }))
-    expect(onDownload).not.toHaveBeenCalled()
+    expect(onSelectConfiguration).not.toHaveBeenCalled()
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
+test("selects an assessed installed model before its offering is projected", async () => {
+  const targetId = ModelOfferingTargetIdSchema.make("target_installed_assessed")
+  const configurationId = ModelServingConfigurationIdSchema.make("configuration_installed_assessed")
+  const state = makeView({
+    ready: false,
+    models: [makeModel({ targetId, displayName: "Assessed Installed Model", offerings: [] })],
+    catalogCandidates: [makeCatalogCandidate({
+      targetId,
+      configurationId,
+      displayName: "Assessed Installed Model",
+      download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+      availability: { _tag: "Available" },
+    })],
+  })
+  const view = await testRender(
+    <OnboardingModelChooser
+      {...chooserProps(state)}
+      width={100}
+      error={null}
+      operation={null}
+      onContinue={onContinue}
+      onSkip={onSkip}
+    />,
+    { width: 100, height: 30 },
+  )
+  try {
+    await act(view.renderOnce)
+    expect(view.captureCharFrame()).toMatch(/Assessed Installed Model\s+Load/)
+    await act(async () => press("enter"))
+    expect(onSelectConfiguration).toHaveBeenCalledWith({
+      targetId,
+      configurationId,
+      displayName: "Assessed Installed Model",
+      reasoningEffort: "none",
+    })
+    expect(onLoad).not.toHaveBeenCalled()
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -218,7 +259,7 @@ test("does not accept another selection while an operation is active", async () 
     await act(async () => press("down"))
     await act(async () => press("enter"))
     expect(onLoad).not.toHaveBeenCalled()
-    expect(onDownload).not.toHaveBeenCalled()
+    expect(onSelectConfiguration).not.toHaveBeenCalled()
     expect(onContinue).not.toHaveBeenCalled()
   } finally {
     await act(async () => view.renderer.destroy())
@@ -357,7 +398,8 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
     await act(view.renderOnce)
     await act(async () => press("down"))
     await act(async () => press("enter"))
-    expect(onDownload).toHaveBeenCalledWith({
+    expect(onSelectConfiguration).toHaveBeenCalledWith({
+      targetId: candidate.targetId,
       configurationId: candidate.configurationId,
       displayName: candidate.displayName,
       reasoningEffort: "none",
@@ -428,7 +470,7 @@ test("keeps the chosen row highlighted and locks navigation while download detai
     await act(view.renderOnce)
     expect(view.captureCharFrame()).toMatch(/› Remote Model\s+Balanced/)
     expect(onLoad).not.toHaveBeenCalled()
-    expect(onDownload).not.toHaveBeenCalled()
+    expect(onSelectConfiguration).not.toHaveBeenCalled()
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -606,7 +648,8 @@ test("excludes unrelated failed downloads and unusable installed models", async 
       await act(async () => press("down"))
     }
     await act(async () => press("enter"))
-    expect(onDownload).toHaveBeenCalledWith({
+    expect(onSelectConfiguration).toHaveBeenCalledWith({
+      targetId: ModelOfferingTargetIdSchema.make("target_remote_4"),
       configurationId: ModelServingConfigurationIdSchema.make("configuration_remote_4"),
       displayName: "Remote 4",
       reasoningEffort: "none",

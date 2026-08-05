@@ -17,7 +17,14 @@ import {
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
-import { GIB, makeCatalogCandidate, makeHardware, makeModel, makeRecommendation, makeView } from "./test-fixtures"
+import {
+  GIB,
+  makeCatalogCandidate,
+  makeHardware,
+  makeModel,
+  makeRecommendation,
+  makeView,
+} from "./test-fixtures"
 
 const selectionsFor = (view: ReturnType<typeof makeView>) =>
   buildLocalInferenceSelections(view.models, view.catalog, view.slots)
@@ -276,6 +283,53 @@ describe("local inference selection view model", () => {
 
   it("classifies the downloaded model selected by a ready slot as running", () => {
     expect(selectionsFor(makeView())[0]?.kind).toBe("running")
+  })
+
+  it("shows an assessed installed target before it has a provider offering", () => {
+    const lowerConfigurationId = ModelServingConfigurationIdSchema.make("configuration_100k")
+    const higherConfigurationId = ModelServingConfigurationIdSchema.make("configuration_200k")
+    const selections = selectionsFor(makeView({
+      ready: false,
+      models: [makeModel({ offerings: [] })],
+      catalogCandidates: [
+        makeCatalogCandidate({
+          configurationId: lowerConfigurationId,
+          profile: { contextLength: 100_000 },
+          download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+          availability: { _tag: "Available" },
+        }),
+        makeCatalogCandidate({
+          configurationId: higherConfigurationId,
+          profile: { contextLength: 200_000 },
+          download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+          availability: { _tag: "Available" },
+        }),
+      ],
+    }))
+
+    expect(selections).toHaveLength(1)
+    expect(selections[0]).toMatchObject({ kind: "stored" })
+    expect(selections[0]?.kind === "stored" && selections[0].configurationId)
+      .toBe(higherConfigurationId)
+    expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
+  })
+
+  it("keeps the preferred configuration when another offering exists", () => {
+    const preferredConfigurationId = ModelServingConfigurationIdSchema.make("configuration_200k")
+    const selections = selectionsFor(makeView({
+      ready: false,
+      catalogCandidates: [makeCatalogCandidate({
+        configurationId: preferredConfigurationId,
+        profile: { contextLength: 200_000 },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        availability: { _tag: "Available" },
+      })],
+    }))
+
+    expect(selections).toHaveLength(1)
+    expect(selections[0]?.kind === "stored" && selections[0].configurationId)
+      .toBe(preferredConfigurationId)
+    expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
   })
 
   it("keeps recommendations actionable without duplicating target state", () => {

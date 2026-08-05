@@ -8,6 +8,7 @@ applies_to:
   - packages/acn/src/local-model-**
   - packages/acn/src/local-provider-**
   - packages/acn/src/model-slot-**
+  - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/config.ts
 ---
@@ -66,9 +67,10 @@ not to the candidate.
 planning, alternatives such as sequence counts one through four are **sequence-capacity options**,
 not catalog or recommendation candidates.
 
-A catalog candidate introduces no identity. Presentation and catalog actions use its
-`ModelServingConfigurationId`. ACN resolves that configuration to its exact target before
-acquisition and creates a provider offering only when the configuration is selected.
+A catalog candidate introduces no identity. Acquisition actions use its `ModelOfferingTargetId`;
+configuration selection uses its `ModelServingConfigurationId`. ACN resolves both identities
+against authoritative catalog state and creates a provider offering only when the configuration is
+selected.
 
 ## Offering and runtime terms
 
@@ -113,8 +115,12 @@ ModelPackage(s)
   -> EligibleAssessedConfiguration
   -> CatalogCandidate
        -> optional Recommendation
-       -> selected by ModelServingConfigurationId
-       -> materialized as ProviderOffering
-       -> referenced by SlotSelection
-       -> loaded as ModelInstance
+       -> DownloadModel(targetId), if packages are missing
+       -> CreateLocalModelOffering(configurationId) -> ProviderOffering / providerModelId
+       -> AssignSlot(slotId, providerModelId) -> SlotSelection
+       -> LoadModel(slotId) -> ModelInstance
 ```
+
+The action pipeline deliberately changes identity at each ownership boundary: target identity for
+package acquisition, configuration identity for offering creation, provider-model identity for
+durable selection, and slot identity for loading.

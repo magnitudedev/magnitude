@@ -114,7 +114,6 @@ const offering = {
     },
     profile: { contextLength: 8_192 },
   },
-  origin: { _tag: "UserConfigured" },
   capabilities,
 } as LocalProviderOffering
 
@@ -219,14 +218,16 @@ const makeHarness = (options: {
       setFavorite: () => Effect.void,
     })),
     Layer.succeed(LocalModelPackages, LocalModelPackages.of({
+      initialized: Effect.succeed(true),
       snapshot: Effect.succeed({ revision: 0, state: { entries: [] } }),
       changes: Stream.empty,
       installedPackageIds: Effect.succeed(
         new Set((options.projectedInstalled ?? options.installed) === false ? [] : [packageId]),
       ),
-      admitTarget: () => Effect.succeed([
-        DownloadAttemptIdSchema.make("test-download"),
-      ]),
+      admitTarget: () => Effect.succeed({
+        _tag: "DownloadAdmitted",
+        attemptIds: [DownloadAttemptIdSchema.make("test-download")],
+      }),
       cancelAttempts: () => Effect.void,
       dismissTargetFailure: () => Effect.void,
       removeTargetPackages: () => Effect.void,
@@ -260,13 +261,12 @@ const makeHarness = (options: {
               }))
         }),
       ),
-      save: (targetId, savedConfiguration, origin) => {
+      save: (targetId, savedConfiguration) => {
         const saved = {
           ...offering,
           providerModelId: ProviderModelIdSchema.make(savedConfiguration.id),
           targetId,
           configuration: savedConfiguration,
-          origin,
         }
         return Ref.update(offerings, (current) => [...current, saved]).pipe(
           Effect.as(saved),

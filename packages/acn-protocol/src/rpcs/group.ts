@@ -56,6 +56,7 @@ const AcnDemandRpcs = RpcGroup.make(
   Config.GetCloudUsage,
   LocalInference.LocalInferenceHardwareMirror.getRpc,
   LocalInference.LocalModelsMirror.getRpc,
+  LocalInference.CreateLocalModelOffering,
   LocalInference.DownloadModel,
   LocalInference.CancelModelDownload,
   LocalInference.DismissModelDownloadFailure,

@@ -13,6 +13,7 @@ export type OnboardingModelSetupView =
   | { readonly _tag: "Choosing" }
   | { readonly _tag: "Downloading"; readonly candidate: LocalModelCatalogCandidate }
   | { readonly _tag: "DownloadFailed"; readonly candidate: LocalModelCatalogCandidate }
+  | { readonly _tag: "Configuring"; readonly candidate: LocalModelCatalogCandidate }
   | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
@@ -70,7 +71,7 @@ export const deriveOnboardingModelSetupView = ({
   if (submission === null) return { _tag: "Choosing" }
 
   const choice = submission.choice
-  const candidate = submission._tag === "DownloadThenLoad"
+  const candidate = submission._tag === "ConfigureThenLoad"
     && models.recommendations._tag === "Ready"
     ? models.recommendations.catalog.find(({ configurationId }) =>
         configurationId === submission.choice.configurationId)
@@ -81,6 +82,12 @@ export const deriveOnboardingModelSetupView = ({
   if (candidate?.download._tag === "Cancelled") return { _tag: "Choosing" }
   if (candidate?.download._tag === "Downloading") {
     return { _tag: "Downloading", candidate }
+  }
+  if (submission._tag === "ConfigureThenLoad"
+    && candidate?.download._tag === "Downloaded"
+    && submitting
+    && Option.isNone(providerModelId)) {
+    return { _tag: "Configuring", candidate }
   }
 
   const primary = slots.slots.primary
@@ -106,7 +113,9 @@ export const deriveOnboardingModelSetupView = ({
   if (lifecycle?._tag === "Stopped") return { _tag: "Choosing" }
 
   if (!submitting) return { _tag: "Choosing" }
-  if (submission._tag === "DownloadThenLoad" && candidate !== undefined) {
+  if (submission._tag === "ConfigureThenLoad"
+    && candidate !== undefined
+    && candidate.download._tag !== "Downloaded") {
     return { _tag: "Downloading", candidate }
   }
   return Option.match(providerModelId, {
@@ -121,6 +130,7 @@ export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView):
     case "Choosing": return "Select a model to start coding…"
     case "Downloading": return `Downloading ${view.candidate.displayName}…`
     case "DownloadFailed": return `Couldn’t download ${view.candidate.displayName}`
+    case "Configuring": return `Configuring ${view.candidate.displayName}…`
     case "Activating":
       return view.phase === "Loading"
         ? `Loading ${view.displayName}…`

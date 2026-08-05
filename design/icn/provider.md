@@ -27,8 +27,7 @@ ACN owns durable local provider offerings. Each offering contains:
 
 - a stable local provider model ID;
 - the stable model-offering-target ID presented to product clients;
-- one exact ICN-issued model serving configuration;
-- its creation origin.
+- one exact ICN-issued model serving configuration.
 
 Capabilities are not persisted on the offering. ACN resolves them from the recommendable catalog
 or the installed package inspection, which are the authoritative evidence for the target.

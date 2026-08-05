@@ -1,5 +1,6 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
+import { ProviderModelIdSchema } from "@magnitudedev/ai/provider/model"
 import { LocalInferenceError } from "../errors"
 import {
   DownloadAttemptIdSchema,
@@ -26,8 +27,14 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
 })
 
 export const DownloadModel = Rpc.make("DownloadModel", {
-  payload: Schema.Struct({ configurationId: ModelServingConfigurationIdSchema }),
+  payload: Schema.Struct({ targetId: ModelOfferingTargetIdSchema }),
   success: ModelDownloadAdmissionSchema,
+  error: LocalInferenceError,
+})
+
+export const CreateLocalModelOffering = Rpc.make("CreateLocalModelOffering", {
+  payload: Schema.Struct({ configurationId: ModelServingConfigurationIdSchema }),
+  success: ProviderModelIdSchema,
   error: LocalInferenceError,
 })
 

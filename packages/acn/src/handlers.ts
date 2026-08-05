@@ -147,7 +147,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       });
 
     const deleteLocalModel = (targetId: ModelOfferingTargetId) => Effect.gen(function* () {
-      const target = yield* localModels.target(targetId);
+      const target = yield* localModels.resolveTarget(targetId);
       if (!target) {
         return yield* new LocalModelMutationFailed({
           code: "local_model_not_found",
@@ -380,9 +380,9 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           mirroredStateChanges.stream,
         ),
 
-      DownloadModel: ({ configurationId }) =>
+      CreateLocalModelOffering: ({ configurationId }) =>
         observeRpcDefects(
-          "DownloadModel",
+          "CreateLocalModelOffering",
           Effect.gen(function* () {
             const selected = yield* localModelRecommendations
               .getCatalogByConfigurationId(configurationId)
@@ -396,17 +396,27 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             const offering = yield* localProviderOfferings.save(
               selected.value.candidate.targetId,
               selected.value.configuration,
-              { _tag: "Automatic" },
             )
-            const attemptIds = yield* localModelPackages.admitTarget(
-              selected.value.candidate.targetId,
-              selected.value.configuration.target,
-            )
-            return {
-              providerModelId: offering.providerModelId,
-              targetId: selected.value.candidate.targetId,
-              attemptIds,
+            return offering.providerModelId
+          }),
+        ),
+
+      DownloadModel: ({ targetId }) =>
+        observeRpcDefects(
+          "DownloadModel",
+          Effect.gen(function* () {
+            const target = yield* localModels.resolveTarget(targetId)
+            if (target === undefined) {
+              return yield* new LocalModelMutationFailed({
+                code: "local_model_target_not_found",
+                message: `Local model target ${targetId} was not found`,
+                retryable: false,
+              })
             }
+            return yield* localModelPackages.admitTarget(
+              targetId,
+              target,
+            )
           }),
         ),
 
@@ -420,7 +430,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         observeRpcDefects(
           "DismissModelDownloadFailure",
           Effect.gen(function* () {
-            const target = yield* localModels.target(targetId)
+            const target = yield* localModels.resolveTarget(targetId)
             if (!target) {
               return yield* new LocalModelMutationFailed({
                 code: "local_model_not_found",

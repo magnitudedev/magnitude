@@ -32,11 +32,6 @@ export interface RecommendationCandidate {
   readonly totalDownloadBytes: number
 }
 
-export interface RecommendationCatalogCandidate {
-  readonly candidate: RecommendationCandidate
-  readonly recommendation: Recommendation | undefined
-}
-
 const generationFor = (candidate: RecommendationCandidate) => candidate.assessment.performance
 
 export const conservativeGenerationSpeed = (
@@ -176,28 +171,21 @@ export const rankCatalogCandidates = (
 export const assembleRecommendationCatalogCandidates = (
   input: readonly RecommendationCandidate[],
   recommendations: readonly Recommendation[],
-): readonly RecommendationCatalogCandidate[] => {
+): readonly RecommendationCandidate[] => {
   const candidatesByConfiguration = new Map(
     input.map((candidate) => [candidate.assessment.configurationId, candidate]),
   )
   const selected = recommendations.flatMap((recommendation) => {
     const candidate = candidatesByConfiguration.get(recommendation.configuration.id)
-    return candidate ? [{
-      candidate,
-      recommendation,
-    }] : []
+    return candidate ? [candidate] : []
   })
   const selectedArtifactIds = new Set(
-    selected.map(({ candidate }) => candidate.artifactId),
+    selected.map(({ artifactId }) => artifactId),
   )
   return [
     ...selected,
     ...rankCatalogCandidates(input)
-      .filter((candidate) => !selectedArtifactIds.has(candidate.artifactId))
-      .map((candidate) => ({
-        candidate,
-        recommendation: undefined,
-      })),
+      .filter((candidate) => !selectedArtifactIds.has(candidate.artifactId)),
   ]
 }
 

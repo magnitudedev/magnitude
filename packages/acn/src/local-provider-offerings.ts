@@ -4,7 +4,6 @@ import {
   type LocalInferenceError,
   ModelCapabilitiesSchema,
   type LocalProviderOffering,
-  type LocalProviderOfferingOrigin,
   type ModelCapabilities,
   type ModelOfferingTarget,
   type ModelOfferingTargetId,
@@ -71,7 +70,6 @@ export interface LocalProviderOfferingsApi {
   readonly save: (
     targetId: ModelOfferingTargetId,
     configuration: ModelServingConfiguration,
-    origin: LocalProviderOfferingOrigin,
   ) => Effect.Effect<LocalProviderOffering, LocalInferenceError>
 }
 
@@ -140,27 +138,30 @@ export const LocalProviderOfferingsLive: Layer.Layer<
             retryable: false,
           }))
     })),
-    save: (targetId, configuration, origin) => Effect.gen(function* () {
+    save: (targetId, configuration) => Effect.gen(function* () {
       const providerModelId = ProviderModelIdSchema.make(configuration.id)
       const persisted: PersistedLocalProviderOffering = {
         providerModelId,
         targetId,
         configuration,
-        origin,
       }
       const configured = yield* list
       const existing = configured.find((offering) => offering.providerModelId === providerModelId)
-      if (existing && !sameConfiguration(existing.configuration, configuration)) {
+      if (existing && (existing.targetId !== targetId
+        || !sameConfiguration(existing.configuration, configuration))) {
         return yield* new LocalModelMutationFailed({
           code: "local_provider_offering_identity_conflict",
           message: `Local provider offering ${providerModelId} conflicts with its stored identity`,
           retryable: false,
         })
       }
-      yield* storage.config.upsertLocalProviderOffering(persisted).pipe(
-        Effect.mapError((error) => failure("save_local_provider_offering_failed", error)),
-      )
-      yield* PubSub.publish(mutations, undefined)
+      if (existing) return existing
+      yield* Effect.uninterruptible(Effect.gen(function* () {
+        yield* storage.config.upsertLocalProviderOffering(persisted).pipe(
+          Effect.mapError((error) => failure("save_local_provider_offering_failed", error)),
+        )
+        yield* PubSub.publish(mutations, undefined)
+      }))
       const offerings = yield* list
       const saved = offerings.find((offering) => offering.providerModelId === providerModelId)
       if (saved) return saved

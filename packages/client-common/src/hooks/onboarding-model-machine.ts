@@ -21,17 +21,17 @@ export interface OnboardingLoadModelChoice extends OnboardingModelChoiceBase {
   readonly providerModelId: ProviderModelId
 }
 
-export interface OnboardingDownloadModelChoice extends OnboardingModelChoiceBase {
+export interface OnboardingConfigurationChoice extends OnboardingModelChoiceBase {
+  readonly targetId: ModelOfferingTargetId
   readonly configurationId: ModelServingConfigurationId
 }
 
 export type OnboardingModelSubmission =
   | { readonly _tag: "Load"; readonly choice: OnboardingLoadModelChoice }
-  | { readonly _tag: "DownloadThenLoad"; readonly choice: OnboardingDownloadModelChoice }
+  | { readonly _tag: "ConfigureThenLoad"; readonly choice: OnboardingConfigurationChoice }
 
 type SubmissionProps = { readonly submission: OnboardingModelSubmission }
 type DownloadProps = SubmissionProps & {
-  readonly providerModelId: ProviderModelId
   readonly targetId: ModelOfferingTargetId
   readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
 }
@@ -45,6 +45,9 @@ export class OnboardingAdmittingDownload extends Data.TaggedClass("AdmittingDown
   SubmissionProps & { readonly cancellationRequested: boolean }
 > {}
 export class OnboardingDownloadAdmitted extends Data.TaggedClass("DownloadAdmitted")<DownloadProps> {}
+export class OnboardingCreatingOffering extends Data.TaggedClass("CreatingOffering")<
+  SubmissionProps & { readonly cancellationRequested: boolean }
+> {}
 export class OnboardingRequestingDownloadCancellation extends Data.TaggedClass(
   "RequestingDownloadCancellation",
 )<DownloadProps> {}
@@ -71,6 +74,7 @@ export const OnboardingModelMachine = FSM.defineFSM(
     Idle: OnboardingIdle,
     AdmittingDownload: OnboardingAdmittingDownload,
     DownloadAdmitted: OnboardingDownloadAdmitted,
+    CreatingOffering: OnboardingCreatingOffering,
     RequestingDownloadCancellation: OnboardingRequestingDownloadCancellation,
     AwaitingDownloadCancellation: OnboardingAwaitingDownloadCancellation,
     DownloadCancellationFailed: OnboardingDownloadCancellationFailed,
@@ -84,8 +88,9 @@ export const OnboardingModelMachine = FSM.defineFSM(
   },
   {
     Idle: ["AdmittingDownload", "Assigning"],
-    AdmittingDownload: ["DownloadAdmitted", "Idle"],
-    DownloadAdmitted: ["RequestingDownloadCancellation", "Assigning", "Idle"],
+    AdmittingDownload: ["DownloadAdmitted", "CreatingOffering", "Idle"],
+    DownloadAdmitted: ["RequestingDownloadCancellation", "CreatingOffering", "Idle"],
+    CreatingOffering: ["Assigning", "Idle"],
     RequestingDownloadCancellation: ["AwaitingDownloadCancellation", "DownloadCancellationFailed"],
     AwaitingDownloadCancellation: ["Idle"],
     DownloadCancellationFailed: ["RequestingDownloadCancellation", "Idle"],
@@ -112,6 +117,7 @@ export const resetOnboardingOperation = (
     case "LoadStopFailed":
       return OnboardingModelMachine.transition(state, "Idle", {})
     case "AdmittingDownload":
+    case "CreatingOffering":
     case "RequestingDownloadCancellation":
     case "AwaitingDownloadCancellation":
     case "Assigning":
@@ -137,6 +143,8 @@ export const onboardingProviderModelId = (
     case "RequestingDownloadCancellation":
     case "AwaitingDownloadCancellation":
     case "DownloadCancellationFailed":
+    case "CreatingOffering":
+      return Option.none()
     case "Assigning":
     case "AdmittingLoad":
     case "LoadAdmitted":
@@ -153,6 +161,7 @@ export const onboardingProviderModelId = (
 export const onboardingCancellationPending = (state: OnboardingModelOperation): boolean => {
   switch (state._tag) {
     case "AdmittingDownload":
+    case "CreatingOffering":
     case "Assigning":
     case "AdmittingLoad":
       return state.cancellationRequested
@@ -174,7 +183,8 @@ export const onboardingCancellationPending = (state: OnboardingModelOperation): 
 export type OnboardingCancellationRequest =
   | { readonly _tag: "Noop"; readonly state: OnboardingModelOperation }
   | { readonly _tag: "Deferred"; readonly state:
-      OnboardingAdmittingDownload | OnboardingAssigning | OnboardingAdmittingLoad }
+      OnboardingAdmittingDownload | OnboardingCreatingOffering
+        | OnboardingAssigning | OnboardingAdmittingLoad }
   | { readonly _tag: "Download"; readonly state: OnboardingRequestingDownloadCancellation }
   | { readonly _tag: "Load"; readonly state: OnboardingRequestingLoadStop }
 
@@ -183,6 +193,7 @@ export const requestOnboardingCancellation = (
 ): OnboardingCancellationRequest => {
   switch (state._tag) {
     case "AdmittingDownload":
+    case "CreatingOffering":
     case "Assigning":
     case "AdmittingLoad":
       return {

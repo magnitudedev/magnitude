@@ -5,8 +5,10 @@ import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
+  type LocalModelCatalogCandidate,
   type LocalModelsState,
   type LocalModelRecommendation,
+  type ModelServingConfigurationId,
   type LocalModelRecommendationProgressStep,
   type ModelSlotsState,
   type ProviderModelCatalogState,
@@ -26,6 +28,7 @@ type LocalInferenceSelectionBase = {
 export type LocalInferenceSelection = LocalInferenceSelectionBase & (
   | {
       readonly kind: "running" | "stored"
+      readonly configurationId: ModelServingConfigurationId
       readonly recommendation: { readonly _tag: "None" }
     }
   | {
@@ -83,26 +86,45 @@ export const buildLocalInferenceSelections = (
     .filter(({ providerId, availability }) =>
       providerId === LOCAL_PROVIDER_ID && availability._tag === "Available")
     .map(({ providerModelId }) => providerModelId))
-  const stored = models.models
-    .filter(({ download }) => download._tag === "Downloaded")
-    .flatMap((model): readonly LocalInferenceSelection[] => model.offerings.map((offering) => {
-      const providerModelId = localProviderIds.has(offering.providerModelId)
-        ? Option.some(offering.providerModelId)
-        : Option.none<ProviderModelId>()
-      const providerModel = Option.flatMap(providerModelId, (id) =>
-        Option.fromNullable(catalogModels.find(({ providerModelId }) => providerModelId === id)))
-      return {
-        id: `offering:${offering.providerModelId}:${model.targetId}`,
-        kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
-        model,
-        recommendation: { _tag: "None" },
-        providerModelId,
-        reasoningEffort: Option.flatMap(
-          providerModel,
-          ({ capabilities }) => capabilities.reasoning.defaultEffort,
-        ),
-      }
-    }))
+  const preferredInstalledCandidates = models.recommendations._tag === "Ready"
+    ? models.recommendations.catalog.reduce((selected, candidate) => {
+        if (candidate.download._tag !== "Downloaded"
+          || candidate.availability._tag !== "Available") return selected
+        const current = selected.get(candidate.targetId)
+        if (current === undefined
+          || candidate.profile.contextLength > current.profile.contextLength) {
+          selected.set(candidate.targetId, candidate)
+        }
+        return selected
+      }, new Map<string, LocalModelCatalogCandidate>())
+    : new Map<string, LocalModelCatalogCandidate>()
+  const installed = models.models.flatMap((model): readonly LocalInferenceSelection[] => {
+    if (model.download._tag !== "Downloaded") return []
+    const candidate = preferredInstalledCandidates.get(model.targetId)
+    const availableOfferings = model.offerings.filter(({ providerModelId }) =>
+      localProviderIds.has(providerModelId))
+    const offering = availableOfferings.find(({ providerModelId }) => running.has(providerModelId))
+      ?? availableOfferings.find(({ configurationId }) =>
+        configurationId === candidate?.configurationId)
+      ?? (candidate === undefined ? availableOfferings[0] : undefined)
+    if (offering === undefined && candidate === undefined) return []
+    const providerModelId = Option.fromNullable(offering?.providerModelId)
+    const configurationId = offering?.configurationId ?? candidate!.configurationId
+    const providerModel = offering === undefined
+      ? undefined
+      : catalogModels.find(({ providerModelId }) => providerModelId === offering.providerModelId)
+    return [{
+      id: `installed:${model.targetId}`,
+      kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
+      model,
+      configurationId,
+      recommendation: { _tag: "None" },
+      providerModelId,
+      reasoningEffort: providerModel?.capabilities.reasoning.defaultEffort
+        ?? candidate?.capabilities.reasoning.defaultEffort
+        ?? Option.none(),
+    }]
+  })
   const recommendations = models.recommendations._tag === "Ready"
     ? models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
         const model = models.models.find(({ targetId }) =>
@@ -131,7 +153,7 @@ export const buildLocalInferenceSelections = (
       providerModelId: Option.fromNullable(model.offerings[0]?.providerModelId),
       reasoningEffort: Option.none(),
     }))
-  return [...stored, ...recommendations, ...transientDownloads]
+  return [...installed, ...recommendations, ...transientDownloads]
     .sort(compareSelections)
 }
 

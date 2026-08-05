@@ -59,7 +59,7 @@ describe("local provider offering package evidence", () => {
     )).toBe(false)
   })
 
-  it("does not block service acquisition on offering assessment", async () => {
+  it("does not block service acquisition on model assessment", async () => {
     const modelPackage = {
       id: "package-installed",
       files: [],
@@ -101,6 +101,7 @@ describe("local provider offering package evidence", () => {
         assess: () => Effect.never,
       } satisfies LocalModelAssessmentsApi)),
       Layer.succeed(LocalModelPackages, LocalModelPackages.of({
+        initialized: Effect.succeed(true),
         snapshot: Effect.succeed({ revision: 0, state: { entries: [entry] } }),
         changes: Stream.never,
         installedPackageIds: Effect.succeed(new Set(["package-installed"])),

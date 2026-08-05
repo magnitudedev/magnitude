@@ -58,7 +58,11 @@ operation owner awaits its bounded request.
 
 A catalog candidate exists only for one completed `Fits` configuration. It contains its exact
 target, serving configuration, profile, assessment environment, memory, performance, capability,
-fidelity, acquisition, and source evidence.
+acquisition, and source evidence.
+
+Recommendation evidence is present only when the target comes from the recommendable catalog.
+Discovered installed targets remain selectable catalog candidates without fabricated intelligence,
+fidelity, or quality values.
 
 `DoesNotFit` and `Incompatible` are completed evidence but are not selectable candidates. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.

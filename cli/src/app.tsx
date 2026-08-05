@@ -303,7 +303,7 @@ function CliAppContent(
   });
   const workflowError = <A,>(
     result: Result.Result<A, OnboardingModelCommandFailed>,
-    command: "download" | "assign" | "load" | "complete" | "cancel" | "clear"
+    command: OnboardingModelCommandFailed["command"]
   ): string | null =>
     Result.matchWithError(result, {
       onInitial: () => null,
@@ -315,7 +315,11 @@ function CliAppContent(
           : "The local model setup command failed unexpectedly.",
       onSuccess: () => null,
     });
-  const downloadMutationError = workflowError(onboardingSetup.workflowResult, "download");
+  const configurationMutationError = workflowError(
+    onboardingSetup.workflowResult,
+    "createOffering",
+  )
+    ?? workflowError(onboardingSetup.workflowResult, "download");
   const loadMutationError = workflowError(onboardingSetup.workflowResult, "load");
   const assignmentMutationError = workflowError(onboardingSetup.workflowResult, "assign");
   const completionMutationError = workflowError(onboardingSetup.workflowResult, "complete");
@@ -325,7 +329,7 @@ function CliAppContent(
     void props.updateOnboarding(true);
   }, [props.updateOnboarding]);
   const loadOnboardingModel = onboardingSetup.load;
-  const downloadOnboardingModel = onboardingSetup.downloadThenLoad;
+  const configureOnboardingModel = onboardingSetup.configureThenLoad;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
@@ -407,7 +411,7 @@ function CliAppContent(
               catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
-              error={downloadMutationError}
+              error={configurationMutationError}
               operation={{
                 _tag: "Downloading",
                 candidate: setupView.candidate,
@@ -415,7 +419,8 @@ function CliAppContent(
                 cancelError: cancelDownloadError,
                 onCancel: cancelOnboardingModelSetup,
                 onRetry: () =>
-                  downloadOnboardingModel({
+                  configureOnboardingModel({
+                    targetId: setupView.candidate.targetId,
                     configurationId: setupView.candidate.configurationId,
                     displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
@@ -425,7 +430,7 @@ function CliAppContent(
                   }),
               }}
               onLoad={loadOnboardingModel}
-              onDownload={downloadOnboardingModel}
+              onSelectConfiguration={configureOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -444,7 +449,8 @@ function CliAppContent(
                 candidate: setupView.candidate,
                 onChooseAnother: cancelOnboardingModelSetup,
                 onRetry: () =>
-                  downloadOnboardingModel({
+                  configureOnboardingModel({
+                    targetId: setupView.candidate.targetId,
                     configurationId: setupView.candidate.configurationId,
                     displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
@@ -454,7 +460,26 @@ function CliAppContent(
                   }),
               }}
               onLoad={loadOnboardingModel}
-              onDownload={downloadOnboardingModel}
+              onSelectConfiguration={configureOnboardingModel}
+              onContinue={completeModelSetup}
+              onSkip={completeModelSetup}
+            />
+          );
+        case "Configuring":
+          return (
+            <OnboardingModelChooser
+              hardware={onboardingSetup.hardware}
+              models={models}
+              catalog={catalog}
+              slots={slots}
+              width={chatColumnWidth}
+              error={configurationMutationError}
+              operation={{
+                _tag: "Configuring",
+                candidate: setupView.candidate,
+              }}
+              onLoad={loadOnboardingModel}
+              onSelectConfiguration={configureOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -486,7 +511,7 @@ function CliAppContent(
                 onChooseAnother: cancelOnboardingModelSetup,
               }}
               onLoad={loadOnboardingModel}
-              onDownload={downloadOnboardingModel}
+              onSelectConfiguration={configureOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -500,13 +525,13 @@ function CliAppContent(
               slots={slots}
               width={chatColumnWidth}
               error={
-                downloadMutationError ??
+                configurationMutationError ??
                 assignmentMutationError ??
                 loadMutationError
               }
               operation={null}
               onLoad={loadOnboardingModel}
-              onDownload={downloadOnboardingModel}
+              onSelectConfiguration={configureOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />

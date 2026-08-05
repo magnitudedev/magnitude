@@ -126,15 +126,16 @@ const packageAcquisition = (
 }
 
 export interface LocalModelPackagesApi {
+  readonly initialized: Effect.Effect<boolean>
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
   readonly admitTarget: (
     targetId: ModelOfferingTargetId,
     target: ModelOfferingTarget,
-  ) => Effect.Effect<ModelDownloadAdmission["attemptIds"], LocalInferenceError>
+  ) => Effect.Effect<ModelDownloadAdmission, LocalInferenceError>
   readonly cancelAttempts: (
-    attemptIds: ModelDownloadAdmission["attemptIds"],
+    attemptIds: Extract<ModelDownloadAdmission, { readonly _tag: "DownloadAdmitted" }>["attemptIds"],
   ) => Effect.Effect<void, LocalInferenceError>
   readonly dismissTargetFailure: (
     target: ModelOfferingTarget,
@@ -290,6 +291,7 @@ export const LocalModelPackagesLive: Layer.Layer<
     target._tag === "Package" ? [target.package] : [target.target, target.draft]
 
   return LocalModelPackages.of({
+    initialized: installed.initialized,
     snapshot: mirror.get,
     changes: mirror.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
@@ -314,9 +316,12 @@ export const LocalModelPackagesLive: Layer.Layer<
       const attemptIds = response.attempts.map((attempt) => DownloadAttemptIdSchema.make(attempt.id))
       const [first, ...rest] = attemptIds
       if (first === undefined) {
-        return yield* Effect.die("A model target must contain at least one package")
+        return { _tag: "AlreadyInstalled" } satisfies ModelDownloadAdmission
       }
-      return [first, ...rest] as ModelDownloadAdmission["attemptIds"]
+      return {
+        _tag: "DownloadAdmitted",
+        attemptIds: [first, ...rest],
+      } satisfies ModelDownloadAdmission
     }).pipe(Effect.mapError((error) =>
       localModelPackageMutationFailure("start_model_download_failed", error))),
     cancelAttempts: (attemptIds) => Effect.gen(function* () {
