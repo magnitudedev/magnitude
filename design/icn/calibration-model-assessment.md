@@ -207,10 +207,12 @@ persisted. Operational failures are never persisted.
 ## Product behavior
 
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
-- Recommendation generation and automatic installed-model setup call the shared assessment service.
+- One catalog projection assesses recommendable and discovered installed targets through the shared
+  assessment service; recommendation policy consumes only recommendable candidates.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
 - Installed targets remain visible while assessment is pending or fails.
-- Only completed `Fits` configurations become catalog candidates or provider offerings.
+- Only completed `Fits` configurations become catalog candidates or are eligible for initial
+  provider-offering creation.
 - Downloading never performs hardware calibration.
 
 ## Conformance

@@ -24,7 +24,6 @@ import {
   providerOfferingPackageEvidence,
   sameProviderOfferingPackageEvidence,
 } from "./local-provider-offering-projection"
-import { LocalModelAutoSetup } from "./local-model-auto-setup"
 import { LocalModelAssessments } from "./local-model-assessments"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 
@@ -134,10 +133,6 @@ const aggregateDownload = (
       })()
 }
 
-export const availabilityFromReconciliationFailure = (
-  failure: ModelFailure,
-): LocalModelCatalogCandidateAvailability => ({ _tag: "Unavailable", failure })
-
 type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
 
 export const availabilityFromProviderProjection = (
@@ -165,22 +160,18 @@ export const availabilityFromProviderProjection = (
     }
   }
   if (Option.isSome(providerProjectionFailure)) {
-    return availabilityFromReconciliationFailure(
-      providerProjectionFailure.value,
-    )
+    return { _tag: "Unavailable", failure: providerProjectionFailure.value }
   }
   return undefined
 }
 
 const aggregateAvailability = (
-  targetId: ModelOfferingTargetId,
   target: ModelOfferingTarget,
   entries: ReadonlyMap<string, ModelPackageEntry>,
   providerModelId: ProviderModelId | undefined,
   providerEntries: ReadonlyMap<ProviderModelId, ProviderModelCatalogEntry>,
   providerProjectionCurrent: boolean,
   providerProjectionFailure: Option.Option<ModelFailure>,
-  autoSetupFailures: ReadonlyMap<ModelOfferingTargetId, ModelFailure>,
 ): LocalModelCatalogCandidateAvailability | undefined => {
   const targetEntries = modelOfferingTargetPackageIds(target).map((packageId) => entries.get(packageId))
   if (!targetEntries.every((entry) => entry?.localState._tag === "Installed")) {
@@ -196,10 +187,6 @@ const aggregateAvailability = (
   if (targetEntries.some((entry) => entry?.inspection._tag === "Pending")) {
     return undefined
   }
-  const setupFailure = autoSetupFailures.get(targetId)
-  if (setupFailure) {
-    return availabilityFromReconciliationFailure(setupFailure)
-  }
   return availabilityFromProviderProjection(
     providerModelId,
     providerEntries,
@@ -211,7 +198,7 @@ const aggregateAvailability = (
 export interface LocalModelsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
-  readonly target: (
+  readonly resolveTarget: (
     targetId: ModelOfferingTargetId,
   ) => Effect.Effect<ModelOfferingTarget | undefined, LocalInferenceError>
 }
@@ -221,11 +208,10 @@ export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalMo
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
-  IcnCatalog | LocalModelAutoSetup | LocalModelPackages | LocalModelRecommendations
+  IcnCatalog | LocalModelPackages | LocalModelRecommendations
     | LocalModelAssessments | LocalProviderOfferingProjection | LocalProviderOfferings | MirroredStateChanges
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
-  const autoSetup = yield* LocalModelAutoSetup
   const packages = yield* LocalModelPackages
   const recommendations = yield* LocalModelRecommendations
   const assessments = yield* LocalModelAssessments
@@ -254,7 +240,6 @@ export const LocalModelsLive: Layer.Layer<
       : []
     const configured = yield* offerings.list
     const projectedOfferings = yield* offeringProjection.state
-    const setupFailures = yield* autoSetup.failures
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
     )
@@ -372,14 +357,12 @@ export const LocalModelsLive: Layer.Layer<
           const model = models.find(({ targetId }) => targetId === candidate.targetId)
           const projection = targets.get(candidate.targetId)
           const availability = projection === undefined ? undefined : aggregateAvailability(
-            projection.id,
             projection.target,
             packageEntries,
             providerIdByConfiguration.get(candidate.configurationId),
             providerEntries,
             providerProjectionCurrent,
             providerProjectionFailure,
-            setupFailures,
           )
           return model === undefined || availability === undefined
             ? []
@@ -441,7 +424,6 @@ export const LocalModelsLive: Layer.Layer<
     assessments.changes,
     offerings.changes,
     offeringProjection.changes,
-    autoSetup.changes,
   ], { concurrency: "unbounded" }).pipe(
     Stream.debounce("25 millis"),
     Stream.runForEach(() => project),
@@ -451,12 +433,12 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
-    target: (targetId) => Effect.gen(function* () {
+    resolveTarget: (targetId) => Effect.gen(function* () {
       const recommendationState = (yield* recommendations.snapshot).state
-      const recommendation = recommendationState._tag === "Ready"
-        ? recommendationState.recommendations.find((candidate) => candidate.targetId === targetId)
+      const catalogEntry = recommendationState._tag === "Ready"
+        ? recommendationState.catalog.find(({ candidate }) => candidate.targetId === targetId)
         : undefined
-      if (recommendation) return recommendation.configuration.target
+      if (catalogEntry) return catalogEntry.configuration.target
       const offering = (yield* offerings.list).find((candidate) => candidate.targetId === targetId)
       if (offering) return offering.configuration.target
       const entry = (yield* packages.snapshot).state.entries.find((candidate) =>

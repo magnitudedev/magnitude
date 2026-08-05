@@ -30,8 +30,9 @@ const replacementInstanceId = ModelInstanceIdSchema.make("instance_replacement")
 const providerModelId = ProviderModelIdSchema.make("model_test")
 const configurationId = ModelServingConfigurationIdSchema.make("configuration_test")
 const submission = {
-  _tag: "DownloadThenLoad" as const,
+  _tag: "ConfigureThenLoad" as const,
   choice: {
+    targetId,
     configurationId,
     displayName: "Test model",
     reasoningEffort: ReasoningEffortSchema.make("none"),
@@ -69,7 +70,6 @@ describe("OnboardingModelMachine", () => {
       cancellationRequested: false,
     })
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
-      providerModelId,
       targetId,
       attemptIds: [admittedAttempt],
     })
@@ -89,6 +89,25 @@ describe("OnboardingModelMachine", () => {
       "DownloadCancellationFailed",
       {},
     )._tag).toBe("DownloadCancellationFailed")
+  })
+
+  it("retains the submitted choice while offering creation is in flight", () => {
+    const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "AdmittingDownload", {
+      submission,
+      cancellationRequested: false,
+    })
+    const creating = OnboardingModelMachine.transition(admitting, "CreatingOffering", {
+      submission,
+      cancellationRequested: false,
+    })
+    const cancellation = requestOnboardingCancellation(creating)
+
+    expect(cancellation._tag).toBe("Deferred")
+    expect(cancellation.state).toMatchObject({
+      _tag: "CreatingOffering",
+      submission,
+      cancellationRequested: true,
+    })
   })
 
   it("does not permit cancellation failure to transition directly to successful cancellation", () => {
@@ -126,7 +145,6 @@ describe("OnboardingModelMachine", () => {
     })
 
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
-      providerModelId,
       targetId,
       attemptIds: [admittedAttempt],
     })

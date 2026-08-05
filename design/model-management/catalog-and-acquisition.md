@@ -9,6 +9,7 @@ applies_to:
   - packages/icn/src/downloads/**
   - packages/acn/src/local-model-packages.ts
   - packages/acn/src/local-models.ts
+  - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
 ---
 
@@ -125,11 +126,11 @@ Installed targets remain visible when catalog loading or recommendation generati
 Catalog-only targets remain visible as not downloaded. ACN may immediately merge an exact command response into its
 observer to reduce presentation latency, but only ICN observations confirm package state.
 
-Catalog actions address the row's `ModelServingConfigurationId`. ACN resolves the complete assessed
-configuration, creates the corresponding provider offering, and admits downloads for its
-`ModelOfferingTargetId`. The client-facing admission result carries the resulting provider-model
-identity, target identity, and exact download-attempt identities needed by subsequent commands and
-observation. ICN package-download commands address targets or packages, never provider identity.
+Acquisition actions address the row's `ModelOfferingTargetId`. ACN resolves the authoritative exact
+target and admits downloads for its required packages. The client-facing admission result reports
+that the target is already installed or carries the exact download-attempt identities needed for
+subsequent cancellation and observation. ICN package-download commands address targets or packages,
+never configuration or provider identity.
 
 Download state stores no assessment evidence and determines neither configuration, offering, nor
 slot identity. Exact admission snapshots are merged immediately into ACN observation, while ICN
@@ -152,6 +153,7 @@ the release catalog, changes identity, or creates a permanent failed state.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
 - Package identity is independent of paths, display names, and mutable upstream references.
-- Catalog actions use configuration identity; provider-model identity begins with the resulting offering.
+- Acquisition uses target identity; configuration selection uses serving-configuration identity;
+  provider-model identity begins with the resulting offering.
 - Catalog failure cannot hide installed targets.
 - One package failure cannot corrupt unrelated inventory or download state.

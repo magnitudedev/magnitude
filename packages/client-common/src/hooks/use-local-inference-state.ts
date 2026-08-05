@@ -45,16 +45,30 @@ export function usePreviewModelLoad(slotId: SlotId) {
 
 export function useLocalModelActions() {
   const client = useAgentClient()
+  const createOfferingAtom = useMemo(
+    () => client.mutation("CreateLocalModelOffering"),
+    [client],
+  )
+  const createOfferingResult = useAtomValue(createOfferingAtom)
+  const createOffering = useAtomSet(
+    createOfferingAtom,
+    { mode: "promise" },
+  )
   const download = useAtomSet(client.mutation("DownloadModel"))
   const cancel = useAtomSet(client.mutation("CancelModelDownload"))
   const dismiss = useAtomSet(client.mutation("DismissModelDownloadFailure"))
   const deleteModel = useAtomSet(client.mutation("DeleteLocalModel"))
 
   return {
-    download: useCallback((configurationId: ModelServingConfigurationId) =>
+    createOfferingResult,
+    createOffering: useCallback((configurationId: ModelServingConfigurationId) => createOffering({
+      payload: { configurationId },
+      reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
+    }), [createOffering]),
+    download: useCallback((targetId: ModelOfferingTargetId) =>
       download({
-        payload: { configurationId },
-        reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
+        payload: { targetId },
+        reactivityKeys: [LocalModelsMirror.id],
       }), [download]),
     cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => cancel({
       payload: { attemptIds },

@@ -1,7 +1,6 @@
 import { Schema } from 'effect'
 import { ProviderModelIdSchema } from '@magnitudedev/ai'
 import {
-  LocalProviderOfferingOriginSchema,
   ModelOfferingTargetIdSchema,
   ProviderModelIdentitySchema,
   ModelServingConfigurationSchema,
@@ -39,7 +38,6 @@ export const PersistedLocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
   targetId: ModelOfferingTargetIdSchema,
   configuration: ModelServingConfigurationSchema,
-  origin: LocalProviderOfferingOriginSchema,
 })
 export type PersistedLocalProviderOffering =
   Schema.Schema.Type<typeof PersistedLocalProviderOfferingSchema>

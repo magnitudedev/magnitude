@@ -5,35 +5,10 @@ import {
 } from "@magnitudedev/sdk"
 import {
   availabilityFromProviderProjection,
-  availabilityFromReconciliationFailure,
 } from "./local-models"
 
 describe("local model availability", () => {
   const providerModelIds = [ProviderModelIdSchema.make("test-configuration")]
-
-  it("publishes retryable automatic reconciliation failures as unavailable", () => {
-    const failure = {
-      code: "local_model_assessment_unavailable",
-      message: "This model is not yet configured",
-      retryable: true,
-    }
-    expect(availabilityFromReconciliationFailure(failure)).toEqual({
-      _tag: "Unavailable",
-      failure,
-    })
-  })
-
-  it("exposes terminal reconciliation failures as unavailable", () => {
-    const failure = {
-      code: "invalid_target",
-      message: "The model files are incompatible",
-      retryable: false,
-    }
-    expect(availabilityFromReconciliationFailure(failure)).toEqual({
-      _tag: "Unavailable",
-      failure,
-    })
-  })
 
   it("withholds provider availability until it matches the package snapshot", () => {
     expect(availabilityFromProviderProjection(

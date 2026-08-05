@@ -28,6 +28,7 @@ const choice = {
   reasoningEffort: TEST_REASONING_EFFORT,
 }
 const downloadChoice = {
+  targetId: TEST_TARGET_ID,
   configurationId: TEST_CONFIGURATION_ID,
   displayName: "Qwen Test",
   reasoningEffort: TEST_REASONING_EFFORT,
@@ -135,13 +136,57 @@ describe("deriveOnboardingModelSetupView", () => {
     const view = deriveOnboardingModelSetupView({
       active: true,
       submission: {
-        _tag: "DownloadThenLoad",
+        _tag: "ConfigureThenLoad",
         choice: downloadChoice,
       },
       submitting: true,
       ...state,
     })
     expect(view).toMatchObject({ _tag: "Downloading", candidate: { displayName: "Qwen Test" } })
+  })
+
+  it("does not represent configuration of an installed model as downloading", () => {
+    const candidate = makeCatalogCandidate({
+      download: { _tag: "Downloaded", installedBytes: 16 },
+      availability: { _tag: "Available" },
+    })
+    const base = makeView({
+      ready: false,
+      models: [makeModel({ offerings: [] })],
+      catalogCandidates: [candidate],
+    })
+    const view = deriveOnboardingModelSetupView({
+      active: true,
+      submission: { _tag: "ConfigureThenLoad", choice: downloadChoice },
+      providerModelId: Option.some(TEST_MODEL_ID),
+      submitting: true,
+      models: base.models,
+      slots: base.slots,
+    })
+
+    expect(view).toMatchObject({ _tag: "Activating", phase: "Loading" })
+  })
+
+  it("represents offering creation for an installed model explicitly", () => {
+    const candidate = makeCatalogCandidate({
+      download: { _tag: "Downloaded", installedBytes: 16 },
+      availability: { _tag: "Available" },
+    })
+    const base = makeView({
+      ready: false,
+      models: [makeModel({ offerings: [] })],
+      catalogCandidates: [candidate],
+    })
+    const view = deriveOnboardingModelSetupView({
+      active: true,
+      submission: { _tag: "ConfigureThenLoad", choice: downloadChoice },
+      providerModelId: Option.none(),
+      submitting: true,
+      models: base.models,
+      slots: base.slots,
+    })
+
+    expect(view).toMatchObject({ _tag: "Configuring", candidate })
   })
 
   it("projects an authoritative download failure", () => {
@@ -159,7 +204,7 @@ describe("deriveOnboardingModelSetupView", () => {
     const view = deriveOnboardingModelSetupView({
       active: true,
       submission: {
-        _tag: "DownloadThenLoad",
+        _tag: "ConfigureThenLoad",
         choice: downloadChoice,
       },
       submitting: false,

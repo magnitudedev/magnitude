@@ -4,8 +4,9 @@ applies_to:
   - packages/acn/src/provider-model-catalog.ts
   - packages/acn/src/model-configuration.ts
   - packages/acn/src/model-slot-**
-  - packages/acn/src/local-model-auto-setup.ts
+  - packages/acn/src/local-model-recommendations.ts
   - packages/acn/src/handlers.ts
+  - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/config.ts
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts
@@ -29,7 +30,6 @@ ProviderOffering
   provider identity
   provider-model identity
   exact ModelServingConfiguration
-  creation origin
 ```
 
 For the local provider, ACN deterministically derives the provider-model value from the ICN-issued
@@ -45,25 +45,28 @@ packages are absent, downloading, being inspected, or temporarily unavailable. I
 projection is enabled only when every required package is installed and its exact configuration has
 a current `Fits` assessment.
 
-Automatic reconciliation may create an offering from an installed target. While inspection or
-assessment is incomplete, ACN retains the previous complete projection or withholds a new one. A
-failure publishes typed unavailability with retryability; it is not rewritten as incompatibility.
-Reconciliation never changes the offering's configuration to obtain a different assessment result.
-Reconciliation runs under a scoped background owner and never delays ACN service publication.
+Assessment publishes configuration candidates independently of offering existence. Offering
+creation occurs only through explicit configuration selection. Provider projection observes the
+persisted offering and authoritative package and assessment state; it never creates offerings.
 
 ## Selecting a catalog option
 
 A catalog candidate is a presentation row for one exact assessed configuration and introduces no
-identity. Catalog actions use its `ModelServingConfigurationId`:
+identity. It carries the target identity used for acquisition and the serving-configuration
+identity used for offering creation. The client-owned selection pipeline is:
 
 ```text
-resolve exact assessed configuration
-  -> persist exact provider offering
-  -> acquire missing target packages, if requested
-  -> return ProviderModelId and acquisition identities
-  -> validate and assign slot
-  -> load assigned configuration, if requested
+DownloadModel(targetId)                              [if packages are missing]
+  -> CreateLocalModelOffering(configurationId)       -> providerModelId
+  -> AssignSlot(slotId, providerModelId)
+  -> LoadModel(slotId)                               [if residency is requested]
 ```
+
+Each command receives the identity of the fact it owns. Download resolves and acquires one exact
+offering target. Offering creation persists one exact assessed serving configuration. Assignment
+stores the resulting provider offering as durable slot intent. Loading acts only on that slot and
+its selected offering. `AssignSlot` also carries the provider ID and reasoning effort; the
+shorthand above highlights the identities that determine each stage.
 
 Before offering creation, neither the row nor the client workflow uses `ProviderModelId`. After
 creation, provider and slot operations use `(ProviderId, ProviderModelId)` and do not use catalog
@@ -90,10 +93,10 @@ unavailability without discarding user intent.
 
 ## Composite client workflows
 
-Onboarding may compose selection, optional download, assignment, loading, completion, and explicit
-cancellation as one client-owned workflow. Its transient state contains only the submitted choice
-and exact command identities required to bridge admission. It does not duplicate download, slot, or
-instance lifecycle.
+Onboarding may compose target acquisition, offering creation, assignment, loading, completion, and
+explicit cancellation as one client-owned workflow. Its transient state retains the submitted
+choice through each finite mutation and contains only the exact command identities required to
+bridge admitted work. It does not duplicate download, slot, or instance lifecycle.
 
 Interruption or restart never reconstructs onboarding intent from server observations. Confirmed
 cancellation invokes ordinary download-cancellation or slot-clear mutations. Successful load closes
@@ -109,8 +112,9 @@ preference and recency changes affect the next menu entry.
 ## Conformance
 
 - Provider identity never depends on recommendation membership or package presence.
-- Catalog actions address configuration identity, never provider-model identity.
-- Offering reconciliation never silently substitutes a configuration.
+- Acquisition actions address target identity; offering-creation actions address configuration
+  identity; neither uses provider-model identity before the offering exists.
+- Provider projection never creates or substitutes an offering.
 - Catalog row identity is not persisted as user intent.
 - Assignment commits durable selection and published configuration atomically.
 - Selection, acquisition, assignment, and loading remain distinct mutations even when composed by a client.

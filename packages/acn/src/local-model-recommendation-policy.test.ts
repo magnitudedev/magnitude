@@ -182,9 +182,7 @@ describe("local model multicriteria recommendation policy", () => {
     const catalog = assembleRecommendationCatalogCandidates([slow], recommendations)
 
     expect(recommendations).toEqual([])
-    expect(catalog).toMatchObject([{
-      candidate: { model: { displayName: "slow" } },
-    }])
+    expect(catalog).toMatchObject([{ model: { displayName: "slow" } }])
   })
 
   it("applies the floor at the same one-decimal precision shown to users", () => {
@@ -269,9 +267,11 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "fastest")?.configuration.profile.contextLength).toBe(100_000)
 
     const catalog = assembleRecommendationCatalogCandidates(candidates, recommendations)
-    const fastest = catalog.find(({ recommendation }) => recommendation?.intent === "fastest")
-    expect(fastest?.candidate.profile.contextLength).toBe(100_000)
-    expect(catalog.filter(({ candidate: entry }) => entry.artifactId === "quick:q6"))
+    const fastestConfigurationId = byIntent(recommendations, "fastest")?.configuration.id
+    const fastest = catalog.find(({ assessment }) =>
+      assessment.configurationId === fastestConfigurationId)
+    expect(fastest?.profile.contextLength).toBe(100_000)
+    expect(catalog.filter(({ artifactId }) => artifactId === "quick:q6"))
       .toHaveLength(1)
   })
 

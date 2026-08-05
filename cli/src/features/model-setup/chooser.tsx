@@ -6,7 +6,7 @@ import { Option } from "effect"
 import {
   truncateToDisplayWidth,
   type LocalInferenceHardwareResult,
-  type OnboardingDownloadModelChoice,
+  type OnboardingConfigurationChoice,
   type OnboardingLoadModelChoice,
 } from "@magnitudedev/client-common"
 import type {
@@ -56,7 +56,7 @@ const actionLabel = (selection: LocalInferenceSelection): string => {
       ? intentLabel(selection.recommendation.value.intent)
       : "Download"
   }
-  return Option.isSome(selection.providerModelId) ? "Load" : "Unavailable"
+  return "Load"
 }
 
 const onboardingSelection = (
@@ -85,7 +85,8 @@ const ModelRow = ({
 }): ReactNode => {
   const theme = useTheme()
   const action = actionLabel(selection)
-  const enabled = selection.kind === "running" || onboardingSelection(selection) !== null
+  const enabled = selection.kind !== "recommendation"
+    || selection.recommendation._tag === "Recommended"
   const markerWidth = 2
   const gap = 2
   const nameWidth = Math.max(1, width - markerWidth - gap - action.length - 1)
@@ -218,6 +219,10 @@ export type OnboardingModelChooserOperation =
       readonly onRetry: () => void
     }
   | {
+      readonly _tag: "Configuring"
+      readonly candidate: LocalModelCatalogCandidate
+    }
+  | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
@@ -236,7 +241,7 @@ export function OnboardingModelChooser({
   error,
   operation,
   onLoad,
-  onDownload,
+  onSelectConfiguration,
   onContinue,
   onSkip,
 }: {
@@ -248,25 +253,29 @@ export function OnboardingModelChooser({
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
   readonly onLoad: (choice: OnboardingLoadModelChoice) => void
-  readonly onDownload: (choice: OnboardingDownloadModelChoice) => void
+  readonly onSelectConfiguration: (choice: OnboardingConfigurationChoice) => void
   readonly onContinue: () => void
   readonly onSkip: () => void
 }): ReactNode {
   const theme = useTheme()
   const selections = useMemo(() =>
     buildLocalInferenceSelections(models, catalog, slots).filter((selection) =>
-      selection.kind === "recommendation"
-        ? selection.recommendation._tag === "Recommended"
-        : Option.isSome(selection.providerModelId)), [catalog, models, slots])
+      selection.kind !== "recommendation"
+        || selection.recommendation._tag === "Recommended"),
+  [catalog, models, slots])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
+  const selectionConfigurationId = (selection: LocalInferenceSelection) =>
+    selection.kind === "recommendation"
+      ? selection.recommendation._tag === "Recommended"
+        ? selection.recommendation.value.candidate.configurationId
+        : undefined
+      : selection.configurationId
   const activeSelectionId = operation === null
     ? Option.none<string>()
     : Option.fromNullable(selections.find((selection) =>
       operation._tag === "Downloading" || operation._tag === "DownloadFailed"
-      ? selection.kind === "recommendation"
-        && selection.recommendation._tag === "Recommended"
-        && selection.recommendation.value.candidate.configurationId
-          === operation.candidate.configurationId
+        || operation._tag === "Configuring"
+      ? selectionConfigurationId(selection) === operation.candidate.configurationId
       : Option.contains(selection.providerModelId, operation.providerModelId))?.id)
   const selectedIndex = selectedInferenceIndex(
     selections,
@@ -310,12 +319,25 @@ export function OnboardingModelChooser({
       })
       return
     }
+    if (selection.kind === "stored") {
+      onSelectConfiguration({
+        targetId: selection.model.targetId,
+        configurationId: selection.configurationId,
+        displayName: selection.model.displayName,
+        reasoningEffort: Option.getOrElse(
+          selection.reasoningEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      })
+      return
+    }
     if (
       selection.kind === "recommendation"
       && selection.recommendation._tag === "Recommended"
     ) {
       const candidate = selection.recommendation.value.candidate
-      onDownload({
+      onSelectConfiguration({
+        targetId: candidate.targetId,
         configurationId: candidate.configurationId,
         displayName: candidate.displayName,
         reasoningEffort: Option.getOrElse(
@@ -324,7 +346,7 @@ export function OnboardingModelChooser({
         ),
       })
     }
-  }, [onContinue, onDownload, onLoad])
+  }, [onContinue, onLoad, onSelectConfiguration])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) {
@@ -529,6 +551,8 @@ export function OnboardingModelChooser({
       ? "Download in progress · Esc cancel"
       : operation?._tag === "DownloadFailed"
         ? "Download failed · Retry or choose another model"
+      : operation?._tag === "Configuring"
+        ? "Configuring model…"
       : operation?._tag === "Activating"
         ? operation.phase === "Failed"
           ? "Model loading failed"

@@ -65,7 +65,6 @@ import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { makeModelConfigurationLayer } from "./model-configuration"
 import { makeAcnIcn } from "./icn"
-import { LocalModelAutoSetupLive } from "./local-model-auto-setup"
 import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
@@ -301,13 +300,13 @@ const addLocalInferenceServices = <A, E, R>(
     withConfiguration
   )
   const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
-  const withEvaluations = Layer.provideMerge(
+  const withAssessments = Layer.provideMerge(
     LocalModelAssessmentsLive,
     withPackages
   )
   const withOfferings = Layer.provideMerge(
     LocalProviderOfferingsLive,
-    withEvaluations
+    withAssessments
   )
   const withOfferingProjection = Layer.provideMerge(
     LocalProviderOfferingProjectionLive,
@@ -317,11 +316,7 @@ const addLocalInferenceServices = <A, E, R>(
     makeLocalModelRecommendationsLive(),
     withOfferingProjection
   )
-  const withAutoSetup = Layer.provideMerge(
-    LocalModelAutoSetupLive,
-    withRecommendations
-  )
-  const withLocalModels = Layer.provideMerge(LocalModelsLive, withAutoSetup)
+  const withLocalModels = Layer.provideMerge(LocalModelsLive, withRecommendations)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
   const withResolver = Layer.provideMerge(
     LocalProviderResolverLive,

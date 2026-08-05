@@ -36,6 +36,7 @@ import {
   type LocalModel,
   type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
+  type ProviderModelId,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -757,8 +758,35 @@ const recommendationLabel = (recommendation: Option.Option<LocalModelRecommendat
     })[intent],
   })
 
-const qualityLabel = ({ fidelityRank }: LocalModelCatalogCandidate): string =>
-  fidelityRank >= 75 ? "Near original" : fidelityRank >= 55 ? "Very high" : fidelityRank >= 45 ? "High" : "Reduced"
+const intelligenceLabel = ({ recommendationEvidence }: LocalModelCatalogCandidate): string =>
+  Option.match(recommendationEvidence, {
+    onNone: () => "—",
+    onSome: ({ intelligence }) => Option.match(intelligence, {
+      onNone: () => "—",
+      onSome: ({ score }) => `${Math.round(score)}/100`,
+    }),
+  })
+
+const qualityLabel = ({ recommendationEvidence }: LocalModelCatalogCandidate): string =>
+  Option.match(recommendationEvidence, {
+    onNone: () => "—",
+    onSome: ({ fidelityRank }) => fidelityRank >= 75
+      ? "Near original"
+      : fidelityRank >= 55
+        ? "Very high"
+        : fidelityRank >= 45 ? "High" : "Reduced",
+  })
+
+const recommendationEvidenceLabel = (candidate: LocalModelCatalogCandidate): string =>
+  Option.isNone(candidate.recommendationEvidence)
+    ? "recommendation evidence unavailable"
+    : `intelligence ${intelligenceLabel(candidate)} · ${qualityLabel(candidate)}`
+
+const qualityEvidence = ({ recommendationEvidence }: LocalModelCatalogCandidate): readonly string[] =>
+  Option.match(recommendationEvidence, {
+    onNone: () => [],
+    onSome: ({ qualityEvidence: evidence }) => evidence,
+  })
 
 const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
   if (candidate.download._tag === "NotDownloaded"
@@ -831,26 +859,34 @@ const CatalogMenu = memo(function CatalogMenu({
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
       || candidate.download._tag === "Downloaded") return
-    void modelActions.download(candidate.configurationId)
+    void modelActions.download(candidate.targetId)
   }, [modelActions])
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.availability._tag !== "Available") return
+    if (candidate.availability._tag !== "Available"
+      || Result.isWaiting(modelActions.createOfferingResult)) return
     const providerModelId = Option.flatMap(snapshot, ({ models }) => Option.fromNullable(
       models.find(({ targetId }) => targetId === candidate.targetId)
         ?.offerings.find(({ configurationId }) => configurationId === candidate.configurationId)
         ?.providerModelId,
     ))
-    if (Option.isNone(providerModelId)) return
-    void slotActions.assign(PRIMARY_SLOT_ID, {
+    const assign = (id: ProviderModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
-      providerModelId: providerModelId.value,
+      providerModelId: id,
       reasoningEffort: Option.getOrElse(
         candidate.capabilities.reasoning.defaultEffort,
         () => ReasoningEffortSchema.make("none"),
       ),
     })
-  }, [slotActions, snapshot])
+    if (Option.isSome(providerModelId)) {
+      void assign(providerModelId.value)
+      return
+    }
+    void modelActions.createOffering(candidate.configurationId).then(
+      assign,
+      () => undefined,
+    )
+  }, [modelActions, slotActions, snapshot])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
@@ -974,7 +1010,7 @@ const CatalogMenu = memo(function CatalogMenu({
           )}
           <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>Calibrated for this machine</text>
           <text style={{ fg: theme.muted }}>
-            {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · intelligence {Math.round(detail.intelligenceScore)}/100 · {qualityLabel(detail)}
+            {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · {recommendationEvidenceLabel(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
             Approximately {detail.estimatedTokensPerSecond.toFixed(1)} tokens/sec
@@ -983,6 +1019,9 @@ const CatalogMenu = memo(function CatalogMenu({
             {catalogStatus(detail)}
           </text>
           {failed && <text style={{ fg: theme.error }}>{detail.download.failure.message}</text>}
+          {Result.isFailure(modelActions.createOfferingResult) && (
+            <text style={{ fg: theme.error }}>Failed to create the local model offering.</text>
+          )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             {detailActions.map((action, index) => (
               <MenuAction
@@ -996,7 +1035,7 @@ const CatalogMenu = memo(function CatalogMenu({
             ))}
           </box>
           <text style={{ fg: theme.muted, marginTop: 1 }}>License: {detail.license}</text>
-          {detail.qualityEvidence.map((evidence) => <text key={evidence} style={{ fg: theme.muted }}>{evidence}</text>)}
+          {qualityEvidence(detail).map((evidence) => <text key={evidence} style={{ fg: theme.muted }}>{evidence}</text>)}
         </scrollbox>
       </>
     )
@@ -1067,7 +1106,7 @@ const CatalogMenu = memo(function CatalogMenu({
               </text>
               <text style={{ fg: theme.primary, width: 16 }}>{recommendationLabel(recommendationFor(candidate))}</text>
               <text style={{ fg: theme.muted, width: 12 }}>{formatBytes(requiredMemoryBytes(candidate.memory))}</text>
-              <text style={{ fg: theme.muted, width: 14 }}>{Math.round(candidate.intelligenceScore)}/100</text>
+              <text style={{ fg: theme.muted, width: 14 }}>{intelligenceLabel(candidate)}</text>
               <text style={{ fg: theme.muted, width: 14 }}>{qualityLabel(candidate)}</text>
               <text style={{ fg: theme.muted, width: 12 }}>~{candidate.estimatedTokensPerSecond.toFixed(0)} t/s</text>
               <text

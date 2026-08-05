@@ -433,11 +433,12 @@ export const LocalModelDownloadSchema = Schema.Union(
 )
 export type LocalModelDownload = typeof LocalModelDownloadSchema.Type
 
-export const ModelDownloadAdmissionSchema = Schema.Struct({
-  providerModelId: ProviderModelIdSchema,
-  targetId: ModelOfferingTargetIdSchema,
-  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
-})
+export const ModelDownloadAdmissionSchema = Schema.Union(
+  Schema.TaggedStruct("AlreadyInstalled", {}),
+  Schema.TaggedStruct("DownloadAdmitted", {
+    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  }),
+)
 export type ModelDownloadAdmission = typeof ModelDownloadAdmissionSchema.Type
 
 export const LocalModelCatalogCandidateAvailabilitySchema = Schema.Union(
@@ -480,6 +481,17 @@ export const LocalModelSchema = Schema.Struct({
 })
 export type LocalModel = typeof LocalModelSchema.Type
 
+export const LocalModelCatalogRecommendationEvidenceSchema = Schema.Struct({
+  intelligence: Schema.optionalWith(Schema.Struct({
+    score: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
+    provenance: NonEmptyString,
+  }), { as: "Option", exact: true }),
+  fidelityRank: NonNegativeSafeInteger,
+  qualityEvidence: Schema.Array(NonEmptyString),
+})
+export type LocalModelCatalogRecommendationEvidence =
+  typeof LocalModelCatalogRecommendationEvidenceSchema.Type
+
 export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
   configurationId: ModelServingConfigurationIdSchema,
   assessmentId: ModelAssessmentIdSchema,
@@ -493,15 +505,15 @@ export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
   quantization: NonEmptyString,
   quantizationName: NonEmptyString,
   memory: Schema.Array(MemoryAssessmentSchema),
-  intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
-  intelligenceProvenance: NonEmptyString,
-  fidelityRank: NonNegativeSafeInteger,
-  qualityEvidence: Schema.Array(NonEmptyString),
   lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
   estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
   upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
   performanceConfidence: Schema.Literal("high", "moderate", "low"),
   capabilities: ModelCapabilitiesSchema,
+  recommendationEvidence: Schema.optionalWith(
+    LocalModelCatalogRecommendationEvidenceSchema,
+    { as: "Option", exact: true },
+  ),
   sources: Schema.Array(Schema.Struct({
     source: ModelPackageSourceSchema,
     files: Schema.Array(Schema.Struct({
@@ -608,18 +620,10 @@ export const LocalModelDownloadsStateSchema = Schema.Struct({
 })
 export type LocalModelDownloadsState = typeof LocalModelDownloadsStateSchema.Type
 
-export const LocalProviderOfferingOriginSchema = Schema.Union(
-  Schema.TaggedStruct("Automatic", {}),
-  Schema.TaggedStruct("Recommendation", { recommendationId: RecommendationIdSchema }),
-  Schema.TaggedStruct("UserConfigured", {}),
-)
-export type LocalProviderOfferingOrigin = typeof LocalProviderOfferingOriginSchema.Type
-
 export const LocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
   targetId: ModelOfferingTargetIdSchema,
   configuration: ModelServingConfigurationSchema,
-  origin: LocalProviderOfferingOriginSchema,
   capabilities: ModelCapabilitiesSchema,
 })
 export type LocalProviderOffering = typeof LocalProviderOfferingSchema.Type

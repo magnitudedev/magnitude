@@ -16,7 +16,6 @@ import {
   MemoryAssessmentSchema,
   ModelOfferingTargetIdSchema,
   ModelServingConfigurationIdSchema,
-  ModelServingConfigurationSchema,
   ModelAssessmentIdSchema,
   type LocalModelAssessmentLifecycle,
   type FitsModelAssessment,
@@ -134,24 +133,6 @@ export const completeAssessmentLifecycle = (
     })
   })
   return next
-}
-
-export const selectModelServingConfiguration = (
-  target: ModelOfferingTarget,
-  result: Extract<LocalModelAssessmentResult, { readonly _tag: "Assessed" }>,
-): Option.Option<ModelServingConfiguration> => {
-  const fits = result.assessments
-    .filter((item): item is Extract<LocalModelAssessment, { readonly _tag: "Fits" }> =>
-      item._tag === "Fits")
-    .sort((left, right) =>
-      right.assessment.profile.contextLength - left.assessment.profile.contextLength)[0]
-  return Option.fromNullable(fits).pipe(
-    Option.map((selected) => ModelServingConfigurationSchema.make({
-      id: selected.assessment.configurationId,
-      target,
-      profile: selected.assessment.profile,
-    })),
-  )
 }
 
 export const formatLocalModelAssessmentFailure = (error: unknown): string => {
