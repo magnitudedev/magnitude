@@ -87,10 +87,20 @@ ACN selects at most one configuration for each intent:
 | `balanced` | Overall capability, speed, memory, fidelity, and download utility |
 | `best_quality` | Highest useful capability and fidelity within resource guards |
 | `fastest` | Highest useful generation speed within capability guards |
-| `lightweight` | Lowest material memory or download cost |
+| `lightweight` | Highest useful capability within a low-memory tier relative to stable hardware capacity |
 
 Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
 A recommendation references a candidate; it does not create another model identity.
+
+The Lightweight tier admits configurations whose complete predicted loaded memory uses at most
+20% of each participating physical memory domain's stable post-reserve capacity. Within that tier,
+capability precedes memory, fidelity, speed, and download size. The selected configuration must also
+use at least 20% less loaded memory than Balanced. If no distinct configuration satisfies both
+boundaries, the portfolio omits Lightweight rather than substituting the absolute smallest model.
+
+Lightweight eligibility is independent of the strongest feasible model's capability. Adding a
+high-capability heavyweight candidate therefore cannot disqualify or downshift an otherwise
+unchanged Lightweight tier.
 
 ## Invalidation
 
@@ -110,6 +120,8 @@ Cached assessment never authorizes loading.
 - All missing profiles for one target are submitted together.
 - Equivalent concurrent misses perform one native assessment.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
+- Lightweight is hardware-relative, capability-maximizing within its memory tier, and independent
+  of the capability ceiling outside that tier.
 - Candidate identity remains the serving-configuration identity.
 - Loading never treats cached assessment as admission authority.
 - ACN startup and service publication never wait for model assessment.

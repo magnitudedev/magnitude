@@ -25,7 +25,10 @@ that same context, and require at least 10 expected baseline tokens per second. 
 eligible candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using
 common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
 fidelity, and download size. Multiple quantizations of one checkpoint may appear when they explain
-a real quality trade-off; duplicate filler cards are omitted. The UI always presents these intents as
+a real quality trade-off; duplicate filler cards are omitted. Lightweight chooses the most capable
+usable configuration in a low-memory tier derived from the configuration's stable post-reserve
+physical memory domains, and is omitted when no distinct configuration is materially lighter than
+Balanced. The UI always presents these intents as
 Balanced, Best Quality, Fastest, then Lightweight, and explains each specialized option by comparing
 its capability, speed, context, footprint, and possible quality loss with Balanced. The UI continues
 to show recommendations, exact artifact details, hardware, download progress, downloaded models,
