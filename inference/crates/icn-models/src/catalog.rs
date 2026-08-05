@@ -48,7 +48,6 @@ struct CatalogModel {
     description: String,
     repository: String,
     formats: Vec<String>,
-    contexts: Vec<u32>,
     license: String,
     quality_score: f64,
     quality_score_provenance: String,
@@ -106,16 +105,12 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     let mut ids = BTreeSet::new();
     for model in &source.models {
         let formats = model.formats.iter().collect::<BTreeSet<_>>();
-        let contexts = model.contexts.iter().collect::<BTreeSet<_>>();
         if model.id.is_empty()
             || model.display_name.is_empty()
             || model.description.is_empty()
             || model.repository.is_empty()
             || model.formats.is_empty()
             || formats.len() != model.formats.len()
-            || model.contexts.is_empty()
-            || contexts.len() != model.contexts.len()
-            || model.contexts.contains(&0)
             || model.license.is_empty()
             || !model.quality_score.is_finite()
             || model.quality_score < 0.0

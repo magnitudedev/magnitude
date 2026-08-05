@@ -5,8 +5,8 @@ import {
   clearAssessmentLifecycle,
   completeAssessmentLifecycle,
   formatLocalModelAssessmentFailure,
+  localModelAssessmentProfiles,
   localModelAssessmentResultFromIcn,
-  modelAssessmentProfiles,
 } from "./local-model-assessments"
 import {
   AssessmentEnvironmentIdSchema,
@@ -21,26 +21,19 @@ const packageTarget = (maximumContextLength: number): ModelOfferingTarget => ({
   package: { properties: { maximumContextLength } },
 } as unknown as ModelOfferingTarget)
 
-describe("modelAssessmentProfiles", () => {
-  it("includes standard points through the model limit plus the exact limit", () => {
-    expect(modelAssessmentProfiles(packageTarget(131_072))).toEqual([
+describe("localModelAssessmentProfiles", () => {
+  it("caps every local model at the 100K baseline", () => {
+    expect(localModelAssessmentProfiles(packageTarget(131_072))).toEqual([
       { contextLength: 100_000 },
-      { contextLength: 131_072 },
+    ])
+    expect(localModelAssessmentProfiles(packageTarget(300_000))).toEqual([
+      { contextLength: 100_000 },
     ])
   })
 
-  it("bounds, deduplicates, and preserves the exact model maximum", () => {
-    expect(modelAssessmentProfiles(packageTarget(80_000))).toEqual([
+  it("uses the model maximum when it is below the local baseline", () => {
+    expect(localModelAssessmentProfiles(packageTarget(80_000))).toEqual([
       { contextLength: 80_000 },
-    ])
-    expect(modelAssessmentProfiles(packageTarget(200_000))).toEqual([
-      { contextLength: 100_000 },
-      { contextLength: 200_000 },
-    ])
-    expect(modelAssessmentProfiles(packageTarget(300_000))).toEqual([
-      { contextLength: 100_000 },
-      { contextLength: 200_000 },
-      { contextLength: 300_000 },
     ])
   })
 
@@ -50,13 +43,24 @@ describe("modelAssessmentProfiles", () => {
       target: { properties: { maximumContextLength: 131_072 } },
       draft: { properties: { maximumContextLength: 32_768 } },
     } as unknown as ModelOfferingTarget
-    expect(modelAssessmentProfiles(target)).toEqual([
+    expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 32_768 },
     ])
   })
 
+  it("caps a speculative pair when both package limits exceed 100K", () => {
+    const target = {
+      _tag: "SpeculativeDecodingPair",
+      target: { properties: { maximumContextLength: 262_144 } },
+      draft: { properties: { maximumContextLength: 131_072 } },
+    } as unknown as ModelOfferingTarget
+    expect(localModelAssessmentProfiles(target)).toEqual([
+      { contextLength: 100_000 },
+    ])
+  })
+
   it("does not invent a profile below the product minimum", () => {
-    expect(modelAssessmentProfiles(packageTarget(2_048))).toEqual([])
+    expect(localModelAssessmentProfiles(packageTarget(2_048))).toEqual([])
   })
 })
 

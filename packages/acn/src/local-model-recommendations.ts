@@ -29,8 +29,8 @@ import {
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { makeObservedState } from "./mirrored-state"
 import {
+  localModelAssessmentProfiles,
   LocalModelAssessments,
-  modelAssessmentProfiles,
 } from "./local-model-assessments"
 import { LocalModelPackages } from "./local-model-packages"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
@@ -445,18 +445,26 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 }]
               },
             )
+            const catalogAssessmentTargets = catalogModels.map((model) => ({
+              ...model,
+              profiles: localModelAssessmentProfiles(model.target),
+            }))
+            const installedAssessmentTargets = installedTargets.map((model) => ({
+              ...model,
+              profiles: localModelAssessmentProfiles(model.target),
+            }))
             const assessmentTargets = [
-              ...catalogModels.map(({ targetId, target }) => ({ targetId, target })),
-              ...installedTargets.map(({ targetId, target }) => ({ targetId, target })),
+              ...catalogAssessmentTargets,
+              ...installedAssessmentTargets,
             ]
             const inputState = yield* Schema.encode(
               Schema.parseJson(Schema.Unknown)
             )({
-              catalog: catalogModels.map((model) => ({
+              catalog: catalogAssessmentTargets.map((model) => ({
                 id: model.id,
                 targetId: model.targetId,
                 checkpointId: model.checkpointId,
-                assessmentProfiles: modelAssessmentProfiles(model.target),
+                assessmentProfiles: model.profiles,
                 displayName: model.displayName,
                 description: model.description,
                 license: model.license,
@@ -470,9 +478,9 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   exactTargetTensorStorageBytes(model)
                 ),
               })),
-              installed: installedTargets.map((model) => ({
+              installed: installedAssessmentTargets.map((model) => ({
                 targetId: model.targetId,
-                assessmentProfiles: modelAssessmentProfiles(model.target),
+                assessmentProfiles: model.profiles,
                 target: model.target,
                 capabilities: model.capabilities,
                 tensorStorageBytes: Option.getOrNull(
@@ -553,10 +561,10 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               total: assessmentTargets.length,
             })
             yield* publishProgress(progress)
-            const requests = assessableTargets.map(({ targetId, target }) => ({
+            const requests = assessableTargets.map(({ targetId, target, profiles }) => ({
               targetId,
               target,
-              profiles: modelAssessmentProfiles(target),
+              profiles,
             }))
             const assessedResults = yield* assessments.assess(
               requests,
@@ -665,13 +673,10 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             const installedCandidates = installedTargets.flatMap((model) => {
               const result = results.get(model.targetId)
               if (result?._tag !== "Assessed") return []
-              const assessment = result.assessments
-                .flatMap((item) => item._tag === "Fits" ? [item.assessment] : [])
-                .sort((left, right) =>
-                  right.profile.contextLength - left.profile.contextLength)[0]
+              const assessment = result.assessments.find((item) => item._tag === "Fits")
               return assessment === undefined
                 ? []
-                : [installedCatalogProjection(model, assessment)]
+                : [installedCatalogProjection(model, assessment.assessment)]
             })
             progress = updateProgress(progress, "recommendations", {
               status: {

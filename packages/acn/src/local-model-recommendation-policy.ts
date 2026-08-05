@@ -68,8 +68,6 @@ const usable = (candidate: RecommendationCandidate): boolean => {
   const generation = generationFor(candidate)
   return generation.contextTokens === candidate.profile.contextLength
     && meetsUsabilityFloor(generation.estimatedTokensPerSecond)
-    && (candidate.profile.contextLength === 100_000
-      || candidate.profile.contextLength === 200_000)
 }
 
 const preferScoredCandidates = (
@@ -78,27 +76,6 @@ const preferScoredCandidates = (
   candidates.some((candidate) => capabilityScore(candidate) !== undefined)
     ? candidates.filter((candidate) => capabilityScore(candidate) !== undefined)
     : candidates
-
-const collapseLargestContext = (
-  candidates: readonly RecommendationCandidate[],
-): readonly RecommendationCandidate[] => {
-  const byArtifact = new Map<string, RecommendationCandidate>()
-  for (const candidate of candidates) {
-    const current = byArtifact.get(candidate.artifactId)
-    if (
-      !current
-      || Number(usable(candidate)) > Number(usable(current))
-      || (usable(candidate) === usable(current)
-        && candidate.profile.contextLength > current.profile.contextLength)
-      || (usable(candidate) === usable(current)
-        && candidate.profile.contextLength === current.profile.contextLength
-        && stableCompare(candidate, current) < 0)
-    ) {
-      byArtifact.set(candidate.artifactId, candidate)
-    }
-  }
-  return [...byArtifact.values()]
-}
 
 const capabilityFloor = (
   candidates: readonly RecommendationCandidate[],
@@ -154,7 +131,7 @@ const compareBalanced = (
 export const rankCatalogCandidates = (
   input: readonly RecommendationCandidate[],
 ): readonly RecommendationCandidate[] =>
-  [...collapseLargestContext(input)]
+  [...input]
     .sort((left, right) =>
       Number(usable(right)) - Number(usable(left))
         || (usable(left) && usable(right) ? compareBalanced(left, right) : 0)
@@ -364,12 +341,11 @@ export const selectRecommendationPortfolio = (
 ): readonly Recommendation[] => {
   const feasible = preferScoredCandidates(input.filter(usable))
   if (feasible.length === 0) return []
-  const largestContexts = collapseLargestContext(feasible)
 
-  const bestQuality = [...largestContexts].sort(compareBestQuality).at(0)
+  const bestQuality = [...feasible].sort(compareBestQuality).at(0)
   if (!bestQuality) return []
 
-  const balancedCapable = withinCapabilityGuard(largestContexts, 20, 0.7)
+  const balancedCapable = withinCapabilityGuard(feasible, 20, 0.7)
   const bestFidelity = Math.max(...balancedCapable.map(({ fidelityRank }) => fidelityRank))
   const balancedCandidates = balancedCapable
     .filter(({ fidelityRank }) => fidelityRank >= bestFidelity - 20)
@@ -425,7 +401,7 @@ export const selectRecommendationPortfolio = (
     usedCheckpointIds.add(fastest.checkpointId)
   }
 
-  const lightweightCapable = largestContexts
+  const lightweightCapable = feasible
     .filter((candidate) =>
       !selectedConfigurations.has(candidate.assessment.configurationId)
       && withinLightweightMemoryTier(candidate, balanced))

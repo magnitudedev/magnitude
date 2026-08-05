@@ -286,41 +286,32 @@ describe("local inference selection view model", () => {
   })
 
   it("shows an assessed installed target before it has a provider offering", () => {
-    const lowerConfigurationId = ModelServingConfigurationIdSchema.make("configuration_100k")
-    const higherConfigurationId = ModelServingConfigurationIdSchema.make("configuration_200k")
+    const configurationId = ModelServingConfigurationIdSchema.make("configuration_default")
     const selections = selectionsFor(makeView({
       ready: false,
       models: [makeModel({ offerings: [] })],
-      catalogCandidates: [
-        makeCatalogCandidate({
-          configurationId: lowerConfigurationId,
-          profile: { contextLength: 100_000 },
-          download: { _tag: "Downloaded", installedBytes: 16 * GIB },
-          availability: { _tag: "Available" },
-        }),
-        makeCatalogCandidate({
-          configurationId: higherConfigurationId,
-          profile: { contextLength: 200_000 },
-          download: { _tag: "Downloaded", installedBytes: 16 * GIB },
-          availability: { _tag: "Available" },
-        }),
-      ],
+      catalogCandidates: [makeCatalogCandidate({
+        configurationId,
+        profile: { contextLength: 131_072 },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        availability: { _tag: "Available" },
+      })],
     }))
 
     expect(selections).toHaveLength(1)
     expect(selections[0]).toMatchObject({ kind: "stored" })
     expect(selections[0]?.kind === "stored" && selections[0].configurationId)
-      .toBe(higherConfigurationId)
+      .toBe(configurationId)
     expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
   })
 
   it("keeps the preferred configuration when another offering exists", () => {
-    const preferredConfigurationId = ModelServingConfigurationIdSchema.make("configuration_200k")
+    const preferredConfigurationId = ModelServingConfigurationIdSchema.make("configuration_default")
     const selections = selectionsFor(makeView({
       ready: false,
       catalogCandidates: [makeCatalogCandidate({
         configurationId: preferredConfigurationId,
-        profile: { contextLength: 200_000 },
+        profile: { contextLength: 100_000 },
         download: { _tag: "Downloaded", installedBytes: 16 * GIB },
         availability: { _tag: "Available" },
       })],
@@ -330,6 +321,22 @@ describe("local inference selection view model", () => {
     expect(selections[0]?.kind === "stored" && selections[0].configurationId)
       .toBe(preferredConfigurationId)
     expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
+  })
+
+  it("shows the configured context for a downloaded catalog model", () => {
+    const selection = selectionsFor(makeView({
+      models: [makeModel({ maximumContextLength: 262_144 })],
+      providerContextWindow: 100_000,
+      catalogCandidates: [makeCatalogCandidate({
+        profile: { contextLength: 100_000 },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        availability: { _tag: "Available" },
+      })],
+    }))[0]
+
+    expect(selection).toBeDefined()
+    expect(selectionMetadata(selection!)).toContain("100K ctx")
+    expect(selectionMetadata(selection!)).not.toContain("256K ctx")
   })
 
   it("keeps recommendations actionable without duplicating target state", () => {

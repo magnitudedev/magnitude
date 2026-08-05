@@ -20,8 +20,10 @@ and GGUF headers plus fit/performance assessments are content-addressed by immut
 hardware evidence. No model weights are downloaded until the user chooses a model.
 
 For each usage choice the ICN recipe service submits the applicable context and parallel-sequence
-profiles to preview. Recommendations use only exact 100K and 200K fits with generation evidence at
-that same context, and require at least 10 expected baseline tokens per second. The service ranks
+profiles to preview. Catalog and discovered local models use one 100K context configuration,
+bounded by the model's native maximum, for fit, catalog availability, recommendations, and loading.
+Recommendations require at least 10 expected baseline tokens per second at their configured
+context. The service ranks
 eligible candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using
 common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
 fidelity, and download size. Multiple quantizations of one checkpoint may appear when they explain

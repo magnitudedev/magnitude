@@ -28,7 +28,7 @@ const candidate = (input: {
   readonly score?: number
   readonly provenance?: string
   readonly fidelity?: number
-  readonly context?: 100_000 | 200_000
+  readonly context?: number
   readonly expected?: number
   readonly lower?: number
   readonly upper?: number
@@ -40,7 +40,7 @@ const candidate = (input: {
 }): RecommendationCandidate => {
   const checkpointId = input.checkpoint ?? input.id
   const artifactId = input.artifact ?? `${checkpointId}:q${input.fidelity ?? 60}`
-  const context = input.context ?? 200_000
+  const context = input.context ?? 100_000
   const expected = input.expected ?? 30
   const fidelity = input.fidelity ?? 60
   const runtimeBytes = (input.runtimeGiB ?? 24) * GIB
@@ -146,22 +146,6 @@ const byIntent = (
   recommendations.find((recommendation) => recommendation.intent === intent)
 
 describe("local model multicriteria recommendation policy", () => {
-  it("prefers 200K for an artifact when it clears the responsiveness floor", () => {
-    const recommendations = selectRecommendationPortfolio([
-      candidate({ id: "model-100", checkpoint: "model", artifact: "model:q6", score: 50, context: 100_000, expected: 40 }),
-      candidate({ id: "model-200", checkpoint: "model", artifact: "model:q6", score: 50, context: 200_000, expected: 20 }),
-    ])
-    expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength).toBe(200_000)
-  })
-
-  it("falls back to 100K when the 200K profile misses the speed floor", () => {
-    const recommendations = selectRecommendationPortfolio([
-      candidate({ id: "model-100", checkpoint: "model", artifact: "model:q6", score: 50, context: 100_000, expected: 30 }),
-      candidate({ id: "model-200", checkpoint: "model", artifact: "model:q6", score: 50, context: 200_000, expected: 9 }),
-    ])
-    expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength).toBe(100_000)
-  })
-
   it("excludes sub-floor measured speed from every intent", () => {
     const slow = candidate({
       id: "slow",
@@ -215,20 +199,19 @@ describe("local model multicriteria recommendation policy", () => {
   it("builds a useful DGX Spark-class portfolio around the strongest responsive model", () => {
     const recommendations = selectRecommendationPortfolio([
       candidate({ id: "laguna-q4-100", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 12.1, context: 100_000, runtimeGiB: 73.41, downloadGiB: 68.4, capacityGiB: 109.5, architecture: "moe" }),
-      candidate({ id: "laguna-q4-200", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 9, context: 200_000, runtimeGiB: 80, downloadGiB: 68.4, capacityGiB: 109.5, architecture: "moe" }),
-      candidate({ id: "laguna-q6", checkpoint: "laguna", artifact: "laguna:q6", score: 70.2, fidelity: 60, expected: 10.8, context: 100_000, runtimeGiB: 104.78, downloadGiB: 99.7, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "laguna-q6", checkpoint: "laguna", artifact: "laguna:q6", score: 70.2, fidelity: 60, expected: 13.2, context: 100_000, runtimeGiB: 104.78, downloadGiB: 99.7, capacityGiB: 109.5, architecture: "moe" }),
       candidate({ id: "qwen35", score: 44.9, fidelity: 40, expected: 28.9, context: 100_000, runtimeGiB: 24.12, downloadGiB: 21.3, capacityGiB: 109.5, architecture: "moe" }),
-      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 19.4, context: 200_000, runtimeGiB: 18.47, downloadGiB: 13.3, capacityGiB: 109.5, architecture: "moe" }),
-      candidate({ id: "qwen9", score: 29.2, fidelity: 40, expected: 12.3, context: 200_000, runtimeGiB: 13.7, downloadGiB: 5.7, capacityGiB: 109.5 }),
-      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 15.3, context: 200_000, runtimeGiB: 11.22, downloadGiB: 2.8, capacityGiB: 109.5 }),
-      candidate({ id: "gemma12", score: 21, fidelity: 58, expected: 13.5, context: 200_000, runtimeGiB: 11.01, downloadGiB: 6.3, capacityGiB: 109.5 }),
+      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 40.8, lower: 32.6, confidence: "moderate", context: 100_000, runtimeGiB: 16.55, downloadGiB: 13.3, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "qwen9", score: 29.2, fidelity: 40, expected: 18, context: 100_000, runtimeGiB: 12, downloadGiB: 5.7, capacityGiB: 109.5 }),
+      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 22, context: 100_000, runtimeGiB: 8, downloadGiB: 2.8, capacityGiB: 109.5 }),
+      candidate({ id: "gemma12", score: 21, fidelity: 58, expected: 20, context: 100_000, runtimeGiB: 9, downloadGiB: 6.3, capacityGiB: 109.5 }),
     ])
 
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
       ["laguna-q4-100", "balanced"],
       ["laguna-q6", "best_quality"],
-      ["qwen35", "fastest"],
-      ["gemma26", "lightweight"],
+      ["gemma26", "fastest"],
+      ["qwen9", "lightweight"],
     ])
   })
 
@@ -335,24 +318,6 @@ describe("local model multicriteria recommendation policy", () => {
     ])
   })
 
-  it("lets Fastest select a materially quicker 100K profile", () => {
-    const candidates = [
-      candidate({ id: "balanced", score: 50, expected: 30, context: 200_000, runtimeGiB: 30 }),
-      candidate({ id: "quick-100", checkpoint: "quick", artifact: "quick:q6", score: 45, expected: 50, context: 100_000, runtimeGiB: 28 }),
-      candidate({ id: "quick-200", checkpoint: "quick", artifact: "quick:q6", score: 45, expected: 32, context: 200_000, runtimeGiB: 30 }),
-    ]
-    const recommendations = selectRecommendationPortfolio(candidates)
-    expect(byIntent(recommendations, "fastest")?.configuration.profile.contextLength).toBe(100_000)
-
-    const catalog = assembleRecommendationCatalogCandidates(candidates, recommendations)
-    const fastestConfigurationId = byIntent(recommendations, "fastest")?.configuration.id
-    const fastest = catalog.find(({ assessment }) =>
-      assessment.configurationId === fastestConfigurationId)
-    expect(fastest?.profile.contextLength).toBe(100_000)
-    expect(catalog.filter(({ artifactId }) => artifactId === "quick:q6"))
-      .toHaveLength(1)
-  })
-
   it("uses confidence-aware conservative speed for Fastest", () => {
     const low = candidate({ id: "low-confidence", score: 45, expected: 100, lower: 16, confidence: "low" })
     const high = candidate({ id: "high-confidence", score: 45, expected: 50, lower: 40, confidence: "high" })
@@ -418,8 +383,6 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "balanced")?.explanation).toContain("Best overall mix")
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("more memory than Balanced")
     expect(byIntent(recommendations, "best_quality")?.explanation).toContain("slower than Balanced")
-    expect(byIntent(recommendations, "fastest")?.explanation)
-      .toContain("half as much context at once")
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("Retains good quality with some possible loss")
     expect(byIntent(recommendations, "lightweight")?.explanation)

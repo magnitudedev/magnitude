@@ -140,6 +140,7 @@ export const makeView = (options: {
   readonly models?: readonly LocalModel[]
   readonly recommendations?: readonly LocalModelRecommendation[]
   readonly catalogCandidates?: readonly LocalModelCatalogCandidate[]
+  readonly providerContextWindow?: number
   readonly allocation?: ModelInstanceAllocation
   readonly ready?: boolean
 } = {}): {
@@ -179,7 +180,7 @@ export const makeView = (options: {
         modelFamilyId: Option.none(),
         displayName: "Qwen Test",
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
-        contextWindow: 32_768,
+        contextWindow: options.providerContextWindow ?? 32_768,
         maxOutputTokens: 4_096,
         memory: Option.none(),
         capabilities: {

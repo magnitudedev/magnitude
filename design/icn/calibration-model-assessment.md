@@ -109,15 +109,15 @@ is not a model result and creates no cache entry.
 
 ## Profiles
 
-ACN requests:
+ACN chooses one profile for each target:
 
 ```text
-100,000 tokens · 200,000 tokens · exact target maximum
+min(100,000 tokens, exact target maximum)
 ```
 
-Values above the target maximum are removed; the maximum is added; duplicates are removed. A target
-below 100,000 is assessed only at its maximum. A pair uses the lower component maximum. ICN does not
-search a context range or choose a profile.
+This applies to release-catalog and discovered installed targets. A pair uses the lower component
+maximum. Profiles below 4,096 tokens are not submitted. ICN does not search a context range or
+choose a profile.
 
 ## Broad rejection proof
 

@@ -42,25 +42,26 @@ import {
 const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const ASSESSMENT_OPERATION_TIMEOUT_MS = 5 * 60 * 1_000
 const MINIMUM_CONTEXT_LENGTH = 4_096
-const STANDARD_CONTEXT_LENGTHS = [100_000, 200_000] as const
+const LOCAL_MODEL_CONTEXT_LENGTH = 100_000
+type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
-export const modelAssessmentProfiles = (
+const targetMaximumContextLength = (
   target: ModelOfferingTarget,
-): readonly ServingProfile[] => {
-  const maximumContextLength = target._tag === "Package"
+): number => target._tag === "Package"
     ? target.package.properties.maximumContextLength
     : Math.min(
         target.target.properties.maximumContextLength,
         target.draft.properties.maximumContextLength,
       )
-  return [...new Set([
-    ...STANDARD_CONTEXT_LENGTHS.filter((contextLength) =>
-      contextLength >= MINIMUM_CONTEXT_LENGTH && contextLength <= maximumContextLength),
-    ...(maximumContextLength >= MINIMUM_CONTEXT_LENGTH ? [maximumContextLength] : []),
-  ])]
-    .sort((left, right) => left - right)
-    .map((contextLength) => ({ contextLength }))
-}
+
+const assessmentProfile = (contextLength: number): AssessmentProfiles =>
+  contextLength >= MINIMUM_CONTEXT_LENGTH ? [{ contextLength }] : []
+
+export const localModelAssessmentProfiles = (
+  target: ModelOfferingTarget,
+): readonly ServingProfile[] => assessmentProfile(
+  Math.min(LOCAL_MODEL_CONTEXT_LENGTH, targetMaximumContextLength(target)),
+)
 
 export type LocalModelAssessment =
   | { readonly _tag: "Fits"; readonly assessment: FitsModelAssessment }

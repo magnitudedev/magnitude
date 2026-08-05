@@ -21,6 +21,7 @@ const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 type LocalInferenceSelectionBase = {
   readonly id: string
   readonly model: LocalModel
+  readonly contextLength: number
   readonly providerModelId: Option.Option<ProviderModelId>
   readonly reasoningEffort: Option.Option<ReasoningEffort>
 }
@@ -86,13 +87,11 @@ export const buildLocalInferenceSelections = (
     .filter(({ providerId, availability }) =>
       providerId === LOCAL_PROVIDER_ID && availability._tag === "Available")
     .map(({ providerModelId }) => providerModelId))
-  const preferredInstalledCandidates = models.recommendations._tag === "Ready"
+  const installedCandidates = models.recommendations._tag === "Ready"
     ? models.recommendations.catalog.reduce((selected, candidate) => {
         if (candidate.download._tag !== "Downloaded"
           || candidate.availability._tag !== "Available") return selected
-        const current = selected.get(candidate.targetId)
-        if (current === undefined
-          || candidate.profile.contextLength > current.profile.contextLength) {
+        if (!selected.has(candidate.targetId)) {
           selected.set(candidate.targetId, candidate)
         }
         return selected
@@ -100,7 +99,7 @@ export const buildLocalInferenceSelections = (
     : new Map<string, LocalModelCatalogCandidate>()
   const installed = models.models.flatMap((model): readonly LocalInferenceSelection[] => {
     if (model.download._tag !== "Downloaded") return []
-    const candidate = preferredInstalledCandidates.get(model.targetId)
+    const candidate = installedCandidates.get(model.targetId)
     const availableOfferings = model.offerings.filter(({ providerModelId }) =>
       localProviderIds.has(providerModelId))
     const offering = availableOfferings.find(({ providerModelId }) => running.has(providerModelId))
@@ -120,6 +119,9 @@ export const buildLocalInferenceSelections = (
       configurationId,
       recommendation: { _tag: "None" },
       providerModelId,
+      contextLength: providerModel?.contextWindow
+        ?? candidate?.profile.contextLength
+        ?? model.maximumContextLength,
       reasoningEffort: providerModel?.capabilities.reasoning.defaultEffort
         ?? candidate?.capabilities.reasoning.defaultEffort
         ?? Option.none(),
@@ -135,6 +137,7 @@ export const buildLocalInferenceSelections = (
           kind: "recommendation",
           model,
           recommendation: { _tag: "Recommended", value: recommendation },
+          contextLength: recommendation.candidate.profile.contextLength,
           providerModelId: Option.none(),
           reasoningEffort: recommendation.candidate.capabilities.reasoning.defaultEffort,
         }]
@@ -150,6 +153,7 @@ export const buildLocalInferenceSelections = (
       kind: "recommendation",
       model,
       recommendation: { _tag: "None" },
+      contextLength: model.maximumContextLength,
       providerModelId: Option.fromNullable(model.offerings[0]?.providerModelId),
       reasoningEffort: Option.none(),
     }))
@@ -370,11 +374,9 @@ export const describeLocalHardware = (
 
 export const selectionTitle = ({ model }: LocalInferenceSelection): string => model.displayName
 
-export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelection): string =>
+export const selectionMetadata = ({ model, contextLength }: LocalInferenceSelection): string =>
   `${model.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
-    recommendation._tag === "Recommended"
-      ? recommendation.value.candidate.profile.contextLength
-      : model.maximumContextLength,
+    contextLength,
   )} ctx`
 
 export const selectionCapacityWarning = ({ recommendation }: LocalInferenceSelection): string | null =>
