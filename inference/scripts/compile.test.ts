@@ -19,10 +19,15 @@ describe("ICN compilation", () => {
   test("targets only attached GPUs for local CUDA builds", () => {
     expect(developmentBuildEnvironment("cuda")).toEqual({
       CMAKE_CUDA_ARCHITECTURES: "native",
+      LLAMA_CPU_ALL_VARIANTS: "0",
     })
     expect(developmentBuildEnvironment("cpu")).toEqual({})
-    expect(developmentBuildEnvironment("metal")).toEqual({})
-    expect(developmentBuildEnvironment("vulkan")).toEqual({})
+    expect(developmentBuildEnvironment("metal")).toEqual({
+      LLAMA_CPU_ALL_VARIANTS: "0",
+    })
+    expect(developmentBuildEnvironment("vulkan")).toEqual({
+      LLAMA_CPU_ALL_VARIANTS: "0",
+    })
     expect(developmentBuildProfile("cuda")).toBe("development-cuda-native")
     expect(developmentBuildProfile("cpu")).toBe("development-cpu")
   })
