@@ -196,13 +196,13 @@ describe("local model multicriteria recommendation policy", () => {
     expect(byIntent(recommendations, "balanced")?.displayName).toBe("rounded-baseline")
   })
 
-  it("builds a useful 64 GiB-class portfolio with a usable dense quality option", () => {
+  it("builds a useful 64 GiB-class portfolio and prefers capability inside Lightweight", () => {
     const recommendations = selectRecommendationPortfolio([
-      candidate({ id: "qwen27", score: 60.7, fidelity: 40, expected: 11.7, context: 100_000, runtimeGiB: 35, downloadGiB: 33 }),
-      candidate({ id: "qwen35-q6", checkpoint: "qwen35", artifact: "qwen35:q6", score: 44.9, fidelity: 60, expected: 35.2, runtimeGiB: 34, downloadGiB: 29.7, architecture: "moe" }),
-      candidate({ id: "qwen35-q8", checkpoint: "qwen35", artifact: "qwen35:q8", score: 44.9, fidelity: 80, expected: 34.1, runtimeGiB: 41, downloadGiB: 35.8, architecture: "moe" }),
-      candidate({ id: "gemma26-100", checkpoint: "gemma26", score: 39, fidelity: 58, expected: 42, context: 100_000, runtimeGiB: 40, downloadGiB: 13.3, architecture: "moe" }),
-      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 29.7, runtimeGiB: 6, downloadGiB: 2.7 }),
+      candidate({ id: "qwen27", score: 60.7, fidelity: 50, expected: 10.9, context: 100_000, runtimeGiB: 26.68, downloadGiB: 18.9, capacityGiB: 57.6 }),
+      candidate({ id: "qwen35-q6", checkpoint: "qwen35", artifact: "qwen35:q6", score: 44.9, fidelity: 60, expected: 36.4, runtimeGiB: 35.72, downloadGiB: 30.4, capacityGiB: 57.6, architecture: "moe" }),
+      candidate({ id: "gemma26-100", checkpoint: "gemma26", score: 39, fidelity: 58, expected: 59.5, context: 100_000, runtimeGiB: 16.55, downloadGiB: 13.3, capacityGiB: 57.6, architecture: "moe" }),
+      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 31.2, runtimeGiB: 11.25, downloadGiB: 2.8, capacityGiB: 57.6 }),
+      candidate({ id: "gemma12", score: 21, fidelity: 58, expected: 29.8, runtimeGiB: 11.01, downloadGiB: 6.3, capacityGiB: 57.6 }),
     ])
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
       ["qwen35-q6", "balanced"],
@@ -214,18 +214,96 @@ describe("local model multicriteria recommendation policy", () => {
 
   it("builds a useful DGX Spark-class portfolio around the strongest responsive model", () => {
     const recommendations = selectRecommendationPortfolio([
-      candidate({ id: "laguna-100", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 26, context: 100_000, runtimeGiB: 90, downloadGiB: 73.4, capacityGiB: 121.7, architecture: "moe" }),
-      candidate({ id: "laguna-200", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 14, context: 200_000, runtimeGiB: 104, downloadGiB: 73.4, capacityGiB: 121.7, architecture: "moe" }),
-      candidate({ id: "qwen122", score: 47.6, fidelity: 40, expected: 16.87, context: 100_000, runtimeGiB: 84, downloadGiB: 71, capacityGiB: 121.7, architecture: "moe" }),
-      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 42.7, context: 100_000, runtimeGiB: 28, downloadGiB: 13.3, capacityGiB: 121.7, architecture: "moe" }),
-      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 21, context: 200_000, runtimeGiB: 6, downloadGiB: 2.7, capacityGiB: 121.7 }),
+      candidate({ id: "laguna-q4-100", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 12.1, context: 100_000, runtimeGiB: 73.41, downloadGiB: 68.4, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "laguna-q4-200", checkpoint: "laguna", artifact: "laguna:q4", score: 70.2, fidelity: 40, expected: 9, context: 200_000, runtimeGiB: 80, downloadGiB: 68.4, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "laguna-q6", checkpoint: "laguna", artifact: "laguna:q6", score: 70.2, fidelity: 60, expected: 10.8, context: 100_000, runtimeGiB: 104.78, downloadGiB: 99.7, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "qwen35", score: 44.9, fidelity: 40, expected: 28.9, context: 100_000, runtimeGiB: 24.12, downloadGiB: 21.3, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "gemma26", score: 39, fidelity: 58, expected: 19.4, context: 200_000, runtimeGiB: 18.47, downloadGiB: 13.3, capacityGiB: 109.5, architecture: "moe" }),
+      candidate({ id: "qwen9", score: 29.2, fidelity: 40, expected: 12.3, context: 200_000, runtimeGiB: 13.7, downloadGiB: 5.7, capacityGiB: 109.5 }),
+      candidate({ id: "qwen4", score: 25.8, fidelity: 40, expected: 15.3, context: 200_000, runtimeGiB: 11.22, downloadGiB: 2.8, capacityGiB: 109.5 }),
+      candidate({ id: "gemma12", score: 21, fidelity: 58, expected: 13.5, context: 200_000, runtimeGiB: 11.01, downloadGiB: 6.3, capacityGiB: 109.5 }),
     ])
 
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
-      ["laguna-200", "balanced"],
-      ["gemma26", "fastest"],
-      ["qwen4", "lightweight"],
+      ["laguna-q4-100", "balanced"],
+      ["laguna-q6", "best_quality"],
+      ["qwen35", "fastest"],
+      ["gemma26", "lightweight"],
     ])
+  })
+
+  it("does not let a new heavyweight capability ceiling downshift Lightweight", () => {
+    const lightweightCandidates = [
+      candidate({ id: "balanced", score: 50, expected: 40, runtimeGiB: 40, capacityGiB: 100 }),
+      candidate({ id: "capable-light", score: 39, expected: 30, runtimeGiB: 18, capacityGiB: 100 }),
+      candidate({ id: "tiny", score: 25.8, expected: 35, runtimeGiB: 8, capacityGiB: 100 }),
+    ]
+    const before = selectRecommendationPortfolio(lightweightCandidates)
+    const after = selectRecommendationPortfolio([
+      ...lightweightCandidates,
+      candidate({ id: "heavyweight", score: 90, expected: 11, runtimeGiB: 85, capacityGiB: 100 }),
+    ])
+
+    expect(byIntent(before, "lightweight")?.displayName).toBe("capable-light")
+    expect(byIntent(after, "lightweight")?.displayName).toBe("capable-light")
+  })
+
+  it("omits Lightweight when no unselected candidate is inside its memory tier", () => {
+    const recommendations = selectRecommendationPortfolio([
+      candidate({ id: "balanced", score: 50, expected: 30, runtimeGiB: 50, capacityGiB: 100 }),
+      candidate({ id: "smaller", score: 40, expected: 25, runtimeGiB: 25, capacityGiB: 100 }),
+    ])
+
+    expect(byIntent(recommendations, "lightweight")).toBeUndefined()
+  })
+
+  it("omits Lightweight when an in-tier candidate is not materially lighter than Balanced", () => {
+    const recommendations = selectRecommendationPortfolio([
+      candidate({ id: "balanced", score: 50, expected: 40, runtimeGiB: 19, capacityGiB: 100 }),
+      candidate({ id: "almost-as-heavy", score: 40, expected: 30, runtimeGiB: 15.5, capacityGiB: 100 }),
+    ])
+
+    expect(byIntent(recommendations, "lightweight")).toBeUndefined()
+  })
+
+  it("applies the Lightweight tier independently to each physical memory domain", () => {
+    const splitBase = candidate({
+      id: "device-heavy",
+      score: 40,
+      expected: 30,
+      runtimeGiB: 18,
+      capacityGiB: 100,
+    })
+    const split = {
+      ...splitBase,
+      assessment: {
+        ...splitBase.assessment,
+        memory: [
+          {
+            memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("system"),
+            capacityBytes: 80 * GIB,
+            requiredBytes: 8 * GIB,
+            compatibilityReserveBytes: 0,
+            warningReserveBytes: 0,
+            remainingBytes: 72 * GIB,
+          },
+          {
+            memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("device"),
+            capacityBytes: 20 * GIB,
+            requiredBytes: 10 * GIB,
+            compatibilityReserveBytes: 0,
+            warningReserveBytes: 0,
+            remainingBytes: 10 * GIB,
+          },
+        ],
+      },
+    }
+    const recommendations = selectRecommendationPortfolio([
+      candidate({ id: "balanced", score: 50, expected: 40, runtimeGiB: 60, capacityGiB: 100 }),
+      split,
+    ])
+
+    expect(byIntent(recommendations, "lightweight")).toBeUndefined()
   })
 
   it("lets responsiveness outweigh a modest capability lead inside the Balanced guard", () => {

@@ -12,6 +12,8 @@ export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 10
 const MAX_RECOMMENDATIONS = 4
 const SPEED_UTILITY_CEILING = 60
 const DOWNLOAD_UTILITY_BYTES = 16 * 1024 ** 3
+const LIGHTWEIGHT_CAPACITY_RATIO = 0.2
+const LIGHTWEIGHT_BALANCED_MEMORY_RATIO = 0.8
 
 export interface RecommendationCandidate {
   readonly model: RecommendableModel
@@ -121,14 +123,6 @@ const withinCapabilityGuard = (
   return candidates.filter((candidate) => (capabilityScore(candidate) ?? floor) >= floor)
 }
 
-const lightweightCapabilityGuard = (
-  candidates: readonly RecommendationCandidate[],
-): readonly RecommendationCandidate[] => {
-  const guarded = withinCapabilityGuard(candidates, 45, 0.3)
-    .filter((candidate) => (capabilityScore(candidate) ?? 20) >= 20)
-  return guarded.length > 0 ? guarded : candidates
-}
-
 const clamp = (value: number): number => Math.max(0, Math.min(1, value))
 
 const speedUtility = (tokensPerSecond: number): number => clamp(
@@ -211,6 +205,31 @@ const materiallyLighterThan = (
   ratio: number,
 ): boolean => candidate.estimatedLoadedBytes <= reference.estimatedLoadedBytes * ratio
   || candidate.totalDownloadBytes <= reference.totalDownloadBytes * ratio
+
+const lightweightMemoryShare = (
+  candidate: RecommendationCandidate,
+): number => Math.max(
+  0,
+  ...candidate.assessment.memory.map((domain) => domain.requiredBytes
+    / Math.max(1, domain.capacityBytes - domain.compatibilityReserveBytes)),
+)
+
+const withinLightweightMemoryTier = (
+  candidate: RecommendationCandidate,
+  balanced: RecommendationCandidate,
+): boolean => lightweightMemoryShare(candidate) <= LIGHTWEIGHT_CAPACITY_RATIO
+  && candidate.estimatedLoadedBytes
+    <= balanced.estimatedLoadedBytes * LIGHTWEIGHT_BALANCED_MEMORY_RATIO
+
+const compareLightweight = (
+  left: RecommendationCandidate,
+  right: RecommendationCandidate,
+): number => (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
+  || left.estimatedLoadedBytes - right.estimatedLoadedBytes
+  || right.fidelityRank - left.fidelityRank
+  || conservativeGenerationSpeed(right) - conservativeGenerationSpeed(left)
+  || left.totalDownloadBytes - right.totalDownloadBytes
+  || stableCompare(left, right)
 
 const percentDifference = (value: number, reference: number): number => Math.round(
   Math.abs(value / Math.max(1, reference) - 1) * 100,
@@ -406,19 +425,13 @@ export const selectRecommendationPortfolio = (
     usedCheckpointIds.add(fastest.checkpointId)
   }
 
-  const lightweightCapable = lightweightCapabilityGuard(largestContexts)
+  const lightweightCapable = largestContexts
     .filter((candidate) =>
-      !selectedConfigurations.has(candidate.assessment.configurationId))
-    .sort((left, right) => left.estimatedLoadedBytes - right.estimatedLoadedBytes
-      || left.totalDownloadBytes - right.totalDownloadBytes
-      || (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
-      || right.fidelityRank - left.fidelityRank
-      || stableCompare(left, right))
-  const lightestLoaded = lightweightCapable.at(0)?.estimatedLoadedBytes ?? 0
-  const nearLightest = lightweightCapable.filter((candidate) =>
-    candidate.estimatedLoadedBytes <= lightestLoaded * 1.15)
-  const lightweight = preferNewCheckpointWithin(nearLightest, usedCheckpointIds)
-  if (lightweight && materiallyLighterThan(lightweight, balanced, 0.8)) {
+      !selectedConfigurations.has(candidate.assessment.configurationId)
+      && withinLightweightMemoryTier(candidate, balanced))
+    .sort(compareLightweight)
+  const lightweight = lightweightCapable.at(0)
+  if (lightweight) {
     selected.push({ candidate: lightweight, intent: "lightweight" })
   }
 
