@@ -21,8 +21,10 @@ export type LocalIcnBackend = "cpu" | "cuda" | "metal" | "vulkan";
 
 export const developmentBuildEnvironment = (
   backend: LocalIcnBackend
-): Readonly<Record<string, string>> =>
-  backend === "cuda" ? { CMAKE_CUDA_ARCHITECTURES: "native" } : {};
+): Readonly<Record<string, string>> => ({
+  ...(backend === "cpu" ? {} : { LLAMA_CPU_ALL_VARIANTS: "0" }),
+  ...(backend === "cuda" ? { CMAKE_CUDA_ARCHITECTURES: "native" } : {}),
+});
 
 export const developmentBuildProfile = (backend: LocalIcnBackend): string =>
   `development-${backend}${backend === "cuda" ? "-native" : ""}`;

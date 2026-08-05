@@ -235,9 +235,10 @@ declared accelerator family, required devices register, and planner inputs are c
 `inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`
 may instead name another `installation.json`; no separate executable or runtime path exists.
 Development preparation may accept an explicit backend override, but that policy is not part of
-production release coordinates. A local CUDA development installation compiles only for the GPUs
-attached to the development host; the portable architecture matrices declared by release backend
-packs are exclusively release concerns.
+production release coordinates. An accelerator-backed local development installation builds one
+baseline CPU companion and compiles CUDA only for GPUs attached to the development host. Portable
+CPU and accelerator architecture matrices declared by release backend packs are exclusively
+release concerns.
 
 Compatibility is established by a versioned ICN API protocol identity plus the release's expected
 native build identity. It is not inferred merely because `/health` returned 200, and it need not
