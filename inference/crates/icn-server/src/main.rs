@@ -1784,17 +1784,6 @@ struct AssessmentEnvironment {
     topology: icn_contracts::MemoryTopology,
 }
 
-fn reusable_model_assessment(assessment: ModelAssessment) -> Option<ModelAssessment> {
-    match assessment {
-        // Native fallback placement currently observes process-local free memory. A successful
-        // plan is rechecked against stable topology and remains reusable; incompatibility is an
-        // artifact/runtime fact. A non-fit may only reflect transient contention, so it is not
-        // reusable until the binding can plan against an explicit capacity input.
-        ModelAssessment::Fits { .. } | ModelAssessment::Incompatible { .. } => Some(assessment),
-        ModelAssessment::DoesNotFit { .. } => None,
-    }
-}
-
 impl NativeModelAssessor {
     fn new(
         models: Arc<ModelManager>,
@@ -1913,7 +1902,6 @@ impl NativeModelAssessor {
             .map(|key| {
                 self.models
                     .read_model_assessment(key, &environment.topology)
-                    .and_then(reusable_model_assessment)
             })
             .collect::<Option<Vec<_>>>();
         tracing::info!(
@@ -1959,11 +1947,7 @@ impl NativeModelAssessor {
             let _gate = gate;
             let mut results = evidence
                 .iter()
-                .map(|key| {
-                    models
-                        .read_model_assessment(key, &environment.topology)
-                        .and_then(reusable_model_assessment)
-                })
+                .map(|key| models.read_model_assessment(key, &environment.topology))
                 .collect::<Vec<_>>();
             let missing = results
                 .iter()
@@ -2014,9 +1998,7 @@ impl NativeModelAssessor {
                     thresholds.warning_reserve_bytes,
                     assessment,
                 )?;
-                if !matches!(assessment, ModelAssessment::DoesNotFit { .. }) {
-                    models.write_model_assessment(&evidence[index], &assessment);
-                }
+                models.write_model_assessment(&evidence[index], &assessment);
                 results[index] = Some(assessment);
             }
             results

@@ -43,13 +43,14 @@ physical capacity. Uncertain targets proceed. File/download size is not rejectio
 
 ACN exposes one assessment service accepting a batch of exact targets and profiles. It owns the
 scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
-Recommendation generation and installed-model offering setup use this service; neither implements
-an assessment path of its own.
+One catalog projection assesses release-catalog and discovered installed targets together;
+recommendation policy consumes the release-catalog candidates from that projection.
 
-ICN persists exact profile results and performs single-flight native work. Repeated reads consume
-current results and do not trigger assessment.
+ICN persists every completed exact profile result, including `DoesNotFit`, and performs
+single-flight native work. Repeated reads consume current results and do not trigger native
+assessment.
 
-Recommendation generation and offering projection are scoped background consumers. Constructing
+Candidate and recommendation projection is a scoped background consumer. Constructing
 ACN services publishes their initial observable state without waiting for assessment; only the
 operation owner awaits its bounded request.
 
@@ -107,4 +108,4 @@ Cached assessment never authorizes loading.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
 - Candidate identity remains the serving-configuration identity.
 - Loading never treats cached assessment as admission authority.
-- ACN startup and service publication never wait for recommendation or offering assessment.
+- ACN startup and service publication never wait for model assessment.
