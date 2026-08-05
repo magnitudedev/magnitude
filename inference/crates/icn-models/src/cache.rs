@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
+use icn_contracts::models::ModelAssessment;
 use icn_contracts::{ContentId, HardwareAssessment, MemoryTopology, ModelExecutionAssessment};
 use icn_utils::file_cache::{
     read_bytes, read_json, read_object, write_bytes_atomic, write_json_atomic,
@@ -190,6 +191,19 @@ impl ModelCache {
         }
     }
 
+    pub fn read_model_assessment(
+        &self,
+        evidence: &str,
+        topology: &MemoryTopology,
+    ) -> Option<ModelAssessment> {
+        self.read_index(ModelIndexKind::ModelAssessment, evidence)
+            .filter(|assessment: &ModelAssessment| assessment.is_valid_for(topology))
+    }
+
+    pub fn write_model_assessment(&self, evidence: &str, assessment: &ModelAssessment) {
+        self.write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
+    }
+
     pub fn read_blob(&self, kind: ModelBlobKind, digest: &str) -> Option<Vec<u8>> {
         valid_digest(digest)
             .then(|| read_bytes(&self.blob_path(kind, digest), MAX_BLOB_BYTES))
@@ -306,6 +320,11 @@ fn valid_digest(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::system_memory_topology;
+    use icn_contracts::MemoryDomainId;
+    use icn_contracts::models::{
+        MemoryAssessment, ModelAssessmentId, ModelServingConfigurationId, PerformanceConfidence,
+        PerformanceEvidence, ServingProfile,
+    };
 
     #[test]
     fn namespaces_are_typed_and_fail_as_misses() {
@@ -438,6 +457,66 @@ mod tests {
             path
         };
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn fitting_target_with_non_fitting_sibling_profiles_survives_cache_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let topology = system_memory_topology(100);
+        let fits = ModelAssessment::Fits {
+            profile: ServingProfile {
+                context_length: 50_000,
+            },
+            configuration_id: ModelServingConfigurationId("fits-configuration".to_owned()),
+            assessment_id: ModelAssessmentId("fits-assessment".to_owned()),
+            memory: vec![MemoryAssessment {
+                memory_domain_id: MemoryDomainId::system(),
+                capacity_bytes: 100,
+                required_bytes: 50,
+                compatibility_reserve_bytes: 0,
+                warning_reserve_bytes: 0,
+                remaining_bytes: 50,
+            }],
+            performance: PerformanceEvidence {
+                context_tokens: 50_000,
+                lower_tokens_per_second: 1.0,
+                estimated_tokens_per_second: 2.0,
+                upper_tokens_per_second: 3.0,
+                confidence: PerformanceConfidence::Low,
+            },
+        };
+        let does_not_fit = ModelAssessment::DoesNotFit {
+            profile: ServingProfile {
+                context_length: 100_000,
+            },
+            configuration_id: ModelServingConfigurationId("non-fit-configuration".to_owned()),
+            assessment_id: ModelAssessmentId("non-fit-assessment".to_owned()),
+            memory: vec![MemoryAssessment {
+                memory_domain_id: MemoryDomainId::system(),
+                capacity_bytes: 100,
+                required_bytes: 101,
+                compatibility_reserve_bytes: 0,
+                warning_reserve_bytes: 0,
+                remaining_bytes: -1,
+            }],
+            limiting_resource: "system memory".to_owned(),
+            deficit_bytes: 1,
+        };
+
+        let initial = ModelCache::new(directory.path());
+        initial.write_model_assessment("fits evidence", &fits);
+        initial.write_model_assessment("non-fit evidence", &does_not_fit);
+
+        let reopened = ModelCache::new(directory.path());
+
+        assert_eq!(
+            reopened.read_model_assessment("fits evidence", &topology),
+            Some(fits),
+        );
+        assert_eq!(
+            reopened.read_model_assessment("non-fit evidence", &topology),
+            Some(does_not_fit),
+        );
     }
 
     #[test]

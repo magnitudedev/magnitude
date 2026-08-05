@@ -519,10 +519,7 @@ impl ModelManager {
         {
             return Some(assessment);
         }
-        let assessment = self
-            .cache
-            .read_index(ModelIndexKind::ModelAssessment, evidence)
-            .filter(|assessment: &ModelAssessment| assessment.is_valid_for(topology))?;
+        let assessment = self.cache.read_model_assessment(evidence, topology)?;
         self.model_assessments
             .write()
             .ok()?
@@ -534,8 +531,7 @@ impl ModelManager {
         if let Ok(mut memory) = self.model_assessments.write() {
             memory.insert(evidence.to_owned(), assessment.clone());
         }
-        self.cache
-            .write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
+        self.cache.write_model_assessment(evidence, assessment);
     }
 
     pub(crate) async fn installed_package(

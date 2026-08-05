@@ -140,26 +140,13 @@ Assessment captures one topology and reserve policy. Memory evidence charges mod
 compute, workspace, projector, target, and draft allocations to canonical physical domains and
 device constraints.
 
-The current native fallback planner observes process-local capacity; its public interface does not
-accept an explicit capacity vector. Therefore:
-
-- a `Fits` result is reusable only after validation against stable topology;
-- `Incompatible` is reusable for the same artifact/runtime identity;
-- native `DoesNotFit` is not reused because transient contention may have caused it.
+Assessment results are validated against the captured topology and capacity policy before reuse.
+`Fits`, `DoesNotFit`, and `Incompatible` are completed results and are reusable for the exact
+assessment identity. Live availability never participates in assessment cache validity.
 
 Load admission always performs fresh planning against current availability. Cached assessment never
 authorizes residency. Explicit stable-capacity native planning may be added only through a proven
 binding-level facility; it must not require changes to the nested llama.cpp core.
-
-### Known issue: alternate-placement capacity
-
-Model assessment currently misuses llama.cpp `common_fit` for alternate-placement planning.
-`common_fit` plans against available process-local memory, while assessment must plan against
-hardware calibration's stable capacity. Consequently, transient device use can change this branch's
-placement or `DoesNotFit` result; those `DoesNotFit` results are not persisted.
-
-Fix this with an explicit-capacity planner at the binding boundary. Live available memory belongs
-only to load admission. Do not patch the nested llama.cpp core.
 
 ## Planning-worker pool
 
@@ -214,9 +201,8 @@ Equivalent target/environment misses share one gate and recheck the cache after 
 corruption is a miss. Process-local parsed model state is reused only within its batch and is not
 serialized.
 
-Stable-topology-checked `Fits` and artifact/runtime `Incompatible` results are persisted. Native
-`DoesNotFit` remains terminal evidence for its request but is not persisted while its capacity input
-is volatile.
+Stable-topology-checked `Fits`, `DoesNotFit`, and artifact/runtime `Incompatible` results are
+persisted. Operational failures are never persisted.
 
 ## Product behavior
 
@@ -232,6 +218,7 @@ is volatile.
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-target job returns one result per requested profile.
 - Warm exact-cache reads invoke no native planner.
+- Warm `DoesNotFit` cache reads invoke no native planner.
 - No domain result represents an operational defect.
 - `Assessing` cannot survive its owning Effect scope.
 - Queueing, native work, caller completion, and child cleanup are all bounded.
