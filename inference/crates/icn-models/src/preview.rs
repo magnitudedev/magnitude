@@ -527,9 +527,19 @@ fn validate_preview_request(request: &ModelPreviewRequest) -> Result<(), Invento
             || profile.context_length > MAX_PREVIEW_CONTEXT_TOKENS
             || profile.parallel_sequences == 0
             || profile.parallel_sequences > MAX_PREVIEW_PARALLEL_SEQUENCES
+            || profile.performance_context_tokens.is_empty()
+            || profile.performance_context_tokens.last() != Some(&profile.context_length)
+            || profile
+                .performance_context_tokens
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || profile
+                .performance_context_tokens
+                .iter()
+                .any(|context| *context == 0 || *context > profile.context_length)
     }) {
         return Err(InventoryError::InvalidRequest(
-            "preview profiles require IDs, context, and parallelism".to_owned(),
+            "preview profiles require IDs, context, parallelism, and ordered performance samples ending at the profile context".to_owned(),
         ));
     }
     let mut ids = std::collections::BTreeSet::new();
@@ -2028,7 +2038,7 @@ mod tests {
                     .map(|(hardware, context_tokens)| {
                         icn_contracts::ModelExecutionAssessment::Executable {
                             hardware,
-                            performance: icn_contracts::GenerationPerformanceAssessment {
+                            performance: vec![icn_contracts::GenerationPerformanceAssessment {
                                 confidence: icn_contracts::GenerationPerformanceConfidence::Low,
                                 workload: "baseline_single_sequence_decode".to_owned(),
                                 always_active_weight_bytes: 1,
@@ -2041,7 +2051,7 @@ mod tests {
                                 lower_tokens_per_second: 1.0,
                                 expected_tokens_per_second: 2.0,
                                 upper_tokens_per_second: 3.0,
-                            },
+                            }],
                         }
                     })
                     .collect())
@@ -2095,6 +2105,7 @@ mod tests {
             id: "profile".to_owned(),
             context_length: 4096,
             parallel_sequences: 1,
+            performance_context_tokens: vec![4096],
         };
         assert!(
             validate_preview_request(&ModelPreviewRequest {
@@ -2120,6 +2131,31 @@ mod tests {
             })
             .is_err()
         );
+        for performance_context_tokens in [
+            Vec::new(),
+            vec![4096, 2048],
+            vec![2048, 2048, 4096],
+            vec![2048],
+            vec![2048, 8192],
+        ] {
+            assert!(
+                validate_preview_request(&ModelPreviewRequest {
+                    source: ModelPreviewSource {
+                        repository: "owner/repository".to_owned(),
+                        revision: "a".repeat(40),
+                        primary_gguf: PathBuf::from("model.gguf"),
+                        additional_components: Vec::new(),
+                    },
+                    profiles: vec![icn_contracts::ModelPreviewProfile {
+                        id: "invalid-performance-contexts".to_owned(),
+                        context_length: 4096,
+                        parallel_sequences: 1,
+                        performance_context_tokens,
+                    }],
+                })
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -2360,7 +2396,7 @@ mod tests {
 
         let execution = icn_contracts::ModelExecutionAssessment::Executable {
             hardware: assessment.clone(),
-            performance: icn_contracts::GenerationPerformanceAssessment {
+            performance: vec![icn_contracts::GenerationPerformanceAssessment {
                 confidence: icn_contracts::GenerationPerformanceConfidence::Low,
                 workload: "baseline_single_sequence_decode".to_owned(),
                 always_active_weight_bytes: 1,
@@ -2373,7 +2409,7 @@ mod tests {
                 lower_tokens_per_second: 1.0,
                 expected_tokens_per_second: 2.0,
                 upper_tokens_per_second: 3.0,
-            },
+            }],
         };
         manager
             .cache
@@ -2450,6 +2486,7 @@ mod tests {
                 id: "profile".to_owned(),
                 context_length: 4096,
                 parallel_sequences: 1,
+                performance_context_tokens: vec![4096],
             }],
         };
         let (first, second) = tokio::join!(

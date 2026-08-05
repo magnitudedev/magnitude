@@ -190,6 +190,44 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     ? `${tokens / 1_024}K`
     : `${Math.round(tokens / 1_000)}K`
 
+export const performanceRange = (
+  candidate: LocalModelCatalogCandidate,
+): {
+  readonly lowerContext: number
+  readonly upperContext: number
+  readonly lowerTokensPerSecond: number
+  readonly upperTokensPerSecond: number
+} => {
+  const lowerContext = Math.min(25_000, candidate.profile.contextLength)
+  const upperContext = Math.min(75_000, candidate.profile.contextLength)
+  const lowerSample = candidate.performance.find(({ contextTokens }) =>
+    contextTokens === lowerContext)!
+  const upperSample = candidate.performance.find(({ contextTokens }) =>
+    contextTokens === upperContext)!
+  return {
+    lowerContext,
+    upperContext,
+    lowerTokensPerSecond: Math.min(
+      lowerSample.estimatedTokensPerSecond,
+      upperSample.estimatedTokensPerSecond,
+    ),
+    upperTokensPerSecond: Math.max(
+      lowerSample.estimatedTokensPerSecond,
+      upperSample.estimatedTokensPerSecond,
+    ),
+  }
+}
+
+export const performanceRangeSpeedLabel = (
+  candidate: LocalModelCatalogCandidate,
+  unit = "tok/s",
+): string => {
+  const range = performanceRange(candidate)
+  return Math.round(range.lowerTokensPerSecond) === Math.round(range.upperTokensPerSecond)
+    ? `~${Math.round(range.lowerTokensPerSecond)} ${unit}`
+    : `~${Math.round(range.lowerTokensPerSecond)}–${Math.round(range.upperTokensPerSecond)} ${unit}`
+}
+
 const progressLabel = (
   step: LocalModelRecommendationProgressStep,
   completed: boolean,

@@ -22,8 +22,11 @@ hardware evidence. No model weights are downloaded until the user chooses a mode
 For each usage choice the ICN recipe service submits the applicable context and parallel-sequence
 profiles to preview. Catalog and discovered local models use one 100K context configuration,
 bounded by the model's native maximum, for fit, catalog availability, recommendations, and loading.
-Recommendations require at least 10 expected baseline tokens per second at their configured
-context. The service ranks
+Each configuration carries speed estimates at 25K, 50K, 75K, and full context, with points above
+its configured context omitted. Recommendations require at least 8 expected baseline tokens per
+second at full context. Ranking and relative speed comparisons use the 50K estimate, bounded by the
+configured context. The UI shows the expected-speed range between the bounded 25K and 75K points.
+The service ranks
 eligible candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using
 common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
 fidelity, and download size. Multiple quantizations of one checkpoint may appear when they explain

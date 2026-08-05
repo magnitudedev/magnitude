@@ -14,9 +14,9 @@ applies_to:
 
 ## Contract
 
-ICN estimates single-user decode throughput for one exact assessed profile. The estimate is advisory
-recommendation evidence. It never changes capacity, authorizes loading, or replaces observed runtime
-timing.
+ICN estimates single-user decode throughput at several occupied-context depths for one exact
+assessed profile. The ordered estimates are advisory recommendation evidence. They never change
+capacity, authorize loading, or replace observed runtime timing.
 
 | Layer | Responsibility |
 |---|---|
@@ -31,9 +31,10 @@ final arithmetic is cheap; obtaining exact inputs is not.
 
 ## Scope
 
-The estimate models baseline autoregressive decode for one sequence and one generated token at the
-profile's configured context capacity. It excludes prompt processing, sampling, transport,
-speculative acceptance, and concurrent scheduling. Exclusions are serialized with the result.
+Each sample models baseline autoregressive decode for one sequence and one generated token at its
+requested occupied-context depth. It excludes prompt processing, sampling, transport, speculative
+acceptance, and concurrent scheduling. The serving profile still owns capacity and fit; performance
+samples do not create additional serving configurations.
 
 No tensor payload is read and no inference or model benchmark runs.
 
@@ -64,8 +65,9 @@ defects. MLA never fabricates a V row; conventional attention never accepts a pa
 - every term uses calibration for its actual fitted device.
 
 Time is derived from calibrated operation throughput and dispatch cost. The reciprocal of total
-predicted seconds is the expected rate. Versioned efficiency factors cover unmeasured elementwise,
-selection, gather, compression, and cross-domain work.
+predicted seconds is the expected rate. The same exact native workload is evaluated at each requested
+depth, so additional samples require no additional context graph. Versioned efficiency factors cover
+unmeasured elementwise, selection, gather, compression, and cross-domain work.
 
 Every result contains finite positive lower, expected, and upper rates with
 `lower <= expected <= upper`, plus `high`, `moderate`, or `low` confidence. Calibration dispersion,
@@ -88,7 +90,7 @@ Performance evidence from a stable-topology-validated `Fits` result is cached wi
 assessment. Identity covers:
 
 - target content and workload schema;
-- exact profile and context;
+- exact profile and ordered performance sample depths;
 - calibration method and concrete metric digest;
 - native build, enabled backends, topology, stable capacity, placement, and execution policy; and
 - estimator method.
@@ -105,6 +107,8 @@ reused while fallback placement can observe process-local free memory.
 - Dense, routed, recurrent, conventional-attention, MLA, compressed, sparse, unified-memory, and
   cross-domain paths have deterministic fixture coverage.
 - Increasing active traffic cannot improve an otherwise identical estimate.
+- Performance samples are strictly ordered by context and end at the configured context.
+- Multiple performance depths for one profile reuse one exact native workload.
 - Recurrent state is never multiplied by context depth.
 - MTP/NextN storage does not affect baseline target decode unless explicitly executed.
 - One same-target assessment batch reuses its native model across all missing profiles.

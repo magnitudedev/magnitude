@@ -99,7 +99,9 @@ export type AssessmentEnvironmentId = S.Schema.Type<typeof AssessmentEnvironment
 export type AssessmentEnvironmentIdEncoded = S.Schema.Encoded<typeof AssessmentEnvironmentId>
 
 export const AssessModelRequest = S.Struct({
-  profiles: S.Array(S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile)),
+  profiles: S.Array(
+    S.suspend((): S.Schema<ModelAssessmentProfile, ModelAssessmentProfileEncoded> => ModelAssessmentProfile),
+  ),
   requestId: S.suspend(
     (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
   ),
@@ -1064,7 +1066,9 @@ export const ModelAssessment = S.Union(
         (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
       ),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
+      performance: S.Array(
+        S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
+      ),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1099,6 +1103,13 @@ export type ModelAssessmentEncoded = S.Schema.Encoded<typeof ModelAssessment>
 export const ModelAssessmentId = S.String
 export type ModelAssessmentId = S.Schema.Type<typeof ModelAssessmentId>
 export type ModelAssessmentIdEncoded = S.Schema.Encoded<typeof ModelAssessmentId>
+
+export const ModelAssessmentProfile = S.Struct({
+  performanceContextTokens: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
+  profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+})
+export type ModelAssessmentProfile = S.Schema.Type<typeof ModelAssessmentProfile>
+export type ModelAssessmentProfileEncoded = S.Schema.Encoded<typeof ModelAssessmentProfile>
 
 export const ModelAssessmentRequestId = S.String
 export type ModelAssessmentRequestId = S.Schema.Type<typeof ModelAssessmentRequestId>

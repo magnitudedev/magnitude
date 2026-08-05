@@ -518,7 +518,7 @@ pub struct GenerationPerformanceAssessment {
 pub enum ModelExecutionAssessment {
     Executable {
         hardware: HardwareAssessment,
-        performance: GenerationPerformanceAssessment,
+        performance: Vec<GenerationPerformanceAssessment>,
     },
     NotExecutable {
         hardware: HardwareAssessment,
@@ -1337,6 +1337,7 @@ pub struct ModelPreviewProfile {
     pub id: String,
     pub context_length: u32,
     pub parallel_sequences: u32,
+    pub performance_context_tokens: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

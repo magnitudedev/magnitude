@@ -161,10 +161,7 @@ const catalogProjection = (
       fidelityRank: candidate.fidelityRank,
       qualityEvidence: candidate.model.qualityEvidence,
     }),
-    lowerTokensPerSecond: candidate.assessment.performance.lowerTokensPerSecond,
-    estimatedTokensPerSecond: candidate.assessment.performance.estimatedTokensPerSecond,
-    upperTokensPerSecond: candidate.assessment.performance.upperTokensPerSecond,
-    performanceConfidence: candidate.assessment.performance.confidence,
+    performance: candidate.assessment.performance,
     capabilities: candidate.model.capabilities,
     sources: targetPackages(candidate.model).map((modelPackage) => ({
       source: modelPackage.source,
@@ -208,10 +205,7 @@ const installedCatalogProjection = (
       quantizationName: packages.map(({ properties }) => properties.quantizationName).join(" + "),
       memory: assessment.memory,
       recommendationEvidence: Option.none(),
-      lowerTokensPerSecond: assessment.performance.lowerTokensPerSecond,
-      estimatedTokensPerSecond: assessment.performance.estimatedTokensPerSecond,
-      upperTokensPerSecond: assessment.performance.upperTokensPerSecond,
-      performanceConfidence: assessment.performance.confidence,
+      performance: assessment.performance,
       capabilities: model.capabilities,
       sources: packages.map((modelPackage) => ({
         source: modelPackage.source,

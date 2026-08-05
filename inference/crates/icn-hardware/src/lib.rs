@@ -1006,8 +1006,8 @@ fn generation_performance(
     devices: &[FitDeviceEstimate],
     topology: &MemoryTopology,
     calibration: &HardwareCalibration,
-    context_tokens: u32,
-) -> Result<GenerationPerformanceAssessment, PerformanceEstimateFailure> {
+    context_tokens: &[u32],
+) -> Result<Vec<GenerationPerformanceAssessment>, PerformanceEstimateFailure> {
     let workload = match decode_workload {
         DecodeWorkloadAssessment::Available { workload } => workload,
         DecodeWorkloadAssessment::Unavailable { reason } => {
@@ -1019,12 +1019,17 @@ fn generation_performance(
     };
     let cross_memory_domain_placement =
         workload_crosses_memory_domains(workload, devices, topology)?;
-    estimate_generation_performance(
-        workload,
-        calibration,
-        context_tokens,
-        cross_memory_domain_placement,
-    )
+    context_tokens
+        .iter()
+        .map(|context_tokens| {
+            estimate_generation_performance(
+                workload,
+                calibration,
+                *context_tokens,
+                cross_memory_domain_placement,
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1770,10 +1775,12 @@ pub fn assess_profiles_with_backend(
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
 ) -> Result<Vec<HardwareAssessment>, AssessmentError> {
-    Ok(assess_profiles_impl(backend, topology, requested, None)?
-        .into_iter()
-        .map(|assessment| assessment.hardware)
-        .collect())
+    Ok(
+        assess_profiles_impl(backend, topology, requested, None, &[])?
+            .into_iter()
+            .map(|assessment| assessment.hardware)
+            .collect(),
+    )
 }
 
 /// Assess several product profiles and attach native baseline-decode performance evidence.
@@ -1782,24 +1789,31 @@ pub fn assess_execution_profiles_with_backend(
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
     calibration: &HardwareCalibration,
+    performance_context_tokens: &[Vec<u32>],
 ) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
-    assess_profiles_impl(backend, topology, requested, Some(calibration))?
-        .into_iter()
-        .map(|assessment| match assessment.performance {
-            Some(performance) => Ok(ModelExecutionAssessment::Executable {
-                hardware: assessment.hardware,
-                performance,
-            }),
-            None => Ok(ModelExecutionAssessment::NotExecutable {
-                hardware: assessment.hardware,
-            }),
-        })
-        .collect()
+    assess_profiles_impl(
+        backend,
+        topology,
+        requested,
+        Some(calibration),
+        performance_context_tokens,
+    )?
+    .into_iter()
+    .map(|assessment| match assessment.performance {
+        Some(performance) => Ok(ModelExecutionAssessment::Executable {
+            hardware: assessment.hardware,
+            performance,
+        }),
+        None => Ok(ModelExecutionAssessment::NotExecutable {
+            hardware: assessment.hardware,
+        }),
+    })
+    .collect()
 }
 
 struct ProfileAssessment {
     hardware: HardwareAssessment,
-    performance: Option<GenerationPerformanceAssessment>,
+    performance: Option<Vec<GenerationPerformanceAssessment>>,
 }
 
 fn assess_profiles_impl(
@@ -1807,9 +1821,16 @@ fn assess_profiles_impl(
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
     calibration: Option<&HardwareCalibration>,
+    performance_context_tokens: &[Vec<u32>],
 ) -> Result<Vec<ProfileAssessment>, AssessmentError> {
     if requested.is_empty() {
         return Ok(Vec::new());
+    }
+    if calibration.is_some() && performance_context_tokens.len() != requested.len() {
+        return Err(AssessmentError::PerformanceEstimate {
+            code: "invalid_performance_contexts",
+            message: "performance sample contexts did not match assessed profiles".to_owned(),
+        });
     }
     let requests = requested
         .iter()
@@ -1852,7 +1873,8 @@ fn assess_profiles_impl(
     requested
         .iter()
         .zip(reports)
-        .map(|(intent, report)| {
+        .enumerate()
+        .map(|(index, (intent, report))| {
             let projectors = projector_memory(intent)?;
             let preferred = capacity_summary(
                 topology,
@@ -1874,7 +1896,7 @@ fn assess_profiles_impl(
                                 &report.devices,
                                 topology,
                                 calibration,
-                                intent.context_size,
+                                &performance_context_tokens[index],
                             )
                         })
                         .transpose()
@@ -1920,7 +1942,7 @@ fn assess_profiles_impl(
                             &assessed.text_report.devices,
                             topology,
                             calibration,
-                            intent.context_size,
+                            &performance_context_tokens[index],
                         )
                     })
                     .transpose()

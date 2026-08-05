@@ -477,13 +477,13 @@ mod tests {
                 warning_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
-            performance: PerformanceEvidence {
+            performance: vec![PerformanceEvidence {
                 context_tokens: 50_000,
                 lower_tokens_per_second: 1.0,
                 estimated_tokens_per_second: 2.0,
                 upper_tokens_per_second: 3.0,
                 confidence: PerformanceConfidence::Low,
-            },
+            }],
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
             profile: ServingProfile {

@@ -31,7 +31,7 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 recommendable target
   -> exact tensor-storage rejection proof
   -> local profile: 100K (bounded by target maximum)
-  -> cached or native ICN assessment
+  -> cached or native ICN assessment with 25K, 50K, 75K, and full-context speed samples
   -> completed configuration candidates
   -> recommendation portfolio
 ```
@@ -61,6 +61,9 @@ operation owner awaits its bounded request.
 A catalog candidate exists only for one completed `Fits` configuration. It contains its exact
 target, serving configuration, profile, assessment environment, memory, performance, capability,
 acquisition, and source evidence.
+
+Candidate performance is an ordered set of samples for the same configuration. Samples above the
+configured context are omitted, and the final sample is always the configured context.
 
 Recommendation evidence is present only when the target comes from the recommendable catalog.
 Discovered installed targets remain selectable catalog candidates without fabricated intelligence,
@@ -94,6 +97,12 @@ ACN selects at most one configuration for each intent:
 Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
 A recommendation references a candidate; it does not create another model identity.
 
+A candidate is usable only when its full-context expected generation speed is at least 8 tokens per
+second. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
+bounded by the configured context for shorter models. Clients present the expected-speed range from
+the samples at 25K and 75K, likewise bounded by the configured context, without treating those
+samples as separate configurations.
+
 The Lightweight tier admits configurations whose complete predicted loaded memory uses at most
 20% of each participating physical memory domain's stable post-reserve capacity. Within that tier,
 capability precedes memory, fidelity, speed, and download size. The selected configuration must also
@@ -123,6 +132,9 @@ Cached assessment never authorizes loading.
 - All missing profiles for one target are submitted together.
 - Equivalent concurrent misses perform one native assessment.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
+- The usability floor uses full-context performance; ranking and relative comparisons use the
+  bounded 50K sample.
+- Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
 - Lightweight is hardware-relative, capability-maximizing within its memory tier, and independent
   of the capability ceiling outside that tier.
 - Candidate identity remains the serving-configuration identity.

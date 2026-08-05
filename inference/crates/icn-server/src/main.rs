@@ -17,13 +17,13 @@ use icn_contracts::bootstrap_protocol::{
 use icn_contracts::models::{
     AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
     InstalledModelPackages as _, LoadModelReady, LoadModelRequest, MemoryAssessment,
-    ModelAssessment, ModelAssessmentId, ModelAssessor, ModelFailure as DomainModelFailure,
-    ModelInstance, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelLoadStage,
-    ModelOfferingTarget as DomainModelOfferingTarget, ModelPackageId, ModelPackageOperand,
-    ModelReleaseReason, ModelServingConfiguration, ModelServingConfigurationId,
-    ModelStoppingAllocation, ModelTargetInput, PerformanceConfidence, PerformanceEvidence,
-    PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
+    ModelAssessment, ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile,
+    ModelAssessor, ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceId,
+    ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadEvent,
+    ModelLoadPlan, ModelLoadStage, ModelOfferingTarget as DomainModelOfferingTarget,
+    ModelPackageId, ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
+    ModelServingConfigurationId, ModelStoppingAllocation, ModelTargetInput, PerformanceConfidence,
+    PerformanceEvidence, PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
     ServingProfile as DomainServingProfile,
 };
 use icn_contracts::{
@@ -747,6 +747,7 @@ struct PlanningWorkerRequest {
     projector: Option<PathBuf>,
     mtp: Vec<PathBuf>,
     defaults: Vec<ModelPlanDefaults>,
+    performance_context_tokens: Vec<Vec<u32>>,
     operation: PlanningOperation,
 }
 
@@ -1625,6 +1626,17 @@ impl NativeResolvedModelAssessor {
                 .map(|profile| self.effective_defaults(Some(profile)))
                 .collect()
         };
+        let performance_context_tokens = if profiles.is_empty() {
+            defaults
+                .iter()
+                .map(|defaults| vec![defaults.context_size])
+                .collect()
+        } else {
+            profiles
+                .iter()
+                .map(|profile| profile.performance_context_tokens.clone())
+                .collect()
+        };
         let hardware_calibration = if estimate_performance {
             Some(self.hardware_calibration.as_ref().clone())
         } else {
@@ -1637,6 +1649,7 @@ impl NativeResolvedModelAssessor {
             projector,
             mtp,
             defaults,
+            performance_context_tokens,
             operation: if estimate_performance {
                 PlanningOperation::Execution {
                     hardware_calibration: hardware_calibration
@@ -1755,6 +1768,7 @@ impl NativeResolvedModelAssessor {
             &snapshot.enabled_backends,
             &snapshot.topology_fingerprint,
             self.effective_defaults(profile),
+            profile.map(|profile| &profile.performance_context_tokens),
         ))
         .map_err(|error| InventoryError::Internal(error.to_string()))
     }
@@ -1859,7 +1873,7 @@ impl NativeModelAssessor {
     async fn assessment_evidence(
         &self,
         target_id: &icn_contracts::models::ModelOfferingTargetId,
-        profiles: &[DomainServingProfile],
+        profiles: &[DomainModelAssessmentProfile],
         reserve_bytes: u64,
         environment: &AssessmentEnvironment,
     ) -> Result<Vec<String>, InventoryError> {
@@ -1871,8 +1885,9 @@ impl NativeModelAssessor {
             .map(|profile| {
                 let defaults = self.assessor.effective_defaults(Some(&ModelPreviewProfile {
                     id: "assessment-cache-key".to_owned(),
-                    context_length: profile.context_length,
+                    context_length: profile.profile.context_length,
                     parallel_sequences: 1,
+                    performance_context_tokens: profile.performance_context_tokens.clone(),
                 }));
                 serde_json::to_string(&(
                     llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
@@ -1880,6 +1895,7 @@ impl NativeModelAssessor {
                     &environment.id.0,
                     &target_id.0,
                     defaults,
+                    &profile.performance_context_tokens,
                     reserve_bytes,
                 ))
                 .map_err(|error| InventoryError::Internal(error.to_string()))
@@ -1890,7 +1906,7 @@ impl NativeModelAssessor {
     async fn cached_profiles(
         &self,
         target_id: &icn_contracts::models::ModelOfferingTargetId,
-        profiles: &[DomainServingProfile],
+        profiles: &[DomainModelAssessmentProfile],
         reserve_bytes: u64,
         environment: &AssessmentEnvironment,
     ) -> Result<Option<Vec<ModelAssessment>>, InventoryError> {
@@ -1916,7 +1932,7 @@ impl NativeModelAssessor {
     async fn assess_profiles(
         &self,
         resolved: &icn_contracts::models::ResolvedModelTarget,
-        profiles: &[DomainServingProfile],
+        profiles: &[DomainModelAssessmentProfile],
         reserve_bytes: u64,
         environment: &AssessmentEnvironment,
         deadline_at_ms: u64,
@@ -1971,8 +1987,9 @@ impl NativeModelAssessor {
                 .iter()
                 .map(|index| ModelPreviewProfile {
                     id: format!("assessment-{index}"),
-                    context_length: profiles[*index].context_length,
+                    context_length: profiles[*index].profile.context_length,
                     parallel_sequences: 1,
+                    performance_context_tokens: profiles[*index].performance_context_tokens.clone(),
                 })
                 .collect::<Vec<_>>();
             let assessed = assessor
@@ -2031,13 +2048,17 @@ fn serving_configuration_id(
 
 fn model_assessment(
     target_id: &icn_contracts::models::ModelOfferingTargetId,
-    profile: DomainServingProfile,
+    assessment_profile: DomainModelAssessmentProfile,
     environment_id: &AssessmentEnvironmentId,
     reserve_bytes: u64,
     system_reserve_bytes: u64,
     warning_reserve_bytes: u64,
     assessment: ModelExecutionAssessment,
 ) -> Result<ModelAssessment, InventoryError> {
+    let DomainModelAssessmentProfile {
+        profile,
+        performance_context_tokens,
+    } = assessment_profile;
     let configuration_id = serving_configuration_id(target_id, &profile);
     let mut digest = Sha256::new();
     digest.update(target_id.0.as_bytes());
@@ -2045,6 +2066,9 @@ fn model_assessment(
     digest.update(environment_id.0.as_bytes());
     digest.update(reserve_bytes.to_le_bytes());
     digest.update(system_reserve_bytes.to_le_bytes());
+    for context_tokens in performance_context_tokens {
+        digest.update(context_tokens.to_le_bytes());
+    }
     let assessment_id = ModelAssessmentId(format!("assessment_{:x}", digest.finalize()));
     let (hardware, performance) = match assessment {
         ModelExecutionAssessment::Executable {
@@ -2055,11 +2079,16 @@ fn model_assessment(
     };
     match hardware {
         HardwareAssessment::Fits { memory, .. } => {
-            let performance = performance_result(performance.ok_or_else(|| {
+            let performance = performance.ok_or_else(|| {
                 InventoryError::Internal(
                     "executable hardware assessment omitted measured performance".to_owned(),
                 )
-            })?);
+            })?;
+            if performance.is_empty() {
+                return Err(InventoryError::Internal(
+                    "executable hardware assessment returned no performance samples".to_owned(),
+                ));
+            }
             Ok(ModelAssessment::Fits {
                 profile,
                 configuration_id,
@@ -2089,7 +2118,7 @@ fn model_assessment(
                         }
                     })
                     .collect(),
-                performance,
+                performance: performance.into_iter().map(performance_result).collect(),
             })
         }
         HardwareAssessment::DoesNotFit {
@@ -2197,6 +2226,31 @@ fn target_input_id(
     }
 }
 
+fn validate_model_assessment_profiles(
+    profiles: &[DomainModelAssessmentProfile],
+) -> Result<(), String> {
+    if profiles.is_empty() || profiles.len() > 16 {
+        return Err("model assessment requires between one and sixteen profiles".to_owned());
+    }
+    for requested in profiles {
+        let contexts = &requested.performance_context_tokens;
+        if requested.profile.context_length == 0
+            || contexts.is_empty()
+            || contexts.last() != Some(&requested.profile.context_length)
+            || contexts.windows(2).any(|pair| pair[0] >= pair[1])
+            || contexts
+                .iter()
+                .any(|context| *context == 0 || *context > requested.profile.context_length)
+        {
+            return Err(
+                "performance sample contexts must be unique, ascending, and end at the profile context"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn target_uses_only_installed_packages(target: &ModelTargetInput) -> bool {
     match target {
         ModelTargetInput::Package { package } => {
@@ -2270,6 +2324,19 @@ impl ModelAssessor for NativeModelAssessor {
                                 ));
                             }
                         };
+                        if let Err(message) = validate_model_assessment_profiles(&item.profiles) {
+                            return Ok((
+                                index,
+                                AssessModelResult::InvalidTarget {
+                                    request_id,
+                                    failure: DomainModelFailure {
+                                        code: "invalid_profiles".to_owned(),
+                                        message,
+                                        retryable: false,
+                                    },
+                                },
+                            ));
+                        }
                         let cached = self
                             .cached_profiles(
                                 &target_id,
@@ -2366,6 +2433,7 @@ fn assess_planning_request_with_backend(
         projector,
         mtp,
         defaults,
+        performance_context_tokens,
         operation,
         ..
     } = request;
@@ -2409,6 +2477,7 @@ fn assess_planning_request_with_backend(
         &topology,
         &plans,
         &hardware_calibration,
+        &performance_context_tokens,
     )?;
     let assessments = plans
         .iter_mut()
@@ -3552,6 +3621,7 @@ impl NativeModelInstanceController {
                 id: format!("load-allocation-{parallel_sequences}"),
                 context_length: profile.context_length,
                 parallel_sequences,
+                performance_context_tokens: Vec::new(),
             })
             .collect::<Vec<_>>();
         let capacity_policy = CapacityPolicy {
@@ -5611,6 +5681,7 @@ mod tests {
             id: "p4".to_owned(),
             context_length: 32_768,
             parallel_sequences: 4,
+            performance_context_tokens: vec![32_768],
         }));
 
         assert_eq!(defaults.context_size, 32_768);
@@ -5799,6 +5870,7 @@ mod tests {
             id: "caller-correlation-does-not-affect-assessment".to_owned(),
             context_length: 128,
             parallel_sequences: 1,
+            performance_context_tokens: vec![128],
         };
         assert_eq!(
             assessor
@@ -5941,6 +6013,7 @@ mod tests {
             id: "parity".to_owned(),
             context_length: 128,
             parallel_sequences: 1,
+            performance_context_tokens: vec![128],
         };
 
         for fixture in fixtures {

@@ -417,10 +417,18 @@ pub struct CapacityPolicy {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAssessmentProfile {
+    pub profile: ServingProfile,
+    pub performance_context_tokens: Vec<u32>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssessModelRequest {
     pub request_id: ModelAssessmentRequestId,
     pub target: ModelTargetInput,
-    pub profiles: Vec<ServingProfile>,
+    pub profiles: Vec<ModelAssessmentProfile>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -473,7 +481,7 @@ pub enum ModelAssessment {
         configuration_id: ModelServingConfigurationId,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
-        performance: PerformanceEvidence,
+        performance: Vec<PerformanceEvidence>,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
