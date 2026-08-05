@@ -14,7 +14,7 @@
     "check": "cargo check --workspace",
     "test": "cargo test --workspace",
     "test:upstream": "bun run scripts/test-upstream.ts",
-    "fit": "cargo run -p icn-hardware --bin icn-fit --",
+    "assess-model": "cargo run -p icn-hardware --bin icn-model-assessment --",
     "parity": "cargo run -p icn-parity -- run --root parity --profile pr",
     "parity:validate": "cargo run -p icn-parity -- validate --root parity",
     "parity:list": "cargo run -p icn-parity -- list --root parity",

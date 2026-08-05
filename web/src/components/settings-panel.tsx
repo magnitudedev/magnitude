@@ -8,9 +8,9 @@
 import { useState, useCallback, type ReactNode } from "react"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalModels, visionPropertyLabel } from "@magnitudedev/client-common"
+import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
-import type { CloudUsageResponse, UsagePeriod, SlotId, LocalModel, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
+import type { CloudUsageResponse, UsagePeriod, SlotId, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
 import { ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
 import type { UseModelConfigResult } from "@magnitudedev/client-common"
 
@@ -174,11 +174,6 @@ function SettingsTab({
   const [inputKey, setInputKey] = useState("")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const localModelsState = useLocalModels()
-  const localModels = Option.match(Result.value(localModelsState), {
-    onNone: () => [] as readonly LocalModel[],
-    onSome: ({ models }) => models,
-  })
   const catalogState = modelConfig ? catalogStateOf(modelConfig) : Option.none()
   const catalogLoading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
@@ -335,7 +330,6 @@ function SettingsTab({
               key={entry.slotId}
               entry={entry}
               modelConfig={modelConfig}
-              localModels={localModels}
               isLast={i === slots.length - 1}
             />
           ))}
@@ -637,12 +631,10 @@ function formatPricing(pricing: { input: number; output: number }): string {
 function SlotCard({
   entry,
   modelConfig,
-  localModels,
   isLast,
 }: {
   entry: SlotEntry
   modelConfig?: UseModelConfigResult
-  localModels: readonly LocalModel[]
   isLast: boolean
 }): ReactNode {
   const slotId = entry.slotId
@@ -681,13 +673,10 @@ function SlotCard({
     onSome: ({ slot }) => slot.selection.reasoningEffort,
   })
   const capacityFailure = Option.flatMap(selected, ({ model }) =>
-    Option.fromNullable(localModels.find(({ preparation }) =>
-      preparation._tag === "Unavailable"
-      && preparation.providerModelIds.includes(model.providerModelId))
-      ?.preparation)).pipe(
-        Option.filter((preparation) => preparation._tag === "Unavailable"
-          && preparation.failure.code === "insufficient_resources"),
-      )
+    model.availability._tag === "Disabled"
+      && model.availability.reason === "insufficient_resources"
+      ? Option.some(model.availability)
+      : Option.none())
 
   const handleModelChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -821,9 +810,9 @@ function SlotCard({
             ))}
           </select>
           </div>
-          {Option.isSome(capacityFailure) && capacityFailure.value._tag === "Unavailable" && (
+          {Option.isSome(capacityFailure) && (
             <div style={{ marginBottom: 6, fontSize: 12, color: "var(--accent-warning)" }}>
-              {capacityFailure.value.failure.message}
+              This model configuration is no longer compatible with the available hardware capacity
             </div>
           )}
           {Option.isSome(selected) && (

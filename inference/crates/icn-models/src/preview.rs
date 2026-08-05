@@ -10,10 +10,10 @@ use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HardwareProvider,
     HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult,
     HuggingFaceModelSearchResults, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
-    HuggingFaceRepositorySnapshot, Integrity, InventoryError, ModelComponent,
-    ModelHardwareAssessor, ModelId, ModelLocation, ModelPreview, ModelPreviewAssessment,
-    ModelPreviewProfile, ModelPreviewRequest, ModelPreviewSource, ModelPreviewer, ModelSource,
-    ResolvedComponent, ResolvedModel,
+    HuggingFaceRepositorySnapshot, Integrity, InventoryError, ModelComponent, ModelId,
+    ModelLocation, ModelPreview, ModelPreviewAssessment, ModelPreviewProfile, ModelPreviewRequest,
+    ModelPreviewSource, ModelPreviewer, ModelSource, ResolvedComponent, ResolvedModel,
+    ResolvedModelAssessor,
 };
 use reqwest::header::{CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,7 @@ struct CachedHuggingFaceRepositorySnapshot {
 
 pub struct ModelPreviewService {
     models: Arc<ModelManager>,
-    assessor: Arc<dyn ModelHardwareAssessor>,
+    assessor: Arc<dyn ResolvedModelAssessor>,
     http: reqwest::Client,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
     hardware_snapshot: tokio::sync::Mutex<Option<(Instant, icn_contracts::HardwareSnapshot)>>,
@@ -63,7 +63,7 @@ pub struct ModelPreviewService {
 
 impl ModelPreviewService {
     #[must_use]
-    pub fn new(models: Arc<ModelManager>, assessor: Arc<dyn ModelHardwareAssessor>) -> Self {
+    pub fn new(models: Arc<ModelManager>, assessor: Arc<dyn ResolvedModelAssessor>) -> Self {
         let http = models.http.clone();
         Self {
             models,
@@ -138,10 +138,7 @@ impl ModelPreviewService {
         };
         let mut assessments = Vec::with_capacity(profiles.len());
         for profile in profiles {
-            let hardware_key = self
-                .assessor
-                .execution_cache_key(Some(profile), snapshot)
-                .await?;
+            let hardware_key = self.assessor.execution_cache_key(Some(profile), snapshot)?;
             let Some(assessment) =
                 self.models
                     .cache
@@ -190,8 +187,7 @@ impl ModelPreviewService {
         for profile in profiles {
             let hardware_key = self
                 .assessor
-                .execution_cache_key(Some(&profile), snapshot)
-                .await?;
+                .execution_cache_key(Some(&profile), snapshot)?;
             let assessment =
                 self.models
                     .cache
@@ -1964,18 +1960,16 @@ mod tests {
         }
     }
 
-    impl ModelHardwareAssessor for CountingProfileAssessor {
-        fn execution_cache_key<'a>(
-            &'a self,
-            profile: Option<&'a icn_contracts::ModelPreviewProfile>,
-            _snapshot: &'a icn_contracts::HardwareSnapshot,
-        ) -> futures_util::future::BoxFuture<'a, Result<String, InventoryError>> {
-            Box::pin(async move {
-                Ok(format!(
-                    "profile:{}",
-                    profile.map_or(0, |profile| profile.context_length)
-                ))
-            })
+    impl ResolvedModelAssessor for CountingProfileAssessor {
+        fn execution_cache_key(
+            &self,
+            profile: Option<&icn_contracts::ModelPreviewProfile>,
+            _snapshot: &icn_contracts::HardwareSnapshot,
+        ) -> Result<String, InventoryError> {
+            Ok(format!(
+                "profile:{}",
+                profile.map_or(0, |profile| profile.context_length)
+            ))
         }
 
         fn assess_profile(
@@ -2042,13 +2036,11 @@ mod tests {
                                 expert_count: 0,
                                 expert_used_count: 0,
                                 cross_memory_domain_placement: false,
-                                points: vec![icn_contracts::GenerationSpeedPoint {
-                                    context_tokens,
-                                    kv_bytes_read_per_token: 1,
-                                    lower_tokens_per_second: 1.0,
-                                    expected_tokens_per_second: 2.0,
-                                    upper_tokens_per_second: 3.0,
-                                }],
+                                context_tokens,
+                                kv_bytes_read_per_token: 1,
+                                lower_tokens_per_second: 1.0,
+                                expected_tokens_per_second: 2.0,
+                                upper_tokens_per_second: 3.0,
                             },
                         }
                     })
@@ -2376,13 +2368,11 @@ mod tests {
                 expert_count: 0,
                 expert_used_count: 0,
                 cross_memory_domain_placement: false,
-                points: vec![icn_contracts::GenerationSpeedPoint {
-                    context_tokens: 4096,
-                    kv_bytes_read_per_token: 1,
-                    lower_tokens_per_second: 1.0,
-                    expected_tokens_per_second: 2.0,
-                    upper_tokens_per_second: 3.0,
-                }],
+                context_tokens: 4096,
+                kv_bytes_read_per_token: 1,
+                lower_tokens_per_second: 1.0,
+                expected_tokens_per_second: 2.0,
+                upper_tokens_per_second: 3.0,
             },
         };
         manager

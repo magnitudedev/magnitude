@@ -498,16 +498,6 @@ pub enum GenerationPerformanceConfidence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GenerationSpeedPoint {
-    pub context_tokens: u32,
-    pub kv_bytes_read_per_token: u64,
-    pub lower_tokens_per_second: f64,
-    pub expected_tokens_per_second: f64,
-    pub upper_tokens_per_second: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GenerationPerformanceAssessment {
     pub confidence: GenerationPerformanceConfidence,
     pub workload: String,
@@ -516,7 +506,11 @@ pub struct GenerationPerformanceAssessment {
     pub expert_count: u32,
     pub expert_used_count: u32,
     pub cross_memory_domain_placement: bool,
-    pub points: Vec<GenerationSpeedPoint>,
+    pub context_tokens: u32,
+    pub kv_bytes_read_per_token: u64,
+    pub lower_tokens_per_second: f64,
+    pub expected_tokens_per_second: f64,
+    pub upper_tokens_per_second: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1147,6 +1141,17 @@ impl MemoryTopology {
             .map(|capacity| capacity.stable_bytes)
     }
 
+    /// Stable capacity across distinct physical memory domains.
+    ///
+    /// This is an upper bound for model tensor storage, not an admission decision: placement and
+    /// per-device limits can make less memory usable for a particular execution plan.
+    #[must_use]
+    pub fn aggregate_stable_capacity(&self) -> u64 {
+        self.capacities.values().fold(0_u64, |total, capacity| {
+            total.saturating_add(capacity.stable_bytes)
+        })
+    }
+
     #[must_use]
     pub fn system_domain(&self) -> &MemoryDomainId {
         self.capacities
@@ -1433,28 +1438,12 @@ pub struct InventoryModel {
     pub created: u64,
     pub name: String,
     pub supported_parameters: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serving_configuration: Option<ServingConfiguration>,
     pub availability: ModelAvailability,
     pub source: ModelSource,
     pub location: ModelLocation,
     pub properties: InventoryProperties,
-    pub hardware: HardwareAssessment,
     pub operations: Vec<ModelOperation>,
     pub updated_at: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServingProfile {
-    pub context_length: u32,
-    pub parallel_sequences: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServingConfiguration {
-    pub profile: ServingProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1565,48 +1554,20 @@ pub trait ModelInventory: Send + Sync + 'static {
     fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
     fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
     fn resolve_ready(&self, id: &ModelId) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>>;
-    fn configure_serving(
-        &self,
-        id: &ModelId,
-        profile: ServingProfile,
-    ) -> BoxFuture<'_, Result<InventoryModel, InventoryError>>;
-}
-
-/// Canonical inventory assessment implemented by the server composition root.
-///
-/// Keeping this boundary in contracts lets `icn-models` own reconciliation without depending on
-/// the native planner or `icn-hardware`. The cache key covers the canonical execution policy, native build,
-/// backend, and stable hardware topology. Assessment failures are operation failures, never model
-/// properties.
-pub trait InventoryHardwareAssessor: HardwareProvider {
-    fn cache_key(&self, snapshot: &HardwareSnapshot) -> Result<String, InventoryError>;
-    fn assess(
-        &self,
-        model: ResolvedModel,
-    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>>;
-
-    fn assess_serving(
-        &self,
-        model: ResolvedModel,
-        _profile: ServingProfile,
-    ) -> BoxFuture<'_, Result<HardwareAssessment, InventoryError>> {
-        self.assess(model)
-    }
 }
 
 pub trait HardwareProvider: Send + Sync + 'static {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>>;
 }
 
-/// Canonical profile-aware model assessment used by inventory and remote preview. Execution cache
-/// identity is asynchronous because implementations must establish every process-local input,
-/// including concrete calibration, before a persisted performance result can be read.
-pub trait ModelHardwareAssessor: HardwareProvider {
-    fn execution_cache_key<'a>(
-        &'a self,
-        profile: Option<&'a ModelPreviewProfile>,
-        snapshot: &'a HardwareSnapshot,
-    ) -> BoxFuture<'a, Result<String, InventoryError>>;
+/// Profile-aware assessment boundary for a model whose exact artifacts have been resolved.
+/// Ready assessors derive cache identity synchronously from required hardware-calibration evidence.
+pub trait ResolvedModelAssessor: HardwareProvider {
+    fn execution_cache_key(
+        &self,
+        profile: Option<&ModelPreviewProfile>,
+        snapshot: &HardwareSnapshot,
+    ) -> Result<String, InventoryError>;
     fn assess_profile(
         &self,
         model: ResolvedModel,
@@ -1909,13 +1870,11 @@ mod tests {
             expert_count: 8,
             expert_used_count: 2,
             cross_memory_domain_placement: true,
-            points: vec![GenerationSpeedPoint {
-                context_tokens: 100_000,
-                kv_bytes_read_per_token: 4_096,
-                lower_tokens_per_second: 10.0,
-                expected_tokens_per_second: 12.0,
-                upper_tokens_per_second: 14.0,
-            }],
+            context_tokens: 262_144,
+            kv_bytes_read_per_token: 4_096,
+            lower_tokens_per_second: 10.0,
+            expected_tokens_per_second: 12.0,
+            upper_tokens_per_second: 14.0,
         };
         let encoded = serde_json::to_value(&assessment).expect("serialize performance evidence");
         assert_eq!(encoded["confidence"], "low");

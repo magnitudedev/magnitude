@@ -36,14 +36,14 @@ or the installed package inspection, which are the authoritative evidence for th
 Within the separate `local` provider namespace, the provider model ID is exactly the serving
 configuration ID. ACN never prefixes or hashes package or profile data to create another identity.
 
-An offering exists independently of current installation, fit, slot selection, or residency.
+An offering exists independently of current installation, assessment, slot selection, or residency.
 ACN's local-offering projection combines the durable offering with installed-package and assessment
 observations to produce the provider model catalog entry. This is the only place that derives local
 provider availability. When ICN can assess the exact configuration, that catalog entry carries the
 complete per-domain memory accounting unchanged: capacity, required allocation, compatibility
 reserve, warning reserve, and remaining headroom. Consumers derive aggregate requirements,
 system-domain load admission, and warning presentation from that one value. They do not receive
-parallel aggregate or fit-label fields. Generic and cloud provider entries do not fabricate local
+parallel aggregate or capacity-label fields. Generic and cloud provider entries do not fabricate local
 memory accounting.
 
 The aggregate provider catalog remains usable when aggregation completes with typed provider or
@@ -72,7 +72,7 @@ The local provider resolver maps the selected provider model ID to the offering'
 configuration ID. Provider binding is cheap and has no runtime side effect.
 
 Existing recency-based slot substitution remains product behavior. It operates on stable provider
-model IDs and does not create, refit, or rewrite offerings.
+model IDs and does not create, reassess, or rewrite offerings.
 
 ## Explicit instances
 

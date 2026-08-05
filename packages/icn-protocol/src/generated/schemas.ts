@@ -111,17 +111,7 @@ export type AssessModelRequestEncoded = S.Schema.Encoded<typeof AssessModelReque
 export const AssessModelResult = S.Union(
   S.extend(
     S.TaggedStruct("Assessed", {
-      profiles: S.Array(S.suspend((): S.Schema<OfferingAssessment, OfferingAssessmentEncoded> => OfferingAssessment)),
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-      targetId: S.suspend((): S.Schema<ModelOfferingTargetId, ModelOfferingTargetIdEncoded> => ModelOfferingTargetId),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("AssessmentFailed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      profiles: S.Array(S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment)),
       requestId: S.suspend(
         (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
       ),
@@ -600,71 +590,6 @@ export const ExecutionSettingsResponse = S.Struct({
 export type ExecutionSettingsResponse = S.Schema.Type<typeof ExecutionSettingsResponse>
 export type ExecutionSettingsResponseEncoded = S.Schema.Encoded<typeof ExecutionSettingsResponse>
 
-export const FitModelResult = S.Union(
-  S.extend(
-    S.TaggedStruct("Fitted", {
-      assessment: S.suspend((): S.Schema<OfferingAssessment, OfferingAssessmentEncoded> => OfferingAssessment),
-      configuration: S.suspend(
-        (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
-      ),
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-      targetId: S.suspend((): S.Schema<ModelOfferingTargetId, ModelOfferingTargetIdEncoded> => ModelOfferingTargetId),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("DoesNotFit", {
-      deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      limitingResource: S.String,
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-      targetId: S.suspend((): S.Schema<ModelOfferingTargetId, ModelOfferingTargetIdEncoded> => ModelOfferingTargetId),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("InvalidTarget", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type FitModelResult = S.Schema.Type<typeof FitModelResult>
-export type FitModelResultEncoded = S.Schema.Encoded<typeof FitModelResult>
-
-export const FitModelsRequest = S.Struct({
-  capacityPolicy: S.suspend((): S.Schema<CapacityPolicy, CapacityPolicyEncoded> => CapacityPolicy),
-  maximumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  minimumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  targets: S.Array(S.suspend((): S.Schema<FitModelTarget, FitModelTargetEncoded> => FitModelTarget)),
-})
-export type FitModelsRequest = S.Schema.Type<typeof FitModelsRequest>
-export type FitModelsRequestEncoded = S.Schema.Encoded<typeof FitModelsRequest>
-
-export const FitModelsResponse = S.Struct({
-  environmentId: S.suspend(
-    (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
-  ),
-  results: S.Array(S.suspend((): S.Schema<FitModelResult, FitModelResultEncoded> => FitModelResult)),
-})
-export type FitModelsResponse = S.Schema.Type<typeof FitModelsResponse>
-export type FitModelsResponseEncoded = S.Schema.Encoded<typeof FitModelsResponse>
-
-export const FitModelTarget = S.Struct({
-  requestId: S.suspend(
-    (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-  ),
-  target: S.suspend((): S.Schema<ModelTargetInput, ModelTargetInputEncoded> => ModelTargetInput),
-})
-export type FitModelTarget = S.Schema.Type<typeof FitModelTarget>
-export type FitModelTargetEncoded = S.Schema.Encoded<typeof FitModelTarget>
-
 export const FlashAttentionResponse = S.Union(S.Literal("auto"), S.Literal("disabled"), S.Literal("enabled"))
 export type FlashAttentionResponse = S.Schema.Type<typeof FlashAttentionResponse>
 export type FlashAttentionResponseEncoded = S.Schema.Encoded<typeof FlashAttentionResponse>
@@ -973,12 +898,35 @@ export const IcnInstallationDeclaration = S.Struct({
 export type IcnInstallationDeclaration = S.Schema.Type<typeof IcnInstallationDeclaration>
 export type IcnInstallationDeclarationEncoded = S.Schema.Encoded<typeof IcnInstallationDeclaration>
 
-export const IcnStartupBackend = S.extend(
-  S.Struct({
-    hardwareLabel: S.String,
-    type: S.Literal("cuda"),
-  }),
-  S.Record({ key: S.String, value: JsonValue }),
+export const IcnStartupBackend = S.Union(
+  S.extend(
+    S.Struct({
+      hardwareLabel: S.String,
+      type: S.Literal("cpu"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      hardwareLabel: S.String,
+      type: S.Literal("metal"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      hardwareLabel: S.String,
+      type: S.Literal("cuda"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      hardwareLabel: S.String,
+      type: S.Literal("vulkan"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
 )
 export type IcnStartupBackend = S.Schema.Type<typeof IcnStartupBackend>
 export type IcnStartupBackendEncoded = S.Schema.Encoded<typeof IcnStartupBackend>
@@ -1108,6 +1056,50 @@ export const Modalities = S.Struct({
 export type Modalities = S.Schema.Type<typeof Modalities>
 export type ModalitiesEncoded = S.Schema.Encoded<typeof Modalities>
 
+export const ModelAssessment = S.Union(
+  S.extend(
+    S.TaggedStruct("Fits", {
+      assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
+      configurationId: S.suspend(
+        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+      ),
+      memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
+      performance: S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
+      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("DoesNotFit", {
+      assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
+      configurationId: S.suspend(
+        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+      ),
+      deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      limitingResource: S.String,
+      memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
+      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Incompatible", {
+      configurationId: S.suspend(
+        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+      ),
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelAssessment = S.Schema.Type<typeof ModelAssessment>
+export type ModelAssessmentEncoded = S.Schema.Encoded<typeof ModelAssessment>
+
+export const ModelAssessmentId = S.String
+export type ModelAssessmentId = S.Schema.Type<typeof ModelAssessmentId>
+export type ModelAssessmentIdEncoded = S.Schema.Encoded<typeof ModelAssessmentId>
+
 export const ModelAssessmentRequestId = S.String
 export type ModelAssessmentRequestId = S.Schema.Type<typeof ModelAssessmentRequestId>
 export type ModelAssessmentRequestIdEncoded = S.Schema.Encoded<typeof ModelAssessmentRequestId>
@@ -1146,6 +1138,10 @@ export const ModelFile = S.Struct({
   role: S.suspend((): S.Schema<ModelFileRole, ModelFileRoleEncoded> => ModelFileRole),
   sha256: S.String,
   sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  tensorStorageBytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
 })
 export type ModelFile = S.Schema.Type<typeof ModelFile>
 export type ModelFileEncoded = S.Schema.Encoded<typeof ModelFile>
@@ -1536,50 +1532,6 @@ export const NamedFunctionCallRequest = S.Struct({
 export type NamedFunctionCallRequest = S.Schema.Type<typeof NamedFunctionCallRequest>
 export type NamedFunctionCallRequestEncoded = S.Schema.Encoded<typeof NamedFunctionCallRequest>
 
-export const OfferingAssessment = S.Union(
-  S.extend(
-    S.TaggedStruct("Fits", {
-      assessmentId: S.suspend((): S.Schema<OfferingAssessmentId, OfferingAssessmentIdEncoded> => OfferingAssessmentId),
-      configurationId: S.suspend(
-        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
-      ),
-      memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("DoesNotFit", {
-      assessmentId: S.suspend((): S.Schema<OfferingAssessmentId, OfferingAssessmentIdEncoded> => OfferingAssessmentId),
-      configurationId: S.suspend(
-        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
-      ),
-      deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      limitingResource: S.String,
-      memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Incompatible", {
-      configurationId: S.suspend(
-        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
-      ),
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type OfferingAssessment = S.Schema.Type<typeof OfferingAssessment>
-export type OfferingAssessmentEncoded = S.Schema.Encoded<typeof OfferingAssessment>
-
-export const OfferingAssessmentId = S.String
-export type OfferingAssessmentId = S.Schema.Type<typeof OfferingAssessmentId>
-export type OfferingAssessmentIdEncoded = S.Schema.Encoded<typeof OfferingAssessmentId>
-
 export const PerformanceConfidence = S.Union(S.Literal("high"), S.Literal("moderate"), S.Literal("low"))
 export type PerformanceConfidence = S.Schema.Type<typeof PerformanceConfidence>
 export type PerformanceConfidenceEncoded = S.Schema.Encoded<typeof PerformanceConfidence>
@@ -1645,7 +1597,6 @@ export const RecommendableModel = S.Struct({
   checkpointId: S.String,
   description: S.String,
   displayName: S.String,
-  eligibleServingProfiles: S.Array(S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile)),
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<RecommendableModelId, RecommendableModelIdEncoded> => RecommendableModelId),
   license: S.String,
@@ -1752,7 +1703,7 @@ export type SplitModeResponseEncoded = S.Schema.Encoded<typeof SplitModeResponse
 
 export const StartModelDownloadRequest = S.extend(
   S.Struct({
-    package: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
+    target: S.suspend((): S.Schema<ModelOfferingTarget, ModelOfferingTargetEncoded> => ModelOfferingTarget),
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
@@ -1761,7 +1712,8 @@ export type StartModelDownloadRequestEncoded = S.Schema.Encoded<typeof StartMode
 
 export const StartModelDownloadResponse = S.extend(
   S.Struct({
-    attempt: S.suspend((): S.Schema<DownloadAttempt, DownloadAttemptEncoded> => DownloadAttempt),
+    attempts: S.Array(S.suspend((): S.Schema<DownloadAttempt, DownloadAttemptEncoded> => DownloadAttempt)),
+    target_id: S.suspend((): S.Schema<ModelOfferingTargetId, ModelOfferingTargetIdEncoded> => ModelOfferingTargetId),
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )

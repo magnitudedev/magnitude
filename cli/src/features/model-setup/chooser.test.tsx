@@ -4,9 +4,9 @@ import { testRender } from "@opentui/react/test-utils"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
-  CatalogCandidateIdSchema,
   DownloadAttemptIdSchema,
   ModelOfferingTargetIdSchema,
+  ModelServingConfigurationIdSchema,
   ProviderModelIdSchema,
   RecommendationIdSchema,
 } from "@magnitudedev/sdk"
@@ -68,24 +68,20 @@ beforeEach(() => {
 })
 
 const chooserView = () => {
-  const remoteCandidateId = CatalogCandidateIdSchema.make("candidate_remote")
   const remoteTargetId = ModelOfferingTargetIdSchema.make("target_remote")
   const remoteProviderModelId = ProviderModelIdSchema.make("configuration_remote")
   const remoteModel = makeModel({
     targetId: remoteTargetId,
-    catalogCandidateIds: [remoteCandidateId],
     displayName: "Remote Model",
     download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * 1024 ** 3 },
-    preparation: { _tag: "NotDownloaded" },
   })
   return makeView({
     ready: false,
     models: [makeModel({ displayName: "Installed Model" }), remoteModel],
     recommendations: [makeRecommendation({
       candidate: makeCatalogCandidate({
-        id: remoteCandidateId,
         targetId: remoteTargetId,
-        providerModelId: remoteProviderModelId,
+        configurationId: ModelServingConfigurationIdSchema.make(remoteProviderModelId),
         displayName: "Remote Model",
         profile: { contextLength: 200_000 },
         estimatedTokensPerSecond: 36.2,
@@ -111,15 +107,12 @@ const chooserViewWithInventory = (installedCount: number, downloadCount: number)
   const downloads = Array.from({ length: downloadCount }, (_, index) => {
     const number = index + 1
     const intents = ["balanced", "best_quality", "fastest", "lightweight"] as const
-    const candidateId = CatalogCandidateIdSchema.make(`candidate_remote_${number}`)
     const targetId = ModelOfferingTargetIdSchema.make(`target_remote_${number}`)
     const providerModelId = ProviderModelIdSchema.make(`configuration_remote_${number}`)
     const model = makeModel({
       targetId,
-      catalogCandidateIds: [candidateId],
       displayName: `Remote ${number}`,
       download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * 1024 ** 3 },
-      preparation: { _tag: "NotDownloaded" },
     })
     const recommendation = makeRecommendation({
       id: RecommendationIdSchema.make(`recommendation_remote_${number}`),
@@ -128,9 +121,8 @@ const chooserViewWithInventory = (installedCount: number, downloadCount: number)
         ? "A deliberately long recommendation description that wraps across several lines without changing the chooser height when this model becomes selected."
         : "Balanced local inference.",
       candidate: makeCatalogCandidate({
-        id: candidateId,
         targetId,
-        providerModelId,
+        configurationId: ModelServingConfigurationIdSchema.make(providerModelId),
         displayName: `Remote ${number}`,
       }),
     })
@@ -283,7 +275,7 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
             estimatedRemainingMs: Option.none(),
           },
           {
-            id: "analysis" as const,
+            id: "assessment" as const,
             status: { _tag: "Running" as const, startedAtMs: 1_030 },
             completedItems: Option.some(12),
             totalItems: Option.some(20),
@@ -313,7 +305,7 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
     expect(hardwareRow).toContain("Linux x86-64 · 16 cores · 64 GiB RAM")
     expect(frame).toContain("Test GPU · 24 GiB VRAM · CUDA")
     expect(frame).not.toContain("Detected hardware")
-    expect(frame).toContain("Evaluating models for this machine · 12/20")
+    expect(frame).toContain("Assessing models for this machine · 12/20")
     expect(frame).toContain("Preparing recommendations")
     expect(hardwareRow?.indexOf("Test CPU")).toBe(progressRow?.indexOf("✓"))
   } finally {
@@ -323,9 +315,8 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
 
 test("keeps the chooser unchanged until authoritative download state arrives", async () => {
   const candidate = makeCatalogCandidate({
-    id: CatalogCandidateIdSchema.make("candidate_remote"),
     targetId: ModelOfferingTargetIdSchema.make("target_remote"),
-    providerModelId: ProviderModelIdSchema.make("configuration_remote"),
+    configurationId: ModelServingConfigurationIdSchema.make("configuration_remote"),
     displayName: "Remote Model",
     download: {
       _tag: "Downloading",
@@ -367,8 +358,7 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
     await act(async () => press("down"))
     await act(async () => press("enter"))
     expect(onDownload).toHaveBeenCalledWith({
-      targetId: candidate.targetId,
-      providerModelId: candidate.providerModelId,
+      configurationId: candidate.configurationId,
       displayName: candidate.displayName,
       reasoningEffort: "none",
     })
@@ -390,7 +380,7 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
 
 test("keeps the chosen row highlighted and locks navigation while download details are active", async () => {
   const candidate = makeCatalogCandidate({
-    id: CatalogCandidateIdSchema.make("candidate_remote"),
+    configurationId: ModelServingConfigurationIdSchema.make("configuration_remote"),
     displayName: "Remote Model",
     downloadBytes: 16 * GIB,
     download: {
@@ -586,20 +576,11 @@ test("excludes unrelated failed downloads and unusable installed models", async 
               retryable: true,
             },
           },
-          preparation: { _tag: "NotDownloaded" as const },
         }),
         makeModel({
           targetId: ModelOfferingTargetIdSchema.make("target_unusable"),
           displayName: "Unusable Installed Model",
-          preparation: {
-            _tag: "Unavailable" as const,
-            providerModelIds: [],
-            failure: {
-              code: "does_not_fit",
-              message: "Requires more memory",
-              retryable: false,
-            },
-          },
+          offerings: [],
         }),
       ],
     },
@@ -626,8 +607,7 @@ test("excludes unrelated failed downloads and unusable installed models", async 
     }
     await act(async () => press("enter"))
     expect(onDownload).toHaveBeenCalledWith({
-      targetId: ModelOfferingTargetIdSchema.make("target_remote_4"),
-      providerModelId: ProviderModelIdSchema.make("configuration_remote_4"),
+      configurationId: ModelServingConfigurationIdSchema.make("configuration_remote_4"),
       displayName: "Remote 4",
       reasoningEffort: "none",
     })

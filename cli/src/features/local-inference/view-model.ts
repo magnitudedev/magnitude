@@ -85,14 +85,14 @@ export const buildLocalInferenceSelections = (
     .map(({ providerModelId }) => providerModelId))
   const stored = models.models
     .filter(({ download }) => download._tag === "Downloaded")
-    .map((model): LocalInferenceSelection => {
-      const providerModelId = model.preparation._tag === "Available"
-        ? Option.fromNullable(model.preparation.providerModelIds.find((id) => localProviderIds.has(id)))
+    .flatMap((model): readonly LocalInferenceSelection[] => model.offerings.map((offering) => {
+      const providerModelId = localProviderIds.has(offering.providerModelId)
+        ? Option.some(offering.providerModelId)
         : Option.none<ProviderModelId>()
       const providerModel = Option.flatMap(providerModelId, (id) =>
         Option.fromNullable(catalogModels.find(({ providerModelId }) => providerModelId === id)))
       return {
-        id: `model:${model.targetId}`,
+        id: `offering:${offering.providerModelId}:${model.targetId}`,
         kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
         model,
         recommendation: { _tag: "None" },
@@ -102,18 +102,18 @@ export const buildLocalInferenceSelections = (
           ({ capabilities }) => capabilities.reasoning.defaultEffort,
         ),
       }
-    })
+    }))
   const recommendations = models.recommendations._tag === "Ready"
     ? models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
-        const model = models.models.find(({ catalogCandidateIds }) =>
-          catalogCandidateIds.includes(recommendation.candidate.id))
+        const model = models.models.find(({ targetId }) =>
+          targetId === recommendation.candidate.targetId)
         if (!model || model.download._tag === "Downloaded") return []
         return [{
           id: `recommendation:${recommendation.id}`,
           kind: "recommendation",
           model,
           recommendation: { _tag: "Recommended", value: recommendation },
-          providerModelId: Option.some(recommendation.candidate.providerModelId),
+          providerModelId: Option.none(),
           reasoningEffort: recommendation.candidate.capabilities.reasoning.defaultEffort,
         }]
       })
@@ -128,7 +128,7 @@ export const buildLocalInferenceSelections = (
       kind: "recommendation",
       model,
       recommendation: { _tag: "None" },
-      providerModelId: Option.fromNullable(model.providerModelIds[0]),
+      providerModelId: Option.fromNullable(model.offerings[0]?.providerModelId),
       reasoningEffort: Option.none(),
     }))
   return [...stored, ...recommendations, ...transientDownloads]
@@ -174,10 +174,10 @@ const progressLabel = (
     const count = Option.getOrElse(step.completedItems, () => 0)
     return `Found ${count} downloaded ${count === 1 ? "model" : "models"}`
   }
-  if (step.id === "analysis") {
-    if (!completed) return "Evaluating models for this machine"
+  if (step.id === "assessment") {
+    if (!completed) return "Assessing models for this machine"
     const count = Option.getOrElse(step.completedItems, () => 0)
-    return `Evaluated ${count} models for this machine`
+    return `Assessed ${count} models for this machine`
   }
   if (!completed) return "Preparing recommendations"
   const count = Option.getOrElse(step.completedItems, () => 0)
@@ -202,7 +202,7 @@ export const localInferenceProgressLines = (
 ): readonly LocalInferenceProgressLine[] => steps.map((step) => {
   const completed = step.status._tag === "Completed"
   const label = progressLabel(step, completed)
-  const showCount = step.id === "analysis" && step.status._tag === "Running"
+  const showCount = step.id === "assessment" && step.status._tag === "Running"
   const count = showCount ? Option.match(step.totalItems, {
     onNone: () => "",
     onSome: (total) => Option.match(step.completedItems, {
@@ -237,7 +237,7 @@ export const localInferenceProgressLines = (
     id: step.id,
     state: "completed",
     label,
-    metadata: step.id === "analysis" && !step.status.cached
+    metadata: step.id === "assessment" && !step.status.cached
       ? ` · ${formatDurationMs(step.status.durationMs)}`
       : "",
   }
@@ -355,5 +355,9 @@ export const selectionMetadata = ({ model, recommendation }: LocalInferenceSelec
       : model.maximumContextLength,
   )} ctx`
 
-export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>
-  model.preparation._tag === "Unavailable" ? model.preparation.failure.message : null
+export const selectionCapacityWarning = ({ recommendation }: LocalInferenceSelection): string | null =>
+  recommendation._tag === "Recommended"
+    && recommendation.value.candidate.availability._tag === "Unavailable"
+    && recommendation.value.candidate.availability.failure.code === "insufficient_resources"
+    ? recommendation.value.candidate.availability.failure.message
+    : null

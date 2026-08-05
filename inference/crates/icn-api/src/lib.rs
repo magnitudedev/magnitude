@@ -22,13 +22,12 @@ use icn_contracts::bootstrap_protocol::{
 };
 use icn_contracts::models::{
     AssessModelsRequest, AssessModelsResponse, DownloadAttempt, DownloadAttemptId,
-    FitModelsRequest, FitModelsResponse, InstalledModelPackages, InstalledModelPackagesResponse,
-    LoadModelRequest, ModelDownloads, ModelDownloadsResponse, ModelEvaluator, ModelInstance,
-    ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelPackageId,
-    ModelServingConfigurationId, PreviewModelLoadRequest, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RemoveInstalledModelPackageResponse,
-    StartModelDownloadRequest, StartModelDownloadResponse,
+    InstalledModelPackages, InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor,
+    ModelDownloads, ModelDownloadsResponse, ModelInstance, ModelInstanceAllocation,
+    ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
+    ModelLoadEvent, ModelLoadPlan, ModelPackageId, ModelServingConfigurationId,
+    PreviewModelLoadRequest, RecommendableModelCatalog, RecommendableModelCatalogProvider,
+    RemoveInstalledModelPackageResponse, StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
@@ -74,7 +73,7 @@ const fn default_true() -> bool {
 pub struct AppState {
     installed_packages: Option<Arc<dyn InstalledModelPackages>>,
     recommendable_catalog: Option<Arc<dyn RecommendableModelCatalogProvider>>,
-    model_evaluator: Option<Arc<dyn ModelEvaluator>>,
+    model_assessor: Option<Arc<dyn ModelAssessor>>,
     model_downloads: Option<Arc<dyn ModelDownloads>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
     hugging_face_catalog: Option<Arc<dyn HuggingFaceModelCatalog>>,
@@ -165,7 +164,7 @@ impl AppState {
         Self {
             installed_packages: None,
             recommendable_catalog: None,
-            model_evaluator: None,
+            model_assessor: None,
             model_downloads: None,
             hardware: None,
             hugging_face_catalog: None,
@@ -180,7 +179,7 @@ impl AppState {
         Self {
             installed_packages: None,
             recommendable_catalog: None,
-            model_evaluator: None,
+            model_assessor: None,
             model_downloads: None,
             hardware: None,
             hugging_face_catalog: None,
@@ -217,8 +216,8 @@ impl AppState {
         self
     }
 
-    pub fn with_model_evaluator(mut self, model_evaluator: Arc<dyn ModelEvaluator>) -> Self {
-        self.model_evaluator = Some(model_evaluator);
+    pub fn with_model_assessor(mut self, model_assessor: Arc<dyn ModelAssessor>) -> Self {
+        self.model_assessor = Some(model_assessor);
         self
     }
 
@@ -263,7 +262,6 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/models/catalog", get(recommendable_model_catalog))
         .route("/v1/models/assess", post(assess_models))
-        .route("/v1/models/fit", post(fit_models))
         .route(
             "/v1/models/downloads",
             get(model_downloads).post(start_model_download),
@@ -1450,35 +1448,12 @@ async fn assess_models(
     State(state): State<AppState>,
     Json(request): Json<AssessModelsRequest>,
 ) -> Result<Json<AssessModelsResponse>, ApiError> {
-    let evaluator = state
-        .model_evaluator
+    let assessor = state
+        .model_assessor
         .as_ref()
-        .ok_or_else(|| ApiError::server("model evaluation is not configured"))?;
-    evaluator
+        .ok_or_else(|| ApiError::server("model assessment is not configured"))?;
+    assessor
         .assess(request)
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(post, path = "/v1/models/fit", operation_id = "fitModels", tag = "models",
-    request_body(content = FitModelsRequest, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Automatically selected target profiles", body = FitModelsResponse),
-        (status = 500, description = "Automatic fitting operation failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.fit", skip_all, err(Debug))]
-async fn fit_models(
-    State(state): State<AppState>,
-    Json(request): Json<FitModelsRequest>,
-) -> Result<Json<FitModelsResponse>, ApiError> {
-    let evaluator = state
-        .model_evaluator
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model evaluation is not configured"))?;
-    evaluator
-        .fit(request)
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -2702,7 +2677,6 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         remove_installed_model,
         recommendable_model_catalog,
         assess_models,
-        fit_models,
         start_model_download,
         model_downloads,
         model_download_attempt,
@@ -2728,8 +2702,6 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         RecommendableModelCatalog,
         AssessModelsRequest,
         AssessModelsResponse,
-        FitModelsRequest,
-        FitModelsResponse,
         StartModelDownloadRequest,
         StartModelDownloadResponse,
         ModelDownloadsResponse,

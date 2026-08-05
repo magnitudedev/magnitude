@@ -1,11 +1,12 @@
 import { Option } from "effect"
 import {
-  CatalogCandidateIdSchema,
+  AssessmentEnvironmentIdSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelOfferingTargetIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
+  ModelAssessmentIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
@@ -30,7 +31,6 @@ export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export const TEST_MODEL_ID = ProviderModelIdSchema.make("configuration_test")
 export const TEST_TARGET_ID = ModelOfferingTargetIdSchema.make("target_test")
 export const TEST_CONFIGURATION_ID = ModelServingConfigurationIdSchema.make("configuration_test")
-export const TEST_CANDIDATE_ID = CatalogCandidateIdSchema.make("candidate_test")
 export const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
 export const TEST_REASONING_EFFORT = ReasoningEffortSchema.make("none")
 
@@ -66,8 +66,7 @@ export const makeHardware = (
 
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
   targetId: TEST_TARGET_ID,
-  catalogCandidateIds: [TEST_CANDIDATE_ID],
-  providerModelIds: [TEST_MODEL_ID],
+  offerings: [{ configurationId: TEST_CONFIGURATION_ID, providerModelId: TEST_MODEL_ID }],
   displayName: "Qwen Test",
   description: "Test model",
   kind: "Standalone",
@@ -75,23 +74,24 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
   maximumContextLength: 32_768,
   downloadBytes: 16 * GIB,
   download: { _tag: "Downloaded", installedBytes: 16 * GIB },
-  preparation: { _tag: "Available", providerModelIds: [TEST_MODEL_ID] },
+  assessment: { _tag: "Unassessed" },
   ...overrides,
 })
 
 export const makeCatalogCandidate = (
   overrides: Partial<LocalModelCatalogCandidate> = {},
 ): LocalModelCatalogCandidate => ({
-  id: TEST_CANDIDATE_ID,
+  configurationId: TEST_CONFIGURATION_ID,
+  assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
+  environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
   targetId: TEST_TARGET_ID,
-  providerModelId: TEST_MODEL_ID,
   displayName: "Qwen Test",
   description: "Test model",
   license: "Apache-2.0",
   profile: { contextLength: 32_768 },
   downloadBytes: 16 * GIB,
   download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-  preparation: { _tag: "NotDownloaded" },
+  availability: { _tag: "NotDownloaded" },
   quantization: "Q4_K_M",
   quantizationName: "4-bit",
   memory: [{
@@ -106,7 +106,10 @@ export const makeCatalogCandidate = (
   intelligenceProvenance: "Test evidence",
   fidelityRank: 75,
   qualityEvidence: ["Test quantization evidence"],
+  lowerTokensPerSecond: 20,
   estimatedTokensPerSecond: 24,
+  upperTokensPerSecond: 28,
+  performanceConfidence: "moderate",
   capabilities: {
     vision: false,
     tools: true,
@@ -143,6 +146,7 @@ export const makeView = (options: {
   readonly models: LocalModelsState
   readonly catalog: ProviderModelCatalogState
   readonly slots: ModelSlotsState
+  readonly providerModelId: Option.Option<typeof TEST_MODEL_ID>
 } => {
   const models = options.models ?? [makeModel()]
   const selection = {
@@ -220,5 +224,6 @@ export const makeView = (options: {
       recentModelIds: { primary: [TEST_MODEL_ID], secondary: [] },
       favoriteModels: [],
     },
+    providerModelId: Option.some(TEST_MODEL_ID),
   }
 }

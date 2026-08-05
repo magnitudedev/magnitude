@@ -23,7 +23,10 @@ export const AcnStartingPhaseSchema = Schema.Union(
   ),
   Schema.TaggedStruct("PreparingBackend", {
     backend: Schema.Union(
+      Schema.TaggedStruct("Cpu", { hardwareLabel: Schema.NonEmptyString }),
+      Schema.TaggedStruct("Metal", { hardwareLabel: Schema.NonEmptyString }),
       Schema.TaggedStruct("Cuda", { hardwareLabel: Schema.NonEmptyString }),
+      Schema.TaggedStruct("Vulkan", { hardwareLabel: Schema.NonEmptyString }),
     ),
   }),
 );

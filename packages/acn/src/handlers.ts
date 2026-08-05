@@ -42,6 +42,7 @@ import { LocalInferenceHardware } from "./local-inference-hardware";
 import { LocalModelPackages } from "./local-model-packages";
 import { LocalModels } from "./local-models";
 import { LocalProviderOfferings } from "./local-provider-offerings";
+import { LocalModelRecommendations } from "./local-model-recommendations";
 import { modelOfferingTargetPackageIds } from "@magnitudedev/acn-protocol";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
@@ -68,6 +69,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const localModelPackages = yield* LocalModelPackages;
     const localModels = yield* LocalModels;
     const localProviderOfferings = yield* LocalProviderOfferings;
+    const localModelRecommendations = yield* LocalModelRecommendations;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -378,36 +380,31 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           mirroredStateChanges.stream,
         ),
 
-      DownloadModel: ({ targetId }) =>
+      DownloadModel: ({ configurationId }) =>
         observeRpcDefects(
           "DownloadModel",
           Effect.gen(function* () {
-            const target = yield* localModels.target(targetId)
-            if (!target) {
+            const selected = yield* localModelRecommendations
+              .getCatalogByConfigurationId(configurationId)
+            if (Option.isNone(selected)) {
               return yield* new LocalModelMutationFailed({
-                code: "local_model_not_found",
-                message: `Local model ${targetId} was not found`,
+                code: "local_model_configuration_not_found",
+                message: `Local model configuration ${configurationId} was not found`,
                 retryable: false,
               })
             }
-            const attemptIds = yield* localModelPackages.admitTarget(target)
-            const snapshot = yield* localModels.refresh
-            const admitted = new Set(attemptIds)
-            const published = snapshot.state.models.find((model) => model.targetId === targetId)
-            const admissionIsPublished = published?.download._tag === "Downloaded"
-              || (published?.download._tag === "Downloading"
-                && published.download.attemptIds.every((attemptId) => admitted.has(attemptId)))
-              || ((published?.download._tag === "Failed"
-                || published?.download._tag === "Cancelled")
-                && published.download.attemptIds.some((attemptId) => admitted.has(attemptId)))
-            if (!admissionIsPublished) {
-              return yield* new LocalModelMutationFailed({
-                code: "model_download_admission_not_published",
-                message: "The admitted model download was not published to local-model state",
-                retryable: true,
-              })
-            }
+            const offering = yield* localProviderOfferings.save(
+              selected.value.candidate.targetId,
+              selected.value.configuration,
+              { _tag: "Automatic" },
+            )
+            const attemptIds = yield* localModelPackages.admitTarget(
+              selected.value.candidate.targetId,
+              selected.value.configuration.target,
+            )
             return {
+              providerModelId: offering.providerModelId,
+              targetId: selected.value.candidate.targetId,
               attemptIds,
             }
           }),

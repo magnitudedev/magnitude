@@ -20,8 +20,13 @@ export const deriveSelectedLocalModelCandidate = (
 ): LocalModelCatalogCandidate | null => {
   const primary = slots.slots.primary
   if (primary._tag === "Unassigned" || models.recommendations._tag !== "Ready") return null
-  return models.recommendations.catalog.find(({ providerModelId }) =>
-    providerModelId === primary.selection.providerModelId)
+  const configurationId = models.models
+    .flatMap((model) => model.offerings)
+    .find(({ providerModelId }) => providerModelId === primary.selection.providerModelId)
+    ?.configurationId
+  if (configurationId === undefined) return null
+  return models.recommendations.catalog.find((candidate) =>
+    candidate.configurationId === configurationId)
     ?? null
 }
 

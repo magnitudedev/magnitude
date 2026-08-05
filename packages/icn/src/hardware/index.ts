@@ -11,10 +11,10 @@ type HardwareReadError = Effect.Effect.Error<ReturnType<IcnClientService["system
 
 export interface IcnHardwareService extends IcnObservedState<HardwareSnapshotSchema, HardwareReadError> {
   /**
-   * Hardware changes that can alter stable fitting evidence. Live availability
+   * Hardware changes that can alter model-assessment evidence. Live availability
    * changes remain on `changes` for admission and presentation consumers.
    */
-  readonly fittingChanges: Stream.Stream<IcnObservedSnapshot<HardwareSnapshotSchema>>
+  readonly assessmentChanges: Stream.Stream<IcnObservedSnapshot<HardwareSnapshotSchema>>
 }
 
 export class IcnHardware extends Context.Tag("@magnitudedev/icn/IcnHardware")<
@@ -51,7 +51,7 @@ export const makeIcnHardware = (
         Effect.forkScoped,
       )
 
-      const fittingChanges = observed.changes.pipe(Stream.changesWith((previous, next) =>
+      const assessmentChanges = observed.changes.pipe(Stream.changesWith((previous, next) =>
         previous.state.native_build === next.state.native_build
         && previous.state.topology_fingerprint === next.state.topology_fingerprint
         && previous.state.system_memory.total_bytes === next.state.system_memory.total_bytes
@@ -64,7 +64,7 @@ export const makeIcnHardware = (
 
       return IcnHardware.of({
         ...observed,
-        fittingChanges,
+        assessmentChanges,
       })
     }),
   )

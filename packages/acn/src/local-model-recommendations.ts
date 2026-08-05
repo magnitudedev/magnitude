@@ -10,7 +10,6 @@ import {
 } from "effect"
 import { createHash } from "node:crypto"
 import {
-  CatalogCandidateIdSchema,
   LocalModelMutationFailed,
   LocalModelCatalogCandidateMetadataSchema,
   ModelFailureSchema,
@@ -21,19 +20,16 @@ import {
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
   type ModelFailure,
+  type ModelServingConfiguration,
   type Recommendation,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware, IcnInstalledModels } from "@magnitudedev/icn"
-import {
-  ProviderModelIdSchema,
-  type ProviderModelId,
-} from "@magnitudedev/ai/provider/model"
 import { makeObservedState } from "./mirrored-state"
 import {
-  localModelAssessmentFailure,
-  LocalModelEvaluations,
-} from "./local-model-evaluations"
+  LocalModelAssessments,
+  modelAssessmentProfiles,
+} from "./local-model-assessments"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import {
   assembleRecommendationCatalogCandidates,
@@ -88,25 +84,39 @@ export interface LocalModelRecommendationsApi {
     readonly revision: number
     readonly state: RecommendationState
   }>
-  readonly refresh: Effect.Effect<void>
-  readonly getCatalogByProviderModelId: (
-    providerModelId: ProviderModelId
-  ) => Effect.Effect<CatalogEntry | undefined>
+  readonly getCatalogByConfigurationId: (
+    configurationId: ModelServingConfiguration["id"]
+  ) => Effect.Effect<Option.Option<CatalogEntry>>
 }
 
 export class LocalModelRecommendations extends Context.Tag(
   "LocalModelRecommendations"
 )<LocalModelRecommendations, LocalModelRecommendationsApi>() {}
 
-const publishedWeightBytes = (model: RecommendableModel): number => {
+export const exactTargetTensorStorageBytes = (
+  model: RecommendableModel
+): Option.Option<number> => {
   const packages =
     model.target._tag === "Package"
       ? [model.target.package]
       : [model.target.target, model.target.draft]
-  return packages
-    .flatMap(({ files }) => files)
-    .filter(({ role }) => role === "weights")
-    .reduce((total, { sizeBytes }) => total + sizeBytes, 0)
+  const files = new Map(
+    packages
+      .flatMap(({ files }) => files)
+      // Primary/sharded weight tensors are required for every execution of the target. Other
+      // package roles can be optional, so counting them could create a false rejection. Native
+      // assessment accounts for every selected component precisely.
+      .filter((file) => file.role === "weights")
+      .map((file) => [file.sha256, file])
+  )
+  if (files.size === 0) return Option.none()
+  let total = 0
+  for (const file of files.values()) {
+    if (Option.isNone(file.tensorStorageBytes)) return Option.none()
+    total += file.tensorStorageBytes.value
+    if (!Number.isSafeInteger(total)) return Option.none()
+  }
+  return Option.some(total)
 }
 
 const targetPackages = (model: RecommendableModel) =>
@@ -130,11 +140,10 @@ const catalogProjection = (
   recommendation: Recommendation | undefined,
 ): CatalogEntry => ({
   candidate: {
-    id: CatalogCandidateIdSchema.make(candidate.assessment.configurationId),
+    configurationId: candidate.assessment.configurationId,
+    assessmentId: candidate.assessment.assessmentId,
+    environmentId: candidate.assessment.environmentId,
     targetId: candidate.model.targetId,
-    providerModelId: ProviderModelIdSchema.make(
-      candidate.assessment.configurationId
-    ),
     displayName: candidate.model.displayName,
     description: candidate.model.description,
     license: candidate.model.license,
@@ -151,7 +160,10 @@ const catalogProjection = (
     intelligenceProvenance: candidate.capability?.provenance ?? "Unavailable",
     fidelityRank: candidate.fidelityRank,
     qualityEvidence: candidate.model.qualityEvidence,
+    lowerTokensPerSecond: candidate.assessment.performance.lowerTokensPerSecond,
     estimatedTokensPerSecond: candidate.assessment.performance.estimatedTokensPerSecond,
+    upperTokensPerSecond: candidate.assessment.performance.upperTokensPerSecond,
+    performanceConfidence: candidate.assessment.performance.confidence,
     capabilities: candidate.model.capabilities,
     sources: targetPackages(candidate.model).map((modelPackage) => ({
       source: modelPackage.source,
@@ -180,7 +192,7 @@ const pendingProgress = (
 const initialProgress = (): readonly LocalModelRecommendationProgressStep[] => [
   pendingProgress("hardware"),
   pendingProgress("inventory"),
-  pendingProgress("analysis"),
+  pendingProgress("assessment"),
   pendingProgress("recommendations"),
 ]
 
@@ -194,7 +206,7 @@ const updateProgress = (
 export const makeLocalModelRecommendationsLive = (): Layer.Layer<
   LocalModelRecommendations,
   never,
-  IcnCatalog | IcnHardware | IcnInstalledModels | LocalModelEvaluations
+  IcnCatalog | IcnHardware | IcnInstalledModels | LocalModelAssessments
 > =>
   Layer.scoped(
     LocalModelRecommendations,
@@ -202,7 +214,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       const catalog = yield* IcnCatalog
       const hardware = yield* IcnHardware
       const installed = yield* IcnInstalledModels
-      const evaluations = yield* LocalModelEvaluations
+      const assessments = yield* LocalModelAssessments
       const startupStartedAtMs = Date.now()
       const startupProgress = updateProgress(initialProgress(), "hardware", {
         status: { _tag: "Running", startedAtMs: startupStartedAtMs },
@@ -299,7 +311,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
         return publishProgress(next).pipe(Effect.as(next))
       }
 
-      const refresh = lock
+      const generate = lock
         .withPermits(1)(
           Effect.gen(function* () {
             const currentStateBeforeRefresh = (yield* mirror.get).state
@@ -354,13 +366,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               catalogState.models,
               recommendableModelFromIcn
             )
-            const stableCapacityBytes = hardwareSnapshot.memory_domains.reduce(
-              (total, domain) => total + domain.stable_capacity_bytes,
-              0
-            )
-            const models = catalogModels.filter(
-              (model) => publishedWeightBytes(model) <= stableCapacityBytes
-            )
+            const models = catalogModels
             const inputState = yield* Schema.encode(
               Schema.parseJson(Schema.Unknown)
             )({
@@ -368,7 +374,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 id: model.id,
                 targetId: model.targetId,
                 checkpointId: model.checkpointId,
-                eligibleServingProfiles: model.eligibleServingProfiles,
+                assessmentProfiles: modelAssessmentProfiles(model.target),
                 displayName: model.displayName,
                 description: model.description,
                 license: model.license,
@@ -378,7 +384,9 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 fidelityRank: model.fidelityRank,
                 quantizationAware: model.quantizationAware,
                 qualityEvidence: model.qualityEvidence,
-                publishedWeightBytes: publishedWeightBytes(model),
+                tensorStorageBytes: Option.getOrNull(
+                  exactTargetTensorStorageBytes(model)
+                ),
               })),
               hardware: hardwareSnapshot.topology_fingerprint,
               nativeBuild: hardwareSnapshot.native_build,
@@ -404,7 +412,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               currentState._tag === "Ready"
             ) {
               const reusedAt = Date.now()
-              progress = updateProgress(progress, "analysis", {
+              progress = updateProgress(progress, "assessment", {
                 status: {
                   _tag: "Completed",
                   startedAtMs: reusedAt,
@@ -436,17 +444,30 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               return
             }
 
+            const aggregateStableCapacityBytes = hardwareSnapshot.memory_domains.reduce(
+              (total, domain) => total + domain.stable_capacity_bytes,
+              0
+            )
+            const assessableModels = models.flatMap((model, index) => {
+              const tensorStorageBytes = exactTargetTensorStorageBytes(model)
+              return Option.isSome(tensorStorageBytes)
+                && tensorStorageBytes.value > aggregateStableCapacityBytes
+                ? []
+                : [{ model, index }]
+            })
+            const rejectedCount = models.length - assessableModels.length
             const assessmentStartedAt = Date.now()
-            progress = yield* startStep(progress, "analysis", {
-              completed: 0,
+            progress = yield* startStep(progress, "assessment", {
+              completed: rejectedCount,
               total: models.length,
             })
             yield* publishProgress(progress)
-            const requests = models.map((model) => ({
+            const requests = assessableModels.map(({ model }) => ({
+              targetId: model.targetId,
               target: model.target,
-              profiles: model.eligibleServingProfiles,
+              profiles: modelAssessmentProfiles(model.target),
             }))
-            const results = yield* evaluations.assessManyWithProgress(
+            const assessedResults = yield* assessments.assess(
               requests,
               (completed, total) =>
                 Effect.gen(function* () {
@@ -463,9 +484,9 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                           )
                         )
                       : 0
-                  progress = updateProgress(progress, "analysis", {
-                    completedItems: Option.some(completed),
-                    totalItems: Option.some(total),
+                  progress = updateProgress(progress, "assessment", {
+                    completedItems: Option.some(rejectedCount + completed),
+                    totalItems: Option.some(rejectedCount + total),
                     estimatedRemainingMs:
                       completed > 0
                         ? Option.some(estimatedRemainingMs)
@@ -474,30 +495,29 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   yield* publishProgress(progress)
                 })
             )
-            const assessmentFailure = localModelAssessmentFailure(results)
-            if (assessmentFailure) {
-              return yield* new LocalModelMutationFailed(assessmentFailure)
-            }
+            const results = new Map(
+              assessableModels.map(({ index }, assessedIndex) => [
+                index,
+                assessedResults[assessedIndex],
+              ])
+            )
             progress = yield* completeStep(
               progress,
-              "analysis",
+              "assessment",
               assessmentStartedAt,
               false,
               { completed: models.length, total: models.length }
             )
-            const evaluated = results.flatMap(
-              (result, modelIndex): readonly RecommendationCandidate[] => {
-                if (result._tag !== "Assessed") return []
+            const evaluated = models.flatMap(
+              (_model, modelIndex): readonly RecommendationCandidate[] => {
+                const result = results.get(modelIndex)
+                if (result?._tag !== "Assessed") return []
                 const model = models[modelIndex]
                 if (!model) return []
                 return result.assessments.flatMap(
-                  (
-                    assessment,
-                    profileIndex
-                  ): readonly RecommendationCandidate[] => {
+                  (assessment): readonly RecommendationCandidate[] => {
                     if (assessment._tag !== "Fits") return []
-                    const profile = model.eligibleServingProfiles[profileIndex]
-                    if (!profile) return []
+                    const profile = assessment.assessment.profile
                     return [
                       {
                         model,
@@ -583,7 +603,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
           })
         )
         .pipe(
-          Effect.withSpan("acn.local-model-recommendations.refresh"),
+          Effect.withSpan("acn.local-model-recommendations.generate"),
           Effect.catchAllCause((cause) =>
             Effect.gen(function* () {
               const failure = Cause.failureOption(cause)
@@ -614,43 +634,45 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   : step
               )
               yield* Ref.set(progressRef, failedProgress)
+              const current = (yield* mirror.get).state
               yield* mirror.setIfChanged(
-                {
-                  _tag: "Failed",
-                  failure: reportedFailure,
-                  progress: failedProgress,
-                },
+                current._tag === "Ready"
+                  ? { ...current, progress: failedProgress }
+                  : {
+                      _tag: "Failed",
+                      failure: reportedFailure,
+                      progress: failedProgress,
+                    },
                 equivalent
               )
               yield* Effect.logWarning(
-                "Unable to refresh local model recommendations"
+                "Unable to generate local model recommendations"
               ).pipe(Effect.annotateLogs({ cause: String(cause) }))
             })
           )
         )
 
-      yield* refresh.pipe(Effect.forkScoped)
+      yield* generate.pipe(Effect.forkScoped)
       yield* Stream.merge(
-        Stream.merge(catalog.changes, hardware.fittingChanges),
+        Stream.merge(catalog.changes, hardware.assessmentChanges),
         installed.changes
       ).pipe(
-        Stream.runForEach(() => refresh),
+        Stream.runForEach(() => generate),
         Effect.forkScoped
       )
 
       return LocalModelRecommendations.of({
         snapshot: mirror.get,
         changes: mirror.changes,
-        refresh,
-        getCatalogByProviderModelId: (providerModelId) =>
+        getCatalogByConfigurationId: (configurationId) =>
           mirror.get.pipe(
             Effect.map(({ state }) =>
               state._tag === "Ready"
-                ? state.catalog.find(
+                ? Option.fromNullable(state.catalog.find(
                     (entry) =>
-                      entry.candidate.providerModelId === providerModelId
-                  )
-                : undefined
+                      entry.configuration.id === configurationId
+                  ))
+                : Option.none()
             )
           ),
       })

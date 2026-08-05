@@ -35,7 +35,10 @@ export const AcnInstallationPlanSchema = Schema.Struct({
 export type AcnInstallationPlan = typeof AcnInstallationPlanSchema.Type;
 
 export const StartupBackendSchema = Schema.Union(
+  Schema.TaggedStruct("Cpu", { hardwareLabel: NonEmptyString }),
+  Schema.TaggedStruct("Metal", { hardwareLabel: NonEmptyString }),
   Schema.TaggedStruct("Cuda", { hardwareLabel: NonEmptyString }),
+  Schema.TaggedStruct("Vulkan", { hardwareLabel: NonEmptyString }),
 )
 export type StartupBackend = typeof StartupBackendSchema.Type
 

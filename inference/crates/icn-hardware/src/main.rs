@@ -4,14 +4,15 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use icn_hardware::{
-    CacheType, FitContextType, FitFlashAttention, FitOptions, FitRequest, GpuLayers, SplitMode,
+    CacheType, GpuLayers, PlanningContextType, PlanningFlashAttention, PlanningOptions,
+    PlanningRequest, SplitMode,
 };
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "icn-fit",
-    about = "Estimate and fit a GGUF using the pinned native planner without loading model tensors"
+    name = "icn-model-assessment",
+    about = "Assess a GGUF using the pinned native planner without loading model tensors"
 )]
 struct Args {
     /// GGUF model file to inspect.
@@ -20,7 +21,7 @@ struct Args {
     /// Context tokens, or `auto` for the model's trained context.
     #[arg(long, default_value = "auto")]
     context: ContextArg,
-    /// Minimum context during fitting, or `full` to forbid context reduction.
+    /// Minimum context during native planning, or `full` to forbid context reduction.
     #[arg(long, default_value = "4096", value_parser = parse_minimum_context)]
     minimum_context: u32,
     /// Margin per device in MiB. One value broadcasts; comma-separated values are per device.
@@ -35,7 +36,7 @@ struct Args {
     /// Maximum parallel sequences sharing the context.
     #[arg(long, default_value_t = 1)]
     sequences: u32,
-    /// GPU layers, or `auto` for common/fit selection.
+    /// GPU layers, or `auto` for native placement selection.
     #[arg(long, default_value = "auto")]
     gpu_layers: GpuLayersArg,
     /// K-cache type accepted by the pinned native backend.
@@ -119,7 +120,7 @@ impl std::str::FromStr for GpuLayersArg {
     }
 }
 
-impl From<FlashArg> for FitFlashAttention {
+impl From<FlashArg> for PlanningFlashAttention {
     fn from(value: FlashArg) -> Self {
         match value {
             FlashArg::Auto => Self::Auto,
@@ -135,7 +136,7 @@ struct Output<'a> {
     estimator: &'static str,
     allocates_model_tensors: bool,
     model: &'a std::path::Path,
-    options: &'a FitOptions,
+    options: &'a PlanningOptions,
     report: &'a llama_cpp_2::model::params::fit::FitReport,
 }
 
@@ -144,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     // Keep stdout machine-readable and avoid thousands of no-allocation graph
     // planning lines on stderr. Library callers retain control of global logs.
     llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(false));
-    let options = FitOptions {
+    let options = PlanningOptions {
         context_tokens: match args.context {
             ContextArg::Auto => None,
             ContextArg::Tokens(value) => Some(value),
@@ -175,23 +176,23 @@ fn main() -> anyhow::Result<()> {
         operation_offload: !args.no_op_offload,
         swa_full: args.swa_full,
         kv_unified: args.kv_unified,
-        context_type: FitContextType::Target,
+        context_type: PlanningContextType::Target,
         recurrent_snapshots: 0,
         maximum_outputs: None,
         threads: None,
         threads_batch: None,
     };
-    let request = FitRequest {
+    let request = PlanningRequest {
         model: args.model,
         options,
     };
     let backend = llama_cpp_2::llama_backend::LlamaBackend::init()
         .context("failed to initialize llama.cpp")?;
-    let report =
-        icn_hardware::estimate_with_backend(&backend, &request).context("model fit failed")?;
+    let report = icn_hardware::assess_model_with_backend(&backend, &request)
+        .context("model assessment failed")?;
     let output = Output {
         implementation: "magnitude-icn",
-        estimator: "pinned_native_fit",
+        estimator: "pinned_native_planner",
         allocates_model_tensors: false,
         model: &request.model,
         options: &request.options,
@@ -206,7 +207,7 @@ fn main() -> anyhow::Result<()> {
     if report.is_success() {
         Ok(())
     } else {
-        anyhow::bail!("native fit assessment returned {:?}", report.status)
+        anyhow::bail!("native model assessment returned {:?}", report.status)
     }
 }
 

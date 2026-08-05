@@ -56,8 +56,8 @@ export const deriveLocalInferenceFooterView = (
     ? selectedSlot
     : undefined
   const activeModel = slot && models !== null
-    ? models.models.find((model) => model.preparation._tag === "Available"
-      && model.preparation.providerModelIds.includes(slot.selection.providerModelId))
+    ? models.models.find((model) => model.offerings.some(({ providerModelId }) =>
+      providerModelId === slot.selection.providerModelId))
     : undefined
   const downloadModel = models?.models.find((model) =>
     model.download._tag === "Downloading" || model.download._tag === "Failed")

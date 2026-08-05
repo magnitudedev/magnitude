@@ -1,21 +1,22 @@
-import { Context, Effect, Layer, PubSub, Ref, Stream } from "effect"
+import { Context, Effect, Layer, Option, PubSub, Ref, Stream } from "effect"
 import {
+  LocalModelMutationFailed,
   modelOfferingTargetPackageIds,
   type ModelFailure,
   type ModelOfferingTargetId,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
-import { LocalModelEvaluations } from "./local-model-evaluations"
+import {
+  LocalModelAssessments,
+  modelAssessmentProfiles,
+  selectModelServingConfiguration,
+} from "./local-model-assessments"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 
-export type LocalModelAutoSetupStatus =
-  | { readonly _tag: "Preparing" }
-  | { readonly _tag: "Unavailable"; readonly failure: ModelFailure }
-
 export interface LocalModelAutoSetupApi {
-  readonly statuses: Effect.Effect<ReadonlyMap<ModelOfferingTargetId, LocalModelAutoSetupStatus>>
+  readonly failures: Effect.Effect<ReadonlyMap<ModelOfferingTargetId, ModelFailure>>
   readonly changes: Stream.Stream<void>
 }
 
@@ -27,20 +28,20 @@ export class LocalModelAutoSetup extends Context.Tag("LocalModelAutoSetup")<
 /**
  * Creates one automatic offering for each usable standalone package discovered
  * on disk. Existing offerings are assessed by their consumers and are never
- * silently replaced or refitted here.
+ * silently replaced here.
  */
 export const LocalModelAutoSetupLive: Layer.Layer<
   LocalModelAutoSetup,
   never,
-  IcnCatalog | IcnHardware | LocalModelEvaluations | LocalModelPackages | LocalProviderOfferings
+  IcnCatalog | IcnHardware | LocalModelAssessments | LocalModelPackages | LocalProviderOfferings
 > = Layer.scoped(LocalModelAutoSetup, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const hardware = yield* IcnHardware
   const packages = yield* LocalModelPackages
-  const evaluations = yield* LocalModelEvaluations
+  const assessments = yield* LocalModelAssessments
   const offerings = yield* LocalProviderOfferings
   const attempted = yield* Ref.make<ReadonlySet<string>>(new Set())
-  const statuses = yield* Ref.make<ReadonlyMap<ModelOfferingTargetId, LocalModelAutoSetupStatus>>(
+  const failures = yield* Ref.make<ReadonlyMap<ModelOfferingTargetId, ModelFailure>>(
     new Map(),
   )
   const changes = yield* PubSub.sliding<void>(16)
@@ -69,17 +70,43 @@ export const LocalModelAutoSetupLive: Layer.Layer<
       && !configuredPackages.has(entry.package.id)
       && !attemptedPackages.has(`${topology}:${entry.package.id}`))
 
-    for (const candidate of candidates) {
+    yield* Effect.forEach(candidates, (candidate) => Effect.gen(function* () {
       const attemptKey = `${topology}:${candidate.package.id}`
-      if (candidate.targetId._tag === "None") continue
+      if (candidate.targetId._tag === "None") return
       const targetId = candidate.targetId.value
-      yield* Ref.update(statuses, (current) =>
-        new Map(current).set(targetId, { _tag: "Preparing" }))
-      yield* PubSub.publish(changes, undefined)
-      const result = yield* evaluations.fit({ _tag: "Package", package: candidate.package }).pipe(
-        Effect.flatMap(({ targetId: fittedTargetId, configuration }) =>
-          offerings.save(fittedTargetId, configuration, { _tag: "Automatic" })),
-        Effect.tapError((error) => Effect.logWarning("Unable to auto-fit installed model package").pipe(
+      const target = { _tag: "Package" as const, package: candidate.package }
+      const result = yield* assessments.assess([{
+        targetId,
+        target,
+        profiles: modelAssessmentProfiles(target),
+      }], () => Effect.void).pipe(
+        Effect.flatMap((assessmentResults) => Effect.gen(function* () {
+          const assessmentResult = Option.fromNullable(assessmentResults[0])
+          if (Option.isNone(assessmentResult)) {
+            return yield* Effect.dieMessage("ICN returned no assessment result")
+          }
+          if (assessmentResult.value._tag === "InvalidTarget") {
+            return yield* new LocalModelMutationFailed({
+              code: "model_target_invalid",
+              message: assessmentResult.value.message,
+              retryable: false,
+            })
+          }
+          const configuration = selectModelServingConfiguration(target, assessmentResult.value)
+          if (Option.isNone(configuration)) {
+            return yield* new LocalModelMutationFailed({
+              code: "model_does_not_fit",
+              message: "No assessed context length fits the available hardware capacity",
+              retryable: false,
+            })
+          }
+          return yield* offerings.save(
+            assessmentResult.value.targetId,
+            configuration.value,
+            { _tag: "Automatic" },
+          )
+        })),
+        Effect.tapError((error) => Effect.logWarning("Unable to assess installed model package").pipe(
           Effect.annotateLogs({ packageId: candidate.package.id, cause: error.message }),
         )),
         Effect.either,
@@ -88,39 +115,36 @@ export const LocalModelAutoSetupLive: Layer.Layer<
         || ("retryable" in result.left && !result.left.retryable)) {
         yield* Ref.update(attempted, (current) => new Set([...current, attemptKey]))
       }
-      yield* Ref.update(statuses, (current) => {
+      yield* Ref.update(failures, (current) => {
         const next = new Map(current)
         if (result._tag === "Right") {
           next.delete(targetId)
         } else {
           next.set(targetId, {
-            _tag: "Unavailable",
-            failure: {
-              code: "code" in result.left ? result.left.code : result.left._tag,
-              message: result.left.message,
-              retryable: "retryable" in result.left ? result.left.retryable : false,
-            },
+            code: "code" in result.left ? result.left.code : result.left._tag,
+            message: result.left.message,
+            retryable: "retryable" in result.left ? result.left.retryable : false,
           })
         }
         return next
       })
       yield* PubSub.publish(changes, undefined)
-    }
+    }), { concurrency: 8 })
   })).pipe(Effect.catchAllCause((cause) =>
     Effect.logWarning("Unable to reconcile installed local models").pipe(
       Effect.annotateLogs({ cause: String(cause) }),
     )))
 
-  yield* reconcile
-  yield* Stream.merge(
-    Stream.merge(packages.changes, hardware.fittingChanges),
-    catalog.changes,
-  ).pipe(
+  yield* Stream.make(undefined).pipe(
+    Stream.concat(Stream.merge(
+      Stream.merge(packages.changes, hardware.assessmentChanges),
+      catalog.changes,
+    )),
     Stream.runForEach(() => reconcile),
     Effect.forkScoped,
   )
   return LocalModelAutoSetup.of({
-    statuses: Ref.get(statuses),
+    failures: Ref.get(failures),
     changes: Stream.fromPubSub(changes),
   })
 }))

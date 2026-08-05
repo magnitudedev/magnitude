@@ -110,17 +110,17 @@ export {
   OnboardingMirror,
   ModelOfferingTargetIdSchema,
   DownloadAttemptIdSchema,
-  CatalogCandidateIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   RecommendationIdSchema,
+  ModelAssessmentIdSchema,
+  AssessmentEnvironmentIdSchema,
   LocalModelsStateSchema,
 } from "@magnitudedev/acn-protocol"
 
 export type {
   DownloadAttemptId,
   ModelOfferingTargetId,
-  CatalogCandidateId,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,

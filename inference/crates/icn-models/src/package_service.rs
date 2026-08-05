@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 
 use futures_util::future::BoxFuture;
 use icn_contracts::models::{
-    InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse, ModelFailure,
-    ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelOfferingTarget,
-    ModelOfferingTargetId, ModelPackage, ModelPackageId, ModelPackageInspection,
-    ModelPackageOperand, ModelPackageProperties, ModelPackageSource, ModelTargetInput,
-    OfferingAssessment, RemoveInstalledModelPackageResponse, ResolvedModelTarget,
+    InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessment,
+    ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
+    ModelOfferingTarget, ModelOfferingTargetId, ModelPackage, ModelPackageId,
+    ModelPackageInspection, ModelPackageOperand, ModelPackageProperties, ModelPackageSource,
+    ModelTargetInput, RemoveInstalledModelPackageResponse, ResolvedModelTarget,
     SpeculativeDecodingPairId,
 };
 use icn_contracts::{
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::PreparedPreview;
 use crate::cache::ModelIndexKind;
 use crate::capabilities::model_capabilities;
-use crate::inventory::ModelManager;
+use crate::inventory::{InstalledPackageRecord, InstalledPackageSnapshot, ModelManager};
 
 struct ResolvedPackageOperand {
     package: ModelPackage,
@@ -160,6 +160,7 @@ fn package_relationship(
 fn package_from_resolved_with(
     resolved: &ResolvedModel,
     digest: impl Fn(&Path) -> Result<String, InventoryError>,
+    tensor_storage: impl Fn(&Path, &ContentIdentity) -> Option<u64>,
 ) -> Result<ModelPackage, InventoryError> {
     let model = &resolved.model;
     let source = package_source(model, resolved);
@@ -201,6 +202,7 @@ fn package_from_resolved_with(
                 ComponentRole::Auxiliary => ModelFileRole::Auxiliary,
             },
             size_bytes: declared.size_bytes,
+            tensor_storage_bytes: tensor_storage(absolute, &declared.content),
             sha256,
         });
     }
@@ -252,7 +254,11 @@ fn shard_count(indices: impl IntoIterator<Item = Option<u32>>) -> u32 {
 pub(crate) fn package_from_resolved(
     resolved: &ResolvedModel,
 ) -> Result<ModelPackage, InventoryError> {
-    package_from_resolved_with(resolved, digest_file)
+    package_from_resolved_with(resolved, digest_file, |path, _| {
+        crate::gguf::inspect(path)
+            .ok()
+            .map(|inspection| inspection.tensor_storage_bytes)
+    })
 }
 
 fn inspection_for(model: &InventoryModel) -> ModelPackageInspection {
@@ -328,97 +334,238 @@ fn speculative_pair_id(
 }
 
 impl ModelManager {
+    fn seed_package_digests_from_snapshot(
+        &self,
+        resolved: &ResolvedModel,
+    ) -> Result<(), InventoryError> {
+        let cached = self
+            .installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?
+            .records
+            .values()
+            .find(|record| {
+                record.model.id == resolved.model.id
+                    && record.model.content_id == resolved.model.content_id
+            })
+            .cloned();
+        let Some(cached) = cached else {
+            return Ok(());
+        };
+        let files = cached
+            .installed
+            .package
+            .files
+            .iter()
+            .map(|file| (&file.path, file))
+            .collect::<BTreeMap<_, _>>();
+        let mut digests = self.package_digests.write().map_err(|_| {
+            InventoryError::Internal("package digest cache lock poisoned".to_owned())
+        })?;
+        for (declared, component) in resolved
+            .model
+            .location
+            .components()
+            .iter()
+            .zip(&resolved.components)
+        {
+            let Some(file) = files.get(&declared.path) else {
+                continue;
+            };
+            if file.size_bytes != declared.size_bytes
+                || file.id != file_id(&file.sha256)
+                || file.sha256.len() != 64
+                || !file
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&component.path) else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if metadata.len() == file.size_bytes {
+                digests.insert(
+                    component.path.clone(),
+                    (metadata.len(), modified, file.sha256.clone()),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn package_from_resolved(
         &self,
         resolved: &ResolvedModel,
     ) -> Result<ModelPackage, InventoryError> {
-        package_from_resolved_with(resolved, |path| {
-            let metadata = fs::metadata(path).map_err(|error| {
-                InventoryError::Io(format!("failed to inspect {}: {error}", path.display()))
-            })?;
-            let modified = metadata.modified().map_err(|error| {
-                InventoryError::Io(format!(
-                    "failed to inspect modification time for {}: {error}",
-                    path.display()
-                ))
-            })?;
-            if let Some((_, _, digest)) = self
-                .package_digests
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("package digest cache lock poisoned".to_owned())
-                })?
-                .get(path)
-                .filter(|(size, cached_modified, _)| {
-                    *size == metadata.len() && *cached_modified == modified
-                })
-            {
-                return Ok(digest.clone());
+        package_from_resolved_with(
+            resolved,
+            |path| {
+                let metadata = fs::metadata(path).map_err(|error| {
+                    InventoryError::Io(format!("failed to inspect {}: {error}", path.display()))
+                })?;
+                let modified = metadata.modified().map_err(|error| {
+                    InventoryError::Io(format!(
+                        "failed to inspect modification time for {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if let Some((_, _, digest)) = self
+                    .package_digests
+                    .read()
+                    .map_err(|_| {
+                        InventoryError::Internal("package digest cache lock poisoned".to_owned())
+                    })?
+                    .get(path)
+                    .filter(|(size, cached_modified, _)| {
+                        *size == metadata.len() && *cached_modified == modified
+                    })
+                {
+                    return Ok(digest.clone());
+                }
+                let digest = digest_file(path)?;
+                self.package_digests
+                    .write()
+                    .map_err(|_| {
+                        InventoryError::Internal("package digest cache lock poisoned".to_owned())
+                    })?
+                    .insert(
+                        path.to_path_buf(),
+                        (metadata.len(), modified, digest.clone()),
+                    );
+                Ok(digest)
+            },
+            |path, content| self.inspect_tensor_storage_bytes(path, content),
+        )
+    }
+
+    fn tensor_storage_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
+        let evidence = serde_json::to_vec(&(
+            "gguf-tensor-storage-v1",
+            content,
+            path.metadata().ok()?.len(),
+        ))
+        .ok()?;
+        Some(format!("tensor_storage_{:x}", Sha256::digest(evidence)))
+    }
+
+    fn inspect_tensor_storage_bytes(&self, path: &Path, content: &ContentIdentity) -> Option<u64> {
+        let key = Self::tensor_storage_cache_key(path, content)?;
+        if let Some(bytes) = self.cache.read_index(ModelIndexKind::TensorStorage, &key) {
+            return Some(bytes);
+        }
+        let bytes = crate::gguf::inspect(path).ok()?.tensor_storage_bytes;
+        self.cache
+            .write_index(ModelIndexKind::TensorStorage, &key, &bytes);
+        Some(bytes)
+    }
+
+    pub(crate) fn build_installed_package_snapshot(
+        &self,
+        models: &BTreeMap<icn_contracts::ModelId, InventoryModel>,
+    ) -> Result<InstalledPackageSnapshot, InventoryError> {
+        let mut records = BTreeMap::new();
+        for model in models.values() {
+            if !matches!(
+                model.availability,
+                ModelAvailability::Available { .. }
+                    | ModelAvailability::InvalidArtifact { .. }
+                    | ModelAvailability::IncompatibleArtifact { .. }
+            ) {
+                continue;
             }
-            let digest = digest_file(path)?;
-            self.package_digests
-                .write()
-                .map_err(|_| {
-                    InventoryError::Internal("package digest cache lock poisoned".to_owned())
-                })?
-                .insert(
-                    path.to_path_buf(),
-                    (metadata.len(), modified, digest.clone()),
-                );
-            Ok(digest)
-        })
+            let resolved = ResolvedModel {
+                components: crate::service::resolve_components(&self.config.root, model)?,
+                model: model.clone(),
+            };
+            self.seed_package_digests_from_snapshot(&resolved)?;
+            let package = self.package_from_resolved(&resolved)?;
+            let installed = InstalledModelPackage {
+                target_id: offering_target_id(&[&package.id]),
+                path: installed_path(model, &resolved),
+                inspection: inspection_for(model),
+                package,
+            };
+            records.insert(
+                installed.package.id.clone(),
+                InstalledPackageRecord {
+                    installed,
+                    model: model.clone(),
+                },
+            );
+        }
+        Ok(InstalledPackageSnapshot { records })
     }
 
     #[must_use]
-    pub fn read_offering_assessment(
+    pub fn read_model_assessment(
         &self,
         evidence: &str,
         topology: &icn_contracts::MemoryTopology,
-    ) -> Option<OfferingAssessment> {
-        self.cache
-            .read_index(ModelIndexKind::OfferingAssessment, evidence)
-            .filter(|assessment: &OfferingAssessment| assessment.is_valid_for(topology))
+    ) -> Option<ModelAssessment> {
+        if let Some(assessment) = self
+            .model_assessments
+            .read()
+            .ok()?
+            .get(evidence)
+            .filter(|assessment| assessment.is_valid_for(topology))
+            .cloned()
+        {
+            return Some(assessment);
+        }
+        let assessment = self
+            .cache
+            .read_index(ModelIndexKind::ModelAssessment, evidence)
+            .filter(|assessment: &ModelAssessment| assessment.is_valid_for(topology))?;
+        self.model_assessments
+            .write()
+            .ok()?
+            .insert(evidence.to_owned(), assessment.clone());
+        Some(assessment)
     }
 
-    pub fn write_offering_assessment(&self, evidence: &str, assessment: &OfferingAssessment) {
+    pub fn write_model_assessment(&self, evidence: &str, assessment: &ModelAssessment) {
+        if let Ok(mut memory) = self.model_assessments.write() {
+            memory.insert(evidence.to_owned(), assessment.clone());
+        }
         self.cache
-            .write_index(ModelIndexKind::OfferingAssessment, evidence, assessment);
+            .write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
     }
 
-    async fn installed_package(
+    pub(crate) async fn installed_package(
         &self,
         package_id: &ModelPackageId,
     ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
         let find = || {
-            self.package_models
+            self.installed_packages
                 .read()
                 .map_err(|_| {
-                    InventoryError::Internal("installed package index lock poisoned".to_owned())
+                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
                 })?
+                .records
                 .get(package_id)
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))
         };
-        let model_id = match find() {
-            Ok(model_id) => model_id,
+        let record = match find() {
+            Ok(record) => record,
             Err(InventoryError::NotFound(_)) => {
-                <Self as InstalledModelPackages>::list_installed(self).await?;
+                self.ensure_installed_model_inventory().await?;
                 find()?
             }
             Err(error) => return Err(error),
         };
-        let resolved = <Self as ModelInventory>::resolve_ready(self, &model_id).await?;
-        let package = self.package_from_resolved(&resolved)?;
-        if package.id != *package_id {
-            self.package_models
-                .write()
-                .map_err(|_| {
-                    InventoryError::Internal("installed package index lock poisoned".to_owned())
-                })?
-                .remove(package_id);
-            return Err(InventoryError::NotFound(package_id.0.clone()));
-        }
-        Ok((package, resolved))
+        let resolved = ResolvedModel {
+            components: crate::service::resolve_components(&self.config.root, &record.model)?,
+            model: record.model,
+        };
+        Ok((record.installed.package, resolved))
     }
 
     async fn resolve_package_operand(
@@ -543,44 +690,12 @@ impl InstalledModelPackages for ModelManager {
         &self,
     ) -> BoxFuture<'_, Result<InstalledModelPackagesResponse, InventoryError>> {
         Box::pin(async move {
-            self.ensure_installed_model_inventory().await?;
-            let models = self
-                .models
+            self.installed_packages
                 .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut packages = Vec::new();
-            let mut package_models = BTreeMap::new();
-            for model in models {
-                if !matches!(
-                    model.availability,
-                    ModelAvailability::Available { .. }
-                        | ModelAvailability::InvalidArtifact { .. }
-                        | ModelAvailability::IncompatibleArtifact { .. }
-                ) {
-                    continue;
-                }
-                let resolved = ResolvedModel {
-                    components: crate::service::resolve_components(&self.config.root, &model)?,
-                    model,
-                };
-                let package = self.package_from_resolved(&resolved)?;
-                package_models.insert(package.id.clone(), resolved.model.id.clone());
-                packages.push(InstalledModelPackage {
-                    target_id: offering_target_id(&[&package.id]),
-                    path: installed_path(&resolved.model, &resolved),
-                    inspection: inspection_for(&resolved.model),
-                    package,
-                });
-            }
-            packages.sort_by(|left, right| left.package.id.cmp(&right.package.id));
-            packages.dedup_by(|left, right| left.package.id == right.package.id);
-            *self.package_models.write().map_err(|_| {
-                InventoryError::Internal("installed package index lock poisoned".to_owned())
-            })? = package_models;
-            Ok(InstalledModelPackagesResponse { packages })
+                .map_err(|_| {
+                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+                })
+                .map(|snapshot| snapshot.response())
         })
     }
 
@@ -638,12 +753,6 @@ impl InstalledModelPackages for ModelManager {
         Box::pin(async move {
             let (_, resolved) = self.installed_package(&package_id).await?;
             let deleted = <Self as ModelInventory>::delete(self, &resolved.model.id).await?;
-            self.package_models
-                .write()
-                .map_err(|_| {
-                    InventoryError::Internal("installed package index lock poisoned".to_owned())
-                })?
-                .remove(&package_id);
             Ok(RemoveInstalledModelPackageResponse {
                 package_id,
                 removed: deleted.deleted,

@@ -36,6 +36,7 @@ import {
 import { resolveReleaseIcnInstallation } from "./release-installation.js";
 import {
   IcnPreparationReporter,
+  icnPreparationBackend,
   type IcnPreparationReporter as IcnPreparationReporterService,
 } from "./preparation.js";
 
@@ -587,10 +588,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
             );
             yield* reporter.report({
               _tag: "PreparingBackend",
-              backend: {
-                _tag: "Cuda",
-                hardwareLabel: record.backend.hardwareLabel,
-              },
+              backend: icnPreparationBackend(record.backend),
             });
             return;
           }

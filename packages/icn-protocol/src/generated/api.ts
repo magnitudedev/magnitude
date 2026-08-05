@@ -59,19 +59,6 @@ export const cancelModelDownload = HttpApiEndpoint.post(
     { status: 404 },
   )
 
-export const fitModels = HttpApiEndpoint.post("fitModels", "/v1/models/fit")
-  .setPayload(
-    S.suspend((): S.Schema<Schemas.FitModelsRequest, Schemas.FitModelsRequestEncoded> => Schemas.FitModelsRequest),
-  )
-  .addSuccess(
-    S.suspend((): S.Schema<Schemas.FitModelsResponse, Schemas.FitModelsResponseEncoded> => Schemas.FitModelsResponse),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
 export const getHardware = HttpApiEndpoint.get("getHardware", "/v1/hardware")
   .addSuccess(
     S.suspend((): S.Schema<Schemas.HardwareSnapshot, Schemas.HardwareSnapshotEncoded> => Schemas.HardwareSnapshot),
@@ -287,7 +274,6 @@ export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
 export const ModelsGroup = HttpApiGroup.make("models")
   .add(assessModels)
   .add(cancelModelDownload)
-  .add(fitModels)
   .add(getModelDownload)
   .add(getModelInstances)
   .add(getModelProperties)

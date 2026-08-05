@@ -4,19 +4,23 @@ import {
   ProviderModelIdSchema,
 } from "@magnitudedev/sdk"
 import {
-  preparationFromProviderProjection,
-  preparationFromReconciliationFailure,
+  availabilityFromProviderProjection,
+  availabilityFromReconciliationFailure,
 } from "./local-models"
 
-describe("local model preparation", () => {
+describe("local model availability", () => {
   const providerModelIds = [ProviderModelIdSchema.make("test-configuration")]
 
-  it("keeps retryable automatic reconciliation failures in preparation", () => {
-    expect(preparationFromReconciliationFailure(providerModelIds, {
-      code: "local_offering_assessment_unavailable",
+  it("publishes retryable automatic reconciliation failures as unavailable", () => {
+    const failure = {
+      code: "local_model_assessment_unavailable",
       message: "This model is not yet configured",
       retryable: true,
-    })).toEqual({ _tag: "Preparing" })
+    }
+    expect(availabilityFromReconciliationFailure(failure)).toEqual({
+      _tag: "Unavailable",
+      failure,
+    })
   })
 
   it("exposes terminal reconciliation failures as unavailable", () => {
@@ -25,27 +29,35 @@ describe("local model preparation", () => {
       message: "The model files are incompatible",
       retryable: false,
     }
-    expect(preparationFromReconciliationFailure(providerModelIds, failure)).toEqual({
+    expect(availabilityFromReconciliationFailure(failure)).toEqual({
       _tag: "Unavailable",
-      providerModelIds,
       failure,
     })
   })
 
-  it("keeps provider availability in preparation until it matches the package snapshot", () => {
-    expect(preparationFromProviderProjection(
-      providerModelIds,
+  it("withholds provider availability until it matches the package snapshot", () => {
+    expect(availabilityFromProviderProjection(
+      providerModelIds[0],
       new Map([[providerModelIds[0]!, {
         availability: { _tag: "Disabled", reason: "incompatible_runtime" },
       }]]),
       false,
       Option.none(),
-    )).toEqual({ _tag: "Preparing" })
+    )).toBeUndefined()
+  })
+
+  it("keeps an assessed installed configuration available before it has an offering", () => {
+    expect(availabilityFromProviderProjection(
+      undefined,
+      new Map(),
+      false,
+      Option.none(),
+    )).toEqual({ _tag: "Available" })
   })
 
   it("exposes an authoritative current provider incompatibility", () => {
-    expect(preparationFromProviderProjection(
-      providerModelIds,
+    expect(availabilityFromProviderProjection(
+      providerModelIds[0],
       new Map([[providerModelIds[0]!, {
         availability: { _tag: "Disabled", reason: "incompatible_runtime" },
       }]]),
@@ -53,12 +65,29 @@ describe("local model preparation", () => {
       Option.none(),
     )).toEqual({
       _tag: "Unavailable",
-      providerModelIds,
       failure: {
         code: "incompatible_runtime",
         message: "This model configuration is not available to the local runtime",
         retryable: true,
       },
+    })
+  })
+
+  it("uses only the provider offering for the exact configuration", () => {
+    const otherProviderModelId = ProviderModelIdSchema.make("other-configuration")
+    expect(availabilityFromProviderProjection(
+      providerModelIds[0],
+      new Map([
+        [providerModelIds[0]!, {
+          availability: { _tag: "Disabled", reason: "insufficient_resources" },
+        }],
+        [otherProviderModelId, { availability: { _tag: "Available" } }],
+      ]),
+      true,
+      Option.none(),
+    )).toMatchObject({
+      _tag: "Unavailable",
+      failure: { code: "insufficient_resources" },
     })
   })
 })

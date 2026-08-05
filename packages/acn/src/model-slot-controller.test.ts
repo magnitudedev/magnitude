@@ -11,12 +11,11 @@ import {
   SubscriptionRef,
 } from "effect"
 import {
-  CatalogCandidateIdSchema,
   DownloadAttemptIdSchema,
+  LocalModelMutationFailed,
   ModelOfferingTargetIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
-  RecommendableModelIdSchema,
   ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
@@ -64,6 +63,7 @@ const modelPackage = {
     path: "model.gguf",
     role: "weights" as const,
     sizeBytes: 1,
+    tensorStorageBytes: Option.none(),
     sha256: "a".repeat(64),
   }],
   relationships: [],
@@ -118,41 +118,9 @@ const offering = {
   capabilities,
 } as LocalProviderOffering
 
-const recommendationEntry = {
-  candidate: {
-    id: CatalogCandidateIdSchema.make("test-configuration"),
-    targetId: offering.targetId,
-    providerModelId,
-    displayName: "Test local model",
-    description: "Test model",
-    license: "test",
-    profile: offering.configuration.profile,
-    downloadBytes: 1,
-    download: { _tag: "Downloaded" as const, installedBytes: 1 },
-    preparation: { _tag: "Available" as const, providerModelIds: [providerModelId] },
-    quantization: "Q4",
-    quantizationName: "4-bit",
-    memory: [],
-    intelligenceScore: 0,
-    intelligenceProvenance: "Unavailable",
-    fidelityRank: 0,
-    qualityEvidence: [],
-    estimatedTokensPerSecond: 24,
-    capabilities,
-    sources: [{
-      source: modelPackage.source,
-      files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
-    }],
-  },
-  recommendableModelId: RecommendableModelIdSchema.make("test-model"),
-  configuration: offering.configuration,
-  recommendation: Option.none(),
-}
-
 const makeHarness = (options: {
   readonly initiallyAssigned?: boolean
   readonly initialOfferings?: readonly LocalProviderOffering[]
-  readonly exposeRecommendation?: boolean
   readonly installed?: boolean
   readonly projectedInstalled?: boolean
   readonly catalogAvailability?: ProviderModelCatalogEntry["availability"]
@@ -274,12 +242,7 @@ const makeHarness = (options: {
         },
       }),
       changes: Stream.empty,
-      refresh: Effect.void,
-      getCatalogByProviderModelId: (requestedProviderModelId) => Effect.succeed(
-        options.exposeRecommendation && requestedProviderModelId === providerModelId
-          ? recommendationEntry
-          : undefined,
-      ),
+      getCatalogByConfigurationId: () => Effect.succeed(Option.none()),
     })),
     Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
       list: Ref.get(offerings),
@@ -290,7 +253,11 @@ const makeHarness = (options: {
             item.providerModelId === requestedProviderModelId)
           return resolved
             ? Effect.succeed(resolved)
-            : Effect.die("Offering was not retained")
+            : Effect.fail(new LocalModelMutationFailed({
+                code: "local_provider_offering_not_found",
+                message: "Offering was not retained",
+                retryable: false,
+              }))
         }),
       ),
       save: (targetId, savedConfiguration, origin) => {
@@ -390,26 +357,21 @@ describe("ModelSlotController load admission", () => {
     })))
   })
 
-  it("retains a recommendation configuration through ordinary slot assignment", async () => {
+  it("rejects local assignment when no provider offering exists", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness({
         initiallyAssigned: false,
         initialOfferings: [],
-        exposeRecommendation: true,
       })
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        yield* controller.updateModelSlot(
+        const error = yield* Effect.flip(controller.updateModelSlot(
           PRIMARY_SLOT_ID,
           Option.some(selection),
-        )
+        ))
 
-        expect(yield* Ref.get(harness.offerings)).toEqual([offering])
-        expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
-          _tag: "ConfiguredLocal",
-          selection,
-          availability: { _tag: "Available" },
-        })
+        expect(error._tag).toBe("ModelSlotMutationRejected")
+        expect(yield* Ref.get(harness.offerings)).toEqual([])
       }).pipe(Effect.provide(harness.layer))
     })))
   })

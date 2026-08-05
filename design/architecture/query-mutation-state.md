@@ -528,4 +528,4 @@ For every domain:
 - [ACN subscriptions](../acn/subscriptions.md)
 - [Root work activity](../agent/work-activity.md)
 - [ICN process lifecycle](../icn/lifecycle.md)
-- [Canonical model slots and instances](../icn/model-instance-lifecycle.md)
+- [Model instance lifecycle](../model-management/instance-lifecycle.md)

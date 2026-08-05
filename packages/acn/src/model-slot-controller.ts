@@ -71,7 +71,7 @@ import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import { modelServingConfigurationToIcn } from "./local-model-icn-adapter"
 import {
-  localModelAvailability,
+  localModelSlotAvailability,
   modelSlotActions,
   projectModelInstance,
   projectModelLoadPlan,
@@ -429,7 +429,7 @@ export const ModelSlotControllerLive: Layer.Layer<
           const downloaded = offering !== undefined
             && modelOfferingTargetPackageIds(offering.configuration.target)
               .every((packageId) => packages.has(packageId))
-          const availability = localModelAvailability(
+          const availability = localModelSlotAvailability(
             { _tag: "Available" },
             offering !== undefined,
             downloaded,
@@ -565,41 +565,17 @@ export const ModelSlotControllerLive: Layer.Layer<
     return normalizeSelectionReasoning(selection, { capabilities })
   })
 
-  const retainSelectedLocalOffering = (
+  const requireSelectedLocalOffering = (
     slotId: SlotId,
     selection: SlotSelection,
   ): Effect.Effect<void, ModelSlotUpdateError> => {
     if (selection.providerId !== LOCAL_PROVIDER_ID) return Effect.void
-    return Effect.gen(function* () {
-      const existing = (yield* localOfferings.list).find((offering) =>
-        offering.providerModelId === selection.providerModelId)
-      if (existing) return
-      const entry = yield* recommendations.getCatalogByProviderModelId(
-        selection.providerModelId,
-      )
-      if (!entry) {
-        return yield* reject(slotId, "The selected local model configuration is unavailable")
-      }
-      yield* localOfferings.save(
-        entry.candidate.targetId,
-        entry.configuration,
-        Option.match(entry.recommendation, {
-          onNone: () => ({ _tag: "UserConfigured" as const }),
-          onSome: ({ id: recommendationId }) => ({
-            _tag: "Recommendation" as const,
-            recommendationId,
-          }),
-        }),
-      )
-    }).pipe(
-      Effect.mapError((error) => error instanceof ModelSlotMutationRejected
-        ? error
-        : new ModelSlotMutationFailed({
-            slotId,
-            code: "local_model_offering_persistence_failed",
-            message: error.message,
-            retryable: error.retryable,
-          })),
+    return localOfferings.resolve(selection.providerModelId).pipe(
+      Effect.asVoid,
+      Effect.mapError(() => new ModelSlotMutationRejected({
+        slotId,
+        message: "The selected local model offering is unavailable",
+      })),
     )
   }
 
@@ -998,7 +974,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   const updateModelSlot: ModelSlotControllerApi["updateModelSlot"] = (slotId, selection) =>
     Effect.gen(function* () {
       if (Option.isSome(selection)) {
-        yield* retainSelectedLocalOffering(slotId, selection.value)
+        yield* requireSelectedLocalOffering(slotId, selection.value)
       }
       const normalized = Option.isSome(selection)
         ? Option.some(yield* normalizeAndValidateSelection(slotId, selection.value))
