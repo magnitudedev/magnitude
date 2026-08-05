@@ -43,6 +43,7 @@ const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const ASSESSMENT_OPERATION_TIMEOUT_MS = 5 * 60 * 1_000
 const MINIMUM_CONTEXT_LENGTH = 4_096
 const LOCAL_MODEL_CONTEXT_LENGTH = 100_000
+const PERFORMANCE_SAMPLE_CONTEXT_LENGTHS = [25_000, 50_000, 75_000] as const
 type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
 const targetMaximumContextLength = (
@@ -62,6 +63,14 @@ export const localModelAssessmentProfiles = (
 ): readonly ServingProfile[] => assessmentProfile(
   Math.min(LOCAL_MODEL_CONTEXT_LENGTH, targetMaximumContextLength(target)),
 )
+
+export const performanceSampleContextTokens = (
+  profile: ServingProfile,
+): readonly number[] => [...new Set([
+  ...PERFORMANCE_SAMPLE_CONTEXT_LENGTHS.filter((contextLength) =>
+    contextLength <= profile.contextLength),
+  profile.contextLength,
+])].sort((left, right) => left - right)
 
 export type LocalModelAssessment =
   | { readonly _tag: "Fits"; readonly assessment: FitsModelAssessment }
@@ -192,6 +201,7 @@ const modelAssessment = (
 ) => Effect.gen(function* () {
   const profile = yield* servingProfileFromIcn(assessment.profile)
   return FitsModelAssessmentSchema.make({
+    _tag: "Fits",
     profile,
     configurationId: ModelServingConfigurationIdSchema.make(assessment.configurationId),
     assessmentId: ModelAssessmentIdSchema.make(assessment.assessmentId),
@@ -320,7 +330,10 @@ export const LocalModelAssessmentsLive: Layer.Layer<
               requests: batch.map(({ index, nativeTarget, profiles }) => ({
                 requestId: `assessment-${index}`,
                 target: nativeTarget,
-                profiles: profiles.map(servingProfileToIcn),
+                profiles: profiles.map((profile) => ({
+                  profile: servingProfileToIcn(profile),
+                  performanceContextTokens: performanceSampleContextTokens(profile),
+                })),
               })),
               capacityPolicy: { requiredReserveBytesPerMemoryDomain: REQUIRED_RESERVE_BYTES },
             },

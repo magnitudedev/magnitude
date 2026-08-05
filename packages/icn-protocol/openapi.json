@@ -1078,7 +1078,7 @@
           "profiles": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ServingProfile"
+              "$ref": "#/components/schemas/ModelAssessmentProfile"
             }
           }
         },
@@ -3364,7 +3364,10 @@
                 }
               },
               "performance": {
-                "$ref": "#/components/schemas/PerformanceEvidence"
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PerformanceEvidence"
+                }
               },
               "_tag": {
                 "type": "string",
@@ -3447,6 +3450,27 @@
       },
       "ModelAssessmentId": {
         "type": "string"
+      },
+      "ModelAssessmentProfile": {
+        "type": "object",
+        "required": [
+          "profile",
+          "performanceContextTokens"
+        ],
+        "properties": {
+          "profile": {
+            "$ref": "#/components/schemas/ServingProfile"
+          },
+          "performanceContextTokens": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "ModelAssessmentRequestId": {
         "type": "string"

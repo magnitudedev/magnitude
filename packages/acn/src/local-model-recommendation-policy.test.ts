@@ -30,6 +30,7 @@ const candidate = (input: {
   readonly fidelity?: number
   readonly context?: number
   readonly expected?: number
+  readonly fullContextExpected?: number
   readonly lower?: number
   readonly upper?: number
   readonly confidence?: "high" | "moderate" | "low"
@@ -49,6 +50,11 @@ const candidate = (input: {
   const packageId = ModelPackageIdSchema.make(`package_${input.id}`)
   const profile = { contextLength: context }
   const configurationId = ModelServingConfigurationIdSchema.make(`${input.id}:ctx${context}`)
+  const comparisonContext = Math.min(50_000, context)
+  const performanceContexts = [...new Set([
+    ...[25_000, 50_000, 75_000].filter((sample) => sample <= context),
+    context,
+  ])].sort((left, right) => left - right)
   return {
     model: {
       id: RecommendableModelIdSchema.make(artifactId),
@@ -115,13 +121,22 @@ const candidate = (input: {
         warningReserveBytes: 0,
         remainingBytes: capacityBytes - runtimeBytes,
       }],
-      performance: {
-        contextTokens: context,
-        lowerTokensPerSecond: input.lower ?? expected * 0.85,
-        estimatedTokensPerSecond: expected,
-        upperTokensPerSecond: input.upper ?? expected * 1.15,
-        confidence: input.confidence ?? "high",
-      },
+      performance: performanceContexts.map((contextTokens) => {
+        const estimatedTokensPerSecond = contextTokens === context
+          ? input.fullContextExpected ?? expected
+          : expected
+        return {
+          contextTokens,
+          lowerTokensPerSecond: contextTokens === comparisonContext
+            ? input.lower ?? estimatedTokensPerSecond * 0.85
+            : estimatedTokensPerSecond * 0.85,
+          estimatedTokensPerSecond,
+          upperTokensPerSecond: contextTokens === comparisonContext
+            ? input.upper ?? estimatedTokensPerSecond * 1.15
+            : estimatedTokensPerSecond * 1.15,
+          confidence: input.confidence ?? "high",
+        }
+      }),
     },
     artifactId,
     checkpointId,
@@ -153,6 +168,25 @@ describe("local model multicriteria recommendation policy", () => {
       expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
     })
     expect(selectRecommendationPortfolio([slow])).toEqual([])
+  })
+
+  it("uses full-context speed for eligibility and 50K speed for comparisons", () => {
+    const usable = candidate({
+      id: "usable",
+      score: 50,
+      expected: 40,
+      fullContextExpected: MINIMUM_EXPECTED_TOKENS_PER_SECOND,
+    })
+    const tooSlowAtFullContext = candidate({
+      id: "too-slow",
+      score: 90,
+      expected: 60,
+      fullContextExpected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
+    })
+
+    expect(conservativeGenerationSpeed(usable)).toBe(40)
+    expect(selectRecommendationPortfolio([usable])).not.toEqual([])
+    expect(selectRecommendationPortfolio([tooSlowAtFullContext])).toEqual([])
   })
 
   it("keeps compatible candidates below the recommendation speed floor in the catalog", () => {
@@ -366,10 +400,11 @@ describe("local model multicriteria recommendation policy", () => {
   it("keeps Fastest explanations consistent with the selected speed evidence", () => {
     const recommendations = selectRecommendationPortfolio([
       candidate({ id: "balanced", score: 60, expected: 30 }),
-      candidate({ id: "fast", score: 40, expected: 50 }),
+      candidate({ id: "fast", score: 40, expected: 50.2 }),
     ])
     const fastest = byIntent(recommendations, "fastest")
-    expect(fastest?.explanation).toContain("50.0 tokens/sec")
+    expect(fastest?.explanation).toContain("~50 tok/s at 50K context")
+    expect(fastest?.explanation).not.toContain("50.2 tok/s")
     expect(fastest?.explanation).toContain("67% faster than Balanced")
   })
 

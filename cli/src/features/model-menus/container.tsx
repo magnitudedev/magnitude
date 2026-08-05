@@ -54,6 +54,7 @@ import {
   describeLocalHardware,
   formatBytes,
   localInferenceProgressLines,
+  performanceRangeSpeedLabel,
 } from "../local-inference/view-model"
 import { deriveSettingsAuthInfo } from "../overlays/auth-display"
 
@@ -1013,7 +1014,7 @@ const CatalogMenu = memo(function CatalogMenu({
             {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · {recommendationEvidenceLabel(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
-            Approximately {detail.estimatedTokensPerSecond.toFixed(1)} tokens/sec
+            {performanceRangeSpeedLabel(detail, "tokens/sec")}
           </text>
           <text style={{ fg: failed ? theme.error : downloading || downloaded ? theme.primary : theme.muted }}>
             {catalogStatus(detail)}
@@ -1108,7 +1109,7 @@ const CatalogMenu = memo(function CatalogMenu({
               <text style={{ fg: theme.muted, width: 12 }}>{formatBytes(requiredMemoryBytes(candidate.memory))}</text>
               <text style={{ fg: theme.muted, width: 14 }}>{intelligenceLabel(candidate)}</text>
               <text style={{ fg: theme.muted, width: 14 }}>{qualityLabel(candidate)}</text>
-              <text style={{ fg: theme.muted, width: 12 }}>~{candidate.estimatedTokensPerSecond.toFixed(0)} t/s</text>
+              <text style={{ fg: theme.muted, width: 12 }}>{performanceRangeSpeedLabel(candidate, "t/s")}</text>
               <text
                 style={{
                   fg: pendingDelete

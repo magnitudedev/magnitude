@@ -84,7 +84,12 @@ const chooserView = () => {
         configurationId: ModelServingConfigurationIdSchema.make(remoteProviderModelId),
         displayName: "Remote Model",
         profile: { contextLength: 100_000 },
-        estimatedTokensPerSecond: 36.2,
+        performance: [
+          { contextTokens: 25_000, lowerTokensPerSecond: 44, estimatedTokensPerSecond: 48, upperTokensPerSecond: 52, confidence: "moderate" },
+          { contextTokens: 50_000, lowerTokensPerSecond: 39, estimatedTokensPerSecond: 43, upperTokensPerSecond: 47, confidence: "moderate" },
+          { contextTokens: 75_000, lowerTokensPerSecond: 32, estimatedTokensPerSecond: 36.2, upperTokensPerSecond: 40, confidence: "moderate" },
+          { contextTokens: 100_000, lowerTokensPerSecond: 25, estimatedTokensPerSecond: 30, upperTokensPerSecond: 35, confidence: "moderate" },
+        ],
       }),
     })],
   })
@@ -162,7 +167,7 @@ test("renders compact installed and downloadable rows with an informational deta
     expect(frame).toContain("Enter select")
     await act(async () => press("down"))
     await act(view.renderOnce)
-    expect(view.captureCharFrame()).toContain("~36 tok/s at 100K ctx")
+    expect(view.captureCharFrame()).toContain("~36–48 tok/s")
   } finally {
     await act(async () => view.renderer.destroy())
   }

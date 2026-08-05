@@ -375,20 +375,38 @@ export const MemoryAssessmentSchema = Schema.Struct({
 })
 export type MemoryAssessment = typeof MemoryAssessmentSchema.Type
 
+export const GenerationPerformanceEvidenceSchema = Schema.Struct({
+  contextTokens: PositiveSafeInteger,
+  lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+  estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+  upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
+  confidence: Schema.Literal("high", "moderate", "low"),
+}).pipe(Schema.filter((sample) =>
+  sample.lowerTokensPerSecond <= sample.estimatedTokensPerSecond
+  && sample.estimatedTokensPerSecond <= sample.upperTokensPerSecond,
+{ message: () => "performance rates must be ordered lower, expected, upper" }))
+export type GenerationPerformanceEvidence =
+  typeof GenerationPerformanceEvidenceSchema.Type
+
+export const GenerationPerformanceSamplesSchema = Schema.Array(
+  GenerationPerformanceEvidenceSchema,
+).pipe(Schema.filter((samples) =>
+  samples.length > 0
+  && samples.every((sample, index) => index === 0
+    || samples[index - 1]!.contextTokens < sample.contextTokens),
+{ message: () => "performance samples must be nonempty and ordered by unique context" }))
+export type GenerationPerformanceSamples = typeof GenerationPerformanceSamplesSchema.Type
+
 export const FitsModelAssessmentSchema = Schema.TaggedStruct("Fits", {
   profile: ServingProfileSchema,
   configurationId: ModelServingConfigurationIdSchema,
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   memory: Schema.Array(MemoryAssessmentSchema),
-  performance: Schema.Struct({
-    contextTokens: PositiveSafeInteger,
-    lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-    estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-    upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-    confidence: Schema.Literal("high", "moderate", "low"),
-  }),
-})
+  performance: GenerationPerformanceSamplesSchema,
+}).pipe(Schema.filter((assessment) =>
+  assessment.performance.at(-1)?.contextTokens === assessment.profile.contextLength,
+{ message: () => "performance samples must end at the serving profile context" }))
 export type FitsModelAssessment = typeof FitsModelAssessmentSchema.Type
 
 export const RecommendationSchema = Schema.Struct({
@@ -492,7 +510,7 @@ export const LocalModelCatalogRecommendationEvidenceSchema = Schema.Struct({
 export type LocalModelCatalogRecommendationEvidence =
   typeof LocalModelCatalogRecommendationEvidenceSchema.Type
 
-export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
+const LocalModelCatalogCandidateMetadataFields = {
   configurationId: ModelServingConfigurationIdSchema,
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
@@ -505,10 +523,7 @@ export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
   quantization: NonEmptyString,
   quantizationName: NonEmptyString,
   memory: Schema.Array(MemoryAssessmentSchema),
-  lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  performanceConfidence: Schema.Literal("high", "moderate", "low"),
+  performance: GenerationPerformanceSamplesSchema,
   capabilities: ModelCapabilitiesSchema,
   recommendationEvidence: Schema.optionalWith(
     LocalModelCatalogRecommendationEvidenceSchema,
@@ -521,15 +536,22 @@ export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct({
       sha256: Sha256Digest,
     })),
   })),
-})
+} as const
+export const LocalModelCatalogCandidateMetadataSchema = Schema.Struct(
+  LocalModelCatalogCandidateMetadataFields,
+).pipe(Schema.filter((candidate) =>
+  candidate.performance.at(-1)?.contextTokens === candidate.profile.contextLength,
+{ message: () => "candidate performance must end at the serving profile context" }))
 export type LocalModelCatalogCandidateMetadata =
   typeof LocalModelCatalogCandidateMetadataSchema.Type
 
 export const LocalModelCatalogCandidateSchema = Schema.Struct({
-  ...LocalModelCatalogCandidateMetadataSchema.fields,
+  ...LocalModelCatalogCandidateMetadataFields,
   download: LocalModelDownloadSchema,
   availability: LocalModelCatalogCandidateAvailabilitySchema,
-})
+}).pipe(Schema.filter((candidate) =>
+  candidate.performance.at(-1)?.contextTokens === candidate.profile.contextLength,
+{ message: () => "candidate performance must end at the serving profile context" }))
 export type LocalModelCatalogCandidate = typeof LocalModelCatalogCandidateSchema.Type
 
 export const LocalModelRecommendationSchema = Schema.Struct({

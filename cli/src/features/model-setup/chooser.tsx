@@ -25,8 +25,8 @@ import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   buildLocalInferenceSelections,
   describeLocalHardwareSummary,
-  formatContext,
   localInferenceProgressLines,
+  performanceRangeSpeedLabel,
   selectedInferenceIndex,
   selectionCapacityWarning,
   selectionMetadata,
@@ -460,7 +460,7 @@ export function OnboardingModelChooser({
       <DetailRow width={detailWidth}>
         {selected.recommendation._tag === "Recommended" && (
           <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
-            {`~${Math.round(selected.recommendation.value.candidate.estimatedTokensPerSecond)} tok/s at ${formatContext(selected.recommendation.value.candidate.profile.contextLength)} ctx`}
+            {performanceRangeSpeedLabel(selected.recommendation.value.candidate)}
           </text>
         )}
       </DetailRow>

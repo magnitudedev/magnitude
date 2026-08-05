@@ -80,50 +80,65 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
 
 export const makeCatalogCandidate = (
   overrides: Partial<LocalModelCatalogCandidate> = {},
-): LocalModelCatalogCandidate => ({
-  configurationId: TEST_CONFIGURATION_ID,
-  assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
-  environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
-  targetId: TEST_TARGET_ID,
-  displayName: "Qwen Test",
-  description: "Test model",
-  license: "Apache-2.0",
-  profile: { contextLength: 32_768 },
-  downloadBytes: 16 * GIB,
-  download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-  availability: { _tag: "NotDownloaded" },
-  quantization: "Q4_K_M",
-  quantizationName: "4-bit",
-  memory: [{
-    memoryDomainId: TEST_MEMORY_DOMAIN_ID,
-    capacityBytes: 22 * GIB,
-    requiredBytes: 18 * GIB,
-    compatibilityReserveBytes: 2 * GIB,
-    warningReserveBytes: 4 * GIB,
-    remainingBytes: 2 * GIB,
-  }],
-  recommendationEvidence: Option.some({
-    intelligence: Option.some({ score: 75, provenance: "Test evidence" }),
-    fidelityRank: 75,
-    qualityEvidence: ["Test quantization evidence"],
-  }),
-  lowerTokensPerSecond: 20,
-  estimatedTokensPerSecond: 24,
-  upperTokensPerSecond: 28,
-  performanceConfidence: "moderate",
-  capabilities: {
-    vision: false,
-    tools: true,
-    structuredOutput: true,
-    reasoning: {
-      supported: false,
-      efforts: [],
-      defaultEffort: Option.none(),
+): LocalModelCatalogCandidate => {
+  const profile = overrides.profile ?? { contextLength: 32_768 }
+  const performanceContexts = [...new Set([
+    ...[25_000, 50_000, 75_000].filter((context) =>
+      context <= profile.contextLength),
+    profile.contextLength,
+  ])].sort((left, right) => left - right)
+  const performance = overrides.performance ?? performanceContexts.map((contextTokens) => {
+    const estimatedTokensPerSecond = contextTokens === profile.contextLength ? 24 : 28
+    return {
+      contextTokens,
+      lowerTokensPerSecond: estimatedTokensPerSecond - 4,
+      estimatedTokensPerSecond,
+      upperTokensPerSecond: estimatedTokensPerSecond + 4,
+      confidence: "moderate" as const,
+    }
+  })
+  return {
+    configurationId: TEST_CONFIGURATION_ID,
+    assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
+    environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
+    targetId: TEST_TARGET_ID,
+    displayName: "Qwen Test",
+    description: "Test model",
+    license: "Apache-2.0",
+    profile,
+    downloadBytes: 16 * GIB,
+    download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
+    availability: { _tag: "NotDownloaded" },
+    quantization: "Q4_K_M",
+    quantizationName: "4-bit",
+    memory: [{
+      memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+      capacityBytes: 22 * GIB,
+      requiredBytes: 18 * GIB,
+      compatibilityReserveBytes: 2 * GIB,
+      warningReserveBytes: 4 * GIB,
+      remainingBytes: 2 * GIB,
+    }],
+    recommendationEvidence: Option.some({
+      intelligence: Option.some({ score: 75, provenance: "Test evidence" }),
+      fidelityRank: 75,
+      qualityEvidence: ["Test quantization evidence"],
+    }),
+    performance,
+    capabilities: {
+      vision: false,
+      tools: true,
+      structuredOutput: true,
+      reasoning: {
+        supported: false,
+        efforts: [],
+        defaultEffort: Option.none(),
+      },
     },
-  },
-  sources: [],
-  ...overrides,
-})
+    sources: [],
+    ...overrides,
+  }
+}
 
 export const makeRecommendation = (
   overrides: Partial<LocalModelRecommendation> = {},

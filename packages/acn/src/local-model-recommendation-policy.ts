@@ -7,9 +7,10 @@ import {
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
-export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 10
+export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 8
 
 const MAX_RECOMMENDATIONS = 4
+const COMPARISON_CONTEXT_LENGTH = 50_000
 const SPEED_UTILITY_CEILING = 60
 const DOWNLOAD_UTILITY_BYTES = 16 * 1024 ** 3
 const LIGHTWEIGHT_CAPACITY_RATIO = 0.2
@@ -34,12 +35,22 @@ export interface RecommendationCandidate {
   readonly totalDownloadBytes: number
 }
 
-const generationFor = (candidate: RecommendationCandidate) => candidate.assessment.performance
+const fullContextGenerationFor = (candidate: RecommendationCandidate) =>
+  candidate.assessment.performance.at(-1)!
+
+const comparisonGenerationFor = (candidate: RecommendationCandidate) => {
+  const comparisonContext = Math.min(
+    COMPARISON_CONTEXT_LENGTH,
+    candidate.profile.contextLength,
+  )
+  return candidate.assessment.performance.find(({ contextTokens }) =>
+    contextTokens === comparisonContext)!
+}
 
 export const conservativeGenerationSpeed = (
   candidate: RecommendationCandidate,
 ): number => {
-  const generation = generationFor(candidate)
+  const generation = comparisonGenerationFor(candidate)
   if (generation.confidence === "high") return generation.estimatedTokensPerSecond
   if (generation.confidence === "moderate") {
     return (generation.lowerTokensPerSecond + generation.estimatedTokensPerSecond) / 2
@@ -65,7 +76,7 @@ const stableCompare = (
   )
 
 const usable = (candidate: RecommendationCandidate): boolean => {
-  const generation = generationFor(candidate)
+  const generation = fullContextGenerationFor(candidate)
   return generation.contextTokens === candidate.profile.contextLength
     && meetsUsabilityFloor(generation.estimatedTokensPerSecond)
 }
@@ -108,7 +119,7 @@ const speedUtility = (tokensPerSecond: number): number => clamp(
 )
 
 export const balancedUtility = (candidate: RecommendationCandidate): number => {
-  const generation = generationFor(candidate)
+  const generation = comparisonGenerationFor(candidate)
   const capability = (capabilityScore(candidate) ?? 50) / 100
   const memory = clamp(1 - candidate.estimatedLoadedBytes
     / Math.max(1, candidate.stableCapacityBudgetBytes))
@@ -167,8 +178,8 @@ const compareBestQuality = (
   || Number(measuredCapability(right)) - Number(measuredCapability(left))
   || right.fidelityRank - left.fidelityRank
   || right.profile.contextLength - left.profile.contextLength
-  || generationFor(right).estimatedTokensPerSecond
-    - generationFor(left).estimatedTokensPerSecond
+  || comparisonGenerationFor(right).estimatedTokensPerSecond
+    - comparisonGenerationFor(left).estimatedTokensPerSecond
   || stableCompare(left, right)
 
 const sameConfiguration = (
@@ -212,6 +223,8 @@ const percentDifference = (value: number, reference: number): number => Math.rou
   Math.abs(value / Math.max(1, reference) - 1) * 100,
 )
 
+const wholeSpeed = (tokensPerSecond: number): number => Math.round(tokensPerSecond)
+
 const qualitySummary = (candidate: RecommendationCandidate): string =>
   candidate.quantizationAware
     ? "retains very high output quality with minimal loss"
@@ -235,15 +248,15 @@ const shorterContextTradeoff = (
   : ""
 
 const describeBalanced = (candidate: RecommendationCandidate): string => {
-  const generation = generationFor(candidate)
-  return `Best overall mix of coding ability, speed, and memory use. Runs at about ${generation.estimatedTokensPerSecond.toFixed(1)} tokens/sec with ${Math.round(candidate.profile.contextLength / 1_000)}K context and ${qualitySummary(candidate)}.`
+  const generation = comparisonGenerationFor(candidate)
+  return `Best overall mix of coding ability, speed, and memory use. Runs at ~${wholeSpeed(generation.estimatedTokensPerSecond)} tok/s at ${Math.round(generation.contextTokens / 1_000)}K context, supports up to ${Math.round(candidate.profile.contextLength / 1_000)}K context, and ${qualitySummary(candidate)}.`
 }
 
 const describeBestQuality = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
-  const generation = generationFor(candidate)
+  const generation = comparisonGenerationFor(candidate)
   const capabilityGain = (capabilityScore(candidate) ?? 0)
     - (capabilityScore(balanced) ?? 0)
   const reason = capabilityGain >= 5
@@ -257,7 +270,7 @@ const describeBestQuality = (
     ? ` It uses about ${memoryChange}% more memory than Balanced.`
     : ""
   const speed = generation.estimatedTokensPerSecond
-  const balancedSpeed = generationFor(balanced).estimatedTokensPerSecond
+  const balancedSpeed = comparisonGenerationFor(balanced).estimatedTokensPerSecond
   const speedTradeoff = speed < balancedSpeed * 0.95
     ? ` It is about ${percentDifference(speed, balancedSpeed)}% slower than Balanced.`
     : " It runs at nearly the same speed as Balanced."
@@ -268,11 +281,11 @@ const describeFastest = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
-  const generation = generationFor(candidate)
-  const balancedSpeed = generationFor(balanced).estimatedTokensPerSecond
+  const generation = comparisonGenerationFor(candidate)
+  const balancedSpeed = comparisonGenerationFor(balanced).estimatedTokensPerSecond
   const speedGain = generation.estimatedTokensPerSecond >= balancedSpeed * 1.05
-    ? `About ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster than Balanced, at roughly ${generation.estimatedTokensPerSecond.toFixed(1)} tokens/sec.`
-    : `Prioritizes responsiveness at roughly ${generation.estimatedTokensPerSecond.toFixed(1)} tokens/sec.`
+    ? `About ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster than Balanced, at ~${wholeSpeed(generation.estimatedTokensPerSecond)} tok/s at ${Math.round(generation.contextTokens / 1_000)}K context.`
+    : `Prioritizes responsiveness at ~${wholeSpeed(generation.estimatedTokensPerSecond)} tok/s at ${Math.round(generation.contextTokens / 1_000)}K context.`
   const capabilityTradeoff = (capabilityScore(candidate) ?? 0)
       < (capabilityScore(balanced) ?? 0)
     ? " It is less capable on difficult coding tasks."
@@ -284,7 +297,7 @@ const describeLightweight = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
-  const generation = generationFor(candidate)
+  const generation = comparisonGenerationFor(candidate)
   const loadedMemoryReduction = Math.max(0, Math.round(
     (1 - candidate.estimatedLoadedBytes / balanced.estimatedLoadedBytes) * 100,
   ))
@@ -294,7 +307,7 @@ const describeLightweight = (
   const reduction = loadedMemoryReduction >= downloadReduction
     ? `${loadedMemoryReduction}% less memory while loaded`
     : `${downloadReduction}% less disk space`
-  const balancedSpeed = generationFor(balanced).estimatedTokensPerSecond
+  const balancedSpeed = comparisonGenerationFor(balanced).estimatedTokensPerSecond
   const speedTradeoff = generation.estimatedTokensPerSecond < balancedSpeed * 0.95
     ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% slower than Balanced.`
     : generation.estimatedTokensPerSecond > balancedSpeed * 1.05

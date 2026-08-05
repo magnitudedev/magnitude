@@ -69,9 +69,9 @@ metric digest.
 
 ## Model assessment
 
-`POST /v1/models/assess` accepts batches of exact targets and explicit profiles. A target is one
-package or an ordered target/draft pair. A profile currently specifies maximum context for one
-sequence.
+`POST /v1/models/assess` accepts batches of exact targets and explicit assessment profiles. A target
+is one package or an ordered target/draft pair. Each assessment profile specifies maximum context
+for one sequence and the context depths at which performance must be estimated.
 
 An uncached assessment performs native work:
 
@@ -79,7 +79,8 @@ An uncached assessment performs native work:
 2. construct a no-allocation native model;
 3. construct a no-allocation context graph for each missing profile;
 4. run native placement selection when the requested placement does not fit;
-5. combine exact workload facts with hardware calibration.
+5. combine the profile's exact workload facts with hardware calibration at every requested
+   performance depth.
 
 It reads no tensor payload, allocates no model weights or KV cache, and runs no inference benchmark.
 It is still nontrivial: model and context-graph construction are not metadata arithmetic.
@@ -90,8 +91,10 @@ cost = one initial model open per target batch
      + native placement-search work where required
 ```
 
-The initial model open is shared by all profiles for one target. Some native fallback-placement paths
-may reopen the model per profile. Different targets cannot share a model object.
+The initial model open is shared by all profiles for one target. Performance depths within one
+profile reuse its single context graph and differ only in estimation arithmetic. Some native
+fallback-placement paths may reopen the model per profile. Different targets cannot share a model
+object.
 
 ### Results
 
@@ -99,7 +102,7 @@ Every requested profile produces one result:
 
 | Result | Meaning |
 |---|---|
-| `Fits` | Configuration identity, memory accounting, and performance evidence |
+| `Fits` | Configuration identity, memory accounting, and ordered performance samples |
 | `DoesNotFit` | Configuration identity, memory accounting, limiting resource, and deficit |
 | `Incompatible` | The artifact/runtime combination cannot execute |
 
@@ -118,6 +121,10 @@ min(100,000 tokens, exact target maximum)
 This applies to release-catalog and discovered installed targets. A pair uses the lower component
 maximum. Profiles below 4,096 tokens are not submitted. ICN does not search a context range or
 choose a profile.
+
+For that one profile, ACN requests performance samples at 25K, 50K, 75K, and full configured
+context. Sample depths above the configured context are omitted and duplicates are removed. The
+ordered sample list is nonempty and always ends at the full configured context.
 
 ## Broad rejection proof
 
@@ -191,7 +198,7 @@ deadline even if child termination or reaping stalls.
 The cache unit is one exact profile result. Identity covers:
 
 - immutable target content, roles, and relationships;
-- exact serving profile and capacity policy;
+- exact serving profile, requested performance depths, and capacity policy;
 - native build, backend ABI, enabled backends, topology, and planning method;
 - hardware-calibration metric identity;
 - projector, speculative, placement, and execution policy.
@@ -219,6 +226,8 @@ persisted. Operational failures are never persisted.
 
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-target job returns one result per requested profile.
+- Every `Fits` result contains ordered performance samples ending at the profile context.
+- Multiple performance depths for one profile require only one native context graph.
 - Warm exact-cache reads invoke no native planner.
 - Warm `DoesNotFit` cache reads invoke no native planner.
 - No domain result represents an operational defect.

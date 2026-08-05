@@ -7,6 +7,7 @@ import {
   formatLocalModelAssessmentFailure,
   localModelAssessmentProfiles,
   localModelAssessmentResultFromIcn,
+  performanceSampleContextTokens,
 } from "./local-model-assessments"
 import {
   AssessmentEnvironmentIdSchema,
@@ -61,6 +62,25 @@ describe("localModelAssessmentProfiles", () => {
 
   it("does not invent a profile below the product minimum", () => {
     expect(localModelAssessmentProfiles(packageTarget(2_048))).toEqual([])
+  })
+})
+
+describe("performanceSampleContextTokens", () => {
+  it("samples 25K, 50K, 75K, and the full configured context", () => {
+    expect(performanceSampleContextTokens({ contextLength: 100_000 })).toEqual([
+      25_000,
+      50_000,
+      75_000,
+      100_000,
+    ])
+  })
+
+  it("bounds and deduplicates samples for shorter-context models", () => {
+    expect(performanceSampleContextTokens({ contextLength: 32_768 })).toEqual([
+      25_000,
+      32_768,
+    ])
+    expect(performanceSampleContextTokens({ contextLength: 20_000 })).toEqual([20_000])
   })
 })
 
