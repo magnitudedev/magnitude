@@ -1,0 +1,66 @@
+import { describe, expect, test } from "vitest"
+import {
+  developmentBuildEnvironment,
+  developmentBuildProfile,
+} from "./build-local"
+import { readCargoMessages } from "./compile"
+
+const stream = (...chunks: readonly string[]): ReadableStream<Uint8Array> => {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  })
+}
+
+describe("ICN compilation", () => {
+  test("targets only attached GPUs for local CUDA builds", () => {
+    expect(developmentBuildEnvironment("cuda")).toEqual({
+      CMAKE_CUDA_ARCHITECTURES: "native",
+    })
+    expect(developmentBuildEnvironment("cpu")).toEqual({})
+    expect(developmentBuildEnvironment("metal")).toEqual({})
+    expect(developmentBuildEnvironment("vulkan")).toEqual({})
+    expect(developmentBuildProfile("cuda")).toBe("development-cuda-native")
+    expect(developmentBuildProfile("cpu")).toBe("development-cpu")
+  })
+
+  test("retains streamed Cargo messages and emits rendered diagnostics", async () => {
+    const rendered: string[] = []
+    const messages = await readCargoMessages(
+      stream(
+        '{"reason":"compiler-message","message":{"rendered":"warn',
+        'ing\\n"}}\n{"reason":"build-script-executed",',
+        '"package_id":"native","out_dir":"/output"}\n',
+      ),
+      (diagnostic) => rendered.push(diagnostic),
+    )
+
+    expect(messages).toEqual([
+      {
+        reason: "build-script-executed",
+        package_id: "native",
+        out_dir: "/output",
+      },
+    ])
+    expect(rendered).toEqual(["warning\n"])
+  })
+
+  test("retains a final Cargo message without a trailing newline", async () => {
+    await expect(
+      readCargoMessages(
+        stream(
+          '{"reason":"compiler-artifact","target":{"name":"magnitude-icn"}}',
+        ),
+        () => {},
+      ),
+    ).resolves.toEqual([
+      {
+        reason: "compiler-artifact",
+        target: { name: "magnitude-icn" },
+      },
+    ])
+  })
+})
