@@ -2209,6 +2209,28 @@ fn target_uses_only_installed_packages(target: &ModelTargetInput) -> bool {
     }
 }
 
+fn assessment_target_failure(error: InventoryError) -> Result<DomainModelFailure, InventoryError> {
+    match error {
+        error @ (InventoryError::InvalidId(_)
+        | InventoryError::InvalidRequest(_)
+        | InventoryError::NotFound(_)) => Ok(DomainModelFailure {
+            code: "invalid_target".to_owned(),
+            message: error.to_string(),
+            retryable: false,
+        }),
+        InventoryError::ModelOperation {
+            code,
+            message,
+            retryable: false,
+        } => Ok(DomainModelFailure {
+            code,
+            message,
+            retryable: false,
+        }),
+        error => Err(error),
+    }
+}
+
 impl ModelAssessor for NativeModelAssessor {
     fn assess(
         &self,
@@ -2298,19 +2320,10 @@ impl ModelAssessor for NativeModelAssessor {
                                         )
                                         .await?,
                                 },
-                                Err(
-                                    error @ (InventoryError::InvalidId(_)
-                                    | InventoryError::InvalidRequest(_)
-                                    | InventoryError::NotFound(_)),
-                                ) => AssessModelResult::InvalidTarget {
+                                Err(error) => AssessModelResult::InvalidTarget {
                                     request_id,
-                                    failure: DomainModelFailure {
-                                        code: "invalid_target".to_owned(),
-                                        message: error.to_string(),
-                                        retryable: false,
-                                    },
+                                    failure: assessment_target_failure(error)?,
                                 },
-                                Err(error) => return Err(error),
                             }
                         };
                         Ok::<_, InventoryError>((index, result))
@@ -3174,12 +3187,18 @@ impl ModelTransitionFailure {
 
 impl From<InventoryError> for ModelTransitionFailure {
     fn from(error: InventoryError) -> Self {
-        let message = error.to_string();
-        Self::new(ModelOperationFailure::new(
-            "model_transition_failed",
-            message,
-            true,
-        ))
+        match error {
+            InventoryError::ModelOperation {
+                code,
+                message,
+                retryable,
+            } => Self::new(ModelOperationFailure::new(code, message, retryable)),
+            error => Self::new(ModelOperationFailure::new(
+                "model_transition_failed",
+                error.to_string(),
+                true,
+            )),
+        }
     }
 }
 
@@ -3581,6 +3600,12 @@ impl NativeModelInstanceController {
                 }
                 HardwareAssessment::InvalidArtifact { code, message }
                 | HardwareAssessment::IncompatibleArtifact { code, message } => {
+                    tracing::error!(
+                        model.configuration.id = %configuration_id.0,
+                        error.code = %code,
+                        error.retryable = false,
+                        "model load planning rejected the selected artifact"
+                    );
                     return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
                         code, message, false,
                     )));
@@ -5254,6 +5279,45 @@ where
 mod tests {
     use super::*;
     use icn_contracts::ModelInventory as _;
+
+    #[test]
+    fn model_transition_preserves_typed_model_operation_failure() {
+        let failure = ModelTransitionFailure::from(InventoryError::ModelOperation {
+            code: "invalid_split_layout".to_owned(),
+            message: "the shard layout is invalid".to_owned(),
+            retryable: false,
+        });
+
+        assert_eq!(failure.event.code, "invalid_split_layout");
+        assert_eq!(failure.event.message, "the shard layout is invalid");
+        assert!(!failure.event.retryable);
+    }
+
+    #[test]
+    fn stable_artifact_rejection_is_scoped_to_one_assessment_target() {
+        let failure = assessment_target_failure(InventoryError::ModelOperation {
+            code: "invalid_split_layout".to_owned(),
+            message: "the shard layout is invalid".to_owned(),
+            retryable: false,
+        })
+        .expect("stable target rejection");
+        assert_eq!(failure.code, "invalid_split_layout");
+        assert!(!failure.retryable);
+
+        let operational = assessment_target_failure(InventoryError::ModelOperation {
+            code: "planning_deadline".to_owned(),
+            message: "planning timed out".to_owned(),
+            retryable: true,
+        })
+        .expect_err("operational failure remains endpoint-wide");
+        assert!(matches!(
+            operational,
+            InventoryError::ModelOperation {
+                retryable: true,
+                ..
+            }
+        ));
+    }
 
     fn calibration_test_snapshot() -> HardwareSnapshot {
         HardwareSnapshot {

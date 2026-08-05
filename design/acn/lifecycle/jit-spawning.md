@@ -12,158 +12,151 @@ applies_to:
   - web/scripts/dev-server.ts
 ---
 
-# JIT ACN spawning and handoff
+# JIT ACN ensurance and upgrades
 
-For one Magnitude data root, one host coordination authority selects the ACN allowed to admit work.
-A client requests an endpoint satisfying explicit requirements; it never receives direct permission
-to spawn, replace, or kill a process.
+For one Magnitude data root, clients converge on one canonical ACN. There is no separate
+coordinator process: the SDK performs JIT ensurance locally, while desktop main and the web host
+perform the same operation for clients without filesystem and process access.
 
-Opening a compatible newer client must succeed independently of older open clients. Older clients
-may join the newer ACN when RPC-compatible; their continuity is best effort, but they cannot
-obstruct, displace, or downgrade it. Incompatible active authority is a typed local conflict unless
-isolation or explicit forced replacement is authorized.
+`ensure(target)` means that, while the host remains capable of running the target, the operation
+keeps reconciling until a compatible ACN is `Ready`. Missing publication, a hung `Starting` ACN, an
+abandoned launch, and another client disappearing are intermediate conditions, not successful
+absence or reasons to give up. An unreapable process, unavailable artifact, or failed host primitive
+is a typed terminal failure because automatic convergence is no longer possible.
 
-“Independently” means an older client's recovery or downgrade attempt cannot fail the newer launch.
-Already-admitted incumbent work may still delay the cooperative handoff required to preserve it.
+## Targets and client upgrade
 
-## Identities and authority
-
-Every requirement and candidate separates:
+Compatibility and precedence are separate:
 
 | Identity | Meaning |
 | --- | --- |
-| Coordination protocol | Compatibility of the stable host-coordination envelope |
+| Coordination protocol | Whether clients and ACNs understand the machine-state envelope |
 | RPC protocol | Whether a client may use the ACN |
-| Storage protocol | Whether processes may safely share the data root |
-| Release priority | Deterministic preference among otherwise compatible candidates |
+| Storage protocol | Whether the ACN may use the data root |
+| Release target | Reproducible artifact and deterministic replacement priority |
 
-Human version and logs are diagnostics. Build time is not compatibility or precedence; development
-artifacts use stable content identity. The exact artifact, protocols, priority, and process identity
-are bound before spawn and cannot be rederived from mutable source state.
+Product version is diagnostic metadata unless it identifies a reproducible release target.
+Development targets use stable artifact identity rather than wall-clock build time.
 
-The coordinator owns endpoint selection, candidate admission and supervision, fencing epochs,
-compatibility, deterministic priority, cooperative handoff, rollback, reconciliation, and exact
-removal. CLI processes may instantiate the service independently, but all mutations reduce through
-one process-safe durable state machine. Desktop main and web host expose the same authority remotely.
+Each client starts with its bundled target and owns a monotonic `effectiveTarget`. Observing a
+compatible higher-priority ACN in either `Starting` or `Ready` immediately advances that target.
+All later selection, recovery, artifact resolution, and spawning use `effectiveTarget`; it never
+moves backward during the client process lifetime.
 
-## Coordination state
+Consequently, an older client may continue against a compatible newer ACN, but can never revive its
+older ACN afterward. If the newer startup fails, that client ensures another instance of the newer
+effective target. Incompatible clients fail locally rather than launching a competing ACN.
+
+## Machine coordination
+
+The shared data root contains only the state needed for clients and ACNs to coordinate:
 
 ```text
-instances/<instance-id>   immutable process advertisement
-coordination              Empty | Active | Handoff, with monotonic epoch
-coordination-lock         short exact-process transaction ownership
-machine-owner             active-runtime grant carrying instance and epoch
+spawn claim               exact client process, token, target, lease
+canonical registration    exact ACN identity, target, endpoint, process identity
+machine owner             exact ACN runtime owner
+instance records          exact processes available for reconciliation and cleanup
 ```
 
-An advertisement contains opaque instance ID, bound protocols and priority, endpoint, PID, and
-process-start identity. PID alone never authorizes signaling or deletion. Malformed or proven-dead
-records are collected; live records are never discarded by age.
+The spawn claim serializes mutation across independent clients. Acquisition revalidates canonical
+state. A live claim cannot be bypassed merely because a waiter is impatient. If the claim owner
+stops renewing its bounded lease, takeover publishes a new fencing token; the former owner can no
+longer publish, replace, or remove anything.
 
-Only the coordinator writes authoritative state. A candidate advertises itself and reports its
-[service lifecycle](./service-lifecycle.md); it never appoints itself canonical.
-`Active(epoch, instance)` and machine ownership name
-the same grant. Every health response, RPC request, admission decision, handoff acknowledgement,
-shutdown request, and force authorization carries `{ instanceId, epoch }`.
+An ACN may publish canonical state only for the current claim and target. Publication is
+process-safe and rejects a lower-priority target when an equal or higher target is canonical or
+being admitted. Scheduling and last-writer order cannot move the target backward.
 
-An obsolete process therefore cannot admit work after revocation, and a stale proxy or reused port
-cannot satisfy a request for another grant. Missing, malformed, unreadable, or timed-out state never
-fabricates absence, a new epoch, or revocation.
+Registration, health, RPC dispatch, shutdown, and cleanup bind the exact ACN and process-start
+identity. A PID or URL alone never grants authority. Missing, malformed, unreadable, or timed-out
+evidence is reconciled under the spawn claim; it is not silently converted into authoritative
+absence.
 
-The transaction lock is recovered only after exact owner-death proof using PID plus process-start
-identity. Long work commits a durable operation phase and releases the transaction lock; elapsed
-time never steals live admission ownership.
+## Ensurance
 
-## Ensure and spawn admission
-
-Discovery is observation. `ensure(requirement)` is host-owned shared work whose result is a
-satisfying canonical endpoint, not the survival of one candidate child.
-
-| Revalidated authority | Required result |
-| --- | --- |
-| Compatible equal/higher `Ready` | Return it |
-| Compatible equal/higher `Starting` or admitted candidate | Join and observe it |
-| Lower-priority compatible authority | Admit one eligible successor |
-| Incompatible active authority | Typed conflict; no automatic eviction |
-| Authoritatively `Empty` | Admit one candidate |
-| `Handoff` | Join/reconcile that exact operation |
-| Unknown or inconsistent evidence | Reconcile or fail locally; do not spawn |
-
-Transport failure, request latency, health timeout, and caller impatience never authorize spawn.
-`Starting` is positive evidence of owned startup; a waiter may fail locally but cannot fall through
-to an equal or lower candidate.
-
-Candidate admission is outcome-total:
-
-1. Revalidate authority and requirements inside the coordination transaction.
-2. Return a satisfying authority, join equivalent work, or reject/defer conflict.
-3. Commit host-owned operation identity before spawning.
-4. Spawn and publish the exact immutable advertisement.
-5. Validate actual artifact, protocols, process identity, and endpoint.
-6. Prepare the candidate to standby readiness without canonical publication or peer destruction.
-7. Enter handoff only if it remains the deterministic eligible winner.
-8. Complete, roll back, or terminalize on every Effect `Exit`.
-
-Standby readiness proves the bound candidate, control endpoint, protocols, and startup dependencies
-needed to make handoff recoverable; it is not ACN `Ready` and cannot admit application RPC.
-
-Caller cancellation removes one waiter only. Host failure leaves a durable phase that another
-coordinator reconciles. Candidate exit is attempt evidence: if another compatible authority wins,
-ensure succeeds with it. Exit becomes candidate failure only when no acceptable authority remains.
-
-## Safe handoff
-
-Automatic replacement is cooperative and may commit only at a quiescent boundary; merely opening a
-client is not force authorization.
+Every initial connection and recovery uses the same operation:
 
 ```text
-candidate StandbyReady
-  -> commit Handoff(Preparing)
-  -> incumbent closes fenced admission and drains owned work
-  -> incumbent reports Quiescent and releases machine ownership
-  -> candidate acquires the next epoch and reaches Ready
-  -> commit Active(candidate)
-  -> retire incumbent
+Ready compatible ACN
+  -> advance effectiveTarget if needed
+  -> return it
+
+Starting compatible ACN
+  -> advance effectiveTarget if needed
+  -> observe that exact startup within its bounded window
+
+No usable ACN
+  -> allow the publication grace
+  -> acquire the spawn claim and revalidate
+  -> join any resulting acceptable startup or spawn effectiveTarget
+
+Starting attempt exceeds its window
+  -> acquire/take over the spawn claim and revalidate
+  -> fence, stop, and reap that exact attempt
+  -> spawn effectiveTarget
 ```
 
-Before final commit, candidate failure restores the incumbent's admission and `Active` grant.
-Incumbent failure is reconciled from exact exit evidence. After commit, the old epoch cannot admit
-work. Explicit forced replacement is a separate user/administrative mutation with an exact fenced
-target; automatic upgrade never escalates to force while admitted product work remains.
+An expired deadline authorizes revalidation and takeover, never an uncoordinated second spawn. A
+new candidate is not started until the previous candidate and its owned ICN are proven exited. If
+exact removal cannot be proven, ensurance fails as blocked rather than accumulating processes.
 
-## Exact removal
+The desired outcome is a compatible canonical endpoint, not survival of a particular child. If
+another client wins with an acceptable target, every waiter succeeds with that ACN. Caller
+cancellation ends only that observation; it does not make an already spawned process unowned.
 
-Only a committed handoff or explicit force operation may remove another instance:
+## Timing semantics
+
+Every duration answers one question and has one expiry action:
+
+| Timing | Justification | Expiry permits |
+| --- | --- | --- |
+| 2-second publication grace | Covers the short local gap in which another client has begun launch-related filesystem/process work but its early ACN registration is not yet observable. It is coalescing grace for file publication and process scheduling, not an ACN health judgment. | Contend for the spawn claim and revalidate. It does not prove that an ACN died or permit bypassing another live claim. |
+| 30-second startup stall window | Bounds trust in an exact, observable `Starting` ACN. Thirty seconds is deliberately much larger than normal local phase transitions while detecting a candidate hung in backend preparation far sooner than the process-wide ceiling. | Take over ensurance, revalidate the exact candidate, and begin its bounded removal. It does not permit a concurrent spawn. |
+| 5-minute absolute ACN startup ceiling | Bounds the entire ACN-owned application startup even if phases or reported progress continue changing. It prevents progress churn or a defective client from retaining `Starting` forever. | The ACN commits `Stopping(startup-failed)` and terminalizes its process-owned runtime. External ensurance then reaps or replaces it. |
+
+The publication grace begins only while no usable registration is visible and ends immediately when
+an exact `Starting` or `Ready` ACN appears. It is not restarted by repeated empty reads.
+
+The startup stall window is scoped to one exact ACN instance. A real phase transition or monotonic
+measured progress restarts it; repeated health responses, estimated animation progress, or unchanged
+values do not. A replacement instance receives its own window. The five-minute ceiling never
+restarts.
+
+Transport request duration is not one of these clocks. A slow application RPC does not imply ACN
+failure and cannot initiate JIT replacement.
+
+## Exact replacement and cleanup
+
+Replacement first fences the exact canonical attempt so it can no longer win publication or admit
+new work, then performs:
 
 ```text
-validate instance + epoch + process-start identity
-  -> request cooperative shutdown
+request cooperative shutdown
   -> bounded exact-exit wait
   -> revalidate and terminate
-  -> bounded wait
+  -> bounded exact-exit wait
   -> revalidate, force kill, and reap/prove death
-  -> remove only exact instance and role records
+  -> prove the owned ICN exited
+  -> remove only exact instance records
+  -> permit the next spawn
 ```
 
-A retained child handle is the strongest authority for a locally spawned candidate; discovered
-processes require identity validation before every signal. Timeout escalates removal or returns a
-typed failure. It never proves death, permits ownership reuse, or lets delayed cleanup remove a
-successor.
+Timeout advances this escalation or returns a typed unreapable-process failure. It never proves
+death. Delayed cleanup validates identity again and cannot remove a successor.
 
 ## Guarantees and verification
 
-- Exactly one fenced epoch admits work for a data root.
-- Selection, machine ownership, and destructive authority cannot disagree.
-- Priority never moves backward because of scheduling or last-writer order.
-- Compatibility is explicit and independent of priority.
-- Unknown observation and client transport failure cannot mutate global ownership.
-- Automatic replacement cannot interrupt admitted product work.
-- Every durable nonterminal phase has a live owner or deterministic reconciler.
-- Caller/host loss cannot orphan launch or handoff.
-- A candidate failure before commit preserves or restores the incumbent.
-- Generic recovery cannot replay an unsafe mutation.
+- JIT ensurance converges to `Ready` or a typed condition that makes convergence impossible.
+- A compatible higher target immediately and permanently upgrades every observing client's
+  effective target.
+- A lower target cannot displace or follow an admitted higher target.
+- Publication grace, startup stall, absolute startup, and cleanup bounds are never interchangeable.
+- At most one client owns spawn mutation and at most one ACN owns the runtime.
+- No replacement spawns before exact ACN and ICN cleanup completes.
+- A hung client, launch claim, ACN startup, or cleanup path cannot block ensurance forever.
+- Observation uncertainty and application latency do not independently authorize mutation.
 
-Conformance uses independent CLI, desktop, and web-host coordinators; equal, older, newer, and
-incompatible candidates in every ordering; slow `Starting`; caller and host failure at every phase;
-malformed/unreadable coordination; PID reuse; active turns and model work during handoff; and
-ambiguous mutation responses. Global invariants are asserted after every transition, not only the
-final result.
+Conformance covers independent CLI, desktop, and web clients; older clients recovering while a
+newer ACN remains `Starting` beyond two seconds; every claim and startup owner hanging; unchanged
+and advancing progress; failure at the five-minute ceiling; caller exit; PID reuse; and cleanup that
+cannot prove ICN exit. Tests assert the invariants after every transition, not only at completion.
