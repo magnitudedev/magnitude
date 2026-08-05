@@ -8,15 +8,24 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { basename, delimiter, resolve } from "node:path";
+import { basename, delimiter, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { IcnInstallationDeclaration } from "@magnitudedev/icn-protocol";
 import { Schema } from "effect";
 import { getDefaultBunTarget } from "../../scripts/release-target";
 import { buildIcnBinary } from "./compile";
 
-const PROJECT_ROOT = resolve(import.meta.dir, "../..");
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 export type LocalIcnBackend = "cpu" | "cuda" | "metal" | "vulkan";
+
+export const developmentBuildEnvironment = (
+  backend: LocalIcnBackend
+): Readonly<Record<string, string>> =>
+  backend === "cuda" ? { CMAKE_CUDA_ARCHITECTURES: "native" } : {};
+
+export const developmentBuildProfile = (backend: LocalIcnBackend): string =>
+  `development-${backend}${backend === "cuda" ? "-native" : ""}`;
 
 const executableExists = async (name: string): Promise<boolean> => {
   const path = Bun.which(name);
@@ -86,9 +95,12 @@ export const buildLocalIcn = async (): Promise<{
 }> => {
   const backend = await selectBackend();
   await run(["bun", "run", "icn:catalog:build-bundle"]);
+  console.log(
+    `[dev] Building ${backend} ICN${backend === "cuda" ? " for attached GPU(s)" : ""}...`
+  );
   const build = await buildIcnBinary({
     target: getDefaultBunTarget(),
-    profile: `development-${backend}`,
+    profile: developmentBuildProfile(backend),
     features: [
       "mtmd",
       "dynamic-backends",
@@ -96,6 +108,7 @@ export const buildLocalIcn = async (): Promise<{
     ],
     release: false,
     clean: false,
+    buildEnvironment: developmentBuildEnvironment(backend),
   });
   const target = resolve(PROJECT_ROOT, "inference/target");
   const staging = await mkdtemp(resolve(target, ".development-"));

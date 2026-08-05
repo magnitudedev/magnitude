@@ -4,11 +4,12 @@ import {
   stat,
 } from "node:fs/promises"
 import { basename, delimiter, dirname, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
 import { Schema } from "effect"
 import { getTargetInfo } from "../../scripts/release-target"
 
-const PROJECT_ROOT = resolve(import.meta.dir, "../..")
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
 const CARGO_MANIFEST = resolve(PROJECT_ROOT, "inference/Cargo.toml")
 
 const run = async (
@@ -62,6 +63,71 @@ interface CargoMessage {
   readonly out_dir?: string
   readonly executable?: string
   readonly target?: { readonly name?: string }
+  readonly message?: { readonly rendered?: string | null }
+}
+
+export const readCargoMessages = async (
+  stream: ReadableStream<Uint8Array>,
+  writeDiagnostic: (rendered: string) => void = (rendered) =>
+    process.stderr.write(rendered),
+): Promise<readonly CargoMessage[]> => {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  const messages: CargoMessage[] = []
+  let pending = ""
+
+  const accept = (line: string): void => {
+    if (line.trim().length === 0) return
+    const message = JSON.parse(line) as CargoMessage
+    if (
+      message.reason === "compiler-message" &&
+      typeof message.message?.rendered === "string"
+    ) writeDiagnostic(message.message.rendered)
+    if (
+      message.reason === "build-script-executed" ||
+      message.reason === "compiler-artifact"
+    ) messages.push(message)
+  }
+
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      const lines = `${pending}${decoder.decode(next.value, { stream: true })}`
+        .split("\n")
+      pending = lines.pop() ?? ""
+      for (const line of lines) accept(line)
+    }
+    pending += decoder.decode()
+    accept(pending)
+    return messages
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+const runCargoBuild = async (
+  command: readonly string[],
+  options: {
+    readonly cwd: string
+    readonly env: Readonly<Record<string, string | undefined>>
+  },
+): Promise<readonly CargoMessage[]> => {
+  const child = Bun.spawn([...command], {
+    cwd: options.cwd,
+    env: options.env,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "inherit",
+  })
+  const [code, messages] = await Promise.all([
+    child.exited,
+    readCargoMessages(child.stdout),
+  ])
+  if (code !== 0) {
+    throw new Error(`${command[0]} failed with exit ${code}`)
+  }
+  return messages
 }
 
 const rustTarget = (target: string): string => {
@@ -200,7 +266,7 @@ export const buildIcnBinary = async ({
     throw new Error("Cargo metadata has no llama-cpp-sys-2 package")
   }
 
-  const output = await run([
+  const messages = await runCargoBuild([
     "cargo",
     "build",
     ...(release ? ["--release"] : []),
@@ -224,10 +290,6 @@ export const buildIcnBinary = async ({
       CARGO_TARGET_DIR: targetDirectory,
     },
   })
-  const messages = output
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as CargoMessage)
   const outDirectories = messages
     .filter((message) =>
       message.reason === "build-script-executed" &&
