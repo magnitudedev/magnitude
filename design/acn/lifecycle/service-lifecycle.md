@@ -18,7 +18,8 @@ One ACN process owns one authoritative service lifecycle:
 Starting(activity, progress?) -> Ready -> Stopping(reason) -> exact exit
 ```
 
-`Exited` is observed by the host coordinator; a process cannot publish proof of its own death.
+`Exited` is observed externally through exact process identity; a process cannot publish proof of
+its own death.
 `Installing` is a client presentation of `Starting`, not an admission mode. Startup or runtime
 failure enters `Stopping`; terminal launch/removal failure is reported after exact process outcome.
 
@@ -37,6 +38,13 @@ A healthy ACN retires only from explicit shutdown, idle policy, its own terminal
 fenced revocation. Missing, unreadable, malformed, or delayed coordination evidence is uncertainty,
 not ownership loss. Revocation and admission share the fence, so no work is accepted after the grant
 is superseded.
+
+Startup has two deliberately different liveness bounds. External JIT ensurance treats 30 seconds
+without an authoritative phase change or monotonic measured progress as a stalled exact candidate
+and begins fenced replacement. Independently, ACN owns a five-minute absolute ceiling from
+application startup entry; it never restarts, even when progress changes, and expiry commits
+`Stopping(startup-failed)`. The shorter window prevents a hung candidate from blocking clients,
+while the process-owned ceiling guarantees terminalization even if every observing client exits.
 
 ## Activity and idleness
 
@@ -71,9 +79,9 @@ fiber interruption, finalizers, cooperative cleanup, ICN shutdown, signal, kill,
 bounded within an overall teardown limit.
 
 ACN retains machine ownership until normal teardown has reaped ICN. If the cooperative limit
-expires, the host coordinator escalates exact process removal; the ACN does not release ownership
-merely because its own cleanup stalled. Timeout causes escalation or typed failure, never proof of
-death or ownership theft.
+expires, the client holding the fenced JIT replacement claim escalates exact process removal; the
+ACN does not release ownership merely because its own cleanup stalled. Timeout causes escalation or
+typed failure, never proof of death or ownership theft.
 
 The stable control router accepts an exact fenced shutdown request before application readiness.
 The request idempotently commits `Stopping` and returns after that transition; it does not wait for

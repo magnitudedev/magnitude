@@ -420,7 +420,7 @@ pub(crate) fn resolve_components(
         }
     };
     let canonical_containment = containment.canonicalize().map_err(io_error)?;
-    model
+    let resolved = model
         .location
         .components()
         .iter()
@@ -437,13 +437,69 @@ pub(crate) fn resolve_components(
                 )));
             }
             Ok(ResolvedComponent {
-                path: canonical,
+                path,
                 role: component.role.clone(),
                 shard_index: component.shard_index,
                 relationship: component.relationship.clone(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    validate_shard_layout(&resolved)?;
+    Ok(resolved)
+}
+
+fn validate_shard_layout(components: &[ResolvedComponent]) -> Result<(), InventoryError> {
+    let mut groups = Vec::<(icn_contracts::ComponentRole, PathBuf)>::new();
+    for component in components
+        .iter()
+        .filter(|component| component.shard_index.is_some())
+    {
+        let directory = component.path.parent().unwrap_or_else(|| Path::new(""));
+        if !groups
+            .iter()
+            .any(|(role, parent)| role == &component.role && parent == directory)
+        {
+            groups.push((component.role.clone(), directory.to_path_buf()));
+        }
+    }
+    for (role, directory) in groups {
+        let shards = components
+            .iter()
+            .filter(|component| {
+                component.role == role
+                    && component.shard_index.is_some()
+                    && component.path.parent() == Some(directory.as_path())
+            })
+            .collect::<Vec<_>>();
+        let count = u32::try_from(shards.len()).map_err(|_| invalid_split_layout(&role))?;
+        let mut indices = BTreeSet::new();
+        for component in shards {
+            let index = component
+                .shard_index
+                .expect("sharded components were filtered");
+            let name = component
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let suffix = format!("-{index:05}-of-{count:05}.gguf");
+            if !indices.insert(index) || !name.ends_with(&suffix) {
+                return Err(invalid_split_layout(&role));
+            }
+        }
+        if indices != (1..=count).collect() {
+            return Err(invalid_split_layout(&role));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_split_layout(role: &icn_contracts::ComponentRole) -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "invalid_split_layout".to_owned(),
+        message: format!("the {role:?} GGUF shard layout is invalid").to_ascii_lowercase(),
+        retryable: false,
+    }
 }
 
 fn plan_managed_delete(
@@ -720,7 +776,109 @@ fn io_error(error: impl std::fmt::Display) -> InventoryError {
 mod tests {
     use super::*;
     use crate::manifest::{OperationComponent, OperationManifest};
-    use icn_contracts::{ComponentRole, ContentId, ContentIdentity, ModelId};
+    use icn_contracts::{
+        ComponentRole, ContentId, ContentIdentity, Integrity, InventoryProperties, ModelComponent,
+        ModelId,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_shards_retain_snapshot_paths_after_containment_validation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp store");
+        let repository = "owner/repo";
+        let commit = "commit";
+        let repository_root = root.path().join("hub").join(hf_repo_dir(repository));
+        let snapshot = repository_root
+            .join("snapshots")
+            .join(commit)
+            .join("UD-Q6_K_XL");
+        let blobs = repository_root.join("blobs");
+        fs::create_dir_all(&snapshot).expect("snapshot");
+        fs::create_dir_all(&blobs).expect("blobs");
+
+        let components = (1..=4)
+            .map(|index| {
+                let name = format!("model-{index:05}-of-00004.gguf");
+                let blob_name = format!("sha256-{index}");
+                fs::write(blobs.join(&blob_name), format!("shard {index}")).expect("write blob");
+                symlink(
+                    Path::new("../../../blobs").join(&blob_name),
+                    snapshot.join(&name),
+                )
+                .expect("snapshot symlink");
+                ModelComponent {
+                    path: PathBuf::from("UD-Q6_K_XL").join(name),
+                    role: ComponentRole::Shard,
+                    size_bytes: 7,
+                    content: ContentIdentity::Sha256 {
+                        value: format!("{index:064x}"),
+                    },
+                    shard_index: Some(index),
+                    relationship: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let model = InventoryModel {
+            id: ModelId("mdl_split".to_owned()),
+            content_id: ContentId("content_split".to_owned()),
+            created: 1,
+            name: "split".to_owned(),
+            supported_parameters: Vec::new(),
+            availability: ModelAvailability::Available { ready_at: 1 },
+            source: ModelSource::HuggingFace {
+                repository: repository.to_owned(),
+                requested_revision: commit.to_owned(),
+                commit: commit.to_owned(),
+                metadata: None,
+            },
+            location: ModelLocation::MagnitudeCache {
+                components,
+                total_bytes: 28,
+                integrity: Integrity::Verified {
+                    method: "test".to_owned(),
+                },
+            },
+            properties: InventoryProperties::Pending,
+            operations: Vec::new(),
+            updated_at: 1,
+        };
+
+        let resolved = resolve_components(root.path(), &model).expect("resolve shards");
+
+        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved[0].path, snapshot.join("model-00001-of-00004.gguf"));
+        assert_ne!(
+            resolved[0].path,
+            resolved[0].path.canonicalize().expect("canonical blob")
+        );
+    }
+
+    #[test]
+    fn invalid_split_filename_is_rejected_before_native_planning() {
+        let directory = tempfile::tempdir().expect("shards");
+        let components = (1..=2)
+            .map(|index| {
+                let path = directory.path().join(format!("blob-{index}"));
+                fs::write(&path, b"fixture").expect("fixture");
+                ResolvedComponent {
+                    path,
+                    role: ComponentRole::Shard,
+                    shard_index: Some(index),
+                    relationship: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let error = validate_shard_layout(&components).expect_err("invalid split layout");
+
+        assert!(matches!(
+            error,
+            InventoryError::ModelOperation { code, retryable: false, .. }
+                if code == "invalid_split_layout"
+        ));
+    }
 
     #[test]
     fn startup_finishes_interrupted_download_tombstone() {

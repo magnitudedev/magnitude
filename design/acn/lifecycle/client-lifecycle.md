@@ -13,72 +13,85 @@ applies_to:
 
 # ACN client lifecycle
 
-Each client has one authority for bootstrap state, its selected ACN endpoint, and transport
-recovery. Screens and RPC consumers observe that authority; they do not own endpoint caches,
-discovery, retry, or replacement policy.
+Each client has one process-local authority for bootstrap presentation, its effective ACN target,
+selected endpoint, and transport recovery. Screens and RPC consumers observe it; they do not own
+independent endpoint caches, retry loops, or launch policy.
 
 ```text
 Checking -> Starting / Installing -> Ready(endpoint)
                |                         |
                +------> Failed <---------+
                            |
-                           +-> retry through the same authority
+                           +-> retry through the same JIT operation
 ```
 
-These are client states, not another copy of ACN service lifecycle. `Installing` is presentation of
-host preparation. `Ready` retains the exact endpoint identity and fencing epoch selected by the host
-coordinator.
+These are client states, not another copy of ACN service lifecycle. Local CLI performs JIT
+ensurance directly. Desktop renderer and browser use their existing host process for filesystem and
+spawn mechanics, but selection and recovery semantics remain identical.
 
-## Host boundary and selection
+## Effective target and selection
 
-The client asks the host coordinator defined by [JIT spawning and handoff](./jit-spawning.md) to
-observe or ensure an endpoint satisfying explicit
-coordination, RPC, storage, and release requirements. Local CLI, desktop main, and web host adapters
-transport the same typed contract; browser and renderer processes never implement selection policy.
+The lifecycle owns three distinct values:
 
-The selected `{ instanceId, epoch, endpoint }` is used by every RPC consumer and remains bound
-through proxies. A proxy cannot cache another process URL, and every dispatch carries the expected
-identity and epoch so port reuse or stale routing cannot reach a different ACN.
+```text
+bundledTarget     target initially requested by this client build
+effectiveTarget   highest compatible target adopted by this client
+selectedEndpoint  exact ACN currently used
+```
 
-Initial preparation may begin before rendering. CLI can wait for the first observable startup state
-to avoid a blank frame; other clients may render immediately. Retry re-enters this same lifecycle
-and coordinator operation rather than creating a second startup path.
+`effectiveTarget` begins at `bundledTarget`. Observing a compatible higher target in `Starting` or
+`Ready` advances it immediately under the lifecycle's selection lock. It never decreases. Every
+later compatibility check, artifact resolution, launch request, and recovery uses the effective
+target rather than a compile-time SDK version.
 
-## Recovery
+A compatible newer ACN therefore upgrades an older open client without restarting it. If that ACN
+later fails, the older client may ensure the adopted target but cannot start its bundled older ACN.
+An adopted target that cannot be reproduced locally produces a typed launch failure; it never
+falls back to a lower target.
 
-A request failure is evidence about that request, not permission to replace ACN. Domain failure and
-caller cancellation never trigger recovery. Operation duration has no transport deadline: a request
-remains bound until it completes, is canceled, concretely loses transport, or receives authoritative
-retirement.
+The selected endpoint carries exact process identity and remains bound through desktop and web
+proxies. Proxies do not cache a logically independent ACN URL.
 
-On concrete transport failure or retirement, the client rereads coordinator state:
+## Startup and recovery
+
+Initial preparation and recovery both enter the JIT ensurance defined by
+[JIT ACN ensurance and upgrades](./jit-spawning.md). Retry re-enters that same operation rather than
+creating a second startup path.
+
+On concrete transport failure or authoritative retirement, the client rereads ACN state:
 
 - the same exact `Ready` ACN means the request failed locally; it is not rejected globally;
-- a compatible `Starting` successor is observed without spawning another candidate;
-- a compatible `Ready` successor becomes the selected endpoint; and
-- absence or incompatibility is returned to coordinator `ensure`, which independently decides
-  whether mutation is legal.
+- a compatible `Starting` ACN satisfying the effective target enters its 30-second stall window,
+  advancing the target first when it is higher;
+- a compatible `Ready` successor advances the target and becomes selected;
+- no usable registration enters the 2-second publication grace before spawn contention; and
+- expiry of a startup window requests coordinated takeover and exact cleanup, not a direct spawn.
 
-Connection refusal/reset, exact process exit, malformed or prematurely ended protocol, and valid
-terminal control are concrete recovery evidence. Slow response, one health timeout, filesystem
-uncertainty, domain error, and cancellation are not.
+The two-second grace covers only an in-flight publication gap. The 30-second window bounds lack of
+forward progress by one exact `Starting` ACN. Their complete ownership and expiry semantics are
+normative in the JIT design and must not be recreated in UI or transport code.
 
-Queries may be replayed and observations reopened with authoritative reread. Idempotent mutations
-may retry only under their domain contract; an ambiguous mutation outcome is reconciled rather than
-blindly replayed against a successor. See [operation ownership](../../architecture/operation-ownership.md).
+Domain failure and caller cancellation never trigger ACN recovery. Operation duration has no
+transport deadline: a request remains bound until it completes, is canceled, concretely loses
+transport, or receives authoritative retirement.
+
+Queries may be replayed and observations reopened according to their domain contract. Idempotent
+mutations retry only with durable identity; an ambiguous mutation outcome is reconciled rather than
+blindly replayed against a successor. See
+[operation ownership](../../architecture/operation-ownership.md).
 
 ## Failure semantics
 
-Typed client outcomes distinguish host preparation failure, candidate failure, incompatible active
-authority, blocked handoff, local transport failure, RPC incompatibility, ambiguous mutation, and
-explicit forced-replacement failure. Incidental child log tails remain diagnostics and never choose
-the failure class. Intentional supersession is not reported as a crash.
+Typed outcomes distinguish artifact acquisition failure, unreproducible adopted target, candidate
+startup failure, blocked exact cleanup, local transport failure, RPC incompatibility, and ambiguous
+mutation. Incidental child logs remain diagnostics. Intentional replacement is not a crash.
 
 ## Guarantees
 
-- All consumers in one client share one selected endpoint and recovery authority.
-- Client transport failure cannot authorize machine-wide replacement.
+- All RPC consumers in one client share one effective target, endpoint, and recovery authority.
+- Accepting a newer compatible ACN permanently prevents that client from launching an older one.
+- `Starting` beyond two seconds does not fall through to an uncoordinated launch.
+- Startup and cleanup deadlines retain the meanings defined by JIT ensurance.
 - Connection loss never becomes empty authoritative product state.
-- Endpoint identity survives every host and proxy boundary.
-- Operation latency cannot move the client away from a live ACN.
-- Recovery preserves query, observation, and mutation semantics rather than treating every RPC alike.
+- Application operation latency cannot move the client away from a live ACN.
+- Recovery preserves query, observation, and mutation semantics.
