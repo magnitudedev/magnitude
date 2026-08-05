@@ -78,8 +78,12 @@ const unavailable = (state: AcnHealthState) =>
     },
   );
 
+// TMP: Outlive the temporary 60-minute model residency window so ACN shutdown
+// cannot reap its owned ICN before the model's own idle timeout expires.
+const DEFAULT_ACN_IDLE_TIMEOUT: Duration.DurationInput = "65 minutes";
+
 export const makeAcnServiceLifecycle = (
-  idleTimeout: Duration.DurationInput = "30 minutes",
+  idleTimeout: Duration.DurationInput = DEFAULT_ACN_IDLE_TIMEOUT,
 ): Effect.Effect<AcnServiceLifecycleApi, never, Scope.Scope> =>
   Effect.gen(function* () {
     const runtime = yield* Ref.make<AcnRuntimeState>({
@@ -195,6 +199,6 @@ export const makeAcnServiceLifecycle = (
   });
 
 export const AcnServiceLifecycleLive = (
-  idleTimeout: Duration.DurationInput = "30 minutes",
+  idleTimeout: Duration.DurationInput = DEFAULT_ACN_IDLE_TIMEOUT,
 ): Layer.Layer<AcnServiceLifecycle> =>
   Layer.scoped(AcnServiceLifecycle, makeAcnServiceLifecycle(idleTimeout));
