@@ -4,16 +4,17 @@
  * Uses Bun APIs for process spawning, clipboard (OSC 52), and terminal size.
  * Stubs for unsupported capabilities (storage, notifications, dialogs).
  */
-import { Effect, Exit, Layer, Option, Scope } from "effect"
+import { Array as Arr, Effect, Exit, Layer, Option, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
-  AcnProcessManager,
+  AcnEnsurer,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
   makeLocalAcnDaemonAdministrator,
   makeAcnJitRuntime,
-  makeLocalAcnProcessManager,
+  makeLocalAcnEnsurer,
+  SDK_VERSION,
 } from "@magnitudedev/sdk"
 import type {
   Platform,
@@ -70,15 +71,27 @@ const terminalCapabilities: TerminalCapabilities = {
 }
 
 export interface TerminalPlatformOptions {
-  readonly launchCommand: Option.Option<ReadonlyArray<string>>
+  readonly launchCommand: Option.Option<Arr.NonEmptyReadonlyArray<string>>
   readonly debug: boolean
   readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
 }
 
-const makeTerminalAcnProcessManager = (
+const makeTerminalAcnEnsurer = (
   debug: boolean,
   scope: Scope.CloseableScope,
-) => makeLocalAcnProcessManager({ ...(debug ? { debug: true } : {}) }).pipe(
+  launchCommand: Option.Option<Arr.NonEmptyReadonlyArray<string>>,
+) => makeLocalAcnEnsurer({
+  ...(debug ? { debug: true } : {}),
+  ...Option.match(launchCommand, {
+    onNone: () => ({}),
+    onSome: (command) => ({
+      launchOverride: {
+        identity: SDK_VERSION,
+        command,
+      },
+    }),
+  }),
+}).pipe(
   Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
   Effect.provideService(Scope.Scope, scope),
   Effect.provide([BunContext.layer, FetchHttpClient.layer]),
@@ -99,12 +112,12 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions): 
     () => makeCliEffectLoggingLayer({ debug: options.debug }),
   )
   const managerScope = await Effect.runPromise(Scope.make())
-  const processManager = await Effect.runPromise(
-    makeTerminalAcnProcessManager(options.debug, managerScope),
+  const ensurer = await Effect.runPromise(
+    makeTerminalAcnEnsurer(options.debug, managerScope, options.launchCommand),
   )
   const acn = await Effect.runPromise(
-    makeAcnJitRuntime({ launchCommand: options.launchCommand }).pipe(
-      Effect.provideService(AcnProcessManager, processManager),
+    makeAcnJitRuntime().pipe(
+      Effect.provideService(AcnEnsurer, ensurer),
       Effect.provideService(Scope.Scope, managerScope),
       Effect.provide(FetchHttpClient.layer),
     ),

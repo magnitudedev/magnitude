@@ -20,8 +20,10 @@ not substitutes for it.
 
 ## Client lifetime
 
-`AcnJitRuntime` creates one random `ClientId`, acquires a dedicated lease protocol, renews
-immediately, and renews every 15 seconds. `RpcClient.Protocol` is single-consumer, so the lease
+`AcnJitRuntime` creates one random `ClientId`, a dedicated lease protocol, and one inert scoped
+lease owner. Its first `ReadyAcn` selection opens the owner's deferred start gate; renewal then
+runs immediately and every 15 seconds.
+The lease is not an initial ACN bootstrap trigger. `RpcClient.Protocol` is single-consumer, so the lease
 client must not share a protocol instance with application RPC clients. The protocol instances do
 share the runtime's endpoint-selection and recovery authority. A graceful close releases the lease
 explicitly and returns the connected count after removal. Abrupt close relies on expiry.

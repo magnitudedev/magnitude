@@ -2,23 +2,32 @@ export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, Acn
 export type { AcnClient } from "./protocol"
 
 export {
-  AcnProcessManager,
-  AcnLaunchRequestSchema,
-  AcnLaunchEventSchema,
-  runAcnLaunch,
-  type AcnLaunchRequest,
-  type AcnLaunchEvent,
-} from "./acn-jit/acn-process-manager"
+  AcnEnsurer,
+  AcnEnsureRequestSchema,
+  AcnEnsureEventSchema,
+  ReadyAcnSchema,
+  RemoteAcnEnsureMessageSchema,
+  runAcnEnsure,
+  type AcnEnsureRequest,
+  type AcnEnsureEvent,
+  type ReadyAcn,
+  type RemoteAcnEnsureMessage,
+} from "./acn-jit/acn-ensurer"
 export {
   AcnDaemonAdministrator,
   type AcnDaemonAdministrator as AcnDaemonAdministratorService,
 } from "./acn-jit/acn-daemon-administrator"
 export {
-  makeLocalAcnProcessManager,
+  makeLocalAcnEnsurer,
   makeLocalAcnDaemonAdministrator,
-  type LocalAcnProcessManager,
-  type LocalAcnProcessManagerOptions,
-} from "./acn-jit/local-acn-process-manager"
+  resolveAssignedAcnProxyTarget,
+  AcnLaunchSource,
+  type LocalAcnEnsurer,
+  type LocalAcnEnsurerOptions,
+  type LocalAcnDaemonAdministratorOptions,
+  type AcnLaunchOverride,
+  type PreparedCommand,
+} from "./acn-jit/local-acn-ensurer"
 export {
   ChildProcessSpawner,
   scopePreHandoffCandidate,
@@ -26,20 +35,15 @@ export {
 } from "./acn-jit/child-process"
 export { BunDetachedChildProcessSpawner } from "./acn-jit/bun-spawn-process"
 export {
-  makeRemoteAcnProcessManager,
-  RemoteAcnCurrentResponseSchema,
+  makeRemoteAcnEnsurer,
   RemoteAcnErrorResponseSchema,
-  RemoteAcnLaunchMessageSchema,
-  RemoteAcnTerminateRequestSchema,
-  type RemoteAcnLaunchMessage,
-} from "./acn-jit/remote-acn-process-manager"
+} from "./acn-jit/remote-acn-ensurer"
 export {
   makeAcnJitRuntime,
   type AcnStartup,
   type AcnClientCloseReport,
   type AcnClientCloseResult,
   type AcnJitRuntime,
-  type AcnJitRuntimeOptions,
 } from "./acn-jit/acn-recovering-client"
 export {
   AcnLifecycleStateSchema,
@@ -60,7 +64,6 @@ export {
   DisplayState as DisplayStateSchema,
   DisplayTimeline as DisplayTimelineSchema,
   DisplayViewSnapshot,
-  AcnInstanceSchema,
   DisplayViewShape as DisplayViewShapeSchema,
   MagnitudeRpcs,
   StreamEvent as StreamEventSchema,
@@ -119,7 +122,6 @@ export {
 } from "@magnitudedev/acn-protocol"
 
 export type {
-  AcnInstance,
   DownloadAttemptId,
   ModelOfferingTargetId,
   RecommendationId,
@@ -208,14 +210,13 @@ export type { RoleId } from "@magnitudedev/roles"
 export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
 export { SDK_VERSION } from "./version"
 export {
-  DaemonDiscoveryFailed,
-  DaemonSpawnFailed,
+  AcnAdministrationFailed,
+  AcnEnsuranceFailed,
   BinaryNotFound,
   BinaryVersionMismatch,
   DownloadFailed,
   ChecksumMismatch,
-  DaemonCrashed,
-  DaemonError,
+  AcnEnsuranceError,
   type StreamDisplayViewFailure,
   type WatchFileFailure,
 } from "./errors"

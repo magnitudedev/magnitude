@@ -18,7 +18,7 @@ import { CLI_VERSION } from "./version";
 import { installGracefulShutdownHandlers } from "./utils/graceful-shutdown";
 import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
-import { Effect, Option } from "effect";
+import { Array as Arr, Effect, Option } from "effect";
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
@@ -101,7 +101,7 @@ async function main() {
       "src",
       "binary.ts"
     );
-    const launchCommand = isDev
+    const launchCommand: Option.Option<Arr.NonEmptyReadonlyArray<string>> = isDev
       ? Option.some([
           "bun",
           acnSourcePath,
@@ -109,7 +109,7 @@ async function main() {
           "--register",
           ...(opts.debug ? ["--debug"] : []),
         ])
-      : Option.none<ReadonlyArray<string>>();
+      : Option.none();
 
     const effectLoggingLayer = makeCliEffectLoggingLayer({
       debug: opts.debug === true,

@@ -29,7 +29,11 @@ const spawnedCandidate = () => {
     target: identity("1.0.0"),
     manager,
   })
-  return reduceAcnProcessState(Option.some(begun), {
+  const prepared = reduceAcnProcessState(Option.some(begun), {
+    _tag: "PreparationSucceeded",
+    manager,
+  })
+  return reduceAcnProcessState(Option.some(prepared), {
     _tag: "CandidateSpawned",
     manager,
     candidate,
@@ -40,6 +44,92 @@ const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | Scope.Sco
   Effect.runPromise(effect.pipe(Effect.scoped, Effect.provide(BunFileSystem.layer)))
 
 describe("ACN process state", () => {
+  it("retains the incumbent until replacement preparation succeeds", () => {
+    const spawned = spawnedCandidate()
+    const assigned = reduceAcnProcessState(Option.some(spawned), {
+      _tag: "CandidateAdmitted",
+      candidate,
+      id: "candidate" as never,
+      url: "http://127.0.0.1:1234",
+    })
+    if (assigned.mode._tag !== "Assigned") throw new Error("unreachable")
+    const preparing = reduceAcnProcessState(Option.some(assigned), {
+      _tag: "BeginReplacement",
+      target: identity("2.0.0"),
+      manager,
+      current: assigned.mode.current,
+    })
+    expect(preparing.mode).toMatchObject({
+      _tag: "Changing",
+      owner: { _tag: "Manager", phase: { _tag: "Preparing", current: Option.some(assigned.mode.current) } },
+    })
+    const prepared = reduceAcnProcessState(Option.some(preparing), {
+      _tag: "PreparationSucceeded",
+      manager,
+    })
+    expect(prepared.mode).toMatchObject({
+      _tag: "Changing",
+      owner: { _tag: "Manager", phase: { _tag: "RetiringAssigned", current: assigned.mode.current } },
+    })
+  })
+
+  it("restores the exact incumbent when replacement preparation fails", () => {
+    const spawned = spawnedCandidate()
+    const assigned = reduceAcnProcessState(Option.some(spawned), {
+      _tag: "CandidateAdmitted",
+      candidate,
+      id: "candidate" as never,
+      url: "http://127.0.0.1:1234",
+    })
+    if (assigned.mode._tag !== "Assigned") throw new Error("unreachable")
+    const preparing = reduceAcnProcessState(Option.some(assigned), {
+      _tag: "BeginReplacement",
+      target: identity("2.0.0"),
+      manager,
+      current: assigned.mode.current,
+    })
+    const failed = reduceAcnProcessState(Option.some(preparing), {
+      _tag: "PreparationFailed",
+      manager,
+      reason: "download failed",
+    })
+    expect(failed.identityFloor).toBe("2.0.0")
+    expect(failed.mode).toMatchObject({
+      _tag: "Assigned",
+      current: assigned.mode.current,
+      result: { _tag: "Some", value: { _tag: "Failed", reason: "download failed" } },
+    })
+  })
+
+  it("requires a takeover owner to prepare again before spawning", () => {
+    const begun = reduceAcnProcessState(Option.none(), {
+      _tag: "BeginEnsure",
+      target: identity("1.0.0"),
+      manager,
+    })
+    const prepared = reduceAcnProcessState(Option.some(begun), {
+      _tag: "PreparationSucceeded",
+      manager,
+    })
+    const replacementManager = {
+      pid: 101,
+      processStartIdentity: ProcessStartIdentitySchema.make("manager-101"),
+    }
+    const takenOver = reduceAcnProcessState(Option.some(prepared), {
+      _tag: "TakeOver",
+      manager: replacementManager,
+    })
+    expect(takenOver.mode).toMatchObject({
+      _tag: "Changing",
+      owner: { _tag: "Manager", process: replacementManager, phase: { _tag: "Preparing" } },
+    })
+    expect(() => reduceAcnProcessState(Option.some(takenOver), {
+      _tag: "CandidateSpawned",
+      manager: replacementManager,
+      candidate,
+    })).toThrow()
+  })
+
   it("preserves one change identity while raising its identity floor", () => {
     const begun = reduceAcnProcessState(Option.none(), {
       _tag: "BeginEnsure",
@@ -67,7 +157,11 @@ describe("ACN process state", () => {
       target: identity("1.0.0"),
       manager,
     })
-    const spawned = reduceAcnProcessState(Option.some(begun), {
+    const prepared = reduceAcnProcessState(Option.some(begun), {
+      _tag: "PreparationSucceeded",
+      manager,
+    })
+    const spawned = reduceAcnProcessState(Option.some(prepared), {
       _tag: "CandidateSpawned",
       manager,
       candidate,

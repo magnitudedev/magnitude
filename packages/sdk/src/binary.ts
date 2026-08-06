@@ -3,7 +3,7 @@ import * as CommandExecutor from "@effect/platform/CommandExecutor";
 import * as FileSystem from "@effect/platform/FileSystem";
 import * as HttpClient from "@effect/platform/HttpClient";
 import * as Path from "@effect/platform/Path";
-import { Effect, Option } from "effect";
+import { Array as Arr, Effect, Option } from "effect";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,7 +19,7 @@ import {
 import {
   BinaryNotFound,
   BinaryVersionMismatch,
-  DaemonSpawnFailed,
+  AcnEnsuranceFailed,
   DownloadFailed,
 } from "./errors";
 
@@ -43,7 +43,7 @@ export interface ResolveBinaryOptions {
 }
 
 export interface ResolvedBinaryCommand {
-  readonly command: string[];
+  readonly command: Arr.NonEmptyReadonlyArray<string>;
   readonly needsDownload: boolean;
 }
 
@@ -75,7 +75,7 @@ const validateBinaryVersion = (
   expectedVersion: string
 ): Effect.Effect<
   void,
-  BinaryVersionMismatch | DaemonSpawnFailed,
+  BinaryVersionMismatch | AcnEnsuranceFailed,
   CommandExecutor.CommandExecutor
 > =>
   Effect.gen(function* () {
@@ -83,7 +83,7 @@ const validateBinaryVersion = (
       Command.string,
       Effect.map((value) => value.trim()),
       Effect.mapError(
-        (cause) => new DaemonSpawnFailed({ reason: String(cause) })
+        (cause) => new AcnEnsuranceFailed({ reason: String(cause) })
       )
     );
     if (actual !== expectedVersion) {
@@ -176,7 +176,7 @@ const ensureAcn = (
   observer: ResolveBinaryOptions["acquisitionObserver"]
 ): Effect.Effect<
   { readonly path: string; readonly acquired: boolean },
-  DownloadFailed | BinaryVersionMismatch | DaemonSpawnFailed,
+  DownloadFailed | BinaryVersionMismatch | AcnEnsuranceFailed,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | Path.Path
@@ -244,7 +244,7 @@ export const downloadAcn = (
   dataDir: string
 ): Effect.Effect<
   string,
-  DownloadFailed | BinaryVersionMismatch | DaemonSpawnFailed,
+  DownloadFailed | BinaryVersionMismatch | AcnEnsuranceFailed,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | Path.Path
@@ -260,7 +260,7 @@ export const resolveBinaryCommand = (
   }
 ): Effect.Effect<
   ResolvedBinaryCommand,
-  DownloadFailed | BinaryNotFound | BinaryVersionMismatch | DaemonSpawnFailed,
+  DownloadFailed | BinaryNotFound | BinaryVersionMismatch | AcnEnsuranceFailed,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | Path.Path

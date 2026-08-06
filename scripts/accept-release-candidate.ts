@@ -4,13 +4,13 @@ import { RpcClient } from "@effect/rpc"
 import {
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
-  AcnProcessManager,
+  AcnEnsurer,
   MagnitudeRpcs,
   makeAcnJitRuntime,
-  makeLocalAcnProcessManager,
-  type AcnInstance,
+  makeLocalAcnEnsurer,
+  makeLocalAcnDaemonAdministrator,
 } from "@magnitudedev/sdk"
-import { Effect, Exit, Layer, Option, Schema, Scope } from "effect"
+import { Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
 import {
   mkdir,
   mkdtemp,
@@ -97,12 +97,17 @@ const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let serverRunning = true
-const processManagerScope = await Effect.runPromise(Scope.make())
+const ensurerScope = await Effect.runPromise(Scope.make())
 
-const processManager = await Effect.runPromise(
-  makeLocalAcnProcessManager({ dataDir }).pipe(
+const ensurer = await Effect.runPromise(
+  makeLocalAcnEnsurer({ dataDir }).pipe(
     Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
-    Effect.provideService(Scope.Scope, processManagerScope),
+    Effect.provideService(Scope.Scope, ensurerScope),
+    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+  ),
+)
+const administrator = await Effect.runPromise(
+  makeLocalAcnDaemonAdministrator({ dataDir }).pipe(
     Effect.provide([BunContext.layer, FetchHttpClient.layer]),
   ),
 )
@@ -156,34 +161,32 @@ const descendantsOf = (
   return descendants
 }
 
-const registeredProcess = async (): Promise<{
-  readonly instance: AcnInstance
+const registeredProcess = async (pid: number): Promise<{
+  readonly pid: number
   readonly descendants: readonly number[]
 }> => {
-  const observed = await Effect.runPromise(processManager.observeCurrent)
-  const current = Option.getOrThrowWith(
-    observed,
-    () => new Error("release bootstrap left no current ACN"),
-  )
-  const pid = current.pid
   if (!processIsAlive(pid)) {
     throw new Error(`release bootstrap ACN ${pid} exited before teardown`)
   }
   return {
-    instance: current,
+    pid,
     descendants: descendantsOf(pid, await processTree()),
   }
 }
 
-const terminateBootstrap = async (): Promise<void> => {
-  const registered = await registeredProcess()
+const terminateBootstrap = async (pid?: number): Promise<void> => {
+  const registered = pid === undefined ? undefined : await registeredProcess(pid)
   let terminationFailure: unknown
   try {
-    await Effect.runPromise(processManager.terminate(registered.instance))
+    await Effect.runPromise(administrator.stopCurrent)
   } catch (cause) {
     terminationFailure = cause
   }
-  const ownedProcesses = [registered.instance.pid, ...registered.descendants]
+  if (registered === undefined) {
+    if (terminationFailure !== undefined) throw terminationFailure
+    return
+  }
+  const ownedProcesses = [registered.pid, ...registered.descendants]
   const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS
   while (
     ownedProcesses.some(processIsAlive) &&
@@ -209,10 +212,8 @@ const terminateBootstrap = async (): Promise<void> => {
 }
 
 const probeBootstrap = Effect.gen(function* () {
-  const runtime = yield* makeAcnJitRuntime({
-    launchCommand: Option.none(),
-  }).pipe(
-    Effect.provideService(AcnProcessManager, processManager),
+  const runtime = yield* makeAcnJitRuntime().pipe(
+    Effect.provideService(AcnEnsurer, ensurer),
   )
 
   yield* runtime.startup.prepare
@@ -230,7 +231,7 @@ const probeBootstrap = Effect.gen(function* () {
         case "Failed":
           return yield* Effect.fail(localModels.state.recommendations)
         case "Loading":
-          yield* Effect.sleep("250 millis")
+          yield* Effect.sleep(Duration.millis(250))
       }
     }
   }).pipe(
@@ -238,11 +239,14 @@ const probeBootstrap = Effect.gen(function* () {
     Effect.scoped,
   )
 }).pipe(
-  Effect.timeout(`${BOOTSTRAP_TIMEOUT_MS} millis`),
+  Effect.provide(FetchHttpClient.layer),
+  Effect.scoped,
+  Effect.timeout(Duration.millis(BOOTSTRAP_TIMEOUT_MS)),
 )
 
 const acceptBootstrap = async (): Promise<void> => {
   let accepted = false
+  let healthPid: number | undefined
   try {
     const health = await Effect.runPromise(probeBootstrap)
     if (
@@ -254,16 +258,12 @@ const acceptBootstrap = async (): Promise<void> => {
         `release bootstrap returned incompatible health: ${JSON.stringify(health)}`,
       )
     }
-    const registered = await registeredProcess()
-    if (registered.instance.pid !== health.pid) {
-      throw new Error(
-        `release bootstrap health PID ${health.pid} differs from registration ${registered.instance.pid}`,
-      )
-    }
+    healthPid = health.pid
+    await registeredProcess(health.pid)
     accepted = true
   } finally {
     try {
-      await terminateBootstrap()
+      await terminateBootstrap(healthPid)
     } catch (cause) {
       if (accepted) throw cause
     }
@@ -322,7 +322,7 @@ try {
   serverRunning = false
   await acceptBootstrap()
 } finally {
-  await Effect.runPromise(Scope.close(processManagerScope, Exit.void))
+  await Effect.runPromise(Scope.close(ensurerScope, Exit.void))
   if (serverRunning) server.stop(true)
   await rm(root, { recursive: true, force: true })
 }

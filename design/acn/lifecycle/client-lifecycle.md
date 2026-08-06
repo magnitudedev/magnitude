@@ -1,6 +1,8 @@
 ---
 applies_to:
-  - packages/sdk/src/acn-jit/**
+  - packages/sdk/src/acn-jit/acn-recovering-client.ts
+  - packages/sdk/src/acn-jit/acn-ensurer.ts
+  - packages/sdk/src/acn-jit/remote-acn-ensurer.ts
   - packages/sdk/src/jit-rpc/**
   - packages/client-common/src/state/acn-lifecycle.ts
   - cli/src/features/app-shell/**
@@ -12,102 +14,80 @@ applies_to:
 
 # ACN client lifecycle
 
-Each client process has one `AcnJitRuntime`. It owns the client's effective ACN identity, selected
-exact instance, JIT ensurance, transport recovery, client lease, and bootstrap presentation. RPC consumers and UI
-surfaces observe that authority; they do not maintain independent identities, endpoint caches,
-launch decisions, or recovery loops.
+Each interactive client owns one `AcnJitRuntime`. The runtime owns the client's effective ACN
+identity, exact selected `ReadyAcn`, single-flight selection, recovering transport, `ClientId`,
+`ClientLease`, bootstrap presentation, and one-way close. It does not interpret process state,
+probe health, choose replacement, or manage processes; those belong to `AcnEnsurer`.
 
 ```text
-Checking -> Starting / Installing -> Ready(instance)
-               |                         |
-               +------> Failed <---------+
-                           |
-                           +-> retry through the same ensure operation
+Checking -> Starting / Installing -> Ready
+               |                     |
+               +------> Failed <-----+
+                          |
+                          +-> explicit retry through AcnEnsurer
 ```
 
-These are client presentation states, not another ACN service lifecycle. CLI performs local process
-management directly. Desktop and web cross their existing host boundary while preserving the same
-typed `AcnProcessManager` behavior.
+These are presentation states, not another ACN service lifecycle.
 
-## ACN association
-
-The runtime owns one association:
+## Association and selection
 
 ```text
 AcnAssociation
-  identity    ACN version this client now corresponds to
-  selected    optional exact Ready ACN instance
+  identity    monotonic minimum ACN identity
+  selected    optional exact ReadyAcn
+
+ActiveSelection
+  one shared deferred outcome
 ```
 
-ACN version is the ACN identity. The association initializes from the client's bundled ACN version,
-but that value is only an initializer.
+The association starts at the bundled SDK identity. Only successful ready selection adopts a newer
+identity. Durable `AcnProcessState.identityFloor` prevents an older client from launching an older
+ACN while a newer candidate is starting, so waiting until readiness cannot permit downgrade.
+Losing the selected endpoint never regresses identity.
 
-Observing a usable newer ACN in `Starting` or `Ready` advances `identity` immediately and
-permanently for that client process. Every later compatibility check, artifact lookup, ensure,
-recovery, and launch reads the association. Losing `selected` never regresses `identity`; an
-unavailable adopted artifact fails explicitly rather than falling back to an older ACN.
+Selection is a true single-flight operation. Bootstrap, retry, lease, and application demand share
+one scoped owner and one exact outcome while selection is active; a semaphore that merely queues
+new operations is insufficient. The owner calls `AcnEnsurer.ensure`, projects progress into client
+presentation, and atomically publishes only terminal `ReadyAcn` values.
 
-Identity and instance selection update through the same serialized reconciliation. The runtime
-exposes identity through one read-only contract; there is no identity constant, header, transport
-side channel, or second store consulted after initialization.
+Runtime construction explicitly starts initial selection. It also constructs one inert, scoped
+lease owner whose renewal fiber is gated by a deferred. The first ready selection opens that gate
+in the same admission critical section, so lease renewal is not an incidental bootstrap trigger.
+Its immediate renewal resolves the already-selected endpoint.
 
-## Ensurance and recovery
+## Recovery
 
-Initial startup, retry, and concrete transport recovery all enter the same serialized ensure path
-defined by [JIT ACN ensurance and upgrades](./jit-spawning.md).
+Every RPC carries both URL and exact ACN instance ID. ACN dispatch rejects another occurrence.
+Transport failure clears only the matching failed selection, joins or starts the same selection
+single-flight, then retries the exact request according to its transport contract. Domain failure
+and caller cancellation do not trigger recovery.
 
-On recovery the runtime rereads current ACN assignment:
+A successful selection is a point-in-time fact. Retirement may begin after selection; exact request
+addressing prevents misrouting and recovery handles that unavoidable race. Desktop and web preserve
+the same typed ensure stream and cancellation semantics as local execution.
 
-- the same exact `Ready` ACN means the request failed locally and does not authorize replacement;
-- a newer usable `Starting` or `Ready` ACN advances the association before further action;
-- an exact `Starting` ACN is observed within its progress-aware startup window;
-- absence enters the two-second publication grace and then delegates to `AcnProcessManager.launch`;
-  and
-- a stalled or stopping exact instance is passed to `launch` as the replacement target.
+Each concrete `RpcClient` owns its own single-consumer protocol receiver. The private lease client
+and application clients share semantic selection/recovery authority, never a protocol receiver.
 
-The runtime never kills an ACN directly. `AcnProcessManager` joins or advances the durable assignment
-change and owns exact cleanup, spawning, and takeover.
+## Close
 
-Domain failure and caller cancellation do not trigger ACN recovery. Operation duration is not a
-transport deadline. Queries may be replayed and observations reopened according to their domain
-contract; mutations require durable idempotency or unknown-outcome reconciliation. See
-[operation ownership](../../architecture/operation-ownership.md).
+Close is one-way and idempotent. It marks the runtime closed under selection admission, closes the
+selection scope and awaits interruption, stops heartbeat renewal, then freezes the selected exact
+endpoint. Bounded model observation and lease release use a non-recovering protocol bound only to
+that endpoint. Close and scope finalization never ensure, discover, replace, or launch an ACN.
 
-Every application RPC is bound to the selected exact ACN instance ID as well as its URL. Direct and
-proxied transports carry that ID to ACN dispatch, which rejects a request addressed to another
-occurrence. Desktop and web preserve the same typed process-manager errors as local execution;
-transport boundaries do not reduce coordination failures to strings.
-
-The runtime creates separate concrete `RpcClient.Protocol` receivers for its private lease client
-and for application clients. A protocol receiver is single-consumer and is never memoized across
-typed clients. These receivers close over the same association, ensure, and recovery policy; that
-shared semantic authority, not a shared transport object, is what makes the runtime singular.
-
-Runtime close is the sole owner of model observation plus graceful lease release. It returns a
-typed close report to the host and does not expose its private typed client or lease handle through
-client-common.
-
-Closing is a one-way runtime transition. It first rejects new ensurance and recovery, stops the
-heartbeat, and freezes the already-selected exact ACN instance. Model observation and lease
-release may address only that frozen instance through a non-recovering protocol. Close and scope
-finalization never discover, replace, or launch an ACN. Once closing begins, application RPCs and
-startup retries fail rather than reopening the runtime.
-
-Each host has one shutdown owner. It invokes runtime close before destroying the runtime scope;
-competing process-exit hooks may not close those resources independently. A browser page entering
-the back/forward cache is suspended rather than closed. Lease expiry remains authoritative if a
-suspended browser cannot run its heartbeat, and restoration resumes ordinary renewal. A desktop
-host keeps its lease-owning renderer scheduled while the application remains open.
+Selection publication and lease installation check `open` under the same admission boundary, so
+they cannot occur after close begins. Each host invokes runtime close before destroying its scope.
+Browser back/forward-cache suspension is not close; lease expiry remains authoritative if renewal
+cannot run while suspended.
 
 ## Guarantees
 
-- One runtime supplies every RPC consumer with the client's current ACN identity and exact instance.
-- Identity never regresses during a client process lifetime.
-- A client that adopts a newer ACN can never later launch its bundled older version.
-- Initial selection and recovery use one ensure policy.
-- The two-second publication grace never authorizes an unfenced spawn.
-- Connection loss, observation failure, and application latency do not independently authorize
-  replacement.
-- Runtime close never invokes ensurance or recovery and cannot create an ACN.
-- No RPC admitted after runtime closing begins can invoke ACN process management.
-- Intentional replacement is not reported as a crash; child logs remain diagnostics.
+- Only `ReadyAcn` enters endpoint selection.
+- Identity never regresses during one client lifetime.
+- Initial selection, retry, lease recovery, and application recovery share one selection outcome.
+- Client presence does not implicitly own bootstrap policy.
+- Transitional assignment and temporary health failure cannot independently become startup failure.
+- Exact addressing prevents a stale selection from reaching a successor.
+- Close cannot publish an endpoint, create a lease, or invoke ensurance after closing begins.
+- Intentional replacement is not reported as a crash; process output remains diagnostic.

@@ -1,9 +1,9 @@
 import { Duration, Effect, Option } from "effect"
-import { DaemonSpawnFailed } from "./errors"
+import { AcnEnsuranceFailed } from "./errors"
 import { scopePreHandoffCandidate, type ChildProcessSpawner } from "./child-process"
 
 const spawnFailure = (operation: string, cause: unknown) =>
-  new DaemonSpawnFailed({ reason: `${operation}: ${String(cause)}` })
+  new AcnEnsuranceFailed({ reason: `${operation}: ${String(cause)}` })
 
 /** Bun implementation of scoped pre-handoff ACN spawning. */
 export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
@@ -32,12 +32,12 @@ export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
         const waitForExit = (duration: Duration.DurationInput) =>
           exited.pipe(Effect.timeoutOption(duration))
         const stopAndReap = Effect.gen(function* () {
-          if (Option.isSome(yield* waitForExit("1 millis"))) return
+          if (Option.isSome(yield* waitForExit(Duration.millis(1)))) return
           yield* signal("SIGTERM")
-          if (Option.isSome(yield* waitForExit("2 seconds"))) return
+          if (Option.isSome(yield* waitForExit(Duration.seconds(2)))) return
           yield* signal("SIGKILL")
-          if (Option.isNone(yield* waitForExit("2 seconds"))) {
-            return yield* new DaemonSpawnFailed({
+          if (Option.isNone(yield* waitForExit(Duration.seconds(2)))) {
+            return yield* new AcnEnsuranceFailed({
               reason: `Pre-handoff ACN ${child.pid} did not exit after SIGKILL`,
             })
           }
