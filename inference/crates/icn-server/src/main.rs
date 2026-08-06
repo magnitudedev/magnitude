@@ -88,9 +88,9 @@ enum Command {
         /// Opaque owner-provided identity echoed by the startup and health protocols.
         #[arg(long, default_value = "standalone")]
         instance_id: String,
-        /// Owning process. ICN exits if this process disappears.
+        /// Exit when the private owning process closes stdin.
         #[arg(long)]
-        parent_pid: Option<u32>,
+        exit_on_stdin_eof: bool,
         /// Private owner capability. Prefer the environment-backed form used by managed launch.
         #[arg(long, env = "MAGNITUDE_ICN_AUTH_TOKEN", hide_env_values = true)]
         auth_token: Option<String>,
@@ -5109,6 +5109,15 @@ fn validate_registered_backend(installation: &installation::Installation) -> any
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(
+        &cli.command,
+        Command::Serve {
+            exit_on_stdin_eof: true,
+            ..
+        }
+    ) {
+        install_parent_stdin_guard();
+    }
     let _telemetry = telemetry::init(matches!(&cli.command, Command::Serve { .. }))?;
     // Native planner diagnostics are extremely verbose and can dominate metadata-only assessment.
     // ICN emits bounded, structured operation telemetry at the service boundary instead.
@@ -5117,7 +5126,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             bind,
             instance_id,
-            parent_pid,
+            exit_on_stdin_eof: _,
             auth_token,
             fake,
             model_store,
@@ -5126,7 +5135,6 @@ async fn main() -> anyhow::Result<()> {
             hf_caches,
             installation,
         } => {
-            await_parent_admission(parent_pid).await?;
             let installation = installation
                 .as_deref()
                 .map(installation::Installation::load)
@@ -5327,7 +5335,7 @@ async fn main() -> anyhow::Result<()> {
                     .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
             );
             let serve_result = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal(parent_pid))
+                .with_graceful_shutdown(interrupt_signal())
                 .await;
             serve_result?;
             tracing::info!("ICN server stopped");
@@ -5359,43 +5367,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(parent_pid: Option<u32>) {
-    tokio::select! {
-        _ = interrupt_signal() => {},
-        _ = parent_watchdog(parent_pid), if parent_pid.is_some() => {},
-        _ = parent_stdin_eof(), if parent_pid.is_some() => {},
-    }
-}
-
-async fn await_parent_admission(parent_pid: Option<u32>) -> anyhow::Result<()> {
-    if parent_pid.is_none() {
-        return Ok(());
-    }
-    tokio::task::spawn_blocking(|| {
-        use std::io::Read as _;
-
-        let mut admission = [0_u8; 1];
-        std::io::stdin()
-            .lock()
-            .read_exact(&mut admission)
-            .context("ICN parent exited before bootstrap admission")?;
-        if admission[0] != b'1' {
-            anyhow::bail!("ICN received an invalid bootstrap admission");
-        }
-        Ok(())
-    })
-    .await
-    .context("ICN bootstrap admission task failed")?
-}
-
-async fn parent_stdin_eof() {
-    // Tokio implements stdin reads on its blocking pool. A pending read then
-    // prevents Runtime::drop from completing during an ordinary SIGTERM while
-    // the parent still owns the pipe, creating a parent/child shutdown cycle.
-    // A detached OS thread has the desired semantics: EOF wakes the async
-    // watchdog after abrupt parent death, while orderly process exit does not
-    // wait for the read to finish.
-    let (eof, observed) = tokio::sync::oneshot::channel();
+fn install_parent_stdin_guard() {
+    // This thread starts before telemetry or native initialization. An ordinary
+    // ACN shutdown signals ICN first; abrupt owner loss closes the private pipe
+    // and must terminate ICN even if synchronous native initialization is busy.
     std::thread::spawn(move || {
         use std::io::Read as _;
 
@@ -5403,13 +5378,11 @@ async fn parent_stdin_eof() {
         let mut buffer = [0_u8; 1];
         loop {
             match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => std::process::exit(0),
                 Ok(_) => {}
             }
         }
-        let _ = eof.send(());
     });
-    let _ = observed.await;
 }
 
 #[cfg(unix)]
@@ -5425,32 +5398,6 @@ async fn interrupt_signal() {
 #[cfg(not(unix))]
 async fn interrupt_signal() {
     let _ = tokio::signal::ctrl_c().await;
-}
-
-async fn parent_watchdog(parent_pid: Option<u32>) {
-    let Some(parent_pid) = parent_pid else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    loop {
-        interval.tick().await;
-        if !process_exists(parent_pid) {
-            return;
-        }
-    }
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    // Signal zero performs an existence/permission check without delivering a signal.
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
-    true
 }
 
 fn spawn_blocking_traced<F, R>(operation: F) -> tokio::task::JoinHandle<R>
@@ -6410,6 +6357,20 @@ mod tests {
         };
         assert_eq!(model_store, Some(PathBuf::from("/tmp/models")));
         assert_eq!(hf_caches, vec![PathBuf::from("/tmp/hf")]);
+    }
+
+    #[test]
+    fn managed_parent_pipe_flag_parses() {
+        let managed =
+            Cli::try_parse_from(["magnitude-icn", "serve", "--fake", "--exit-on-stdin-eof"])
+                .expect("managed parent-pipe flag should parse");
+        let Command::Serve {
+            exit_on_stdin_eof, ..
+        } = managed.command
+        else {
+            panic!("expected serve command")
+        };
+        assert!(exit_on_stdin_eof);
     }
 
     #[test]

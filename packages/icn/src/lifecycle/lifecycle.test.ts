@@ -42,7 +42,6 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
       huggingFaceCaches: ["/read-only/hf"],
     }),
     host,
-    parentPid: 42,
     startupTimeout: Duration.seconds(30),
     gracefulShutdownTimeout: Duration.seconds(5),
     forceShutdownTimeout: Duration.seconds(2),
@@ -54,7 +53,6 @@ describe("ICN managed launch", () => {
     const args = renderIcnArguments(
       config(),
       "instance-1",
-      42,
       "/opt/magnitude/installation.json",
     );
     expect(args).toEqual([
@@ -63,8 +61,7 @@ describe("ICN managed launch", () => {
       "127.0.0.1:0",
       "--instance-id",
       "instance-1",
-      "--parent-pid",
-      "42",
+      "--exit-on-stdin-eof",
       "--installation",
       "/opt/magnitude/installation.json",
       "--model-store",
@@ -85,7 +82,6 @@ describe("ICN managed launch", () => {
       renderIcnArguments(
         config("::1"),
         "instance-2",
-        42,
         "/opt/magnitude/installation.json",
       ).slice(0, 3)
     ).toEqual(["serve", "--bind", "[::1]:0"]);

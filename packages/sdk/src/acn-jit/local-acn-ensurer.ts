@@ -25,7 +25,6 @@ import {
   type AcnChangeResult,
   type AssignedAcn,
   type ExactAcnCandidate,
-  type ExactIcnProcess,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/process-state"
 import type { ArtifactInstallationEvent } from "@magnitudedev/release"
@@ -259,30 +258,16 @@ const makeLocalTerminationKernel = (
     return yield* provideLocal(waitForExactExit(exactProcess, Duration.seconds(2)))
   })
 
-  const stopIcn = (state: AcnProcessState, icn: ExactIcnProcess) =>
-    Effect.gen(function* () {
-      if (!(yield* provideLocal(processIsExact(icn)))) return true
-      if (!(yield* signalWhileOwned(state.revision, icn, "SIGTERM"))) return false
-      if (yield* provideLocal(waitForExactExit(icn, Duration.seconds(1)))) return true
-      if (!(yield* signalWhileOwned(state.revision, icn, "SIGKILL"))) return false
-      return yield* provideLocal(waitForExactExit(icn, Duration.seconds(1)))
-    })
-
   const retireAssigned = (state: AcnProcessState, current: AssignedAcn) =>
-    Effect.gen(function* () {
-      const acnExited = yield* stopExact(
-        state,
-        current,
-        client.execute(
-          HttpClientRequest.post(`${current.url}/shutdown`).pipe(
-            HttpClientRequest.setHeader("x-magnitude-acn-id", current.id),
-          ),
+    stopExact(
+      state,
+      current,
+      client.execute(
+        HttpClientRequest.post(`${current.url}/shutdown`).pipe(
+          HttpClientRequest.setHeader("x-magnitude-acn-id", current.id),
         ),
-      )
-      if (!acnExited) return false
-      if (Option.isSome(current.ownedIcn) && !(yield* stopIcn(state, current.ownedIcn.value))) return false
-      return true
-    })
+      ),
+    )
 
   const stopCurrent = Effect.gen(function* () {
     let observedRevision = Option.none<AcnProcessRevision>()

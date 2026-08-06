@@ -95,7 +95,6 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
     Schema.greaterThanDuration(Duration.zero)
   ),
   outputLimitBytes: PositiveInt,
-  parentPid: PositiveInt,
 }) {}
 
 export interface ResolvedIcnBinary {
@@ -433,29 +432,6 @@ export class IcnProcess extends Context.Tag("@magnitudedev/icn/IcnProcess")<
   IcnProcessService
 >() {}
 
-export interface IcnOwnedProcess {
-  readonly instanceId: string
-  readonly pid: number
-}
-
-export interface IcnProcessOwnershipHandle {
-  readonly release: Effect.Effect<void, IcnLifecycleError>
-}
-
-/**
- * The enclosing ACN's durable ownership of its exact ICN child. Acquisition
- * happens immediately after spawn; release runs only after bounded shutdown.
- */
-export interface IcnProcessOwnershipService {
-  readonly acquire: (
-    process: IcnOwnedProcess,
-  ) => Effect.Effect<IcnProcessOwnershipHandle, IcnLifecycleError>
-}
-
-export class IcnProcessOwnership extends Context.Tag(
-  "@magnitudedev/icn/IcnProcessOwnership"
-)<IcnProcessOwnership, IcnProcessOwnershipService>() {}
-
 const appendBounded = (ref: Ref.Ref<string>, chunk: string, limit: number) =>
   Ref.update(ref, (current) => {
     const bytes = new TextEncoder().encode(`${current}${chunk}`);
@@ -497,7 +473,6 @@ const opaqueInstanceId = Effect.gen(function* () {
 export const renderIcnArguments = (
   config: IcnLifecycleConfig,
   instanceId: string,
-  parentPid: number,
   path: string,
 ): ReadonlyArray<string> => [
   "serve",
@@ -505,8 +480,7 @@ export const renderIcnArguments = (
   `${config.host === "::1" ? "[::1]" : config.host}:0`,
   "--instance-id",
   instanceId,
-  "--parent-pid",
-  String(parentPid),
+  "--exit-on-stdin-eof",
   "--installation",
   path,
   ...Option.match(config.storage.modelStore, {
@@ -539,7 +513,6 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     yield* reporter.report({ _tag: "Starting" });
     const instanceId = yield* opaqueInstanceId;
     const authorization = yield* opaqueInstanceId;
-    const ownership = yield* IcnProcessOwnership;
     const lifecycle = yield* SubscriptionRef.make<IcnProcessLifecycleState>(
       new IcnProcessStarting({}),
     );
@@ -547,14 +520,12 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     const shutdownCompletion = yield* Deferred.make<void, IcnLifecycleError>();
     const { process, terminateProcess } = yield* Effect.uninterruptibleMask(() =>
       Effect.gen(function* () {
-        const bootstrapAdmission = yield* Deferred.make<Uint8Array>();
         const process = yield* Command.start(
           Command.make(
             binary.path,
             ...renderIcnArguments(
               config,
               instanceId,
-              config.parentPid,
               binary.installation,
             )
           ).pipe(
@@ -563,11 +534,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
               MAGNITUDE_ICN_AUTH_TOKEN: authorization,
               HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
             }),
-            Command.stdin(
-              Stream.fromEffect(Deferred.await(bootstrapAdmission)).pipe(
-                Stream.concat(Stream.never),
-              ),
-            ),
+            Command.stdin(Stream.never),
           )
         ).pipe(
           Effect.mapError((cause) =>
@@ -639,21 +606,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
             }),
           );
         });
-        const ownershipHandle = yield* ownership.acquire({
-          instanceId,
-          pid: Number(process.pid),
-        }).pipe(
-          Effect.catchAll((error) => stopAndProve.pipe(
-            Effect.zipRight(Effect.fail(error)),
-          )),
-        );
-        yield* Deferred.succeed(
-          bootstrapAdmission,
-          new TextEncoder().encode("1"),
-        );
-        const terminateProcess = yield* Effect.cached(
-          stopAndProve.pipe(Effect.zipRight(ownershipHandle.release)),
-        );
+        const terminateProcess = yield* Effect.cached(stopAndProve);
         yield* Effect.addFinalizer(() =>
           lifecycleLock.withPermits(1)(
             SubscriptionRef.update(lifecycle, (current) =>
@@ -1002,7 +955,6 @@ export const makeIcnProcess = (
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | Path.Path
-  | IcnProcessOwnership
   | IcnPreparationReporterService
 > =>
   Layer.scoped(

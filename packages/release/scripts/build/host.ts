@@ -58,8 +58,7 @@ const smokeIcnServer = async (
     "127.0.0.1:0",
     "--instance-id",
     instance,
-    "--parent-pid",
-    String(process.pid),
+    "--exit-on-stdin-eof",
     "--installation",
     installation,
     "--model-store",
@@ -73,6 +72,7 @@ const smokeIcnServer = async (
     stdout: "pipe",
     stderr: "inherit",
   })
+  let reaped = false
   try {
     const reader = child.stdout.getReader()
     const decoder = new TextDecoder()
@@ -125,16 +125,30 @@ const smokeIcnServer = async (
     if (!hardware.ok) {
       throw new Error(`ICN authenticated hardware returned HTTP ${hardware.status}`)
     }
-  } finally {
-    child.kill("SIGTERM")
     child.stdin.end()
-    const exited = await Promise.race([
-      child.exited.then(() => true),
-      Bun.sleep(5_000).then(() => false),
+    const exitCode = await Promise.race<number | undefined>([
+      child.exited,
+      Bun.sleep(5_000).then(() => undefined),
     ])
-    if (!exited) {
-      child.kill("SIGKILL")
-      await child.exited
+    if (exitCode === undefined) {
+      throw new Error("ICN did not exit after its managed parent pipe closed")
+    }
+    reaped = true
+    if (exitCode !== 0) {
+      throw new Error(`ICN parent-pipe shutdown exited with code ${exitCode}`)
+    }
+  } finally {
+    if (!reaped) {
+      child.kill("SIGTERM")
+      child.stdin.end()
+      const exited = await Promise.race([
+        child.exited.then(() => true),
+        Bun.sleep(5_000).then(() => false),
+      ])
+      if (!exited) {
+        child.kill("SIGKILL")
+        await child.exited
+      }
     }
   }
 }

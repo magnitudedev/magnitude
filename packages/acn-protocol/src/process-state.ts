@@ -37,23 +37,12 @@ export const ExactAcnCandidateSchema = Schema.Struct({
 })
 export type ExactAcnCandidate = typeof ExactAcnCandidateSchema.Type
 
-export const ExactIcnProcessSchema = Schema.Struct({
-  id: NonEmptyString,
-  pid: PositiveSafeInteger,
-  processStartIdentity: ProcessStartIdentitySchema,
-})
-export type ExactIcnProcess = typeof ExactIcnProcessSchema.Type
-
 export const AssignedAcnSchema = Schema.Struct({
   id: AcnInstanceIdSchema,
   identity: AcnIdentitySchema,
   url: NonEmptyString,
   pid: PositiveSafeInteger,
   processStartIdentity: ProcessStartIdentitySchema,
-  ownedIcn: Schema.optionalWith(ExactIcnProcessSchema, {
-    as: "Option",
-    exact: true,
-  }),
 })
 export type AssignedAcn = typeof AssignedAcnSchema.Type
 
@@ -180,14 +169,6 @@ export const AcnProcessCommandSchema = Schema.Union(
     manager: ExactProcessSchema,
     reason: NonEmptyString,
   }),
-  Schema.TaggedStruct("RecordIcn", {
-    acn: AssignedAcnSchema,
-    icn: ExactIcnProcessSchema,
-  }),
-  Schema.TaggedStruct("ClearIcn", {
-    acn: AssignedAcnSchema,
-    icn: ExactIcnProcessSchema,
-  }),
 )
 export type AcnProcessCommand = typeof AcnProcessCommandSchema.Type
 
@@ -281,18 +262,11 @@ const sameProcess = (left: ExactProcess, right: ExactProcess): boolean =>
 const sameCandidate = (left: ExactAcnCandidate, right: ExactAcnCandidate): boolean =>
   left.identity === right.identity && sameProcess(left, right)
 
-const sameIcn = (left: ExactIcnProcess, right: ExactIcnProcess): boolean =>
-  left.id === right.id && sameProcess(left, right)
-
 const sameAssigned = (left: AssignedAcn, right: AssignedAcn): boolean =>
   left.id === right.id &&
   left.identity === right.identity &&
   left.url === right.url &&
-  sameProcess(left, right) &&
-  Option.match(left.ownedIcn, {
-    onNone: () => Option.isNone(right.ownedIcn),
-    onSome: (owned) => Option.isSome(right.ownedIcn) && sameIcn(owned, right.ownedIcn.value),
-  })
+  sameProcess(left, right)
 
 function requireTransition(
   condition: boolean,
@@ -640,7 +614,6 @@ export const reduceAcnProcessState = (
             url: command.url,
             pid: command.candidate.pid,
             processStartIdentity: command.candidate.processStartIdentity,
-            ownedIcn: Option.none(),
           },
           result: Option.some({ _tag: "Admitted", changeRevision: state.mode.changeRevision }),
         },
@@ -794,42 +767,6 @@ export const reduceAcnProcessState = (
             changeRevision: state.mode.changeRevision,
             reason: command.reason,
           }),
-        },
-      }
-    }
-    case "RecordIcn": {
-      requireTransition(
-        state.mode._tag === "Assigned" && sameAssigned(state.mode.current, command.acn),
-        command,
-        "exact ACN is not assigned",
-      )
-      requireTransition(Option.isNone(state.mode.current.ownedIcn), command, "assigned ACN already owns an ICN")
-      return {
-        ...state,
-        revision,
-        mode: {
-          ...state.mode,
-          current: { ...state.mode.current, ownedIcn: Option.some(command.icn) },
-        },
-      }
-    }
-    case "ClearIcn": {
-      requireTransition(
-        state.mode._tag === "Assigned" && sameAssigned(state.mode.current, command.acn),
-        command,
-        "exact ACN is not assigned",
-      )
-      requireTransition(
-        Option.isSome(state.mode.current.ownedIcn) && sameIcn(state.mode.current.ownedIcn.value, command.icn),
-        command,
-        "exact ICN is not owned by the assigned ACN",
-      )
-      return {
-        ...state,
-        revision,
-        mode: {
-          ...state.mode,
-          current: { ...state.mode.current, ownedIcn: Option.none() },
         },
       }
     }

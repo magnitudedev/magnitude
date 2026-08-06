@@ -252,25 +252,22 @@ Startup is one scoped acquisition:
 
 1. Validate launch configuration, resolve the executable, and verify its identity.
 2. Create a fresh opaque instance ID and child-only authorization capability.
-3. Spawn `magnitude-icn serve` in bootstrap mode with a private writable stdin pipe. Before reading
-   one admission byte, ICN may install parent-death monitoring but may not initialize the native
-   runtime, hardware, CUDA, model workers, storage, or its HTTP service.
+3. Spawn `magnitude-icn serve` as a private child with a writable stdin pipe retained by the ACN
+   process scope. Before telemetry, native initialization, storage, workers, or HTTP startup, ICN
+   installs an EOF guard on that pipe so abrupt ACN loss terminates it immediately.
 4. Before spawn acquisition becomes interruptible, construct the complete single-flight
    TERM/KILL/reap shutdown and install it as the one scope finalizer.
-5. Atomically add the exact child PID, process-start identity, and ICN instance ID beneath the same
-   assigned ACN occurrence in `AcnProcessState`. Failure or assignment conflict runs complete
-   shutdown without sending admission.
-6. Write the admission byte. ICN may now initialize model-free and bind loopback port zero; Bun must
-   not probe a free port and release it before spawn.
-7. Consume stdout and stderr through one supervised pipeline. Retain a bounded diagnostic tail and
+5. ICN initializes model-free and binds loopback port zero; Bun must not probe a free port and
+   release it before spawn.
+6. Consume stdout and stderr through one supervised pipeline. Retain a bounded diagnostic tail and
    forward line-oriented output to structured logs without secrets.
-8. Read ICN's machine-readable startup record containing the actual origin, instance ID, process
+7. Read ICN's machine-readable startup record containing the actual origin, instance ID, process
    identity, API identity, and native build identity. Arbitrary human log text is not a readiness
    protocol.
-9. Probe readiness with bounded backoff while racing the child exit and overall startup deadline.
+8. Probe readiness with bounded backoff while racing the child exit and overall startup deadline.
    Validate the instance ID and compatibility fields so an unrelated listener can never satisfy
    readiness.
-10. Publish `IcnProcess`, construct `IcnClient` from it, and begin continuous exit supervision.
+9. Publish `IcnProcess`, construct `IcnClient` from it, and begin continuous exit supervision.
 
 ICN's HTTP listener is created before it emits the startup record. Its readiness response is
 successful only after storage, inventory recovery, native runtime registration, normalized
@@ -318,20 +315,20 @@ process-scope finalizer. ACN ownership remains held until that operation finishe
    reap the child.
 5. Finalize process-output observers and publish the terminal lifecycle result.
 
-Owned-child state is cleared only after exact exit is proved. If ACN is force-killed or ICN cannot
-be reaped, the assigned or retiring ACN occurrence retains the child identity for
-`AcnEnsurer` to finish exact cleanup before another candidate is admitted.
+The scoped child handle is the complete ownership authority. ICN identity is diagnostic evidence,
+not durable process state, and the external ACN manager neither adopts nor directly cleans up ICN.
 
 The native server must handle both interrupt and termination signals with the same idempotent
 graceful-shutdown path. Repeated shutdown requests do not send overlapping signal sequences.
 Finalization is uninterruptible around signal delivery and child reaping, while both waits remain
 bounded. Cleanup errors are logged and classified; they never leave an unobserved child handle.
 
-Signals enter ACN's authoritative lifecycle; they do not call `process.exit` before cleanup. ICN
-first reads one admission byte from its inherited stdin pipe. EOF before that byte exits without
-expensive initialization. After admission, ICN continues watching parent-PID liveness and stdin EOF
-for abrupt parent death. The EOF wait runs on a detached OS thread, not Tokio's blocking pool.
-These are crash backstops, not child adoption or sharing.
+Signals enter ACN's authoritative lifecycle; they do not call `process.exit` before cleanup. For
+managed launch, ICN watches its private stdin pipe from process entry. Orderly ACN shutdown signals
+and reaps ICN before closing scope; abrupt ACN loss closes the pipe and ICN exits immediately,
+including during synchronous native initialization. The EOF wait runs on a detached OS thread, not
+Tokio's blocking pool. This is a private child-lifetime channel, not admission, discovery, adoption,
+or sharing.
 
 ## Model instance lifecycle
 
@@ -455,10 +452,10 @@ streams. These are composed resource gates, not shared activity timestamps.
 The lifecycle conforms when:
 
 - one ready ACN has exactly one owned ICN child and no reusable/discoverable ICN daemon;
-- ICN cannot initialize native runtime, CUDA, hardware, workers, storage, or HTTP before its exact
-  ownership is committed beneath the assigned ACN;
-- replacement racing ICN acquisition either preserves the recorded child or stops it before
-  bootstrap admission;
+- ACN process admission precedes ICN scope acquisition, and no ICN identity is added to durable ACN
+  process state;
+- managed ICN observes its private parent pipe before expensive initialization and exits if the ACN
+  disappears;
 - constructing `IcnClient` without `IcnProcess` is impossible in the Effect dependency graph;
 - ACN cannot become ready when its ICN binary is absent, incompatible, or unready;
 - launch is model-free and changing the active model never replaces the ICN process;
@@ -494,8 +491,7 @@ The lifecycle conforms when:
 - normal ACN shutdown cancels higher-level work, gives ICN only a short graceful termination window,
   escalates on deadline, and reaps it;
 - termination and interrupt signals both activate native graceful shutdown;
-- abrupt parent death before admission cannot leave an expensive ICN runtime, and parent death
-  after admission cannot leave an ICN indefinitely orphaned;
+- abrupt ACN death at any point after managed ICN spawn cannot leave an ICN indefinitely orphaned;
 - lifecycle and transport failures remain typed and retain bounded, redacted diagnostics; and
 - generated-artifact checks, package tests, native signal tests, and release smoke tests prove the
   shipped ACN and ICN identities are compatible; candidate validation additionally requires local
