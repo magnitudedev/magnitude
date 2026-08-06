@@ -58,7 +58,7 @@ export function truncateToDisplayWidth(
 ): string {
   const safeWidth = Math.max(0, Math.floor(maxWidth))
   if (safeWidth === 0) return ''
-  if (text.length <= safeWidth) return text
+  if (getDisplayWidth(text) <= safeWidth) return text
   const ellipsisWidth = getDisplayWidth(ellipsis)
   if (safeWidth <= ellipsisWidth) {
     let clippedEllipsis = ''

@@ -1,6 +1,9 @@
 import { describe, expect, test } from "vitest"
 import type { KeyEvent } from "@opentui/core"
-import { resolveRootNavigationDirection } from "./container"
+import {
+  resolveRootNavigationDirection,
+  scrollCatalogCandidateIntoView,
+} from "./container"
 
 const key = (
   name: string,
@@ -34,5 +37,21 @@ describe("model menu root navigation", () => {
   test("leaves unrelated keys to the active view", () => {
     expect(resolveRootNavigationDirection(key("escape"))).toBeNull()
     expect(resolveRootNavigationDirection(key("up"))).toBeNull()
+  })
+})
+
+describe("catalog keyboard navigation", () => {
+  test("reveals the candidate selected by the keyboard cursor", () => {
+    const revealed: string[] = []
+
+    scrollCatalogCandidateIntoView({
+      scrollChildIntoView: (id) => { revealed.push(id) },
+    }, "qwen-config")
+
+    expect(revealed).toEqual(["catalog-candidate:qwen-config"])
+  })
+
+  test("does nothing before the catalog scrollbox is mounted", () => {
+    expect(() => scrollCatalogCandidateIntoView(null, "qwen-config")).not.toThrow()
   })
 })

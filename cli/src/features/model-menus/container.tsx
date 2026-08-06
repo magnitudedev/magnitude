@@ -2,10 +2,11 @@ import {
   memo,
   useCallback,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react"
-import { TextAttributes, type KeyEvent } from "@opentui/core"
+import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
@@ -16,9 +17,11 @@ import {
   modelMemoryStatusLabel,
   modelSlotInstanceId,
   modelSlotResidentAllocation,
+  getDisplayWidth,
   requiredMemoryBytes,
   providerModelMemoryConditions,
   selectedSlotModel,
+  truncateToDisplayWidth,
   usePlatform,
   useLocalInferenceHardware,
   useLocalModelActions,
@@ -43,6 +46,7 @@ import { Button } from "../../components/button"
 import { HardwareMemoryDomain } from "../../components/hardware-memory-domain"
 import { useSpinnerFrame } from "../../hooks/use-spinner-frame"
 import { useBoundedCursor } from "../../hooks/use-bounded-cursor"
+import { useLocalWidth } from "../../hooks/use-local-width"
 import { useTheme } from "../../hooks/use-theme"
 import {
   authSourceAtom,
@@ -57,6 +61,13 @@ import {
   performanceRangeSpeedLabel,
 } from "../local-inference/view-model"
 import { deriveSettingsAuthInfo } from "../overlays/auth-display"
+import {
+  catalogDetailHints,
+  catalogListHints,
+  deriveCatalogLayout,
+  formatCatalogModelLabel,
+  type CatalogLayout,
+} from "./catalog-layout"
 
 const ROOTS = ["models", "catalog", "hardware", "cloud"] as const
 const ROOT_LABELS: Record<ModelMenuRoot, string> = {
@@ -102,6 +113,16 @@ export const resolveRootNavigationDirection = (
   if (key.name === "right") return 1
   if (key.name === "tab") return key.shift ? -1 : 1
   return null
+}
+
+const catalogCandidateRowId = (configurationId: string): string =>
+  `catalog-candidate:${configurationId}`
+
+export const scrollCatalogCandidateIntoView = (
+  scrollbox: Pick<ScrollBoxRenderable, "scrollChildIntoView"> | null,
+  configurationId: string,
+): void => {
+  scrollbox?.scrollChildIntoView(catalogCandidateRowId(configurationId))
 }
 
 const formatContextWindow = (tokens: number): string =>
@@ -267,6 +288,8 @@ const MenuHeader = memo(function MenuHeader({
   onSectionClick,
   summary,
   hints,
+  compact = false,
+  width,
 }: {
   readonly title: string
   readonly subtitle?: string
@@ -274,6 +297,8 @@ const MenuHeader = memo(function MenuHeader({
   readonly onSectionClick?: () => void
   readonly summary?: string
   readonly hints?: string
+  readonly compact?: boolean
+  readonly width?: number
 }) {
   const theme = useTheme()
   const [sectionHovered, setSectionHovered] = useState(false)
@@ -285,6 +310,10 @@ const MenuHeader = memo(function MenuHeader({
       {title.toUpperCase()}
     </text>
   )
+  const compactSelectionWidth = Math.max(1, (width ?? 80) - 4)
+  const displayedHints = width === undefined || hints === undefined
+    ? hints
+    : truncateToDisplayWidth(hints, compactSelectionWidth)
   return (
     <box style={{ flexShrink: 0, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
       <box style={{ flexDirection: "row" }}>
@@ -297,12 +326,17 @@ const MenuHeader = memo(function MenuHeader({
             {sectionTitle}
           </Button>
         ) : sectionTitle}
-        {subtitle && <text style={{ fg: theme.muted }}> · {subtitle}</text>}
-        {selection && <text style={{ fg: theme.foreground }}> → {selection}</text>}
+        {!compact && subtitle && <text style={{ fg: theme.muted }}> · {subtitle}</text>}
+        {!compact && selection && <text style={{ fg: theme.foreground }}> → {selection}</text>}
         <box style={{ flexGrow: 1 }} />
         {summary && <text style={{ fg: theme.muted }}>{summary}</text>}
       </box>
-      {hints && <text style={{ fg: theme.muted }}>{hints}</text>}
+      {compact && selection && (
+        <text style={{ fg: theme.foreground }} wrapMode="none">
+          {truncateToDisplayWidth(selection, compactSelectionWidth)}
+        </text>
+      )}
+      {displayedHints && <text style={{ fg: theme.muted }} wrapMode="none">{displayedHints}</text>}
     </box>
   )
 })
@@ -800,11 +834,154 @@ const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
   return "Installed"
 }
 
+const CatalogCandidateRow = memo(function CatalogCandidateRow({
+  candidate,
+  recommendation,
+  focused,
+  pendingDelete,
+  index,
+  layout,
+  rowId,
+  onClick,
+  onMouseOver,
+}: {
+  readonly candidate: LocalModelCatalogCandidate
+  readonly recommendation: Option.Option<LocalModelRecommendation>
+  readonly focused: boolean
+  readonly pendingDelete: boolean
+  readonly index: number
+  readonly layout: CatalogLayout
+  readonly rowId: string
+  readonly onClick: () => void
+  readonly onMouseOver: () => void
+}) {
+  const theme = useTheme()
+  const status = pendingDelete ? "Delete [y/n]" : catalogStatus(candidate)
+  const statusColor = pendingDelete
+    ? theme.warning
+    : candidate.download._tag === "Failed"
+      ? theme.error
+      : candidate.download._tag === "Downloading" || candidate.download._tag === "Downloaded"
+        ? theme.primary
+        : theme.muted
+  const recommendationText = recommendationLabel(recommendation)
+  const memoryText = formatBytes(requiredMemoryBytes(candidate.memory))
+  const speedText = performanceRangeSpeedLabel(candidate, "t/s")
+  const backgroundColor = focused
+    ? theme.surfaceHover
+    : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
+
+  if (layout.stackedRows) {
+    const cursorWidth = 2
+    const primaryStatusWidth = layout.mode === "minimal"
+      ? 0
+      : Math.min(getDisplayWidth(status), Math.max(1, layout.contentWidth - cursorWidth - 1))
+    const secondaryStatusWidth = layout.mode === "minimal"
+      ? Math.min(getDisplayWidth(`${status} · `), Math.max(1, layout.contentWidth - cursorWidth - 1))
+      : 0
+    const modelWidth = Math.max(1, layout.contentWidth - cursorWidth - primaryStatusWidth)
+    const modelLabel = formatCatalogModelLabel(
+      candidate.displayName,
+      candidate.quantizationName,
+      modelWidth,
+    )
+    const metadata = [recommendationText, memoryText, ...(layout.showSpeed ? [speedText] : [])]
+      .filter((value) => value !== "")
+      .join(" · ")
+    const metadataWidth = Math.max(1, layout.contentWidth - cursorWidth - secondaryStatusWidth)
+
+    return (
+      <Button
+        id={rowId}
+        onClick={onClick}
+        onMouseOver={onMouseOver}
+        style={{
+          flexDirection: "column",
+          width: "100%",
+          height: 2,
+          minHeight: 2,
+          flexShrink: 0,
+          backgroundColor,
+        }}
+      >
+        <box style={{ flexDirection: "row", width: "100%", height: 1, flexShrink: 0 }}>
+          <text style={{ fg: focused ? theme.primary : theme.foreground, width: cursorWidth }} wrapMode="none">
+            {focused ? "›" : " "}
+          </text>
+          <text style={{ fg: focused ? theme.primary : theme.foreground, width: modelWidth }} wrapMode="none">
+            {modelLabel}
+          </text>
+          {layout.mode !== "minimal" && (
+            <text style={{ fg: statusColor, width: primaryStatusWidth }} wrapMode="none">
+              {truncateToDisplayWidth(status, primaryStatusWidth)}
+            </text>
+          )}
+        </box>
+        <box style={{ flexDirection: "row", width: "100%", height: 1, flexShrink: 0 }}>
+          <text style={{ width: cursorWidth }}> </text>
+          {layout.mode === "minimal" && (
+            <text style={{ fg: statusColor, width: secondaryStatusWidth }} wrapMode="none">
+              {truncateToDisplayWidth(`${status} · `, secondaryStatusWidth)}
+            </text>
+          )}
+          <text style={{ fg: theme.muted, width: metadataWidth }} wrapMode="none">
+            {truncateToDisplayWidth(metadata, metadataWidth)}
+          </text>
+        </box>
+      </Button>
+    )
+  }
+
+  return (
+    <Button
+      id={rowId}
+      onClick={onClick}
+      onMouseOver={onMouseOver}
+      style={{ flexDirection: "row", width: "100%", backgroundColor }}
+    >
+      <text style={{ fg: focused ? theme.primary : theme.foreground, width: 2 }} wrapMode="none">
+        {focused ? "›" : " "}
+      </text>
+      <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
+        {formatCatalogModelLabel(candidate.displayName, candidate.quantizationName, layout.modelWidth)}
+      </text>
+      <text style={{ fg: theme.primary, width: layout.columns.recommendation }} wrapMode="none">
+        {truncateToDisplayWidth(recommendationText, layout.columns.recommendation)}
+      </text>
+      <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">
+        {truncateToDisplayWidth(memoryText, layout.columns.memory)}
+      </text>
+      {layout.showIntelligence && (
+        <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">
+          {truncateToDisplayWidth(intelligenceLabel(candidate), layout.columns.intelligence)}
+        </text>
+      )}
+      {layout.showQuality && (
+        <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">
+          {truncateToDisplayWidth(qualityLabel(candidate), layout.columns.quality)}
+        </text>
+      )}
+      {layout.showSpeed && (
+        <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">
+          {truncateToDisplayWidth(speedText, layout.columns.speed)}
+        </text>
+      )}
+      <text style={{ fg: statusColor, width: layout.columns.status }} wrapMode="none">
+        {truncateToDisplayWidth(status, layout.columns.status)}
+      </text>
+    </Button>
+  )
+})
+
 const CatalogMenu = memo(function CatalogMenu({
   initialCatalogDetailId,
   setRootSwitchingEnabled,
 }: CatalogMenuProps) {
   const theme = useTheme()
+  const menuSize = useLocalWidth()
+  const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
+  const menuWidth = menuSize.width ?? 80
+  const layout = deriveCatalogLayout(menuWidth)
   const localModels = useLocalModels()
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
@@ -856,6 +1033,13 @@ const CatalogMenu = memo(function CatalogMenu({
   }, [detail])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
+
+  const moveCursorTo = useCallback((index: number) => {
+    const candidate = candidates[index]
+    if (!candidate) return
+    setCursorId(candidate.configurationId)
+    scrollCatalogCandidateIntoView(catalogScrollRef.current, candidate.configurationId)
+  }, [candidates])
 
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
@@ -946,10 +1130,10 @@ const CatalogMenu = memo(function CatalogMenu({
     }
     if ((key.name === "up" || key.name === "k") && candidates.length > 0) {
       key.preventDefault()
-      setCursorId(candidates[Math.max(0, cursorIndex - 1)]!.configurationId)
+      moveCursorTo(Math.max(0, cursorIndex - 1))
     } else if ((key.name === "down" || key.name === "j") && candidates.length > 0) {
       key.preventDefault()
-      setCursorId(candidates[Math.min(candidates.length - 1, cursorIndex + 1)]!.configurationId)
+      moveCursorTo(Math.min(candidates.length - 1, cursorIndex + 1))
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
       detailActionCursor.reset()
@@ -970,7 +1154,7 @@ const CatalogMenu = memo(function CatalogMenu({
         key.preventDefault()
       }
     }
-  }, [candidates, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, focusedDetailAction, modelActions, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
+  }, [candidates, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, focusedDetailAction, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
 
   if (detail) {
     const recommendation = recommendationFor(detail)
@@ -983,7 +1167,11 @@ const CatalogMenu = memo(function CatalogMenu({
       select: "Select this model",
     } as const
     return (
-      <>
+      <box
+        ref={menuSize.ref}
+        onSizeChange={menuSize.onSizeChange}
+        style={{ flexGrow: 1, minHeight: 0, flexDirection: "column" }}
+      >
         <MenuHeader
           title="Catalog"
           selection={detail.displayName}
@@ -991,7 +1179,9 @@ const CatalogMenu = memo(function CatalogMenu({
             setDetailId(null)
             setRootSwitchingEnabled(true)
           }}
-          hints="↑↓ navigate · Enter choose · Esc back"
+          hints={catalogDetailHints(layout.compactHeader)}
+          compact={layout.compactHeader}
+          width={menuWidth}
         />
         <scrollbox scrollX={false} style={{
           flexGrow: 1,
@@ -1001,21 +1191,32 @@ const CatalogMenu = memo(function CatalogMenu({
           viewportOptions: { backgroundColor: theme.menuBg },
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{detail.displayName}</text>
-          <text style={{ fg: theme.muted }}>{detail.description}</text>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.displayName}</text>
+          <text style={{ fg: theme.muted }} wrapMode="word">{detail.description}</text>
           {Option.isSome(recommendation) && (
             <>
               <text style={{ fg: theme.primary }}>{recommendationLabel(recommendation)}</text>
-              <text style={{ fg: theme.muted }}>{recommendation.value.explanation}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">{recommendation.value.explanation}</text>
             </>
           )}
           <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>Calibrated for this machine</text>
-          <text style={{ fg: theme.muted }}>
-            {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · {recommendationEvidenceLabel(detail)}
-          </text>
-          <text style={{ fg: theme.muted }}>
-            {performanceRangeSpeedLabel(detail, "tokens/sec")}
-          </text>
+          {layout.compactHeader ? (
+            <>
+              <text style={{ fg: theme.muted }} wrapMode="word">Memory: {formatBytes(requiredMemoryBytes(detail.memory))}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">Quantization: {detail.quantization}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">Evidence: {recommendationEvidenceLabel(detail)}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}</text>
+            </>
+          ) : (
+            <>
+              <text style={{ fg: theme.muted }} wrapMode="word">
+                {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · {recommendationEvidenceLabel(detail)}
+              </text>
+              <text style={{ fg: theme.muted }} wrapMode="word">
+                {performanceRangeSpeedLabel(detail, "tokens/sec")}
+              </text>
+            </>
+          )}
           <text style={{ fg: failed ? theme.error : downloading || downloaded ? theme.primary : theme.muted }}>
             {catalogStatus(detail)}
           </text>
@@ -1035,22 +1236,32 @@ const CatalogMenu = memo(function CatalogMenu({
               />
             ))}
           </box>
-          <text style={{ fg: theme.muted, marginTop: 1 }}>License: {detail.license}</text>
-          {qualityEvidence(detail).map((evidence) => <text key={evidence} style={{ fg: theme.muted }}>{evidence}</text>)}
+          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {detail.license}</text>
+          {qualityEvidence(detail).map((evidence) => <text key={evidence} style={{ fg: theme.muted }} wrapMode="word">{evidence}</text>)}
         </scrollbox>
-      </>
+      </box>
     )
   }
 
   return (
-    <>
+    <box
+      ref={menuSize.ref}
+      onSizeChange={menuSize.onSizeChange}
+      style={{ flexGrow: 1, minHeight: 0, flexDirection: "column" }}
+    >
       <MenuHeader
         title="Catalog"
-        subtitle="Find and download local models"
-        summary={`${candidates.length} compatible`}
-        hints="↑↓ navigate · Enter details · D download · S select · Backspace cancel/remove · Esc close"
+        subtitle={layout.stackedRows
+          ? undefined
+          : layout.mode === "full" ? "Find and download local models" : "Local models"}
+        summary={layout.mode === "minimal"
+          ? String(candidates.length)
+          : layout.compactHeader ? `${candidates.length} models` : `${candidates.length} compatible`}
+        hints={catalogListHints(layout.mode)}
+        compact={layout.compactHeader}
+        width={menuWidth}
       />
-      <scrollbox scrollX={false} style={{
+      <scrollbox ref={catalogScrollRef} scrollX={false} style={{
         flexGrow: 1,
         minHeight: 0,
         rootOptions: { backgroundColor: theme.menuBg },
@@ -1058,16 +1269,24 @@ const CatalogMenu = memo(function CatalogMenu({
         viewportOptions: { backgroundColor: theme.menuBg },
         contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
       }}>
-        <box style={{ flexDirection: "row", width: "100%" }}>
-          <text style={{ fg: theme.muted, width: 2 }}> </text>
-          <text style={{ fg: theme.muted, flexGrow: 1 }}>MODEL</text>
-          <text style={{ fg: theme.muted, width: 16 }}>RECOMMENDATION</text>
-          <text style={{ fg: theme.muted, width: 12 }}>MEMORY</text>
-          <text style={{ fg: theme.muted, width: 14 }}>INTELLIGENCE</text>
-          <text style={{ fg: theme.muted, width: 14 }}>QUALITY</text>
-          <text style={{ fg: theme.muted, width: 12 }}>SPEED</text>
-          <text style={{ fg: theme.muted, width: 18 }}>STATUS</text>
-        </box>
+        {!layout.stackedRows && (
+          <box style={{ flexDirection: "row", width: "100%" }}>
+            <text style={{ fg: theme.muted, width: 2 }} wrapMode="none"> </text>
+            <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
+            <text style={{ fg: theme.muted, width: layout.columns.recommendation }} wrapMode="none">RECOMMENDATION</text>
+            <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>
+            {layout.showIntelligence && (
+              <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">INTELLIGENCE</text>
+            )}
+            {layout.showQuality && (
+              <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">QUALITY</text>
+            )}
+            {layout.showSpeed && (
+              <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">SPEED</text>
+            )}
+            <text style={{ fg: theme.muted, width: layout.columns.status }} wrapMode="none">STATUS</text>
+          </box>
+        )}
         {runningProgress && (
           <text style={{ fg: theme.primary, marginLeft: 2 }}>
             {spinner} {runningProgress.label}{runningProgress.metadata}
@@ -1081,8 +1300,15 @@ const CatalogMenu = memo(function CatalogMenu({
           const focused = index === cursorIndex
           const pendingDelete = pendingDeleteId === candidate.configurationId
           return (
-            <Button
+            <CatalogCandidateRow
               key={candidate.configurationId}
+              candidate={candidate}
+              recommendation={recommendationFor(candidate)}
+              focused={focused}
+              pendingDelete={pendingDelete}
+              index={index}
+              layout={layout}
+              rowId={catalogCandidateRowId(candidate.configurationId)}
               onClick={() => {
                 setPendingDeleteId(null)
                 detailActionCursor.reset()
@@ -1093,42 +1319,11 @@ const CatalogMenu = memo(function CatalogMenu({
                 setCursorId(candidate.configurationId)
                 if (pendingDeleteId !== candidate.configurationId) setPendingDeleteId(null)
               }}
-              style={{
-                flexDirection: "row",
-                width: "100%",
-                backgroundColor: focused
-                  ? theme.surfaceHover
-                  : index % 2 === 0 ? theme.menuBg : theme.menuAltBg,
-              }}
-            >
-              <text style={{ fg: focused ? theme.primary : theme.foreground, width: 2 }}>{focused ? "›" : " "}</text>
-              <text style={{ fg: focused ? theme.primary : theme.foreground, flexGrow: 1 }}>
-                {candidate.displayName}<span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{` (${candidate.quantizationName})`}</span>
-              </text>
-              <text style={{ fg: theme.primary, width: 16 }}>{recommendationLabel(recommendationFor(candidate))}</text>
-              <text style={{ fg: theme.muted, width: 12 }}>{formatBytes(requiredMemoryBytes(candidate.memory))}</text>
-              <text style={{ fg: theme.muted, width: 14 }}>{intelligenceLabel(candidate)}</text>
-              <text style={{ fg: theme.muted, width: 14 }}>{qualityLabel(candidate)}</text>
-              <text style={{ fg: theme.muted, width: 12 }}>{performanceRangeSpeedLabel(candidate, "t/s")}</text>
-              <text
-                style={{
-                  fg: pendingDelete
-                    ? theme.warning
-                    : candidate.download._tag === "Failed"
-                      ? theme.error
-                      : candidate.download._tag === "Downloading" || candidate.download._tag === "Downloaded"
-                        ? theme.primary
-                        : theme.muted,
-                  width: 18,
-                }}
-              >
-                {pendingDelete ? "Delete [y/n]" : catalogStatus(candidate)}
-              </text>
-            </Button>
+            />
           )
         })}
       </scrollbox>
-    </>
+    </box>
   )
 })
 
