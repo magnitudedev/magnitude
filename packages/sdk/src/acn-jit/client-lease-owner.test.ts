@@ -33,6 +33,7 @@ describe("AcnClientLeaseOwner", () => {
                 }),
             } as never;
             const owner = yield* makeAcnClientLeaseOwner(clientId, client);
+            yield* owner.start;
 
             yield* Effect.yieldNow();
             expect(renewals).toEqual([clientId]);

@@ -7,7 +7,7 @@
  */
 import { contextBridge, ipcRenderer, clipboard as electronClipboard, shell } from "electron"
 import { RpcClient } from "@effect/rpc"
-import { Context, Effect, Fiber, Layer, ManagedRuntime, Stream } from "effect"
+import { Cause, Context, Effect, Fiber, Layer, ManagedRuntime, Option, Stream } from "effect"
 import {
   DesktopRpcError,
   DesktopRpcs,
@@ -51,19 +51,35 @@ function makeDesktopRpcRuntime() {
         throw new Error(errorMessage(cause))
       }
     },
-    async runStream<A>(
+    runStream<A>(
       operation: (client: DesktopRpcClient) => Stream.Stream<A, unknown, never>,
       onValue: (value: A) => void,
-    ): Promise<void> {
-      const client = await clientPromise
-      try {
-        await runtime.runPromise(
-          operation(client).pipe(
-            Stream.runForEach((value) => Effect.sync(() => onValue(value))),
-          ),
-        )
-      } catch (cause) {
-        throw new Error(errorMessage(cause))
+      onError: (error: unknown) => void,
+      onEnd: () => void,
+    ): () => void {
+      let active = true
+      let fiber: Fiber.RuntimeFiber<void, unknown> | null = null
+      void clientPromise.then((client) => {
+        if (!active) return
+        fiber = runtime.runFork(operation(client).pipe(
+          Stream.runForEach((value) => Effect.sync(() => onValue(value))),
+          Effect.matchCauseEffect({
+            onFailure: (cause) => Cause.isInterruptedOnly(cause)
+              ? Effect.void
+              : Effect.sync(() => onError(Option.getOrElse(
+                Cause.failureOption(cause),
+                () => new Error(errorMessage(cause)),
+              ))),
+            onSuccess: () => Effect.sync(onEnd),
+          }),
+        ))
+      }).catch((cause) => {
+        if (active) onError(new Error(errorMessage(cause)))
+      })
+      return () => {
+        active = false
+        if (fiber !== null) runtime.runFork(Fiber.interrupt(fiber))
+        fiber = null
       }
     },
     onMenuAction(cb: (action: MenuAction) => void): () => void {
@@ -104,18 +120,14 @@ function makeDesktopApi(): DesktopApi {
     get platform(): DesktopPlatform {
       return process.platform as DesktopPlatform
     },
-    acnProcessManager: {
-      async current() {
-        return desktopRpc.run((client) => client.AcnCurrent({}))
-      },
-      async launch(request, onEvent) {
-        await desktopRpc.runStream(
-          (client) => client.AcnLaunch(request),
+    acnEnsurer: {
+      ensure(request, onEvent, onError, onEnd) {
+        return desktopRpc.runStream(
+          (client) => client.AcnEnsure(request),
           onEvent,
+          onError,
+          onEnd,
         )
-      },
-      async terminate(instance) {
-        await desktopRpc.run((client) => client.AcnTerminate({ instance }))
       },
     },
     onMenuAction(cb: (action: MenuAction) => void): () => void {

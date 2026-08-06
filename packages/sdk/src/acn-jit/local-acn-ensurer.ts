@@ -4,10 +4,11 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as Path from "@effect/platform/Path"
 import {
+  AcnReady,
   type AcnIdentity,
+  type AcnInstanceId,
   AcnHealthResponseSchema,
   type AcnHealthResponse,
-  type AcnInstance,
   type AcnStartupProgress,
 } from "@magnitudedev/acn-protocol"
 import { canUseAcnIdentity, compareAcnIdentities } from "@magnitudedev/acn-protocol/acn-identity"
@@ -16,52 +17,65 @@ import {
   applyAcnProcessCommand,
   currentProcessStartIdentity,
   readAcnProcessState,
+  readAcnProcessStateRevision,
   readProcessStartIdentity,
   type AcnProcessCommand,
   type AcnProcessRevision,
   type AcnProcessState,
+  type AcnChangeResult,
   type AssignedAcn,
   type ExactAcnCandidate,
   type ExactIcnProcess,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/process-state"
 import type { ArtifactInstallationEvent } from "@magnitudedev/release"
-import { Array as Arr, Clock, Effect, Option, Schema, Scope, Stream } from "effect"
+import { Array as Arr, Clock, Context, Duration, Effect, Option, Schema, Scope, Stream } from "effect"
 import { defaultDataDir, resolveBinaryCommand } from "../binary"
 import type { BinaryAcquisitionEvent } from "../binary"
 import {
-  AcnProcessManager,
-  type AcnLaunchEvent,
-  type AcnLaunchRequest,
-} from "./acn-process-manager"
+  AcnEnsurer,
+  type AcnEnsureEvent,
+  type AcnEnsureRequest,
+  type ReadyAcn,
+} from "./acn-ensurer"
 import {
   AcnDaemonAdministrator,
   type AcnDaemonAdministrator as AcnDaemonAdministratorService,
 } from "./acn-daemon-administrator"
 import { ChildProcessSpawner } from "./child-process"
 import {
-  DaemonDiscoveryFailed,
-  DaemonError,
-  DaemonSpawnFailed,
+  AcnAdministrationFailed,
+  AcnEnsuranceError,
+  AcnEnsuranceFailed,
+  type AcnEnsuranceError as AcnEnsuranceErrorType,
 } from "./errors"
 import {
   acnLifecycleObservationFromHealthState,
   acnStartupProgressKey,
 } from "./lifecycle"
 
-export interface LocalAcnProcessManagerOptions {
+export interface AcnLaunchOverride {
+  readonly identity: AcnIdentity
+  readonly command: Arr.NonEmptyReadonlyArray<string>
+}
+
+export interface LocalAcnEnsurerOptions {
   readonly binaryPath?: string
   readonly dataDir?: string
   readonly debug?: boolean
-  readonly probeTimeoutMs?: number
+  readonly launchOverride?: AcnLaunchOverride
 }
 
-export type LocalAcnProcessManager = AcnProcessManager
+export interface LocalAcnDaemonAdministratorOptions {
+  readonly dataDir?: string
+}
 
-const normalizeDaemonError = (error: unknown): DaemonError =>
-  Schema.is(DaemonError)(error)
+export type LocalAcnEnsurer = AcnEnsurer
+
+const normalizeEnsuranceError = (error: unknown): AcnEnsuranceErrorType =>
+  Schema.is(AcnEnsuranceError)(error)
     ? error
-    : new DaemonSpawnFailed({ reason: String(error) })
+    : new AcnEnsuranceFailed({ reason: String(error) })
 
 const sameProcess = (left: ExactProcess, right: ExactProcess): boolean =>
   left.pid === right.pid && left.processStartIdentity === right.processStartIdentity
@@ -71,6 +85,13 @@ const sameAcnOccurrence = (
   right: Pick<AssignedAcn, "id" | "pid" | "processStartIdentity">,
 ): boolean => left.id === right.id && sameProcess(left, right)
 
+const ASSIGNMENT_STALL = Duration.seconds(30)
+const CHANGE_STALL = Duration.seconds(30)
+const HEALTH_PROBE_TIMEOUT = Duration.seconds(2)
+const PROCESS_EXIT_POLL_INTERVAL = Duration.millis(50)
+const RECONCILIATION_POLL_INTERVAL = Duration.millis(50)
+const STATE_OBSERVATION_INTERVAL = Duration.millis(100)
+
 const stateRevision = (state: Option.Option<AcnProcessState>): Option.Option<AcnProcessRevision> =>
   Option.map(state, (value) => value.revision)
 
@@ -79,12 +100,12 @@ const processIsExact = (process: ExactProcess) =>
     Effect.map(Option.exists((identity) => identity === process.processStartIdentity)),
   )
 
-const waitForExactExit = (process: ExactProcess, durationMs: number) =>
+const waitForExactExit = (process: ExactProcess, duration: Duration.DurationInput) =>
   Effect.gen(function* () {
-    const deadline = (yield* Clock.currentTimeMillis) + durationMs
+    const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(Duration.decode(duration))
     while ((yield* Clock.currentTimeMillis) < deadline) {
       if (!(yield* processIsExact(process))) return true
-      yield* Effect.sleep("50 millis")
+      yield* Effect.sleep(PROCESS_EXIT_POLL_INTERVAL)
     }
     return !(yield* processIsExact(process))
   })
@@ -94,7 +115,7 @@ const signalExact = (process: ExactProcess, signal: NodeJS.Signals) =>
     if (!(yield* processIsExact(process))) return
     yield* Effect.try({
       try: () => globalThis.process.kill(process.pid, signal),
-      catch: (error) => new DaemonSpawnFailed({
+      catch: (error) => new AcnEnsuranceFailed({
         reason: `Failed to send ${signal} to exact process ${process.pid}: ${String(error)}`,
       }),
     }).pipe(Effect.catchIf(
@@ -105,13 +126,13 @@ const signalExact = (process: ExactProcess, signal: NodeJS.Signals) =>
 
 const probeHealth = (
   current: AssignedAcn,
-  timeoutMs: number,
+  timeout: Duration.DurationInput,
   client: HttpClient.HttpClient,
 ) => client.execute(HttpClientRequest.get(`${current.url}/health`)).pipe(
-  Effect.timeout(`${timeoutMs} millis`),
+  Effect.timeout(timeout),
   Effect.flatMap((response) => response.json),
   Effect.flatMap(Schema.decodeUnknown(AcnHealthResponseSchema)),
-  Effect.mapError((error) => new DaemonDiscoveryFailed({
+  Effect.mapError((error) => new AcnEnsuranceFailed({
     reason: `Failed to observe ACN ${current.id}: ${String(error)}`,
   })),
   Effect.filterOrFail(
@@ -119,30 +140,20 @@ const probeHealth = (
       health.id === current.id &&
       health.version === current.identity &&
       health.pid === current.pid,
-    () => new DaemonDiscoveryFailed({
+    () => new AcnEnsuranceFailed({
       reason: `ACN ${current.id} health does not match assigned process state`,
     }),
   ),
 )
 
-const instanceFrom = (current: AssignedAcn, health: AcnHealthResponse): AcnInstance => ({
+const readyFrom = (current: AssignedAcn): ReadyAcn => ({
   id: current.id,
   identity: current.identity,
   url: current.url,
   pid: current.pid,
   processStartIdentity: current.processStartIdentity,
-  lifecycle: health.state,
+  lifecycle: new AcnReady({}),
 })
-
-const assignedIn = (state: AcnProcessState): Option.Option<AssignedAcn> => {
-  if (state.mode._tag === "Assigned") return Option.some(state.mode.current)
-  if (
-    state.mode._tag === "Changing" &&
-    state.mode.owner._tag === "Manager" &&
-    state.mode.owner.phase._tag === "RetiringAssigned"
-  ) return Option.some(state.mode.owner.phase.current)
-  return Option.none()
-}
 
 const artifactProgress = (
   event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
@@ -153,16 +164,29 @@ const artifactProgress = (
   attempt: Option.some(event.progress.attempt),
 })
 
-const emitHealth = (health: AcnHealthResponse, emit: (event: AcnLaunchEvent) => void) =>
+const emitHealth = (health: AcnHealthResponse, emit: (event: AcnEnsureEvent) => void) =>
   Option.match(acnLifecycleObservationFromHealthState(health.state), {
     onNone: () => Effect.void,
     onSome: (observation) => Effect.sync(() => emit({ _tag: "Observation", observation })),
   })
 
-interface PreparedCommand {
+export interface PreparedCommand {
   readonly identity: AcnIdentity
-  readonly command: readonly string[]
+  readonly command: Arr.NonEmptyReadonlyArray<string>
 }
+
+/** Host-local source of launch material for exact ACN identities. */
+export interface AcnLaunchSource {
+  readonly supports: (identity: AcnIdentity) => boolean
+  readonly prepare: (
+    identity: AcnIdentity,
+    emit: (event: AcnEnsureEvent) => void,
+  ) => Effect.Effect<PreparedCommand, AcnEnsuranceErrorType>
+}
+
+export const AcnLaunchSource = Context.GenericTag<AcnLaunchSource>(
+  "@magnitudedev/sdk/AcnLaunchSource",
+)
 
 type ChangeObservation =
   | { readonly _tag: "Completed" }
@@ -170,11 +194,14 @@ type ChangeObservation =
   | { readonly _tag: "Stalled"; readonly state: AcnProcessState }
 
 type ReadinessObservation =
-  | { readonly _tag: "Ready"; readonly instance: AcnInstance }
+  | { readonly _tag: "Ready"; readonly instance: ReadyAcn }
   | { readonly _tag: "Replace"; readonly current: AssignedAcn }
+  | { readonly _tag: "StartupFailed"; readonly reason: string }
+  | { readonly _tag: "Follow"; readonly changeRevision: AcnProcessRevision }
+  | { readonly _tag: "Reclassify" }
 
 const makeLocalTerminationKernel = (
-  options: LocalAcnProcessManagerOptions,
+  options: LocalAcnDaemonAdministratorOptions,
 ) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const client = yield* HttpClient.HttpClient
@@ -224,21 +251,21 @@ const makeLocalTerminationKernel = (
     requestShutdown: Effect.Effect<unknown, unknown> = Effect.void,
   ) => Effect.gen(function* () {
     if (!(yield* stillOwnsRevision(state.revision))) return false
-    yield* requestShutdown.pipe(Effect.timeout("750 millis"), Effect.ignore)
-    if (yield* provideLocal(waitForExactExit(exactProcess, 2_000))) return true
+    yield* requestShutdown.pipe(Effect.timeout(Duration.millis(750)), Effect.ignore)
+    if (yield* provideLocal(waitForExactExit(exactProcess, Duration.seconds(2)))) return true
     if (!(yield* signalWhileOwned(state.revision, exactProcess, "SIGINT"))) return false
-    if (yield* provideLocal(waitForExactExit(exactProcess, 2_000))) return true
+    if (yield* provideLocal(waitForExactExit(exactProcess, Duration.seconds(2)))) return true
     if (!(yield* signalWhileOwned(state.revision, exactProcess, "SIGKILL"))) return false
-    return yield* provideLocal(waitForExactExit(exactProcess, 2_000))
+    return yield* provideLocal(waitForExactExit(exactProcess, Duration.seconds(2)))
   })
 
   const stopIcn = (state: AcnProcessState, icn: ExactIcnProcess) =>
     Effect.gen(function* () {
       if (!(yield* provideLocal(processIsExact(icn)))) return true
       if (!(yield* signalWhileOwned(state.revision, icn, "SIGTERM"))) return false
-      if (yield* provideLocal(waitForExactExit(icn, 1_000))) return true
+      if (yield* provideLocal(waitForExactExit(icn, Duration.seconds(1)))) return true
       if (!(yield* signalWhileOwned(state.revision, icn, "SIGKILL"))) return false
-      return yield* provideLocal(waitForExactExit(icn, 1_000))
+      return yield* provideLocal(waitForExactExit(icn, Duration.seconds(1)))
     })
 
   const retireAssigned = (state: AcnProcessState, current: AssignedAcn) =>
@@ -304,9 +331,9 @@ const makeLocalTerminationKernel = (
           )
           continue
         }
-        if (phase._tag === "Spawning") {
-          return yield* new DaemonSpawnFailed({
-            reason: "Terminate change cannot retain an untracked spawning phase",
+        if (phase._tag === "Spawning" || phase._tag === "Preparing") {
+          return yield* new AcnEnsuranceFailed({
+            reason: `Terminate change cannot retain ${phase._tag}`,
           })
         }
 
@@ -314,7 +341,7 @@ const makeLocalTerminationKernel = (
           ? yield* retireAssigned(state, phase.current)
           : yield* stopExact(state, phase.candidate)
         if (!retired) {
-          return yield* new DaemonSpawnFailed({
+          return yield* new AcnEnsuranceFailed({
             reason: phase._tag === "RetiringAssigned"
               ? `Could not prove ACN ${phase.current.id} and its ICN absent`
               : `Could not prove candidate ACN ${phase.candidate.pid} absent`,
@@ -337,15 +364,19 @@ const makeLocalTerminationKernel = (
         ? changing.owner.process
         : changing.owner.candidate
       const ownerAlive = yield* provideLocal(processIsExact(owner))
-      if (!ownerAlive || (yield* Clock.currentTimeMillis) - unchangedSince >= 30_000) {
+      if (!ownerAlive || (yield* Clock.currentTimeMillis) - unchangedSince >= Duration.toMillis(CHANGE_STALL)) {
         yield* apply(stateOption, { _tag: "TakeOver", manager }).pipe(
           Effect.catchTag("AcnProcessStateConflict", () => Effect.void),
         )
         continue
       }
-      yield* Effect.sleep("100 millis")
+      yield* Effect.sleep(STATE_OBSERVATION_INTERVAL)
     }
-  }).pipe(Effect.mapError(normalizeDaemonError))
+  }).pipe(Effect.mapError((error) => new AcnAdministrationFailed({
+    reason: typeof error === "object" && error !== null && "reason" in error
+      ? String(error.reason)
+      : String(error),
+  })))
 
   return {
     fs,
@@ -363,7 +394,7 @@ const makeLocalTerminationKernel = (
 })
 
 export const makeLocalAcnDaemonAdministrator = (
-  options: LocalAcnProcessManagerOptions = {},
+  options: LocalAcnDaemonAdministratorOptions = {},
 ): Effect.Effect<
   AcnDaemonAdministratorService,
   never,
@@ -372,11 +403,25 @@ export const makeLocalAcnDaemonAdministrator = (
   Effect.map((kernel) => AcnDaemonAdministrator.of({ stopCurrent: kernel.stopCurrent })),
 )
 
+/** Resolves one exact proxy target without health probing or lifecycle projection. */
+export const resolveAssignedAcnProxyTarget = (
+  dataDirectory: string,
+  expectedId: AcnInstanceId,
+): Effect.Effect<Option.Option<string>, AcnEnsuranceFailed, FileSystem.FileSystem> =>
+  readAcnProcessState(dataDirectory).pipe(
+    Effect.map((state) => Option.flatMap(state, (value) =>
+      value.mode._tag === "Assigned" && value.mode.current.id === expectedId
+        ? Option.some(value.mode.current.url)
+        : Option.none(),
+    )),
+    Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) })),
+  )
+
 /** Local implementation of the exact-current ACN process contract. */
-export const makeLocalAcnProcessManager = (
-  options: LocalAcnProcessManagerOptions = {},
+export const makeLocalAcnEnsurer = (
+  options: LocalAcnEnsurerOptions = {},
 ): Effect.Effect<
-  LocalAcnProcessManager,
+  LocalAcnEnsurer,
   never,
   | FileSystem.FileSystem
   | HttpClient.HttpClient
@@ -400,38 +445,16 @@ export const makeLocalAcnProcessManager = (
   } = termination
   const path = yield* Path.Path
   const spawner = yield* ChildProcessSpawner
-  const probeTimeoutMs = options.probeTimeoutMs ?? 2_000
   const operationScope = yield* Effect.scope
   const reconcilePermit = yield* Effect.makeSemaphore(1)
 
-  const observeAssigned = (current: AssignedAcn) => Effect.gen(function* () {
-    if (!(yield* provideLocal(processIsExact(current)))) return Option.none<AcnInstance>()
-    const health = yield* probeHealth(current, probeTimeoutMs, client)
-    return Option.some(instanceFrom(current, health))
-  })
-
-  const observeCurrent = Effect.gen(function* () {
-    const state = yield* readState
-    if (Option.isNone(state)) return Option.none<AcnInstance>()
-    return yield* Option.match(assignedIn(state.value), {
-      onNone: () => Effect.succeed(Option.none<AcnInstance>()),
-      onSome: observeAssigned,
-    })
-  })
-
-
   const resolveCommand = (
-    request: AcnLaunchRequest,
     identity: AcnIdentity,
-    emit: (event: AcnLaunchEvent) => void,
-  ): Effect.Effect<PreparedCommand, DaemonError> =>
-    Option.match(request.command, {
-      onSome: (command) => identity === request.identity
-        ? Effect.succeed({ identity, command: Array.from(command) })
-        : Effect.fail(new DaemonSpawnFailed({
-            reason: `Configured ACN command is for ${request.identity}, not adopted identity ${identity}`,
-          })),
-      onNone: () => {
+    emit: (event: AcnEnsureEvent) => void,
+  ): Effect.Effect<PreparedCommand, AcnEnsuranceErrorType> =>
+    options.launchOverride !== undefined && options.launchOverride.identity === identity
+      ? Effect.succeed({ identity, command: options.launchOverride.command })
+      : (() => {
         let plan: Option.Option<{
           readonly daemonBytes: number
           readonly inferenceEngineBytes: number
@@ -464,8 +487,17 @@ export const makeLocalAcnProcessManager = (
           Effect.provideService(Path.Path, path),
           Effect.map((resolved) => ({ identity, command: resolved.command })),
         )
-      },
-    }).pipe(Effect.mapError(normalizeDaemonError))
+      })().pipe(Effect.mapError(normalizeEnsuranceError))
+
+  const defaultLaunchSource: AcnLaunchSource = {
+    supports: (identity) =>
+      options.launchOverride?.identity === identity || !identity.includes("+dev."),
+    prepare: resolveCommand,
+  }
+  const launchSource = Option.getOrElse(
+    yield* Effect.serviceOption(AcnLaunchSource),
+    () => defaultLaunchSource,
+  )
 
   const spawnCandidate = (
     state: AcnProcessState,
@@ -498,7 +530,7 @@ export const makeLocalAcnProcessManager = (
     const pid = child.pid
     const startIdentity = yield* provideLocal(readProcessStartIdentity(pid)).pipe(
       Effect.flatMap(Option.match({
-        onNone: () => Effect.fail(new DaemonSpawnFailed({ reason: `Spawned ACN ${pid} exited before publication` })),
+        onNone: () => Effect.fail(new AcnEnsuranceFailed({ reason: `Spawned ACN ${pid} exited before publication` })),
         onSome: Effect.succeed,
       })),
     )
@@ -528,17 +560,44 @@ export const makeLocalAcnProcessManager = (
   const reconcileOwned = (
     state: AcnProcessState,
     prepared: Option.Option<PreparedCommand>,
-  ) =>
-    reconcilePermit.withPermits(1)(Effect.gen(function* () {
+    emit: (event: AcnEnsureEvent) => void,
+  ) => Effect.gen(function* () {
       const fresh = yield* readState
-      if (Option.isNone(fresh) || fresh.value.revision !== state.revision) return
+      if (Option.isNone(fresh) || fresh.value.revision !== state.revision) return prepared
       const current = fresh.value
       if (
         current.mode._tag !== "Changing" ||
         current.mode.owner._tag !== "Manager" ||
         !sameProcess(current.mode.owner.process, manager)
-      ) return
+      ) return prepared
       switch (current.mode.owner.phase._tag) {
+        case "Preparing": {
+          if (current.mode.purpose._tag !== "Ensure") return Option.none()
+          const target = current.mode.purpose.target
+          if (!launchSource.supports(target)) {
+            yield* apply(Option.some(current), {
+              _tag: "PreparationFailed",
+              manager,
+              reason: `This host has no launch source for ACN ${target}`,
+            }).pipe(Effect.catchTag("AcnProcessStateConflict", () => Effect.void))
+            return Option.none()
+          }
+          const resolved = yield* launchSource.prepare(target, emit).pipe(Effect.either)
+          if (resolved._tag === "Left") {
+            const reason = "reason" in resolved.left ? String(resolved.left.reason) : String(resolved.left)
+            yield* apply(Option.some(current), {
+              _tag: "PreparationFailed",
+              manager,
+              reason,
+            }).pipe(Effect.catchTag("AcnProcessStateConflict", () => Effect.void))
+            return Option.none()
+          }
+          const advanced = yield* apply(Option.some(current), {
+            _tag: "PreparationSucceeded",
+            manager,
+          }).pipe(Effect.either)
+          return advanced._tag === "Right" ? Option.some(resolved.right) : Option.none()
+        }
         case "RetiringAssigned": {
           const retired = yield* retireAssigned(current, current.mode.owner.phase.current)
           yield* apply(Option.some(current), retired
@@ -548,7 +607,7 @@ export const makeLocalAcnProcessManager = (
                 manager,
                 reason: `Could not prove ACN ${current.mode.owner.phase.current.id} and its ICN absent`,
               }).pipe(Effect.catchTag("AcnProcessStateConflict", () => Effect.void))
-          return
+          return prepared
         }
         case "RetiringCandidate": {
           const candidate = current.mode.owner.phase.candidate
@@ -562,85 +621,99 @@ export const makeLocalAcnProcessManager = (
               }).pipe(
             Effect.catchTag("AcnProcessStateConflict", () => Effect.void),
           )
-          return
+          return Option.none()
         }
         case "BlockedCandidateCleanup":
-          return
+          return prepared
         case "Spawning": {
-          if (Option.isNone(prepared)) return
+          if (Option.isNone(prepared)) {
+            yield* apply(Option.some(current), {
+              _tag: "FailSpawning",
+              manager,
+              reason: "Launch preparation was lost before spawning",
+            }).pipe(Effect.catchTag("AcnProcessStateConflict", () => Effect.void))
+            return Option.none()
+          }
           yield* spawnCandidate(current, prepared.value)
+          return prepared
         }
       }
-    }))
+    })
 
   const reconcileChange = (
-    initial: AcnProcessState,
-    prepared: Option.Option<PreparedCommand>,
-  ) => Effect.gen(function* () {
-    let observedRevision = initial.revision
-    let unchangedSince = yield* Clock.currentTimeMillis
+    changeRevision: AcnProcessRevision,
+    emit: (event: AcnEnsureEvent) => void,
+  ) => reconcilePermit.withPermits(1)(Effect.gen(function* () {
+    let prepared = Option.none<PreparedCommand>()
     while (true) {
       const stateOption = yield* readState
       if (Option.isNone(stateOption)) return
       const state = stateOption.value
-      if (state.mode._tag !== "Changing") return
-      if (state.revision !== observedRevision) {
-        observedRevision = state.revision
-        unchangedSince = yield* Clock.currentTimeMillis
-      }
+      if (state.mode._tag !== "Changing" || state.mode.changeRevision !== changeRevision) return
       if (state.mode.owner._tag === "Manager" && sameProcess(state.mode.owner.process, manager)) {
         if (state.mode.owner.phase._tag === "BlockedCandidateCleanup") return
-        if (
-          state.mode.owner.phase._tag === "Spawning" &&
-          (
-            Option.isNone(prepared) ||
-            state.mode.purpose._tag !== "Ensure" ||
-            prepared.value.identity !== state.mode.purpose.target
-          )
-        ) return
-        yield* reconcileOwned(state, prepared)
-        yield* Effect.sleep("50 millis")
+        prepared = yield* reconcileOwned(state, prepared, emit)
+        yield* Effect.sleep(RECONCILIATION_POLL_INTERVAL)
         continue
       }
-      const owner = state.mode.owner._tag === "Manager"
-        ? state.mode.owner.process
-        : state.mode.owner.candidate
-      const alive = yield* provideLocal(processIsExact(owner))
-      if (!alive && state.mode.owner._tag === "Candidate") {
-        yield* apply(Option.some(state), {
-          _tag: "CandidateFailed",
-          candidate: state.mode.owner.candidate,
-          reason: `Candidate ACN ${state.mode.owner.candidate.pid} exited before admission`,
-        }).pipe(Effect.catchTag("AcnProcessStateConflict", () => Effect.void))
-        return
-      }
-      const canContinue = state.mode.purpose._tag === "Terminate" || (
-        Option.isSome(prepared) && prepared.value.identity === state.mode.purpose.target
-      )
-      if (canContinue && (!alive || (yield* Clock.currentTimeMillis) - unchangedSince >= 30_000)) {
-        yield* apply(Option.some(state), { _tag: "TakeOver", manager }).pipe(
-          Effect.catchTag("AcnProcessStateConflict", () => Effect.void),
-        )
-        yield* Effect.sleep("50 millis")
-        continue
-      }
-      yield* Effect.sleep("100 millis")
+      // CandidateSpawned transfers reconciliation to the candidate itself.
+      // Any other owner transfer fences this supervisor; foreground ensure
+      // observers own dead/stalled-owner recovery.
+      return
     }
-  })
+  }))
 
   const applyAndReconcile = (
     state: Option.Option<AcnProcessState>,
     command: AcnProcessCommand,
-    prepared: Option.Option<PreparedCommand>,
+    emit: (event: AcnEnsureEvent) => void,
   ) => Effect.uninterruptible(
     Effect.gen(function* () {
       const changed = yield* apply(state, command)
-      yield* Effect.forkIn(reconcileChange(changed, prepared), operationScope)
+      if (changed.mode._tag === "Changing") {
+        yield* Effect.forkIn(reconcileChange(changed.mode.changeRevision, emit), operationScope)
+      }
       return changed
     }),
   )
 
-  const observeChange = (initial: AcnProcessState): Effect.Effect<ChangeObservation, DaemonError> =>
+  const resultForChange = (
+    changeRevision: AcnProcessRevision,
+    latestRevision: AcnProcessRevision,
+  ): Effect.Effect<Option.Option<AcnChangeResult>, AcnEnsuranceErrorType> =>
+    Effect.gen(function* () {
+      for (let revision = changeRevision + 1; revision <= latestRevision; revision += 1) {
+        const historical = yield* provideLocal(readAcnProcessStateRevision(
+          dataDirectory,
+          revision as AcnProcessRevision,
+        ))
+        if (historical.mode._tag === "Changing") continue
+        const result = historical.mode.result
+        if (Option.exists(result, (value) => value.changeRevision === changeRevision)) return result
+      }
+      return Option.none()
+    }).pipe(Effect.mapError(normalizeEnsuranceError))
+
+  const assignmentForChange = (
+    changeRevision: AcnProcessRevision,
+    latestRevision: AcnProcessRevision,
+  ): Effect.Effect<Option.Option<AssignedAcn>, AcnEnsuranceErrorType> =>
+    Effect.gen(function* () {
+      for (let revision = changeRevision + 1; revision <= latestRevision; revision += 1) {
+        const historical = yield* provideLocal(readAcnProcessStateRevision(
+          dataDirectory,
+          revision as AcnProcessRevision,
+        ))
+        if (historical.mode._tag !== "Assigned") continue
+        const result = Option.getOrUndefined(historical.mode.result)
+        if (result?._tag === "Admitted" && result.changeRevision === changeRevision) {
+          return Option.some(historical.mode.current)
+        }
+      }
+      return Option.none()
+    }).pipe(Effect.mapError(normalizeEnsuranceError))
+
+  const observeChange = (initial: AcnProcessState): Effect.Effect<ChangeObservation, AcnEnsuranceErrorType> =>
     Effect.gen(function* () {
       if (initial.mode._tag !== "Changing") return { _tag: "Completed" } as const
       const changeRevision = initial.mode.changeRevision
@@ -648,11 +721,18 @@ export const makeLocalAcnProcessManager = (
       let unchangedSince = yield* Clock.currentTimeMillis
       while (true) {
         const observed = yield* readState
-        if (Option.isNone(observed)) return { _tag: "Completed" } as const
+        if (Option.isNone(observed)) {
+          return yield* new AcnEnsuranceFailed({ reason: `ACN change ${changeRevision} disappeared` })
+        }
         const state = observed.value
-        if (state.mode._tag !== "Changing") {
-          const result = Option.getOrUndefined(state.mode.result)
-          return result?._tag === "Failed" && result.changeRevision === changeRevision
+        if (state.mode._tag !== "Changing" || state.mode.changeRevision !== changeRevision) {
+          const result = Option.getOrUndefined(yield* resultForChange(changeRevision, state.revision))
+          if (result === undefined) {
+            return yield* new AcnEnsuranceFailed({
+              reason: `ACN change ${changeRevision} was superseded without a durable result`,
+            })
+          }
+          return result._tag === "Failed"
             ? { _tag: "Failed", reason: result.reason } as const
             : { _tag: "Completed" } as const
         }
@@ -687,56 +767,115 @@ export const makeLocalAcnProcessManager = (
           if (!(failed.left instanceof AcnProcessStateConflict)) return yield* failed.left
           continue
         }
-        if (!alive || (yield* Clock.currentTimeMillis) - unchangedSince >= 30_000) {
+        if (!alive || (yield* Clock.currentTimeMillis) - unchangedSince >= Duration.toMillis(CHANGE_STALL)) {
           return { _tag: "Stalled", state } as const
         }
-        yield* Effect.sleep("100 millis")
+        yield* Effect.sleep(STATE_OBSERVATION_INTERVAL)
       }
-    }).pipe(Effect.mapError(normalizeDaemonError))
+    }).pipe(Effect.mapError(normalizeEnsuranceError))
 
   const waitUntilReady = (
-    targetIdentity: string,
-    emit: (event: AcnLaunchEvent) => void,
-  ): Effect.Effect<ReadinessObservation, DaemonError> => Effect.gen(function* () {
+    targetIdentity: AcnIdentity,
+    emit: (event: AcnEnsureEvent) => void,
+    startupChange: Option.Option<AcnProcessRevision>,
+  ): Effect.Effect<ReadinessObservation, AcnEnsuranceErrorType> => Effect.gen(function* () {
+    let bound = Option.none<AssignedAcn>()
     let progressKey: string | undefined
-    let progressDeadline = (yield* Clock.currentTimeMillis) + 30_000
+    let progressDeadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(ASSIGNMENT_STALL)
     while (true) {
       const state = yield* readState
-      if (Option.isNone(state)) return yield* new DaemonSpawnFailed({ reason: "ACN assignment disappeared" })
+      if (Option.isNone(state)) {
+        return Option.isSome(bound) || Option.isSome(startupChange)
+          ? { _tag: "StartupFailed", reason: "ACN assignment disappeared during startup" } as const
+          : { _tag: "Reclassify" } as const
+      }
       if (state.value.mode._tag === "Changing") {
-        yield* Effect.sleep("100 millis")
-        continue
+        if (Option.isSome(bound) || Option.isSome(startupChange)) {
+          return state.value.mode.purpose._tag === "Ensure" &&
+            canUseAcnIdentity(targetIdentity, state.value.mode.purpose.target)
+            ? { _tag: "Follow", changeRevision: state.value.mode.changeRevision } as const
+            : { _tag: "StartupFailed", reason: "Bound ACN startup occurrence was replaced" } as const
+        }
+        return { _tag: "Reclassify" } as const
       }
       if (state.value.mode._tag === "Unassigned") {
         const result = Option.getOrUndefined(state.value.mode.result)
-        return yield* new DaemonSpawnFailed({
-          reason: result?._tag === "Failed" ? result.reason : "ACN launch ended without assignment",
-        })
+        return Option.isSome(bound) || Option.isSome(startupChange)
+          ? { _tag: "StartupFailed", reason: result?._tag === "Failed"
+            ? result.reason
+            : "ACN startup ended without assignment" } as const
+          : { _tag: "Reclassify" } as const
       }
       const current = state.value.mode.current
+      if (Option.isSome(bound) && !sameAcnOccurrence(bound.value, current)) {
+        const result = Option.getOrUndefined(state.value.mode.result)
+        if (
+          result?._tag === "Admitted" &&
+          canUseAcnIdentity(targetIdentity, current.identity)
+        ) return { _tag: "Follow", changeRevision: result.changeRevision } as const
+        return { _tag: "StartupFailed", reason: "Bound ACN startup occurrence changed" } as const
+      }
+      if (Option.isSome(startupChange)) {
+        const result = Option.getOrUndefined(state.value.mode.result)
+        if (result?._tag !== "Admitted" || result.changeRevision !== startupChange.value) {
+          const historical = yield* assignmentForChange(startupChange.value, state.value.revision)
+          if (Option.isNone(historical) || !sameAcnOccurrence(historical.value, current)) {
+            if (
+              result?._tag === "Admitted" &&
+              canUseAcnIdentity(targetIdentity, current.identity)
+            ) return { _tag: "Follow", changeRevision: result.changeRevision } as const
+            return { _tag: "StartupFailed", reason: `ACN change ${startupChange.value} no longer owns the assignment` } as const
+          }
+        }
+        bound = Option.some(current)
+      }
       if (!canUseAcnIdentity(targetIdentity, current.identity)) {
-        return yield* new DaemonSpawnFailed({ reason: `Assigned ACN ${current.identity} does not satisfy ${targetIdentity}` })
+        return yield* new AcnEnsuranceFailed({ reason: `Assigned ACN ${current.identity} does not satisfy ${targetIdentity}` })
       }
       if (!(yield* provideLocal(processIsExact(current)))) {
-        return { _tag: "Replace", current } as const
+        return Option.isSome(bound)
+          ? { _tag: "StartupFailed", reason: `ACN ${current.id} exited before becoming ready` } as const
+          : { _tag: "Replace", current } as const
       }
-      const health = yield* probeHealth(current, probeTimeoutMs, client)
+      const healthResult = yield* Effect.either(probeHealth(current, HEALTH_PROBE_TIMEOUT, client))
+      if (healthResult._tag === "Left") {
+        if ((yield* Clock.currentTimeMillis) >= progressDeadline) {
+          return Option.isSome(bound)
+            ? { _tag: "StartupFailed", reason: `ACN ${current.id} did not become ready` } as const
+            : { _tag: "Replace", current } as const
+        }
+        yield* Effect.sleep(STATE_OBSERVATION_INTERVAL)
+        continue
+      }
+      const health = healthResult.right
       yield* emitHealth(health, emit)
-      const instance = instanceFrom(current, health)
-      if (health.state._tag === "Ready") return { _tag: "Ready", instance } as const
-      if (health.state._tag === "Stopping") {
-        return { _tag: "Replace", current } as const
+      if (health.state._tag === "Ready") {
+        const confirmed = yield* readState
+        if (
+          Option.isSome(confirmed) &&
+          confirmed.value.mode._tag === "Assigned" &&
+          sameAcnOccurrence(confirmed.value.mode.current, current) &&
+          confirmed.value.mode.current.identity === current.identity &&
+          confirmed.value.mode.current.url === current.url
+        ) return { _tag: "Ready", instance: readyFrom(current) } as const
+        continue
       }
+      if (health.state._tag === "Stopping") {
+        return Option.isSome(bound)
+          ? { _tag: "StartupFailed", reason: `ACN ${current.id} stopped before becoming ready` } as const
+          : { _tag: "Replace", current } as const
+      }
+      bound = Option.some(current)
       const nextKey = acnStartupProgressKey(health.state)
       if (nextKey !== progressKey) {
         progressKey = nextKey
-        progressDeadline = (yield* Clock.currentTimeMillis) + 30_000
+        progressDeadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(ASSIGNMENT_STALL)
       } else if ((yield* Clock.currentTimeMillis) >= progressDeadline) {
-        return { _tag: "Replace", current } as const
+        return { _tag: "StartupFailed", reason: `ACN ${current.id} startup stalled` } as const
       }
-      yield* Effect.sleep("100 millis")
+      yield* Effect.sleep(STATE_OBSERVATION_INTERVAL)
     }
-  }).pipe(Effect.mapError(normalizeDaemonError))
+  }).pipe(Effect.mapError(normalizeEnsuranceError))
 
   const targetFor = (
     requestIdentity: AcnIdentity,
@@ -748,25 +887,120 @@ export const makeLocalAcnProcessManager = (
       : current.identityFloor,
   })
 
-  const ensure = (request: AcnLaunchRequest, emit: (event: AcnLaunchEvent) => void) =>
+  const ensure = (request: AcnEnsureRequest, emit: (event: AcnEnsureEvent) => void) =>
     Effect.gen(function* () {
-      let forced = Option.map(request.replace, (instance) => ({
-        id: instance.id,
-        pid: instance.pid,
-        processStartIdentity: instance.processStartIdentity,
-      }))
+      let forced = Option.none<Pick<AssignedAcn, "id" | "pid" | "processStartIdentity">>()
       let stalledRevision = Option.none<AcnProcessRevision>()
+      let joinedChange = Option.none<AcnProcessRevision>()
 
       while (true) {
-        let state = yield* readState
-        let targetIdentity = targetFor(request.identity, state)
+        const state = yield* readState
+
+        if (Option.isSome(joinedChange)) {
+          if (Option.isNone(state)) {
+            return yield* new AcnEnsuranceFailed({ reason: `ACN change ${joinedChange.value} disappeared` })
+          }
+          const currentState = state.value
+          if (
+            currentState.mode._tag === "Changing" &&
+            currentState.mode.changeRevision === joinedChange.value
+          ) {
+            const observation = yield* observeChange(currentState)
+            if (observation._tag === "Failed") {
+              const restored = yield* readState
+              if (
+                Option.isSome(restored) &&
+                restored.value.mode._tag === "Assigned" &&
+                canUseAcnIdentity(request.minimumIdentity, restored.value.mode.current.identity)
+              ) {
+                joinedChange = Option.none()
+                continue
+              }
+              return yield* new AcnEnsuranceFailed({ reason: observation.reason })
+            }
+            if (observation._tag === "Stalled") {
+              const target = currentState.mode.purpose._tag === "Ensure"
+                ? currentState.mode.purpose.target
+                : undefined
+              if (target !== undefined && launchSource.supports(target)) {
+                const taken = yield* applyAndReconcile(
+                  state,
+                  { _tag: "TakeOver", manager },
+                  emit,
+                ).pipe(Effect.either)
+                if (taken._tag === "Left" && !(taken.left instanceof AcnProcessStateConflict)) {
+                  return yield* taken.left
+                }
+              } else {
+                yield* Effect.sleep(STATE_OBSERVATION_INTERVAL)
+              }
+            }
+            continue
+          }
+          const result = Option.getOrUndefined(yield* resultForChange(joinedChange.value, currentState.revision))
+          if (result === undefined) {
+            return yield* new AcnEnsuranceFailed({
+              reason: `ACN change ${joinedChange.value} ended without a durable result`,
+            })
+          }
+          if (result._tag === "Failed") {
+            if (
+              currentState.mode._tag === "Assigned" &&
+              canUseAcnIdentity(request.minimumIdentity, currentState.mode.current.identity)
+            ) {
+              joinedChange = Option.none()
+              continue
+            }
+            return yield* new AcnEnsuranceFailed({ reason: result.reason })
+          }
+          if (result._tag === "Admitted" && currentState.mode._tag === "Changing") {
+            if (
+              currentState.mode.purpose._tag === "Ensure" &&
+              canUseAcnIdentity(request.minimumIdentity, currentState.mode.purpose.target)
+            ) {
+              joinedChange = Option.some(currentState.mode.changeRevision)
+              continue
+            }
+          }
+          if (result._tag === "Admitted" && currentState.mode._tag === "Assigned") {
+            const currentResult = Option.getOrUndefined(currentState.mode.result)
+            if (currentResult?._tag === "Admitted" && currentResult.changeRevision !== joinedChange.value) {
+              if (canUseAcnIdentity(request.minimumIdentity, currentState.mode.current.identity)) {
+                joinedChange = Option.some(currentResult.changeRevision)
+                continue
+              }
+            }
+          }
+          if (result._tag !== "Admitted" || currentState.mode._tag !== "Assigned") {
+            return yield* new AcnEnsuranceFailed({ reason: `ACN change ${joinedChange.value} did not admit an ACN` })
+          }
+          const readiness = yield* waitUntilReady(request.minimumIdentity, emit, joinedChange)
+          if (readiness._tag === "Ready") return readiness.instance
+          if (readiness._tag === "Follow") {
+            joinedChange = Option.some(readiness.changeRevision)
+            continue
+          }
+          return yield* new AcnEnsuranceFailed({
+            reason: readiness._tag === "StartupFailed"
+              ? readiness.reason
+              : `ACN change ${joinedChange.value} lost its admitted occurrence`,
+          })
+        }
 
         if (Option.isSome(state) && state.value.mode._tag === "Assigned") {
           const current = state.value.mode.current
           const forceCurrent = Option.exists(forced, (replace) => sameAcnOccurrence(replace, current))
-          if (!forceCurrent && canUseAcnIdentity(targetIdentity, current.identity)) {
-            const readiness = yield* waitUntilReady(targetIdentity, emit)
+          if (!forceCurrent && canUseAcnIdentity(request.minimumIdentity, current.identity)) {
+            const readiness = yield* waitUntilReady(request.minimumIdentity, emit, Option.none())
             if (readiness._tag === "Ready") return readiness.instance
+            if (readiness._tag === "Reclassify") continue
+            if (readiness._tag === "Follow") {
+              joinedChange = Option.some(readiness.changeRevision)
+              continue
+            }
+            if (readiness._tag === "StartupFailed") {
+              return yield* new AcnEnsuranceFailed({ reason: readiness.reason })
+            }
             forced = Option.some(readiness.current)
             stalledRevision = Option.none()
             continue
@@ -782,7 +1016,7 @@ export const makeLocalAcnProcessManager = (
               const taken = yield* applyAndReconcile(
                 state,
                 { _tag: "TakeOver", manager },
-                Option.none(),
+                emit,
               ).pipe(Effect.either)
               if (taken._tag === "Left" && !(taken.left instanceof AcnProcessStateConflict)) {
                 return yield* taken.left
@@ -792,7 +1026,7 @@ export const makeLocalAcnProcessManager = (
             }
             const observation = yield* observeChange(changing)
             if (observation._tag === "Failed") {
-              return yield* new DaemonSpawnFailed({ reason: observation.reason })
+              return yield* new AcnEnsuranceFailed({ reason: observation.reason })
             }
             stalledRevision = observation._tag === "Stalled"
               ? Option.some(observation.state.revision)
@@ -800,27 +1034,64 @@ export const makeLocalAcnProcessManager = (
             continue
           }
 
-          const sufficient = canUseAcnIdentity(targetIdentity, mode.purpose.target)
-          const blocked = mode.owner._tag === "Manager" &&
-            mode.owner.phase._tag === "BlockedCandidateCleanup"
-          if (sufficient && !blocked && !Option.contains(stalledRevision, changing.revision)) {
-            const observation = yield* observeChange(changing)
-            if (observation._tag === "Failed") {
-              return yield* new DaemonSpawnFailed({ reason: observation.reason })
+          if (
+            mode.owner._tag === "Manager" &&
+            mode.owner.phase._tag === "BlockedCandidateCleanup" &&
+            launchSource.supports(mode.purpose.target)
+          ) {
+            const retrying = yield* applyAndReconcile(
+              state,
+              { _tag: "RetryCandidateCleanup", manager },
+              emit,
+            ).pipe(Effect.either)
+            if (retrying._tag === "Left") {
+              if (retrying.left instanceof AcnProcessStateConflict) continue
+              return yield* retrying.left
             }
+            joinedChange = Option.some(mode.changeRevision)
+            continue
+          }
+
+          if (canUseAcnIdentity(request.minimumIdentity, mode.purpose.target)) {
+            joinedChange = Option.some(mode.changeRevision)
+            continue
+          }
+
+          const targetIdentity = targetFor(request.minimumIdentity, state)
+          if (
+            mode.owner._tag === "Manager" &&
+            mode.owner.phase._tag === "Preparing" &&
+            launchSource.supports(targetIdentity)
+          ) {
+            const upgraded = yield* applyAndReconcile(
+              state,
+              { _tag: "UpgradeEnsure", target: targetIdentity, manager },
+              emit,
+            ).pipe(Effect.either)
+            if (upgraded._tag === "Left") {
+              if (upgraded.left instanceof AcnProcessStateConflict) continue
+              return yield* upgraded.left
+            }
+            joinedChange = Option.some(mode.changeRevision)
+            continue
+          }
+
+          const observation = yield* observeChange(changing)
+          if (observation._tag === "Failed") {
+            stalledRevision = Option.none()
+          } else {
             stalledRevision = observation._tag === "Stalled"
               ? Option.some(observation.state.revision)
               : Option.none()
-            continue
           }
+          continue
         }
 
-        const prepared = yield* resolveCommand(request, targetIdentity, emit)
-        state = yield* readState
-        targetIdentity = targetFor(request.identity, state)
-        if (prepared.identity !== targetIdentity) {
-          stalledRevision = Option.none()
-          continue
+        const targetIdentity = targetFor(request.minimumIdentity, state)
+        if (!launchSource.supports(targetIdentity)) {
+          return yield* new AcnEnsuranceFailed({
+            reason: `This client cannot launch required ACN ${targetIdentity}`,
+          })
         }
 
         let transition: AcnProcessCommand | undefined
@@ -831,47 +1102,30 @@ export const makeLocalAcnProcessManager = (
           const forceCurrent = Option.exists(forced, (replace) => sameAcnOccurrence(replace, current))
           if (!forceCurrent && canUseAcnIdentity(targetIdentity, current.identity)) continue
           transition = { _tag: "BeginReplacement", target: targetIdentity, manager, current }
-        } else if (state.value.mode.purpose._tag === "Terminate") {
-          stalledRevision = Option.none()
-          continue
-        } else if (!canUseAcnIdentity(targetIdentity, state.value.mode.purpose.target)) {
-          transition = { _tag: "UpgradeEnsure", target: targetIdentity, manager }
-        } else if (
-          state.value.mode.owner._tag === "Manager" &&
-          state.value.mode.owner.phase._tag === "BlockedCandidateCleanup"
-        ) {
-          transition = { _tag: "RetryCandidateCleanup", manager }
-        } else if (Option.contains(stalledRevision, state.value.revision)) {
-          transition = { _tag: "TakeOver", manager }
         } else {
-          stalledRevision = Option.none()
           continue
         }
 
         const changed = yield* applyAndReconcile(
           state,
           transition,
-          Option.some(prepared),
+          emit,
         ).pipe(Effect.either)
         if (changed._tag === "Left") {
           if (changed.left instanceof AcnProcessStateConflict) continue
           return yield* changed.left
         }
+        if (changed.right.mode._tag === "Changing" && changed.right.mode.purpose._tag === "Ensure") {
+          joinedChange = Option.some(changed.right.mode.changeRevision)
+        }
         stalledRevision = Option.none()
-        const observation = yield* observeChange(changed.right)
-        if (observation._tag === "Failed") {
-          return yield* new DaemonSpawnFailed({ reason: observation.reason })
-        }
-        if (observation._tag === "Stalled") {
-          stalledRevision = Option.some(observation.state.revision)
-        }
       }
-    }).pipe(Effect.mapError(normalizeDaemonError))
+    }).pipe(Effect.mapError(normalizeEnsuranceError))
 
-  const launch: AcnProcessManager["launch"] = (request) =>
-    Stream.asyncPush<AcnLaunchEvent, DaemonError>((sink) => {
+  const ensureStream: AcnEnsurer["ensure"] = (request) =>
+    Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceErrorType>((sink) => {
       const run = ensure(request, (event) => sink.single(event)).pipe(
-        Effect.mapError(normalizeDaemonError),
+        Effect.mapError(normalizeEnsuranceError),
         Effect.match({
           onFailure: sink.fail,
           onSuccess: (instance) => {
@@ -883,30 +1137,5 @@ export const makeLocalAcnProcessManager = (
       return Effect.forkScoped(run)
     }, { bufferSize: "unbounded" })
 
-  const terminate = (instance: AcnInstance) => Effect.gen(function* () {
-    let state = yield* readState
-    if (Option.isNone(state) || state.value.mode._tag !== "Assigned") return
-    const current = state.value.mode.current
-    if (current.id !== instance.id || !sameProcess(current, instance)) {
-      return yield* new DaemonSpawnFailed({ reason: `ACN ${instance.id} is no longer the assigned exact process` })
-    }
-    const changed = yield* applyAndReconcile(
-      state,
-      { _tag: "BeginTerminate", manager, current },
-      Option.none(),
-    )
-    const result = yield* observeChange(changed)
-    if (result._tag === "Failed") {
-      return yield* new DaemonSpawnFailed({ reason: result.reason })
-    }
-    if (result._tag === "Stalled") {
-      return yield* new DaemonSpawnFailed({ reason: `ACN ${instance.id} termination stalled` })
-    }
-  })
-
-  return AcnProcessManager.of({
-    observeCurrent: observeCurrent.pipe(Effect.mapError(normalizeDaemonError)),
-    launch,
-    terminate: (instance) => terminate(instance).pipe(Effect.mapError(normalizeDaemonError)),
-  })
+  return AcnEnsurer.of({ ensure: ensureStream })
 })

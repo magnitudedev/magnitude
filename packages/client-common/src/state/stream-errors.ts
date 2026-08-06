@@ -9,8 +9,7 @@ import { Cause, Chunk } from "effect"
 import {
   BinaryNotFound,
   BinaryVersionMismatch,
-  DaemonCrashed,
-  DaemonSpawnFailed,
+  AcnEnsuranceFailed,
   DownloadFailed,
   type StreamDisplayViewFailure,
 } from "@magnitudedev/sdk"
@@ -21,35 +20,30 @@ import {
 export interface StreamErrorInfo {
   readonly message: string
   readonly invariantViolation: boolean
-  readonly isDaemonResolutionError: boolean
+  readonly isAcnAvailabilityError: boolean
 }
 
-type DaemonResolutionError =
+type AcnAvailabilityError =
   | BinaryNotFound
   | BinaryVersionMismatch
-  | DaemonSpawnFailed
-  | DaemonCrashed
+  | AcnEnsuranceFailed
   | DownloadFailed
 
-export function isDaemonResolutionError(error: unknown): error is DaemonResolutionError {
+export function isAcnAvailabilityError(error: unknown): error is AcnAvailabilityError {
   return (
     error instanceof BinaryNotFound ||
     error instanceof BinaryVersionMismatch ||
-    error instanceof DaemonSpawnFailed ||
-    error instanceof DaemonCrashed ||
+    error instanceof AcnEnsuranceFailed ||
     error instanceof DownloadFailed
   )
 }
 
-export function daemonErrorMessage(error: DaemonResolutionError): string {
+export function acnAvailabilityErrorMessage(error: AcnAvailabilityError): string {
   if (error instanceof BinaryNotFound) {
     return "Magnitude daemon is missing. Please restart Magnitude to reinstall it."
   }
   if (error instanceof BinaryVersionMismatch) {
     return `Magnitude daemon version does not match this client. Expected ${error.expected}, got ${error.actual}.`
-  }
-  if (error instanceof DaemonCrashed) {
-    return `Magnitude daemon crashed on startup (exit code ${error.exitCode}).`
   }
   if (error instanceof DownloadFailed) {
     return `Failed to download the Magnitude daemon: ${error.reason}`
@@ -65,17 +59,17 @@ function caughtErrorDetails(error: unknown): string {
 }
 
 export function classifyStartupError(error: unknown): StreamErrorInfo {
-  if (isDaemonResolutionError(error)) {
+  if (isAcnAvailabilityError(error)) {
     return {
-      message: daemonErrorMessage(error),
+      message: acnAvailabilityErrorMessage(error),
       invariantViolation: false,
-      isDaemonResolutionError: true,
+      isAcnAvailabilityError: true,
     }
   }
   return {
     message: caughtErrorDetails(error),
     invariantViolation: true,
-    isDaemonResolutionError: false,
+    isAcnAvailabilityError: false,
   }
 }
 
@@ -113,29 +107,36 @@ function fullStreamErrorDetails(cause: Cause.Cause<StreamDisplayViewFailure>): s
  *
  * Display streams recover from daemon deaths transparently (SDK operation
  * contract), so an error landing here is terminal: either fatal daemon
- * unavailability (RpcClientError, resolution error in `cause`) or a domain
+ * unavailability (RpcClientError, ensurance error in `cause`) or a domain
  * error like the session disappearing — the latter is an invariant violation.
  */
 export function classifyStreamError(cause: Cause.Cause<StreamDisplayViewFailure>): StreamErrorInfo {
   for (const failure of Chunk.toReadonlyArray(Cause.failures(cause))) {
-    if (isDaemonResolutionError(failure)) {
+    if (isAcnAvailabilityError(failure)) {
       return {
-        message: daemonErrorMessage(failure),
+        message: acnAvailabilityErrorMessage(failure),
         invariantViolation: false,
-        isDaemonResolutionError: true,
+        isAcnAvailabilityError: true,
       }
     }
     if (failure._tag === "RpcClientError") {
+      if (isAcnAvailabilityError(failure.cause)) {
+        return {
+          message: acnAvailabilityErrorMessage(failure.cause),
+          invariantViolation: false,
+          isAcnAvailabilityError: true,
+        }
+      }
       return {
         message: `Lost connection to the Magnitude daemon and could not recover.\n\n${formatStreamFailure(failure)}`,
         invariantViolation: false,
-        isDaemonResolutionError: false,
+        isAcnAvailabilityError: false,
       }
     }
   }
   return {
     message: fullStreamErrorDetails(cause),
     invariantViolation: true,
-    isDaemonResolutionError: false,
+    isAcnAvailabilityError: false,
   }
 }

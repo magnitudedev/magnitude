@@ -320,7 +320,7 @@ process-scope finalizer. ACN ownership remains held until that operation finishe
 
 Owned-child state is cleared only after exact exit is proved. If ACN is force-killed or ICN cannot
 be reaped, the assigned or retiring ACN occurrence retains the child identity for
-`AcnProcessManager` to finish exact cleanup before another candidate is admitted.
+`AcnEnsurer` to finish exact cleanup before another candidate is admitted.
 
 The native server must handle both interrupt and termination signals with the same idempotent
 graceful-shutdown path. Repeated shutdown requests do not send overlapping signal sequences.

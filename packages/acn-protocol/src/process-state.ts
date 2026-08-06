@@ -73,7 +73,13 @@ const AcnChangePurposeSchema = Schema.Union(
 )
 export type AcnChangePurpose = typeof AcnChangePurposeSchema.Type
 
+const OptionalAssignedAcn = Schema.optionalWith(AssignedAcnSchema, {
+  as: "Option",
+  exact: true,
+})
+
 const ManagerPhaseSchema = Schema.Union(
+  Schema.TaggedStruct("Preparing", { current: OptionalAssignedAcn }),
   Schema.TaggedStruct("RetiringAssigned", { current: AssignedAcnSchema }),
   Schema.TaggedStruct("RetiringCandidate", { candidate: ExactAcnCandidateSchema }),
   Schema.TaggedStruct("BlockedCandidateCleanup", {
@@ -141,6 +147,11 @@ export const AcnProcessCommandSchema = Schema.Union(
     manager: ExactProcessSchema,
   }),
   Schema.TaggedStruct("TakeOver", { manager: ExactProcessSchema }),
+  Schema.TaggedStruct("PreparationSucceeded", { manager: ExactProcessSchema }),
+  Schema.TaggedStruct("PreparationFailed", {
+    manager: ExactProcessSchema,
+    reason: NonEmptyString,
+  }),
   Schema.TaggedStruct("PredecessorExited", { manager: ExactProcessSchema }),
   Schema.TaggedStruct("CandidateSpawned", {
     manager: ExactProcessSchema,
@@ -299,10 +310,22 @@ const nextRevision = (current: Option.Option<AcnProcessState>): AcnProcessRevisi
     onSome: (state) => state.revision + 1,
   }))
 
-const managerPhaseForTransfer = (owner: AcnChangeOwner): ManagerPhase =>
-  owner._tag === "Candidate"
-    ? { _tag: "RetiringCandidate", candidate: owner.candidate }
-    : owner.phase
+const managerPhaseForTakeOver = (owner: AcnChangeOwner): ManagerPhase => {
+  if (owner._tag === "Candidate") {
+    return { _tag: "RetiringCandidate", candidate: owner.candidate }
+  }
+  switch (owner.phase._tag) {
+    case "Preparing":
+      return owner.phase
+    case "RetiringAssigned":
+      return { _tag: "Preparing", current: Option.some(owner.phase.current) }
+    case "Spawning":
+      return { _tag: "Preparing", current: Option.none() }
+    case "RetiringCandidate":
+    case "BlockedCandidateCleanup":
+      return owner.phase
+  }
+}
 
 /** Pure legal-transition boundary for the process-state protocol. */
 export const reduceAcnProcessState = (
@@ -319,7 +342,11 @@ export const reduceAcnProcessState = (
         _tag: "Changing",
         changeRevision: revision,
         purpose: { _tag: "Ensure", target: command.target },
-        owner: { _tag: "Manager", process: command.manager, phase: { _tag: "Spawning" } },
+        owner: {
+          _tag: "Manager",
+          process: command.manager,
+          phase: { _tag: "Preparing", current: Option.none() },
+        },
       },
     }
   }
@@ -338,7 +365,11 @@ export const reduceAcnProcessState = (
           _tag: "Changing",
           changeRevision: revision,
           purpose: { _tag: "Ensure", target: floor },
-          owner: { _tag: "Manager", process: command.manager, phase: { _tag: "Spawning" } },
+          owner: {
+            _tag: "Manager",
+            process: command.manager,
+            phase: { _tag: "Preparing", current: Option.none() },
+          },
         },
       }
     }
@@ -361,7 +392,7 @@ export const reduceAcnProcessState = (
           owner: {
             _tag: "Manager",
             process: command.manager,
-            phase: { _tag: "RetiringAssigned", current: state.mode.current },
+            phase: { _tag: "Preparing", current: Option.some(state.mode.current) },
           },
         },
       }
@@ -403,7 +434,7 @@ export const reduceAcnProcessState = (
                 candidate: state.mode.owner.phase.candidate,
               }
             : state.mode.owner.phase
-        if (phase._tag === "Spawning") {
+        if (phase._tag === "Spawning" || (phase._tag === "Preparing" && Option.isNone(phase.current))) {
           return {
             revision,
             identityFloor: state.identityFloor,
@@ -416,6 +447,9 @@ export const reduceAcnProcessState = (
             },
           }
         }
+        const terminationPhase = phase._tag === "Preparing"
+          ? { _tag: "RetiringAssigned" as const, current: Option.getOrThrow(phase.current) }
+          : phase
         return {
           ...state,
           revision,
@@ -423,7 +457,7 @@ export const reduceAcnProcessState = (
             _tag: "Changing",
             changeRevision: state.mode.changeRevision,
             purpose: { _tag: "Terminate" },
-            owner: { _tag: "Manager", process: command.manager, phase },
+            owner: { _tag: "Manager", process: command.manager, phase: terminationPhase },
           },
         }
       }
@@ -448,6 +482,11 @@ export const reduceAcnProcessState = (
         command,
         "no active ensure to upgrade",
       )
+      requireTransition(
+        state.mode.owner._tag === "Manager" && state.mode.owner.phase._tag === "Preparing",
+        command,
+        "only a preparing ensure may be upgraded",
+      )
       const activeTarget = state.mode.purpose.target
       requireTransition(
         compareAcnIdentities(command.target, activeTarget) > 0,
@@ -464,7 +503,7 @@ export const reduceAcnProcessState = (
           owner: {
             _tag: "Manager",
             process: command.manager,
-            phase: managerPhaseForTransfer(state.mode.owner),
+            phase: state.mode.owner.phase,
           },
         },
       }
@@ -479,9 +518,60 @@ export const reduceAcnProcessState = (
           owner: {
             _tag: "Manager",
             process: command.manager,
-            phase: managerPhaseForTransfer(state.mode.owner),
+            phase: managerPhaseForTakeOver(state.mode.owner),
           },
         },
+      }
+    }
+    case "PreparationSucceeded": {
+      requireTransition(
+        state.mode._tag === "Changing" &&
+        state.mode.purpose._tag === "Ensure" &&
+        state.mode.owner._tag === "Manager" &&
+        sameProcess(state.mode.owner.process, command.manager) &&
+        state.mode.owner.phase._tag === "Preparing",
+        command,
+        "manager does not own preparation",
+      )
+      const current = state.mode.owner.phase.current
+      return {
+        ...state,
+        revision,
+        mode: {
+          ...state.mode,
+          owner: {
+            _tag: "Manager",
+            process: command.manager,
+            phase: Option.match(current, {
+              onNone: () => ({ _tag: "Spawning" as const }),
+              onSome: (assigned) => ({ _tag: "RetiringAssigned" as const, current: assigned }),
+            }),
+          },
+        },
+      }
+    }
+    case "PreparationFailed": {
+      requireTransition(
+        state.mode._tag === "Changing" &&
+        state.mode.purpose._tag === "Ensure" &&
+        state.mode.owner._tag === "Manager" &&
+        sameProcess(state.mode.owner.process, command.manager) &&
+        state.mode.owner.phase._tag === "Preparing",
+        command,
+        "manager does not own preparation",
+      )
+      const result = Option.some({
+        _tag: "Failed" as const,
+        changeRevision: state.mode.changeRevision,
+        reason: command.reason,
+      })
+      return {
+        revision,
+        identityFloor: state.identityFloor,
+        mode: Option.match(state.mode.owner.phase.current, {
+          onNone: () => ({ _tag: "Unassigned" as const, result }),
+          onSome: (current) => ({ _tag: "Assigned" as const, current, result }),
+        }),
       }
     }
     case "PredecessorExited": {
@@ -583,7 +673,11 @@ export const reduceAcnProcessState = (
         revision,
         mode: {
           ...state.mode,
-          owner: { _tag: "Manager", process: command.manager, phase: { _tag: "Spawning" } },
+          owner: {
+            _tag: "Manager",
+            process: command.manager,
+            phase: { _tag: "Preparing", current: Option.none() },
+          },
         },
       }
     }
@@ -763,6 +857,29 @@ const platformReason = (error: PlatformError): string | undefined =>
 const stateUnavailable = (path: string, error: unknown): AcnProcessStateUnavailable =>
   new AcnProcessStateUnavailable({ path, reason: String(error) })
 
+export const readAcnProcessStateRevision = (
+  dataDirectory: string,
+  revision: AcnProcessRevision,
+): Effect.Effect<AcnProcessState, AcnProcessStateError, FileSystem.FileSystem> => {
+  const path = revisionPath(dataDirectory, revision)
+  return Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const text = yield* fs.readFileString(path).pipe(
+      Effect.mapError((error) => stateUnavailable(path, error)),
+    )
+    const state = yield* Schema.decodeUnknown(Schema.parseJson(AcnProcessStateSchema))(text).pipe(
+      Effect.mapError((error) => new AcnProcessStateInvalid({ path, reason: String(error) })),
+    )
+    if (state.revision !== revision) {
+      return yield* new AcnProcessStateInvalid({
+        path,
+        reason: `encoded revision ${state.revision} does not match filename revision ${revision}`,
+      })
+    }
+    return state
+  })
+}
+
 export const readAcnProcessState = (
   dataDirectory: string,
 ): Effect.Effect<Option.Option<AcnProcessState>, AcnProcessStateError, FileSystem.FileSystem> =>
@@ -790,20 +907,7 @@ export const readAcnProcessState = (
     }
     const revision = revisions.at(-1)
     if (revision === undefined) return Option.none()
-    const path = revisionPath(dataDirectory, revision)
-    const text = yield* fs.readFileString(path).pipe(
-      Effect.mapError((error) => stateUnavailable(path, error)),
-    )
-    const state = yield* Schema.decodeUnknown(Schema.parseJson(AcnProcessStateSchema))(text).pipe(
-      Effect.mapError((error) => new AcnProcessStateInvalid({ path, reason: String(error) })),
-    )
-    if (state.revision !== revision) {
-      return yield* new AcnProcessStateInvalid({
-        path,
-        reason: `encoded revision ${state.revision} does not match filename revision ${revision}`,
-      })
-    }
-    return Option.some(state)
+    return Option.some(yield* readAcnProcessStateRevision(dataDirectory, revision))
   })
 
 const sameExpectedRevision = (

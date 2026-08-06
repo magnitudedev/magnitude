@@ -1,16 +1,18 @@
 /**
  * Browser-safe SDK entry.
  *
- * Renderer builds resolve `@magnitudedev/sdk` here. Daemon discovery and
- * launch are delegated to the host over HTTP.
+ * Renderer builds resolve `@magnitudedev/sdk` here. ACN ensurance is
+ * delegated to the host over HTTP.
  */
 export {
-  AcnProcessManager,
-  AcnLaunchEventSchema,
-  AcnLaunchRequestSchema,
-} from "./acn-jit/acn-process-manager"
-export type { AcnLaunchEvent, AcnLaunchRequest } from "./acn-jit/acn-process-manager"
-export { makeRemoteAcnProcessManager } from "./acn-jit/remote-acn-process-manager"
+  AcnEnsurer,
+  AcnEnsureEventSchema,
+  AcnEnsureRequestSchema,
+  ReadyAcnSchema,
+  RemoteAcnEnsureMessageSchema,
+} from "./acn-jit/acn-ensurer"
+export type { AcnEnsureEvent, AcnEnsureRequest, ReadyAcn } from "./acn-jit/acn-ensurer"
+export { makeRemoteAcnEnsurer } from "./acn-jit/remote-acn-ensurer"
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
@@ -18,23 +20,19 @@ export type {
   AcnClientCloseReport,
   AcnClientCloseResult,
   AcnJitRuntime,
-  AcnJitRuntimeOptions,
 } from "./acn-jit/acn-recovering-client"
 export {
-  DaemonDiscoveryFailed,
-  DaemonSpawnFailed,
+  AcnEnsuranceFailed,
   BinaryNotFound,
   BinaryVersionMismatch,
   DownloadFailed,
   ChecksumMismatch,
-  DaemonCrashed,
-  DaemonError,
+  AcnEnsuranceError,
 } from "./errors"
 
 export {
   DisplayState as DisplayStateSchema,
   DisplayViewSnapshot,
-  AcnInstanceSchema,
   DisplayViewShape as DisplayViewShapeSchema,
   MagnitudeRpcs,
   StreamEvent as StreamEventSchema,
@@ -101,7 +99,6 @@ export {
 } from "@magnitudedev/ai/provider/model"
 
 export type {
-  AcnInstance,
   DownloadAttemptId,
   ModelOfferingTargetId,
   RecommendationId,

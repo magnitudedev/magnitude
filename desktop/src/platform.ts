@@ -2,17 +2,17 @@
  * Desktop Platform implementation — spec §5.3
  *
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
- * ACN process management remains one contract across the Electron boundary.
+ * ACN ensurance remains one contract across the Electron boundary.
  */
-import { Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
+import { Effect, Exit, Layer, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
-  DaemonSpawnFailed,
-  DaemonError,
-  AcnProcessManager,
+  AcnEnsuranceFailed,
+  AcnEnsuranceError,
+  AcnEnsurer,
   makeAcnJitRuntime,
-  type AcnLaunchEvent,
-  type AcnProcessManager as AcnProcessManagerService,
+  type AcnEnsureEvent,
+  type AcnEnsurer as AcnEnsurerService,
 } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
@@ -61,47 +61,33 @@ let api: DesktopApi
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-const daemonError = (cause: unknown) => Schema.is(DaemonError)(cause)
+const ensuranceError = (cause: unknown) => Schema.is(AcnEnsuranceError)(cause)
   ? cause
-  : new DaemonSpawnFailed({ reason: errorMessage(cause) })
+  : new AcnEnsuranceFailed({ reason: errorMessage(cause) })
 
-function createDesktopAcnProcessManager(desktopApi: DesktopApi): AcnProcessManagerService {
-  return AcnProcessManager.of({
-    observeCurrent:
-      Effect.tryPromise({
-        try: async () => {
-          const instance = await desktopApi.acnProcessManager.current()
-          return Option.fromNullable(instance)
-        },
-        catch: daemonError,
-      }),
-    launch: (request) =>
-      Stream.asyncPush<AcnLaunchEvent, DaemonError>((emit) =>
-        Effect.tryPromise({
-          try: () => desktopApi.acnProcessManager.launch(request, (event) => emit.single(event)),
-          catch: daemonError,
-        }).pipe(
-          Effect.match({
-            onFailure: emit.fail,
-            onSuccess: () => emit.end(),
-          }),
-          Effect.forkScoped,
-        ),
-      ),
-    terminate: (instance) => Effect.tryPromise({
-      try: () => desktopApi.acnProcessManager.terminate(instance),
-      catch: daemonError,
-    }),
+function createDesktopAcnEnsurer(desktopApi: DesktopApi): AcnEnsurerService {
+  return AcnEnsurer.of({
+    ensure: (request) => Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceError>((emit) =>
+      Effect.acquireRelease(
+        Effect.sync(() => desktopApi.acnEnsurer.ensure(
+          request,
+          (event) => emit.single(event),
+          (error) => emit.fail(ensuranceError(error)),
+          () => emit.end(),
+        )),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      ).pipe(Effect.asVoid),
+    ),
   })
 }
 
 export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
   api = desktopApi
-  const processManager = createDesktopAcnProcessManager(desktopApi)
+  const ensurer = createDesktopAcnEnsurer(desktopApi)
   const acnScope = await Effect.runPromise(Scope.make())
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnProcessManager, processManager),
+      Effect.provideService(AcnEnsurer, ensurer),
       Effect.provideService(Scope.Scope, acnScope),
       Effect.provide(FetchHttpClient.layer),
     ),

@@ -8,8 +8,8 @@ import {
   type AcnHealthState,
 } from "@magnitudedev/acn-protocol";
 import { FSM } from "@magnitudedev/utils";
-import { Clock, Effect, Option, Schema, Stream, SubscriptionRef } from "effect";
-import type { DaemonError } from "./errors";
+import { Clock, Duration, Effect, Option, Schema, Stream, SubscriptionRef } from "effect";
+import type { AcnEnsuranceError } from "./errors";
 
 export const AcnStartingPhaseSchema = Schema.Union(
   Schema.Literal(
@@ -152,7 +152,7 @@ export interface AcnLifecycleOwner extends AcnLifecycle {
     observation: AcnLifecycleObservation
   ) => Effect.Effect<void>;
   readonly ready: Effect.Effect<void>;
-  readonly fail: (error: DaemonError) => Effect.Effect<void>;
+  readonly fail: (error: AcnEnsuranceError) => Effect.Effect<void>;
 }
 
 interface PhaseRange {
@@ -297,18 +297,10 @@ const failureStage = (state: InternalState): AcnFailureStage => {
   return "Connect";
 };
 
-const daemonErrorMessage = (error: DaemonError): string => {
+const ensuranceErrorMessage = (error: AcnEnsuranceError): string => {
   switch (error._tag) {
-    case "DaemonDiscoveryFailed":
+    case "AcnEnsuranceFailed":
       return error.reason;
-    case "DaemonSpawnFailed":
-      return error.reason;
-    case "DaemonCrashed":
-      return Option.match(error.diagnostic, {
-        onNone: () => `Magnitude exited with code ${error.exitCode}`,
-        onSome: (diagnostic) =>
-          `Magnitude exited with code ${error.exitCode}: ${diagnostic}`,
-      });
     case "BinaryNotFound":
       return `Magnitude executable was not found at ${error.path}`;
     case "BinaryVersionMismatch":
@@ -320,8 +312,8 @@ const daemonErrorMessage = (error: DaemonError): string => {
   }
 };
 
-const nonEmptyFailureMessage = (error: DaemonError): string => {
-  const message = daemonErrorMessage(error).trim();
+const nonEmptyFailureMessage = (error: AcnEnsuranceError): string => {
+  const message = ensuranceErrorMessage(error).trim();
   return message.length > 0 ? message : "Magnitude is unavailable";
 };
 
@@ -345,7 +337,7 @@ export const makeAcnLifecycle = (): Effect.Effect<AcnLifecycleOwner> =>
           }
           return Stream.merge(
             current,
-            Stream.tick("50 millis").pipe(
+            Stream.tick(Duration.millis(50)).pipe(
               Stream.mapEffect(() => renderState(state))
             )
           );

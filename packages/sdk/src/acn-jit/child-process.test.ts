@@ -1,11 +1,11 @@
 import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { scopePreHandoffCandidate } from "./child-process"
-import { DaemonSpawnFailed } from "./errors"
+import { AcnEnsuranceFailed } from "./errors"
 
 const candidate = (options: {
-  readonly releaseForHandoff: Effect.Effect<void, DaemonSpawnFailed>
-  readonly stopAndReap: Effect.Effect<void, DaemonSpawnFailed>
+  readonly releaseForHandoff: Effect.Effect<void, AcnEnsuranceFailed>
+  readonly stopAndReap: Effect.Effect<void, AcnEnsuranceFailed>
 }) =>
   scopePreHandoffCandidate({
     pid: 42,
@@ -62,7 +62,7 @@ describe("scopePreHandoffCandidate", () => {
         Effect.gen(function* () {
           const child = yield* candidate({
             releaseForHandoff: Effect.fail(
-              new DaemonSpawnFailed({
+            new AcnEnsuranceFailed({
                 reason: "bootstrap pipe failed",
               }),
             ),

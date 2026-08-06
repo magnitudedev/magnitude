@@ -16,7 +16,7 @@ import * as nodePath from "node:path"
 import * as nodeFs from "node:fs"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
-import { Cause, Duration, Effect, Exit, Layer, Option, PubSub, Scope, Stream } from "effect"
+import { Array as Arr, Cause, Duration, Effect, Exit, Layer, Option, PubSub, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { layer as nodeFileSystemLayer } from "@effect/platform-node-shared/NodeFileSystem"
@@ -28,19 +28,20 @@ import { makeElectronRpcServerLayer } from "./electron-rpc"
 
 // SDK imports — these run in the main process (Node)
 import {
-  makeLocalAcnProcessManager,
+  makeLocalAcnEnsurer,
   ChildProcessSpawner,
   scopePreHandoffCandidate,
-  DaemonSpawnFailed,
-  type AcnProcessManager as AcnProcessManagerService,
+  AcnEnsuranceFailed,
+  SDK_VERSION,
+  type AcnEnsurer as AcnEnsurerService,
 } from "@magnitudedev/sdk"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
-let acnProcessManagerPromise: Promise<AcnProcessManagerService> | null = null
-const acnProcessManagerScope = Effect.runPromise(Scope.make())
+let acnEnsurerPromise: Promise<AcnEnsurerService> | null = null
+const acnEnsurerScope = Effect.runPromise(Scope.make())
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
 
 /**
@@ -53,7 +54,7 @@ const nodeSpawn: ChildProcessSpawner = {
       Effect.gen(function* () {
         const proc = yield* Effect.async<
           ReturnType<typeof spawn>,
-          DaemonSpawnFailed
+          AcnEnsuranceFailed
         >((resume) => {
           const [executable, ...args] = command
           const proc = spawn(executable, args, {
@@ -71,7 +72,7 @@ const nodeSpawn: ChildProcessSpawner = {
           }
           const onError = (cause: Error) => {
             cleanup()
-            resume(Effect.fail(new DaemonSpawnFailed({
+            resume(Effect.fail(new AcnEnsuranceFailed({
                 reason: `Failed to spawn Magnitude: ${cause.message}`,
             })))
           }
@@ -81,7 +82,7 @@ const nodeSpawn: ChildProcessSpawner = {
         })
         const pid = proc.pid
         if (pid === undefined) {
-          return yield* new DaemonSpawnFailed({
+          return yield* new AcnEnsuranceFailed({
             reason: "Spawned ACN has no process ID",
           })
         }
@@ -98,29 +99,29 @@ const nodeSpawn: ChildProcessSpawner = {
               if (!proc.kill(name)) throw new Error(`process ${pid} rejected ${name}`)
             },
             catch: (cause) =>
-              new DaemonSpawnFailed({
+              new AcnEnsuranceFailed({
                 reason: `Failed to send ${name} to ACN ${pid}: ${String(cause)}`,
               }),
           })
         const waitForExit = (duration: Duration.DurationInput) =>
           exited.pipe(Effect.timeoutOption(duration))
         const stopAndReap = Effect.gen(function* () {
-          if (Option.isSome(yield* waitForExit("1 millis"))) return
+          if (Option.isSome(yield* waitForExit(Duration.millis(1)))) return
           yield* signal("SIGTERM")
-          if (Option.isSome(yield* waitForExit("2 seconds"))) return
+          if (Option.isSome(yield* waitForExit(Duration.seconds(2)))) return
           yield* signal("SIGKILL")
-          if (Option.isNone(yield* waitForExit("2 seconds"))) {
-            return yield* new DaemonSpawnFailed({
+          if (Option.isNone(yield* waitForExit(Duration.seconds(2)))) {
+            return yield* new AcnEnsuranceFailed({
               reason: `Pre-handoff ACN ${pid} did not exit after SIGKILL`,
             })
           }
         })
-        const releaseForHandoff = Effect.async<void, DaemonSpawnFailed>((resume) => {
+        const releaseForHandoff = Effect.async<void, AcnEnsuranceFailed>((resume) => {
           const stdin = proc.stdin
           if (stdin === null) {
             resume(
               Effect.fail(
-                new DaemonSpawnFailed({
+                new AcnEnsuranceFailed({
                   reason: "ACN bootstrap pipe is unavailable",
                 }),
               ),
@@ -131,7 +132,7 @@ const nodeSpawn: ChildProcessSpawner = {
             stdin.off("error", onError)
             resume(
               Effect.fail(
-                new DaemonSpawnFailed({
+                new AcnEnsuranceFailed({
                   reason: `Failed to hand off ACN bootstrap: ${cause.message}`,
                 }),
               ),
@@ -382,7 +383,7 @@ function createWindow(): void {
   })
 }
 
-function defaultLaunchCommand(): Option.Option<ReadonlyArray<string>> {
+function defaultLaunchCommand(): Option.Option<Arr.NonEmptyReadonlyArray<string>> {
   const isDev = !app.isPackaged
   const acnSourcePath = nodePath.resolve(__dirname, "..", "..", "..", "packages", "acn", "src", "binary.ts")
   return isDev
@@ -397,21 +398,30 @@ function localDaemonOptions() {
       onNone: () => ({}),
       onSome: (path) => ({ binaryPath: path }),
     }),
+    ...Option.match(defaultLaunchCommand(), {
+      onNone: () => ({}),
+      onSome: (command) => ({
+        launchOverride: {
+          identity: SDK_VERSION,
+          command,
+        },
+      }),
+    }),
   }
 }
 
-async function getAcnProcessManager(): Promise<AcnProcessManagerService> {
-  const scope = await acnProcessManagerScope
-  acnProcessManagerPromise ??= makeLocalAcnProcessManager(localDaemonOptions()).pipe(
+async function getAcnEnsurer(): Promise<AcnEnsurerService> {
+  const scope = await acnEnsurerScope
+  acnEnsurerPromise ??= makeLocalAcnEnsurer(localDaemonOptions()).pipe(
     Effect.provideService(ChildProcessSpawner, nodeSpawn),
     Effect.provideService(Scope.Scope, scope),
     Effect.provide(nodePlatformLayer),
     Effect.runPromise,
   )
-  return acnProcessManagerPromise
+  return acnEnsurerPromise
 }
 
-const acnProcessManager = Effect.promise(getAcnProcessManager)
+const acnEnsurer = Effect.promise(getAcnEnsurer)
 
 function messageFromUnknown(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
@@ -428,24 +438,10 @@ const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpc
   })
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
-  AcnCurrent: () => acnProcessManager.pipe(
-    Effect.flatMap((manager) => manager.observeCurrent),
-    Effect.map(Option.getOrNull),
-  ),
-  AcnLaunch: (request) => Stream.unwrap(
-    acnProcessManager.pipe(
-      Effect.map((manager) =>
-        manager
-          .launch({
-            ...request,
-            command: Option.orElse(request.command, defaultLaunchCommand),
-          }),
-      ),
+  AcnEnsure: (request) => Stream.unwrap(
+    acnEnsurer.pipe(
+      Effect.map((ensurer) => ensurer.ensure(request)),
     ),
-  ),
-  AcnTerminate: ({ instance }) => acnProcessManager.pipe(
-    Effect.flatMap((manager) => manager.terminate(instance)),
-    Effect.as({}),
   ),
   StorageGet: ({ key }) => Effect.sync(() => storageGet(key)),
   StorageSet: ({ key, value }) => Effect.sync(() => storageSet(key, value)).pipe(Effect.as({})),
@@ -524,7 +520,7 @@ app.on("activate", () => {
 })
 
 app.on("will-quit", () => {
-  void acnProcessManagerScope.then((scope) =>
+  void acnEnsurerScope.then((scope) =>
     Effect.runPromise(Scope.close(scope, Exit.void)),
   )
 })

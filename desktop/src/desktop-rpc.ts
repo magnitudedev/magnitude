@@ -2,13 +2,12 @@ import { Rpc, RpcClient, RpcClientError, RpcGroup } from "@effect/rpc"
 import { Schema } from "effect"
 import { MenuActionSchema, type MenuAction } from "@magnitudedev/client-common/src/types/menu-action"
 import {
-  AcnLaunchEventSchema,
-  AcnLaunchRequestSchema,
-  DaemonError,
-  type AcnLaunchEvent,
-  type AcnLaunchRequest,
+  AcnEnsureEventSchema,
+  AcnEnsureRequestSchema,
+  AcnEnsuranceError,
+  type AcnEnsureEvent,
+  type AcnEnsureRequest,
 } from "@magnitudedev/sdk"
-import { AcnInstanceSchema, type AcnInstance } from "@magnitudedev/sdk"
 
 export type { MenuAction }
 
@@ -33,21 +32,11 @@ export interface OpenFileOptions {
 }
 
 export const DesktopRpcs = RpcGroup.make(
-  Rpc.make("AcnCurrent", {
-    payload: Unit,
-    success: Schema.NullOr(AcnInstanceSchema),
-    error: DaemonError,
-  }),
-  Rpc.make("AcnLaunch", {
-    payload: AcnLaunchRequestSchema,
-    success: AcnLaunchEventSchema,
-    error: DaemonError,
+  Rpc.make("AcnEnsure", {
+    payload: AcnEnsureRequestSchema,
+    success: AcnEnsureEventSchema,
+    error: AcnEnsuranceError,
     stream: true,
-  }),
-  Rpc.make("AcnTerminate", {
-    payload: Schema.Struct({ instance: AcnInstanceSchema }),
-    success: Unit,
-    error: DaemonError,
   }),
   Rpc.make("StorageGet", {
     payload: Schema.Struct({ key: Schema.String }),
@@ -103,13 +92,13 @@ export type DesktopPlatform = "darwin" | "win32" | "linux"
 
 export interface DesktopApi {
   readonly platform: DesktopPlatform
-  readonly acnProcessManager: {
-    current(): Promise<AcnInstance | null>
-    launch(
-      request: AcnLaunchRequest,
-      onEvent: (event: AcnLaunchEvent) => void,
-    ): Promise<void>
-    terminate(instance: AcnInstance): Promise<void>
+  readonly acnEnsurer: {
+    ensure(
+      request: AcnEnsureRequest,
+      onEvent: (event: AcnEnsureEvent) => void,
+      onError: (error: unknown) => void,
+      onEnd: () => void,
+    ): () => void
   }
   readonly onMenuAction: (cb: (action: MenuAction) => void) => () => void
   readonly quit: () => void
