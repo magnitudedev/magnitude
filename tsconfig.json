@@ -22,6 +22,7 @@
 
       "@magnitudedev/scratchpad": ["./packages/scratchpad/src"],
       "@magnitudedev/acn-protocol": ["./packages/acn-protocol/src"],
+      "@magnitudedev/acn-protocol/*": ["./packages/acn-protocol/src/*"],
       "@magnitudedev/sdk": ["./packages/sdk/src"],
       "@magnitudedev/storage": ["./packages/storage/src"],
       "@magnitudedev/acn": ["./packages/acn/src"],

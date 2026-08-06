@@ -5,8 +5,6 @@ import {
   type AcnInstallationPhase,
   type AcnInstallationPlan,
   type AcnStartupProgress,
-  AcnEndpointSchema,
-  type AcnEndpoint,
   type AcnHealthState,
 } from "@magnitudedev/acn-protocol";
 import { FSM } from "@magnitudedev/utils";
@@ -19,16 +17,16 @@ export const AcnStartingPhaseSchema = Schema.Union(
     "WaitingForOwner",
     "LaunchingAcn",
     "ResolvingLocalInference",
-    "LaunchingLocalInference",
+    "LaunchingLocalInference"
   ),
   Schema.TaggedStruct("PreparingBackend", {
     backend: Schema.Union(
       Schema.TaggedStruct("Cpu", { hardwareLabel: Schema.NonEmptyString }),
       Schema.TaggedStruct("Metal", { hardwareLabel: Schema.NonEmptyString }),
       Schema.TaggedStruct("Cuda", { hardwareLabel: Schema.NonEmptyString }),
-      Schema.TaggedStruct("Vulkan", { hardwareLabel: Schema.NonEmptyString }),
+      Schema.TaggedStruct("Vulkan", { hardwareLabel: Schema.NonEmptyString })
     ),
-  }),
+  })
 );
 export type AcnStartingPhase = typeof AcnStartingPhaseSchema.Type;
 
@@ -44,13 +42,13 @@ const NormalizedProgressSchema = Schema.Number.pipe(Schema.between(0, 1));
 
 export class ClientAcnChecking extends Schema.TaggedClass<ClientAcnChecking>()(
   "Checking",
-  {},
+  {}
 ) {}
 export class ClientAcnStarting extends Schema.TaggedClass<ClientAcnStarting>()(
   "Starting",
   {
     phase: AcnStartingPhaseSchema,
-  },
+  }
 ) {}
 export class ClientAcnInstalling extends Schema.TaggedClass<ClientAcnInstalling>()(
   "Installing",
@@ -62,13 +60,11 @@ export class ClientAcnInstalling extends Schema.TaggedClass<ClientAcnInstalling>
       as: "Option",
       exact: true,
     }),
-  },
+  }
 ) {}
 export class ClientAcnReady extends Schema.TaggedClass<ClientAcnReady>()(
   "Ready",
-  {
-    endpoint: AcnEndpointSchema,
-  },
+  {}
 ) {}
 export class ClientAcnFailed extends Schema.TaggedClass<ClientAcnFailed>()(
   "Failed",
@@ -76,7 +72,7 @@ export class ClientAcnFailed extends Schema.TaggedClass<ClientAcnFailed>()(
     stage: AcnFailureStageSchema,
     message: Schema.String.pipe(Schema.minLength(1)),
     retryable: Schema.Boolean,
-  },
+  }
 ) {}
 
 export const AcnLifecycleStateSchema = Schema.Union(
@@ -84,7 +80,7 @@ export const AcnLifecycleStateSchema = Schema.Union(
   ClientAcnStarting,
   ClientAcnInstalling,
   ClientAcnReady,
-  ClientAcnFailed,
+  ClientAcnFailed
 );
 export type AcnLifecycleState = typeof AcnLifecycleStateSchema.Type;
 
@@ -101,12 +97,11 @@ export const AcnLifecycleObservationSchema = Schema.Union(
     }),
   })
 );
-export type AcnLifecycleObservation =
-  typeof AcnLifecycleObservationSchema.Type;
+export type AcnLifecycleObservation = typeof AcnLifecycleObservationSchema.Type;
 
 /** Projects authoritative daemon startup state into client presentation state. */
 export const acnLifecycleObservationFromHealthState = (
-  state: AcnHealthState,
+  state: AcnHealthState
 ): Option.Option<AcnLifecycleObservation> => {
   if (state._tag !== "Starting") return Option.none();
   if (typeof state.activity !== "string") {
@@ -118,7 +113,7 @@ export const acnLifecycleObservationFromHealthState = (
             plan: state.activity.plan,
             progress: state.progress,
           }
-        : { _tag: "Starting", phase: state.activity },
+        : { _tag: "Starting", phase: state.activity }
     );
   }
   const phase = {
@@ -127,6 +122,24 @@ export const acnLifecycleObservationFromHealthState = (
     Starting: "LaunchingLocalInference",
   } as const;
   return Option.some({ _tag: "Starting", phase: phase[state.activity] });
+};
+
+/** Stable liveness key: changes only for authoritative phase or measured progress. */
+export const acnStartupProgressKey = (state: AcnHealthState): string => {
+  if (state._tag !== "Starting") return state._tag;
+  const activity =
+    typeof state.activity === "string"
+      ? state.activity
+      : state.activity._tag === "PreparingBackend"
+      ? `${state.activity._tag}:${state.activity.backend._tag}:${state.activity.backend.hardwareLabel}`
+      : `${state.activity._tag}:${state.activity.phase}:${state.activity.plan.daemonBytes}:${state.activity.plan.inferenceEngineBytes}`;
+  return Option.match(state.progress, {
+    onNone: () => activity,
+    onSome: (progress) =>
+      `${activity}:${progress.completed}:${progress.totalBytes}:${
+        progress.unit
+      }:${Option.getOrUndefined(progress.attempt) ?? ""}`,
+  });
 };
 
 export interface AcnLifecycle {
@@ -138,7 +151,7 @@ export interface AcnLifecycleOwner extends AcnLifecycle {
   readonly report: (
     observation: AcnLifecycleObservation
   ) => Effect.Effect<void>;
-  readonly ready: (endpoint: AcnEndpoint) => Effect.Effect<void>;
+  readonly ready: Effect.Effect<void>;
   readonly fail: (error: DaemonError) => Effect.Effect<void>;
 }
 
@@ -159,7 +172,7 @@ class ClientAcnInstallingAuthority extends Schema.TaggedClass<ClientAcnInstallin
       as: "Option",
       exact: true,
     }),
-  },
+  }
 ) {}
 
 const ClientAcnLifecycleFsm = FSM.defineFSM(
@@ -176,8 +189,8 @@ const ClientAcnLifecycleFsm = FSM.defineFSM(
     Installing: ["Starting", "Installing", "Ready", "Failed"],
     Ready: ["Starting"],
     Failed: ["Starting", "Installing", "Ready", "Failed"],
-  } as const,
-)
+  } as const
+);
 
 type InternalState =
   | ClientAcnChecking
@@ -300,14 +313,10 @@ const daemonErrorMessage = (error: DaemonError): string => {
       return `Magnitude executable was not found at ${error.path}`;
     case "BinaryVersionMismatch":
       return `Magnitude executable ${error.path} has version ${error.actual}; expected ${error.expected}`;
-    case "RegistrationFileInvalid":
-      return `Magnitude registration is invalid: ${error.reason}`;
     case "DownloadFailed":
       return error.reason;
     case "ChecksumMismatch":
       return "Downloaded Magnitude artifact failed integrity verification";
-    case "NoDaemon":
-      return "No Magnitude service is available";
   }
 };
 
@@ -319,7 +328,7 @@ const nonEmptyFailureMessage = (error: DaemonError): string => {
 export const makeAcnLifecycle = (): Effect.Effect<AcnLifecycleOwner> =>
   Effect.gen(function* () {
     const internal = yield* SubscriptionRef.make<InternalState>(
-      new ClientAcnChecking({}),
+      new ClientAcnChecking({})
     );
     const transitionLock = yield* Effect.makeSemaphore(1);
 
@@ -348,79 +357,79 @@ export const makeAcnLifecycle = (): Effect.Effect<AcnLifecycleOwner> =>
     const report = (
       observation: AcnLifecycleObservation
     ): Effect.Effect<void> =>
-      transitionLock.withPermits(1)(Effect.gen(function* () {
-        const current = yield* SubscriptionRef.get(internal);
-        if (observation._tag === "Starting") {
-          if (current._tag === "Installing" && typeof observation.phase === "string") return;
+      transitionLock.withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* SubscriptionRef.get(internal);
+          if (observation._tag === "Starting") {
+            if (
+              current._tag === "Installing" &&
+              typeof observation.phase === "string"
+            )
+              return;
+            yield* SubscriptionRef.set(
+              internal,
+              ClientAcnLifecycleFsm.transition(current, "Starting", {
+                phase: observation.phase,
+              })
+            );
+            return;
+          }
+
+          const now = yield* Clock.currentTimeMillis;
+          const daemonIncluded =
+            current._tag === "Installing"
+              ? current.daemonIncluded
+              : observation.phase === "DownloadingDaemon";
+          const currentOverall =
+            current._tag === "Installing" ? overallProgressAt(current, now) : 0;
+          const samePhase =
+            current._tag === "Installing" &&
+            current.phase === observation.phase;
           yield* SubscriptionRef.set(
             internal,
-            ClientAcnLifecycleFsm.transition(
-              current,
-              "Starting",
-              { phase: observation.phase },
-            ),
+            ClientAcnLifecycleFsm.transition(current, "Installing", {
+              phase: observation.phase,
+              plan: observation.plan,
+              daemonIncluded,
+              startedAtMillis: samePhase ? current.startedAtMillis : now,
+              maximumOverallProgress: currentOverall,
+              detail: observation.progress,
+            })
           );
-          return;
-        }
-
-        const now = yield* Clock.currentTimeMillis;
-        const daemonIncluded =
-          current._tag === "Installing"
-            ? current.daemonIncluded
-            : observation.phase === "DownloadingDaemon";
-        const currentOverall =
-          current._tag === "Installing"
-            ? overallProgressAt(current, now)
-            : 0;
-        const samePhase =
-          current._tag === "Installing" &&
-          current.phase === observation.phase;
-        yield* SubscriptionRef.set(
-          internal,
-          ClientAcnLifecycleFsm.transition(current, "Installing", {
-            phase: observation.phase,
-            plan: observation.plan,
-            daemonIncluded,
-            startedAtMillis: samePhase
-              ? current.startedAtMillis
-              : now,
-            maximumOverallProgress: currentOverall,
-            detail: observation.progress,
-          }),
-        );
-      }));
+        })
+      );
 
     return {
       get,
       changes,
       report,
-      ready: (endpoint) => transitionLock.withPermits(1)(
+      ready: transitionLock.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* SubscriptionRef.get(internal);
-          if (current._tag === "Ready" && current.endpoint.id === endpoint.id) {
-            return;
-          }
+          if (current._tag === "Ready") return;
           yield* SubscriptionRef.set(
             internal,
-            ClientAcnLifecycleFsm.transition(current, "Ready", { endpoint }),
+            ClientAcnLifecycleFsm.transition(current, "Ready", {})
           );
-        }),
+        })
       ),
       fail: (error) =>
-        transitionLock.withPermits(1)(Effect.gen(function* () {
-          const current = yield* SubscriptionRef.get(internal);
-          if (current._tag === "Ready") {
-            return;
-          }
-          yield* SubscriptionRef.set(
-            internal,
-            ClientAcnLifecycleFsm.transition(current, "Failed", {
-              stage: failureStage(current),
-              message: nonEmptyFailureMessage(error),
-              retryable: true,
-            }),
-          );
-        })),
+        transitionLock.withPermits(1)(
+          Effect.gen(function* () {
+            const current = yield* SubscriptionRef.get(internal);
+            if (current._tag === "Ready") {
+              return;
+            }
+            yield* SubscriptionRef.set(
+              internal,
+              ClientAcnLifecycleFsm.transition(current, "Failed", {
+                stage: failureStage(current),
+                message: nonEmptyFailureMessage(error),
+                retryable: true,
+              })
+            );
+          })
+        ),
     };
   });
 

@@ -22,5 +22,4 @@ export {
   type DisplayViewStreamInput,
   type DisplayViewStreamHandle,
 } from "./display-view-stream"
-export { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
-export { registrationPath, readRegistration, type AcnRegistration } from "./daemon-registration"
+export { defaultDataDir } from "./data-dir"

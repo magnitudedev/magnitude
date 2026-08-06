@@ -1,7 +1,6 @@
 ---
 applies_to:
   - packages/acn/src/service-lifecycle.ts
-  - packages/acn/src/daemon-lifecycle.ts
   - packages/acn/src/server.ts
   - packages/acn/src/activity-tracker.ts
   - packages/acn/src/resource-use-gate.ts
@@ -18,80 +17,78 @@ One ACN process owns one authoritative service lifecycle:
 Starting(activity, progress?) -> Ready -> Stopping(reason) -> exact exit
 ```
 
-`Exited` is observed externally through exact process identity; a process cannot publish proof of
-its own death.
-`Installing` is a client presentation of `Starting`, not an admission mode. Startup or runtime
-failure enters `Stopping`; terminal launch/removal failure is reported after exact process outcome.
+`Exited` is observed externally through exact process identity. `Installing` is a client
+presentation of `Starting`, not an admission mode. Startup or runtime failure enters `Stopping`.
 
-## Authority and admission
+## Process admission
 
-Health, lifecycle observation, RPC dispatch, root activity admission, and shutdown all read the
-same lifecycle value. `Ready` installs the complete RPC application and opens admission atomically.
-`Stopping` closes RPC and activity admission before it becomes observable; the first stop reason
-wins and the transition is monotonic and idempotent.
+A JIT candidate starts only a stable health/shutdown control server. It remains parent-bound until
+durable process state names its exact process and may not construct application or ICN services.
 
-The stable control server exists throughout startup. Health exposes authoritative startup activity,
-while application RPC rejects until `Ready`. Readiness requires the exact canonical grant and
-machine-owner epoch, the private ICN, and the complete application layer.
+After binding its control endpoint, the candidate atomically changes its exact candidate-owned
+revision to `Assigned`. That compare-and-set is process admission. Losing to takeover makes the
+candidate stop and exit without expensive initialization. Successful admission removes dependence
+on its launching manager and permits application startup.
 
-A healthy ACN retires only from explicit shutdown, idle policy, its own terminal failure, or a valid
-fenced revocation. Missing, unreadable, malformed, or delayed coordination evidence is uncertainty,
-not ownership loss. Revocation and admission share the fence, so no work is accepted after the grant
-is superseded.
+An assigned ACN does not poll coordination state or self-revoke on missing, unreadable, or newer
+state. Retirement begins only through exact explicit shutdown, idle policy, its own terminal failure,
+or process signals. Replacement state continues to carry the exact predecessor until an external
+manager proves it and its ICN absent.
 
-Startup has two deliberately different liveness bounds. External JIT ensurance treats 30 seconds
-without an authoritative phase change or monotonic measured progress as a stalled exact candidate
-and begins fenced replacement. Independently, ACN owns a five-minute absolute ceiling from
-application startup entry; it never restarts, even when progress changes, and expiry commits
-`Stopping(startup-failed)`. The shorter window prevents a hung candidate from blocking clients,
-while the process-owned ceiling guarantees terminalization even if every observing client exits.
+## Readiness and admission
+
+Health, lifecycle observation, application RPC dispatch, root activity admission, and shutdown read
+one lifecycle value. The control server exists throughout startup. Application RPC rejects until
+the complete application and private ICN exist.
+
+`Ready` installs the RPC application and opens work admission atomically. `Stopping` closes RPC and
+activity admission before becoming observable. The first stop reason wins; both transitions are
+monotonic and idempotent.
+
+External JIT ensurance treats thirty seconds without authoritative phase change or monotonic
+measured progress as a stalled exact `Starting` instance and begins coordinated replacement. ACN
+independently owns a five-minute absolute application-startup ceiling that never restarts. Expiry
+commits `Stopping(startup-failed)`.
 
 ## Activity and idleness
 
-ACN stops after 30 minutes without work. The first idle period begins only after readiness. A finite
-RPC holds a claim for the entire handler; shared work continuing after a request retains its own
-scoped claim according to [operation ownership](../../architecture/operation-ownership.md).
+ACN stops after thirty minutes without work. The first idle period begins only after readiness. A
+finite RPC retains demand for its whole handler; shared work continuing after a request retains its
+own scoped demand according to [operation ownership](../../architecture/operation-ownership.md).
 
-Observation does not retain ACN: health, subscriptions, status and file watches, mirror refetch,
-display streams, ICN observation, telemetry, and introspection are non-demand. The loopback HTTP
-server imposes no idle deadline on an active handler; elapsed response time is never service failure.
-
-The final claim starts the idle timer. Claim acquisition and retirement commit are serialized, so
-work cannot enter a generation being destroyed and stale cleanup cannot affect a successor.
+Health, subscriptions, status/file watches, mirror refetch, display streams, ICN observation,
+telemetry, and introspection are non-demand. The final demand release starts the idle timer. Demand
+admission and retirement commit are serialized so work cannot enter a service being destroyed.
 
 ## Shutdown
 
-Every stop cause uses one process-owned, single-flight terminalization:
+Every stop cause uses one process-owned, single-flight shutdown:
 
 ```text
 commit Stopping and close admission
-  -> atomically detach subscriptions
-  -> bounded best-effort terminal delivery and transport close
-  -> close application and resident session scopes
+  -> terminate subscriptions and transports
+  -> close application and session scopes
   -> terminate and reap private ICN
-  -> release exact machine ownership and instance visibility
-  -> host observes exact ACN exit
+  -> clear ICN ownership only after exact exit proof
+  -> exit ACN
+  -> external manager proves ACN exit and advances process state
 ```
 
-ACN shutdown closes session scopes directly; it does not wait on session idle retirement whose work
-claims belong to those scopes. Caller interruption cannot abandon shutdown. Notification writes,
-fiber interruption, finalizers, cooperative cleanup, ICN shutdown, signal, kill, and reaping are
-bounded within an overall teardown limit.
+Caller interruption cannot abandon shutdown. Application-scope closure, notification, fiber,
+finalizer, ICN, signal, kill, and reap work are bounded. If ACN cannot clear its recorded ICN
+ownership, process state retains the exact child for manager reconciliation. The ACN never removes
+or reassigns its own ACN occurrence.
 
-ACN retains machine ownership until normal teardown has reaped ICN. If the cooperative limit
-expires, the client holding the fenced JIT replacement claim escalates exact process removal; the
-ACN does not release ownership merely because its own cleanup stalled. Timeout causes escalation or
-typed failure, never proof of death or ownership theft.
-
-The stable control router accepts an exact fenced shutdown request before application readiness.
-The request idempotently commits `Stopping` and returns after that transition; it does not wait for
-teardown. A mismatched instance or epoch cannot stop the process.
+The control router accepts exact-instance shutdown before application readiness. A matching request
+idempotently commits `Stopping` and returns after that transition; a request for another occurrence
+cannot stop the process.
 
 ## Guarantees
 
-- One lifecycle value governs health, readiness, admission, idleness, and shutdown.
-- Every nonterminal phase has a live owner capable of terminalizing it.
-- No application work is admitted outside the exact fenced `Ready` grant.
-- Observation cannot retain ACN; elapsed operation duration cannot replace it.
-- Shutdown cannot be retained indefinitely by subscribers, sessions, finalizers, or ICN.
-- Ownership is released only after dependent runtime authority has ended.
+- One lifecycle value governs health, readiness, work admission, idleness, and shutdown.
+- No application or ICN work starts before exact process admission.
+- Losing candidate admission cannot initialize expensive resources.
+- No application work is admitted outside the exact assigned `Ready` ACN.
+- Missing or unreadable process state cannot make a healthy assigned ACN self-destruct.
+- Observation cannot retain ACN, and operation duration cannot replace it.
+- Shutdown is single-flight, bounded, and retains exact child identity until exit proof.

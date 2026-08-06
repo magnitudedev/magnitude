@@ -1,18 +1,16 @@
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { RpcClient } from "@effect/rpc"
-import { AcnVersionRegistryJson } from "@magnitudedev/acn-protocol"
 import {
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
-  DaemonDiscovery,
-  DaemonLauncher,
+  AcnProcessManager,
   MagnitudeRpcs,
   makeAcnJitRuntime,
-  makeLocalDaemonDiscovery,
-  makeLocalDaemonLauncher,
+  makeLocalAcnProcessManager,
+  type AcnInstance,
 } from "@magnitudedev/sdk"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Effect, Exit, Layer, Option, Schema, Scope } from "effect"
 import {
   mkdir,
   mkdtemp,
@@ -21,7 +19,7 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { resolve } from "node:path"
 import { releaseUrl } from "@magnitudedev/release/acquisition"
 import { ReleaseManifestSchema } from "@magnitudedev/release/contracts"
 import { currentHost } from "@magnitudedev/release/targets"
@@ -99,6 +97,15 @@ const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let serverRunning = true
+const processManagerScope = await Effect.runPromise(Scope.make())
+
+const processManager = await Effect.runPromise(
+  makeLocalAcnProcessManager({ dataDir }).pipe(
+    Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
+    Effect.provideService(Scope.Scope, processManagerScope),
+    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+  ),
+)
 
 const environment = (home: string) => ({
   ...process.env,
@@ -150,29 +157,33 @@ const descendantsOf = (
 }
 
 const registeredProcess = async (): Promise<{
-  readonly pid: number
+  readonly instance: AcnInstance
   readonly descendants: readonly number[]
 }> => {
-  const registry = Schema.decodeUnknownSync(AcnVersionRegistryJson)(
-    await readFile(join(dataDir, "acn", "registry.json"), "utf8"),
+  const observed = await Effect.runPromise(processManager.observeCurrent)
+  const current = Option.getOrThrowWith(
+    observed,
+    () => new Error("release bootstrap left no current ACN"),
   )
-  if (Option.isNone(registry.registration)) {
-    throw new Error("release bootstrap left no registered ACN")
-  }
-  const pid = registry.registration.value.pid
+  const pid = current.pid
   if (!processIsAlive(pid)) {
     throw new Error(`release bootstrap ACN ${pid} exited before teardown`)
   }
   return {
-    pid,
+    instance: current,
     descendants: descendantsOf(pid, await processTree()),
   }
 }
 
 const terminateBootstrap = async (): Promise<void> => {
   const registered = await registeredProcess()
-  process.kill(registered.pid, "SIGTERM")
-  const ownedProcesses = [registered.pid, ...registered.descendants]
+  let terminationFailure: unknown
+  try {
+    await Effect.runPromise(processManager.terminate(registered.instance))
+  } catch (cause) {
+    terminationFailure = cause
+  }
+  const ownedProcesses = [registered.instance.pid, ...registered.descendants]
   const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS
   while (
     ownedProcesses.some(processIsAlive) &&
@@ -181,7 +192,10 @@ const terminateBootstrap = async (): Promise<void> => {
     await Bun.sleep(100)
   }
   const survivors = ownedProcesses.filter(processIsAlive)
-  if (survivors.length === 0) return
+  if (survivors.length === 0) {
+    if (terminationFailure !== undefined) throw terminationFailure
+    return
+  }
   for (const pid of survivors) {
     try {
       process.kill(pid, "SIGKILL")
@@ -195,22 +209,10 @@ const terminateBootstrap = async (): Promise<void> => {
 }
 
 const probeBootstrap = Effect.gen(function* () {
-  const options = {
-    dataDir,
-    version: manifest.version,
-  }
-  const discovery = yield* makeLocalDaemonDiscovery({ dataDir }).pipe(
-    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-  )
-  const launcher = yield* makeLocalDaemonLauncher(options).pipe(
-    Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
-    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-  )
   const runtime = yield* makeAcnJitRuntime({
     launchCommand: Option.none(),
   }).pipe(
-    Effect.provideService(DaemonDiscovery, discovery),
-    Effect.provideService(DaemonLauncher, launcher),
+    Effect.provideService(AcnProcessManager, processManager),
   )
 
   yield* runtime.startup.prepare
@@ -253,9 +255,9 @@ const acceptBootstrap = async (): Promise<void> => {
       )
     }
     const registered = await registeredProcess()
-    if (registered.pid !== health.pid) {
+    if (registered.instance.pid !== health.pid) {
       throw new Error(
-        `release bootstrap health PID ${health.pid} differs from registration ${registered.pid}`,
+        `release bootstrap health PID ${health.pid} differs from registration ${registered.instance.pid}`,
       )
     }
     accepted = true
@@ -320,6 +322,7 @@ try {
   serverRunning = false
   await acceptBootstrap()
 } finally {
+  await Effect.runPromise(Scope.close(processManagerScope, Exit.void))
   if (serverRunning) server.stop(true)
   await rm(root, { recursive: true, force: true })
 }

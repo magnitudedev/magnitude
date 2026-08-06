@@ -2,8 +2,6 @@ import { Schema } from "effect";
 import { Rpc, RpcClientError } from "@effect/rpc";
 import { StreamDisplayView, WatchFile } from "@magnitudedev/acn-protocol";
 
-export class NoDaemon extends Schema.TaggedError<NoDaemon>()("NoDaemon", {}) {}
-
 export class DaemonDiscoveryFailed extends Schema.TaggedError<DaemonDiscoveryFailed>()(
   "DaemonDiscoveryFailed",
   {
@@ -31,14 +29,6 @@ export class BinaryVersionMismatch extends Schema.TaggedError<BinaryVersionMisma
     path: Schema.String,
     expected: Schema.String,
     actual: Schema.String,
-  }
-) {}
-
-export class RegistrationFileInvalid extends Schema.TaggedError<RegistrationFileInvalid>()(
-  "RegistrationFileInvalid",
-  {
-    path: Schema.String,
-    reason: Schema.String,
   }
 ) {}
 
@@ -77,12 +67,10 @@ export class DaemonCrashed extends Schema.TaggedError<DaemonCrashed>()(
  * `instanceof` chains.
  */
 export const DaemonError = Schema.Union(
-  NoDaemon,
   DaemonDiscoveryFailed,
   DaemonSpawnFailed,
   BinaryNotFound,
   BinaryVersionMismatch,
-  RegistrationFileInvalid,
   DownloadFailed,
   ChecksumMismatch,
   DaemonCrashed

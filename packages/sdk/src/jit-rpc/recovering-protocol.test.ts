@@ -13,9 +13,14 @@ import {
   type RecoveringStreamProtocol,
 } from "./recovering-stream-protocol"
 import {
-  AcnOwnerIdSchema,
-  type AcnEndpoint,
+  AcnInstanceIdSchema,
 } from "@magnitudedev/acn-protocol"
+
+interface TestEndpoint {
+  readonly id: ReturnType<typeof AcnInstanceIdSchema.make>
+  readonly version: string
+  readonly url: string
+}
 
 const { RpcClientError: TransportError } = RpcClientError
 
@@ -80,8 +85,10 @@ type Attempt =
 
 const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
   let calls = 0
+  const requests: HttpClientRequest.HttpClientRequest[] = []
   const client = HttpClient.make((request) =>
     Effect.suspend(() => {
+      requests.push(request)
       const attempt = attempts[Math.min(calls, attempts.length - 1)]
       calls++
       if (attempt.kind === "refuse") {
@@ -99,7 +106,7 @@ const makeFakeHttp = (attempts: ReadonlyArray<Attempt>) => {
       return attempt.delay === undefined ? response : response.pipe(Effect.delay(attempt.delay))
     })
   )
-  return { client, calls: () => calls }
+  return { client, calls: () => calls, requests: () => requests }
 }
 
 // ─── Fake access ───────────────────────────────────────────────────────────
@@ -110,10 +117,10 @@ const makeFakeEndpointAccess = (options: {
 }) => {
   let currentCalls = 0
   let startCalls = 0
-  let selected: AcnEndpoint | null = null
+  let selected: TestEndpoint | null = null
   const fallbackStartUrl = options.current.find(Option.isSome)?.value ?? "http://started"
-  const endpoint = (url: string, id: string = url): AcnEndpoint => ({
-    id: AcnOwnerIdSchema.make(id),
+  const endpoint = (url: string, id: string = url): TestEndpoint => ({
+    id: AcnInstanceIdSchema.make(id),
     version: "1.0.0",
     url,
   })
@@ -140,7 +147,7 @@ const makeFakeEndpointAccess = (options: {
         Effect.tap((value) => Effect.sync(() => { selected = value })),
       )
     }),
-    recover: (failed: AcnEndpoint) => Effect.suspend(() => {
+    recover: (failed: TestEndpoint) => Effect.suspend(() => {
       if (selected !== null && selected.id !== failed.id) {
         return Effect.succeed(selected)
       }
@@ -197,8 +204,8 @@ const classifyInfraError = (
 
 const withClient = <A, E>(
   access: {
-    readonly endpoint: Effect.Effect<AcnEndpoint>
-    readonly recover: (failed: AcnEndpoint) => Effect.Effect<AcnEndpoint>
+    readonly endpoint: Effect.Effect<TestEndpoint>
+    readonly recover: (failed: TestEndpoint) => Effect.Effect<TestEndpoint>
   },
   http: HttpClient.HttpClient,
   use: (client: FakeClient) => Effect.Effect<A, E>,
@@ -208,7 +215,7 @@ const withClient = <A, E>(
       Effect.gen(function* () {
         const client = yield* RpcClient.make(FakeRpcs).pipe(
           Effect.provide(
-            recoveringProtocolLayer<never>({
+            recoveringProtocolLayer<never, TestEndpoint>({
               endpoint: access.endpoint,
               recover: access.recover,
               rpcPath: "/rpc",
@@ -258,7 +265,7 @@ const collectEvents = (client: FakeClient) =>
 describe("recovering protocol — operation contract", () => {
   it("dispatches optimistically against a discovered daemon (no spawn)", async () => {
     const { access, startCalls } = makeFakeEndpointAccess({ current: [Option.some("http://daemon-1")] })
-    const { client, calls } = makeFakeHttp([
+    const { client, calls, requests } = makeFakeHttp([
       { kind: "lines", make: (id) => [exitMessage("Ping", id, Exit.succeed("pong"))] },
     ])
 
@@ -269,6 +276,7 @@ describe("recovering protocol — operation contract", () => {
     expect(result).toBe("pong")
     expect(calls()).toBe(1)
     expect(startCalls()).toBe(0)
+    expect(requests()[0]?.headers["x-magnitude-acn-id"]).toBe("http://daemon-1")
   })
 
   it("does not recover or replay a healthy unary request because its response is slow", async () => {

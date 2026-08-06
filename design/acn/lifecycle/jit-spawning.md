@@ -1,162 +1,197 @@
 ---
 applies_to:
   - packages/sdk/src/acn-jit/**
-  - packages/acn/src/daemon-registration.ts
-  - packages/acn/src/machine-ownership.ts
-  - packages/acn/src/peer-acn.ts
-  - packages/acn/src/process-identity.ts
-  - packages/acn/src/daemon-lifecycle.ts
-  - packages/acn-protocol/src/acn-registry.ts
-  - packages/acn-protocol/src/schemas/acn-health.ts
+  - packages/acn-protocol/src/acn-identity.ts
+  - packages/acn-protocol/src/process-state.ts
+  - packages/acn/src/server.ts
+  - packages/acn/src/icn/**
   - desktop/src/main.ts
   - web/scripts/dev-server.ts
 ---
 
 # JIT ACN ensurance and upgrades
 
-For one Magnitude data root, clients converge on one canonical ACN. There is no separate
-coordinator process: the SDK performs JIT ensurance locally, while desktop main and the web host
-perform the same operation for clients without filesystem and process access.
-
-`ensure(target)` means that, while the host remains capable of running the target, the operation
-keeps reconciling until a compatible ACN is `Ready`. Missing publication, a hung `Starting` ACN, an
-abandoned launch, and another client disappearing are intermediate conditions, not successful
-absence or reasons to give up. An unreapable process, unavailable artifact, or failed host primitive
-is a typed terminal failure because automatic convergence is no longer possible.
-
-## Targets and client upgrade
-
-Compatibility and precedence are separate:
-
-| Identity | Meaning |
-| --- | --- |
-| Coordination protocol | Whether clients and ACNs understand the machine-state envelope |
-| RPC protocol | Whether a client may use the ACN |
-| Storage protocol | Whether the ACN may use the data root |
-| Release target | Reproducible artifact and deterministic replacement priority |
-
-Product version is diagnostic metadata unless it identifies a reproducible release target.
-Development targets use stable artifact identity rather than wall-clock build time.
-
-Each client starts with its bundled target and owns a monotonic `effectiveTarget`. Observing a
-compatible higher-priority ACN in either `Starting` or `Ready` immediately advances that target.
-All later selection, recovery, artifact resolution, and spawning use `effectiveTarget`; it never
-moves backward during the client process lifetime.
-
-Consequently, an older client may continue against a compatible newer ACN, but can never revive its
-older ACN afterward. If the newer startup fails, that client ensures another instance of the newer
-effective target. Incompatible clients fail locally rather than launching a competing ACN.
-
-## Machine coordination
-
-The shared data root contains only the state needed for clients and ACNs to coordinate:
+For one Magnitude data root, independent client hosts coordinate to obtain one usable ACN. There is
+no coordinator process. `AcnJitRuntime` owns client policy; `AcnProcessManager` owns local ACN process
+reconciliation; one durable `AcnProcessState` serializes independent managers and candidate ACNs.
 
 ```text
-spawn claim               exact client process, token, target, lease
-canonical registration    exact ACN identity, target, endpoint, process identity
-machine owner             exact ACN runtime owner
-instance records          exact processes available for reconciliation and cleanup
+AcnJitRuntime --ensure(identity)--> AcnProcessManager <--> AcnProcessState
+                                           |
+                                           +--> exact candidate ACN
 ```
 
-The spawn claim serializes mutation across independent clients. Acquisition revalidates canonical
-state. A live claim cannot be bypassed merely because a waiter is impatient. If the claim owner
-stops renewing its bounded lease, takeover publishes a new fencing token; the former owner can no
-longer publish, replace, or remove anything.
+`ensure(identity)` converges on that identity or a newer usable `Ready` ACN. Missing assignment,
+active replacement, delayed startup, manager death, and takeover are intermediate states. Ensurance
+ends only with a usable exact instance or a typed condition that prevents safe convergence.
 
-An ACN may publish canonical state only for the current claim and target. Publication is
-process-safe and rejects a lower-priority target when an equal or higher target is canonical or
-being admitted. Scheduling and last-writer order cannot move the target backward.
+## Identity
 
-Registration, health, RPC dispatch, shutdown, and cleanup bind the exact ACN and process-start
-identity. A PID or URL alone never grants authority. Missing, malformed, unreadable, or timed-out
-evidence is reconciled under the spawn claim; it is not silently converted into authoritative
-absence.
+ACN version is ACN identity. An ACN instance ID plus PID and process-start identity identifies one
+exact process occurrence. No protocol, SDK, target, priority, generation, or coordination identity
+competes with ACN version.
 
-## Ensurance
+Each client starts from its bundled identity and permanently adopts a usable newer `Starting` or
+`Ready` ACN. Durable process state also retains a monotonic `identityFloor`. Every launch targets the
+higher of the caller identity and that floor, so a client that has not yet observed an upgrade
+cannot revive an older ACN.
 
-Every initial connection and recovery uses the same operation:
+An equal or lower request joins a sufficient assigned ACN or active change. Artifact resolution is
+caller-owned preparation, not authority: after resolution the manager rereads process state and
+classifies the request again. It may use the artifact only when its identity still equals the target
+the request is authorized to start. A higher request atomically raises an active change target and
+identity floor while preserving the change identity. A lower candidate then either loses admission
+or, if it already won, is replaced as the exact assigned predecessor.
+
+## ACN process state
+
+The highest complete immutable revision is the complete assignment authority:
 
 ```text
-Ready compatible ACN
-  -> advance effectiveTarget if needed
-  -> return it
-
-Starting compatible ACN
-  -> advance effectiveTarget if needed
-  -> observe that exact startup within its bounded window
-
-No usable ACN
-  -> allow the publication grace
-  -> acquire the spawn claim and revalidate
-  -> join any resulting acceptable startup or spawn effectiveTarget
-
-Starting attempt exceeds its window
-  -> acquire/take over the spawn claim and revalidate
-  -> fence, stop, and reap that exact attempt
-  -> spawn effectiveTarget
+AcnProcessState
+  revision          compare-and-set fence
+  identityFloor     monotonic launch floor
+  mode
+    Unassigned
+    Assigned(exact ACN, optional exact ICN)
+    Changing(change identity, purpose, exact owner, phase)
 ```
 
-An expired deadline authorizes revalidation and takeover, never an uncoordinated second spawn. A
-new candidate is not started until the previous candidate and its owned ICN are proven exited. If
-exact removal cannot be proven, ensurance fails as blocked rather than accumulating processes.
+`Changing` is owned either by an exact manager process reconciling `RetiringAssigned`,
+`RetiringCandidate`, `BlockedCandidateCleanup`, or `Spawning`, or by the exact unadmitted candidate
+responsible for admission. Only one change and one owner exist. A blocked cleanup phase retains the
+exact unreaped candidate and typed reason; it never authorizes another spawn.
 
-The desired outcome is a compatible canonical endpoint, not survival of a particular child. If
-another client wins with an acceptable target, every waiter succeeds with that ACN. Caller
-cancellation ends only that observation; it does not make an already spawned process unowned.
+Writers read revision `N`, validate one typed command through the state reducer, and exclusively
+publish complete revision `N+1`. Concurrent writers for `N+1` have one winner. The revision is the
+only fencing value; there is no launch term, election token, lease, heartbeat, current pointer,
+instance inventory, completion marker, machine-owner record, or separate owned-ICN record.
 
-## Timing semantics
+Malformed or unreadable highest state is a typed protocol failure. It is never skipped or treated as
+absence. Revisions are not deleted on the correctness path.
 
-Every duration answers one question and has one expiry action:
-
-| Timing | Justification | Expiry permits |
-| --- | --- | --- |
-| 2-second publication grace | Covers the short local gap in which another client has begun launch-related filesystem/process work but its early ACN registration is not yet observable. It is coalescing grace for file publication and process scheduling, not an ACN health judgment. | Contend for the spawn claim and revalidate. It does not prove that an ACN died or permit bypassing another live claim. |
-| 30-second startup stall window | Bounds trust in an exact, observable `Starting` ACN. Thirty seconds is deliberately much larger than normal local phase transitions while detecting a candidate hung in backend preparation far sooner than the process-wide ceiling. | Take over ensurance, revalidate the exact candidate, and begin its bounded removal. It does not permit a concurrent spawn. |
-| 5-minute absolute ACN startup ceiling | Bounds the entire ACN-owned application startup even if phases or reported progress continue changing. It prevents progress churn or a defective client from retaining `Starting` forever. | The ACN commits `Stopping(startup-failed)` and terminalizes its process-owned runtime. External ensurance then reaps or replaces it. |
-
-The publication grace begins only while no usable registration is visible and ends immediately when
-an exact `Starting` or `Ready` ACN appears. It is not restarted by repeated empty reads.
-
-The startup stall window is scoped to one exact ACN instance. A real phase transition or monotonic
-measured progress restarts it; repeated health responses, estimated animation progress, or unchanged
-values do not. A replacement instance receives its own window. The five-minute ceiling never
-restarts.
-
-Transport request duration is not one of these clocks. A slow application RPC does not imply ACN
-failure and cannot initiate JIT replacement.
-
-## Exact replacement and cleanup
-
-Replacement first fences the exact canonical attempt so it can no longer win publication or admit
-new work, then performs:
+## Assignment changes
 
 ```text
-request cooperative shutdown
-  -> bounded exact-exit wait
-  -> revalidate and terminate
-  -> bounded exact-exit wait
-  -> revalidate, force kill, and reap/prove death
-  -> prove the owned ICN exited
-  -> remove only exact instance records
-  -> permit the next spawn
+Unassigned
+  -> Changing(manager, Ensure(target), Spawning)
+  -> Changing(candidate)
+  -> Assigned(candidate)
+
+Assigned(current)
+  -> Changing(manager, Ensure(target), RetiringAssigned(current))
+  -> Changing(manager, Ensure(target), Spawning)
+  -> Changing(candidate)
+  -> Assigned(candidate)
 ```
 
-Timeout advances this escalation or returns a typed unreapable-process failure. It never proves
-death. Delayed cleanup validates identity again and cannot remove a successor.
+Beginning replacement does not revoke the predecessor. `RetiringAssigned` continues to identify the
+admitted ACN while the manager requests shutdown, escalates against that exact occurrence, and
+proves its recorded ICN absent. Only that proof permits `Spawning`. Failed proof returns a typed
+blocked result while retaining the unreaped occurrence; it never authorizes another candidate.
 
-## Guarantees and verification
+After spawn, the manager records the exact candidate and atomically transfers change ownership to
+it. Before that transfer the candidate is parent-bound and may not initialize application services.
+The candidate binds its stable control endpoint and admits itself by compare-and-setting the exact
+candidate-owned revision to `Assigned`. Only successful admission permits application or ICN
+startup.
 
-- JIT ensurance converges to `Ready` or a typed condition that makes convergence impossible.
-- A compatible higher target immediately and permanently upgrades every observing client's
-  effective target.
-- A lower target cannot displace or follow an admitted higher target.
-- Publication grace, startup stall, absolute startup, and cleanup bounds are never interchangeable.
-- At most one client owns spawn mutation and at most one ACN owns the runtime.
-- No replacement spawns before exact ACN and ICN cleanup completes.
-- A hung client, launch claim, ACN startup, or cleanup path cannot block ensurance forever.
-- Observation uncertainty and application latency do not independently authorize mutation.
+The raw child is a scoped pre-handoff resource. Spawn succeeds only with a PID and immediately
+installs bounded stop-and-reap cleanup. The manager then obtains process-start identity and commits
+the exact candidate to process state. Only that successful commit permits one atomic handoff that
+releases the bootstrap gate and disarms scoped cleanup:
 
-Conformance covers independent CLI, desktop, and web clients; older clients recovering while a
-newer ACN remains `Starting` beyond two seconds; every claim and startup owner hanging; unchanged
-and advancing progress; failure at the five-minute ceiling; caller exit; PID reuse; and cleanup that
-cannot prove ICN exit. Tests assert the invariants after every transition, not only at completion.
+```text
+spawn in child scope
+  -> failure/cancellation before handoff: scope stops and reaps child
+  -> CandidateSpawned CAS
+  -> handoff: release bootstrap and disarm scope cleanup
+  -> durable process state owns recovery
+```
+
+The spawner internally owns the exit observation needed for bounded cleanup and does not pipe child
+output into lifecycle outcomes. Its returned child handle exposes only the mandatory PID and this one ownership transfer, not general
+process observation or killing policy. After handoff, cleanup addresses the exact occurrence retained in process state. If the
+manager dies before handoff, parent-pipe EOF makes the child exit; if handoff fails, scoped cleanup
+remains armed.
+
+Admission and takeover contend on the same next revision:
+
+```text
+candidate wins -> Assigned; takeover must preserve it
+manager wins   -> candidate admission fails; candidate exits without ICN
+```
+
+Candidate replacement and candidate failure are distinct transitions. A live stalled or
+lower-identity candidate is retired before the manager returns to `Spawning`. A candidate already
+proven dead without admission commits `Unassigned(Failed)`; the same failed artifact is not retried
+without a new ensure request. Failure to prove candidate exit enters `BlockedCandidateCleanup`.
+
+`terminate(instance)` uses the same state machine with `Terminate` purpose and can affect only the
+exact supplied assigned occurrence. It never enumerates or kills peers.
+
+Assignment results—admitted, terminated, or failed before admission—are retained in the current
+terminal `Assigned` or `Unassigned` state. A later change may replace that result; callers converge
+on current truth rather than querying historical operation outcomes. ACN readiness remains owned by
+the ACN service lifecycle.
+
+## Ensurance and timing
+
+```text
+usable Ready ACN
+  -> adopt newer identity
+  -> select exact instance
+
+usable Starting ACN
+  -> adopt newer identity
+  -> observe exact progress
+
+no usable current ACN
+  -> two-second publication grace
+  -> processManager.launch(identity)
+  -> join or advance current assignment change
+
+Starting stalls
+  -> processManager.launch(identity, replace = exact instance)
+  -> coordinated replacement
+```
+
+| Timing                                | Meaning                                                                                                        | Expiry action                                                                |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| 2-second publication grace            | Covers short filesystem and process-scheduling publication gaps. It is not a health deadline.                  | Enter `launch`, which rereads state and joins or atomically begins a change. |
+| 30-second change/startup stall        | Bounds continuous observation of one unchanged active owner or one exact `Starting` ACN without real progress. | Contend for takeover or replacement through state compare-and-set.           |
+| 5-minute absolute ACN startup ceiling | Bounds ACN-owned application startup even if progress continues.                                               | ACN enters `Stopping(startup-failed)` and cleans its runtime.                |
+
+For an active change, exact owner death permits immediate takeover. A live owner requires thirty
+seconds of continuously unchanged authoritative state. A revision, phase, or owner change restarts
+observation. Repeated reads and animation do not count as progress.
+
+For an assigned `Starting` ACN, authoritative phase change or monotonic measured progress restarts
+its stall window. Application RPC duration is not a coordination clock.
+
+Artifact preparation before `Changing` remains caller-owned and interruptible. The successful
+transition to `Changing` and creation of its reconciliation fiber form one uninterruptible admission
+step into the scoped local process manager. Caller or remote-stream cancellation after admission
+removes only that observer. Host shutdown closes the manager scope; durable owner and phase state
+remain for another manager to take over.
+
+## Guarantees
+
+- One state revision is the complete assignment authority.
+- One compare-and-set winner may change assignment; stale writers cannot commit.
+- Identity floor and active change target never regress.
+- A higher target upgrades one active change rather than creating a competing operation.
+- Artifact resolution never grants authority and an artifact is launched only for its exact target.
+- No candidate is admitted before exact predecessor ACN and admitted ICN cleanup.
+- No unadmitted candidate may start application or ICN work.
+- Every spawned child is scope-owned until its exact durable handoff; every pre-handoff exit path
+  stops and reaps it.
+- Candidate admission and takeover cannot both win.
+- Dead and stalled owners are recoverable without unfenced spawn.
+- Candidate failure cannot become an implicit unbounded retry loop.
+- Observation uncertainty and elapsed application work do not authorize mutation.
+- Repeated startup failure cannot accumulate admitted ACNs or CUDA-owning ICNs.
+
+The unavoidable raw `spawn`-to-publication interval contains no expensive work. A literal guarantee
+that a second kernel process can never briefly exist would require a resident supervisor, which is
+not part of this design.

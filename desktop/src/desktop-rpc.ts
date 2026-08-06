@@ -1,12 +1,14 @@
 import { Rpc, RpcClient, RpcClientError, RpcGroup } from "@effect/rpc"
-import { Option, Schema } from "effect"
+import { Schema } from "effect"
 import { MenuActionSchema, type MenuAction } from "@magnitudedev/client-common/src/types/menu-action"
 import {
-  DaemonLaunchEventSchema,
-  DaemonStatusSchema,
-  type DaemonLaunchEvent,
-  type DaemonStatus,
+  AcnLaunchEventSchema,
+  AcnLaunchRequestSchema,
+  DaemonError,
+  type AcnLaunchEvent,
+  type AcnLaunchRequest,
 } from "@magnitudedev/sdk"
+import { AcnInstanceSchema, type AcnInstance } from "@magnitudedev/sdk"
 
 export type { MenuAction }
 
@@ -31,21 +33,21 @@ export interface OpenFileOptions {
 }
 
 export const DesktopRpcs = RpcGroup.make(
-  Rpc.make("DaemonCurrent", {
+  Rpc.make("AcnCurrent", {
     payload: Unit,
-    success: Schema.NullOr(DaemonStatusSchema),
-    error: DesktopRpcError,
+    success: Schema.NullOr(AcnInstanceSchema),
+    error: DaemonError,
   }),
-  Rpc.make("DaemonLaunch", {
-    payload: Schema.Struct({
-      command: Schema.optionalWith(Schema.Array(Schema.String), {
-        as: "Option",
-        exact: true,
-      }),
-    }),
-    success: DaemonLaunchEventSchema,
-    error: DesktopRpcError,
+  Rpc.make("AcnLaunch", {
+    payload: AcnLaunchRequestSchema,
+    success: AcnLaunchEventSchema,
+    error: DaemonError,
     stream: true,
+  }),
+  Rpc.make("AcnTerminate", {
+    payload: Schema.Struct({ instance: AcnInstanceSchema }),
+    success: Unit,
+    error: DaemonError,
   }),
   Rpc.make("StorageGet", {
     payload: Schema.Struct({ key: Schema.String }),
@@ -101,14 +103,13 @@ export type DesktopPlatform = "darwin" | "win32" | "linux"
 
 export interface DesktopApi {
   readonly platform: DesktopPlatform
-  readonly daemonDiscovery: {
-    current(): Promise<DaemonStatus | null>
-  }
-  readonly daemonLauncher: {
+  readonly acnProcessManager: {
+    current(): Promise<AcnInstance | null>
     launch(
-      command: Option.Option<ReadonlyArray<string>>,
-      onEvent: (event: DaemonLaunchEvent) => void,
+      request: AcnLaunchRequest,
+      onEvent: (event: AcnLaunchEvent) => void,
     ): Promise<void>
+    terminate(instance: AcnInstance): Promise<void>
   }
   readonly onMenuAction: (cb: (action: MenuAction) => void) => () => void
   readonly quit: () => void

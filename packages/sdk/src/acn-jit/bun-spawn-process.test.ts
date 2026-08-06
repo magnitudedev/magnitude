@@ -1,29 +1,24 @@
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { BunDetachedChildProcessSpawner } from "./bun-spawn-process"
 
 describe("BunDetachedChildProcessSpawner", () => {
-  it("drains stdout and stderr into a bounded diagnostic tail", async () => {
-    const spawned = await Effect.runPromise(
-      BunDetachedChildProcessSpawner.spawn([
-        globalThis.process.execPath,
-        "-e",
-        [
-          `process.stdout.write("x".repeat(${70 * 1024}), () => {`,
-          `  process.stderr.write("candidate failed\\n", () => process.exit(7))`,
-          "})",
-        ].join(";"),
-      ]),
+  it("returns a scope-owned candidate with a mandatory PID", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const spawned = yield* BunDetachedChildProcessSpawner.spawn([
+            globalThis.process.execPath,
+            "-e",
+            [
+              `process.stdout.write("x".repeat(${70 * 1024}), () => {`,
+              `  process.stderr.write("candidate failed\\n", () => process.exit(7))`,
+              "})",
+            ].join(";"),
+          ])
+          expect(spawned.pid).toBeGreaterThan(0)
+        }),
+      ),
     )
-
-    expect(await Effect.runPromise(spawned.exited)).toBe(7)
-    const diagnostic = await Effect.runPromise(spawned.diagnostic)
-    expect(Option.isSome(diagnostic)).toBe(true)
-    if (Option.isSome(diagnostic)) {
-      expect(new TextEncoder().encode(diagnostic.value).byteLength).toBeLessThanOrEqual(
-        64 * 1024,
-      )
-      expect(diagnostic.value).toContain("candidate failed")
-    }
   })
 })

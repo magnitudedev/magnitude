@@ -49,7 +49,6 @@ const stateWithTaskParent = (parentId: Option.Option<string>): DisplayState => (
   },
   agents: {},
   actors: {},
-  modelRequests: {},
   tasks: {
     byId: {
       root: {

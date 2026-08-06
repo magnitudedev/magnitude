@@ -4,7 +4,6 @@ import * as HttpBody from "@effect/platform/HttpBody"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { Array as Arr, Chunk, Deferred, Effect, Either, Layer, Schema, Stream } from "effect"
 import { JsonValueSchema } from "@magnitudedev/utils/schema"
-import type { AcnEndpoint } from "@magnitudedev/acn-protocol"
 import type { RecoveringStreamProtocol } from "./recovering-stream-protocol"
 import {
   type JitRpcAttemptFailure,
@@ -32,19 +31,24 @@ const Completed: AttemptOutcome = { _tag: "Completed" }
 const SubscriptionTerminated: AttemptOutcome = { _tag: "SubscriptionTerminated" }
 const EndpointRetired: AttemptOutcome = { _tag: "EndpointRetired" }
 
-export interface RecoveringProtocolOptions<InfraError> {
-  readonly endpoint: Effect.Effect<AcnEndpoint, InfraError>
+interface RpcEndpoint {
+  readonly id: string
+  readonly url: string
+}
+
+export interface RecoveringProtocolOptions<InfraError, Endpoint extends RpcEndpoint = RpcEndpoint> {
+  readonly endpoint: Effect.Effect<Endpoint, InfraError>
   readonly recover: (
-    failedEndpoint: AcnEndpoint,
-  ) => Effect.Effect<AcnEndpoint, InfraError>
+    failedEndpoint: Endpoint,
+  ) => Effect.Effect<Endpoint, InfraError>
   readonly rpcPath: string
   readonly streamProtocol: RecoveringStreamProtocol
   readonly isEndpointRetirementExit?: (exit: ResponseExitEncoded["exit"]) => boolean
   readonly classifyInfraError: (error: InfraError) => RpcClientError.RpcClientError
 }
 
-export const makeRecoveringProtocol = <InfraError>(
-  options: RecoveringProtocolOptions<InfraError>,
+export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint = RpcEndpoint>(
+  options: RecoveringProtocolOptions<InfraError, Endpoint>,
 ) =>
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient
@@ -65,7 +69,7 @@ export const makeRecoveringProtocol = <InfraError>(
             let failuresWithoutProgress = 0
 
             const attempt = (
-              endpointUrl: string,
+              endpoint: Endpoint,
             ): Effect.Effect<AttemptOutcome, JitRpcAttemptFailure> =>
               Effect.gen(function* () {
                 const lifecycle = yield* Deferred.make<AttemptOutcome>()
@@ -90,8 +94,9 @@ export const makeRecoveringProtocol = <InfraError>(
                     : HttpBody.uint8Array(encoded, serialization.contentType)
 
                 const response = yield* client
-                  .post(`${endpointUrl}${options.rpcPath}`, {
+                  .post(`${endpoint.url}${options.rpcPath}`, {
                     body,
+                    headers: { "x-magnitude-acn-id": endpoint.id },
                   })
                   .pipe(
                     Effect.mapError(
@@ -239,7 +244,7 @@ export const makeRecoveringProtocol = <InfraError>(
                     url: endpoint.url,
                   }),
                 )
-                const outcome = yield* Effect.either(attempt(endpoint.url))
+                const outcome = yield* Effect.either(attempt(endpoint))
                 if (Either.isRight(outcome)) {
                   if (outcome.right._tag === "SubscriptionTerminated") {
                     yield* options.recover(endpoint).pipe(
@@ -306,8 +311,8 @@ export const makeRecoveringProtocol = <InfraError>(
     )
   })
 
-export const recoveringProtocolLayer = <InfraError>(
-  options: RecoveringProtocolOptions<InfraError>,
+export const recoveringProtocolLayer = <InfraError, Endpoint extends RpcEndpoint = RpcEndpoint>(
+  options: RecoveringProtocolOptions<InfraError, Endpoint>,
 ): Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient> =>
   Layer.scoped(
     Protocol,

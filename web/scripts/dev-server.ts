@@ -2,57 +2,51 @@
  * Dev server — the single server for `bun web`.
  *
  * One process, one port. This server:
- * 1. Exposes daemon discovery and launch
+ * 1. Exposes ACN process management
  * 2. Serves the web app via Vite's middleware
- * 3. Handles /current + /launch
- * 4. Proxies /rpc, /health, and /logs to the authoritative ACN
+ * 3. Exposes current, launch, and exact termination operations
+ * 4. Proxies RPC, health, and logs only to the selected exact ACN
  *
  * The browser talks only to this same-origin server.
  */
 import http, { createServer, type ServerResponse } from "node:http"
 import { createServer as createViteServer } from "vite"
-import { Effect, Layer, Runtime, Option, Schema, Stream } from "effect"
+import { Effect, Exit, Layer, Runtime, Option, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
-  makeLocalDaemonDiscovery,
-  makeLocalDaemonLauncher,
+  makeLocalAcnProcessManager,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
-  RemoteDaemonCurrentResponseSchema,
-  RemoteDaemonErrorResponseSchema,
-  RemoteDaemonLaunchRequestSchema,
-  RemoteDaemonLaunchMessageSchema,
-  type RemoteDaemonLaunchMessage,
+  AcnLaunchRequestSchema,
+  RemoteAcnCurrentResponseSchema,
+  RemoteAcnErrorResponseSchema,
+  RemoteAcnLaunchMessageSchema,
+  RemoteAcnTerminateRequestSchema,
+  DaemonError,
+  DaemonSpawnFailed,
+  type RemoteAcnLaunchMessage,
 } from "@magnitudedev/sdk"
-import type { DaemonStatus } from "@magnitudedev/sdk"
 import { resolve } from "node:path"
 
 // ─── Daemon host boundaries ─────────────────────────────────────────────────
 
 const rt = Runtime.defaultRuntime
+const processManagerScope = await Runtime.runPromise(rt)(Scope.make())
 
-async function createDiscovery() {
-  return Runtime.runPromise(rt)(makeLocalDaemonDiscovery().pipe(
-    Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer)),
-  ))
-}
-
-async function createLauncher() {
-  return Runtime.runPromise(rt)(makeLocalDaemonLauncher().pipe(
+async function createProcessManager() {
+  return Runtime.runPromise(rt)(makeLocalAcnProcessManager().pipe(
     Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
+    Effect.provideService(Scope.Scope, processManagerScope),
     Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer)),
   ))
 }
 
-let discoveryPromise: ReturnType<typeof createDiscovery> | null = null
-let launcherPromise: ReturnType<typeof createLauncher> | null = null
-let daemonUrl = ""
+const processManagerPromise = createProcessManager()
 
-async function currentAcn(): Promise<DaemonStatus | null> {
-  discoveryPromise ??= createDiscovery()
-  const discovery = await discoveryPromise
-  const result = await Runtime.runPromise(rt)(discovery.current())
+async function currentAcn() {
+  const manager = await processManagerPromise
+  const result = await Runtime.runPromise(rt)(manager.observeCurrent)
   return Option.getOrElse(result, () => null)
 }
 
@@ -66,16 +60,19 @@ const defaultLaunchCommand = Option.some<ReadonlyArray<string>>([
   "--register",
 ])
 const decodeLaunchRequest = Schema.decode(
-  Schema.parseJson(RemoteDaemonLaunchRequestSchema),
+  Schema.parseJson(AcnLaunchRequestSchema),
 )
 const encodeLaunchMessage = Schema.encode(
-  Schema.parseJson(RemoteDaemonLaunchMessageSchema),
+  Schema.parseJson(RemoteAcnLaunchMessageSchema),
 )
 const encodeCurrentResponse = Schema.encode(
-  Schema.parseJson(RemoteDaemonCurrentResponseSchema),
+  Schema.parseJson(RemoteAcnCurrentResponseSchema),
+)
+const decodeTerminateRequest = Schema.decode(
+  Schema.parseJson(RemoteAcnTerminateRequestSchema),
 )
 const encodeErrorResponse = Schema.encode(
-  Schema.parseJson(RemoteDaemonErrorResponseSchema),
+  Schema.parseJson(RemoteAcnErrorResponseSchema),
 )
 
 const respondError = async (
@@ -84,8 +81,21 @@ const respondError = async (
   error: unknown,
 ): Promise<void> => {
   res.writeHead(status, { "Content-Type": "application/json" })
+  res.end(JSON.stringify({ error: String(error) }))
+}
+
+const asDaemonError = (cause: unknown) => Schema.is(DaemonError)(cause)
+  ? cause
+  : new DaemonSpawnFailed({ reason: String(cause) })
+
+const respondDaemonError = async (
+  res: ServerResponse,
+  status: number,
+  cause: unknown,
+): Promise<void> => {
+  res.writeHead(status, { "Content-Type": "application/json" })
   res.end(await Runtime.runPromise(rt)(
-    encodeErrorResponse({ error: String(error) }),
+    encodeErrorResponse({ error: asDaemonError(cause) }),
   ))
 }
 // ─── HTTP server with Vite middleware ─────────────────────────────────
@@ -102,19 +112,18 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url!, `http://localhost:${PORT}`)
 
   // ── ACN process operations ──────────────────────────────────────
-  if (url.pathname === "/current" && req.method === "GET") {
+  if (url.pathname === "/acn/current" && req.method === "GET") {
     try {
       const found = await currentAcn()
-      if (found) daemonUrl = found.url
       res.writeHead(200, { "Content-Type": "application/json" })
-      res.end(await Runtime.runPromise(rt)(encodeCurrentResponse({ daemon: found })))
+      res.end(await Runtime.runPromise(rt)(encodeCurrentResponse({ instance: found })))
     } catch (err) {
-      await respondError(res, 500, err)
+      await respondDaemonError(res, 500, err)
     }
     return
   }
 
-  if (url.pathname === "/launch" && req.method === "POST") {
+  if (url.pathname === "/acn/launch" && req.method === "POST") {
     try {
       const chunks: Buffer[] = []
       for await (const chunk of req) chunks.push(chunk as Buffer)
@@ -126,61 +135,79 @@ const server = createServer(async (req, res) => {
         "Content-Type": "application/x-ndjson",
         "Cache-Control": "no-store",
       })
-      const write = (message: RemoteDaemonLaunchMessage) =>
+      const write = (message: RemoteAcnLaunchMessage) =>
         encodeLaunchMessage(message).pipe(
           Effect.flatMap((encoded) =>
             Effect.sync(() => {
-              if (message._tag === "Ready") daemonUrl = message.endpoint.url
               if (!res.destroyed) res.write(`${encoded}\n`)
             }),
           ),
         )
       try {
-        launcherPromise ??= createLauncher()
-        const launcher = await launcherPromise
+        const manager = await processManagerPromise
         await Runtime.runPromise(rt)(
-          launcher
-            .launch(Option.orElse(body.command, () => defaultLaunchCommand))
+          manager
+            .launch({
+              ...body,
+              command: Option.orElse(body.command, () => defaultLaunchCommand),
+            })
             .pipe(
               Stream.runForEach(write),
             ),
         )
       } catch (err) {
-        const message = String(err).trim() || "ACN startup failed"
-        await Runtime.runPromise(rt)(write({ _tag: "Failed", message }))
+        await Runtime.runPromise(rt)(write({ _tag: "Failed", error: asDaemonError(err) }))
       }
       res.end()
     } catch (err) {
-      await respondError(res, 500, err)
+      await respondDaemonError(res, 500, err)
+    }
+    return
+  }
+
+  if (url.pathname === "/acn/terminate" && req.method === "POST") {
+    try {
+      const chunks: Buffer[] = []
+      for await (const chunk of req) chunks.push(chunk as Buffer)
+      const body = await Runtime.runPromise(rt)(decodeTerminateRequest(
+        Buffer.concat(chunks).toString(),
+      ))
+      const manager = await processManagerPromise
+      await Runtime.runPromise(rt)(manager.terminate(body.instance))
+      res.writeHead(204)
+      res.end()
+    } catch (err) {
+      await respondDaemonError(res, 500, err)
     }
     return
   }
 
   // ── Same-origin ACN proxy (streaming) ───────────────────────────
-  if (
-    url.pathname === "/rpc" ||
-    url.pathname === "/health" ||
-    url.pathname === "/logs"
-  ) {
-    if (!daemonUrl) {
-      try {
-        const current = await currentAcn()
-        if (current) daemonUrl = current.url
-      } catch (error) {
-        await respondError(res, 502, error)
-        return
-      }
+  const proxyMatch = url.pathname.match(/^\/acn\/([^/]+)(\/rpc|\/health|\/logs)$/)
+  if (proxyMatch) {
+    const expectedId = decodeURIComponent(proxyMatch[1]!)
+    const targetPath = proxyMatch[2]!
+    let current
+    try {
+      current = await currentAcn()
+    } catch (error) {
+      await respondError(res, 502, error)
+      return
     }
-    if (!daemonUrl) {
+    if (!current) {
       await respondError(res, 503, "No daemon available")
       return
     }
+    if (current.id !== expectedId) {
+      await respondError(res, 409, "Selected ACN instance is no longer current")
+      return
+    }
 
-    const target = new URL(daemonUrl)
+    const target = new URL(current.url)
     const proxyReq = http.request({
       hostname: target.hostname,
       port: target.port,
-      path: url.pathname + url.search,
+      path: targetPath + url.search,
       method: req.method,
       headers: req.headers,
     }, (proxyRes) => {
@@ -189,7 +216,6 @@ const server = createServer(async (req, res) => {
     })
 
     proxyReq.on("error", (error) => {
-      daemonUrl = ""
       if (res.headersSent) {
         res.destroy(error)
         return
@@ -207,4 +233,8 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[dev] Server running at http://localhost:${PORT}`)
+})
+
+server.on("close", () => {
+  void Runtime.runPromise(rt)(Scope.close(processManagerScope, Exit.void))
 })

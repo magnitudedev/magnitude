@@ -104,17 +104,18 @@ function makeDesktopApi(): DesktopApi {
     get platform(): DesktopPlatform {
       return process.platform as DesktopPlatform
     },
-    daemonDiscovery: {
+    acnProcessManager: {
       async current() {
-        return desktopRpc.run((client) => client.DaemonCurrent({}))
+        return desktopRpc.run((client) => client.AcnCurrent({}))
       },
-    },
-    daemonLauncher: {
-      async launch(command, onEvent) {
+      async launch(request, onEvent) {
         await desktopRpc.runStream(
-          (client) => client.DaemonLaunch({ command }),
+          (client) => client.AcnLaunch(request),
           onEvent,
         )
+      },
+      async terminate(instance) {
+        await desktopRpc.run((client) => client.AcnTerminate({ instance }))
       },
     },
     onMenuAction(cb: (action: MenuAction) => void): () => void {

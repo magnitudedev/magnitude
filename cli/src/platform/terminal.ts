@@ -4,17 +4,15 @@
  * Uses Bun APIs for process spawning, clipboard (OSC 52), and terminal size.
  * Stubs for unsupported capabilities (storage, notifications, dialogs).
  */
-import { Effect, Layer, Option } from "effect"
+import { Effect, Exit, Layer, Option, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
-  DaemonDiscovery,
-  DaemonLauncher,
+  AcnProcessManager,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
   makeAcnJitRuntime,
-  makeLocalDaemonDiscovery,
-  makeLocalDaemonLauncher,
+  makeLocalAcnProcessManager,
 } from "@magnitudedev/sdk"
 import type {
   Platform,
@@ -72,7 +70,6 @@ const terminalCapabilities: TerminalCapabilities = {
 
 export interface TerminalPlatformOptions {
   readonly launchCommand: Option.Option<ReadonlyArray<string>>
-  readonly publicationTimeoutMs: Option.Option<number>
   readonly debug: boolean
   readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
 }
@@ -82,30 +79,22 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions): 
     options.effectLoggingLayer,
     () => makeCliEffectLoggingLayer({ debug: options.debug }),
   )
-  const launcherOptions = {
-      ...Option.match(options.publicationTimeoutMs, {
-        onNone: () => ({}),
-        onSome: (publicationTimeoutMs) => ({ publicationTimeoutMs }),
-      }),
-      ...(options.debug ? { debug: true } : {}),
-    }
-  const discovery = await Effect.runPromise(
-    makeLocalDaemonDiscovery({
+  const managerScope = await Effect.runPromise(Scope.make())
+  process.once("beforeExit", () => {
+    Effect.runFork(Scope.close(managerScope, Exit.void))
+  })
+  const processManager = await Effect.runPromise(
+    makeLocalAcnProcessManager({
       ...(options.debug ? { debug: true } : {}),
     }).pipe(
-      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-    ),
-  )
-  const launcher = await Effect.runPromise(
-    makeLocalDaemonLauncher(launcherOptions).pipe(
       Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
+      Effect.provideService(Scope.Scope, managerScope),
       Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     ),
   )
   const acn = await Effect.runPromise(
     makeAcnJitRuntime({ launchCommand: options.launchCommand }).pipe(
-      Effect.provideService(DaemonDiscovery, discovery),
-      Effect.provideService(DaemonLauncher, launcher),
+      Effect.provideService(AcnProcessManager, processManager),
     ),
   )
   const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)

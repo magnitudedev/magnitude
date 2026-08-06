@@ -2,22 +2,20 @@
  * Desktop Platform implementation — spec §5.3
  *
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
- * Daemon discovery and launch delegate independently to Electron main.
+ * ACN process management remains one contract across the Electron boundary.
  */
-import { Effect, Layer, Option, Stream } from "effect"
+import { Effect, Layer, Option, Schema, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   DaemonSpawnFailed,
-  DaemonDiscovery,
-  DaemonLauncher,
+  DaemonError,
+  AcnProcessManager,
   makeAcnJitRuntime,
-  type DaemonLaunchEvent,
-  type DaemonDiscovery as DaemonDiscoveryService,
-  type DaemonLauncher as DaemonLauncherService,
+  type AcnLaunchEvent,
+  type AcnProcessManager as AcnProcessManagerService,
 } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
-import type { DaemonStatus } from "@magnitudedev/sdk"
 
 const DEFAULT_SERVER_KEY = "default-server"
 
@@ -63,26 +61,25 @@ let api: DesktopApi
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-function createDesktopDaemonDiscovery(desktopApi: DesktopApi): DaemonDiscoveryService {
-  return {
-    current: () =>
+const daemonError = (cause: unknown) => Schema.is(DaemonError)(cause)
+  ? cause
+  : new DaemonSpawnFailed({ reason: errorMessage(cause) })
+
+function createDesktopAcnProcessManager(desktopApi: DesktopApi): AcnProcessManagerService {
+  return AcnProcessManager.of({
+    observeCurrent:
       Effect.tryPromise({
         try: async () => {
-          const daemon = await desktopApi.daemonDiscovery.current()
-          return daemon === null ? Option.none<DaemonStatus>() : Option.some(daemon)
+          const instance = await desktopApi.acnProcessManager.current()
+          return Option.fromNullable(instance)
         },
-        catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
+        catch: daemonError,
       }),
-  }
-}
-
-function createDesktopDaemonLauncher(desktopApi: DesktopApi): DaemonLauncherService {
-  return {
-    launch: (command) =>
-      Stream.asyncPush<DaemonLaunchEvent, DaemonSpawnFailed>((emit) =>
+    launch: (request) =>
+      Stream.asyncPush<AcnLaunchEvent, DaemonError>((emit) =>
         Effect.tryPromise({
-          try: () => desktopApi.daemonLauncher.launch(command, (event) => emit.single(event)),
-          catch: (cause) => new DaemonSpawnFailed({ reason: errorMessage(cause) }),
+          try: () => desktopApi.acnProcessManager.launch(request, (event) => emit.single(event)),
+          catch: daemonError,
         }).pipe(
           Effect.match({
             onFailure: emit.fail,
@@ -91,17 +88,19 @@ function createDesktopDaemonLauncher(desktopApi: DesktopApi): DaemonLauncherServ
           Effect.forkScoped,
         ),
       ),
-  }
+    terminate: (instance) => Effect.tryPromise({
+      try: () => desktopApi.acnProcessManager.terminate(instance),
+      catch: daemonError,
+    }),
+  })
 }
 
 export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
   api = desktopApi
-  const discovery = createDesktopDaemonDiscovery(desktopApi)
-  const launcher = createDesktopDaemonLauncher(desktopApi)
+  const processManager = createDesktopAcnProcessManager(desktopApi)
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
-      Effect.provideService(DaemonDiscovery, discovery),
-      Effect.provideService(DaemonLauncher, launcher),
+      Effect.provideService(AcnProcessManager, processManager),
     ),
   )
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
