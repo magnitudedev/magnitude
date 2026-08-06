@@ -97,6 +97,8 @@ import {
   makeAcnServiceLifecycle,
   type AcnServiceLifecycleApi,
 } from "./service-lifecycle"
+import { ClientLeaseManagerLive } from "./client-lease-manager"
+import { ModelResidencyPolicyLive } from "./model-residency-policy"
 
 export interface AcnServerOptions {
   readonly register?: boolean
@@ -329,9 +331,13 @@ const addLocalInferenceServices = <A, E, R>(
   dataDir: string
 ) => {
   const withIcn = Layer.provideMerge(makeAcnIcn(dataDir), base)
+  const withResidencyPolicy = Layer.provideMerge(
+    ModelResidencyPolicyLive,
+    withIcn,
+  )
   const withConfiguration = Layer.provideMerge(
     makeModelConfigurationLayer(),
-    withIcn
+    withResidencyPolicy
   )
   const withHardware = Layer.provideMerge(
     LocalInferenceHardwareLive,
@@ -370,7 +376,8 @@ const addLocalInferenceServices = <A, E, R>(
 
 const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
   const withDemand = Layer.provideMerge(AcnRpcDemandLive, services)
-  const withCommands = Layer.provideMerge(SessionCommandsLive, withDemand)
+  const withClientLeases = Layer.provideMerge(ClientLeaseManagerLive, withDemand)
+  const withCommands = Layer.provideMerge(SessionCommandsLive, withClientLeases)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
   const withActiveSessionStatuses = Layer.provideMerge(
     ActiveSessionStatusesLive,

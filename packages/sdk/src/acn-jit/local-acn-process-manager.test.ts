@@ -7,16 +7,141 @@ import {
 } from "@magnitudedev/acn-protocol"
 import {
   applyAcnProcessCommand,
+  currentProcessStartIdentity,
   readAcnProcessState,
+  readProcessStartIdentity,
 } from "@magnitudedev/acn-protocol/process-state"
 import { Deferred, Effect, Fiber, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { runAcnLaunch } from "./acn-process-manager"
 import { ChildProcessSpawner, scopePreHandoffCandidate } from "./child-process"
-import { makeLocalAcnProcessManager } from "./local-acn-process-manager"
+import {
+  makeLocalAcnDaemonAdministrator,
+  makeLocalAcnProcessManager,
+} from "./local-acn-process-manager"
 import { DaemonSpawnFailed } from "./errors"
 
 describe("LocalAcnProcessManager", () => {
+  it("administrative stop is a no-op without durable assignment state", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem
+          const dataDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "acn-stop-empty-" })
+          const administrator = yield* makeLocalAcnDaemonAdministrator({ dataDir: dataDirectory }).pipe(
+            Effect.provide(Layer.mergeAll(BunContext.layer, FetchHttpClient.layer))
+          )
+          yield* administrator.stopCurrent
+          expect(Option.isNone(yield* readAcnProcessState(dataDirectory))).toBe(true)
+        })
+      ).pipe(Effect.provide(BunFileSystem.layer))
+    )
+  })
+
+  it("administrative stop cancels an unpublished spawning intent", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem
+          const dataDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "acn-stop-spawning-" })
+          yield* applyAcnProcessCommand({
+            dataDirectory,
+            expectedRevision: Option.none(),
+            command: {
+              _tag: "BeginEnsure",
+              target: "1.0.0" as never,
+              manager: {
+                pid: process.pid,
+                processStartIdentity: "superseded-manager" as never,
+              },
+            },
+          })
+          const administrator = yield* makeLocalAcnDaemonAdministrator({ dataDir: dataDirectory }).pipe(
+            Effect.provide(Layer.mergeAll(BunContext.layer, FetchHttpClient.layer))
+          )
+          yield* administrator.stopCurrent
+          const stopped = Option.getOrThrow(yield* readAcnProcessState(dataDirectory))
+          expect(stopped.mode._tag).toBe("Unassigned")
+          if (stopped.mode._tag !== "Unassigned") return
+          expect(Option.getOrThrow(stopped.mode.result)._tag).toBe("Terminated")
+        })
+      ).pipe(Effect.provide(BunFileSystem.layer))
+    )
+  })
+
+  it("administrative stop gracefully retires the exact assigned ACN", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem
+          const dataDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "acn-stop-assigned-" })
+          const child = Bun.spawn([
+            process.execPath,
+            "-e",
+            "setInterval(() => {}, 1000)",
+          ])
+          yield* Effect.addFinalizer(() => Effect.sync(() => child.kill()))
+          const processStartIdentity = Option.getOrThrow(
+            yield* readProcessStartIdentity(child.pid),
+          )
+          const manager = {
+            pid: process.pid,
+            processStartIdentity: yield* currentProcessStartIdentity,
+          }
+          const server = Bun.serve({
+            port: 0,
+            hostname: "127.0.0.1",
+            fetch: (request) => {
+              if (new URL(request.url).pathname === "/shutdown") {
+                child.kill("SIGTERM")
+                return new Response(null, { status: 204 })
+              }
+              return new Response(null, { status: 404 })
+            },
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
+
+          const begun = yield* applyAcnProcessCommand({
+            dataDirectory,
+            expectedRevision: Option.none(),
+            command: { _tag: "BeginEnsure", target: "1.0.0" as never, manager },
+          })
+          const candidate = {
+            identity: "1.0.0" as never,
+            pid: child.pid,
+            processStartIdentity,
+          }
+          const spawned = yield* applyAcnProcessCommand({
+            dataDirectory,
+            expectedRevision: Option.some(begun.revision),
+            command: { _tag: "CandidateSpawned", manager, candidate },
+          })
+          yield* applyAcnProcessCommand({
+            dataDirectory,
+            expectedRevision: Option.some(spawned.revision),
+            command: {
+              _tag: "CandidateAdmitted",
+              candidate,
+              id: AcnInstanceIdSchema.make("assigned-acn"),
+              url: `http://127.0.0.1:${server.port}`,
+            },
+          })
+
+          const administrator = yield* makeLocalAcnDaemonAdministrator({ dataDir: dataDirectory }).pipe(
+            Effect.provide(Layer.mergeAll(BunContext.layer, FetchHttpClient.layer))
+          )
+          yield* administrator.stopCurrent
+
+          const stopped = Option.getOrThrow(yield* readAcnProcessState(dataDirectory))
+          expect(stopped.mode._tag).toBe("Unassigned")
+          if (stopped.mode._tag !== "Unassigned") return
+          expect(Option.getOrThrow(stopped.mode.result)._tag).toBe("Terminated")
+          expect(Option.isNone(yield* readProcessStartIdentity(child.pid))).toBe(true)
+        })
+      ).pipe(Effect.provide(BunContext.layer))
+    )
+  })
+
   it("coalesces concurrent launches onto one admitted candidate", async () => {
     let spawns = 0
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

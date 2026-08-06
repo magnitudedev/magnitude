@@ -34,6 +34,10 @@ import {
   type AcnLaunchEvent,
   type AcnLaunchRequest,
 } from "./acn-process-manager"
+import {
+  AcnDaemonAdministrator,
+  type AcnDaemonAdministrator as AcnDaemonAdministratorService,
+} from "./acn-daemon-administrator"
 import { ChildProcessSpawner } from "./child-process"
 import {
   DaemonDiscoveryFailed,
@@ -169,32 +173,17 @@ type ReadinessObservation =
   | { readonly _tag: "Ready"; readonly instance: AcnInstance }
   | { readonly _tag: "Replace"; readonly current: AssignedAcn }
 
-/** Local implementation of the exact-current ACN process contract. */
-export const makeLocalAcnProcessManager = (
-  options: LocalAcnProcessManagerOptions = {},
-): Effect.Effect<
-  LocalAcnProcessManager,
-  never,
-  | FileSystem.FileSystem
-  | HttpClient.HttpClient
-  | CommandExecutor.CommandExecutor
-  | Path.Path
-  | ChildProcessSpawner
-  | Scope.Scope
-> => Effect.gen(function* () {
+const makeLocalTerminationKernel = (
+  options: LocalAcnProcessManagerOptions,
+) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const client = yield* HttpClient.HttpClient
   const commandExecutor = yield* CommandExecutor.CommandExecutor
-  const path = yield* Path.Path
-  const spawner = yield* ChildProcessSpawner
   const dataDirectory = options.dataDir ?? defaultDataDir()
-  const probeTimeoutMs = options.probeTimeoutMs ?? 2_000
   const manager: ExactProcess = {
     pid: process.pid,
     processStartIdentity: yield* currentProcessStartIdentity.pipe(Effect.orDie),
   }
-  const operationScope = yield* Effect.scope
-  const reconcilePermit = yield* Effect.makeSemaphore(1)
 
   const provideLocal = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
@@ -210,21 +199,6 @@ export const makeLocalAcnProcessManager = (
       command,
     }))
 
-  const observeAssigned = (current: AssignedAcn) => Effect.gen(function* () {
-    if (!(yield* provideLocal(processIsExact(current)))) return Option.none<AcnInstance>()
-    const health = yield* probeHealth(current, probeTimeoutMs, client)
-    return Option.some(instanceFrom(current, health))
-  })
-
-  const observeCurrent = Effect.gen(function* () {
-    const state = yield* readState
-    if (Option.isNone(state)) return Option.none<AcnInstance>()
-    return yield* Option.match(assignedIn(state.value), {
-      onNone: () => Effect.succeed(Option.none<AcnInstance>()),
-      onSome: observeAssigned,
-    })
-  })
-
   const stillOwnsRevision = (revision: AcnProcessRevision) => readState.pipe(
     Effect.map(Option.exists((state) =>
       state.revision === revision &&
@@ -236,26 +210,26 @@ export const makeLocalAcnProcessManager = (
 
   const signalWhileOwned = (
     revision: AcnProcessRevision,
-    process: ExactProcess,
+    exactProcess: ExactProcess,
     signal: NodeJS.Signals,
   ) => Effect.gen(function* () {
     if (!(yield* stillOwnsRevision(revision))) return false
-    yield* provideLocal(signalExact(process, signal))
+    yield* provideLocal(signalExact(exactProcess, signal))
     return true
   })
 
   const stopExact = (
     state: AcnProcessState,
-    process: ExactProcess,
+    exactProcess: ExactProcess,
     requestShutdown: Effect.Effect<unknown, unknown> = Effect.void,
   ) => Effect.gen(function* () {
     if (!(yield* stillOwnsRevision(state.revision))) return false
     yield* requestShutdown.pipe(Effect.timeout("750 millis"), Effect.ignore)
-    if (yield* provideLocal(waitForExactExit(process, 2_000))) return true
-    if (!(yield* signalWhileOwned(state.revision, process, "SIGINT"))) return false
-    if (yield* provideLocal(waitForExactExit(process, 2_000))) return true
-    if (!(yield* signalWhileOwned(state.revision, process, "SIGKILL"))) return false
-    return yield* provideLocal(waitForExactExit(process, 2_000))
+    if (yield* provideLocal(waitForExactExit(exactProcess, 2_000))) return true
+    if (!(yield* signalWhileOwned(state.revision, exactProcess, "SIGINT"))) return false
+    if (yield* provideLocal(waitForExactExit(exactProcess, 2_000))) return true
+    if (!(yield* signalWhileOwned(state.revision, exactProcess, "SIGKILL"))) return false
+    return yield* provideLocal(waitForExactExit(exactProcess, 2_000))
   })
 
   const stopIcn = (state: AcnProcessState, icn: ExactIcnProcess) =>
@@ -282,6 +256,169 @@ export const makeLocalAcnProcessManager = (
       if (Option.isSome(current.ownedIcn) && !(yield* stopIcn(state, current.ownedIcn.value))) return false
       return true
     })
+
+  const stopCurrent = Effect.gen(function* () {
+    let observedRevision = Option.none<AcnProcessRevision>()
+    let unchangedSince = yield* Clock.currentTimeMillis
+
+    while (true) {
+      const stateOption = yield* readState
+      if (Option.isNone(stateOption) || stateOption.value.mode._tag === "Unassigned") return
+      const state = stateOption.value
+
+      if (state.mode._tag === "Assigned") {
+        const changed = yield* apply(stateOption, {
+          _tag: "BeginTerminateCurrent",
+          manager,
+        }).pipe(Effect.either)
+        if (changed._tag === "Left") {
+          if (changed.left instanceof AcnProcessStateConflict) continue
+          return yield* changed.left
+        }
+        observedRevision = Option.none()
+        unchangedSince = yield* Clock.currentTimeMillis
+        continue
+      }
+
+      if (state.mode._tag === "Unassigned") return
+      const changing = state.mode
+      if (changing.purpose._tag === "Ensure") {
+        const changed = yield* apply(stateOption, {
+          _tag: "BeginTerminateCurrent",
+          manager,
+        }).pipe(Effect.either)
+        if (changed._tag === "Left") {
+          if (changed.left instanceof AcnProcessStateConflict) continue
+          return yield* changed.left
+        }
+        observedRevision = Option.none()
+        unchangedSince = yield* Clock.currentTimeMillis
+        continue
+      }
+
+      if (changing.owner._tag === "Manager" && sameProcess(changing.owner.process, manager)) {
+        const phase = changing.owner.phase
+        if (phase._tag === "BlockedCandidateCleanup") {
+          yield* apply(stateOption, { _tag: "RetryCandidateCleanup", manager }).pipe(
+            Effect.catchTag("AcnProcessStateConflict", () => Effect.void),
+          )
+          continue
+        }
+        if (phase._tag === "Spawning") {
+          return yield* new DaemonSpawnFailed({
+            reason: "Terminate change cannot retain an untracked spawning phase",
+          })
+        }
+
+        const retired = phase._tag === "RetiringAssigned"
+          ? yield* retireAssigned(state, phase.current)
+          : yield* stopExact(state, phase.candidate)
+        if (!retired) {
+          return yield* new DaemonSpawnFailed({
+            reason: phase._tag === "RetiringAssigned"
+              ? `Could not prove ACN ${phase.current.id} and its ICN absent`
+              : `Could not prove candidate ACN ${phase.candidate.pid} absent`,
+          })
+        }
+        yield* apply(
+          stateOption,
+          phase._tag === "RetiringAssigned"
+            ? { _tag: "PredecessorExited", manager }
+            : { _tag: "CandidateExited", manager },
+        ).pipe(Effect.catchTag("AcnProcessStateConflict", () => Effect.void))
+        continue
+      }
+
+      if (!Option.contains(observedRevision, state.revision)) {
+        observedRevision = Option.some(state.revision)
+        unchangedSince = yield* Clock.currentTimeMillis
+      }
+      const owner = changing.owner._tag === "Manager"
+        ? changing.owner.process
+        : changing.owner.candidate
+      const ownerAlive = yield* provideLocal(processIsExact(owner))
+      if (!ownerAlive || (yield* Clock.currentTimeMillis) - unchangedSince >= 30_000) {
+        yield* apply(stateOption, { _tag: "TakeOver", manager }).pipe(
+          Effect.catchTag("AcnProcessStateConflict", () => Effect.void),
+        )
+        continue
+      }
+      yield* Effect.sleep("100 millis")
+    }
+  }).pipe(Effect.mapError(normalizeDaemonError))
+
+  return {
+    fs,
+    client,
+    commandExecutor,
+    dataDirectory,
+    manager,
+    provideLocal,
+    readState,
+    apply,
+    stopExact,
+    retireAssigned,
+    stopCurrent,
+  }
+})
+
+export const makeLocalAcnDaemonAdministrator = (
+  options: LocalAcnProcessManagerOptions = {},
+): Effect.Effect<
+  AcnDaemonAdministratorService,
+  never,
+  FileSystem.FileSystem | HttpClient.HttpClient | CommandExecutor.CommandExecutor
+> => makeLocalTerminationKernel(options).pipe(
+  Effect.map((kernel) => AcnDaemonAdministrator.of({ stopCurrent: kernel.stopCurrent })),
+)
+
+/** Local implementation of the exact-current ACN process contract. */
+export const makeLocalAcnProcessManager = (
+  options: LocalAcnProcessManagerOptions = {},
+): Effect.Effect<
+  LocalAcnProcessManager,
+  never,
+  | FileSystem.FileSystem
+  | HttpClient.HttpClient
+  | CommandExecutor.CommandExecutor
+  | Path.Path
+  | ChildProcessSpawner
+  | Scope.Scope
+> => Effect.gen(function* () {
+  const termination = yield* makeLocalTerminationKernel(options)
+  const {
+    fs,
+    client,
+    commandExecutor,
+    dataDirectory,
+    manager,
+    provideLocal,
+    readState,
+    apply,
+    stopExact,
+    retireAssigned,
+  } = termination
+  const path = yield* Path.Path
+  const spawner = yield* ChildProcessSpawner
+  const probeTimeoutMs = options.probeTimeoutMs ?? 2_000
+  const operationScope = yield* Effect.scope
+  const reconcilePermit = yield* Effect.makeSemaphore(1)
+
+  const observeAssigned = (current: AssignedAcn) => Effect.gen(function* () {
+    if (!(yield* provideLocal(processIsExact(current)))) return Option.none<AcnInstance>()
+    const health = yield* probeHealth(current, probeTimeoutMs, client)
+    return Option.some(instanceFrom(current, health))
+  })
+
+  const observeCurrent = Effect.gen(function* () {
+    const state = yield* readState
+    if (Option.isNone(state)) return Option.none<AcnInstance>()
+    return yield* Option.match(assignedIn(state.value), {
+      onNone: () => Effect.succeed(Option.none<AcnInstance>()),
+      onSome: observeAssigned,
+    })
+  })
+
 
   const resolveCommand = (
     request: AcnLaunchRequest,

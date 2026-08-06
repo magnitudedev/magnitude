@@ -10,6 +10,7 @@ import * as Shell from "./shell"
 import * as Stream from "./stream"
 import * as LocalInference from "./local-inference"
 import * as Onboarding from "./onboarding"
+import * as ClientLease from "./client-lease"
 import { AcnRpcDemand } from "./middleware"
 import { WatchMirroredStates } from "./mirrored-state"
 
@@ -85,7 +86,13 @@ const AcnDemandRpcs = RpcGroup.make(
  * subscriptions use their wrapping protocol without demand, and every finite
  * RPC receives `AcnRpcDemand` together at this single boundary.
  */
-export const MagnitudeRpcs = RpcGroup.make(Connection.Health).merge(
+const AcnNeutralRpcs = RpcGroup.make(
+  Connection.Health,
+  ClientLease.RenewClientLease,
+  ClientLease.ReleaseClientLease,
+)
+
+export const MagnitudeRpcs = AcnNeutralRpcs.merge(
   AcnSubscriptions,
   AcnDemandRpcs,
 )

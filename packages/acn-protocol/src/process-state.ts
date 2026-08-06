@@ -133,6 +133,9 @@ export const AcnProcessCommandSchema = Schema.Union(
     manager: ExactProcessSchema,
     current: AssignedAcnSchema,
   }),
+  Schema.TaggedStruct("BeginTerminateCurrent", {
+    manager: ExactProcessSchema,
+  }),
   Schema.TaggedStruct("UpgradeEnsure", {
     target: AcnIdentitySchema,
     manager: ExactProcessSchema,
@@ -384,6 +387,61 @@ export const reduceAcnProcessState = (
         },
       }
     }
+    case "BeginTerminateCurrent": {
+      requireTransition(
+        state.mode._tag === "Assigned" ||
+          (state.mode._tag === "Changing" && state.mode.purpose._tag === "Ensure"),
+        command,
+        "there is no current ensure or assignment to terminate",
+      )
+      if (state.mode._tag === "Changing") {
+        const phase = state.mode.owner._tag === "Candidate"
+          ? { _tag: "RetiringCandidate" as const, candidate: state.mode.owner.candidate }
+          : state.mode.owner.phase._tag === "BlockedCandidateCleanup"
+            ? {
+                _tag: "RetiringCandidate" as const,
+                candidate: state.mode.owner.phase.candidate,
+              }
+            : state.mode.owner.phase
+        if (phase._tag === "Spawning") {
+          return {
+            revision,
+            identityFloor: state.identityFloor,
+            mode: {
+              _tag: "Unassigned",
+              result: Option.some({
+                _tag: "Terminated",
+                changeRevision: state.mode.changeRevision,
+              }),
+            },
+          }
+        }
+        return {
+          ...state,
+          revision,
+          mode: {
+            _tag: "Changing",
+            changeRevision: state.mode.changeRevision,
+            purpose: { _tag: "Terminate" },
+            owner: { _tag: "Manager", process: command.manager, phase },
+          },
+        }
+      }
+      return {
+        revision,
+        identityFloor: state.identityFloor,
+        mode: {
+          _tag: "Changing",
+          changeRevision: revision,
+          purpose: { _tag: "Terminate" },
+          owner: {
+            _tag: "Manager",
+            process: command.manager,
+            phase: { _tag: "RetiringAssigned", current: state.mode.current },
+          },
+        },
+      }
+    }
     case "UpgradeEnsure": {
       requireTransition(
         state.mode._tag === "Changing" && state.mode.purpose._tag === "Ensure",
@@ -507,6 +565,19 @@ export const reduceAcnProcessState = (
         command,
         "manager does not own candidate retirement",
       )
+      if (state.mode.purpose._tag === "Terminate") {
+        return {
+          revision,
+          identityFloor: state.identityFloor,
+          mode: {
+            _tag: "Unassigned",
+            result: Option.some({
+              _tag: "Terminated",
+              changeRevision: state.mode.changeRevision,
+            }),
+          },
+        }
+      }
       return {
         ...state,
         revision,

@@ -78,9 +78,7 @@ const unavailable = (state: AcnHealthState) =>
     },
   );
 
-// TMP: Outlive the temporary 60-minute model residency window so ACN shutdown
-// cannot reap its owned ICN before the model's own idle timeout expires.
-const DEFAULT_ACN_IDLE_TIMEOUT: Duration.DurationInput = "65 minutes";
+const DEFAULT_ACN_IDLE_TIMEOUT = Duration.minutes(30);
 
 export const makeAcnServiceLifecycle = (
   idleTimeout: Duration.DurationInput = DEFAULT_ACN_IDLE_TIMEOUT,

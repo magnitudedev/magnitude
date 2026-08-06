@@ -8,6 +8,7 @@ import {
   AgentClientProvider,
   PlatformProvider,
   DisplayViewControllerProvider,
+  deriveCliExitNotice,
   stopDisplayViewController,
 } from "@magnitudedev/client-common";
 import { CliApp, type SessionStart } from "./app";
@@ -15,7 +16,7 @@ import type { AuthSource } from "./state/cli-atoms";
 import { getLastSessionId } from "./state/last-session";
 import { CLI_VERSION } from "./version";
 import { installGracefulShutdownHandlers } from "./utils/graceful-shutdown";
-import { createTerminalPlatform } from "./platform/terminal";
+import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
 import { Effect, Option } from "effect";
 
@@ -55,112 +56,134 @@ async function main() {
       "--system-override <text>",
       "Override leader system prompt with raw text"
     )
-    .option("--setup", "Rerun Local Models and Cloud Fallback setup")
+    .option("--setup", "Rerun Local Models and Cloud Fallback setup");
 
-    .action(async (opts) => {
-      const sessionStart: SessionStart =
-        opts.resume === undefined
-          ? { _tag: "new" }
-          : opts.resume === true
-          ? { _tag: "latest" }
-          : { _tag: "resume", sessionId: opts.resume };
-
-      // Headless mode is temporarily disabled while the CLI transitions to a
-      // pure SDK/RPC client architecture. It needs a daemon-backed persistence
-      // design before it can run again.
-      if (opts.headless) {
-        process.stderr.write(
-          "Error: --headless is temporarily disabled. Use the TUI mode.\n"
-        );
-        process.exit(1);
+  program
+    .command("stop")
+    .description("Stop the current Magnitude daemon and release its local models")
+    .action(async () => {
+      try {
+        await stopTerminalAcn();
+        process.stdout.write("Magnitude daemon stopped.\n");
+      } catch (error) {
+        process.stderr.write(`Failed to stop Magnitude daemon: ${String(error)}\n`);
+        process.exitCode = 1;
       }
+    });
 
-      const isDev =
-        import.meta.url.endsWith(".tsx") ||
-        (process.argv[1]?.endsWith(".tsx") ?? false);
-      const acnSourcePath = resolve(
-        import.meta.dir,
-        "..",
-        "..",
-        "packages",
-        "acn",
-        "src",
-        "binary.ts"
+  program.action(async (opts) => {
+    const sessionStart: SessionStart =
+      opts.resume === undefined
+        ? { _tag: "new" }
+        : opts.resume === true
+        ? { _tag: "latest" }
+        : { _tag: "resume", sessionId: opts.resume };
+
+    // Headless mode is temporarily disabled while the CLI transitions to a
+    // pure SDK/RPC client architecture. It needs a daemon-backed persistence
+    // design before it can run again.
+    if (opts.headless) {
+      process.stderr.write(
+        "Error: --headless is temporarily disabled. Use the TUI mode.\n"
       );
-      const launchCommand = isDev
-        ? Option.some([
-            "bun",
-            acnSourcePath,
-            "serve",
-            "--register",
-            ...(opts.debug ? ["--debug"] : []),
-          ])
-        : Option.none<ReadonlyArray<string>>();
+      process.exit(1);
+    }
 
-      const effectLoggingLayer = makeCliEffectLoggingLayer({
-        debug: opts.debug === true,
-      });
-      Atom.runtime.addGlobalLayer(effectLoggingLayer);
-      const platform = await createTerminalPlatform({
-        launchCommand,
-        debug: opts.debug === true,
-        effectLoggingLayer: Option.some(effectLoggingLayer),
-      });
-      const initialAcnLifecycleState = await Effect.runPromise(
-        platform.acnStartup.prepare
-      );
-      const agentClientTag = createAgentClient(platform.protocolLayer);
-      const renderer = await createCliRenderer({
-        exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
-      });
+    const isDev =
+      import.meta.url.endsWith(".tsx") ||
+      (process.argv[1]?.endsWith(".tsx") ?? false);
+    const acnSourcePath = resolve(
+      import.meta.dir,
+      "..",
+      "..",
+      "packages",
+      "acn",
+      "src",
+      "binary.ts"
+    );
+    const launchCommand = isDev
+      ? Option.some([
+          "bun",
+          acnSourcePath,
+          "serve",
+          "--register",
+          ...(opts.debug ? ["--debug"] : []),
+        ])
+      : Option.none<ReadonlyArray<string>>();
 
-      // Terminal background detection is handled by useTerminalBgDetection
-      // inside the React tree (needs atom registry to write to themeAtom)
+    const effectLoggingLayer = makeCliEffectLoggingLayer({
+      debug: opts.debug === true,
+    });
+    Atom.runtime.addGlobalLayer(effectLoggingLayer);
+    const platform = await createTerminalPlatform({
+      launchCommand,
+      debug: opts.debug === true,
+      effectLoggingLayer: Option.some(effectLoggingLayer),
+    });
+    const initialAcnLifecycleState = await Effect.runPromise(
+      platform.acnStartup.prepare
+    );
+    const agentClientTag = createAgentClient(platform.protocolLayer);
+    const renderer = await createCliRenderer({
+      exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
+    });
+    let modelExitNotice: string | undefined;
 
-      installGracefulShutdownHandlers(
-        renderer,
-        async () => {
-          stopDisplayViewController();
-        },
-        () => {
-          const activeSessionId = getLastSessionId();
-          if (!activeSessionId) {
-            return;
-          }
-          process.stdout.write(
-            `\nResume this session with:\nmagnitude --resume ${activeSessionId}\n`
+    // Terminal background detection is handled by useTerminalBgDetection
+    // inside the React tree (needs atom registry to write to themeAtom)
+
+    installGracefulShutdownHandlers(
+      renderer,
+      async () => {
+        const observation = await platform.shutdown();
+        modelExitNotice = Option.getOrUndefined(
+          deriveCliExitNotice(observation)
+        );
+        stopDisplayViewController();
+      },
+      () => {
+        const notices: string[] = [];
+        if (modelExitNotice) notices.push(modelExitNotice);
+        const activeSessionId = getLastSessionId();
+        if (activeSessionId) {
+          notices.push(
+            `Resume this session with:\nmagnitude --resume ${activeSessionId}`
           );
         }
-      );
+        if (notices.length > 0) {
+          process.stdout.write(`\n${notices.join("\n\n")}\n`);
+        }
+      }
+    );
 
-      createRoot(renderer).render(
-        <PlatformProvider platform={platform}>
-          <RegistryProvider defaultIdleTTL={5000}>
-            <AgentClientProvider tag={agentClientTag}>
-              <DisplayViewControllerProvider>
-                <CliApp
-                  sessionStart={sessionStart}
-                  initialPrompt={opts.prompt}
-                  goal={opts.goal}
-                  envAuth={resolveEnvAuth()}
-                  forceLocalInferenceSetup={opts.setup ?? false}
-                  initialAcnLifecycle={initialAcnLifecycleState}
-                  sessionOptions={{
-                    disableShellSafeguards:
-                      opts.disableShellSafeguards ?? false,
-                    disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
-                    atifPath: opts.atif,
-                    solo: opts.solo ?? false,
-                    headless: false,
-                    systemPromptOverride: opts.systemOverride,
-                  }}
-                />
-              </DisplayViewControllerProvider>
-            </AgentClientProvider>
-          </RegistryProvider>
-        </PlatformProvider>
-      );
-    });
+    createRoot(renderer).render(
+      <PlatformProvider platform={platform}>
+        <RegistryProvider defaultIdleTTL={5000}>
+          <AgentClientProvider tag={agentClientTag}>
+            <DisplayViewControllerProvider>
+              <CliApp
+                sessionStart={sessionStart}
+                initialPrompt={opts.prompt}
+                goal={opts.goal}
+                envAuth={resolveEnvAuth()}
+                forceLocalInferenceSetup={opts.setup ?? false}
+                initialAcnLifecycle={initialAcnLifecycleState}
+                sessionOptions={{
+                  disableShellSafeguards:
+                    opts.disableShellSafeguards ?? false,
+                  disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
+                  atifPath: opts.atif,
+                  solo: opts.solo ?? false,
+                  headless: false,
+                  systemPromptOverride: opts.systemOverride,
+                }}
+              />
+            </DisplayViewControllerProvider>
+          </AgentClientProvider>
+        </RegistryProvider>
+      </PlatformProvider>
+    );
+  });
 
   program.parse();
 }

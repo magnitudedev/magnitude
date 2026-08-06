@@ -44,6 +44,7 @@ import { LocalModels } from "./local-models";
 import { LocalProviderOfferings } from "./local-provider-offerings";
 import { LocalModelRecommendations } from "./local-model-recommendations";
 import { modelOfferingTargetPackageIds } from "@magnitudedev/acn-protocol";
+import { ClientLeaseManager } from "./client-lease-manager";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -70,6 +71,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const localModels = yield* LocalModels;
     const localProviderOfferings = yield* LocalProviderOfferings;
     const localModelRecommendations = yield* LocalModelRecommendations;
+    const clientLeases = yield* ClientLeaseManager;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -192,6 +194,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
       ),
+      RenewClientLease: ({ clientId }) => clientLeases.renew(clientId),
+      ReleaseClientLease: ({ clientId }) => clientLeases.release(clientId),
 
       // Session lifecycle
       PreloadSession: ({ cwd, options, draftOwnerId }) =>

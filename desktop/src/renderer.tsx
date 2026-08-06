@@ -5,8 +5,8 @@
  * creates the AgentClient AtomRpc tag with the desktop daemon services, and mounts App
  * inside PlatformProvider + RegistryProvider + AgentClientProvider.
  *
- * ACN selection remains lazy. The client lifecycle selects an endpoint when
- * the first RPC consumer mounts.
+ * The scoped client lease is the first RPC consumer and establishes ACN
+ * selection as the interactive client lifetime starts.
  *
  * On window close, interrupts the renderer stream and notifies main (§5.6).
  */
@@ -22,6 +22,7 @@ injectCssVars()
 
 const desktopApi = window.__magnitudeDesktop
 const root = createRoot(document.getElementById("root")!)
+let activePlatform: Awaited<ReturnType<typeof createDesktopPlatform>> | undefined
 
 document.documentElement.dataset.desktopPlatform = desktopApi.platform
 
@@ -60,6 +61,7 @@ function renderDaemonError(message: string) {
 
 async function renderApp() {
   const platform = await createDesktopPlatform(desktopApi)
+  activePlatform = platform
   const agentClientTag = createAgentClient(platform.protocolLayer)
   root.render(
     <PlatformProvider platform={platform}>
@@ -75,6 +77,7 @@ async function renderApp() {
 // On window close, interrupt the stream fiber and notify main (§5.6)
 window.addEventListener("beforeunload", () => {
   stopDisplayViewController()
+  void activePlatform?.shutdown()
   desktopApi.interruptStream()
 })
 

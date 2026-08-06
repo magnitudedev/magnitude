@@ -52,12 +52,13 @@ commits `Stopping(startup-failed)`.
 
 ## Activity and idleness
 
-ACN stops after thirty minutes without work. The first idle period begins only after readiness. A
+ACN stops after thirty minutes without work or connected-client retention. The first idle period begins only after readiness. A
 finite RPC retains demand for its whole handler; shared work continuing after a request retains its
 own scoped demand according to [operation ownership](../../architecture/operation-ownership.md).
 
 Health, subscriptions, status/file watches, mirror refetch, display streams, ICN observation,
-telemetry, and introspection are non-demand. The final demand release starts the idle timer. Demand
+telemetry, and introspection are non-demand. Explicit renewable client leases retain ACN without
+turning observation into demand. The final demand and client-retention release starts the idle timer. Demand
 admission and retirement commit are serialized so work cannot enter a service being destroyed.
 
 ## Shutdown

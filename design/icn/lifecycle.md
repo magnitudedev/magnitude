@@ -480,8 +480,9 @@ The lifecycle conforms when:
 - `ModelInstancesSnapshot` drives matching slot projections; the load response stream never owns
   lifecycle;
 - loading one local model terminalizes the prior instance before the replacement becomes Ready;
-- a resident model remains loaded until explicit replacement, exact-instance Stop, memory-pressure
-  eviction, inference-worker loss, or ICN process exit;
+- a resident model remains loaded until its current idle-residency policy expires, explicit
+  replacement, exact-instance Stop, memory-pressure eviction, inference-worker loss, or ICN
+  process exit;
 - replacement, load, and Stop serialize through native mutation authority and cannot
   invalidate an admitted inference lease;
 - product model-download, activation, deletion, hardware, and assessment operations reach ICN only through

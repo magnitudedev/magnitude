@@ -3192,7 +3192,44 @@ struct NativeModelInstanceController {
     loaded_configurations: Arc<Mutex<std::collections::BTreeSet<String>>>,
     instances: InstanceEntries,
     mutation: Arc<tokio::sync::Mutex<()>>,
+    residency_policy: Arc<RwLock<ModelResidencyPolicyState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelResidencyPolicyState {
+    generation: u64,
     idle_timeout: std::time::Duration,
+}
+
+fn next_model_residency_policy(
+    current: ModelResidencyPolicyState,
+    generation: u64,
+    idle_timeout: std::time::Duration,
+) -> Result<ModelResidencyPolicyState, InventoryError> {
+    if idle_timeout.is_zero() {
+        return Err(InventoryError::InvalidRequest(
+            "model residency idle timeout must be greater than zero".to_owned(),
+        ));
+    }
+    if generation < current.generation {
+        return Err(InventoryError::InvalidRequest(format!(
+            "model residency policy generation {generation} is older than {}",
+            current.generation,
+        )));
+    }
+    if generation == current.generation {
+        return if idle_timeout == current.idle_timeout {
+            Ok(current)
+        } else {
+            Err(InventoryError::InvalidRequest(format!(
+                "model residency policy generation {generation} conflicts with the established timeout",
+            )))
+        };
+    }
+    Ok(ModelResidencyPolicyState {
+        generation,
+        idle_timeout,
+    })
 }
 
 #[derive(Clone)]
@@ -3225,7 +3262,8 @@ fn idle_release_elapsed(
     expected: &ReadyInstanceRecord,
     current: Option<&ReadyInstanceRecord>,
     activity: InstanceActivity,
-    timeout: std::time::Duration,
+    expected_policy_generation: u64,
+    policy: ModelResidencyPolicyState,
     now: std::time::Instant,
 ) -> Option<std::time::Duration> {
     let current = current?;
@@ -3233,11 +3271,22 @@ fn idle_release_elapsed(
         || current.instance_id != expected.instance_id
         || activity.generation != expected.generation
         || activity.active_leases != 0
+        || policy.generation != expected_policy_generation
     {
         return None;
     }
     let elapsed = now.checked_duration_since(activity.idle_since?)?;
-    (elapsed >= timeout).then_some(elapsed)
+    (elapsed >= policy.idle_timeout).then_some(elapsed)
+}
+
+fn restart_idle_interval(
+    activity: &mut InstanceActivity,
+    expected_generation: u64,
+    now: std::time::Instant,
+) {
+    if activity.generation == expected_generation && activity.active_leases == 0 {
+        activity.idle_since = Some(now);
+    }
 }
 
 impl ModelTransitionFailure {
@@ -3272,9 +3321,7 @@ impl From<InventoryError> for ModelTransitionFailure {
 }
 
 impl NativeModelInstanceController {
-    // TMP: Approximate client-aware model residency until presence can select
-    // the connected 60-minute and disconnected 10-minute policies dynamically.
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    const DISCONNECTED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     fn load_failure(error: InventoryError) -> DomainModelFailure {
         let (code, retryable) = match &error {
@@ -3324,7 +3371,10 @@ impl NativeModelInstanceController {
             loaded_configurations: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             instances: InstanceEntries::new(),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
-            idle_timeout: Self::IDLE_TIMEOUT,
+            residency_policy: Arc::new(RwLock::new(ModelResidencyPolicyState {
+                generation: 0,
+                idle_timeout: Self::DISCONNECTED_IDLE_TIMEOUT,
+            })),
         }
     }
 
@@ -3446,7 +3496,11 @@ impl NativeModelInstanceController {
                     activity_changed.await;
                     continue;
                 };
-                let deadline = tokio::time::Instant::from_std(idle_since + controller.idle_timeout);
+                let policy = *controller
+                    .residency_policy
+                    .read()
+                    .expect("model residency policy lock poisoned");
+                let deadline = tokio::time::Instant::from_std(idle_since + policy.idle_timeout);
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => {}
                     _ = &mut activity_changed => continue,
@@ -3458,11 +3512,16 @@ impl NativeModelInstanceController {
                 };
                 let current = controller.instances.ready_instance().await;
                 let activity = ready_instance.runtime.activity();
+                let current_policy = *controller
+                    .residency_policy
+                    .read()
+                    .expect("model residency policy lock poisoned");
                 let Some(elapsed) = idle_release_elapsed(
                     &ready_instance,
                     current.as_ref(),
                     activity,
-                    controller.idle_timeout,
+                    policy.generation,
+                    current_policy,
                     std::time::Instant::now(),
                 ) else {
                     drop(backend_mutation);
@@ -4568,6 +4627,40 @@ impl NativeModelInstanceController {
 }
 
 impl ModelInstanceController for NativeModelInstanceController {
+    fn set_residency_policy(
+        &self,
+        generation: u64,
+        idle_timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        Box::pin(async move {
+            let _guard = self.mutation.lock().await;
+            {
+                let current = *self.residency_policy.read().map_err(|_| {
+                    InventoryError::Internal("model residency policy lock poisoned".to_owned())
+                })?;
+                let next = next_model_residency_policy(current, generation, idle_timeout)?;
+                if next == current {
+                    return Ok(());
+                }
+                *self.residency_policy.write().map_err(|_| {
+                    InventoryError::Internal("model residency policy lock poisoned".to_owned())
+                })? = next;
+            }
+
+            if let Some(resident) = self.instances.ready_instance().await {
+                if let Ok(mut activity) = resident.runtime.activity.lock() {
+                    restart_idle_interval(
+                        &mut activity,
+                        resident.generation,
+                        std::time::Instant::now(),
+                    );
+                }
+                resident.runtime.activity_changed.notify_waiters();
+            }
+            Ok(())
+        })
+    }
+
     fn preview_load(
         &self,
         request: PreviewModelLoadRequest,
@@ -5755,6 +5848,10 @@ mod tests {
     #[test]
     fn idle_release_requires_the_exact_residency_and_a_full_idle_interval() {
         let timeout = std::time::Duration::from_secs(600);
+        let policy = ModelResidencyPolicyState {
+            generation: 3,
+            idle_timeout: timeout,
+        };
         let now = std::time::Instant::now();
         let resident = ReadyInstanceRecord {
             configuration_id: ModelServingConfigurationId("model-a".to_owned()),
@@ -5771,7 +5868,7 @@ mod tests {
         };
 
         assert_eq!(
-            idle_release_elapsed(&resident, Some(&resident), activity, timeout, now),
+            idle_release_elapsed(&resident, Some(&resident), activity, 3, policy, now),
             Some(timeout)
         );
         assert_eq!(
@@ -5782,7 +5879,8 @@ mod tests {
                     idle_since: Some(now - timeout + std::time::Duration::from_nanos(1)),
                     ..activity
                 },
-                timeout,
+                3,
+                policy,
                 now,
             ),
             None
@@ -5790,8 +5888,35 @@ mod tests {
     }
 
     #[test]
+    fn residency_policy_generations_are_idempotent_and_monotonic() {
+        let current = ModelResidencyPolicyState {
+            generation: 4,
+            idle_timeout: std::time::Duration::from_secs(600),
+        };
+        assert_eq!(
+            next_model_residency_policy(current, 4, current.idle_timeout).unwrap(),
+            current,
+        );
+        assert!(
+            next_model_residency_policy(current, 4, std::time::Duration::from_secs(3600),).is_err()
+        );
+        assert!(next_model_residency_policy(current, 3, current.idle_timeout).is_err());
+        assert_eq!(
+            next_model_residency_policy(current, 5, std::time::Duration::from_secs(3600),).unwrap(),
+            ModelResidencyPolicyState {
+                generation: 5,
+                idle_timeout: std::time::Duration::from_secs(3600),
+            },
+        );
+    }
+
+    #[test]
     fn idle_release_rejects_active_or_stale_observations() {
         let timeout = std::time::Duration::from_secs(600);
+        let policy = ModelResidencyPolicyState {
+            generation: 3,
+            idle_timeout: timeout,
+        };
         let now = std::time::Instant::now();
         let resident = ReadyInstanceRecord {
             configuration_id: ModelServingConfigurationId("model-a".to_owned()),
@@ -5823,13 +5948,14 @@ mod tests {
                     active_leases: 1,
                     ..idle
                 },
-                timeout,
+                3,
+                policy,
                 now,
             ),
             None
         );
         assert_eq!(
-            idle_release_elapsed(&resident, Some(&stale), idle, timeout, now),
+            idle_release_elapsed(&resident, Some(&stale), idle, 3, policy, now),
             None
         );
         assert_eq!(
@@ -5840,10 +5966,151 @@ mod tests {
                     generation: 8,
                     ..idle
                 },
-                timeout,
+                3,
+                policy,
                 now,
             ),
             None
+        );
+        assert_eq!(
+            idle_release_elapsed(&resident, Some(&resident), idle, 2, policy, now,),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn residency_policy_changes_restart_connected_and_disconnected_idle_intervals() {
+        let resident = ReadyInstanceRecord {
+            configuration_id: ModelServingConfigurationId("model-a".to_owned()),
+            instance_id: ModelInstanceId("instance-a".to_owned()),
+            generation: 7,
+            package_ids: Vec::new(),
+            allocation: test_model_instance_allocation(),
+            runtime: InstanceRuntime::empty(),
+        };
+        let mut activity = InstanceActivity {
+            generation: resident.generation,
+            active_leases: 0,
+            idle_since: Some(tokio::time::Instant::now().into_std()),
+        };
+
+        tokio::time::advance(std::time::Duration::from_secs(5 * 60)).await;
+        restart_idle_interval(
+            &mut activity,
+            resident.generation,
+            tokio::time::Instant::now().into_std(),
+        );
+        let connected = ModelResidencyPolicyState {
+            generation: 1,
+            idle_timeout: std::time::Duration::from_secs(60 * 60),
+        };
+        tokio::time::advance(connected.idle_timeout - std::time::Duration::from_nanos(1)).await;
+        assert_eq!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                activity,
+                connected.generation,
+                connected,
+                tokio::time::Instant::now().into_std(),
+            ),
+            None,
+        );
+        tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+        assert!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                activity,
+                connected.generation,
+                connected,
+                tokio::time::Instant::now().into_std(),
+            )
+            .is_some()
+        );
+
+        restart_idle_interval(
+            &mut activity,
+            resident.generation,
+            tokio::time::Instant::now().into_std(),
+        );
+        let disconnected = ModelResidencyPolicyState {
+            generation: 2,
+            idle_timeout: std::time::Duration::from_secs(10 * 60),
+        };
+        tokio::time::advance(disconnected.idle_timeout).await;
+        assert!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                activity,
+                disconnected.generation,
+                disconnected,
+                tokio::time::Instant::now().into_std(),
+            )
+            .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_inference_wins_the_deadline_and_receives_a_fresh_idle_interval() {
+        let timeout = std::time::Duration::from_secs(10 * 60);
+        let policy = ModelResidencyPolicyState {
+            generation: 3,
+            idle_timeout: timeout,
+        };
+        let resident = ReadyInstanceRecord {
+            configuration_id: ModelServingConfigurationId("model-a".to_owned()),
+            instance_id: ModelInstanceId("instance-a".to_owned()),
+            generation: 7,
+            package_ids: Vec::new(),
+            allocation: test_model_instance_allocation(),
+            runtime: InstanceRuntime::empty(),
+        };
+        let mut activity = InstanceActivity {
+            generation: resident.generation,
+            active_leases: 1,
+            idle_since: None,
+        };
+
+        tokio::time::advance(timeout).await;
+        assert_eq!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                activity,
+                policy.generation,
+                policy,
+                tokio::time::Instant::now().into_std(),
+            ),
+            None,
+        );
+
+        activity.active_leases = 0;
+        activity.idle_since = Some(tokio::time::Instant::now().into_std());
+        tokio::time::advance(timeout - std::time::Duration::from_nanos(1)).await;
+        assert_eq!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                activity,
+                policy.generation,
+                policy,
+                tokio::time::Instant::now().into_std(),
+            ),
+            None,
+        );
+        tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+        assert!(
+            idle_release_elapsed(
+                &resident,
+                Some(&resident),
+                activity,
+                policy.generation,
+                policy,
+                tokio::time::Instant::now().into_std(),
+            )
+            .is_some()
         );
     }
 

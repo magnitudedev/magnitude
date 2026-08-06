@@ -50,6 +50,7 @@ vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-mtp/vulkan"]
 
 [dev-dependencies]
 tempfile = "3.24.0"
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

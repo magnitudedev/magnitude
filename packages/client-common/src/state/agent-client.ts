@@ -24,7 +24,8 @@ export type AgentClientInstance = ReturnType<typeof createAgentClient>
  * The protocol layer must be created once at startup (by the Platform) and
  * passed here. This ensures all RPC consumers — AtomRpc mutations, the
  * display controller, file-watch, session-statuses — share one client
- * lifecycle authority and one transport.
+ * lifecycle and recovery authority. Each typed RPC client still builds its
+ * own single-consumer protocol receiver.
  */
 export function createAgentClient(
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,

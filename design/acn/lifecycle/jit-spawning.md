@@ -25,6 +25,11 @@ AcnJitRuntime --ensure(identity)--> AcnProcessManager <--> AcnProcessState
 active replacement, delayed startup, manager death, and takeover are intermediate states. Ensurance
 ends only with a usable exact instance or a typed condition that prevents safe convergence.
 
+Administrative stop is a separate local capability from JIT ensurance. It publishes
+`BeginTerminateCurrent` through the same durable process state, converting any active Ensure intent
+to Terminate before exact cleanup. Browser and renderer process managers do not receive this
+privileged operation merely to satisfy the ordinary JIT interface.
+
 ## Identity
 
 ACN version is ACN identity. An ACN instance ID plus PID and process-start identity identifies one
@@ -129,6 +134,12 @@ without a new ensure request. Failure to prove candidate exit enters `BlockedCan
 
 `terminate(instance)` uses the same state machine with `Terminate` purpose and can affect only the
 exact supplied assigned occurrence. It never enumerates or kills peers.
+
+`terminateCurrent` is the administrative edge-triggered variant. It atomically converts the current
+assignment or Ensure change to `Terminate`, fences and retires an admitted candidate, or completes
+an unpublished spawning phase without starting a process. It joins or takes over an existing
+termination through the same owner-liveness rules. It stops the ACN; exact ICN cleanup is only the
+recorded orphan backstop after ACN exit.
 
 Assignment results—admitted, terminated, or failed before admission—are retained in the current
 terminal `Assigned` or `Unassigned` state. A later change may replace that result; callers converge

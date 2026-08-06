@@ -238,6 +238,23 @@ export const searchHuggingFaceModels = HttpApiEndpoint.post("searchHuggingFaceMo
     { status: 500 },
   )
 
+export const setModelResidencyPolicy = HttpApiEndpoint.post("setModelResidencyPolicy", "/v1/models/residency-policy")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.SetModelResidencyPolicyRequest, Schemas.SetModelResidencyPolicyRequestEncoded> =>
+        Schemas.SetModelResidencyPolicyRequest,
+    ),
+  )
+  .addSuccess(S.Void, { status: 204 })
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const startModelDownload = HttpApiEndpoint.post("startModelDownload", "/v1/models/downloads")
   .setPayload(
     S.suspend(
@@ -282,6 +299,7 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(listModelDownloads)
   .add(previewModelLoad)
   .add(removeInstalledModel)
+  .add(setModelResidencyPolicy)
   .add(startModelDownload)
   .add(stopModelInstance)
 

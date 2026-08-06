@@ -273,6 +273,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/models/instances/watch", get(watch_model_instances))
         .route(
+            "/v1/models/residency-policy",
+            post(set_model_residency_policy),
+        )
+        .route(
             "/v1/models/instances/{instance_id}/stop",
             post(stop_model_instance),
         )
@@ -340,7 +344,19 @@ pub struct HealthResponse {
     native_build: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetModelResidencyPolicyRequest {
+    pub generation: u64,
+    pub idle_timeout_seconds: u64,
+}
+
 pub trait ModelInstanceController: Send + Sync + 'static {
+    fn set_residency_policy(
+        &self,
+        generation: u64,
+        idle_timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<(), InventoryError>>;
     fn preview_load(
         &self,
         request: PreviewModelLoadRequest,
@@ -385,6 +401,14 @@ impl StaticModelInstanceController {
 }
 
 impl ModelInstanceController for StaticModelInstanceController {
+    fn set_residency_policy(
+        &self,
+        _generation: u64,
+        _idle_timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn preview_load(
         &self,
         _request: PreviewModelLoadRequest,
@@ -1183,6 +1207,38 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         instance_id: state.identity.instance_id,
         native_build: state.identity.native_build,
     })
+}
+
+#[utoipa::path(post, path = "/v1/models/residency-policy", operation_id = "setModelResidencyPolicy", tag = "models",
+    request_body(content = SetModelResidencyPolicyRequest, content_type = "application/json"),
+    responses(
+        (status = 204, description = "The model residency policy is established"),
+        (status = 400, description = "The policy is invalid or conflicts with its generation", body = ErrorResponse),
+        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.model_residency_policy.set", skip_all, err(Debug))]
+async fn set_model_residency_policy(
+    State(state): State<AppState>,
+    Json(request): Json<SetModelResidencyPolicyRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.idle_timeout_seconds == 0 {
+        return Err(ApiError::invalid(
+            "idleTimeoutSeconds must be greater than zero",
+        ));
+    }
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    controller
+        .set_residency_policy(
+            request.generation,
+            std::time::Duration::from_secs(request.idle_timeout_seconds),
+        )
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/v1/models/instances", operation_id = "loadModelInstance", tag = "models",
@@ -2686,12 +2742,14 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         model_instances,
         watch_model_instances,
         stop_model_instance,
+        set_model_residency_policy,
         props,
         apply_template,
         chat_completions
     ),
     components(schemas(
         HealthResponse,
+        SetModelResidencyPolicyRequest,
         HardwareSnapshot,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
@@ -3278,6 +3336,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn residency_policy_endpoint_accepts_positive_seconds_and_rejects_zero() {
+        let state = AppState::new(FakeBackend::new("test-model", ""));
+        let accepted = app(state.clone())
+            .oneshot(
+                Request::post("/v1/models/residency-policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "generation": 1, "idleTimeoutSeconds": 600 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+
+        let rejected = app(state)
+            .oneshot(
+                Request::post("/v1/models/residency-policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "generation": 2, "idleTimeoutSeconds": 0 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn hugging_face_endpoints_expose_live_search_and_immutable_resolution() {
         let state = AppState::new(FakeBackend::new("test-model", ""))
             .with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog));
@@ -3377,6 +3465,14 @@ mod tests {
     }
 
     impl ModelInstanceController for StubModelInstanceController {
+        fn set_residency_policy(
+            &self,
+            _generation: u64,
+            _idle_timeout: std::time::Duration,
+        ) -> BoxFuture<'_, Result<(), InventoryError>> {
+            Box::pin(async { Ok(()) })
+        }
+
         fn preview_load(
             &self,
             _request: PreviewModelLoadRequest,
