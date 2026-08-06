@@ -35,8 +35,8 @@ monotonic `identityFloor`.
 
 `ReadyAcn` is the only endpoint result. Its constructor proves stable `Assigned`, exact live
 process, matching ID/identity/PID `Ready` health, and a final stable-state reread for the same
-occurrence and endpoint. Revision-only ICN record changes do not invalidate the occurrence.
-Readiness is selection-time evidence; later transport recovery handles retirement after selection.
+occurrence and endpoint. Readiness is selection-time evidence; later transport recovery handles
+retirement after selection.
 
 Each host has an `AcnLaunchSource` describing the identities that host can launch and how it prepares
 one supported identity. A local development command supports only its exact build identity;
@@ -55,13 +55,13 @@ AcnProcessState
   identityFloor     monotonic launch floor
   mode
     Unassigned
-    Assigned(exact ACN, optional exact ICN)
+    Assigned(exact ACN)
     Changing(change revision, purpose, exact owner, phase)
 ```
 
 The highest complete immutable consecutive revision is the entire authority. Writers validate one
 typed reducer command and exclusively publish the next revision. There is no current pointer,
-launch lease, second owned-ICN record, manager registry, or completion store. Invalid or unreadable
+launch lease, child-process record, manager registry, or completion store. Invalid or unreadable
 highest state fails typed and is never treated as absence.
 
 `Changing` has one `Ensure` or `Terminate` purpose and one exact manager or candidate owner. Its
@@ -90,9 +90,9 @@ the retained incumbent, or `Unassigned` when there was none, and records failure
 change. The identity floor remains a launch fence, but does not make a retained incumbent unusable
 to a client whose own minimum identity it satisfies.
 
-Replacement first shuts down and proves absence of the exact predecessor and its recorded ICN.
-The ACN normally stops its child ICN; recorded ICN cleanup is the orphan backstop. Failed proof
-retains the occurrence and fails the change.
+Replacement first shuts down and proves absence of the exact predecessor. The predecessor's private
+ICN is owned entirely by its ACN scope and exits during orderly scope finalization or when abrupt ACN
+loss closes its parent pipe. Failed ACN exit proof retains the occurrence and fails the change.
 
 A spawned child is scoped and parent-bound until its exact candidate is committed. Only successful
 `CandidateSpawned` permits atomic handoff, releasing bootstrap and disarming cleanup. The candidate
@@ -136,8 +136,7 @@ spawn, and contenders coordinate through next-revision compare-and-set.
 
 `stopCurrent` converts stable assignment or an active Ensure change to durable `Terminate`, then
 joins or takes over exact cleanup until stable `Unassigned`. It does not kill clients, resolve an
-artifact, or start an ACN. Stopping the ACN owns normal ICN shutdown; exact recorded ICN termination
-is only the orphan fallback.
+artifact, start an ACN, or directly manage the ACN's private ICN child.
 
 ## Guarantees
 

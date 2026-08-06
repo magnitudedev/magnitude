@@ -12,7 +12,7 @@ import {
   readProcessStartIdentity,
   type AssignedAcn,
 } from "@magnitudedev/acn-protocol/process-state"
-import { Deferred, Effect, Fiber, Layer, Option, Runtime, Stream } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { runAcnEnsure } from "./acn-ensurer"
 import { ChildProcessSpawner, scopePreHandoffCandidate } from "./child-process"
@@ -75,87 +75,6 @@ describe("LocalAcnEnsurer", () => {
         },
       })
       expect(Option.isNone(yield* resolveAssignedAcnProxyTarget(dataDirectory, id))).toBe(true)
-    }).pipe(Effect.provide(BunContext.layer))))
-  })
-
-  it("accepts readiness when the final reread changes only ICN ownership revision", async () => {
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem
-      const dataDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "acn-ready-reread-" })
-      const manager = {
-        pid: process.pid,
-        processStartIdentity: yield* currentProcessStartIdentity,
-      }
-      const runPromise = Runtime.runPromise(yield* Effect.runtime<FileSystem.FileSystem>())
-      let assignedAcn: AssignedAcn | undefined
-      let recorded = false
-      const server = Bun.serve({
-        port: 0,
-        hostname: "127.0.0.1",
-        fetch: async () => {
-          const current = assignedAcn
-          if (current === undefined) return new Response(null, { status: 503 })
-          if (!recorded) {
-            recorded = true
-            const state = Option.getOrThrow(await runPromise(readAcnProcessState(dataDirectory)))
-            await runPromise(applyAcnProcessCommand({
-              dataDirectory,
-              expectedRevision: Option.some(state.revision),
-              command: {
-                _tag: "RecordIcn",
-                acn: current,
-                icn: { id: "icn-1", ...manager },
-              },
-            }))
-          }
-          return Response.json({
-            service: "magnitude-acn",
-            version: current.identity,
-            id: current.id,
-            pid: current.pid,
-            state: new AcnReady({}),
-          })
-        },
-      })
-      yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
-      const begun = yield* applyAcnProcessCommand({
-        dataDirectory,
-        expectedRevision: Option.none(),
-        command: { _tag: "BeginEnsure", target: "1.0.0" as never, manager },
-      })
-      const prepared = yield* applyAcnProcessCommand({
-        dataDirectory,
-        expectedRevision: Option.some(begun.revision),
-        command: { _tag: "PreparationSucceeded", manager },
-      })
-      const candidate = { identity: "1.0.0" as never, ...manager }
-      const spawned = yield* applyAcnProcessCommand({
-        dataDirectory,
-        expectedRevision: Option.some(prepared.revision),
-        command: { _tag: "CandidateSpawned", manager, candidate },
-      })
-      const assigned = yield* applyAcnProcessCommand({
-        dataDirectory,
-        expectedRevision: Option.some(spawned.revision),
-        command: {
-          _tag: "CandidateAdmitted",
-          candidate,
-          id: AcnInstanceIdSchema.make("ready-reread-acn"),
-          url: `http://127.0.0.1:${server.port}`,
-        },
-      })
-      if (assigned.mode._tag !== "Assigned") return yield* Effect.dieMessage("ACN was not assigned")
-      assignedAcn = assigned.mode.current
-      const ensurer = yield* makeLocalAcnEnsurer({ dataDir: dataDirectory }).pipe(
-        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
-          spawn: () => Effect.dieMessage("stable ready assignment must not spawn"),
-        })),
-        Effect.provide(Layer.mergeAll(BunContext.layer, FetchHttpClient.layer)),
-      )
-      const result = yield* runAcnEnsure(ensurer.ensure({ minimumIdentity: "1.0.0" as never }))
-      expect(result.id).toBe(assignedAcn.id)
-      const final = Option.getOrThrow(yield* readAcnProcessState(dataDirectory))
-      expect(final.mode._tag === "Assigned" && Option.isSome(final.mode.current.ownedIcn)).toBe(true)
     }).pipe(Effect.provide(BunContext.layer))))
   })
 

@@ -1,18 +1,10 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import * as CommandExecutor from "@effect/platform/CommandExecutor"
-import * as FileSystem from "@effect/platform/FileSystem"
 import { Duration, Effect, Layer, Option, Ref } from "effect";
 import {
   type AcnInstallationPlan,
   type AcnStartupProgress,
 } from "@magnitudedev/acn-protocol";
-import {
-  applyAcnProcessCommand,
-  readAcnProcessState,
-  readProcessStartIdentity,
-  type ExactIcnProcess,
-} from "@magnitudedev/acn-protocol/process-state"
 import type { ArtifactInstallationEvent } from "@magnitudedev/release";
 import {
   IcnBinaryResolutionConfig,
@@ -27,13 +19,10 @@ import {
   IcnInstancesLive,
   IcnStorageConfig,
   IcnPreparationReporter,
-  IcnProcessOwnership,
-  IcnLifecycleError,
 } from "@magnitudedev/icn";
 import { ACN_VERSION } from "../version";
 import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
 import { AcnServiceLifecycle } from "../service-lifecycle";
-import { ACN_INSTANCE_ID } from "../identity"
 
 const artifactProgress = (
   artifact: "Base" | "Accelerator",
@@ -114,7 +103,6 @@ const makeProcess = (dataDir: string) =>
       gracefulShutdownTimeout: Duration.millis(500),
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
-      parentPid: process.pid,
     })
   ).pipe(Layer.orDie);
 
@@ -138,106 +126,6 @@ const makeSupervision = () =>
   );
 
 export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
-  const ownership = Layer.effect(
-    IcnProcessOwnership,
-    Effect.gen(function* () {
-      const commandExecutor = yield* CommandExecutor.CommandExecutor
-      const fileSystem = yield* FileSystem.FileSystem
-      return IcnProcessOwnership.of({
-        acquire: ({ instanceId, pid }) => {
-          return Effect.gen(function* () {
-            const processStartIdentity = yield* readProcessStartIdentity(pid).pipe(
-              Effect.mapError((cause) => new IcnLifecycleError({
-                operation: "spawn",
-                reason: "spawn-failed",
-                message: `unable to identify spawned ICN process ${pid}`,
-                diagnostic: Option.some(String(cause)),
-              })),
-              Effect.flatMap(Option.match({
-                onNone: () => Effect.fail(new IcnLifecycleError({
-                  operation: "spawn",
-                  reason: "spawn-failed",
-                  message: `spawned ICN process ${pid} was not alive`,
-                  diagnostic: Option.none(),
-                })),
-                onSome: Effect.succeed,
-              })),
-            )
-            const icn: ExactIcnProcess = {
-              id: instanceId,
-              pid,
-              processStartIdentity,
-            }
-            const observed = yield* readAcnProcessState(dataDir)
-            if (
-              Option.isNone(observed) ||
-              observed.value.mode._tag !== "Assigned" ||
-              observed.value.mode.current.id !== ACN_INSTANCE_ID ||
-              observed.value.mode.current.pid !== globalThis.process.pid
-            ) return yield* new IcnLifecycleError({
-              operation: "spawn",
-              reason: "spawn-failed",
-              message: "ACN lost assignment before ICN ownership acquisition",
-              diagnostic: Option.none(),
-            })
-            yield* applyAcnProcessCommand({
-              dataDirectory: dataDir,
-              expectedRevision: Option.some(observed.value.revision),
-              command: {
-                _tag: "RecordIcn",
-                acn: observed.value.mode.current,
-                icn,
-              },
-            }).pipe(
-              Effect.mapError((cause) => new IcnLifecycleError({
-                operation: "spawn",
-                reason: "spawn-failed",
-                message: "unable to persist ACN ownership of its ICN process",
-                diagnostic: Option.some(String(cause)),
-              })),
-            )
-            const release = Effect.gen(function* () {
-              const current = yield* readAcnProcessState(dataDir)
-              if (
-                Option.isNone(current) ||
-                current.value.mode._tag !== "Assigned" ||
-                current.value.mode.current.id !== ACN_INSTANCE_ID ||
-                Option.isNone(current.value.mode.current.ownedIcn) ||
-                current.value.mode.current.ownedIcn.value.id !== icn.id ||
-                current.value.mode.current.ownedIcn.value.pid !== icn.pid ||
-                current.value.mode.current.ownedIcn.value.processStartIdentity !== icn.processStartIdentity
-              ) return
-              yield* applyAcnProcessCommand({
-                dataDirectory: dataDir,
-                expectedRevision: Option.some(current.value.revision),
-                command: { _tag: "ClearIcn", acn: current.value.mode.current, icn },
-              })
-            }).pipe(
-              Effect.provideService(FileSystem.FileSystem, fileSystem),
-              Effect.mapError((cause) => new IcnLifecycleError({
-                operation: "shutdown",
-                reason: "shutdown-failed",
-                message: "unable to release persisted ICN ownership",
-                diagnostic: Option.some(String(cause)),
-              })),
-            )
-            return { release }
-          }).pipe(
-            Effect.mapError((cause) => cause instanceof IcnLifecycleError
-              ? cause
-              : new IcnLifecycleError({
-                  operation: "spawn",
-                  reason: "spawn-failed",
-                  message: "unable to coordinate ICN ownership",
-                  diagnostic: Option.some(String(cause)),
-                })),
-            Effect.provideService(CommandExecutor.CommandExecutor, commandExecutor),
-            Effect.provideService(FileSystem.FileSystem, fileSystem),
-          )
-        },
-      })
-    }),
-  )
   const preparation = Layer.effect(
     IcnPreparationReporter,
     Effect.gen(function* () {
@@ -321,10 +209,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
       };
     })
   );
-  const process = makeProcess(dataDir).pipe(
-    Layer.provide(preparation),
-    Layer.provide(ownership),
-  );
+  const process = makeProcess(dataDir).pipe(Layer.provide(preparation));
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withClient);

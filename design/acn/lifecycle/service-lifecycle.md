@@ -33,7 +33,7 @@ on its launching manager and permits application startup.
 An assigned ACN does not poll coordination state or self-revoke on missing, unreadable, or newer
 state. Retirement begins only through exact explicit shutdown, idle policy, its own terminal failure,
 or process signals. Replacement state continues to carry the exact predecessor until an external
-manager proves it and its ICN absent.
+manager proves the ACN absent.
 
 ## Readiness and admission
 
@@ -70,15 +70,14 @@ commit Stopping and close admission
   -> terminate subscriptions and transports
   -> close application and session scopes
   -> terminate and reap private ICN
-  -> clear ICN ownership only after exact exit proof
   -> exit ACN
   -> external manager proves ACN exit and advances process state
 ```
 
 Caller interruption cannot abandon shutdown. Application-scope closure, notification, fiber,
-finalizer, ICN, signal, kill, and reap work are bounded. If ACN cannot clear its recorded ICN
-ownership, process state retains the exact child for manager reconciliation. The ACN never removes
-or reassigns its own ACN occurrence.
+finalizer, ICN, signal, kill, and reap work are bounded. Abrupt ACN loss closes ICN's private parent
+pipe; ICN is not durably recorded or reconciled by the external manager. The ACN never removes or
+reassigns its own ACN occurrence.
 
 The control router accepts exact-instance shutdown before application readiness. A matching request
 idempotently commits `Stopping` and returns after that transition; a request for another occurrence
@@ -92,4 +91,4 @@ cannot stop the process.
 - No application work is admitted outside the exact assigned `Ready` ACN.
 - Missing or unreadable process state cannot make a healthy assigned ACN self-destruct.
 - Observation cannot retain ACN, and operation duration cannot replace it.
-- Shutdown is single-flight, bounded, and retains exact child identity until exit proof.
+- Shutdown is single-flight and bounded; the scoped child handle owns exact termination and reap.
