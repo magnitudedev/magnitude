@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.35
+
+### Patch Changes
+
+- [`cd89dfc`](https://github.com/magnitudedev/magnitude/commit/cd89dfcca87c5862374b4daa910fb2124f0975fb) Thanks [@anerli](https://github.com/anerli)! - timeout fixes, daemon coordination fixes
+
 ## 0.0.1-alpha.34
 
 ### Patch Changes
