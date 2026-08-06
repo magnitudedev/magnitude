@@ -3,7 +3,7 @@
  *
  * Responsibilities:
  * 1. Bundle path discovery — find the magnitude-acn binary
- * 2. Daemon discovery and launch via separate Effect-native services
+ * 2. ACN process management through one Effect-native service
  * 3. OS shell integration — BrowserWindow, preload, menu shortcuts
  *
  * The main process does NOT proxy ACN RPC traffic. It exposes desktop
@@ -16,7 +16,7 @@ import * as nodePath from "node:path"
 import * as nodeFs from "node:fs"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
-import { Cause, Effect, Layer, Option, PubSub, Stream } from "effect"
+import { Cause, Duration, Effect, Exit, Layer, Option, PubSub, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { layer as nodeFileSystemLayer } from "@effect/platform-node-shared/NodeFileSystem"
@@ -28,23 +28,19 @@ import { makeElectronRpcServerLayer } from "./electron-rpc"
 
 // SDK imports — these run in the main process (Node)
 import {
-  makeLocalDaemonDiscovery,
-  makeLocalDaemonLauncher,
+  makeLocalAcnProcessManager,
   ChildProcessSpawner,
+  scopePreHandoffCandidate,
   DaemonSpawnFailed,
-  captureSpawnDiagnostics,
-  type DaemonError,
-  type DaemonDiscovery as DaemonDiscoveryService,
-  type DaemonLauncher as DaemonLauncherService,
+  type AcnProcessManager as AcnProcessManagerService,
 } from "@magnitudedev/sdk"
-import type { DaemonStatus } from "@magnitudedev/sdk"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
-let daemonDiscoveryPromise: Promise<DaemonDiscoveryService> | null = null
-let daemonLauncherPromise: Promise<DaemonLauncherService> | null = null
+let acnProcessManagerPromise: Promise<AcnProcessManagerService> | null = null
+const acnProcessManagerScope = Effect.runPromise(Scope.make())
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
 
 /**
@@ -53,44 +49,108 @@ const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
  */
 const nodeSpawn: ChildProcessSpawner = {
   spawn: (command) =>
-    Effect.try({
-      try: () => {
-        const [executable, ...args] = command
-        const proc = spawn(executable, args, {
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: process.env,
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        const proc = yield* Effect.async<
+          ReturnType<typeof spawn>,
+          DaemonSpawnFailed
+        >((resume) => {
+          const [executable, ...args] = command
+          const proc = spawn(executable, args, {
+            detached: true,
+            stdio: ["pipe", "ignore", "ignore"],
+            env: process.env,
+          })
+          const cleanup = () => {
+            proc.off("spawn", onSpawn)
+            proc.off("error", onError)
+          }
+          const onSpawn = () => {
+            cleanup()
+            resume(Effect.succeed(proc))
+          }
+          const onError = (cause: Error) => {
+            cleanup()
+            resume(Effect.fail(new DaemonSpawnFailed({
+                reason: `Failed to spawn Magnitude: ${cause.message}`,
+            })))
+          }
+          proc.once("spawn", onSpawn)
+          proc.once("error", onError)
+          return Effect.sync(cleanup)
         })
-        const diagnostics = captureSpawnDiagnostics(
-          [proc.stdout, proc.stderr].filter(
-            (output): output is NonNullable<typeof proc.stdout> =>
-              output !== null,
-          ),
-        )
-        for (const output of [proc.stdout, proc.stderr]) {
-          const unref = Reflect.get(output ?? {}, "unref")
-          if (typeof unref === "function") unref.call(output)
+        const pid = proc.pid
+        if (pid === undefined) {
+          return yield* new DaemonSpawnFailed({
+            reason: "Spawned ACN has no process ID",
+          })
         }
-        const exited = new Promise<number>((resolve) => {
+        const exitedPromise = new Promise<number>((resolve) => {
           proc.once("close", (code) => resolve(code ?? 1))
           proc.once("error", () => resolve(1))
         })
+        const exited = Effect.promise(() => exitedPromise)
         proc.unref()
-        return {
-          pid: Option.fromNullable(proc.pid),
-          exited: Effect.promise(() => exited),
-          diagnostic: diagnostics.diagnostic,
-          kill: (signal) =>
-            Effect.sync(() => {
-              proc.kill(signal)
-            }),
-        }
-      },
-      catch: (cause) =>
-        new DaemonSpawnFailed({
-          reason: `Failed to spawn Magnitude: ${String(cause)}`,
-        }),
-    }),
+
+        const signal = (name: NodeJS.Signals) =>
+          Effect.try({
+            try: () => {
+              if (!proc.kill(name)) throw new Error(`process ${pid} rejected ${name}`)
+            },
+            catch: (cause) =>
+              new DaemonSpawnFailed({
+                reason: `Failed to send ${name} to ACN ${pid}: ${String(cause)}`,
+              }),
+          })
+        const waitForExit = (duration: Duration.DurationInput) =>
+          exited.pipe(Effect.timeoutOption(duration))
+        const stopAndReap = Effect.gen(function* () {
+          if (Option.isSome(yield* waitForExit("1 millis"))) return
+          yield* signal("SIGTERM")
+          if (Option.isSome(yield* waitForExit("2 seconds"))) return
+          yield* signal("SIGKILL")
+          if (Option.isNone(yield* waitForExit("2 seconds"))) {
+            return yield* new DaemonSpawnFailed({
+              reason: `Pre-handoff ACN ${pid} did not exit after SIGKILL`,
+            })
+          }
+        })
+        const releaseForHandoff = Effect.async<void, DaemonSpawnFailed>((resume) => {
+          const stdin = proc.stdin
+          if (stdin === null) {
+            resume(
+              Effect.fail(
+                new DaemonSpawnFailed({
+                  reason: "ACN bootstrap pipe is unavailable",
+                }),
+              ),
+            )
+            return
+          }
+          const onError = (cause: Error) => {
+            stdin.off("error", onError)
+            resume(
+              Effect.fail(
+                new DaemonSpawnFailed({
+                  reason: `Failed to hand off ACN bootstrap: ${cause.message}`,
+                }),
+              ),
+            )
+          }
+          stdin.once("error", onError)
+          stdin.end("1", () => {
+            stdin.off("error", onError)
+            resume(Effect.void)
+          })
+          return Effect.sync(() => stdin.off("error", onError))
+        })
+        return yield* scopePreHandoffCandidate({
+          pid,
+          releaseForHandoff,
+          stopAndReap,
+        })
+      }),
+    ),
 }
 
 /**
@@ -162,35 +222,6 @@ function findBinaryPath(): Option.Option<string> {
   // Let the SDK resolve/download its cache. Do not pass the SDK cache as an
   // explicit binaryPath, or version repair turns into explicit-path failure.
   return Option.none()
-}
-
-/**
- * Format a user-friendly error message for a DaemonError.
- */
-function formatDaemonError(error: DaemonError): string {
-  switch (error._tag) {
-    case "NoDaemon":
-      return "Could not connect to the Magnitude daemon. Please try again."
-    case "DaemonSpawnFailed":
-      return `Failed to start the Magnitude daemon: ${error.reason}`
-    case "BinaryNotFound":
-      return `The Magnitude ACN binary was not found at: ${error.path}`
-    case "BinaryVersionMismatch":
-      return `Binary version mismatch. Expected ${error.expected}, found ${error.actual} at ${error.path}.`
-    case "RegistrationFileInvalid":
-      return `Registration file is invalid at ${error.path}: ${error.reason}`
-    case "DownloadFailed":
-      return `Failed to download the ACN binary: ${error.reason} (HTTP ${error.status})`
-    case "ChecksumMismatch":
-      return `Checksum mismatch for ${error.path}. Expected ${error.expected}, got ${error.actual}.`
-    case "DaemonCrashed":
-      return Option.match(error.diagnostic, {
-        onNone: () =>
-          `The Magnitude daemon crashed with exit code ${error.exitCode}.`,
-        onSome: (diagnostic) =>
-          `The Magnitude daemon crashed with exit code ${error.exitCode}: ${diagnostic}`,
-      })
-  }
 }
 
 function sendMenuAction(action: MenuAction): void {
@@ -368,30 +399,18 @@ function localDaemonOptions() {
   }
 }
 
-async function getDaemonDiscovery(): Promise<DaemonDiscoveryService> {
-  daemonDiscoveryPromise ??= makeLocalDaemonDiscovery().pipe(
-    Effect.provide(nodePlatformLayer),
-    Effect.runPromise,
-  )
-  return daemonDiscoveryPromise
-}
-
-async function getDaemonLauncher(): Promise<DaemonLauncherService> {
-  daemonLauncherPromise ??= makeLocalDaemonLauncher(localDaemonOptions()).pipe(
+async function getAcnProcessManager(): Promise<AcnProcessManagerService> {
+  const scope = await acnProcessManagerScope
+  acnProcessManagerPromise ??= makeLocalAcnProcessManager(localDaemonOptions()).pipe(
     Effect.provideService(ChildProcessSpawner, nodeSpawn),
+    Effect.provideService(Scope.Scope, scope),
     Effect.provide(nodePlatformLayer),
     Effect.runPromise,
   )
-  return daemonLauncherPromise
+  return acnProcessManagerPromise
 }
 
-const daemonDiscovery = Effect.promise(getDaemonDiscovery)
-const daemonLauncher = Effect.promise(getDaemonLauncher)
-
-const currentAcn: Effect.Effect<
-  Option.Option<DaemonStatus>,
-  DaemonError
-> = daemonDiscovery.pipe(Effect.flatMap((discovery) => discovery.current()))
+const acnProcessManager = Effect.promise(getAcnProcessManager)
 
 function messageFromUnknown(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
@@ -401,15 +420,6 @@ function desktopRpcError(cause: unknown): DesktopRpcError {
   return new DesktopRpcError({ message: messageFromUnknown(cause) })
 }
 
-const daemonRpc = <A>(
-  operation: Effect.Effect<A, DaemonError>,
-): Effect.Effect<A, DesktopRpcError> =>
-  operation.pipe(
-    Effect.mapError(
-      (error) => new DesktopRpcError({ message: formatDaemonError(error) }),
-    ),
-  )
-
 const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpcError> =>
   Effect.tryPromise({
     try: operation,
@@ -417,19 +427,24 @@ const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpc
   })
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
-  DaemonCurrent: () => daemonRpc(currentAcn).pipe(
+  AcnCurrent: () => acnProcessManager.pipe(
+    Effect.flatMap((manager) => manager.observeCurrent),
     Effect.map(Option.getOrNull),
   ),
-  DaemonLaunch: ({ command }) => Stream.unwrap(
-    daemonLauncher.pipe(
-      Effect.map((launcher) =>
-        launcher
-          .launch(Option.orElse(command, defaultLaunchCommand))
-          .pipe(Stream.mapError((error) => new DesktopRpcError({
-            message: formatDaemonError(error),
-          }))),
+  AcnLaunch: (request) => Stream.unwrap(
+    acnProcessManager.pipe(
+      Effect.map((manager) =>
+        manager
+          .launch({
+            ...request,
+            command: Option.orElse(request.command, defaultLaunchCommand),
+          }),
       ),
     ),
+  ),
+  AcnTerminate: ({ instance }) => acnProcessManager.pipe(
+    Effect.flatMap((manager) => manager.terminate(instance)),
+    Effect.as({}),
   ),
   StorageGet: ({ key }) => Effect.sync(() => storageGet(key)),
   StorageSet: ({ key, value }) => Effect.sync(() => storageSet(key, value)).pipe(Effect.as({})),
@@ -505,6 +520,12 @@ app.on("window-all-closed", () => {
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length !== 0) return
   createWindow()
+})
+
+app.on("will-quit", () => {
+  void acnProcessManagerScope.then((scope) =>
+    Effect.runPromise(Scope.close(scope, Exit.void)),
+  )
 })
 
 // ── Client lease release on quit (spec §5.6) ─────────────────────────

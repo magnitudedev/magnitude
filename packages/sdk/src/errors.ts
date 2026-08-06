@@ -7,8 +7,6 @@ export {
   DaemonError,
   DaemonSpawnFailed,
   DownloadFailed,
-  NoDaemon,
-  RegistrationFileInvalid,
   type StreamDisplayViewFailure,
   type WatchFileFailure,
 } from "./acn-jit/errors"

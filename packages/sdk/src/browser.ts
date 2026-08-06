@@ -4,22 +4,22 @@
  * Renderer builds resolve `@magnitudedev/sdk` here. Daemon discovery and
  * launch are delegated to the host over HTTP.
  */
-export { DaemonDiscovery, DaemonStatusSchema } from "./acn-jit/daemon-discovery"
-export type { DaemonStatus } from "./acn-jit/daemon-discovery"
-export { DaemonLauncher, DaemonLaunchEventSchema } from "./acn-jit/daemon-launcher"
-export type { DaemonLaunchEvent } from "./acn-jit/daemon-launcher"
-export { makeRemoteDaemonDiscovery, makeRemoteDaemonLauncher } from "./acn-jit/remote-daemon"
+export {
+  AcnProcessManager,
+  AcnLaunchEventSchema,
+  AcnLaunchRequestSchema,
+} from "./acn-jit/acn-process-manager"
+export type { AcnLaunchEvent, AcnLaunchRequest } from "./acn-jit/acn-process-manager"
+export { makeRemoteAcnProcessManager } from "./acn-jit/remote-acn-process-manager"
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
 export type { AcnJitRuntime, AcnJitRuntimeOptions } from "./acn-jit/acn-recovering-client"
 export {
-  NoDaemon,
   DaemonDiscoveryFailed,
   DaemonSpawnFailed,
   BinaryNotFound,
   BinaryVersionMismatch,
-  RegistrationFileInvalid,
   DownloadFailed,
   ChecksumMismatch,
   DaemonCrashed,
@@ -29,6 +29,7 @@ export {
 export {
   DisplayState as DisplayStateSchema,
   DisplayViewSnapshot,
+  AcnInstanceSchema,
   DisplayViewShape as DisplayViewShapeSchema,
   MagnitudeRpcs,
   StreamEvent as StreamEventSchema,
@@ -95,6 +96,7 @@ export {
 } from "@magnitudedev/ai/provider/model"
 
 export type {
+  AcnInstance,
   DownloadAttemptId,
   ModelOfferingTargetId,
   RecommendationId,

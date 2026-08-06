@@ -1,6 +1,6 @@
 import { FSM } from "@magnitudedev/utils";
 import { Schema } from "effect";
-import { AcnOwnerIdSchema } from "../acn-registry";
+import { AcnIdentitySchema, AcnInstanceIdSchema } from "../acn-identity";
 
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1));
 const NonNegativeSafeInteger = Schema.Number.pipe(
@@ -58,7 +58,7 @@ export type AcnStartupActivity = typeof AcnStartupActivitySchema.Type;
 export const AcnStoppingReasonSchema = Schema.Literal(
   "idle",
   "ownership-lost",
-  "peer-request",
+  "replacement",
   "icn-exited",
   "signal",
   "startup-failed",
@@ -102,8 +102,8 @@ export type AcnHealthState = typeof AcnHealthStateSchema.Type;
 
 export const AcnHealthResponseSchema = Schema.Struct({
   service: Schema.Literal("magnitude-acn"),
-  version: NonEmptyString,
-  id: AcnOwnerIdSchema,
+  version: AcnIdentitySchema,
+  id: AcnInstanceIdSchema,
   pid: PositiveSafeInteger,
   state: AcnHealthStateSchema,
 });

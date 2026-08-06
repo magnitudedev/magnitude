@@ -3,33 +3,18 @@ applies_to:
   - packages/icn-protocol/**
   - packages/icn/**
   - packages/openapi-effect/**
-  - inference/crates/icn-api/**
-  - inference/crates/icn-contracts/**
-  - inference/crates/icn-server/**
+  - inference/**
   - packages/acn/src/server.ts
   - packages/acn/src/icn/**
-  - packages/acn/src/serve.ts
-  - packages/acn/src/binary.ts
-  - packages/acn/src/daemon-lifecycle.ts
   - packages/acn/src/model-*.ts
-  - packages/acn/src/provider-model-catalog.ts
-  - packages/acn/src/local-model-packages.ts
-  - packages/acn/src/local-model-assessments.ts
-  - packages/acn/src/local-inference-hardware.ts
+  - packages/acn/src/local-*.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - inference/scripts/**
-  - inference/package.json
-  - package.json
-  - scripts/dev.ts
-  - inference/catalog/**
-  - .github/workflows/release.yml
-  - .github/workflows/release-build.yml
 ---
 
 # ICN process lifecycle and Bun boundary
 
-ICN is ACN's sole local-inference runtime. Every running ACN owns exactly one private ICN child
-process for its entire ready lifetime. `@magnitudedev/icn-protocol` is the generated wire boundary
+ICN is ACN's sole local-inference runtime. Every ready ACN owns exactly one private ICN child
+process. `@magnitudedev/icn-protocol` is the generated wire boundary
 for both bootstrap records and the HTTP API. `@magnitudedev/icn` is the authored Effect-native
 client integration and lifecycle manager for the child. Lifecycle code resolves and verifies the
 native binary, owns the process scope, instantiates one `IcnClient` from the generated client
@@ -267,17 +252,25 @@ Startup is one scoped acquisition:
 
 1. Validate launch configuration, resolve the executable, and verify its identity.
 2. Create a fresh opaque instance ID and child-only authorization capability.
-3. Spawn `magnitude-icn serve` model-free, bound to loopback port zero. ICN asks the operating
-   system for the port; Bun must not probe a free port and release it before spawn.
-4. Consume stdout and stderr through one supervised pipeline. Retain a bounded diagnostic tail and
+3. Spawn `magnitude-icn serve` in bootstrap mode with a private writable stdin pipe. Before reading
+   one admission byte, ICN may install parent-death monitoring but may not initialize the native
+   runtime, hardware, CUDA, model workers, storage, or its HTTP service.
+4. Before spawn acquisition becomes interruptible, construct the complete single-flight
+   TERM/KILL/reap shutdown and install it as the one scope finalizer.
+5. Atomically add the exact child PID, process-start identity, and ICN instance ID beneath the same
+   assigned ACN occurrence in `AcnProcessState`. Failure or assignment conflict runs complete
+   shutdown without sending admission.
+6. Write the admission byte. ICN may now initialize model-free and bind loopback port zero; Bun must
+   not probe a free port and release it before spawn.
+7. Consume stdout and stderr through one supervised pipeline. Retain a bounded diagnostic tail and
    forward line-oriented output to structured logs without secrets.
-5. Read ICN's machine-readable startup record containing the actual origin, instance ID, process
+8. Read ICN's machine-readable startup record containing the actual origin, instance ID, process
    identity, API identity, and native build identity. Arbitrary human log text is not a readiness
    protocol.
-6. Probe readiness with bounded backoff while racing the child exit and overall startup deadline.
+9. Probe readiness with bounded backoff while racing the child exit and overall startup deadline.
    Validate the instance ID and compatibility fields so an unrelated listener can never satisfy
    readiness.
-7. Publish `IcnProcess`, construct `IcnClient` from it, and begin continuous exit supervision.
+10. Publish `IcnProcess`, construct `IcnClient` from it, and begin continuous exit supervision.
 
 ICN's HTTP listener is created before it emits the startup record. Its readiness response is
 successful only after storage, inventory recovery, native runtime registration, normalized
@@ -288,12 +281,12 @@ perform an inventory-wide model inspection or model assessment. Startup retry ap
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
-Before this acquisition begins, ACN publishes its owner registration and a startup-only health
-endpoint. That endpoint reports the resolver's authoritative base download, accelerator download,
-installation, and launch activity; byte progress is present only while artifact bytes are being
-accepted. It rejects application RPC until acquisition succeeds. ACN reports `Ready` and admits RPC
-only after `IcnProcess` and the complete application layer exist. Concurrent consumers share the
-same memoized layer and cannot create additional children.
+Before this acquisition begins, the exact ACN has atomically entered `Assigned`. Its startup health
+reports authoritative base download, accelerator download, installation, and launch activity; byte
+progress is present only while artifact bytes are being accepted. It rejects application RPC until
+acquisition succeeds. ACN reports `Ready` and admits RPC only after `IcnProcess` and the complete
+application layer exist. Concurrent consumers share the same memoized layer and cannot create
+additional children.
 
 ### Ready lifetime and unexpected exit
 
@@ -314,8 +307,8 @@ before readiness or during `Ready` is still unexpected.
 ### Shutdown
 
 ACN first closes root demand admission and finalizes ICN request producers and observers. Explicit
-shutdown and scope finalization use the same idempotent child operation. ACN ownership remains held
-until that operation finishes.
+shutdown and scope finalization use the same cached child terminalization installed as the one
+process-scope finalizer. ACN ownership remains held until that operation finishes.
 
 1. Mark ICN stopping so exit is no longer classified as dependency loss.
 2. Send the platform's graceful termination signal once.
@@ -325,15 +318,20 @@ until that operation finishes.
    reap the child.
 5. Finalize process-output observers and publish the terminal lifecycle result.
 
+Owned-child state is cleared only after exact exit is proved. If ACN is force-killed or ICN cannot
+be reaped, the assigned or retiring ACN occurrence retains the child identity for
+`AcnProcessManager` to finish exact cleanup before another candidate is admitted.
+
 The native server must handle both interrupt and termination signals with the same idempotent
 graceful-shutdown path. Repeated shutdown requests do not send overlapping signal sequences.
 Finalization is uninterruptible around signal delivery and child reaping, while both waits remain
 bounded. Cleanup errors are logged and classified; they never leave an unobserved child handle.
 
-Signals and recoverable ownership loss enter ACN's authoritative lifecycle; they do not call `process.exit`
-before cleanup. For abrupt death, ICN watches parent-PID liveness and EOF on a private inherited
-stdin pipe. The EOF wait runs on a detached OS thread, not Tokio's blocking pool. These are crash
-backstops, not child adoption or sharing.
+Signals enter ACN's authoritative lifecycle; they do not call `process.exit` before cleanup. ICN
+first reads one admission byte from its inherited stdin pipe. EOF before that byte exits without
+expensive initialization. After admission, ICN continues watching parent-PID liveness and stdin EOF
+for abrupt parent death. The EOF wait runs on a detached OS thread, not Tokio's blocking pool.
+These are crash backstops, not child adoption or sharing.
 
 ## Model instance lifecycle
 
@@ -457,6 +455,10 @@ streams. These are composed resource gates, not shared activity timestamps.
 The lifecycle conforms when:
 
 - one ready ACN has exactly one owned ICN child and no reusable/discoverable ICN daemon;
+- ICN cannot initialize native runtime, CUDA, hardware, workers, storage, or HTTP before its exact
+  ownership is committed beneath the assigned ACN;
+- replacement racing ICN acquisition either preserves the recorded child or stops it before
+  bootstrap admission;
 - constructing `IcnClient` without `IcnProcess` is impossible in the Effect dependency graph;
 - ACN cannot become ready when its ICN binary is absent, incompatible, or unready;
 - launch is model-free and changing the active model never replaces the ICN process;
@@ -491,7 +493,8 @@ The lifecycle conforms when:
 - normal ACN shutdown cancels higher-level work, gives ICN only a short graceful termination window,
   escalates on deadline, and reaps it;
 - termination and interrupt signals both activate native graceful shutdown;
-- abrupt parent death cannot leave an ICN indefinitely orphaned;
+- abrupt parent death before admission cannot leave an expensive ICN runtime, and parent death
+  after admission cannot leave an ICN indefinitely orphaned;
 - lifecycle and transport failures remain typed and retain bounded, redacted diagnostics; and
 - generated-artifact checks, package tests, native signal tests, and release smoke tests prove the
   shipped ACN and ICN identities are compatible; candidate validation additionally requires local

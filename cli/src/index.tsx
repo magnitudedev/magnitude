@@ -103,7 +103,6 @@ async function main() {
       Atom.runtime.addGlobalLayer(effectLoggingLayer);
       const platform = await createTerminalPlatform({
         launchCommand,
-        publicationTimeoutMs: isDev ? Option.some(30_000) : Option.none(),
         debug: opts.debug === true,
         effectLoggingLayer: Option.some(effectLoggingLayer),
       });

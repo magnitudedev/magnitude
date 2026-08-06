@@ -1,60 +1,60 @@
-import { Effect, Option } from "effect"
+import { Duration, Effect, Option } from "effect"
 import { DaemonSpawnFailed } from "./errors"
-import type { ChildProcessSpawner } from "./local-daemon"
-import { captureSpawnDiagnostics } from "./spawn-diagnostic"
+import { scopePreHandoffCandidate, type ChildProcessSpawner } from "./child-process"
 
-const chunks = (
-  stream: ReadableStream<Uint8Array>,
-): AsyncIterable<Uint8Array> => ({
-  async *[Symbol.asyncIterator]() {
-    const reader = stream.getReader()
-    try {
-      while (true) {
-        const result = await reader.read()
-        if (result.done) return
-        yield result.value
-      }
-    } finally {
-      reader.releaseLock()
-    }
-  },
-})
+const spawnFailure = (operation: string, cause: unknown) =>
+  new DaemonSpawnFailed({ reason: `${operation}: ${String(cause)}` })
 
-/**
- * Bun implementation for detached daemons.
- *
- * The detached process is unreferenced so it can outlive its launching client.
- * While the client remains alive, stdout and stderr are continuously drained
- * into a bounded diagnostic tail for startup failures.
- */
+/** Bun implementation of scoped pre-handoff ACN spawning. */
 export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
   spawn: (command) =>
-    Effect.try({
-      try: () => {
-        const process = Bun.spawn({
-          cmd: Array.from(command),
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: globalThis.process.env,
-        })
-        const diagnostics = captureSpawnDiagnostics([
-          chunks(process.stdout),
-          chunks(process.stderr),
-        ])
-        process.unref()
-        return {
-          pid: Option.some(process.pid),
-          exited: Effect.promise(() => process.exited),
-          diagnostic: diagnostics.diagnostic,
-          kill: (signal) =>
-            Effect.sync(() => {
-              process.kill(signal)
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        const child = yield* Effect.try({
+          try: () =>
+            Bun.spawn({
+              cmd: Array.from(command),
+              detached: true,
+              stdio: ["pipe", "ignore", "ignore"],
+              env: globalThis.process.env,
             }),
-        }
-      },
-      catch: (cause) =>
-        new DaemonSpawnFailed({
-          reason: `Failed to spawn Magnitude: ${String(cause)}`,
-        }),
-    }),
+          catch: (cause) => spawnFailure("Failed to spawn Magnitude", cause),
+        })
+        const exited = Effect.promise(() => child.exited)
+        child.unref()
+
+        const signal = (name: NodeJS.Signals) =>
+          Effect.try({
+            try: () => child.kill(name),
+            catch: (cause) => spawnFailure(`Failed to send ${name} to ACN ${child.pid}`, cause),
+          }).pipe(Effect.asVoid)
+
+        const waitForExit = (duration: Duration.DurationInput) =>
+          exited.pipe(Effect.timeoutOption(duration))
+        const stopAndReap = Effect.gen(function* () {
+          if (Option.isSome(yield* waitForExit("1 millis"))) return
+          yield* signal("SIGTERM")
+          if (Option.isSome(yield* waitForExit("2 seconds"))) return
+          yield* signal("SIGKILL")
+          if (Option.isNone(yield* waitForExit("2 seconds"))) {
+            return yield* new DaemonSpawnFailed({
+              reason: `Pre-handoff ACN ${child.pid} did not exit after SIGKILL`,
+            })
+          }
+        })
+
+        return yield* scopePreHandoffCandidate({
+          pid: child.pid,
+          releaseForHandoff: Effect.tryPromise({
+            try: async () => {
+              child.stdin.write("1")
+              await child.stdin.flush()
+              await child.stdin.end()
+            },
+            catch: (cause) => spawnFailure("Failed to hand off ACN bootstrap", cause),
+          }),
+          stopAndReap,
+        })
+      }),
+    ),
 }

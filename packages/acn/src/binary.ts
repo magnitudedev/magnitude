@@ -2,29 +2,33 @@ import { Command, Options } from "@effect/cli"
 import * as PlatformCommand from "@effect/platform/Command"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { FetchHttpClient } from "@effect/platform"
-import { Console, Data, Effect, Layer } from "effect"
+import { Console, Data, Effect, Layer, Option } from "effect"
 import { launchAcnServer } from "./server"
-import { killAllAcns } from "./kill-all"
 import { ACN_VERSION } from "./version"
 import { resolveRgPath } from "@magnitudedev/ripgrep"
-import { defaultDataDir } from "./daemon-lifecycle"
+import { defaultDataDir } from "./data-dir"
 
 const register = Options.boolean("register")
 const debug = Options.boolean("debug")
 const dataDir = Options.text("data-dir").pipe(Options.withDefault(defaultDataDir()))
+const changeRevision = Options.text("change-revision").pipe(Options.optional)
 
 const launchServer = (options: {
   readonly register: boolean
   readonly debug: boolean
   readonly dataDir: string
+  readonly changeRevision: Option.Option<string>
 }) =>
-  launchAcnServer(options)
+  launchAcnServer({
+    ...options,
+    changeRevision: Option.map(options.changeRevision, Number),
+  })
 
-const serve = Command.make("serve", { register, debug, dataDir }, launchServer).pipe(
+const serve = Command.make("serve", { register, debug, dataDir, changeRevision }, launchServer).pipe(
   Command.withDescription("Start the ACN server"),
 )
 
-const server = Command.make("server", { register, debug, dataDir }, launchServer).pipe(
+const server = Command.make("server", { register, debug, dataDir, changeRevision }, launchServer).pipe(
   Command.withDescription("Alias for serve"),
 )
 
@@ -65,13 +69,9 @@ const doctor = Command.make("doctor", {}, () =>
   ),
 ).pipe(Command.withDescription("Verify packaged ACN runtime dependencies"))
 
-const killAll = Command.make("kill-all", { dataDir }, ({ dataDir }) => killAllAcns(dataDir)).pipe(
-  Command.withDescription("Terminate all registered ACN processes"),
-)
-
-const acn = Command.make("magnitude-acn", { register, debug, dataDir }, launchServer).pipe(
+const acn = Command.make("magnitude-acn", { register, debug, dataDir, changeRevision }, launchServer).pipe(
   Command.withDescription("Magnitude Agent Control Node"),
-  Command.withSubcommands([serve, server, version, doctor, killAll]),
+  Command.withSubcommands([serve, server, version, doctor]),
 )
 
 const cli = Command.run(acn, {

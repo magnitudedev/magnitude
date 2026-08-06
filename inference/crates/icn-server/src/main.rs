@@ -5033,6 +5033,7 @@ async fn main() -> anyhow::Result<()> {
             hf_caches,
             installation,
         } => {
+            await_parent_admission(parent_pid).await?;
             let installation = installation
                 .as_deref()
                 .map(installation::Installation::load)
@@ -5271,6 +5272,27 @@ async fn shutdown_signal(parent_pid: Option<u32>) {
         _ = parent_watchdog(parent_pid), if parent_pid.is_some() => {},
         _ = parent_stdin_eof(), if parent_pid.is_some() => {},
     }
+}
+
+async fn await_parent_admission(parent_pid: Option<u32>) -> anyhow::Result<()> {
+    if parent_pid.is_none() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(|| {
+        use std::io::Read as _;
+
+        let mut admission = [0_u8; 1];
+        std::io::stdin()
+            .lock()
+            .read_exact(&mut admission)
+            .context("ICN parent exited before bootstrap admission")?;
+        if admission[0] != b'1' {
+            anyhow::bail!("ICN received an invalid bootstrap admission");
+        }
+        Ok(())
+    })
+    .await
+    .context("ICN bootstrap admission task failed")?
 }
 
 async fn parent_stdin_eof() {

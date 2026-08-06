@@ -2,40 +2,32 @@ export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, Acn
 export type { AcnClient } from "./protocol"
 
 export {
-  DaemonDiscovery,
-  DaemonStatusSchema,
-  type DaemonStatus,
-} from "./acn-jit/daemon-discovery"
+  AcnProcessManager,
+  AcnLaunchRequestSchema,
+  AcnLaunchEventSchema,
+  runAcnLaunch,
+  type AcnLaunchRequest,
+  type AcnLaunchEvent,
+} from "./acn-jit/acn-process-manager"
 export {
-  DaemonLauncher,
-  DaemonLaunchEventSchema,
-  runDaemonLaunch,
-  type DaemonLaunchEvent,
-} from "./acn-jit/daemon-launcher"
+  makeLocalAcnProcessManager,
+  type LocalAcnProcessManager,
+  type LocalAcnProcessManagerOptions,
+} from "./acn-jit/local-acn-process-manager"
 export {
-  makeLocalDaemonDiscovery,
-  makeLocalDaemonLauncher,
   ChildProcessSpawner,
-  type ChildProcess,
-  type LocalDaemonDiscoveryOptions,
-  type LocalDaemonLauncherOptions,
-} from "./acn-jit/local-daemon"
+  scopePreHandoffCandidate,
+  type SpawnedAcnCandidate,
+} from "./acn-jit/child-process"
 export { BunDetachedChildProcessSpawner } from "./acn-jit/bun-spawn-process"
 export {
-  captureSpawnDiagnostics,
-  type SpawnDiagnosticCapture,
-} from "./acn-jit/spawn-diagnostic"
-export {
-  makeRemoteDaemonDiscovery,
-  makeRemoteDaemonLauncher,
-  RemoteDaemonCurrentResponseSchema,
-  RemoteDaemonErrorResponseSchema,
-  RemoteDaemonLaunchRequestSchema,
-  RemoteDaemonLaunchMessageSchema,
-  type RemoteDaemonCurrentResponse,
-  type RemoteDaemonLaunchRequest,
-  type RemoteDaemonLaunchMessage,
-} from "./acn-jit/remote-daemon"
+  makeRemoteAcnProcessManager,
+  RemoteAcnCurrentResponseSchema,
+  RemoteAcnErrorResponseSchema,
+  RemoteAcnLaunchMessageSchema,
+  RemoteAcnTerminateRequestSchema,
+  type RemoteAcnLaunchMessage,
+} from "./acn-jit/remote-acn-process-manager"
 export {
   makeAcnJitRuntime,
   type AcnStartup,
@@ -61,6 +53,7 @@ export {
   DisplayState as DisplayStateSchema,
   DisplayTimeline as DisplayTimelineSchema,
   DisplayViewSnapshot,
+  AcnInstanceSchema,
   DisplayViewShape as DisplayViewShapeSchema,
   MagnitudeRpcs,
   StreamEvent as StreamEventSchema,
@@ -119,6 +112,7 @@ export {
 } from "@magnitudedev/acn-protocol"
 
 export type {
+  AcnInstance,
   DownloadAttemptId,
   ModelOfferingTargetId,
   RecommendationId,
@@ -207,12 +201,10 @@ export type { RoleId } from "@magnitudedev/roles"
 export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
 export { SDK_VERSION } from "./version"
 export {
-  NoDaemon,
   DaemonDiscoveryFailed,
   DaemonSpawnFailed,
   BinaryNotFound,
   BinaryVersionMismatch,
-  RegistrationFileInvalid,
   DownloadFailed,
   ChecksumMismatch,
   DaemonCrashed,

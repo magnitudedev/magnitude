@@ -1,7 +1,6 @@
 import { Effect, Option, TestClock, TestContext } from "effect";
 import { describe, expect, it } from "vitest";
 import { makeAcnLifecycle } from "./lifecycle";
-import { AcnOwnerIdSchema } from "@magnitudedev/acn-protocol";
 
 const plan = {
   daemonBytes: 100,
@@ -107,11 +106,7 @@ describe("ACN installation lifecycle", () => {
         if (approached._tag !== "Installing") return;
         expect(approached.overallProgress).toBeLessThan(1);
 
-        yield* lifecycle.ready({
-          id: AcnOwnerIdSchema.make("ready"),
-          url: "http://127.0.0.1:9999",
-          version: "1.0.0",
-        });
+        yield* lifecycle.ready;
         const ready = yield* lifecycle.get;
         expect(ready._tag).toBe("Ready");
       })
@@ -170,7 +165,7 @@ describe("ACN installation lifecycle", () => {
             backend: { _tag: "Cuda", hardwareLabel: "NVIDIA GPU" },
           },
         });
-      }),
+      })
     );
   });
 });

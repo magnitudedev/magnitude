@@ -28,7 +28,6 @@ const displayState = (title: string): DisplayState => ({
   timelines: {},
   agents: {},
   actors: {},
-  modelRequests: {},
   tasks: {
     byId: {},
     order: [],
@@ -50,14 +49,14 @@ const idleAgents: AgentLifecycleState = {
   agentByForkId: new Map(),
   rootWork: {
     phase: "idle",
-    accumulatedWorkMs: 0,
-    workingStartedAt: null,
-    lastChainMs: 0,
+    accumulatedProductiveMs: 0,
+    productiveStartedAt: null,
+    lastProductiveMs: 0,
+    chainStartedAt: null,
     activeChildCount: 0,
-    _currentTurnId: null,
+    _currentTurn: null,
     _currentChainId: null,
-    _thinkingCharCount: null,
-    _activeToolKey: null,
+    _isThinking: false,
     _generation: null,
   },
 }

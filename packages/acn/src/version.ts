@@ -1,9 +1,10 @@
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
+import { AcnIdentitySchema } from "@magnitudedev/acn-protocol"
 
 /**
  * ACN version, overridable via `MAGNITUDE_ACN_VERSION` env var for dev/testing.
- * Lets multiple dev sessions share the same daemon by forcing them to the
- * same version segment.
+ * Lets development clients and their candidate ACN use one explicit identity.
  */
-export const ACN_VERSION: string =
-  process.env.MAGNITUDE_ACN_VERSION ?? MAGNITUDE_VERSION
+export const ACN_VERSION = AcnIdentitySchema.make(
+  process.env.MAGNITUDE_ACN_VERSION ?? MAGNITUDE_VERSION,
+)

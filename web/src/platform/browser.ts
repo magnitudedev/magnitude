@@ -6,11 +6,9 @@
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
-  DaemonDiscovery,
-  DaemonLauncher,
+  AcnProcessManager,
   makeAcnJitRuntime,
-  makeRemoteDaemonDiscovery,
-  makeRemoteDaemonLauncher,
+  makeRemoteAcnProcessManager,
 } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 
@@ -117,16 +115,12 @@ const browserDialogs: Dialogs = {
 export async function createBrowserPlatform(
   proxyUrl: string = window.location.origin,
 ): Promise<Platform> {
-  const discovery = await Effect.runPromise(
-    makeRemoteDaemonDiscovery(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
-  )
-  const launcher = await Effect.runPromise(
-    makeRemoteDaemonLauncher(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
+  const processManager = await Effect.runPromise(
+    makeRemoteAcnProcessManager(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
   )
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
-      Effect.provideService(DaemonDiscovery, discovery),
-      Effect.provideService(DaemonLauncher, launcher),
+      Effect.provideService(AcnProcessManager, processManager),
     ),
   )
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))

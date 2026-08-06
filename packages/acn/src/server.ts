@@ -12,6 +12,7 @@ import { RpcSerialization, RpcServer } from "@effect/rpc"
 import {
   Cause,
   Context,
+  Data,
   Effect,
   Exit,
   Fiber,
@@ -33,9 +34,16 @@ import {
   AcnHealthResponseSchema,
   MagnitudeRpcs,
 } from "@magnitudedev/acn-protocol"
+import {
+  AcnProcessRevisionSchema,
+  applyAcnProcessCommand,
+  currentProcessStartIdentity,
+  readAcnProcessState,
+  type ExactAcnCandidate,
+} from "@magnitudedev/acn-protocol/process-state"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
-import { DaemonLifecycleLive, defaultDataDir } from "./daemon-lifecycle"
+import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
 import { ProviderModelCatalogLive } from "./provider-model-catalog"
@@ -78,18 +86,10 @@ import { SessionStoreLive } from "./session-store"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import {
-  ACN_OWNER_ID,
+  ACN_INSTANCE_ID,
   makeHealthResponse,
 } from "./identity"
 import { MirroredStateChangesLive } from "./mirrored-state"
-import { acquireAcnMachineOwnership } from "./machine-ownership"
-import {
-  readRegistrationOwnership,
-  removeExactInstance,
-  registrationIsOwnedBy,
-  registrationPath,
-  writeInstanceAtomic,
-} from "./daemon-registration"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
 import {
@@ -97,26 +97,64 @@ import {
   makeAcnServiceLifecycle,
   type AcnServiceLifecycleApi,
 } from "./service-lifecycle"
-import { removePeerAcns } from "./peer-acn"
-import { currentProcessStartIdentity } from "./process-identity"
 
 export interface AcnServerOptions {
   readonly register?: boolean
   readonly debug?: boolean
   readonly dataDir?: string
+  readonly changeRevision?: Option.Option<number>
+}
+
+class AcnBootstrapRejected extends Data.TaggedError("AcnBootstrapRejected")<{
+  readonly reason: string
+}> {}
+
+const awaitBootstrapRelease = Effect.async<void, AcnBootstrapRejected>((resume) => {
+  const onData = (chunk: Buffer) => {
+    cleanup()
+    chunk.includes(0x31)
+      ? resume(Effect.void)
+      : resume(Effect.fail(new AcnBootstrapRejected({ reason: "invalid bootstrap release" })))
+  }
+  const onEnd = () => {
+    cleanup()
+    resume(Effect.fail(new AcnBootstrapRejected({ reason: "bootstrap owner exited before state transfer" })))
+  }
+  const onError = (error: Error) => {
+    cleanup()
+    resume(Effect.fail(new AcnBootstrapRejected({ reason: error.message })))
+  }
+  const cleanup = () => {
+    process.stdin.off("data", onData)
+    process.stdin.off("end", onEnd)
+    process.stdin.off("error", onError)
+  }
+  process.stdin.once("data", onData)
+  process.stdin.once("end", onEnd)
+  process.stdin.once("error", onError)
+  process.stdin.resume()
+  return Effect.sync(cleanup)
+})
+
+const acnServerUrl = (address: HttpServer.Address): string => {
+  if (address._tag === "UnixAddress") {
+    throw new TypeError("Unix sockets are not supported for ACN coordination")
+  }
+  const hostname = address.hostname === "0.0.0.0" ? "127.0.0.1" : address.hostname
+  return `http://${hostname}:${address.port}`
 }
 
 const CORS_ALLOWED_HEADERS =
-  "Content-Type, Content-Length, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
+  "Content-Type, Content-Length, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
 const LOCAL_HTTP_ORIGIN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
 
-const closeScopeBounded = (scope: Scope.CloseableScope) =>
+const closeApplication = (scope: Scope.CloseableScope) =>
   Effect.gen(function* () {
     const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkDaemon)
     yield* Effect.raceFirst(
       Fiber.await(closing),
-      Effect.sleep("1 second"),
+      Effect.sleep("5 seconds"),
     ).pipe(Effect.asVoid)
   })
 
@@ -400,34 +438,41 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
         ),
         Effect.orDie,
       )
-      const instanceRecord = {
-        id: ACN_OWNER_ID,
-        version: ACN_VERSION,
-        url: Option.none<string>(),
-        pid: process.pid,
-        processStartIdentity,
-      }
-      const publishedInstancePath = yield* writeInstanceAtomic(
-        dataDir,
-        instanceRecord,
-      ).pipe(
-        Effect.provide(BunFileSystem.layer),
-        Effect.orDie,
-      )
-      const instance = {
-        path: publishedInstancePath,
-        record: instanceRecord,
-      }
-      yield* Effect.addFinalizer(() =>
-        removeExactInstance(instance).pipe(
-          Effect.provide(BunFileSystem.layer),
-          Effect.ignore,
-        ),
-      )
+      const candidate: Option.Option<ExactAcnCandidate> = options.register === true
+        ? yield* Effect.gen(function* () {
+            yield* awaitBootstrapRelease
+            const rawChangeRevision = Option.getOrUndefined(options.changeRevision ?? Option.none())
+            if (
+              rawChangeRevision === undefined ||
+              !Number.isSafeInteger(rawChangeRevision) ||
+              rawChangeRevision <= 0
+            ) {
+              return yield* new AcnBootstrapRejected({ reason: "registered ACN is missing a valid change revision" })
+            }
+            const changeRevision = AcnProcessRevisionSchema.make(rawChangeRevision)
+            const state = yield* readAcnProcessState(dataDir)
+            if (
+              Option.isNone(state) ||
+              state.value.mode._tag !== "Changing" ||
+              state.value.mode.changeRevision !== changeRevision ||
+              state.value.mode.owner._tag !== "Candidate"
+            ) return yield* new AcnBootstrapRejected({ reason: "process state does not name this candidate change" })
+            const expected = state.value.mode.owner.candidate
+            if (
+              expected.pid !== process.pid ||
+              expected.processStartIdentity !== processStartIdentity ||
+              expected.identity !== ACN_VERSION
+            ) return yield* new AcnBootstrapRejected({ reason: "process state does not name this exact candidate" })
+            return Option.some(expected)
+          }).pipe(
+            Effect.provide(BunFileSystem.layer),
+            Effect.orDie,
+          )
+        : Option.none()
       const lifecycle = yield* makeAcnServiceLifecycle()
       const applicationScope = yield* Scope.make()
       const closeApplicationScope = yield* Effect.cached(
-        closeScopeBounded(applicationScope),
+        closeApplication(applicationScope),
       )
       yield* Effect.addFinalizer(() => closeApplicationScope)
 
@@ -455,16 +500,25 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
           Effect.orDie
         )
       )
-      yield* router.add("POST", "/rpc", lifecycle.dispatchRpc)
+      yield* router.add(
+        "POST",
+        "/rpc",
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest
+          return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
+            ? yield* lifecycle.dispatchRpc
+            : HttpServerResponse.empty({ status: 409 })
+        }),
+      )
       yield* router.add(
         "POST",
         "/shutdown",
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest
-          if (request.headers["x-magnitude-acn-id"] !== ACN_OWNER_ID) {
+          if (request.headers["x-magnitude-acn-id"] !== ACN_INSTANCE_ID) {
             return HttpServerResponse.empty({ status: 409 })
           }
-          yield* lifecycle.beginStopping({ reason: "peer-request" })
+          yield* lifecycle.beginStopping({ reason: "replacement" })
           return HttpServerResponse.empty({ status: 202 })
         }),
       )
@@ -472,68 +526,27 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
         .serve(router.asHttpEffect())
         .pipe(Effect.provide(infrastructure))
       yield* Layer.buildWithScope(
-        Layer.merge(
-          DaemonLifecycleLive({
-            version: ACN_VERSION,
-            register: options.register ?? false,
-            debug,
-            dataDir,
-            instance,
-          }),
-          AcnProcessHandlersLive
-        ),
+        AcnProcessHandlersLive,
         applicationScope
       ).pipe(Effect.provide(infrastructure))
 
-      if (options.register ?? false) {
-        yield* removePeerAcns(dataDir, ACN_OWNER_ID).pipe(
-          Effect.provide(infrastructure),
-          Effect.tapError((error) =>
-            lifecycle.beginStopping({
-              reason: "startup-failed",
-              detail: `Unable to remove ACN peer ${error.id}: ${error.reason}`,
-            }),
-          ),
-        )
-      }
-
-      const ownership = yield* Effect.raceFirst(
-        acquireAcnMachineOwnership({
-          dataDir,
-          id: ACN_OWNER_ID,
-          version: ACN_VERSION,
-        }).pipe(
-          Effect.timeoutOption("10 seconds"),
-          Effect.flatMap(
-            Option.match({
-              onSome: () => Effect.succeed(true),
-              onNone: () => lifecycle.beginStopping({
-                reason: "startup-failed",
-                detail: "Timed out acquiring active ACN ownership",
-              }).pipe(Effect.as(false)),
-            }),
-          ),
-        ),
-        lifecycle.awaitStopping.pipe(Effect.as(false))
-      ).pipe(Effect.provide(infrastructure))
-      if (!ownership) {
-        const request = yield* lifecycle.awaitStopping
-        yield* Effect.logInfo(
-          "ACN retired before acquiring active runtime ownership"
-        ).pipe(
-          Effect.annotateLogs({
-            reason: request.reason,
-            detail: Option.getOrNull(request.safeDetail),
+      if (Option.isSome(candidate)) {
+        const state = yield* readAcnProcessState(dataDir).pipe(Effect.provide(infrastructure))
+        const admitted = yield* applyAcnProcessCommand({
+          dataDirectory: dataDir,
+          expectedRevision: Option.map(state, (value) => value.revision),
+          command: {
+            _tag: "CandidateAdmitted",
+            candidate: candidate.value,
+            id: ACN_INSTANCE_ID,
+            url: acnServerUrl(server.address),
+          },
+        }).pipe(Effect.provide(infrastructure), Effect.either)
+        if (admitted._tag === "Left") {
+          yield* lifecycle.beginStopping({
+            reason: "ownership-lost",
+            detail: String(admitted.left),
           })
-        )
-        return
-      }
-      if (options.register ?? false) {
-        const registration = yield* readRegistrationOwnership(
-          registrationPath(dataDir)
-        ).pipe(Effect.provide(infrastructure))
-        if (!registrationIsOwnedBy(registration, ACN_OWNER_ID)) {
-          yield* lifecycle.beginStopping({ reason: "ownership-lost" })
           return
         }
       }
