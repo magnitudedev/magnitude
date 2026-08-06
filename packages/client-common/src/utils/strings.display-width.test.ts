@@ -26,6 +26,12 @@ describe('display-width string helpers', () => {
     expect(getDisplayWidth(output)).toBeLessThanOrEqual(8)
   })
 
+  test('truncateToDisplayWidth truncates short strings containing wide glyphs', () => {
+    const output = truncateToDisplayWidth('界界', 2)
+    expect(output).toBe('…')
+    expect(getDisplayWidth(output)).toBeLessThanOrEqual(2)
+  })
+
   test('truncateToDisplayWidth respects display width for combining graphemes', () => {
     const output = truncateToDisplayWidth('e\u0301e\u0301e\u0301e\u0301', 4)
     expect(getDisplayWidth(output)).toBeLessThanOrEqual(4)
