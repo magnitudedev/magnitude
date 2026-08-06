@@ -13,7 +13,7 @@ applies_to:
 # ACN client lifecycle
 
 Each client process has one `AcnJitRuntime`. It owns the client's effective ACN identity, selected
-exact instance, JIT ensurance, transport recovery, and bootstrap presentation. RPC consumers and UI
+exact instance, JIT ensurance, transport recovery, client lease, and bootstrap presentation. RPC consumers and UI
 surfaces observe that authority; they do not maintain independent identities, endpoint caches,
 launch decisions, or recovery loops.
 
@@ -78,6 +78,27 @@ proxied transports carry that ID to ACN dispatch, which rejects a request addres
 occurrence. Desktop and web preserve the same typed process-manager errors as local execution;
 transport boundaries do not reduce coordination failures to strings.
 
+The runtime creates separate concrete `RpcClient.Protocol` receivers for its private lease client
+and for application clients. A protocol receiver is single-consumer and is never memoized across
+typed clients. These receivers close over the same association, ensure, and recovery policy; that
+shared semantic authority, not a shared transport object, is what makes the runtime singular.
+
+Runtime close is the sole owner of model observation plus graceful lease release. It returns a
+typed close report to the host and does not expose its private typed client or lease handle through
+client-common.
+
+Closing is a one-way runtime transition. It first rejects new ensurance and recovery, stops the
+heartbeat, and freezes the already-selected exact ACN instance. Model observation and lease
+release may address only that frozen instance through a non-recovering protocol. Close and scope
+finalization never discover, replace, or launch an ACN. Once closing begins, application RPCs and
+startup retries fail rather than reopening the runtime.
+
+Each host has one shutdown owner. It invokes runtime close before destroying the runtime scope;
+competing process-exit hooks may not close those resources independently. A browser page entering
+the back/forward cache is suspended rather than closed. Lease expiry remains authoritative if a
+suspended browser cannot run its heartbeat, and restoration resumes ordinary renewal. A desktop
+host keeps its lease-owning renderer scheduled while the application remains open.
+
 ## Guarantees
 
 - One runtime supplies every RPC consumer with the client's current ACN identity and exact instance.
@@ -87,4 +108,6 @@ transport boundaries do not reduce coordination failures to strings.
 - The two-second publication grace never authorizes an unfenced spawn.
 - Connection loss, observation failure, and application latency do not independently authorize
   replacement.
+- Runtime close never invokes ensurance or recovery and cannot create an ACN.
+- No RPC admitted after runtime closing begins can invoke ACN process management.
 - Intentional replacement is not reported as a crash; child logs remain diagnostics.

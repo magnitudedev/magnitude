@@ -1682,6 +1682,13 @@ export const ServingProfile = S.Struct({
 export type ServingProfile = S.Schema.Type<typeof ServingProfile>
 export type ServingProfileEncoded = S.Schema.Encoded<typeof ServingProfile>
 
+export const SetModelResidencyPolicyRequest = S.Struct({
+  generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  idleTimeoutSeconds: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type SetModelResidencyPolicyRequest = S.Schema.Type<typeof SetModelResidencyPolicyRequest>
+export type SetModelResidencyPolicyRequestEncoded = S.Schema.Encoded<typeof SetModelResidencyPolicyRequest>
+
 export const SpeculativeDecodingPairId = S.String
 export type SpeculativeDecodingPairId = S.Schema.Type<typeof SpeculativeDecodingPairId>
 export type SpeculativeDecodingPairIdEncoded = S.Schema.Encoded<typeof SpeculativeDecodingPairId>

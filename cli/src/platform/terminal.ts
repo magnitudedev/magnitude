@@ -11,6 +11,7 @@ import {
   AcnProcessManager,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
+  makeLocalAcnDaemonAdministrator,
   makeAcnJitRuntime,
   makeLocalAcnProcessManager,
 } from "@magnitudedev/sdk"
@@ -74,36 +75,51 @@ export interface TerminalPlatformOptions {
   readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
 }
 
+const makeTerminalAcnProcessManager = (
+  debug: boolean,
+  scope: Scope.CloseableScope,
+) => makeLocalAcnProcessManager({ ...(debug ? { debug: true } : {}) }).pipe(
+  Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
+  Effect.provideService(Scope.Scope, scope),
+  Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+)
+
+export async function stopTerminalAcn(): Promise<void> {
+  const administrator = await Effect.runPromise(
+    makeLocalAcnDaemonAdministrator().pipe(
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+    ),
+  )
+  await Effect.runPromise(administrator.stopCurrent)
+}
+
 export async function createTerminalPlatform(options: TerminalPlatformOptions): Promise<Platform> {
   const effectLoggingLayer = Option.getOrElse(
     options.effectLoggingLayer,
     () => makeCliEffectLoggingLayer({ debug: options.debug }),
   )
   const managerScope = await Effect.runPromise(Scope.make())
-  process.once("beforeExit", () => {
-    Effect.runFork(Scope.close(managerScope, Exit.void))
-  })
   const processManager = await Effect.runPromise(
-    makeLocalAcnProcessManager({
-      ...(options.debug ? { debug: true } : {}),
-    }).pipe(
-      Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
-      Effect.provideService(Scope.Scope, managerScope),
-      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-    ),
+    makeTerminalAcnProcessManager(options.debug, managerScope),
   )
   const acn = await Effect.runPromise(
     makeAcnJitRuntime({ launchCommand: options.launchCommand }).pipe(
       Effect.provideService(AcnProcessManager, processManager),
+      Effect.provideService(Scope.Scope, managerScope),
+      Effect.provide(FetchHttpClient.layer),
     ),
   )
   const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(transport))
+  const shutdown = () => Effect.runPromise(
+    acn.close.pipe(Effect.ensuring(Scope.close(managerScope, Exit.void))),
+  )
 
   return {
     id: "terminal",
     protocolLayer,
     acnStartup: acn.startup,
+    shutdown,
     clipboard: osc52Clipboard,
     storage: noopStorage,
     notifications: noopNotifications,
@@ -127,7 +143,7 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions): 
     },
     async setDefaultServer(): Promise<void> {},
     quit(): void {
-      process.exit(0)
+      process.kill(process.pid, "SIGTERM")
     },
     terminal: terminalCapabilities,
   }

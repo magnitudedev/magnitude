@@ -14,7 +14,12 @@ export { makeRemoteAcnProcessManager } from "./acn-jit/remote-acn-process-manage
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
-export type { AcnJitRuntime, AcnJitRuntimeOptions } from "./acn-jit/acn-recovering-client"
+export type {
+  AcnClientCloseReport,
+  AcnClientCloseResult,
+  AcnJitRuntime,
+  AcnJitRuntimeOptions,
+} from "./acn-jit/acn-recovering-client"
 export {
   DaemonDiscoveryFailed,
   DaemonSpawnFailed,

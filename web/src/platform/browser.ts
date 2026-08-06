@@ -3,7 +3,7 @@
  *
  * Uses browser APIs: localStorage, navigator.clipboard, window.open, fetch.
  */
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   AcnProcessManager,
@@ -118,16 +118,27 @@ export async function createBrowserPlatform(
   const processManager = await Effect.runPromise(
     makeRemoteAcnProcessManager(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
   )
+  const acnScope = await Effect.runPromise(Scope.make())
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
       Effect.provideService(AcnProcessManager, processManager),
+      Effect.provideService(Scope.Scope, acnScope),
+      Effect.provide(FetchHttpClient.layer),
     ),
   )
+  window.addEventListener("pagehide", (event) => {
+    if (event.persisted) return
+    Effect.runFork(acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))))
+  })
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
+  const shutdown = () => Effect.runPromise(
+    acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+  )
   return {
     id: "web",
     protocolLayer,
     acnStartup: acn.startup,
+    shutdown,
     clipboard: browserClipboard,
     storage: browserStorage,
     notifications: browserNotifications,

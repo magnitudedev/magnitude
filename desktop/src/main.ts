@@ -327,6 +327,7 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      backgroundThrottling: false,
     },
   })
 
@@ -530,12 +531,6 @@ app.on("will-quit", () => {
 
 // ── Client lease release on quit (spec §5.6) ─────────────────────────
 //
-// The protocol does not expose a ReleaseLease or Disconnect RPC. The daemon
-// tracks client connections via heartbeat and automatically reaps stale
-// leases when the heartbeat stops. Since the Electron main process does not
-// hold an open RPC connection (the renderer connects independently), there
-// is no lease to release from main. The renderer's stream fiber is
-// interrupted via `interruptStream()` in the `beforeunload` handler.
-//
-// No client disposal needed — the renderer manages its own connection.
-// The daemon process is detached and persists beyond the app lifecycle.
+// The renderer owns its ClientLease and attempts scoped release before unload.
+// The main process has no client lease of its own. Lease expiry remains the
+// correctness path if the renderer cannot finish asynchronous unload cleanup.

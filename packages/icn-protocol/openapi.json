@@ -835,6 +835,49 @@
         }
       }
     },
+    "/v1/models/residency-policy": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "setModelResidencyPolicy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetModelResidencyPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The model residency policy is established"
+          },
+          "400": {
+            "description": "The policy is invalid or conflicts with its generation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/props": {
       "get": {
         "tags": [
@@ -4810,6 +4853,26 @@
           "contextLength": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "SetModelResidencyPolicyRequest": {
+        "type": "object",
+        "required": [
+          "generation",
+          "idleTimeoutSeconds"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "idleTimeoutSeconds": {
+            "type": "integer",
+            "format": "int64",
             "minimum": 0
           }
         },

@@ -17,7 +17,7 @@ describe("ACN RPC lifecycle policy", () => {
       )
       const demand = hasDemandMiddleware(rpc.middlewares)
 
-      if (tag === "Health") {
+      if (tag === "Health" || tag === "RenewClientLease" || tag === "ReleaseClientLease") {
         expect({ subscription, demand }).toEqual({ subscription: false, demand: false })
       } else if (subscription) {
         expect(demand).toBe(false)

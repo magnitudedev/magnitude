@@ -4,7 +4,7 @@
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
  * ACN process management remains one contract across the Electron boundary.
  */
-import { Effect, Layer, Option, Schema, Stream } from "effect"
+import { Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   DaemonSpawnFailed,
@@ -98,16 +98,23 @@ function createDesktopAcnProcessManager(desktopApi: DesktopApi): AcnProcessManag
 export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
   api = desktopApi
   const processManager = createDesktopAcnProcessManager(desktopApi)
+  const acnScope = await Effect.runPromise(Scope.make())
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
       Effect.provideService(AcnProcessManager, processManager),
+      Effect.provideService(Scope.Scope, acnScope),
+      Effect.provide(FetchHttpClient.layer),
     ),
   )
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
+  const shutdown = () => Effect.runPromise(
+    acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+  )
   return {
     id: "desktop",
     protocolLayer,
     acnStartup: acn.startup,
+    shutdown,
     clipboard: desktopClipboard,
     storage: desktopStorage,
     notifications: desktopNotifications,
@@ -132,7 +139,9 @@ export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Pla
       return api.onMenuAction(cb)
     },
     quit(): void {
-      api.quit()
+      void shutdown().finally(() => {
+        api.quit()
+      })
     },
   }
 }

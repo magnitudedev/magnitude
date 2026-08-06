@@ -108,6 +108,82 @@ describe("ACN process state", () => {
     })).toThrow()
   })
 
+  it("administratively terminates the exact assigned ACN", () => {
+    const spawned = spawnedCandidate()
+    const assigned = reduceAcnProcessState(Option.some(spawned), {
+      _tag: "CandidateAdmitted",
+      candidate,
+      id: "candidate" as never,
+      url: "http://127.0.0.1:1234",
+    })
+    const terminating = reduceAcnProcessState(Option.some(assigned), {
+      _tag: "BeginTerminateCurrent",
+      manager,
+    })
+    expect(terminating.mode).toMatchObject({
+      _tag: "Changing",
+      purpose: { _tag: "Terminate" },
+      owner: { _tag: "Manager", phase: { _tag: "RetiringAssigned" } },
+    })
+  })
+
+  it("cancels unpublished spawning without starting or killing a process", () => {
+    const begun = reduceAcnProcessState(Option.none(), {
+      _tag: "BeginEnsure",
+      target: identity("1.0.0"),
+      manager,
+    })
+    const stopped = reduceAcnProcessState(Option.some(begun), {
+      _tag: "BeginTerminateCurrent",
+      manager,
+    })
+    expect(stopped.mode._tag).toBe("Unassigned")
+    if (stopped.mode._tag !== "Unassigned") throw new Error("unreachable")
+    expect(Option.getOrThrow(stopped.mode.result)._tag).toBe("Terminated")
+  })
+
+  it("fences and retires an admitted candidate during administrative stop", () => {
+    const terminating = reduceAcnProcessState(Option.some(spawnedCandidate()), {
+      _tag: "BeginTerminateCurrent",
+      manager,
+    })
+    expect(terminating.mode).toMatchObject({
+      _tag: "Changing",
+      purpose: { _tag: "Terminate" },
+      owner: { _tag: "Manager", phase: { _tag: "RetiringCandidate", candidate } },
+    })
+    const stopped = reduceAcnProcessState(Option.some(terminating), {
+      _tag: "CandidateExited",
+      manager,
+    })
+    expect(stopped.mode._tag).toBe("Unassigned")
+  })
+
+  it("preserves exact blocked-candidate cleanup while transferring stop ownership", () => {
+    const blockedOwner = {
+      pid: 101,
+      processStartIdentity: ProcessStartIdentitySchema.make("manager-101"),
+    }
+    const takenOver = reduceAcnProcessState(Option.some(spawnedCandidate()), {
+      _tag: "TakeOver",
+      manager: blockedOwner,
+    })
+    const blocked = reduceAcnProcessState(Option.some(takenOver), {
+      _tag: "CandidateCleanupBlocked",
+      manager: blockedOwner,
+      reason: "still alive",
+    })
+    const terminating = reduceAcnProcessState(Option.some(blocked), {
+      _tag: "BeginTerminateCurrent",
+      manager,
+    })
+    expect(terminating.mode).toMatchObject({
+      _tag: "Changing",
+      purpose: { _tag: "Terminate" },
+      owner: { _tag: "Manager", process: manager, phase: { _tag: "RetiringCandidate", candidate } },
+    })
+  })
+
   it("commits an independently dead candidate as failure instead of retrying", () => {
     const failed = reduceAcnProcessState(Option.some(spawnedCandidate()), {
       _tag: "CandidateFailed",

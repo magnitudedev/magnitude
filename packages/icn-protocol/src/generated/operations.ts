@@ -490,6 +490,33 @@ export const searchHuggingFaceModelsOperation = {
   payloadRequired: true,
 } as const
 
+export const setModelResidencyPolicyOperation = {
+  operationId: "setModelResidencyPolicy",
+  transport: "http",
+  method: "POST",
+  path: "/v1/models/residency-policy",
+  group: "models",
+  successes: [{ status: 204, schema: S.Void }],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.SetModelResidencyPolicyRequest, Schemas.SetModelResidencyPolicyRequestEncoded> =>
+      Schemas.SetModelResidencyPolicyRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
 export const startModelDownloadOperation = {
   operationId: "startModelDownload",
   transport: "http",

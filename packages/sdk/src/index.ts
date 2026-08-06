@@ -10,7 +10,12 @@ export {
   type AcnLaunchEvent,
 } from "./acn-jit/acn-process-manager"
 export {
+  AcnDaemonAdministrator,
+  type AcnDaemonAdministrator as AcnDaemonAdministratorService,
+} from "./acn-jit/acn-daemon-administrator"
+export {
   makeLocalAcnProcessManager,
+  makeLocalAcnDaemonAdministrator,
   type LocalAcnProcessManager,
   type LocalAcnProcessManagerOptions,
 } from "./acn-jit/local-acn-process-manager"
@@ -31,6 +36,8 @@ export {
 export {
   makeAcnJitRuntime,
   type AcnStartup,
+  type AcnClientCloseReport,
+  type AcnClientCloseResult,
   type AcnJitRuntime,
   type AcnJitRuntimeOptions,
 } from "./acn-jit/acn-recovering-client"
