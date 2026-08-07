@@ -35,6 +35,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun install --frozen-lockfile
+      - run: bun run packages/version/scripts/generate-version.ts
       - name: Test Linux CPU MTP memory-domain accounting
         run: >-
           cargo test
@@ -61,7 +62,6 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ steps.version.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ github.sha }}
-      - run: bun run packages/version/scripts/generate-version.ts
       - name: Accept the production candidate path
         run: >-
           bun run scripts/accept-release-candidate.ts
