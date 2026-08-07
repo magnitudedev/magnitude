@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "Code with local models, zero setup",
+    "description": "Your agent, running on local models",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"
@@ -66,9 +66,9 @@
         "pages": [
             "why-magnitude",
             "get-started",
+            "skills",
             "models",
             "inference-engine",
-            "magnitude-cloud",
             "reference",
             "troubleshooting"
         ]

@@ -16,12 +16,12 @@ Magnitude reuses the profile until your hardware or inference engine changes. Op
 
 Magnitude combines the hardware profile with its curated model data to recommend a small set of configurations for your machine. Each recommendation is a specific model, quantization, and context size.
 
-- **Balanced** offers the best overall mix of coding ability, speed, and memory use.
-- **Best Quality** prioritizes coding ability or higher model fidelity.
+- **Balanced** offers the best overall mix of capability, speed, and memory use.
+- **Best Quality** prioritizes model capability or higher model fidelity.
 - **Fastest** prioritizes response speed.
 - **Lightweight** uses less memory and disk space.
 
-Recommendations consider coding ability, estimated speed, context, runtime memory, download size, and how much quality is retained by the quantization. They can differ between computers even when both machines have enough memory for the same model.
+Recommendations consider agent capability, estimated speed, context, runtime memory, download size, and how much quality is retained by the quantization. They can differ between computers even when both machines have enough memory for the same model.
 
 Speed is shown as a range, such as `~36–48 tok/s`. Actual performance varies with prompt length, other work running on the computer, and the exact model revision.
 
@@ -29,7 +29,7 @@ Speed is shown as a range, such as `~36–48 tok/s`. Actual performance varies w
 
 Recommendations are a short list selected for your machine. The catalog contains the complete curated set of local model configurations Magnitude can evaluate for it.
 
-Open `/settings`, then select **catalog** to compare model details including recommendation, memory, coding intelligence, quantization quality, speed, context, and license information. You can download another model at any time or select one that is already installed.
+Open `/settings`, then select **catalog** to compare model details including recommendation, memory, intelligence, quantization quality, speed, context, and license information. You can download another model at any time or select one that is already installed.
 
 Magnitude-managed models are stored in `~/.magnitude/models`. Magnitude also checks the Hugging Face Hub cache for compatible GGUF models, respecting `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and `XDG_CACHE_HOME` before falling back to `~/.cache/huggingface/hub`.
 

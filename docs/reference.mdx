@@ -13,9 +13,7 @@ icon: book-open
 | `/models` | | Choose a ready model |
 | `/catalog` | | Find and download local models |
 | `/hardware` | | Inspect local inference hardware |
-| `/cloud` | | Manage the Magnitude Cloud connection |
 | `/settings` | `/s` | Open model settings |
-| `/usage` | `/limits` | View Cloud usage and reset times |
 | `/bash` | | Enter bash mode |
 | `/init` | | Generate `AGENTS.md` for the project |
 | `/transcript` | | Toggle transcript display mode |
@@ -36,7 +34,7 @@ Type `/` to see available commands with autocomplete. Installed skills may add t
 
 When the reasoning selector is open, use the arrow keys or `J`/`K` to move, `Enter` to apply the selection, and `Esc` to close it without applying the pending change.
 
-Menus use the arrow keys to move, `Enter` to choose, and `Esc` to close. The models settings menu also uses `Tab` and `Shift+Tab` to move between models, catalog, hardware, and cloud.
+Menus use the arrow keys to move, `Enter` to choose, and `Esc` to close. The models settings menu also uses `Tab` and `Shift+Tab` to move between models, catalog, and hardware.
 
 ### Input editing
 
@@ -74,7 +72,6 @@ Edit `AGENTS.md` like any other project file. Magnitude reads applicable instruc
 
 | Variable | Purpose |
 |---|---|
-| `MAGNITUDE_API_KEY` | Connect Magnitude Cloud without saving the key in settings |
 | `HF_HUB_CACHE` | Set the Hugging Face Hub cache directory |
 | `HUGGINGFACE_HUB_CACHE` | Legacy Hugging Face Hub cache override |
 | `HF_HOME` | Set the Hugging Face data directory; Magnitude checks its `hub` directory |
@@ -94,6 +91,5 @@ Magnitude creates `~/.magnitude` automatically.
 | `~/.magnitude/logs/` | Application logs |
 | `~/.magnitude/traces/` | Local trace data when tracing is enabled |
 | `~/.magnitude/config.json` | User settings and model selections |
-| `~/.magnitude/auth.json` | Stored credentials |
 
 Deleting `~/.magnitude/cache` may cause hardware profiling and model evaluation to run again, but it does not delete downloaded models. Models managed by Magnitude are stored separately under `~/.magnitude/models`.

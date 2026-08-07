@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: "Resolve installation, local model, memory, performance, and Magnitude Cloud problems"
+description: "Resolve installation, local model, memory, and performance problems"
 icon: wrench
 ---
 
@@ -9,13 +9,12 @@ icon: wrench
 Start with the check that matches your problem:
 
 - **Magnitude won't open:** Exit it completely, launch it again from your project directory, then [update or reinstall it](/get-started#install) if the problem continues.
-- **Setup was skipped or did not finish:** Run `magnitude --setup` to set up Local Models or Magnitude Cloud again.
+- **Setup was skipped or did not finish:** Run `magnitude --setup` to set up local models again.
 - **A local model will not download or load:** Check the exact message, then see [Model setup and downloads](#model-setup-and-downloads) or [Model loading and memory](#model-loading-and-memory).
 - **Magnitude appears stuck:** Check the current status against [Magnitude is waiting or running slowly](#magnitude-is-waiting-or-running-slowly).
-- **A Cloud model is not working:** See [Magnitude Cloud problems](#magnitude-cloud-problems).
 
 <Warning>
-  Do not delete `~/.magnitude` as a general troubleshooting step. It contains downloaded models, conversations, settings, credentials, and disposable caches.
+  Do not delete `~/.magnitude` as a general troubleshooting step. It contains downloaded models, conversations, settings, and disposable caches.
 </Warning>
 
 ## Logs and local data
@@ -34,12 +33,11 @@ When Magnitude exits an active session, it prints a resume command containing th
 | `~/.magnitude/models/` | Magnitude-managed local models | Models must be downloaded again |
 | `~/.magnitude/sessions/` | Conversations and session state | Conversation history is lost |
 | `~/.magnitude/config.json` | Settings and model selections | Settings and selections are reset |
-| `~/.magnitude/auth.json` | Stored credentials | Saved Cloud authentication is removed |
 
 Clearing `~/.magnitude/cache` does not delete downloaded models, but it may cause hardware profiling and model evaluation to run again. It does not restore a missing bundled model catalog. See [Files and directories](/reference#files-and-directories) for the complete storage reference.
 
 <Warning>
-  Never share `auth.json` or API keys. Do not upload a session's `events.jsonl`; it can contain prompts, conversation history, and project information.
+  Do not upload a session's `events.jsonl`; it can contain prompts, conversation history, and project information.
 </Warning>
 
 ## Magnitude won't start
@@ -115,30 +113,17 @@ Longer conversations require more input processing before generation begins. The
 
 Catalog speed is an estimate at the displayed context size. Actual performance varies with prompt length, other work running on the computer, and the exact model revision. Compare the completed work summary's `tok/s` with the catalog estimate. Choose **Fastest** to prioritize response speed or **Lightweight** to use fewer resources.
 
-## Magnitude Cloud problems
-
-| What you see | What to do |
-|---|---|
-| **Authentication failed** | Add or update the API key in `/settings → Cloud` |
-| **Subscription required** | Confirm the subscription in the [Magnitude Cloud console](https://app.magnitude.dev) |
-| **Usage limit reached** | Open `/usage` or `/limits` to see remaining usage and reset times |
-| Magnitude is out of sync with the server | Update Magnitude to the latest version |
-| Cloud model unavailable | Select an available Cloud model |
-| Temporary connection or upstream failure | Magnitude retries automatically; wait for the retry before restarting |
-
-Magnitude Cloud requires an active subscription and a valid API key. You can save the key in `/settings → Cloud` or provide it with `MAGNITUDE_API_KEY`. Visit the [Magnitude Cloud console](https://app.magnitude.dev) to confirm the subscription and create an API key.
-
 ## Reset and reinstall
 
 Use the least disruptive recovery that applies to the problem:
 
 1. Restart Magnitude.
 2. Update Magnitude.
-3. Run `magnitude --setup` if Local Models or Cloud setup needs to be rerun.
+3. Run `magnitude --setup` if local model setup needs to be rerun.
 4. Clear only `~/.magnitude/cache` when the problem concerns derived profiling or model-evaluation data.
 5. Reinstall the CLI if bundled inference files or the bundled model catalog are missing.
 
-Do not remove models, sessions, `config.json`, or `auth.json` unless you intentionally want the data described in [Logs and local data](#logs-and-local-data) to be removed.
+Do not remove models, sessions, or `config.json` unless you intentionally want the data described in [Logs and local data](#logs-and-local-data) to be removed.
 
 ## Get help
 
@@ -152,4 +137,4 @@ If the problem remains, include:
 - Steps that reproduce the problem
 - Relevant, reviewed lines from the session's `logs.jsonl`
 
-Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC). Before sharing diagnostics, remove API keys, credentials, private code, prompts, project contents, and sensitive paths.
+Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC). Before sharing diagnostics, remove private files, prompts, project contents, and sensitive paths.
