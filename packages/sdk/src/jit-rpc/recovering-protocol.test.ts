@@ -6,7 +6,7 @@ import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { Effect, Exit, FiberId, Layer, Option, Schema, Stream } from "effect"
 import { recoveringProtocolLayer } from "./recovering-protocol"
-import { RecoveryExhausted, SubscriptionProtocolViolation } from "./errors"
+import { RpcOutcomeUnknown, SubscriptionProtocolViolation } from "./errors"
 import {
   isCleanOrInterruptedExit,
   isInterruptedExit,
@@ -209,6 +209,7 @@ const withClient = <A, E>(
   },
   http: HttpClient.HttpClient,
   use: (client: FakeClient) => Effect.Effect<A, E>,
+  recoveryPolicy: "ReplaySafe" | "AtMostOnce" = "ReplaySafe",
 ): Promise<A> =>
   Effect.runPromise(
     Effect.scoped(
@@ -222,6 +223,7 @@ const withClient = <A, E>(
               streamProtocol: fakeStreamProtocol,
               isEndpointRetirementExit: isInterruptedExit,
               classifyInfraError,
+              recoveryPolicy: () => recoveryPolicy,
             }).pipe(
               Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
             )
@@ -340,23 +342,23 @@ describe("recovering protocol — operation contract", () => {
     expect(startCalls()).toBe(1)
   })
 
-  it("surfaces a fatal error after two consecutive failures without progress (crash loop)", async () => {
+  it("does not replay an at-most-once request after an ambiguous transport failure", async () => {
     const { access } = makeFakeEndpointAccess({ current: [Option.some("http://zombie")] })
     const { client, calls } = makeFakeHttp([{ kind: "refuse" }])
 
     const outcome = await withClient(access, client, (c) =>
-      Effect.flip(c.Ping({ value: "ping" }))
+      Effect.flip(c.Ping({ value: "ping" })),
+      "AtMostOnce",
     )
 
     expect(outcome).toBeInstanceOf(TransportError)
     const rpcError = outcome as RpcClientError.RpcClientError
-    expect(rpcError.cause).toBeInstanceOf(RecoveryExhausted)
-    expect((rpcError.cause as RecoveryExhausted).attempts).toBe(2)
+    expect(rpcError.cause).toBeInstanceOf(RpcOutcomeUnknown)
     expect(rpcError.reason).toBe("Unknown")
-    expect(calls()).toBe(2)
+    expect(calls()).toBe(1)
   })
 
-  it("surfaces a bad HTTP status as transport exhaustion with a typed cause", async () => {
+  it("does not replay an at-most-once request after an ambiguous server failure", async () => {
     const { access } = makeFakeEndpointAccess({ current: [Option.some("http://broken-daemon")] })
     const statusClient = HttpClient.make((request) =>
       Effect.succeed(
@@ -368,24 +370,28 @@ describe("recovering protocol — operation contract", () => {
     )
 
     const outcome = await withClient(access, statusClient, (c) =>
-      Effect.flip(c.Ping({ value: "ping" }))
+      Effect.flip(c.Ping({ value: "ping" })),
+      "AtMostOnce",
     )
 
     expect(outcome).toBeInstanceOf(TransportError)
     const rpcError = outcome as RpcClientError.RpcClientError
-    expect(rpcError.cause).toBeInstanceOf(RecoveryExhausted)
-    expect((rpcError.cause as RecoveryExhausted).attempts).toBe(2)
+    expect(rpcError.cause).toBeInstanceOf(RpcOutcomeUnknown)
   })
 
-  it("surfaces resolution failure as fatal with the infra error in cause", async () => {
-    const { access } = makeFakeEndpointAccess({ current: [Option.none()] })
-    const { client } = makeFakeHttp([{ kind: "refuse" }])
+  it("surfaces a non-retryable HTTP contract status without recovery", async () => {
+    const { access, startCalls } = makeFakeEndpointAccess({ current: [Option.some("http://daemon")] })
+    const client = HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(
+      request,
+      new Response("bad request", { status: 400 }),
+    )))
 
     const outcome = await withClient(access, client, (c) =>
       Effect.flip(c.Ping({ value: "ping" }))
     )
 
     expect(outcome).toBeInstanceOf(TransportError)
+    expect(startCalls()).toBe(0)
   })
 
   it("treats a stream body ending without an exit as death and re-issues invisibly", async () => {

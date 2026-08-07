@@ -2,32 +2,22 @@ export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, Acn
 export type { AcnClient } from "./protocol"
 
 export {
-  AcnEnsurer,
+  AcnInstanceManager,
   AcnEnsureRequestSchema,
   AcnEnsureEventSchema,
-  ReadyAcnSchema,
+  AcnReadyInstanceSchema,
   RemoteAcnEnsureMessageSchema,
   runAcnEnsure,
   type AcnEnsureRequest,
   type AcnEnsureEvent,
-  type ReadyAcn,
+  type AcnInstance,
   type RemoteAcnEnsureMessage,
-} from "./acn-jit/acn-ensurer"
+} from "./acn-jit/acn-instance-manager"
 export {
-  AcnDaemonAdministrator,
-  type AcnDaemonAdministrator as AcnDaemonAdministratorService,
-} from "./acn-jit/acn-daemon-administrator"
-export {
-  makeLocalAcnEnsurer,
-  makeLocalAcnDaemonAdministrator,
-  resolveAssignedAcnProxyTarget,
-  AcnLaunchSource,
-  type LocalAcnEnsurer,
-  type LocalAcnEnsurerOptions,
-  type LocalAcnDaemonAdministratorOptions,
+  makeLocalAcnInstanceManager,
+  type LocalAcnInstanceManagerOptions,
   type AcnLaunchOverride,
-  type PreparedCommand,
-} from "./acn-jit/local-acn-ensurer"
+} from "./acn-jit/local-acn-instance-manager"
 export {
   ChildProcessSpawner,
   scopePreHandoffCandidate,
@@ -35,9 +25,9 @@ export {
 } from "./acn-jit/child-process"
 export { BunDetachedChildProcessSpawner } from "./acn-jit/bun-spawn-process"
 export {
-  makeRemoteAcnEnsurer,
+  makeRemoteAcnInstanceManager,
   RemoteAcnErrorResponseSchema,
-} from "./acn-jit/remote-acn-ensurer"
+} from "./acn-jit/remote-acn-instance-manager"
 export {
   makeAcnJitRuntime,
   type AcnStartup,
@@ -208,11 +198,12 @@ export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT
 export type { RoleId } from "@magnitudedev/roles"
 
 export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
-export { SDK_VERSION } from "./version"
+export { SDK_VERSION, SDK_REVISION, SDK_ACN_TARGET } from "./version"
 export {
   AcnAdministrationFailed,
   AcnEnsuranceFailed,
   BinaryNotFound,
+  BinaryRevisionMismatch,
   BinaryVersionMismatch,
   DownloadFailed,
   ChecksumMismatch,

@@ -8,7 +8,12 @@
   "exports": {
     ".": "./src/index.ts",
     "./acn-identity": "./src/acn-identity.ts",
-    "./process-state": "./src/process-state.ts"
+    "./coordination": "./src/coordination/index.ts",
+    "./coordination/bun": "./src/coordination/bun.ts",
+    "./coordination/sqlite-mutex": "./src/coordination/sqlite-mutex.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@effect/platform": "^0.96.0",
@@ -16,5 +21,9 @@
     "@magnitudedev/utils": "workspace:*",
     "effect": "^3.21.2",
     "@effect/rpc": "0.75.1"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "^0.90.0",
+    "vitest": "^3.2.4"
   }
 }

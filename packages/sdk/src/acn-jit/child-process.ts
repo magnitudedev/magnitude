@@ -6,8 +6,8 @@ export interface SpawnedAcnCandidate {
   readonly pid: number
 
   /**
-   * Transfers lifetime ownership to the exact candidate already committed in
-   * ACN process state. This is one-shot and leaves scoped cleanup disarmed.
+   * Releases the exact candidate into its marker/ownership loop. This is
+   * one-shot and leaves scoped cleanup disarmed.
    */
   readonly handoff: Effect.Effect<void, AcnEnsuranceFailed>
 }

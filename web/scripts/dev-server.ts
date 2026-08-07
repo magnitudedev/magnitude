@@ -15,7 +15,7 @@ import { Effect, Exit, Fiber, Layer, Runtime, Option, Schema, Scope, Stream } fr
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
-  makeLocalAcnEnsurer,
+  makeLocalAcnInstanceManager,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
   AcnEnsureRequestSchema,
@@ -24,11 +24,10 @@ import {
   RemoteAcnEnsureMessageSchema,
   AcnEnsuranceError,
   AcnEnsuranceFailed,
-  SDK_VERSION,
-  defaultDataDir,
-  resolveAssignedAcnProxyTarget,
+  SDK_ACN_TARGET,
   type RemoteAcnEnsureMessage,
 } from "@magnitudedev/sdk"
+import { BunSqliteMutexLayer } from "@magnitudedev/sdk/bun"
 import { resolve } from "node:path"
 
 // ─── Daemon host boundaries ─────────────────────────────────────────────────
@@ -38,19 +37,20 @@ const ensurerScope = await Runtime.runPromise(rt)(Scope.make())
 const acnSourcePath = resolve(import.meta.dir, "..", "..", "packages", "acn", "src", "binary.ts")
 
 async function createEnsurer() {
-  return Runtime.runPromise(rt)(makeLocalAcnEnsurer({
+  return Runtime.runPromise(rt)(makeLocalAcnInstanceManager({
     launchOverride: {
-      identity: SDK_VERSION,
-      command: ["bun", acnSourcePath, "serve", "--register"],
+      target: SDK_ACN_TARGET,
+      command: ["bun", acnSourcePath, "serve"],
     },
   }).pipe(
     Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
     Effect.provideService(Scope.Scope, ensurerScope),
-    Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer)),
+    Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer, BunSqliteMutexLayer)),
   ))
 }
 
-const ensurerPromise = createEnsurer()
+const managerPromise = createEnsurer()
+const proxyTargets = new Map<string, string>()
 
 // ─── Dev-mode launch command ────────────────────────────────────────────────
 
@@ -109,20 +109,24 @@ const server = createServer(async (req, res) => {
       const body = await Runtime.runPromise(rt)(decodeEnsureRequest(
         raw.length === 0 ? "{}" : raw,
       ))
-      const ensurer = await ensurerPromise
+      const manager = await managerPromise
       res.writeHead(200, {
         "Content-Type": "application/x-ndjson",
         "Cache-Control": "no-store",
       })
-      const write = (message: RemoteAcnEnsureMessage) =>
-        encodeEnsureMessage(message).pipe(
+      const write = (message: RemoteAcnEnsureMessage) => {
+        if (message._tag === "Ready") {
+          proxyTargets.set(message.instance.id, message.instance.url)
+        }
+        return encodeEnsureMessage(message).pipe(
           Effect.flatMap((encoded) =>
             Effect.sync(() => {
               if (!res.destroyed) res.write(`${encoded}\n`)
             }),
           ),
         )
-      const observer = Runtime.runFork(rt)(ensurer.ensure(body).pipe(
+      }
+      const observer = Runtime.runFork(rt)(manager.ensure(body).pipe(
         Stream.runForEach(write),
         Effect.catchAll((error) => write({ _tag: "Failed", error })),
       ))
@@ -146,22 +150,13 @@ const server = createServer(async (req, res) => {
       await respondError(res, 400, "Invalid ACN instance ID")
       return
     }
-    let targetUrl: Option.Option<string>
-    try {
-      targetUrl = await Runtime.runPromise(rt)(resolveAssignedAcnProxyTarget(
-        defaultDataDir(),
-        expectedId.value,
-      ).pipe(Effect.provide(BunContext.layer)))
-    } catch (error) {
-      await respondError(res, 502, error)
-      return
-    }
-    if (Option.isNone(targetUrl)) {
+    const targetUrl = proxyTargets.get(expectedId.value)
+    if (targetUrl === undefined) {
       await respondError(res, 409, "Selected ACN instance is no longer current")
       return
     }
 
-    const target = new URL(targetUrl.value)
+    const target = new URL(targetUrl)
     const proxyReq = http.request({
       hostname: target.hostname,
       port: target.port,

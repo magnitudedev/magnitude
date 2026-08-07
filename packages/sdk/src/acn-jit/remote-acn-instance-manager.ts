@@ -1,18 +1,19 @@
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import { Effect, Schema, Stream } from "effect"
+import { AcnReady, type AcnInstance } from "@magnitudedev/acn-protocol"
 import {
   AcnEnsureRequestSchema,
-  AcnEnsurer,
+  AcnInstanceManager,
   RemoteAcnEnsureMessageSchema,
   type AcnEnsureEvent,
-  type ReadyAcn,
-} from "./acn-ensurer"
-import { AcnEnsuranceError, AcnEnsuranceFailed } from "./errors"
+} from "./acn-instance-manager"
+import { AcnAdministrationFailed, AcnEnsuranceError, AcnEnsuranceFailed } from "./errors"
 
 export const RemoteAcnErrorResponseSchema = Schema.Struct({ error: AcnEnsuranceError })
 
 const failure = (reason: string) => new AcnEnsuranceFailed({ reason })
+type ReadyInstance = AcnInstance<AcnReady>
 
 const extractError = (response: { readonly status: number; readonly json: Effect.Effect<unknown, unknown> }) =>
   response.json.pipe(
@@ -21,16 +22,16 @@ const extractError = (response: { readonly status: number; readonly json: Effect
     Effect.catchAll(() => Effect.succeed(failure(`Invalid ACN ensure error response (HTTP ${response.status})`))),
   )
 
-const proxyRoute = (proxyUrl: string, instance: ReadyAcn): ReadyAcn => ({
+const proxyRoute = (proxyUrl: string, instance: ReadyInstance): ReadyInstance => ({
   ...instance,
   url: `${proxyUrl}/acn/${encodeURIComponent(instance.id)}`,
 })
 
-export const makeRemoteAcnEnsurer = (
+export const makeRemoteAcnInstanceManager = (
   proxyUrl: string,
-): Effect.Effect<AcnEnsurer, never, HttpClient.HttpClient> => Effect.gen(function* () {
+): Effect.Effect<AcnInstanceManager, never, HttpClient.HttpClient> => Effect.gen(function* () {
   const client = yield* HttpClient.HttpClient
-  const ensure: AcnEnsurer["ensure"] = (request) => Stream.unwrap(Effect.gen(function* () {
+  const ensure: AcnInstanceManager["ensure"] = (request) => Stream.unwrap(Effect.gen(function* () {
     const body = yield* Schema.encode(AcnEnsureRequestSchema)(request).pipe(
       Effect.mapError((error) => failure(`Failed to encode ACN ensure request: ${String(error)}`)),
     )
@@ -62,5 +63,8 @@ export const makeRemoteAcnEnsurer = (
         : event),
     )
   }))
-  return AcnEnsurer.of({ ensure })
+  const stop = Effect.fail(new AcnAdministrationFailed({
+    reason: "Remote ACN administration is not exposed by this host",
+  }))
+  return AcnInstanceManager.of({ ensure, stop })
 })

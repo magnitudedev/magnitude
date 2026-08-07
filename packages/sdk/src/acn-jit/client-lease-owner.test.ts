@@ -32,8 +32,8 @@ describe("AcnClientLeaseOwner", () => {
                   return { connectedClientCount: 0 };
                 }),
             } as never;
-            const owner = yield* makeAcnClientLeaseOwner(clientId, client);
-            yield* owner.start;
+            const owner = yield* makeAcnClientLeaseOwner(clientId);
+            yield* owner.establishThrough(client);
 
             yield* Effect.yieldNow();
             expect(renewals).toEqual([clientId]);

@@ -15,6 +15,7 @@ import {
   ReleaseManifestSchema,
   type ReleaseArtifact,
 } from "../src/contracts"
+import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import {
   acnArchive,
   backendArchive,
@@ -242,8 +243,9 @@ if (!/^[a-f0-9]{40}$/.test(sourceCommit)) {
   throw new Error("MAGNITUDE_SOURCE_COMMIT must be a full lowercase commit SHA")
 }
 const manifest = Schema.decodeUnknownSync(ReleaseManifestSchema)({
-  schemaVersion: 1,
+  schemaVersion: 2,
   version,
+  acnRevision: ACN_COORDINATION_REVISION,
   tag: `@magnitudedev/cli@${version}`,
   sourceCommit,
   artifacts: artifacts

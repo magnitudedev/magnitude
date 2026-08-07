@@ -1,8 +1,9 @@
 ---
 applies_to:
   - packages/sdk/src/acn-jit/acn-recovering-client.ts
-  - packages/sdk/src/acn-jit/acn-ensurer.ts
-  - packages/sdk/src/acn-jit/remote-acn-ensurer.ts
+  - packages/sdk/src/acn-jit/acn-instance-manager.ts
+  - packages/sdk/src/acn-jit/local-acn-instance-manager.ts
+  - packages/sdk/src/acn-jit/remote-acn-instance-manager.ts
   - packages/sdk/src/jit-rpc/**
   - packages/client-common/src/state/acn-lifecycle.ts
   - cli/src/features/app-shell/**
@@ -15,16 +16,17 @@ applies_to:
 # ACN client lifecycle
 
 Each interactive client owns one `AcnJitRuntime`. The runtime owns the client's effective ACN
-identity, exact selected `ReadyAcn`, single-flight selection, recovering transport, `ClientId`,
-`ClientLease`, bootstrap presentation, and one-way close. It does not interpret process state,
-probe health, choose replacement, or manage processes; those belong to `AcnEnsurer`.
+identity, exact selected `AcnInstance<AcnReady>`, single-flight selection, recovering transport,
+`ClientId`, `ClientLease`, bootstrap presentation, and one-way close. It does not interpret
+coordination state, probe health, choose replacement, or manage processes; those belong to
+`AcnInstanceManager`.
 
 ```text
 Checking -> Starting / Installing -> Ready
                |                     |
                +------> Failed <-----+
                           |
-                          +-> explicit retry through AcnEnsurer
+                          +-> explicit retry through AcnInstanceManager
 ```
 
 These are presentation states, not another ACN service lifecycle.
@@ -34,21 +36,21 @@ These are presentation states, not another ACN service lifecycle.
 ```text
 AcnAssociation
   identity    monotonic minimum ACN identity
-  selected    optional exact ReadyAcn
+  selected    optional exact AcnInstance<AcnReady>
 
 ActiveSelection
   one shared deferred outcome
 ```
 
 The association starts at the bundled SDK identity. Only successful ready selection adopts a newer
-identity. Durable `AcnProcessState.identityFloor` prevents an older client from launching an older
-ACN while a newer candidate is starting, so waiting until readiness cannot permit downgrade.
-Losing the selected endpoint never regresses identity.
+identity. The durable `AcnRevisionStore` prevents an older client from launching an older ACN
+while a newer revision is selected, so waiting until readiness cannot permit downgrade. Losing the
+selected endpoint never regresses identity.
 
 Selection is a true single-flight operation. Bootstrap, retry, lease, and application demand share
 one scoped owner and one exact outcome while selection is active; a semaphore that merely queues
-new operations is insufficient. The owner calls `AcnEnsurer.ensure`, projects progress into client
-presentation, and atomically publishes only terminal `ReadyAcn` values.
+new operations is insufficient. The owner calls `AcnInstanceManager.ensure`, projects progress into
+client presentation, and atomically publishes only terminal `AcnInstance<AcnReady>` values.
 
 Runtime construction explicitly starts initial selection. It also constructs one inert, scoped
 lease owner whose renewal fiber is gated by a deferred. The first ready selection opens that gate
@@ -83,7 +85,7 @@ cannot run while suspended.
 
 ## Guarantees
 
-- Only `ReadyAcn` enters endpoint selection.
+- Only `AcnInstance<AcnReady>` enters endpoint selection.
 - Identity never regresses during one client lifetime.
 - Initial selection, retry, lease recovery, and application recovery share one selection outcome.
 - Client presence does not implicitly own bootstrap policy.

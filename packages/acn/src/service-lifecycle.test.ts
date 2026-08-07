@@ -18,4 +18,12 @@ describe("AcnServiceLifecycle", () => {
     expect(result.ready._tag).toBe("Ready")
     expect(result.stopping).toMatchObject({ _tag: "Stopping", reason: "replacement" })
   })
+
+  it("can stop during startup without waiting on its own bootstrap use", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const lifecycle = yield* makeAcnServiceLifecycle()
+      expect(yield* lifecycle.beginStopping({ reason: "startup-failed" })).toBe(true)
+      expect((yield* lifecycle.awaitStopping)._tag).toBe("Stopping")
+    })))
+  })
 })

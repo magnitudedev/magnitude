@@ -6,10 +6,11 @@ import { makeHealthResponse } from "./identity";
 describe("ACN identity", () => {
   it("exposes the exact registry owner identity through health", () => {
     expect(
-      makeHealthResponse("1.2.3", { _tag: "Ready" }, "owner-1", 1234)
+      makeHealthResponse("1.2.3", { _tag: "Ready" }, "owner-1", 1234, 42)
     ).toEqual({
       service: "magnitude-acn",
       version: "1.2.3",
+      revision: 42,
       id: "owner-1",
       pid: 1234,
       state: { _tag: "Ready" },

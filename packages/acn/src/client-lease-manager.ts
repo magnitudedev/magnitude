@@ -112,7 +112,7 @@ export const makeClientLeaseManager = (
               return asResult(transition.state)
             }
 
-            const releaseRetention = yield* restore(lifecycle.acquireActivity("client-leases")).pipe(
+            const releaseRetention = yield* restore(lifecycle.acquireIdleRetention("client-leases")).pipe(
               Effect.catchTag("ResourceRetired", () => Effect.interrupt)
             )
             yield* completePolicyUpdate(true).pipe(

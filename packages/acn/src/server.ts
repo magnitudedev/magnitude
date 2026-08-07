@@ -13,6 +13,7 @@ import {
   Cause,
   Context,
   Data,
+  Duration,
   Effect,
   Exit,
   Fiber,
@@ -32,15 +33,24 @@ import {
 } from "@magnitudedev/storage"
 import {
   AcnHealthResponseSchema,
+  AcnRevisionSchema,
   MagnitudeRpcs,
+  type AcnHealthResponse,
 } from "@magnitudedev/acn-protocol"
 import {
-  AcnProcessRevisionSchema,
-  applyAcnProcessCommand,
-  currentProcessStartIdentity,
-  readAcnProcessState,
-  type ExactAcnCandidate,
-} from "@magnitudedev/acn-protocol/process-state"
+  ExactProcessController,
+  ExactProcessControllerLive,
+  makeAcnOwnerLock,
+  makeAcnRevisionStore,
+  reapProcessTree,
+  retryStoreObservation as retryCoordinationObservation,
+  COORDINATION_POLL_INTERVAL,
+  type AcnOwnerLockHandle,
+  type AcnOwnerLock,
+  type AcnRevisionStore,
+  type ExactProcess,
+} from "@magnitudedev/acn-protocol/coordination"
+import { BunSqliteMutexLayer } from "@magnitudedev/acn-protocol/coordination/bun"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
 import { defaultDataDir } from "./data-dir"
@@ -83,7 +93,12 @@ import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
-import { ACN_VERSION } from "./version"
+import {
+  ACN_BUILD_KIND,
+  ACN_DEVELOPMENT_KEY,
+  ACN_REVISION,
+  ACN_VERSION,
+} from "./version"
 import { TracingLayer } from "./tracing"
 import {
   ACN_INSTANCE_ID,
@@ -101,10 +116,9 @@ import { ClientLeaseManagerLive } from "./client-lease-manager"
 import { ModelResidencyPolicyLive } from "./model-residency-policy"
 
 export interface AcnServerOptions {
-  readonly register?: boolean
+  readonly waitForHandoff?: boolean
   readonly debug?: boolean
   readonly dataDir?: string
-  readonly changeRevision?: Option.Option<number>
 }
 
 class AcnBootstrapRejected extends Data.TaggedError("AcnBootstrapRejected")<{
@@ -156,7 +170,7 @@ const closeApplication = (scope: Scope.CloseableScope) =>
     const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkDaemon)
     yield* Effect.raceFirst(
       Fiber.await(closing),
-      Effect.sleep("5 seconds"),
+      Effect.sleep(Duration.seconds(5)),
     ).pipe(Effect.asVoid)
   })
 
@@ -434,224 +448,226 @@ const makeAcnInfrastructure = (
  * Runs one ACN process until its lifecycle enters Stopping. Scope
  * closure then stops HTTP, disposes sessions, and reaps the private ICN.
  */
-export const launchAcnServer = (options: AcnServerOptions = {}) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const dataDir = options.dataDir ?? defaultDataDir()
-      const debug = options.debug === true
-      const processStartIdentity = yield* currentProcessStartIdentity.pipe(
-        Effect.provide(
-          BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
-        ),
-        Effect.orDie,
-      )
-      const candidate: Option.Option<ExactAcnCandidate> = options.register === true
-        ? yield* Effect.gen(function* () {
-            yield* awaitBootstrapRelease
-            const rawChangeRevision = Option.getOrUndefined(options.changeRevision ?? Option.none())
-            if (
-              rawChangeRevision === undefined ||
-              !Number.isSafeInteger(rawChangeRevision) ||
-              rawChangeRevision <= 0
-            ) {
-              return yield* new AcnBootstrapRejected({ reason: "registered ACN is missing a valid change revision" })
-            }
-            const changeRevision = AcnProcessRevisionSchema.make(rawChangeRevision)
-            const state = yield* readAcnProcessState(dataDir)
-            if (
-              Option.isNone(state) ||
-              state.value.mode._tag !== "Changing" ||
-              state.value.mode.changeRevision !== changeRevision ||
-              state.value.mode.owner._tag !== "Candidate"
-            ) return yield* new AcnBootstrapRejected({ reason: "process state does not name this candidate change" })
-            const expected = state.value.mode.owner.candidate
-            if (
-              expected.pid !== process.pid ||
-              expected.processStartIdentity !== processStartIdentity ||
-              expected.identity !== ACN_VERSION
-            ) return yield* new AcnBootstrapRejected({ reason: "process state does not name this exact candidate" })
-            return Option.some(expected)
-          }).pipe(
-            Effect.provide(BunFileSystem.layer),
-            Effect.orDie,
-          )
-        : Option.none()
-      const lifecycle = yield* makeAcnServiceLifecycle()
-      const applicationScope = yield* Scope.make()
-      const closeApplicationScope = yield* Effect.cached(
-        closeApplication(applicationScope),
-      )
-      yield* Effect.addFinalizer(() => closeApplicationScope)
+const OWNER_HEALTH_TIMEOUT = Duration.seconds(2)
 
-      const infrastructure = yield* Layer.buildWithScope(
-        makeAcnInfrastructure(options, lifecycle),
-        applicationScope
-      )
-      const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
-      const server = Context.get(infrastructure, HttpServer.HttpServer)
-
-      yield* router.addGlobalMiddleware((responseEffect) =>
-        Effect.gen(function* () {
-          const request = yield* HttpServerRequest.HttpServerRequest
-          return withCors(yield* responseEffect, request)
-        })
-      )
-      yield* router.add("OPTIONS", "*", OptionsRouteHandler)
-      yield* router.add(
-        "GET",
-        "/health",
-        lifecycle.state.pipe(
-          Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
-          Effect.flatMap(encodeHealthResponse),
-          Effect.flatMap(HttpServerResponse.json),
-          Effect.orDie
-        )
-      )
-      yield* router.add(
-        "POST",
-        "/rpc",
-        Effect.gen(function* () {
-          const request = yield* HttpServerRequest.HttpServerRequest
-          return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
-            ? yield* lifecycle.dispatchRpc
-            : HttpServerResponse.empty({ status: 409 })
-        }),
-      )
-      yield* router.add(
-        "POST",
-        "/shutdown",
-        Effect.gen(function* () {
-          const request = yield* HttpServerRequest.HttpServerRequest
-          if (request.headers["x-magnitude-acn-id"] !== ACN_INSTANCE_ID) {
-            return HttpServerResponse.empty({ status: 409 })
-          }
-          yield* lifecycle.beginStopping({ reason: "replacement" })
-          return HttpServerResponse.empty({ status: 202 })
-        }),
-      )
-      yield* server
-        .serve(router.asHttpEffect())
-        .pipe(Effect.provide(infrastructure))
-      yield* Layer.buildWithScope(
-        AcnProcessHandlersLive,
-        applicationScope
-      ).pipe(Effect.provide(infrastructure))
-
-      if (Option.isSome(candidate)) {
-        const state = yield* readAcnProcessState(dataDir).pipe(Effect.provide(infrastructure))
-        const admitted = yield* applyAcnProcessCommand({
-          dataDirectory: dataDir,
-          expectedRevision: Option.map(state, (value) => value.revision),
-          command: {
-            _tag: "CandidateAdmitted",
-            candidate: candidate.value,
-            id: ACN_INSTANCE_ID,
-            url: acnServerUrl(server.address),
-          },
-        }).pipe(Effect.provide(infrastructure), Effect.either)
-        if (admitted._tag === "Left") {
-          yield* lifecycle.beginStopping({
-            reason: "ownership-lost",
-            detail: String(admitted.left),
-          })
-          return
-        }
-      }
-      const currentLifecycle = yield* lifecycle.state
-      if (currentLifecycle._tag === "Stopping") return
-      yield* lifecycle.reportStarting("Resolving", Option.none())
-
-      const application = Effect.gen(function* () {
-        const builtServices = yield* debug
-          ? Layer.buildWithScope(
-              AcnDebugServicesLayer(dataDir),
-              applicationScope
-            ).pipe(
-              Effect.provide(infrastructure),
-              Effect.map((context) => ({
-                context,
-                introspector: Option.some(
-                  Context.get(context, AcnIntrospector)
-                ),
-              }))
-            )
-          : Layer.buildWithScope(
-              AcnBaseServicesLayer(dataDir),
-              applicationScope
-            ).pipe(
-              Effect.provide(infrastructure),
-              Effect.map((context) => ({
-                context,
-                introspector: Option.none<AcnIntrospectorApi>(),
-              }))
-            )
-        const acnServices = builtServices.context
-        const serviceContext = Context.merge(infrastructure, acnServices)
-        const handlers = yield* Layer.buildWithScope(
-          HandlersLive,
-          applicationScope
-        ).pipe(Effect.provide(serviceContext))
-        const applicationContext = Context.merge(serviceContext, handlers)
-
-        const rpcRouter = yield* HttpLayerRouter.make
-        const rawProtocol = yield* RpcServer.makeProtocolHttpRouter({
-          path: "/rpc",
-        }).pipe(
-          Effect.provideService(HttpLayerRouter.HttpRouter, rpcRouter),
-          Effect.provide(infrastructure)
-        )
-        const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
-          Effect.provide(applicationContext)
-        )
-        yield* RpcServer.make(MagnitudeRpcs).pipe(
-          Effect.provideService(RpcServer.Protocol, protocol),
-          Effect.provide(applicationContext),
-          Effect.forkIn(applicationScope)
-        )
-        if (Option.isSome(builtServices.introspector)) {
-          yield* installAcnIntrospectionRoutes(
-            router,
-            builtServices.introspector.value
-          )
-        }
-
-        yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
-        return {
-          subscriptions: Context.get(applicationContext, AcnSubscriptions),
-          icn: Context.get(applicationContext, IcnProcess),
-        }
-      })
-
-      const { subscriptions, icn } = yield* application.pipe(
-        Effect.timeout("5 minutes"),
-        Effect.tapErrorCause((cause) =>
-          lifecycle
-            .beginStopping({
-              reason: "startup-failed",
-              detail: "Magnitude could not prepare local inference",
-            })
-            .pipe(
-              Effect.zipRight(
-                Effect.logError("ACN application startup failed").pipe(
-                  Effect.annotateLogs({ cause: Cause.pretty(cause) })
-                )
-              )
-            )
-        )
-      )
-      const request = yield* lifecycle.awaitStopping
-      yield* Effect.logInfo("ACN shutdown requested").pipe(
-        Effect.annotateLogs({
-          reason: request.reason,
-          detail: Option.getOrNull(request.safeDetail),
-        })
-      )
-      yield* subscriptions.terminate
-      // Close consumers before the owned ICN. Layer finalizer ordering stops
-      // observation fibers and HTTP admission before the ICN finalizer sends
-      // its termination signal, so graceful drain cannot be prolonged by new
-      // internal requests.
-      yield* closeApplicationScope
-      yield* icn.shutdown.pipe(Effect.orDie)
+const reapPreviousTree = (
+  previous: Option.Option<ExactProcess>,
+  current: ExactProcess,
+): Effect.Effect<void, AcnBootstrapRejected, ExactProcessController> => Effect.gen(function* () {
+  if (Option.isNone(previous)) return
+  const process = previous.value
+  if (process.pid === current.pid &&
+    process.processStartIdentity === current.processStartIdentity) return
+  const processes = yield* ExactProcessController
+  const reaped = yield* reapProcessTree(processes, process)
+  if (!reaped) {
+    return yield* new AcnBootstrapRejected({
+      reason: `Could not prove predecessor process tree ${process.pid} absent`,
     })
+  }
+}).pipe(Effect.mapError((error) => error instanceof AcnBootstrapRejected
+  ? error
+  : new AcnBootstrapRejected({ reason: String(error) })))
+
+const ownerHealth = (port: number): Effect.Effect<Option.Option<AcnHealthResponse>> =>
+  Effect.tryPromise({
+    try: async (signal) => {
+      const response = await fetch(`http://127.0.0.1:${port}/health`, { signal })
+      return Schema.decodeUnknownSync(AcnHealthResponseSchema)(await response.json())
+    },
+    catch: (error) => new AcnBootstrapRejected({ reason: String(error) }),
+  }).pipe(
+    Effect.timeout(OWNER_HEALTH_TIMEOUT),
+    Effect.option,
+  )
+
+const acquireSelectedOwner = (
+  revisionStore: AcnRevisionStore,
+  ownerLock: AcnOwnerLock,
+): Effect.Effect<Option.Option<AcnOwnerLockHandle>, unknown, Scope.Scope> => Effect.suspend(() =>
+  Effect.gen(function* () {
+    const selected = yield* retryCoordinationObservation(revisionStore.selected)
+    if (Option.isNone(selected) || selected.value > ACN_REVISION) return Option.none()
+    if (selected.value < ACN_REVISION) {
+      return yield* new AcnBootstrapRejected({ reason: "active ACN revision is missing from selection" })
+    }
+    const acquired = yield* retryCoordinationObservation(ownerLock.tryAcquire)
+    if (Option.isSome(acquired)) {
+      const confirmed = yield* retryCoordinationObservation(revisionStore.selected)
+      if (Option.contains(confirmed, ACN_REVISION)) return acquired
+      yield* acquired.value.close
+      return Option.none()
+    }
+    const observation = yield* retryCoordinationObservation(ownerLock.observe)
+    if (observation._tag === "Locked") {
+      const health = yield* ownerHealth(observation.owner.port)
+      if (Option.isSome(health) && health.value.revision >= ACN_REVISION) return Option.none()
+    }
+    yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
+    return yield* acquireSelectedOwner(revisionStore, ownerLock)
+  }),
+)
+
+export const launchAcnServer = (options: AcnServerOptions = {}) =>
+  Effect.scoped(Effect.gen(function* () {
+    const dataDir = options.dataDir ?? defaultDataDir()
+    const debug = options.debug === true
+    if (options.waitForHandoff === true) yield* awaitBootstrapRelease
+
+    const revisionStore = yield* makeAcnRevisionStore(dataDir).pipe(
+      Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
+    )
+    const ownerLock = yield* makeAcnOwnerLock(dataDir).pipe(
+      Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
+    )
+    if (ACN_BUILD_KIND === "published") {
+      yield* revisionStore.registerPublished(ACN_REVISION)
+    } else {
+      if (ACN_DEVELOPMENT_KEY === undefined) {
+        return yield* new AcnBootstrapRejected({
+          reason: "Development ACN build has no coordination key",
+        })
+      }
+      const hold = yield* revisionStore.holdDevelopment(ACN_REVISION, ACN_DEVELOPMENT_KEY)
+      void hold
+    }
+
+    const owner = yield* acquireSelectedOwner(revisionStore, ownerLock).pipe(
+      Effect.mapError((error) => new AcnBootstrapRejected({ reason: String(error) })),
+    )
+    if (Option.isNone(owner)) return
+    const ownerHandle = owner.value
+
+    const currentProcess = yield* ExactProcessController.pipe(
+      Effect.flatMap((processes) => processes.current),
+      Effect.mapError((error) => new AcnBootstrapRejected({ reason: error.message })),
+    )
+    yield* reapPreviousTree(Option.map(ownerHandle.previous, (record) => ({
+      pid: record.pid,
+      processStartIdentity: record.processStartIdentity,
+    })), currentProcess)
+
+    const lifecycle = yield* makeAcnServiceLifecycle()
+    const applicationScope = yield* Scope.make()
+    const closeApplicationScope = yield* Effect.cached(closeApplication(applicationScope))
+    yield* Effect.addFinalizer(() => closeApplicationScope)
+    const infrastructure = yield* Layer.buildWithScope(
+      makeAcnInfrastructure(options, lifecycle),
+      applicationScope,
+    )
+    const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
+    const server = Context.get(infrastructure, HttpServer.HttpServer)
+    const address = server.address
+    if (address._tag === "UnixAddress") {
+      return yield* new AcnBootstrapRejected({ reason: "ACN requires a loopback TCP endpoint" })
+    }
+    yield* ownerHandle.publish({
+      ...currentProcess,
+      port: address.port,
+    })
+
+    yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest
+      return withCors(yield* responseEffect, request)
+    }))
+    yield* router.add("OPTIONS", "*", OptionsRouteHandler)
+    yield* router.add("GET", "/health", lifecycle.state.pipe(
+      Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
+        Effect.flatMap((body) => HttpServerResponse.json(body, {
+          status: state._tag === "Ready" ? 200 : 503,
+        })),
+      )),
+      Effect.orDie,
+    ))
+    yield* router.add("POST", "/rpc", Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest
+      return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
+        ? yield* lifecycle.dispatchRpc
+        : HttpServerResponse.empty({ status: 409 })
+    }))
+    yield* router.add("POST", "/shutdown", lifecycle.beginStopping({ reason: "administrative" }).pipe(
+      Effect.as(HttpServerResponse.empty({ status: 202 })),
+    ))
+    yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
+    yield* Layer.buildWithScope(AcnProcessHandlersLive, applicationScope).pipe(
+      Effect.provide(infrastructure),
+    )
+
+    const observeReplacement = revisionStore.selected.pipe(
+      Effect.flatMap((selected) => Option.exists(selected, (revision) => revision > ACN_REVISION)
+        ? lifecycle.beginStopping({ reason: "replacement" }).pipe(Effect.asVoid)
+        : Effect.sleep(COORDINATION_POLL_INTERVAL)),
+      Effect.catchAll((error) =>
+        Effect.logWarning("ACN revision selection is indeterminate").pipe(
+          Effect.annotateLogs({ error: error._tag, path: error.path }),
+          Effect.zipRight(Effect.sleep(COORDINATION_POLL_INTERVAL)),
+        )),
+    )
+    yield* Effect.forever(observeReplacement).pipe(Effect.forkIn(applicationScope))
+
+    yield* lifecycle.reportStarting("Resolving", Option.none())
+    const application = Effect.gen(function* () {
+      const builtServices = yield* debug
+        ? Layer.buildWithScope(AcnDebugServicesLayer(dataDir), applicationScope).pipe(
+            Effect.provide(infrastructure),
+            Effect.map((context) => ({
+              context,
+              introspector: Option.some(Context.get(context, AcnIntrospector)),
+            })),
+          )
+        : Layer.buildWithScope(AcnBaseServicesLayer(dataDir), applicationScope).pipe(
+            Effect.provide(infrastructure),
+            Effect.map((context) => ({
+              context,
+              introspector: Option.none<AcnIntrospectorApi>(),
+            })),
+          )
+      const serviceContext = Context.merge(infrastructure, builtServices.context)
+      const handlers = yield* Layer.buildWithScope(HandlersLive, applicationScope).pipe(
+        Effect.provide(serviceContext),
+      )
+      const applicationContext = Context.merge(serviceContext, handlers)
+      const rpcRouter = yield* HttpLayerRouter.make
+      const rawProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+        Effect.provideService(HttpLayerRouter.HttpRouter, rpcRouter),
+        Effect.provide(infrastructure),
+      )
+      const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
+        Effect.provide(applicationContext),
+      )
+      yield* RpcServer.make(MagnitudeRpcs).pipe(
+        Effect.provideService(RpcServer.Protocol, protocol),
+        Effect.provide(applicationContext),
+        Effect.forkIn(applicationScope),
+      )
+      if (Option.isSome(builtServices.introspector)) {
+        yield* installAcnIntrospectionRoutes(router, builtServices.introspector.value)
+      }
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+      return {
+        subscriptions: Context.get(applicationContext, AcnSubscriptions),
+        icn: Context.get(applicationContext, IcnProcess),
+      }
+    })
+
+    const { subscriptions, icn } = yield* application.pipe(
+      Effect.timeout(Duration.minutes(5)),
+      Effect.tapErrorCause((cause) => lifecycle.beginStopping({
+        reason: "startup-failed",
+        detail: "Magnitude could not prepare local inference",
+      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed").pipe(
+        Effect.annotateLogs({ cause: Cause.pretty(cause) }),
+      )))),
+    )
+    const request = yield* lifecycle.awaitStopping
+    yield* Effect.logInfo("ACN shutdown requested").pipe(Effect.annotateLogs({
+      reason: request.reason,
+      detail: Option.getOrNull(request.safeDetail),
+    }))
+    yield* subscriptions.terminate
+    yield* closeApplicationScope
+    yield* icn.shutdown.pipe(Effect.orDie)
+  })).pipe(
+    Effect.provideService(ExactProcessController, ExactProcessControllerLive),
+    Effect.provide(BunSqliteMutexLayer),
   )

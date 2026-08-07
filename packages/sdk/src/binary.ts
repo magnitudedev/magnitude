@@ -18,6 +18,7 @@ import {
 } from "@magnitudedev/release";
 import {
   BinaryNotFound,
+  BinaryRevisionMismatch,
   BinaryVersionMismatch,
   AcnEnsuranceFailed,
   DownloadFailed,
@@ -36,6 +37,7 @@ export type BinaryAcquisitionEvent =
 export interface ResolveBinaryOptions {
   readonly binaryPath?: string;
   readonly version?: string;
+  readonly acnRevision?: number;
   readonly dataDir?: string;
   readonly acquisitionObserver: Option.Option<{
     readonly report: (event: BinaryAcquisitionEvent) => Effect.Effect<void>;
@@ -95,9 +97,38 @@ const validateBinaryVersion = (
     }
   });
 
+const validateBinaryRevision = (
+  binaryPath: string,
+  expectedRevision: number,
+): Effect.Effect<
+  void,
+  BinaryRevisionMismatch | AcnEnsuranceFailed,
+  CommandExecutor.CommandExecutor
+> => Effect.gen(function* () {
+  const output = yield* Command.make(binaryPath, "coordination-revision").pipe(
+    Command.string,
+    Effect.map((value) => value.trim()),
+    Effect.mapError((cause) => new AcnEnsuranceFailed({ reason: String(cause) })),
+  )
+  const actual = Number(output)
+  if (!Number.isSafeInteger(actual) || actual <= 0) {
+    return yield* new AcnEnsuranceFailed({
+      reason: `Magnitude executable ${binaryPath} returned an invalid ACN revision`,
+    })
+  }
+  if (actual !== expectedRevision) {
+    return yield* new BinaryRevisionMismatch({
+      path: binaryPath,
+      expected: expectedRevision,
+      actual,
+    })
+  }
+})
+
 const cachedAcn = (
   dataDir: string,
-  version: string
+  version: string,
+  expectedRevision: number | undefined,
 ): Effect.Effect<
   Option.Option<string>,
   never,
@@ -123,6 +154,9 @@ const cachedAcn = (
       return Option.none();
     }
     const valid = yield* validateBinaryVersion(executable, version).pipe(
+      Effect.zipRight(expectedRevision === undefined
+        ? Effect.void
+        : validateBinaryRevision(executable, expectedRevision)),
       Effect.as(true),
       Effect.catchAll(() => Effect.succeed(false))
     );
@@ -172,11 +206,12 @@ const acquisitionFailure = (version: string) => (cause: unknown) =>
 
 const ensureAcn = (
   version: string,
+  expectedRevision: number | undefined,
   dataDir: string,
   observer: ResolveBinaryOptions["acquisitionObserver"]
 ): Effect.Effect<
   { readonly path: string; readonly acquired: boolean },
-  DownloadFailed | BinaryVersionMismatch | AcnEnsuranceFailed,
+  DownloadFailed | BinaryVersionMismatch | BinaryRevisionMismatch | AcnEnsuranceFailed,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | Path.Path
@@ -185,14 +220,22 @@ const ensureAcn = (
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const cached = yield* cachedAcn(dataDir, version);
+    const cached = yield* cachedAcn(dataDir, version, expectedRevision);
     if (Option.isSome(cached)) return { path: cached.value, acquired: false };
 
+    const manifestPath = path.join(releaseRoot(dataDir), "manifests", version)
     const release = yield* acquireRelease(
       releaseBaseUrl(),
       version,
-      path.join(releaseRoot(dataDir), "manifests", version)
+      manifestPath,
     ).pipe(Effect.mapError(acquisitionFailure(version)));
+    if (expectedRevision !== undefined && release.manifest.acnRevision !== expectedRevision) {
+      return yield* new BinaryRevisionMismatch({
+        path: manifestPath,
+        expected: expectedRevision,
+        actual: release.manifest.acnRevision,
+      })
+    }
     const artifact = yield* selectArtifact(
       release.manifest,
       "acn",
@@ -235,6 +278,9 @@ const ensureAcn = (
       acquired = true;
     }
     yield* validateBinaryVersion(executable, version);
+    if (expectedRevision !== undefined) {
+      yield* validateBinaryRevision(executable, expectedRevision)
+    }
     yield* publishPointer(dataDir, version, artifact.sha256);
     return { path: executable, acquired };
   });
@@ -244,13 +290,13 @@ export const downloadAcn = (
   dataDir: string
 ): Effect.Effect<
   string,
-  DownloadFailed | BinaryVersionMismatch | AcnEnsuranceFailed,
+  DownloadFailed | BinaryVersionMismatch | BinaryRevisionMismatch | AcnEnsuranceFailed,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | Path.Path
   | HttpClient.HttpClient
 > =>
-  ensureAcn(version, dataDir, Option.none()).pipe(
+  ensureAcn(version, undefined, dataDir, Option.none()).pipe(
     Effect.map(({ path }) => path)
   );
 
@@ -260,7 +306,7 @@ export const resolveBinaryCommand = (
   }
 ): Effect.Effect<
   ResolvedBinaryCommand,
-  DownloadFailed | BinaryNotFound | BinaryVersionMismatch | AcnEnsuranceFailed,
+  DownloadFailed | BinaryNotFound | BinaryVersionMismatch | BinaryRevisionMismatch | AcnEnsuranceFailed,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | Path.Path
@@ -270,6 +316,7 @@ export const resolveBinaryCommand = (
     const fs = yield* FileSystem.FileSystem;
     const dataDir = options?.dataDir ?? defaultDataDir();
     const expectedVersion = options?.version;
+    const expectedRevision = options?.acnRevision;
 
     if (options?.binaryPath) {
       if (
@@ -281,13 +328,12 @@ export const resolveBinaryCommand = (
       }
       if (expectedVersion)
         yield* validateBinaryVersion(options.binaryPath, expectedVersion);
+      if (expectedRevision !== undefined)
+        yield* validateBinaryRevision(options.binaryPath, expectedRevision);
       return {
         command: [
           options.binaryPath,
           "serve",
-          "--register",
-          "--data-dir",
-          dataDir,
         ],
         needsDownload: false,
       };
@@ -299,18 +345,19 @@ export const resolveBinaryCommand = (
         return yield* new BinaryNotFound({ path });
       }
       return {
-        command: [path, "serve", "--register", "--data-dir", dataDir],
+        command: [path, "serve"],
         needsDownload: false,
       };
     }
 
     const resolved = yield* ensureAcn(
       expectedVersion,
+      expectedRevision,
       dataDir,
       options.acquisitionObserver
     );
     return {
-      command: [resolved.path, "serve", "--register", "--data-dir", dataDir],
+      command: [resolved.path, "serve"],
       needsDownload: resolved.acquired,
     };
   });

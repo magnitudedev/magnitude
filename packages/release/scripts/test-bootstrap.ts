@@ -9,6 +9,7 @@ import {
   type ReleaseArtifact,
   type ReleaseManifest,
 } from "../src/contracts"
+import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import { releaseUrl } from "../src/acquisition"
 import {
   acnArchive,
@@ -180,8 +181,9 @@ const buildCandidate = Effect.gen(function* () {
     return yield* failure("candidate has no release artifacts")
   }
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     version,
+    acnRevision: ACN_COORDINATION_REVISION,
     tag: `@magnitudedev/cli@${version}`,
     sourceCommit,
     artifacts: [firstArtifact, ...remainingArtifacts],

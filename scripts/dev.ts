@@ -30,8 +30,7 @@ const run = async (
 const versionExit = await run([
   "bun",
   "run",
-  "packages/version/scripts/generate-version.ts",
-  "--dev",
+  "dev:version",
 ])
 if (versionExit !== 0) process.exit(versionExit)
 

@@ -2,9 +2,10 @@ import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
 import type { FromClientEncoded, ResponseExitEncoded } from "@effect/rpc/RpcMessage"
 import * as HttpBody from "@effect/platform/HttpBody"
 import * as HttpClient from "@effect/platform/HttpClient"
-import { Array as Arr, Chunk, Deferred, Effect, Either, Layer, Schema, Stream } from "effect"
+import { Array as Arr, Chunk, Deferred, Effect, Either, Layer, Schema, Scope, Stream } from "effect"
 import { JsonValueSchema } from "@magnitudedev/utils/schema"
 import type { RecoveringStreamProtocol } from "./recovering-stream-protocol"
+import type { AcnRpcRecoveryPolicy } from "@magnitudedev/acn-protocol"
 import {
   type JitRpcAttemptFailure,
   toRpcClientError,
@@ -16,7 +17,7 @@ import {
   SubscriptionProtocolViolation,
   StreamLivenessTimeout,
   StreamEndedWithoutExit,
-  RecoveryExhausted,
+  RpcOutcomeUnknown,
 } from "./errors"
 import { isChunkMessage, isFromServerEncoded, isTerminalMessage } from "./transport"
 
@@ -45,6 +46,7 @@ export interface RecoveringProtocolOptions<InfraError, Endpoint extends RpcEndpo
   readonly streamProtocol: RecoveringStreamProtocol
   readonly isEndpointRetirementExit?: (exit: ResponseExitEncoded["exit"]) => boolean
   readonly classifyInfraError: (error: InfraError) => RpcClientError.RpcClientError
+  readonly recoveryPolicy: (tag: string) => AcnRpcRecoveryPolicy
 }
 
 export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint = RpcEndpoint>(
@@ -53,6 +55,7 @@ export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint 
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient
     const serialization = yield* RpcSerialization.RpcSerialization
+    const protocolScope = yield* Scope.Scope
 
     return yield* Protocol.make(
       Effect.fnUntraced(function* (writeResponse) {
@@ -62,11 +65,11 @@ export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint 
           if (request._tag !== "Request") return Effect.void
 
           const isStream = options.streamProtocol.isStream(request.tag)
+          const policy = isStream ? undefined : options.recoveryPolicy(request.tag)
 
           return Effect.suspend(() => {
             let done = false
             let progressed = false
-            let failuresWithoutProgress = 0
 
             const attempt = (
               endpoint: Endpoint,
@@ -253,6 +256,10 @@ export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint 
                     continue
                   }
                   if (outcome.right._tag === "EndpointRetired") {
+                    if (policy === "AtMostOnce") {
+                      yield* options.recover(endpoint).pipe(Effect.ignore, Effect.forkIn(protocolScope))
+                      return yield* toRpcClientError(new RpcOutcomeUnknown({ tag: request.tag }))
+                    }
                     yield* options.recover(endpoint).pipe(
                       Effect.mapError(options.classifyInfraError),
                     )
@@ -279,20 +286,21 @@ export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint 
                 }
                 if (done) return
 
-                failuresWithoutProgress = progressed ? 1 : failuresWithoutProgress + 1
-                if (failuresWithoutProgress >= 2) {
-                  yield* Effect.logDebug("jit-rpc surfacing fatal").pipe(
-                    Effect.annotateLogs({
-                      tag: request.tag,
-                      id: request.id,
-                      failures: failuresWithoutProgress,
-                    }),
-                  )
-                  return yield* toRpcClientError(
-                    new RecoveryExhausted({
-                      attempts: failuresWithoutProgress,
-                    }),
-                  )
+                if (
+                  failure._tag === "RequestEncodeFailed" ||
+                  failure._tag === "ResponseDecodeFailed" ||
+                  failure._tag === "UnrecognizedMessage" ||
+                  (failure._tag === "BadResponseStatus" &&
+                    failure.status !== 409 &&
+                    failure.status !== 503 &&
+                    (failure.status < 500 || failure.status >= 600))
+                ) return yield* toRpcClientError(failure)
+
+                const definitelyNotDispatched = failure._tag === "BadResponseStatus" &&
+                  (failure.status === 409 || failure.status === 503)
+                if (!isStream && policy === "AtMostOnce" && !definitelyNotDispatched) {
+                  yield* options.recover(endpoint).pipe(Effect.ignore, Effect.forkIn(protocolScope))
+                  return yield* toRpcClientError(new RpcOutcomeUnknown({ tag: request.tag }))
                 }
                 yield* options.recover(endpoint).pipe(
                   Effect.mapError(options.classifyInfraError),

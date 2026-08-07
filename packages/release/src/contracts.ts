@@ -50,8 +50,9 @@ export const ReleaseArtifactSchema = Schema.Struct({
 export type ReleaseArtifact = typeof ReleaseArtifactSchema.Type
 
 export const ReleaseManifestSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
+  schemaVersion: Schema.Literal(2),
   version: NonEmpty,
+  acnRevision: PositiveInt.pipe(Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
   tag: NonEmpty,
   sourceCommit: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
   artifacts: Schema.NonEmptyArray(ReleaseArtifactSchema),

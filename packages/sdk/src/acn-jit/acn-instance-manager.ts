@@ -1,59 +1,46 @@
 import {
-  AcnIdentitySchema,
-  AcnInstanceIdSchema,
+  AcnTargetSchema,
   AcnReady,
-  ProcessStartIdentitySchema,
+  AcnReadyInstanceSchema,
+  type AcnInstance,
+  type AcnTarget,
 } from "@magnitudedev/acn-protocol"
 import { Context, Effect, Option, Schema, Stream } from "effect"
 import { AcnLifecycleObservationSchema } from "./lifecycle"
-import { AcnEnsuranceError, AcnEnsuranceFailed, type AcnEnsuranceError as AcnEnsuranceErrorType } from "./errors"
+import {
+  AcnAdministrationFailed,
+  AcnEnsuranceError,
+  AcnEnsuranceFailed,
+  type AcnEnsuranceError as AcnEnsuranceErrorType,
+} from "./errors"
 
-const PositiveSafeInteger = Schema.Number.pipe(
-  Schema.int(),
-  Schema.positive(),
-  Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
-)
+type ReadyInstance = AcnInstance<AcnReady>
 
-export const ReadyAcnSchema = Schema.Struct({
-  id: AcnInstanceIdSchema,
-  identity: AcnIdentitySchema,
-  url: Schema.NonEmptyString,
-  pid: PositiveSafeInteger,
-  processStartIdentity: ProcessStartIdentitySchema,
-  lifecycle: AcnReady,
-})
-export type ReadyAcn = typeof ReadyAcnSchema.Type
-
-export const AcnEnsureRequestSchema = Schema.Struct({
-  minimumIdentity: AcnIdentitySchema,
-})
+export const AcnEnsureRequestSchema = Schema.Struct({ target: AcnTargetSchema })
 export type AcnEnsureRequest = typeof AcnEnsureRequestSchema.Type
 
 export const AcnEnsureEventSchema = Schema.Union(
-  Schema.TaggedStruct("Observation", {
-    observation: AcnLifecycleObservationSchema,
-  }),
-  Schema.TaggedStruct("Ready", {
-    instance: ReadyAcnSchema,
-  }),
+  Schema.TaggedStruct("Observation", { observation: AcnLifecycleObservationSchema }),
+  Schema.TaggedStruct("Ready", { instance: AcnReadyInstanceSchema }),
 )
 export type AcnEnsureEvent = typeof AcnEnsureEventSchema.Type
 
-export interface AcnEnsurer {
+export interface AcnInstanceManager {
   readonly ensure: (
     request: AcnEnsureRequest,
   ) => Stream.Stream<AcnEnsureEvent, AcnEnsuranceErrorType>
+  readonly stop: Effect.Effect<void, AcnAdministrationFailed>
 }
 
-export const AcnEnsurer = Context.GenericTag<AcnEnsurer>(
-  "@magnitudedev/sdk/AcnEnsurer",
+export const AcnInstanceManager = Context.GenericTag<AcnInstanceManager>(
+  "@magnitudedev/sdk/AcnInstanceManager",
 )
 
 export const runAcnEnsure = (
   events: Stream.Stream<AcnEnsureEvent, AcnEnsuranceErrorType>,
-): Effect.Effect<ReadyAcn, AcnEnsuranceErrorType> =>
+): Effect.Effect<ReadyInstance, AcnEnsuranceErrorType> =>
   events.pipe(
-    Stream.runFoldEffect(Option.none<ReadyAcn>(), (ready, event) => {
+    Stream.runFoldEffect(Option.none<ReadyInstance>(), (ready, event) => {
       if (event._tag === "Observation") {
         return Option.isSome(ready)
           ? Effect.fail(new AcnEnsuranceFailed({ reason: "ACN ensure emitted progress after readiness" }))
@@ -74,3 +61,6 @@ export const RemoteAcnEnsureMessageSchema = Schema.Union(
   Schema.TaggedStruct("Failed", { error: AcnEnsuranceError }),
 )
 export type RemoteAcnEnsureMessage = typeof RemoteAcnEnsureMessageSchema.Type
+
+export type { AcnInstance, AcnTarget }
+export { AcnReady, AcnReadyInstanceSchema }
