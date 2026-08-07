@@ -497,7 +497,7 @@ impl InferenceWorker {
                 let _ = hello_sender.send((hello, stdout));
             })?;
         let (hello, mut stdout) =
-            match hello_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            match hello_receiver.recv_timeout(std::time::Duration::from_secs(10 * 60)) {
                 Ok((hello, stdout)) => (hello?, stdout),
                 Err(_) => {
                     let _ = child.kill();
