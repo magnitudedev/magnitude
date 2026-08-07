@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.37
+
+### Patch Changes
+
+- [`311dcb6`](https://github.com/magnitudedev/magnitude/commit/311dcb68e1186b8f4df039c95717577ad7cbdbfb) Thanks [@anerli](https://github.com/anerli)! - fix inference worker timeout
+
 ## 0.0.1-alpha.36
 
 ### Patch Changes
