@@ -13,7 +13,7 @@ export function AnimatedLogo() {
       ))}
       <text>{' '}</text>
       <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Magnitude</text>
-      <text style={{ fg: theme.muted }}>The best way to code with local models</text>
+      <text style={{ fg: theme.muted }}>Your actually local agent</text>
     </box>
   )
 }
