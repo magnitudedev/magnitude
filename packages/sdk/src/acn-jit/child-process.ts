@@ -1,52 +1,43 @@
 import { Array as Arr, Context, Effect, Ref, Scope } from "effect"
 import { AcnEnsuranceFailed } from "./errors"
 
-/** An ACN candidate child whose lifetime is owned by the spawning scope until handoff. */
+/** An ACN candidate whose cleanup remains armed until owner admission is observed. */
 export interface SpawnedAcnCandidate {
   readonly pid: number
-
-  /**
-   * Releases the exact candidate into its marker/ownership loop. This is
-   * one-shot and leaves scoped cleanup disarmed.
-   */
-  readonly handoff: Effect.Effect<void, AcnEnsuranceFailed>
+  readonly exited: Effect.Effect<number>
+  readonly admit: Effect.Effect<void, AcnEnsuranceFailed>
 }
 
-interface PreHandoffAcnCandidate {
+interface ScopedAcnCandidate {
   readonly pid: number
-  readonly releaseForHandoff: Effect.Effect<void, AcnEnsuranceFailed>
+  readonly exited: Effect.Effect<number>
   readonly stopAndReap: Effect.Effect<void, AcnEnsuranceFailed>
+  readonly releaseParentChannel: Effect.Effect<void, AcnEnsuranceFailed>
 }
 
-/** Installs the ownership guarantee shared by every platform spawner. */
-export const scopePreHandoffCandidate = (
-  candidate: PreHandoffAcnCandidate,
+/** Installs the candidate cleanup/admission boundary shared by platform spawners. */
+export const scopeAcnCandidate = (
+  candidate: ScopedAcnCandidate,
 ): Effect.Effect<SpawnedAcnCandidate, never, Scope.Scope> =>
   Effect.gen(function* () {
-    const handedOff = yield* Ref.make(false)
-    const handoffAttempted = yield* Ref.make(false)
-    yield* Effect.addFinalizer(() =>
-      Ref.get(handedOff).pipe(
-        Effect.flatMap((complete) => (complete ? Effect.void : candidate.stopAndReap)),
-        Effect.orDie,
-      ),
-    )
-    const handoff = Effect.uninterruptible(
-      Effect.gen(function* () {
-        const alreadyAttempted = yield* Ref.getAndSet(handoffAttempted, true)
-        if (alreadyAttempted) {
-          return yield* new AcnEnsuranceFailed({
-            reason: `ACN candidate ${candidate.pid} handoff was already attempted`,
-          })
-        }
-        yield* candidate.releaseForHandoff
-        yield* Ref.set(handedOff, true)
-      }),
-    )
-    return {
-      pid: candidate.pid,
-      handoff,
-    }
+    const state = yield* Ref.make<"Armed" | "AdmissionAttempted" | "Admitted">("Armed")
+    yield* Effect.addFinalizer(() => Ref.get(state).pipe(
+      Effect.flatMap((value) => value === "Admitted" ? Effect.void : candidate.stopAndReap),
+      Effect.orDie,
+    ))
+    const admit = Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+      const firstAttempt = yield* Ref.modify(state, (current) => current === "Armed"
+        ? [true, "AdmissionAttempted" as const]
+        : [false, current])
+      if (!firstAttempt) {
+        return yield* new AcnEnsuranceFailed({
+          reason: `ACN candidate ${candidate.pid} admission was already acknowledged`,
+        })
+      }
+      yield* restore(candidate.releaseParentChannel)
+      yield* Ref.set(state, "Admitted")
+    }))
+    return { pid: candidate.pid, exited: candidate.exited, admit }
   })
 
 export interface ChildProcessSpawner {

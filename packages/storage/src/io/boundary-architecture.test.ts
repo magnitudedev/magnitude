@@ -5,8 +5,9 @@ import { describe, expect, it } from "vitest";
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");
 
 const boundaryFiles = [
-  "packages/sdk/src/acn-jit/local-daemon-spawner.ts",
-  "packages/acn/src/daemon-registration.ts",
+  "packages/acn-protocol/src/coordination/coordination-database.ts",
+  "packages/sdk/src/acn-jit/local-acn-instance-manager.ts",
+  "packages/acn/src/server.ts",
   "packages/acn/src/session-runtime-options.ts",
   "packages/storage/src/io/structured-file.ts",
   "packages/client-common/src/sync/display-view-store.ts",
@@ -30,9 +31,9 @@ describe("external-data boundary architecture", () => {
 
   it("keeps the removed JSON lock protocol out of production coordination", async () => {
     for (const relativePath of [
-      "packages/sdk/src/acn-jit/local-daemon-spawner.ts",
-      "packages/acn/src/daemon-registration.ts",
-      "packages/acn/src/daemon-lifecycle.ts",
+      "packages/acn-protocol/src/coordination/coordination-database.ts",
+      "packages/sdk/src/acn-jit/local-acn-instance-manager.ts",
+      "packages/acn/src/server.ts",
     ]) {
       const source = await readFile(
         resolve(repositoryRoot, relativePath),

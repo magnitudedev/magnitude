@@ -1,4 +1,8 @@
-import { Effect } from "effect"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { ExactProcessControllerLive } from "@magnitudedev/acn-protocol/coordination"
+import { Duration, Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { BunDetachedChildProcessSpawner } from "./bun-spawn-process"
 
@@ -21,4 +25,36 @@ describe("BunDetachedChildProcessSpawner", () => {
       ),
     )
   })
+
+  it.skipIf(process.platform === "win32")(
+    "reaps the candidate group when the root exits before its descendant",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "magnitude-candidate-tree-"))
+      const childPidPath = join(root, "child-pid")
+      let childPid = 0
+      try {
+        await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+          const spawned = yield* BunDetachedChildProcessSpawner.spawn([
+            process.execPath,
+            "-e",
+            "const child = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' }); child.unref(); await Bun.write(process.argv.at(-1), String(child.pid));",
+            childPidPath,
+          ])
+          while (!(yield* Effect.promise(() => Bun.file(childPidPath).exists()))) {
+            yield* Effect.sleep(Duration.millis(5))
+          }
+          childPid = Number(yield* Effect.promise(() => readFile(childPidPath, "utf8")))
+          yield* spawned.exited
+        })))
+        expect(Option.isNone(await Effect.runPromise(
+          ExactProcessControllerLive.inspect(childPid),
+        ))).toBe(true)
+      } finally {
+        if (childPid > 0) {
+          try { process.kill(childPid, "SIGKILL") } catch { /* already reaped */ }
+        }
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 })

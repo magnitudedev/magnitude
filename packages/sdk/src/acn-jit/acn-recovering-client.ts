@@ -34,6 +34,7 @@ import { isInterruptedExit, recoveringProtocolLayer as jitRecoveringProtocolLaye
 import { SDK_ACN_TARGET } from "../version"
 import type { AcnClient } from "../protocol"
 import {
+  ACN_ENSURE_TIMEOUT,
   AcnInstanceManager,
   runAcnEnsure,
 } from "./acn-instance-manager"
@@ -201,9 +202,9 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     )),
   )
 
-  const finishSelection = (
+  const finishFailedSelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
-    exit: Exit.Exit<ReadyInstance, AcnEnsuranceError>,
+    cause: Cause.Cause<AcnEnsuranceError>,
   ) => admission.withPermits(1)(Effect.gen(function* () {
     const current = yield* Ref.get(activeSelection)
     if (Option.isNone(current) || current.value !== deferred) return
@@ -212,21 +213,40 @@ export const makeAcnJitRuntime = (): Effect.Effect<
       yield* Deferred.fail(deferred, runtimeClosed())
       return
     }
-    if (Exit.isFailure(exit)) {
-      const failure = Option.getOrUndefined(Cause.failureOption(exit.cause))
-      if (failure !== undefined) yield* lifecycle.fail(failure)
-      yield* Deferred.done(deferred, exit)
-      return
-    }
-    const ready = exit.value
-    const previous = yield* SubscriptionRef.get(association)
-    const target = ready.revision > previous.target.revision
-      ? { revision: ready.revision, identity: ready.identity }
-      : previous.target
-    yield* SubscriptionRef.set(association, { target, selected: Option.some(ready) })
-    yield* lifecycle.ready
-    yield* Deferred.succeed(deferred, ready)
+    const failure = Option.getOrUndefined(Cause.failureOption(cause))
+    if (failure !== undefined) yield* lifecycle.fail(failure)
+    yield* Deferred.failCause(deferred, cause)
   })).pipe(Effect.uninterruptible)
+
+  const finishReadySelection = (
+    deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
+    ready: ReadyInstance,
+    client: ClientLeaseRpcClient,
+  ): Effect.Effect<boolean> => admission.withPermits(1)(
+    Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+      const current = yield* Ref.get(activeSelection)
+      if (Option.isNone(current) || current.value !== deferred) return true
+      if (!(yield* Ref.get(open))) {
+        yield* Ref.set(activeSelection, Option.none())
+        yield* Deferred.fail(deferred, runtimeClosed())
+        return true
+      }
+      const established = yield* restore(owner.establishThrough(client).pipe(
+        Effect.timeout(CLIENT_LEASE_ESTABLISH_TIMEOUT),
+        Effect.either,
+      ))
+      if (Either.isLeft(established)) return false
+      const previous = yield* SubscriptionRef.get(association)
+      const target = ready.revision > previous.target.revision
+        ? { revision: ready.revision, identity: ready.identity }
+        : previous.target
+      yield* Ref.set(activeSelection, Option.none())
+      yield* SubscriptionRef.set(association, { target, selected: Option.some(ready) })
+      yield* lifecycle.ready
+      yield* Deferred.succeed(deferred, ready)
+      return true
+    })),
+  )
 
   const launchSelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
@@ -238,17 +258,14 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   )).pipe(
     Effect.exit,
     Effect.flatMap((exit) => {
-      if (Exit.isFailure(exit)) return finishSelection(deferred, exit)
+      if (Exit.isFailure(exit)) return finishFailedSelection(deferred, exit.cause)
       return exactClient(exit.value).pipe(
-        Effect.flatMap((client) => owner.establishThrough(client)),
-        Effect.timeout(CLIENT_LEASE_ESTABLISH_TIMEOUT),
-        Effect.either,
-        Effect.flatMap(Either.match({
-          onLeft: () => Effect.sleep(CLIENT_LEASE_ESTABLISH_RETRY_DELAY).pipe(
+        Effect.flatMap((client) => finishReadySelection(deferred, exit.value, client)),
+        Effect.flatMap((finished) => finished
+          ? Effect.void
+          : Effect.sleep(CLIENT_LEASE_ESTABLISH_RETRY_DELAY).pipe(
             Effect.zipRight(launchSelection(deferred, target)),
-          ),
-          onRight: () => finishSelection(deferred, exit),
-        })),
+          )),
       )
     }),
   ))
@@ -266,7 +283,16 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     const deferred = yield* Deferred.make<ReadyInstance, SelectionError>()
     const target = (yield* SubscriptionRef.get(association)).target
     yield* Ref.set(activeSelection, Option.some(deferred))
-    yield* Effect.forkIn(launchSelection(deferred, target), selectionScope)
+    const selection = launchSelection(deferred, target).pipe(
+      Effect.timeoutFail({
+        duration: ACN_ENSURE_TIMEOUT,
+        onTimeout: () => new AcnEnsuranceFailed({
+          reason: "ACN client selection did not converge within its absolute deadline",
+        }),
+      }),
+      Effect.catchAll((error) => finishFailedSelection(deferred, Cause.fail(error))),
+    )
+    yield* Effect.forkIn(selection, selectionScope)
     return yield* Effect.succeed(Deferred.await(deferred))
   })
 

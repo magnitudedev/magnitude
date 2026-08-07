@@ -190,9 +190,7 @@ async function main() {
     `// Source: packages/cli/package.json\n` +
     (fingerprint === undefined ? "" : `// Development fingerprint: ${fingerprint}\n`) +
     `export const MAGNITUDE_VERSION = ${JSON.stringify(version)}\n` +
-    `export const ACN_COORDINATION_REVISION = ${revision}\n` +
-    `export const ACN_BUILD_KIND = ${JSON.stringify(fingerprint === undefined ? "published" : "development")} as const\n` +
-    `export const ACN_DEVELOPMENT_KEY = ${fingerprint === undefined ? "undefined" : JSON.stringify(fingerprint)}\n`
+    `export const ACN_COORDINATION_REVISION = ${revision}\n`
 
   await Bun.write(OUTPUT_FILE, contents)
 }

@@ -13,39 +13,48 @@ import {
 import {
   ExactProcessController,
   ExactProcessControllerLive,
-  makeAcnOwnerLock,
+  makeAcnOwnerStore,
   makeAcnRevisionStore,
-  reapProcessTree,
-  retryStoreObservation,
-  SqliteMutex,
+  SqliteDriver,
   COORDINATION_POLL_INTERVAL,
-  type AcnProcessStoreError,
-  type AcnOwnerLock,
+  TREE_KILL_WAIT,
+  TREE_TERM_WAIT,
+  waitForTreeAbsence,
   type AcnOwnerRecord,
-  type AcnRevisionStore,
+  type AcnProcessStoreError,
   type ExactProcess,
   type ExactProcessController as ExactProcessControllerService,
 } from "@magnitudedev/acn-protocol/coordination"
 import type { ArtifactInstallationEvent } from "@magnitudedev/release"
-import { Array as Arr, Duration, Effect, Option, Schema, Scope, Stream } from "effect"
+import {
+  Array as Arr,
+  Clock,
+  Duration,
+  Effect,
+  Match,
+  Option,
+  Schedule,
+  Schema,
+  Scope,
+  Stream,
+} from "effect"
 import { defaultDataDir, resolveBinaryCommand, type BinaryAcquisitionEvent } from "../binary"
+import { SDK_ACN_TARGET } from "../version"
 import {
-  SDK_ACN_BUILD_KIND,
-  SDK_ACN_DEVELOPMENT_KEY,
-  SDK_ACN_TARGET,
-} from "../version"
-import {
+  ACN_ENSURE_TIMEOUT,
   AcnInstanceManager,
   type AcnEnsureEvent,
 } from "./acn-instance-manager"
-import { ChildProcessSpawner } from "./child-process"
+import { ChildProcessSpawner, type SpawnedAcnCandidate } from "./child-process"
 import {
   AcnAdministrationFailed,
-  AcnEnsuranceError,
   AcnEnsuranceFailed,
   type AcnEnsuranceError as AcnEnsuranceErrorType,
 } from "./errors"
-import { acnLifecycleObservationFromHealthState } from "./lifecycle"
+import {
+  acnLifecycleObservationFromHealthState,
+  acnStartupProgressKey,
+} from "./lifecycle"
 
 type ReadyInstance = AcnInstance<AcnReady>
 
@@ -71,36 +80,105 @@ interface HealthObservation {
   readonly health: AcnHealthResponse
 }
 
+interface LaunchedCandidate {
+  readonly process: ExactProcess
+  readonly child: SpawnedAcnCandidate
+  readonly launchedAt: number
+}
+
+type ConvergenceState =
+  | { readonly _tag: "CoordinationChanged" }
+  | { readonly _tag: "AdvanceSelection" }
+  | { readonly _tag: "SurvivingPredecessorTree"; readonly owner: AcnOwnerRecord }
+  | {
+      readonly _tag: "ObservableOwner"
+      readonly owner: AcnOwnerRecord
+      readonly selected: AcnTarget["revision"]
+      readonly observed: Option.Option<HealthObservation>
+      readonly now: number
+    }
+  | { readonly _tag: "OwnerWithoutSelection"; readonly owner: AcnOwnerRecord }
+  | { readonly _tag: "CandidatePending" }
+  | { readonly _tag: "CandidateExited"; readonly candidate: LaunchedCandidate }
+  | { readonly _tag: "CandidateAdmissionExpired"; readonly candidate: LaunchedCandidate }
+  | { readonly _tag: "AwaitingNewerSelectedOwner" }
+  | { readonly _tag: "LaunchCandidate" }
+  | { readonly _tag: "LaunchOccurrenceLost" }
+
 const HEALTH_TIMEOUT = Duration.seconds(2)
+const HEALTH_GRACE = Duration.seconds(30)
+const STARTUP_CEILING = Duration.minutes(5)
+const STOPPING_GRACE = Duration.seconds(5)
+const CANDIDATE_ADMISSION_TIMEOUT = Duration.seconds(30)
+const CANDIDATE_PARENT_RELEASE_TIMEOUT = Duration.seconds(2)
 const GRACEFUL_STOP_WAIT = Duration.seconds(5)
+const STORE_RETRY_INTERVAL = Duration.millis(25)
+const STORE_OPERATION_TIMEOUT = Duration.seconds(30)
+const PROCESS_OPERATION_TIMEOUT = Duration.seconds(30)
 
-const inspectProcess = (
-  processes: ExactProcessControllerService,
-  pid: number,
-): Effect.Effect<Option.Option<ExactProcess["processStartIdentity"]>> => Effect.suspend(() =>
-  processes.inspect(pid).pipe(
-    Effect.catchAll((error) => Effect.logWarning("ACN process inspection is temporarily unavailable").pipe(
-      Effect.annotateLogs({ pid, operation: error.operation }),
-      Effect.zipRight(Effect.sleep(COORDINATION_POLL_INTERVAL)),
-      Effect.zipRight(inspectProcess(processes, pid)),
-    )),
-  ),
+const monotonicMillis = Clock.currentTimeNanos.pipe(
+  Effect.map((nanos) => Number(nanos / 1_000_000n)),
 )
-
-const storeEnsuranceError = (error: AcnProcessStoreError): AcnEnsuranceErrorType =>
-  new AcnEnsuranceFailed({
-    reason: `${error._tag} during ${"operation" in error ? error.operation : "validation"} at ${error.path}: ${error.message}`,
-  })
 
 const sameOwner = (left: AcnOwnerRecord, right: AcnOwnerRecord): boolean =>
   left.pid === right.pid &&
   left.processStartIdentity === right.processStartIdentity &&
   left.port === right.port
 
+const sameOptionalOwner = (
+  left: Option.Option<AcnOwnerRecord>,
+  right: Option.Option<AcnOwnerRecord>,
+): boolean => Option.match(left, {
+  onNone: () => Option.isNone(right),
+  onSome: (owner) => Option.exists(right, (other) => sameOwner(owner, other)),
+})
+
+const ownerNamesProcess = (owner: AcnOwnerRecord, process: ExactProcess): boolean =>
+  owner.pid === process.pid && owner.processStartIdentity === process.processStartIdentity
+
+const ownerKey = (owner: AcnOwnerRecord): string =>
+  `${owner.pid}:${owner.processStartIdentity}:${owner.port}`
+
 const exactFrom = (owner: AcnOwnerRecord): ExactProcess => ({
   pid: owner.pid,
   processStartIdentity: owner.processStartIdentity,
 })
+
+const storeFailure = (error: AcnProcessStoreError): AcnEnsuranceFailed =>
+  new AcnEnsuranceFailed({
+    reason: `${error._tag} during ${"operation" in error ? error.operation : "validation"} at ${error.path}${"message" in error ? `: ${error.message}` : ""}`,
+  })
+
+const retryStore = <A>(
+  effect: Effect.Effect<A, AcnProcessStoreError>,
+): Effect.Effect<A, AcnEnsuranceFailed> => effect.pipe(
+  Effect.retry({
+    schedule: Schedule.spaced(STORE_RETRY_INTERVAL),
+    while: (error) => error._tag !== "AcnProcessStoreInvalid",
+  }),
+  Effect.timeoutFail({
+    duration: STORE_OPERATION_TIMEOUT,
+    onTimeout: () => new AcnEnsuranceFailed({ reason: "ACN coordination store remained unavailable" }),
+  }),
+  Effect.mapError((error) => error instanceof AcnEnsuranceFailed ? error : storeFailure(error)),
+)
+
+const inspectProcess = (
+  processes: ExactProcessControllerService,
+  pid: number,
+): Effect.Effect<Option.Option<ExactProcess["processStartIdentity"]>, AcnEnsuranceFailed> =>
+  processes.inspect(pid).pipe(
+    Effect.retry(Schedule.spaced(COORDINATION_POLL_INTERVAL)),
+    Effect.timeoutFail({
+      duration: PROCESS_OPERATION_TIMEOUT,
+      onTimeout: () => new AcnEnsuranceFailed({
+        reason: `Exact process inspection remained unavailable for PID ${pid}`,
+      }),
+    }),
+    Effect.mapError((error) => error instanceof AcnEnsuranceFailed
+      ? error
+      : new AcnEnsuranceFailed({ reason: error.message })),
+  )
 
 const artifactProgress = (
   event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
@@ -110,25 +188,6 @@ const artifactProgress = (
   unit: "Bytes" as const,
   attempt: Option.some(event.progress.attempt),
 })
-
-const registerTarget = (
-  store: AcnRevisionStore,
-  target: AcnTarget,
-): Effect.Effect<void, AcnEnsuranceErrorType, Scope.Scope> =>
-  SDK_ACN_BUILD_KIND === "published"
-    ? retryStoreObservation(store.registerPublished(target.revision)).pipe(
-        Effect.mapError(storeEnsuranceError),
-      )
-    : Effect.gen(function* () {
-        if (SDK_ACN_DEVELOPMENT_KEY === undefined) {
-          return yield* new AcnEnsuranceFailed({ reason: "Development ACN target has no development key" })
-        }
-        const hold = yield* retryStoreObservation(
-          store.holdDevelopment(target.revision, SDK_ACN_DEVELOPMENT_KEY),
-        ).pipe(Effect.mapError(storeEnsuranceError))
-        // The hold is released via scope finalizer when the manager's scope closes.
-        void hold
-      })
 
 const sameTarget = (left: AcnTarget, right: AcnTarget): boolean =>
   left.revision === right.revision && left.identity === right.identity
@@ -143,7 +202,7 @@ export const makeLocalAcnInstanceManager = (
   | CommandExecutor.CommandExecutor
   | Path.Path
   | ChildProcessSpawner
-  | SqliteMutex
+  | SqliteDriver
   | Scope.Scope
 > => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -153,16 +212,18 @@ export const makeLocalAcnInstanceManager = (
   const spawner = yield* ChildProcessSpawner
   const processes = yield* ExactProcessController
   const dataDirectory = options.dataDir ?? defaultDataDir()
-  const store = yield* makeAcnRevisionStore(dataDirectory).pipe(
+  const revisions = yield* makeAcnRevisionStore(dataDirectory).pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.provideService(Path.Path, path),
   )
-  const ownerLock = yield* makeAcnOwnerLock(dataDirectory).pipe(
+  const owners = yield* makeAcnOwnerStore(dataDirectory).pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.provideService(Path.Path, path),
   )
 
-  const probeHealth = (owner: AcnOwnerRecord): Effect.Effect<Option.Option<HealthObservation>, AcnEnsuranceErrorType> =>
+  const probeHealth = (
+    owner: AcnOwnerRecord,
+  ): Effect.Effect<Option.Option<HealthObservation>> =>
     http.execute(HttpClientRequest.get(`http://127.0.0.1:${owner.port}/health`)).pipe(
       Effect.timeoutOption(HEALTH_TIMEOUT),
       Effect.option,
@@ -173,9 +234,7 @@ export const makeLocalAcnInstanceManager = (
           onSome: (response) => response.json.pipe(
             Effect.flatMap(Schema.decodeUnknown(AcnHealthResponseSchema)),
             Effect.map((health) => Option.some({ status: response.status, health })),
-            Effect.mapError((error) => new AcnEnsuranceFailed({
-              reason: `ACN owner returned malformed health: ${String(error)}`,
-            })),
+            Effect.catchAll(() => Effect.succeed(Option.none())),
           ),
         }),
       })),
@@ -226,46 +285,76 @@ export const makeLocalAcnInstanceManager = (
     )
   }
 
-  const observeReady = (
+  const ownerStillCurrent = (owner: AcnOwnerRecord): Effect.Effect<boolean, AcnEnsuranceFailed> =>
+    retryStore(owners.current).pipe(
+      Effect.map(Option.exists((current) => sameOwner(current, owner))),
+    )
+
+  const ownerStillSafeToSignal = (
+    owner: AcnOwnerRecord,
+  ): Effect.Effect<boolean, AcnEnsuranceFailed> => Effect.gen(function* () {
+    if (!(yield* ownerStillCurrent(owner))) return false
+    const identity = yield* inspectProcess(processes, owner.pid)
+    if (Option.isSome(identity) && identity.value !== owner.processStartIdentity) {
+      return yield* new AcnEnsuranceFailed({
+        reason: `PID ${owner.pid} now identifies a different process occurrence`,
+      })
+    }
+    return true
+  })
+
+  const retireOwner = (
+    owner: AcnOwnerRecord,
+  ): Effect.Effect<void, AcnEnsuranceFailed> => Effect.gen(function* () {
+    const exact = exactFrom(owner)
+    if (yield* processes.treeAbsent(exact).pipe(
+      Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+    )) return
+
+    const identity = yield* inspectProcess(processes, owner.pid)
+    if (Option.contains(identity, owner.processStartIdentity) && (yield* ownerStillCurrent(owner))) {
+      yield* http.execute(HttpClientRequest.post(`http://127.0.0.1:${owner.port}/shutdown`)).pipe(
+        Effect.timeout(HEALTH_TIMEOUT),
+        Effect.ignore,
+      )
+      if (yield* waitForTreeAbsence(processes, exact, GRACEFUL_STOP_WAIT).pipe(
+        Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+      )) return
+    }
+    if (!(yield* ownerStillSafeToSignal(owner))) return
+    yield* processes.signalTree(exact, "term").pipe(
+      Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+    )
+    if (yield* waitForTreeAbsence(processes, exact, TREE_TERM_WAIT).pipe(
+      Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+    )) return
+    if (!(yield* ownerStillSafeToSignal(owner))) return
+    yield* processes.signalTree(exact, "kill").pipe(
+      Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+    )
+    if (!(yield* waitForTreeAbsence(processes, exact, TREE_KILL_WAIT).pipe(
+      Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+    ))) {
+      return yield* new AcnEnsuranceFailed({
+        reason: `Could not prove ACN process tree ${owner.pid} absent`,
+      })
+    }
+  })
+
+  const readyInstance = (
     selected: AcnTarget["revision"],
     owner: AcnOwnerRecord,
-    emit: (event: AcnEnsureEvent) => void,
-  ): Effect.Effect<Option.Option<ReadyInstance>, AcnEnsuranceErrorType> =>
+    observed: HealthObservation,
+  ): Effect.Effect<Option.Option<ReadyInstance>, AcnEnsuranceFailed> =>
     Effect.gen(function* () {
+      const { health, status } = observed
+      if (status !== 200 || health.state._tag !== "Ready") return Option.none()
+      const confirmedRevision = yield* retryStore(revisions.selected)
+      if (!Option.contains(confirmedRevision, selected)) return Option.none()
+      const confirmedOwner = yield* retryStore(owners.current)
+      if (!Option.exists(confirmedOwner, (current) => sameOwner(current, owner))) return Option.none()
       const identity = yield* inspectProcess(processes, owner.pid)
       if (!Option.contains(identity, owner.processStartIdentity)) return Option.none()
-      const observed = yield* probeHealth(owner)
-      if (Option.isNone(observed)) return Option.none()
-      const { health, status } = observed.value
-      if (health.pid !== owner.pid) {
-        return yield* new AcnEnsuranceFailed({ reason: "ACN health PID contradicts locked owner metadata" })
-      }
-      if (health.revision > selected) {
-        return yield* new AcnEnsuranceFailed({
-          reason: "ACN health revision contradicts the selected coordination revision",
-        })
-      }
-      if (health.revision < selected) return Option.none()
-      if (status !== 200 && status !== 503) {
-        return yield* new AcnEnsuranceFailed({ reason: `ACN health returned unexpected status ${status}` })
-      }
-      if ((status === 200) !== (health.state._tag === "Ready")) {
-        return yield* new AcnEnsuranceFailed({ reason: "ACN health status contradicts its lifecycle state" })
-      }
-      const progress = acnLifecycleObservationFromHealthState(health.state)
-      if (Option.isSome(progress)) emit({ _tag: "Observation", observation: progress.value })
-      if (status !== 200) return Option.none()
-
-      const confirmedRevision = yield* retryStoreObservation(store.selected).pipe(
-        Effect.mapError(storeEnsuranceError),
-      )
-      if (!Option.contains(confirmedRevision, selected)) return Option.none()
-      const confirmedOwner = yield* retryStoreObservation(ownerLock.observe).pipe(
-        Effect.mapError(storeEnsuranceError),
-      )
-      if (confirmedOwner._tag !== "Locked" || !sameOwner(confirmedOwner.owner, owner)) return Option.none()
-      const confirmedIdentity = yield* inspectProcess(processes, owner.pid)
-      if (!Option.contains(confirmedIdentity, owner.processStartIdentity)) return Option.none()
       return Option.some({
         revision: health.revision,
         id: health.id,
@@ -280,100 +369,222 @@ export const makeLocalAcnInstanceManager = (
   const ensureEffect = (
     target: AcnTarget,
     emit: (event: AcnEnsureEvent) => void,
-  ): Effect.Effect<ReadyInstance, AcnEnsuranceErrorType, Scope.Scope> =>
-    Effect.gen(function* () {
+  ): Effect.Effect<ReadyInstance, AcnEnsuranceErrorType, Scope.Scope> => {
+    const run = Effect.gen(function* () {
       let prepared = Option.none<PreparedCommand>()
-      let launched = Option.none<ExactProcess>()
-      while (true) {
-        const selected = yield* retryStoreObservation(store.selected).pipe(
-          Effect.mapError(storeEnsuranceError),
-        )
-        const owner = yield* retryStoreObservation(ownerLock.observe).pipe(
-          Effect.mapError(storeEnsuranceError),
-        )
-        if (owner._tag === "Locked") {
-          if (Option.isSome(selected) && selected.value >= target.revision) {
-            const ready = yield* observeReady(selected.value, owner.owner, emit)
-            if (Option.isSome(ready)) return ready.value
-          }
-          if (Option.isNone(prepared) &&
-            (Option.isNone(selected) || selected.value < target.revision)) {
-            if (!sameTarget(target, SDK_ACN_TARGET)) {
-              return yield* new AcnEnsuranceFailed({
-                reason: `Selected ACN revision cannot be advanced to ${target.revision} by this client`,
-              })
-            }
-            prepared = Option.some(yield* resolveCommand(target, emit))
-            yield* registerTarget(store, target)
-          }
-          yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
-          continue
-        }
-        if (owner._tag === "Publishing") {
-          yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
-          continue
-        }
-        if (Option.isSome(selected) && selected.value > target.revision) {
+      let launched = Option.none<LaunchedCandidate>()
+      let hasLaunched = false
+      let stateOwner = ""
+      let stateKey = ""
+      let stateSince = yield* monotonicMillis
+      let ownerObservedAt = stateSince
+
+      const prepare = Effect.gen(function* () {
+        if (Option.isSome(prepared)) return prepared.value
+        if (!sameTarget(target, SDK_ACN_TARGET)) {
           return yield* new AcnEnsuranceFailed({
-            reason: `Selected ACN revision ${selected.value} cannot be launched by this client`,
+            reason: `This client cannot launch ACN revision ${target.revision}`,
           })
         }
-        if (Option.isNone(prepared)) {
-          if (Option.isNone(selected) || selected.value < target.revision) {
-            if (!sameTarget(target, SDK_ACN_TARGET)) {
-              return yield* new AcnEnsuranceFailed({
-                reason: `Selected ACN revision cannot be advanced to ${target.revision} by this client`,
-              })
-            }
-            prepared = Option.some(yield* resolveCommand(target, emit))
-            yield* registerTarget(store, target)
-            continue
-          }
-          prepared = Option.some(yield* resolveCommand(target, emit))
-        }
-        if (Option.isNone(selected) || selected.value !== target.revision) {
-          yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
-          continue
-        }
-        if (Option.isNone(prepared)) {
-          return yield* new AcnEnsuranceFailed({ reason: "Selected ACN launch material was not prepared" })
-        }
-        const command = prepared.value.command
+        const value = yield* resolveCommand(target, emit)
+        yield* retryStore(revisions.register(target.revision))
+        prepared = Option.some(value)
+        return value
+      })
+
+      const classifyWithoutLiveOwner = (
+        selected: Option.Option<AcnTarget["revision"]>,
+        now: number,
+      ): Effect.Effect<ConvergenceState> => Effect.gen(function* () {
         if (Option.isSome(launched)) {
-          const alive = yield* inspectProcess(processes, launched.value.pid)
-          if (Option.contains(alive, launched.value.processStartIdentity)) {
-            yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
-            continue
-          }
-          launched = Option.none()
+          const candidate = launched.value
+          const exited = yield* candidate.child.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
+          if (Option.isSome(exited)) return { _tag: "CandidateExited", candidate }
+          return now - candidate.launchedAt >= Duration.toMillis(CANDIDATE_ADMISSION_TIMEOUT)
+            ? { _tag: "CandidateAdmissionExpired", candidate }
+            : { _tag: "CandidatePending" }
         }
-        const argv = [
-          ...command,
-          ...(options.debug === true && !command.includes("--debug") ? ["--debug"] : []),
-          "--wait-for-handoff",
-          "--data-dir",
-          dataDirectory,
-        ]
-        if (!Arr.isNonEmptyReadonlyArray(argv)) {
-          return yield* new AcnEnsuranceFailed({ reason: "Cannot spawn an empty ACN command" })
+        if (Option.exists(selected, (revision) => revision > target.revision)) {
+          return { _tag: "AwaitingNewerSelectedOwner" }
         }
-        const child = yield* spawner.spawn(argv)
-        const identity = yield* inspectProcess(processes, child.pid).pipe(
-          Effect.flatMap(Option.match({
-            onNone: () => Effect.fail(new AcnEnsuranceFailed({
-              reason: `Spawned ACN ${child.pid} exited before handoff`,
+        return hasLaunched
+          ? { _tag: "LaunchOccurrenceLost" }
+          : { _tag: "LaunchCandidate" }
+      })
+
+      while (true) {
+        const now = yield* monotonicMillis
+        const ownerBeforeSelection = yield* retryStore(owners.current)
+        const selected = yield* retryStore(revisions.selected)
+        const owner = yield* retryStore(owners.current)
+
+        const state = !sameOptionalOwner(ownerBeforeSelection, owner)
+          ? { _tag: "CoordinationChanged" as const }
+          : Option.isSome(owner) && Option.exists(selected, (revision) => revision < target.revision)
+            ? { _tag: "AdvanceSelection" as const }
+          : yield* Option.match(owner, {
+          onNone: () => classifyWithoutLiveOwner(selected, now),
+          onSome: (current): Effect.Effect<ConvergenceState, AcnEnsuranceFailed> =>
+            Effect.gen(function* () {
+              if (Option.isSome(launched) && ownerNamesProcess(current, launched.value.process)) {
+                yield* launched.value.child.admit.pipe(
+                  Effect.timeoutFail({
+                    duration: CANDIDATE_PARENT_RELEASE_TIMEOUT,
+                    onTimeout: () => new AcnEnsuranceFailed({
+                      reason: `Could not release parent channel for admitted ACN ${current.pid}`,
+                    }),
+                  }),
+                )
+                launched = Option.none()
+              }
+              const exactIdentity = yield* inspectProcess(processes, current.pid)
+              const rootLive = Option.contains(exactIdentity, current.processStartIdentity)
+              const treeAbsent = rootLive
+                ? false
+                : yield* processes.treeAbsent(exactFrom(current)).pipe(
+                    Effect.mapError((error) => new AcnEnsuranceFailed({ reason: error.message })),
+                  )
+              if (!rootLive && !treeAbsent) {
+                return { _tag: "SurvivingPredecessorTree", owner: current }
+              }
+              if (treeAbsent) {
+                stateOwner = ""
+                stateKey = ""
+                return yield* classifyWithoutLiveOwner(selected, now)
+              }
+              return yield* Option.match(selected, {
+                onNone: () => Effect.succeed<ConvergenceState>({
+                  _tag: "OwnerWithoutSelection",
+                  owner: current,
+                }),
+                onSome: (revision) => probeHealth(current).pipe(
+                  Effect.map((observed): ConvergenceState => ({
+                    _tag: "ObservableOwner",
+                    owner: current,
+                    selected: revision,
+                    observed,
+                    now,
+                  })),
+                ),
+              })
+            }),
+        })
+
+        const completed = yield* Match.value(state).pipe(
+          Match.tag("CoordinationChanged", () =>
+            Effect.yieldNow().pipe(Effect.as(Option.none<ReadyInstance>()))),
+          Match.tag("AdvanceSelection", () =>
+            prepare.pipe(Effect.as(Option.none<ReadyInstance>()))),
+          Match.tag("SurvivingPredecessorTree", ({ owner }) =>
+            retireOwner(owner).pipe(Effect.as(Option.none<ReadyInstance>()))),
+          Match.tag("OwnerWithoutSelection", ({ owner }) => Effect.fail(new AcnEnsuranceFailed({
+            reason: `ACN owner ${owner.pid} exists without a selected revision`,
+          }))),
+          Match.tag("ObservableOwner", ({ owner, selected, observed, now }) =>
+            Effect.gen(function* () {
+              const currentOwnerKey = ownerKey(owner)
+              const nextStateKey = Option.match(observed, {
+                onNone: () => "Unavailable",
+                onSome: ({ health, status }) =>
+                  `${status}:${health.revision}:${acnStartupProgressKey(health.state)}`,
+              })
+              if (stateOwner !== currentOwnerKey || stateKey !== nextStateKey) {
+                if (stateOwner !== currentOwnerKey) ownerObservedAt = now
+                stateOwner = currentOwnerKey
+                stateKey = nextStateKey
+                stateSince = now
+              }
+              if (Option.isSome(observed)) {
+                const { health, status } = observed.value
+                if (health.pid !== owner.pid || health.revision !== selected ||
+                  (status === 200) !== (health.state._tag === "Ready") ||
+                  (status !== 200 && status !== 503)) {
+                  yield* retireOwner(owner)
+                  return Option.none<ReadyInstance>()
+                }
+                const progress = acnLifecycleObservationFromHealthState(health.state)
+                if (Option.isSome(progress)) emit({ _tag: "Observation", observation: progress.value })
+                const ready = yield* readyInstance(selected, owner, observed.value)
+                if (Option.isSome(ready)) return ready
+                if (health.state._tag === "Starting" &&
+                  now - ownerObservedAt >= Duration.toMillis(STARTUP_CEILING)) {
+                  yield* retireOwner(owner)
+                  return Option.none<ReadyInstance>()
+                }
+              }
+              const grace = Option.exists(observed, ({ health }) => health.state._tag === "Stopping")
+                ? STOPPING_GRACE
+                : HEALTH_GRACE
+              if (now - stateSince >= Duration.toMillis(grace)) {
+                yield* retireOwner(owner)
+              } else {
+                yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
+              }
+              return Option.none<ReadyInstance>()
             })),
-            onSome: Effect.succeed,
+          Match.tag("CandidatePending", () =>
+            Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
+          Match.tag("CandidateExited", ({ candidate }) => Effect.fail(new AcnEnsuranceFailed({
+            reason: `ACN candidate ${candidate.process.pid} exited before admission`,
+          }))),
+          Match.tag("CandidateAdmissionExpired", ({ candidate }) => Effect.fail(new AcnEnsuranceFailed({
+            reason: `ACN candidate ${candidate.process.pid} did not commit admission`,
+          }))),
+          Match.tag("AwaitingNewerSelectedOwner", () =>
+            Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
+          Match.tag("LaunchOccurrenceLost", () => Effect.fail(new AcnEnsuranceFailed({
+            reason: "The ACN candidate launched by this ensure occurrence is no longer available",
+          }))),
+          Match.tag("LaunchCandidate", () => Effect.gen(function* () {
+            const command = yield* prepare
+            const confirmed = yield* retryStore(revisions.selected)
+            if (!Option.contains(confirmed, target.revision)) {
+              yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
+              return Option.none<ReadyInstance>()
+            }
+            const argv = [
+              ...command.command,
+              ...(options.debug === true && !command.command.includes("--debug") ? ["--debug"] : []),
+              "--parent-bound",
+              "--data-dir",
+              dataDirectory,
+            ]
+            if (!Arr.isNonEmptyReadonlyArray(argv)) {
+              return yield* new AcnEnsuranceFailed({ reason: "Cannot spawn an empty ACN command" })
+            }
+            const child = yield* spawner.spawn(argv)
+            hasLaunched = true
+            const identity = yield* inspectProcess(processes, child.pid).pipe(
+              Effect.flatMap(Option.match({
+                onNone: () => Effect.fail(new AcnEnsuranceFailed({
+                  reason: `Spawned ACN ${child.pid} exited before identity inspection`,
+                })),
+                onSome: Effect.succeed,
+              })),
+            )
+            launched = Option.some({
+              process: { pid: child.pid, processStartIdentity: identity },
+              child,
+              launchedAt: now,
+            })
+            return Option.none<ReadyInstance>()
           })),
+          Match.exhaustive,
         )
-        launched = Option.some({ pid: child.pid, processStartIdentity: identity })
-        yield* child.handoff
+        if (Option.isSome(completed)) return completed.value
       }
     })
+    return Effect.scoped(run).pipe(Effect.timeoutFail({
+      duration: ACN_ENSURE_TIMEOUT,
+      onTimeout: () => new AcnEnsuranceFailed({
+        reason: "ACN ensurance did not converge within its absolute deadline",
+      }),
+    }))
+  }
 
   const ensure: AcnInstanceManager["ensure"] = (request) =>
-    Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceErrorType>((sink) => {
-      return Effect.forkScoped(ensureEffect(request.target, (event) => sink.single(event)).pipe(
+    Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceErrorType>((sink) =>
+      Effect.forkScoped(ensureEffect(request.target, (event) => sink.single(event)).pipe(
         Effect.match({
           onFailure: sink.fail,
           onSuccess: (instance) => {
@@ -381,27 +592,19 @@ export const makeLocalAcnInstanceManager = (
             sink.end()
           },
         }),
-      ))
-    }, { bufferSize: "unbounded" })
+      )), { bufferSize: "unbounded" })
 
   const stop = Effect.gen(function* () {
-    const observation = yield* ownerLock.observe
-    if (observation._tag !== "Locked") return
-    const owner = observation.owner
-    const exact = exactFrom(owner)
-    const identity = yield* processes.inspect(owner.pid)
-    if (!Option.contains(identity, owner.processStartIdentity)) return
-    yield* http.execute(HttpClientRequest.post(`http://127.0.0.1:${owner.port}/shutdown`)).pipe(
-      Effect.timeout(GRACEFUL_STOP_WAIT),
-      Effect.ignore,
+    const owner = yield* retryStore(owners.current)
+    if (Option.isNone(owner)) return
+    yield* retireOwner(owner.value).pipe(
+      Effect.mapError((error) => new AcnAdministrationFailed({ reason: error.reason })),
     )
-    if (yield* reapProcessTree(processes, exact)) return
-    return yield* new AcnAdministrationFailed({
-      reason: `Could not prove ACN process tree ${owner.pid} absent`,
-    })
   }).pipe(Effect.mapError((error) => error instanceof AcnAdministrationFailed
     ? error
-    : new AcnAdministrationFailed({ reason: String(error) })))
+    : new AcnAdministrationFailed({
+        reason: error instanceof Error ? error.message : String(error),
+      })))
 
   return AcnInstanceManager.of({ ensure, stop })
 }).pipe(Effect.provideService(ExactProcessController, ExactProcessControllerLive))

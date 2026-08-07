@@ -22,6 +22,11 @@ factory, observes termination, and performs bounded shutdown. ACN consumes that 
 directly; a second semantic facade is forbidden unless it owns a new invariant rather than merely
 renaming generated operations.
 
+The ICN child remains in its ACN's dedicated OS process-tree termination unit. Cooperative ICN
+shutdown is private to ACN, but external ACN retirement may signal that whole unit and must prove it
+absent even when the ACN root has already exited. No separate ICN discovery or durable identity is
+needed for that fallback.
+
 The child supervisor exposes one `defineFSM` lifecycle:
 
 ```text

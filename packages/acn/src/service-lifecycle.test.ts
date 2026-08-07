@@ -26,4 +26,17 @@ describe("AcnServiceLifecycle", () => {
       expect((yield* lifecycle.awaitStopping)._tag).toBe("Stopping")
     })))
   })
+
+  it("signals stopping without waiting for admitted activity to drain", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const lifecycle = yield* makeAcnServiceLifecycle()
+      yield* lifecycle.becomeReady(Effect.die("unused RPC"))
+      const release = yield* lifecycle.acquireActivity("test")
+      expect(yield* lifecycle.beginStopping({ reason: "administrative" })).toBe(true)
+      expect((yield* lifecycle.awaitStopping)._tag).toBe("Stopping")
+      expect(yield* Effect.timeoutOption(lifecycle.awaitActivityDrain, "1 millis")).toEqual(Option.none())
+      yield* release
+      yield* lifecycle.awaitActivityDrain
+    })))
+  })
 })

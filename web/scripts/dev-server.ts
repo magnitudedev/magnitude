@@ -27,7 +27,7 @@ import {
   SDK_ACN_TARGET,
   type RemoteAcnEnsureMessage,
 } from "@magnitudedev/sdk"
-import { BunSqliteMutexLayer } from "@magnitudedev/sdk/bun"
+import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
 import { resolve } from "node:path"
 
 // ─── Daemon host boundaries ─────────────────────────────────────────────────
@@ -45,7 +45,7 @@ async function createEnsurer() {
   }).pipe(
     Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
     Effect.provideService(Scope.Scope, ensurerScope),
-    Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer, BunSqliteMutexLayer)),
+    Effect.provide(Layer.mergeAll(FetchHttpClient.layer, BunContext.layer, BunSqliteDriverLayer)),
   ))
 }
 

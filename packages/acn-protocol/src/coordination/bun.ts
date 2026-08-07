@@ -1,7 +1,7 @@
 import { Layer } from "effect"
-import { BunSqliteMutex } from "./bun-sqlite-mutex"
-import { SqliteMutex } from "./sqlite-mutex"
+import { BunSqliteDriver } from "./bun-sqlite-driver"
+import { SqliteDriver } from "./sqlite-driver"
 
-export { BunSqliteMutex }
+export { BunSqliteDriver }
 
-export const BunSqliteMutexLayer = Layer.succeed(SqliteMutex, BunSqliteMutex)
+export const BunSqliteDriverLayer = Layer.succeed(SqliteDriver, BunSqliteDriver)

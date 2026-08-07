@@ -14,7 +14,19 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { Rpc, RpcClient } from "@effect/rpc"
-import { Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import {
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Schema,
+  Stream,
+  TestClock,
+  TestContext,
+} from "effect"
 import { AcnEnsuranceFailed } from "./errors"
 import { AcnInstanceManager } from "./acn-instance-manager"
 import { makeAcnJitRuntime } from "./acn-recovering-client"
@@ -161,6 +173,39 @@ describe("AcnJitRuntime", () => {
     })))
   })
 
+  it("serializes close with lease establishment and releases the admitted lease", async () => {
+    const tags: string[] = []
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const leaseEntered = yield* Deferred.make<void>()
+      const releaseRenewal = yield* Deferred.make<void>()
+      const base = rpcClient(tags)
+      const http = HttpClient.make((request) => {
+        const message = JSON.parse(bodyText(request).split("\n")[0]!) as { tag: string }
+        return message.tag === "RenewClientLease"
+          ? Deferred.succeed(leaseEntered, undefined).pipe(
+              Effect.zipRight(Deferred.await(releaseRenewal)),
+              Effect.zipRight(base.execute(request)),
+            )
+          : base.execute(request)
+      })
+      const runtime = yield* makeAcnJitRuntime().pipe(
+        Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
+          ensure: () => Stream.succeed({ _tag: "Ready" as const, instance: ready }),
+          stop: Effect.void,
+        })),
+        Effect.provideService(HttpClient.HttpClient, http),
+      )
+      yield* Deferred.await(leaseEntered)
+      const closing = yield* runtime.close.pipe(Effect.fork)
+      yield* Effect.yieldNow()
+      expect(Option.isNone(yield* Fiber.poll(closing))).toBe(true)
+      yield* Deferred.succeed(releaseRenewal, undefined)
+      yield* Fiber.join(closing)
+      expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(1)
+      expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
+    })))
+  })
+
   it("shares one deterministic ensurance failure with every concurrent waiter", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const release = yield* Deferred.make<void>()
@@ -189,6 +234,27 @@ describe("AcnJitRuntime", () => {
       expect(exits.every(Exit.isFailure)).toBe(true)
       expect(calls).toBe(1)
     })))
+  })
+
+  it("terminalizes one selection when its manager never resolves", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>()
+      const manager = AcnInstanceManager.of({
+        ensure: () => Stream.unwrap(
+          Deferred.succeed(entered, undefined).pipe(Effect.as(Stream.never)),
+        ),
+        stop: Effect.void,
+      })
+      const runtime = yield* makeAcnJitRuntime().pipe(
+        Effect.provideService(AcnInstanceManager, manager),
+        Effect.provideService(HttpClient.HttpClient, rpcClient([])),
+      )
+      const waiting = yield* runtime.startup.retry.pipe(Effect.exit, Effect.fork)
+      yield* Deferred.await(entered)
+      yield* TestClock.adjust(Duration.minutes(10))
+      expect(Exit.isFailure(yield* Fiber.join(waiting))).toBe(true)
+      expect((yield* runtime.startup.state.get)._tag).toBe("Failed")
+    })).pipe(Effect.provide(TestContext.TestContext)))
   })
 
   it("recovers an application RPC by replacing only its failed exact endpoint", async () => {

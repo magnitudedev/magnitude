@@ -1,1 +1,4 @@
-export { BunSqliteMutex, BunSqliteMutexLayer } from "@magnitudedev/acn-protocol/coordination/bun"
+export {
+  BunSqliteDriver,
+  BunSqliteDriverLayer,
+} from "@magnitudedev/acn-protocol/coordination/bun"
