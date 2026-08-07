@@ -19,14 +19,14 @@ Magnitude supports macOS and Linux. Windows is supported through WSL.
 
 ## What you can use it for
 
-- Analyze usage data and customer calls
-- Grep production logs and diagnose failures
-- Review PRs and fix bugs
-- Search and summarize internal docs
-- Build technical docs or company slides
-- Automate repetitive tasks with scripts
+- Analyze sensitive data
+- Manage private notes
+- Review code and logs
+- Search and organize files
+- Build docs or slides
+- Create automation scripts
 
-Out of the box it can use your shell, edit files, and run scripts. Add skills and it can work with Excel and PowerPoint or drive your logged-in Chrome browser.
+Out of the box it can use your shell, edit files, and run scripts. Add skills and it can work with Excel, PowerPoint, PDFs or Chrome.
 
 ## Add skills
 
