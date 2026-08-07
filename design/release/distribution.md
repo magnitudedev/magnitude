@@ -20,6 +20,10 @@ applies_to:
 
 Changesets is the sole authority for the CLI version, npm publication, and npm dist-tag. It
 maintains one version PR. Merging that PR automatically releases its exact versioned source commit.
+When Changesets changes the CLI version, the same version operation advances the checked-in ACN
+release revision allocation by exactly one. Re-running it without a CLI version change does not
+advance the allocation. A failed or abandoned publication may leave an unused allocation; retries
+of the same source retain the same allocation.
 Ordinary pushes do not start a normal release. A parameterless manual dispatch resolves the latest
 merged Changesets PR for the current version and reconciles that same release. Before publication,
 an operator may explicitly pin a later commit on `main` to recover that still-unpublished version.
@@ -58,6 +62,11 @@ GitHub release origin and its HTTPS transport for the manifest. Artifact sizes a
 downloaded bytes match that manifest; they do not provide an independent publishing identity.
 
 ## Build and validation
+
+Every clean-checkout release job that loads version-dependent release code generates version
+metadata immediately after dependency installation. Generation combines the CLI package version
+and checked-in ACN release revision allocation; the generated module is build output and is not
+committed.
 
 Planner-input generation is an explicit operation performed once per release. Every host receives
 the same bundle. Ordinary Cargo builds perform no model-data network access.
