@@ -8,21 +8,21 @@ import { ACN_REVISION, ACN_VERSION } from "./version"
 import { resolveRgPath } from "@magnitudedev/ripgrep"
 import { defaultDataDir } from "./data-dir"
 
-const waitForHandoff = Options.boolean("wait-for-handoff")
 const debug = Options.boolean("debug")
+const parentBound = Options.boolean("parent-bound")
 const dataDir = Options.text("data-dir").pipe(Options.withDefault(defaultDataDir()))
 
 const launchServer = (options: {
-  readonly waitForHandoff: boolean
+  readonly parentBound: boolean
   readonly debug: boolean
   readonly dataDir: string
 }) => launchAcnServer(options)
 
-const serve = Command.make("serve", { waitForHandoff, debug, dataDir }, launchServer).pipe(
+const serve = Command.make("serve", { parentBound, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Start the ACN server"),
 )
 
-const server = Command.make("server", { waitForHandoff, debug, dataDir }, launchServer).pipe(
+const server = Command.make("server", { parentBound, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Alias for serve"),
 )
 
@@ -69,7 +69,7 @@ const doctor = Command.make("doctor", {}, () =>
   ),
 ).pipe(Command.withDescription("Verify packaged ACN runtime dependencies"))
 
-const acn = Command.make("magnitude-acn", { waitForHandoff, debug, dataDir }, launchServer).pipe(
+const acn = Command.make("magnitude-acn", { parentBound, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Magnitude Agent Control Node"),
   Command.withSubcommands([serve, server, version, coordinationRevision, doctor]),
 )

@@ -20,7 +20,7 @@ export {
 } from "./acn-jit/local-acn-instance-manager"
 export {
   ChildProcessSpawner,
-  scopePreHandoffCandidate,
+  scopeAcnCandidate,
   type SpawnedAcnCandidate,
 } from "./acn-jit/child-process"
 export { BunDetachedChildProcessSpawner } from "./acn-jit/bun-spawn-process"

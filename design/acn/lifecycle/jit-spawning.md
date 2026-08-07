@@ -16,34 +16,31 @@ applies_to:
 # JIT ACN instance management and upgrades
 
 Independent hosts sharing one Magnitude data root coordinate to obtain one usable ACN without a
-resident coordinator. `AcnInstanceManager` owns complete endpoint acquisition. Two durable
-file-and-lock resources — `AcnRevisionStore` and `AcnOwnerLock` — serialize revision selection and
-single-owner publication.
+resident coordinator. `AcnInstanceManager` owns complete endpoint acquisition. `AcnRevisionStore`
+and `AcnOwnerStore` project the shared facts from one SQLite database; neither is a daemon or a
+generic coordination service.
 
 ```text
-client runtime --ensure(target)--> AcnInstanceManager <--> AcnRevisionStore + AcnOwnerLock
+client runtime --ensure(target)--> AcnInstanceManager <--> AcnRevisionStore + AcnOwnerStore
                                                            |
                                                            +--> exact owner ACN
 ```
 
-Missing owner, replacement, delayed startup, owner death, and candidate launch are intermediate.
-Ensurance returns only exact `AcnInstance<AcnReady>` or a typed condition that prevents safe
-convergence. There is no public current observation, caller-selected replacement, or ordinary
-exact-terminate operation. Administrative stop is an operation of the same `AcnInstanceManager`.
+Every ensurance occurrence resolves exactly once to an exact `AcnInstance<AcnReady>` or a typed
+terminal failure within its absolute deadline. Missing ownership, replacement, delayed startup,
+owner death, and candidate launch are bounded intermediate states, never endpoint results.
 
 ## Identity and success
 
-ACN version is ACN identity. Instance ID plus PID and process-start identity names one exact
-occurrence. Revision is a scalar positive safe integer. Published revisions sit on million-wide
-band boundaries in `packages/version/acn-revision.json`; development builds claim unique offsets
-within the band via filesystem link races during version generation. The selected revision is the
-greatest scalar revision among published markers and development markers with at least one active
-holder.
+ACN version is ACN identity. PID plus process-start identity names one exact process occurrence;
+the instance ID is its RPC identity. Revision is one positive safe integer. Development computes a
+scalar revision before registration and thereafter follows exactly the same protocol as releases.
+Registered revisions are permanent and selection is their maximum.
 
-`AcnInstance<AcnReady>` is the only endpoint result. Its constructor proves stable ownership,
-exact live process, matching ID/identity/PID `Ready` health, and a final stable-state reread for
-the same occurrence and endpoint. Readiness is selection-time evidence; later transport recovery
-handles retirement after selection.
+`AcnInstance<AcnReady>` is the only endpoint result. Projection requires a selected revision, the
+complete owner row, an exact live process identity, HTTP `200` ready health whose PID and revision
+match those facts, and final rereads confirming the same owner and selection. Readiness is
+selection-time evidence; later transport recovery handles retirement.
 
 Each host has a private launch path describing the identities that host can launch and how it
 prepares one supported identity. A local development command supports only its exact build
@@ -51,84 +48,54 @@ identity; published-release acquisition supports release identities. Commands ne
 boundaries. Launch preparation is a private dependency of the local manager, not a cross-host
 domain capability.
 
-Preparation is part of the authoritative selection protocol. Only a host whose target revision is
-selected may prepare and launch. Other clients observe that selection and never attempt to prepare
-the owner's target. Preparation is interruptible before acquisition, but cancellation of the
-caller cannot abandon an acquired owner lock.
+Launch material is prepared before its revision is registered. A manager launches only when its
+prepared revision is selected. An older manager may adopt a ready newer owner but never launches a
+binary under that newer revision.
 
 ## Durable authority
 
-```text
-AcnRevisionStore                        AcnOwnerLock
-  D/acn/revisions/<revision>              D/acn/owner-lock.sqlite (SQLite mutex)
-    published: zero bytes                   D/acn/owner.json (published while holding)
-    development: 16-hex-byte key          Unlocked | Publishing | Locked(owner)
-  D/acn/development-holds/<revision>/
-    <uuid>.sqlite (SQLite holder mutexes)
-```
+The complete immutable cross-version surface is defined only by
+[ACN cross-version coordination protocol](./cross-version-coordination-protocol.md). This document
+defines how `AcnInstance`, `AcnInstanceManager`, `AcnJitRuntime`, and `AcnServiceLifecycle` use that
+protocol; it does not define or extend the shared protocol surface.
 
-The selected revision is the entire authority. Published markers are permanent; development
-markers participate only while at least one holder mutex is active. Any failure to enumerate,
-validate, or probe relevant state makes selection indeterminate; indeterminate selection authorizes
-neither admission nor retirement.
-
-The owner lock is a SQLite `BEGIN IMMEDIATE` transaction. While holding it, the owner atomically
-publishes `owner.json` with its exact PID, process-start identity, and bound port. The transaction
-proves ownership; metadata never does. Rollback, connection close, or process exit releases
-ownership through SQLite's OS locks. Unlocked metadata remains predecessor-cleanup evidence until a
-successor proves that exact tree absent and atomically replaces it with its own publication.
+Schema, statements, decoding, transaction ordering, and typed error translation exist once in the
+protocol package. Bun and Node adapters only open scoped connections, execute bound statements,
+query rows, close connections, and classify native failures.
 
 ## Change protocol
 
-```text
-no selection -> register/hold revision -> selected
-selected, no owner -> acquire owner lock -> publish metadata -> serve
-selected, owner exists -> observe health -> adopt or wait
-selected, greater revision appears -> retire (replacement)
-```
+A candidate derives its exact process identity and binds health/shutdown on an OS-assigned loopback
+port before admission, but starts no application or ICN service. It rereads the expected owner,
+proves that predecessor's dedicated process tree absent, and calls `replaceOwner`. Only `Replaced`
+is admission; owner or selection mismatch makes the candidate exit.
 
-A candidate prepares its revision marker before attempting to acquire the owner lock, may serve
-only while holding the owner SQLite transaction, and must reread selection after acquisition. A
-non-selected candidate releases the lock and exits without serving.
+The candidate stays parent-bound and scope-owned until admission commits. Parent loss and each
+atomic admission attempt are serialized by an Effect semaphore; state is an Effect `Ref` and the
+one-shot parent-loss signal is a `Deferred`. Retries occur outside that critical section so parent
+loss can win between contended attempts. The spawning manager keeps exact candidate cleanup armed
+until it observes the owner row equal that candidate and closes the parent channel. Thus every
+instant is owned either by manager cleanup or by a complete admitted owner row.
 
-An owner writes its metadata before exposing HTTP or initializing application/ICN services, retains
-the owner transaction through complete service and child teardown, and retires only after positively
-observing a greater revision. Observation uncertainty causes no retirement.
+Only after admission may the ACN initialize application and ICN services. It begins retirement only
+after positively selecting a different required revision. Indeterminate selection does not retire
+a usable owner.
 
-Replacement first shuts down and proves absence of the exact predecessor process tree. The
-predecessor's private ICN is owned entirely by its ACN scope and exits during orderly scope
-finalization or when abrupt ACN loss closes its parent pipe. Failed exit proof retains the
-occurrence and fails the change.
+The manager's private exhaustive state projection covers ready, starting, stopping, unavailable,
+contradictory health, stale owner, surviving descendant tree, pending/exited/stalled candidate,
+newer unsupported selection, and launchable absence. Every state has an explicit action and fixed
+deadline. One ensurance occurrence launches at most one candidate and cannot silently turn a failed
+launch into a respawn.
 
-A spawned child is scoped and parent-bound until its exact owner is published. The candidate binds
-its control endpoint, verifies exact ownership, and publishes before application or ICN startup.
-Owner acquisition and health verification contend for the same lock, so two candidates cannot both
-serve.
+Because selection and owner are separate ordinary reads, observation uses an owner–selection–owner
+sandwich. If the complete owner differs, the manager re-observes instead of interpreting a mixed
+pair. Mutation and final ready adoption then perform the narrower rereads required by their action.
 
-One public ensure binds every observed change by exact revision and resolves its result from the
-current selection state even if a later change has already begun. A failed launch is never silently
-reclassified as another attempt. After a successful adoption, the ensure may explicitly follow a
-causally later sufficient replacement; this is upgrade following, not a retry. A selected owner
-satisfying the caller's own minimum revision also remains usable after a higher-target preparation
-failure. These rules prevent implicit respawn loops without turning coherent upgrades into failures.
-
-## Reconciliation ownership
-
-Successful owner lock acquisition plus forking its supervisor is one uninterruptible admission
-step. One host-local supervisor at a time drives the exact admitted owner; a higher revision
-selected within that change discards obsolete preparation before the same supervisor reclassifies
-it. Owner publication transfers reconciliation to the owner, so the manager supervisor exits at
-handoff. It also exits on foreign owner ownership and never takes the change back. Observer
-cancellation does not abandon admitted manager work.
-
-Foreground ensure observers classify and wait. They do not prepare, duplicate cleanup, or spawn.
-Exact owner absence or continuous unusable health permits coordinated replacement. Incapable
-followers remain observers and cannot turn their local incapability into global change failure.
-
-Policy deadlines use Effect `Duration`, monotonic `Clock`, and `TestClock`. The convergence
-durations are the coordination poll interval, the tree reap waits (term then kill), and the
-ACN-owned five-minute absolute application-startup ceiling. There is no publication grace: the
-owner lock is held before publish, and contenders coordinate through SQLite busy semantics.
+Policy uses Effect `Duration`, monotonic `Clock`, bounded `Schedule`, and `TestClock`. Initial bounds
+are one second polling, two seconds per health request, thirty seconds without health or startup
+progress, thirty seconds for candidate admission, five minutes absolute application startup, five
+seconds for stopping, two seconds after TERM, two seconds after KILL, and ten minutes absolute per
+ensurance occurrence. Progress never extends either absolute ceiling.
 
 ## Administrative stop
 
@@ -136,19 +103,23 @@ owner lock is held before publish, and contenders coordinate through SQLite busy
 tree with bounded term-then-kill escalation. It does not kill clients, resolve an artifact, start
 an ACN, or directly manage the ACN's private ICN child.
 
+Before shutdown and each signal escalation, the manager rereads the same complete owner and checks
+the root identity. A changed owner is not targeted. Root absence does not suppress process-group
+signaling: a surviving descendant group is still retired and exact group absence is required before
+replacement.
+
 ## Guarantees
 
-- The selected revision is the complete assignment authority and stale writers cannot commit.
-- Active revision never regresses.
+- Revision selection and owner replacement are the only durable coordination facts.
+- Registered and selected revision never regress.
 - No endpoint is projected from an unselected, starting, or stopping state.
-- No candidate starts application/ICN before exact owner publication.
-- No predecessor retirement begins before a greater revision is selected.
+- No candidate starts application/ICN before atomic owner admission.
+- Two candidates observing the same predecessor cannot both commit.
+- A predecessor row is replaced only after exact process-tree absence proof.
 - Only a host whose target revision is selected invokes its launch path.
-- A follower-local unsupported target or acquisition failure cannot fail another owner's change.
 - Every raw child is scope-owned until exact owner publication.
-- Two candidates cannot both serve the same revision.
-- Cancellation cannot abandon admitted reconciliation.
-- Foreign ownership cannot be taken back by a stale healthy supervisor.
-- Observation uncertainty alone never authorizes immediate mutation.
+- No stale manager action targets a changed owner.
+- Observation uncertainty authorizes neither adoption nor unbounded waiting.
 - One ensure cannot turn a failed launch or startup into an implicit retry loop.
-- Every launch and startup occurrence is resolved exactly before a sufficient successor is followed.
+- Every ensure and candidate occurrence has one finite terminal result.
+- Failure to prove exact tree absence fails typed and never permits overlapping service trees.

@@ -18,9 +18,9 @@
       "types": "./src/bun.ts",
       "import": "./src/bun.ts"
     },
-    "./sqlite-mutex": {
-      "types": "./src/sqlite-mutex.ts",
-      "import": "./src/sqlite-mutex.ts"
+    "./sqlite-driver": {
+      "types": "./src/sqlite-driver.ts",
+      "import": "./src/sqlite-driver.ts"
     }
   },
   "scripts": {

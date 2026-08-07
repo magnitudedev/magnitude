@@ -10,7 +10,7 @@
     "./acn-identity": "./src/acn-identity.ts",
     "./coordination": "./src/coordination/index.ts",
     "./coordination/bun": "./src/coordination/bun.ts",
-    "./coordination/sqlite-mutex": "./src/coordination/sqlite-mutex.ts"
+    "./coordination/sqlite-driver": "./src/coordination/sqlite-driver.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

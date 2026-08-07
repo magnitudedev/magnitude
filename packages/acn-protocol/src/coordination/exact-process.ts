@@ -38,6 +38,7 @@ class ProcessFacilityFailed extends Data.TaggedError("ProcessFacilityFailed")<{
 }> {}
 
 class ProcessAbsent extends Data.TaggedError("ProcessAbsent") {}
+class ProcessPresent extends Data.TaggedError("ProcessPresent") {}
 
 const facilityFailure = (cause: unknown): ProcessFacilityFailed =>
   new ProcessFacilityFailed({
@@ -52,9 +53,10 @@ const command = (
   executable: string,
   arguments_: readonly string[],
 ): Effect.Effect<string, ProcessFacilityFailed> => Effect.async((resume) => {
-  execFile(executable, [...arguments_], { encoding: "utf8" }, (error, stdout) => {
+  const child = execFile(executable, [...arguments_], { encoding: "utf8" }, (error, stdout) => {
     resume(error === null ? Effect.succeed(stdout) : Effect.fail(facilityFailure(error)))
   })
+  return Effect.sync(() => child.kill())
 })
 
 const linuxIdentity = (pid: number): Effect.Effect<Option.Option<string>, ProcessFacilityFailed> =>
@@ -150,6 +152,27 @@ const send = (
   ? cause
   : failed(process_.pid, tree ? `signal-tree-${signal}` : `signal-${signal}`, cause)))
 
+const sendTree = (
+  process_: ExactProcess,
+  signal: ExactProcessSignal,
+): Effect.Effect<boolean, ExactProcessInspectionFailed> => Effect.gen(function* () {
+  if (process.platform === "win32") return yield* send(process_, signal, true)
+  const identity = yield* inspect(process_.pid)
+  if (Option.isSome(identity) && identity.value !== process_.processStartIdentity) return false
+  const name = signal === "term" ? "SIGTERM" : "SIGKILL"
+  return yield* Effect.try({
+    try: () => {
+      process.kill(-process_.pid, name)
+      return true
+    },
+    catch: (cause) => isErrno(cause, "ESRCH")
+      ? new ProcessAbsent()
+      : failed(process_.pid, `signal-tree-${signal}`, cause),
+  }).pipe(
+    Effect.catchTag("ProcessAbsent", () => Effect.succeed(false)),
+  )
+})
+
 const unixTreeAbsent = (pid: number): Effect.Effect<boolean, ExactProcessInspectionFailed> =>
   Effect.try({
     try: () => {
@@ -157,11 +180,28 @@ const unixTreeAbsent = (pid: number): Effect.Effect<boolean, ExactProcessInspect
     },
     catch: (cause) => isErrno(cause, "ESRCH")
       ? new ProcessAbsent()
+      : isErrno(cause, "EPERM")
+        ? new ProcessPresent()
       : failed(pid, "inspect-tree", cause),
   }).pipe(
     Effect.as(false),
-    Effect.catchTag("ProcessAbsent", () => Effect.succeed(true)),
+    Effect.catchTags({
+      ProcessAbsent: () => Effect.succeed(true),
+      ProcessPresent: () => Effect.succeed(false),
+    }),
   )
+
+const windowsTreeAbsent = (
+  process_: ExactProcess,
+): Effect.Effect<boolean, ExactProcessInspectionFailed> => inspect(process_.pid).pipe(
+  Effect.flatMap((identity) => Option.contains(identity, process_.processStartIdentity)
+    ? Effect.succeed(false)
+    : Effect.fail(failed(
+        process_.pid,
+        "inspect-tree",
+        "native Windows cannot prove descendant-tree absence after the recorded root exits; use WSL",
+      ))),
+)
 
 export const ExactProcessControllerLive: ExactProcessController = {
   inspect,
@@ -175,9 +215,8 @@ export const ExactProcessControllerLive: ExactProcessController = {
     })),
   ),
   signal: (process_, signal) => send(process_, signal, false),
-  signalTree: (process_, signal) => send(process_, signal, true),
+  signalTree: sendTree,
   treeAbsent: (process_) => process.platform === "win32"
-    ? inspect(process_.pid).pipe(Effect.map((identity) =>
-        !Option.contains(identity, process_.processStartIdentity)))
+    ? windowsTreeAbsent(process_)
     : unixTreeAbsent(process_.pid),
 }

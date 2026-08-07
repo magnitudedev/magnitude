@@ -1,7 +1,5 @@
 import {
-  ACN_BUILD_KIND as GENERATED_ACN_BUILD_KIND,
   ACN_COORDINATION_REVISION,
-  ACN_DEVELOPMENT_KEY,
   MAGNITUDE_VERSION,
 } from "@magnitudedev/version"
 import {
@@ -19,8 +17,6 @@ export const ACN_VERSION = AcnIdentitySchema.make(
 )
 
 export const ACN_REVISION = AcnRevisionSchema.make(ACN_COORDINATION_REVISION)
-export const ACN_BUILD_KIND: "published" | "development" = GENERATED_ACN_BUILD_KIND
-export { ACN_DEVELOPMENT_KEY }
 
 export const ACN_TARGET: AcnTarget = {
   identity: ACN_VERSION,

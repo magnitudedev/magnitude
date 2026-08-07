@@ -16,7 +16,7 @@ import * as nodePath from "node:path"
 import * as nodeFs from "node:fs"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
-import { Array as Arr, Cause, Duration, Effect, Exit, Layer, Option, PubSub, Scope, Stream } from "effect"
+import { Array as Arr, Cause, Duration, Effect, Exit, Layer, Option, PubSub, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { layer as nodeFileSystemLayer } from "@effect/platform-node-shared/NodeFileSystem"
@@ -25,13 +25,13 @@ import { layer as nodePathLayer } from "@effect/platform-node-shared/NodePath"
 import { inheritLoginShellEnv } from "./shell-env"
 import { DesktopRpcError, DesktopRpcs, type MenuAction } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
-import { NodeSqliteMutexLayer } from "./sqlite-mutex"
+import { NodeSqliteDriverLayer } from "./sqlite-driver"
 
 // SDK imports — these run in the main process (Node)
 import {
   makeLocalAcnInstanceManager,
   ChildProcessSpawner,
-  scopePreHandoffCandidate,
+  scopeAcnCandidate,
   AcnEnsuranceFailed,
   SDK_ACN_TARGET,
   type AcnInstanceManager as AcnInstanceManagerService,
@@ -94,30 +94,57 @@ const nodeSpawn: ChildProcessSpawner = {
         const exited = Effect.promise(() => exitedPromise)
         proc.unref()
 
-        const signal = (name: NodeJS.Signals) =>
+        const signalTree = (name: NodeJS.Signals) =>
           Effect.try({
             try: () => {
-              if (!proc.kill(name)) throw new Error(`process ${pid} rejected ${name}`)
+              try {
+                if (process.platform === "win32") {
+                  if (!proc.kill(name)) throw new Error(`process ${pid} rejected ${name}`)
+                } else {
+                  process.kill(-pid, name)
+                }
+              } catch (cause) {
+                if (cause instanceof Error && "code" in cause && cause.code === "ESRCH") return
+                throw cause
+              }
             },
             catch: (cause) =>
               new AcnEnsuranceFailed({
                 reason: `Failed to send ${name} to ACN ${pid}: ${String(cause)}`,
               }),
           })
-        const waitForExit = (duration: Duration.DurationInput) =>
-          exited.pipe(Effect.timeoutOption(duration))
+        const treeAbsent = Effect.sync(() => {
+          if (process.platform === "win32") return proc.exitCode !== null
+          try {
+            process.kill(-pid, 0)
+            return false
+          } catch (cause) {
+            if (cause instanceof Error && "code" in cause) {
+              if (cause.code === "ESRCH") return true
+              if (cause.code === "EPERM") return false
+            }
+            throw cause
+          }
+        })
+        const waitForTreeAbsence = (duration: Duration.DurationInput) => treeAbsent.pipe(
+          Effect.flatMap((absent) => absent ? Effect.void : Effect.fail("TreePresent" as const)),
+          Effect.retry(Schedule.spaced(Duration.millis(20))),
+          Effect.timeoutOption(duration),
+          Effect.catchAll(() => Effect.succeed(Option.none())),
+          Effect.map(Option.isSome),
+        )
         const stopAndReap = Effect.gen(function* () {
-          if (Option.isSome(yield* waitForExit(Duration.millis(1)))) return
-          yield* signal("SIGTERM")
-          if (Option.isSome(yield* waitForExit(Duration.seconds(2)))) return
-          yield* signal("SIGKILL")
-          if (Option.isNone(yield* waitForExit(Duration.seconds(2)))) {
+          if (yield* treeAbsent) return
+          yield* signalTree("SIGTERM")
+          if (yield* waitForTreeAbsence(Duration.seconds(2))) return
+          yield* signalTree("SIGKILL")
+          if (!(yield* waitForTreeAbsence(Duration.seconds(2)))) {
             return yield* new AcnEnsuranceFailed({
-              reason: `Pre-handoff ACN ${pid} did not exit after SIGKILL`,
+              reason: `ACN candidate tree ${pid} did not exit after SIGKILL`,
             })
           }
         })
-        const releaseForHandoff = Effect.async<void, AcnEnsuranceFailed>((resume) => {
+        const releaseParentChannel = Effect.async<void, AcnEnsuranceFailed>((resume) => {
           const stdin = proc.stdin
           if (stdin === null) {
             resume(
@@ -140,15 +167,16 @@ const nodeSpawn: ChildProcessSpawner = {
             )
           }
           stdin.once("error", onError)
-          stdin.end("1", () => {
+          stdin.end(() => {
             stdin.off("error", onError)
             resume(Effect.void)
           })
           return Effect.sync(() => stdin.off("error", onError))
         })
-        return yield* scopePreHandoffCandidate({
+        return yield* scopeAcnCandidate({
           pid,
-          releaseForHandoff,
+          exited,
+          releaseParentChannel,
           stopAndReap,
         })
       }),
@@ -416,7 +444,7 @@ async function getAcnManager(): Promise<AcnInstanceManagerService> {
   acnManagerPromise ??= makeLocalAcnInstanceManager(localDaemonOptions()).pipe(
     Effect.provideService(ChildProcessSpawner, nodeSpawn),
     Effect.provideService(Scope.Scope, scope),
-    Effect.provide(Layer.merge(nodePlatformLayer, NodeSqliteMutexLayer)),
+    Effect.provide(Layer.merge(nodePlatformLayer, NodeSqliteDriverLayer)),
     Effect.runPromise,
   )
   return acnManagerPromise

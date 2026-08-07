@@ -50,12 +50,14 @@ selected endpoint never regresses identity.
 Selection is a true single-flight operation. Bootstrap, retry, lease, and application demand share
 one scoped owner and one exact outcome while selection is active; a semaphore that merely queues
 new operations is insufficient. The owner calls `AcnInstanceManager.ensure`, projects progress into
-client presentation, and atomically publishes only terminal `AcnInstance<AcnReady>` values.
+client presentation, and atomically publishes only terminal `AcnInstance<AcnReady>` values. Every
+typed manager terminal failure is projected to `Failed`; explicit retry starts one new ensure
+occurrence with a fresh absolute deadline.
 
 Runtime construction explicitly starts initial selection. It also constructs one inert, scoped
-lease owner whose renewal fiber is gated by a deferred. The first ready selection opens that gate
-in the same admission critical section, so lease renewal is not an incidental bootstrap trigger.
-Its immediate renewal resolves the already-selected endpoint.
+lease owner whose renewal fiber is gated by a deferred. Immediate lease establishment, selected
+instance publication, and the open/closed check occur in one admission critical section. The
+heartbeat starts only after that establishment succeeds.
 
 ## Recovery
 
@@ -78,8 +80,10 @@ selection scope and awaits interruption, stops heartbeat renewal, then freezes t
 endpoint. Bounded model observation and lease release use a non-recovering protocol bound only to
 that endpoint. Close and scope finalization never ensure, discover, replace, or launch an ACN.
 
-Selection publication and lease installation check `open` under the same admission boundary, so
-they cannot occur after close begins. Each host invokes runtime close before destroying its scope.
+Selection publication and lease establishment check `open` under the same admission boundary as
+close. If establishment wins, close observes that exact selection and releases its lease; if close
+wins, no lease is established or selection published. Each host invokes runtime close before
+destroying its scope.
 Browser back/forward-cache suspension is not close; lease expiry remains authoritative if renewal
 cannot run while suspended.
 

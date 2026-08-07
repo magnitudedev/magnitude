@@ -13,13 +13,15 @@ import {
   Cause,
   Context,
   Data,
+  Deferred,
   Duration,
   Effect,
   Exit,
-  Fiber,
   Layer,
   Option,
+  Ref,
   Runtime,
+  Schedule,
   Schema,
   Scope,
 } from "effect"
@@ -33,24 +35,20 @@ import {
 } from "@magnitudedev/storage"
 import {
   AcnHealthResponseSchema,
-  AcnRevisionSchema,
   MagnitudeRpcs,
-  type AcnHealthResponse,
 } from "@magnitudedev/acn-protocol"
 import {
   ExactProcessController,
   ExactProcessControllerLive,
-  makeAcnOwnerLock,
+  makeAcnOwnerStore,
   makeAcnRevisionStore,
-  reapProcessTree,
-  retryStoreObservation as retryCoordinationObservation,
   COORDINATION_POLL_INTERVAL,
-  type AcnOwnerLockHandle,
-  type AcnOwnerLock,
+  type AcnProcessStoreError,
+  type AcnOwnerStore,
   type AcnRevisionStore,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/coordination"
-import { BunSqliteMutexLayer } from "@magnitudedev/acn-protocol/coordination/bun"
+import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bun"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
 import { defaultDataDir } from "./data-dir"
@@ -93,12 +91,7 @@ import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
 import { SessionStoreLive } from "./session-store"
-import {
-  ACN_BUILD_KIND,
-  ACN_DEVELOPMENT_KEY,
-  ACN_REVISION,
-  ACN_VERSION,
-} from "./version"
+import { ACN_REVISION, ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import {
   ACN_INSTANCE_ID,
@@ -116,7 +109,7 @@ import { ClientLeaseManagerLive } from "./client-lease-manager"
 import { ModelResidencyPolicyLive } from "./model-residency-policy"
 
 export interface AcnServerOptions {
-  readonly waitForHandoff?: boolean
+  readonly parentBound?: boolean
   readonly debug?: boolean
   readonly dataDir?: string
 }
@@ -125,31 +118,54 @@ class AcnBootstrapRejected extends Data.TaggedError("AcnBootstrapRejected")<{
   readonly reason: string
 }> {}
 
-const awaitBootstrapRelease = Effect.async<void, AcnBootstrapRejected>((resume) => {
-  const onData = (chunk: Buffer) => {
-    cleanup()
-    chunk.includes(0x31)
-      ? resume(Effect.void)
-      : resume(Effect.fail(new AcnBootstrapRejected({ reason: "invalid bootstrap release" })))
-  }
+type ParentBindingState = "Pending" | "Admitted" | "Lost"
+
+const makeParentBinding = (
+  enabled: boolean,
+): Effect.Effect<{
+  readonly admit: <A>(
+    effect: Effect.Effect<A, AcnProcessStoreError>,
+    admitted: (value: A) => boolean,
+  ) => Effect.Effect<A, AcnProcessStoreError | AcnBootstrapRejected>
+}, never, Scope.Scope> => Effect.gen(function* () {
+  if (!enabled) return { admit: (effect) => effect }
+  const state = yield* Ref.make<ParentBindingState>("Pending")
+  const lock = yield* Effect.makeSemaphore(1)
+  const lost = yield* Deferred.make<void>()
+  const runtime = yield* Effect.runtime<never>()
+  const reportLoss = () => Runtime.runSync(runtime, Deferred.succeed(lost, undefined))
   const onEnd = () => {
-    cleanup()
-    resume(Effect.fail(new AcnBootstrapRejected({ reason: "bootstrap owner exited before state transfer" })))
+    reportLoss()
   }
-  const onError = (error: Error) => {
-    cleanup()
-    resume(Effect.fail(new AcnBootstrapRejected({ reason: error.message })))
+  const onError = () => {
+    reportLoss()
   }
-  const cleanup = () => {
-    process.stdin.off("data", onData)
-    process.stdin.off("end", onEnd)
-    process.stdin.off("error", onError)
-  }
-  process.stdin.once("data", onData)
   process.stdin.once("end", onEnd)
   process.stdin.once("error", onError)
   process.stdin.resume()
-  return Effect.sync(cleanup)
+  yield* Effect.addFinalizer(() => Effect.sync(() => {
+    process.stdin.off("end", onEnd)
+    process.stdin.off("error", onError)
+  }))
+  yield* Deferred.await(lost).pipe(
+    Effect.flatMap(() => lock.withPermits(1)(Ref.update(state, (current) =>
+      current === "Pending" ? "Lost" : current))),
+    Effect.forkScoped,
+  )
+  return {
+    admit: (effect, isAdmitted) => lock.withPermits(1)(Effect.gen(function* () {
+      const lossObserved = Option.isSome(yield* Deferred.poll(lost))
+      if ((yield* Ref.get(state)) === "Lost" || lossObserved) {
+        yield* Ref.set(state, "Lost")
+        return yield* new AcnBootstrapRejected({
+          reason: "ACN spawning parent exited before admission",
+        })
+      }
+      const value = yield* effect
+      if (isAdmitted(value)) yield* Ref.set(state, "Admitted")
+      return value
+    }).pipe(Effect.uninterruptible)),
+  }
 })
 
 const acnServerUrl = (address: HttpServer.Address): string => {
@@ -166,13 +182,20 @@ const LOCAL_HTTP_ORIGIN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
 
 const closeApplication = (scope: Scope.CloseableScope) =>
-  Effect.gen(function* () {
-    const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkDaemon)
-    yield* Effect.raceFirst(
-      Fiber.await(closing),
-      Effect.sleep(Duration.seconds(5)),
-    ).pipe(Effect.asVoid)
-  })
+  Scope.close(scope, Exit.void).pipe(
+    Effect.disconnect,
+    Effect.timeoutOption(Duration.seconds(5)),
+    Effect.asVoid,
+  )
+
+const boundedShutdownStep = (
+  effect: Effect.Effect<unknown, unknown>,
+  timeout: Duration.DurationInput = Duration.seconds(5),
+) => effect.pipe(
+  Effect.disconnect,
+  Effect.timeoutOption(timeout),
+  Effect.asVoid,
+)
 
 function isAllowedCorsOrigin(origin: string): boolean {
   return (
@@ -448,104 +471,51 @@ const makeAcnInfrastructure = (
  * Runs one ACN process until its lifecycle enters Stopping. Scope
  * closure then stops HTTP, disposes sessions, and reaps the private ICN.
  */
-const OWNER_HEALTH_TIMEOUT = Duration.seconds(2)
-
-const reapPreviousTree = (
-  previous: Option.Option<ExactProcess>,
-  current: ExactProcess,
-): Effect.Effect<void, AcnBootstrapRejected, ExactProcessController> => Effect.gen(function* () {
-  if (Option.isNone(previous)) return
-  const process = previous.value
-  if (process.pid === current.pid &&
-    process.processStartIdentity === current.processStartIdentity) return
-  const processes = yield* ExactProcessController
-  const reaped = yield* reapProcessTree(processes, process)
-  if (!reaped) {
-    return yield* new AcnBootstrapRejected({
-      reason: `Could not prove predecessor process tree ${process.pid} absent`,
-    })
-  }
-}).pipe(Effect.mapError((error) => error instanceof AcnBootstrapRejected
-  ? error
-  : new AcnBootstrapRejected({ reason: String(error) })))
-
-const ownerHealth = (port: number): Effect.Effect<Option.Option<AcnHealthResponse>> =>
-  Effect.tryPromise({
-    try: async (signal) => {
-      const response = await fetch(`http://127.0.0.1:${port}/health`, { signal })
-      return Schema.decodeUnknownSync(AcnHealthResponseSchema)(await response.json())
-    },
-    catch: (error) => new AcnBootstrapRejected({ reason: String(error) }),
-  }).pipe(
-    Effect.timeout(OWNER_HEALTH_TIMEOUT),
-    Effect.option,
-  )
-
-const acquireSelectedOwner = (
-  revisionStore: AcnRevisionStore,
-  ownerLock: AcnOwnerLock,
-): Effect.Effect<Option.Option<AcnOwnerLockHandle>, unknown, Scope.Scope> => Effect.suspend(() =>
-  Effect.gen(function* () {
-    const selected = yield* retryCoordinationObservation(revisionStore.selected)
-    if (Option.isNone(selected) || selected.value > ACN_REVISION) return Option.none()
-    if (selected.value < ACN_REVISION) {
-      return yield* new AcnBootstrapRejected({ reason: "active ACN revision is missing from selection" })
-    }
-    const acquired = yield* retryCoordinationObservation(ownerLock.tryAcquire)
-    if (Option.isSome(acquired)) {
-      const confirmed = yield* retryCoordinationObservation(revisionStore.selected)
-      if (Option.contains(confirmed, ACN_REVISION)) return acquired
-      yield* acquired.value.close
-      return Option.none()
-    }
-    const observation = yield* retryCoordinationObservation(ownerLock.observe)
-    if (observation._tag === "Locked") {
-      const health = yield* ownerHealth(observation.owner.port)
-      if (Option.isSome(health) && health.value.revision >= ACN_REVISION) return Option.none()
-    }
-    yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
-    return yield* acquireSelectedOwner(revisionStore, ownerLock)
+const retryCoordination = <A>(
+  effect: Effect.Effect<A, AcnProcessStoreError | AcnBootstrapRejected>,
+): Effect.Effect<A, AcnBootstrapRejected> => effect.pipe(
+  Effect.retry({
+    schedule: Schedule.spaced(Duration.millis(25)),
+    while: (error) => error._tag !== "AcnBootstrapRejected"
+      && error._tag !== "AcnProcessStoreInvalid",
   }),
+  Effect.timeoutFail({
+    duration: Duration.seconds(30),
+    onTimeout: () => new AcnBootstrapRejected({ reason: "ACN coordination timed out" }),
+  }),
+  Effect.mapError((error) => error instanceof AcnBootstrapRejected
+    ? error
+    : new AcnBootstrapRejected({ reason: `${error._tag}: ${"message" in error ? error.message : "busy"}` })),
 )
+
+const predecessorAbsent = (
+  owner: Option.Option<{ readonly pid: number; readonly processStartIdentity: ExactProcess["processStartIdentity"] }>,
+): Effect.Effect<boolean, AcnBootstrapRejected, ExactProcessController> => Option.match(owner, {
+  onNone: () => Effect.succeed(true),
+  onSome: (process) => ExactProcessController.pipe(
+    Effect.flatMap((processes) => processes.treeAbsent(process)),
+    Effect.mapError((error) => new AcnBootstrapRejected({ reason: error.message })),
+  ),
+})
 
 export const launchAcnServer = (options: AcnServerOptions = {}) =>
   Effect.scoped(Effect.gen(function* () {
     const dataDir = options.dataDir ?? defaultDataDir()
     const debug = options.debug === true
-    if (options.waitForHandoff === true) yield* awaitBootstrapRelease
+    const parentBinding = yield* makeParentBinding(options.parentBound === true)
 
     const revisionStore = yield* makeAcnRevisionStore(dataDir).pipe(
       Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
     )
-    const ownerLock = yield* makeAcnOwnerLock(dataDir).pipe(
+    const ownerStore = yield* makeAcnOwnerStore(dataDir).pipe(
       Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
     )
-    if (ACN_BUILD_KIND === "published") {
-      yield* revisionStore.registerPublished(ACN_REVISION)
-    } else {
-      if (ACN_DEVELOPMENT_KEY === undefined) {
-        return yield* new AcnBootstrapRejected({
-          reason: "Development ACN build has no coordination key",
-        })
-      }
-      const hold = yield* revisionStore.holdDevelopment(ACN_REVISION, ACN_DEVELOPMENT_KEY)
-      void hold
-    }
-
-    const owner = yield* acquireSelectedOwner(revisionStore, ownerLock).pipe(
-      Effect.mapError((error) => new AcnBootstrapRejected({ reason: String(error) })),
-    )
-    if (Option.isNone(owner)) return
-    const ownerHandle = owner.value
+    yield* retryCoordination(revisionStore.register(ACN_REVISION))
 
     const currentProcess = yield* ExactProcessController.pipe(
       Effect.flatMap((processes) => processes.current),
       Effect.mapError((error) => new AcnBootstrapRejected({ reason: error.message })),
     )
-    yield* reapPreviousTree(Option.map(ownerHandle.previous, (record) => ({
-      pid: record.pid,
-      processStartIdentity: record.processStartIdentity,
-    })), currentProcess)
 
     const lifecycle = yield* makeAcnServiceLifecycle()
     const applicationScope = yield* Scope.make()
@@ -561,10 +531,6 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     if (address._tag === "UnixAddress") {
       return yield* new AcnBootstrapRejected({ reason: "ACN requires a loopback TCP endpoint" })
     }
-    yield* ownerHandle.publish({
-      ...currentProcess,
-      port: address.port,
-    })
 
     yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest
@@ -589,6 +555,22 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       Effect.as(HttpServerResponse.empty({ status: 202 })),
     ))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
+
+    const expectedOwner = yield* retryCoordination(ownerStore.current)
+    if (!(yield* predecessorAbsent(Option.map(expectedOwner, (owner) => ({
+      pid: owner.pid,
+      processStartIdentity: owner.processStartIdentity,
+    }))))) return
+    const admission = yield* parentBinding.admit(
+      ownerStore.replaceOwner(
+        expectedOwner,
+        { ...currentProcess, port: address.port },
+        ACN_REVISION,
+      ),
+      (result) => result._tag === "Replaced",
+    ).pipe(retryCoordination)
+    if (admission._tag !== "Replaced") return
+
     yield* Layer.buildWithScope(AcnProcessHandlersLive, applicationScope).pipe(
       Effect.provide(infrastructure),
     )
@@ -650,7 +632,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       }
     })
 
-    const { subscriptions, icn } = yield* application.pipe(
+    const startup = application.pipe(
       Effect.timeout(Duration.minutes(5)),
       Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
@@ -659,15 +641,26 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
         Effect.annotateLogs({ cause: Cause.pretty(cause) }),
       )))),
     )
+    const started = yield* Effect.raceFirst(
+      startup.pipe(Effect.disconnect, Effect.map(Option.some)),
+      lifecycle.awaitStopping.pipe(Effect.map(() => Option.none())),
+    )
+    if (Option.isNone(started)) {
+      yield* boundedShutdownStep(lifecycle.awaitActivityDrain)
+      yield* closeApplicationScope
+      return
+    }
+    const { subscriptions, icn } = started.value
     const request = yield* lifecycle.awaitStopping
     yield* Effect.logInfo("ACN shutdown requested").pipe(Effect.annotateLogs({
       reason: request.reason,
       detail: Option.getOrNull(request.safeDetail),
     }))
-    yield* subscriptions.terminate
+    yield* boundedShutdownStep(lifecycle.awaitActivityDrain)
+    yield* boundedShutdownStep(subscriptions.terminate)
     yield* closeApplicationScope
-    yield* icn.shutdown.pipe(Effect.orDie)
+    yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))
   })).pipe(
     Effect.provideService(ExactProcessController, ExactProcessControllerLive),
-    Effect.provide(BunSqliteMutexLayer),
+    Effect.provide(BunSqliteDriverLayer),
   )

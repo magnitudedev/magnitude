@@ -23,20 +23,19 @@ presentation of `Starting`, not an admission mode. Startup or runtime failure en
 ## Process admission
 
 A JIT candidate starts only a stable health/shutdown control server. It remains parent-bound until
-it acquires the owner lock and publishes its exact process metadata, and may not construct
-application or ICN services before that.
+its exact owner row commits, and may not construct application or ICN services before that.
 
-After binding its control endpoint, the candidate acquires `owner-lock.sqlite`, rereads the selected
-revision to confirm it is still selected, and publishes `owner.json` with its exact PID, process-start
-identity, and port. That publication is process admission. Losing the lock or selection makes the
-candidate stop and exit without expensive initialization. Successful admission removes dependence
-on its launching manager and permits application startup.
+After binding its control endpoint, the candidate reads the complete current owner, proves that
+predecessor's dedicated process tree absent, then atomically replaces the singleton SQLite owner
+row only if both owner and selected revision remain unchanged. That commit is process admission.
+Owner or selection mismatch makes the candidate stop and exit without expensive initialization.
+Successful admission removes dependence on its launching manager and permits application startup.
 
 An admitted ACN observes the revision store for a greater selected revision and retires when one
 appears. It does not self-revoke on missing, unreadable, or indeterminate coordination state.
 Retirement begins only through exact explicit shutdown, idle policy, its own terminal failure, or
-process signals. A successor initializes nothing until it owns the lock and the predecessor ACN/ICN
-tree is proven absent.
+process signals. A successor initializes nothing until its owner row commits and the predecessor
+ACN/ICN tree has been proven absent.
 
 ## Readiness and admission
 
@@ -70,6 +69,7 @@ Every stop cause uses one process-owned, single-flight shutdown:
 
 ```text
 commit Stopping and close admission
+  -> bounded activity drain
   -> terminate subscriptions and transports
   -> close application and session scopes
   -> terminate and reap private ICN
@@ -77,21 +77,24 @@ commit Stopping and close admission
   -> external manager proves ACN tree absent and may acquire ownership
 ```
 
-Caller interruption cannot abandon shutdown. Application-scope closure, notification, fiber,
-finalizer, ICN, signal, kill, and reap work are bounded. Abrupt ACN loss closes ICN's private parent
-pipe; ICN is not durably recorded or reconciled by the external manager. The ACN never removes or
+`beginStopping` completes immediately after the atomic stopping/admission transition; it never
+awaits drain, finalizers, child shutdown, or exit. The server-owned supervisor performs every later
+step with a fixed deadline and disconnects cooperative work before applying its timeout, so an
+uninterruptible finalizer cannot retain escalation. Abrupt ACN loss closes ICN's private parent pipe;
+ICN is not durably recorded or reconciled by the external manager. The ACN never removes or
 reassigns its own ACN occurrence.
 
-The control router accepts exact-instance shutdown before application readiness. A matching request
-idempotently commits `Stopping` and returns after that transition; a request for another occurrence
-cannot stop the process.
+The control router accepts shutdown before application readiness. The process receiving the request
+idempotently commits `Stopping` and returns after that transition. Safety against delayed shutdown
+belongs to manager-side owner and exact-process revalidation, not a required endpoint token.
 
 ## Guarantees
 
 - One lifecycle value governs health, readiness, work admission, idleness, and shutdown.
-- No application or ICN work starts before exact owner lock acquisition and metadata publication.
+- No application or ICN work starts before atomic exact-owner admission.
 - Losing owner acquisition cannot initialize expensive resources.
 - No application work is admitted outside the exact admitted `Ready` ACN.
 - Missing or unreadable coordination state cannot make a healthy admitted ACN self-destruct.
 - Observation cannot retain ACN, and operation duration cannot replace it.
-- Shutdown is single-flight and bounded; the scoped child handle owns exact termination and reap.
+- The stopping transition is single-flight; cooperative teardown and external exact-tree escalation
+  are independently bounded.

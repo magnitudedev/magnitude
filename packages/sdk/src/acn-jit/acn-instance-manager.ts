@@ -5,7 +5,7 @@ import {
   type AcnInstance,
   type AcnTarget,
 } from "@magnitudedev/acn-protocol"
-import { Context, Effect, Option, Schema, Stream } from "effect"
+import { Context, Duration, Effect, Option, Schema, Stream } from "effect"
 import { AcnLifecycleObservationSchema } from "./lifecycle"
 import {
   AcnAdministrationFailed,
@@ -15,6 +15,8 @@ import {
 } from "./errors"
 
 type ReadyInstance = AcnInstance<AcnReady>
+
+export const ACN_ENSURE_TIMEOUT = Duration.minutes(10)
 
 export const AcnEnsureRequestSchema = Schema.Struct({ target: AcnTargetSchema })
 export type AcnEnsureRequest = typeof AcnEnsureRequestSchema.Type

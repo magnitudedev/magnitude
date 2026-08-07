@@ -51,6 +51,7 @@ export interface AcnServiceLifecycleApi {
   readonly becomeReady: (rpc: AcnRpcApplication) => Effect.Effect<void>;
   readonly beginStopping: (request: AcnStopRequest) => Effect.Effect<boolean>;
   readonly awaitStopping: Effect.Effect<AcnStopping>;
+  readonly awaitActivityDrain: Effect.Effect<void>;
   readonly acquireActivity: (
     label: string,
   ) => Effect.Effect<Effect.Effect<void>, ResourceRetired>;
@@ -132,17 +133,10 @@ export const makeAcnServiceLifecycle = (
           // Startup is itself admitted work. Every path out of Starting must
           // release it before waiting for admitted work to drain.
           yield* releaseBootstrap;
+          yield* Deferred.succeed(stopping, next);
           return true;
         }).pipe(Effect.uninterruptible),
-      ).pipe(Effect.flatMap((started) => started
-        ? gate.awaitDrained.pipe(
-            Effect.zipRight(Ref.get(runtime)),
-            Effect.flatMap((current) => current.lifecycle._tag === "Stopping"
-              ? Deferred.succeed(stopping, current.lifecycle).pipe(Effect.asVoid)
-              : Effect.dieMessage("ACN stopping transition was lost")),
-            Effect.as(true),
-          )
-        : Effect.succeed(false)));
+      );
 
     const reportStarting: AcnServiceLifecycleApi["reportStarting"] =
       (activity, progress) =>
@@ -202,6 +196,7 @@ export const makeAcnServiceLifecycle = (
       becomeReady,
       beginStopping,
       awaitStopping: Deferred.await(stopping),
+      awaitActivityDrain: gate.awaitDrained,
       acquireActivity: gate.acquire,
       acquireIdleRetention: gate.acquireRetention,
       joinActivityIfBusy: gate.joinIfBusy,

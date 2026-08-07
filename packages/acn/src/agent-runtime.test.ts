@@ -371,6 +371,7 @@ describe("AgentRuntime", () => {
         beginStopping: (request) =>
           Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
         awaitStopping: Effect.never,
+        awaitActivityDrain: Effect.never,
         acquireActivity: () => Effect.die("unused"),
         acquireIdleRetention: () => Effect.die("unused"),
         joinActivityIfBusy: () => Effect.die("unused"),

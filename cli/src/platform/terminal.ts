@@ -15,7 +15,7 @@ import {
   makeLocalAcnInstanceManager,
   SDK_ACN_TARGET,
 } from "@magnitudedev/sdk"
-import { BunSqliteMutexLayer } from "@magnitudedev/sdk/bun"
+import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
 import type {
   Platform,
   Storage,
@@ -94,7 +94,7 @@ const makeTerminalAcnInstanceManager = (
 }).pipe(
   Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
   Effect.provideService(Scope.Scope, scope),
-  Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteMutexLayer]),
+  Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
 )
 
 export async function stopTerminalAcn(): Promise<void> {
@@ -103,7 +103,7 @@ export async function stopTerminalAcn(): Promise<void> {
     makeLocalAcnInstanceManager().pipe(
       Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
       Effect.provideService(Scope.Scope, scope),
-      Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteMutexLayer]),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
     ),
   )
   await Effect.runPromise(manager.stop.pipe(Effect.ensuring(Scope.close(scope, Exit.void))))

@@ -11,7 +11,15 @@ export class AcnProcessStoreInvalid extends Data.TaggedError("AcnProcessStoreInv
   readonly message: string
 }> {}
 
-export type AcnProcessStoreError = AcnProcessStoreUnavailable | AcnProcessStoreInvalid
+export class AcnProcessStoreBusy extends Data.TaggedError("AcnProcessStoreBusy")<{
+  readonly operation: string
+  readonly path: string
+}> {}
+
+export type AcnProcessStoreError =
+  | AcnProcessStoreUnavailable
+  | AcnProcessStoreInvalid
+  | AcnProcessStoreBusy
 
 export class ExactProcessInspectionFailed extends Data.TaggedError("ExactProcessInspectionFailed")<{
   readonly pid: number
