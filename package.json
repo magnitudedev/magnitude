@@ -37,7 +37,7 @@
     "logs:copy": "bun session logs --copy",
     "cs": "changeset",
     "changeset": "changeset",
-    "version": "changeset version && bun run packages/version/scripts/advance-acn-revision.ts",
+    "version": "bun run packages/version/scripts/apply-changesets-version.ts",
     "publish": "changeset publish",
     "pre:alpha": "changeset pre enter alpha",
     "pre:beta": "changeset pre enter beta",

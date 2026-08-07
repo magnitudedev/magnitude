@@ -6,6 +6,7 @@ export default [
   'packages/storage',
   'packages/client-common',
   'packages/providers',
+  'packages/version',
   'cli',
   'packages/utils',
 ]

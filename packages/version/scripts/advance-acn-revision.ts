@@ -1,28 +1,22 @@
 import { readFile, writeFile } from "node:fs/promises"
-import { resolve } from "node:path"
+import { dirname, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
-const root = resolve(import.meta.dir, "..", "..", "..")
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..")
 const revisionPath = resolve(root, "packages/version/acn-revision.json")
-const packagePath = resolve(root, "packages/cli/package.json")
-const bandSize = 1_000_000
 
-const revision = JSON.parse(await readFile(revisionPath, "utf8")) as {
-  version?: unknown
-  revision?: unknown
-}
-const packageJson = JSON.parse(await readFile(packagePath, "utf8")) as { version?: unknown }
-if (typeof packageJson.version !== "string") throw new Error("CLI package version is missing")
-if (typeof revision.version !== "string" ||
-  !Number.isSafeInteger(revision.revision) ||
-  (revision.revision as number) <= 0 ||
-  (revision.revision as number) % bandSize !== 0) {
-  throw new Error("ACN revision record is malformed")
-}
-if (revision.version !== packageJson.version) {
-  const next = (revision.revision as number) + bandSize
+export const advanceAcnRevision = async (
+  path: string = revisionPath,
+): Promise<void> => {
+  const record = JSON.parse(await readFile(path, "utf8")) as {
+    revision?: unknown
+  }
+  if (!Number.isSafeInteger(record.revision) || (record.revision as number) <= 0) {
+    throw new Error("ACN revision record is malformed")
+  }
+  const next = (record.revision as number) + 1
   if (!Number.isSafeInteger(next)) throw new Error("ACN revision space is exhausted")
-  await writeFile(revisionPath, `${JSON.stringify({
-    version: packageJson.version,
-    revision: next,
-  }, null, 2)}\n`)
+  await writeFile(path, `${JSON.stringify({ revision: next }, null, 2)}\n`)
 }
+
+if (import.meta.main) await advanceAcnRevision()

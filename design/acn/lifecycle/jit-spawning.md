@@ -37,6 +37,12 @@ the instance ID is its RPC identity. Revision is one positive safe integer. Deve
 scalar revision before registration and thereafter follows exactly the same protocol as releases.
 Registered revisions are permanent and selection is their maximum.
 
+Each versioned release source allocates one checked-in scalar revision, advanced by one whenever
+Changesets changes the CLI version. Development generation increments the machine-local counter
+at `~/.magnitude/acn/development-revision-counter` and adds it to that allocation. The
+counter is ephemeral build state: it is neither a coordination prerequisite nor part of the
+coordination database, and ACN processes observe only the resulting scalar revision.
+
 `AcnInstance<AcnReady>` is the only endpoint result. Projection requires a selected revision, the
 complete owner row, an exact live process identity, HTTP `200` ready health whose PID and revision
 match those facts, and final rereads confirming the same owner and selection. Readiness is

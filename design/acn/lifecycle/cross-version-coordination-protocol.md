@@ -44,9 +44,11 @@ CREATE TABLE owner (
 );
 ```
 
-There are no revision files, development-specific records, `owner.json`, `owner-lock.sqlite`,
-fixed port, persisted instance history, persisted workflow or lifecycle, owner generation, owner
-lease, or compatibility representation.
+There are no revision files, development-specific records, `owner.json`, `owner-lock.sqlite`, fixed
+port, persisted instance history, persisted workflow or lifecycle, owner generation, owner lease,
+or compatibility representation in the shared coordination surface. Development build tooling may
+use `~/.magnitude/acn/development-revision-counter` to allocate its scalar before launch; no
+coordination participant reads that ephemeral build state, and it is not part of this protocol.
 
 Every connection uses SQLite rollback-journal mode and `busy_timeout=0`. `SQLITE_BUSY` is the only
 contention result and callers retry it only within a fixed operation deadline. No connection,
