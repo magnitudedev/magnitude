@@ -62,6 +62,12 @@ export class RecoveryExhausted extends Schema.TaggedError<RecoveryExhausted>()(
   { attempts: Schema.Number },
 ) {}
 
+/** The request may have committed, so replay would risk duplicating a mutation. */
+export class RpcOutcomeUnknown extends Schema.TaggedError<RpcOutcomeUnknown>()(
+  "RpcOutcomeUnknown",
+  { tag: Schema.String },
+) {}
+
 export type JitRpcAttemptFailure =
   | RequestEncodeFailed
   | TransportRequestFailed
@@ -72,11 +78,14 @@ export type JitRpcAttemptFailure =
   | StreamLivenessTimeout
   | StreamEndedWithoutExit
   | RecoveryExhausted
+  | RpcOutcomeUnknown
 
 // ─── Lifters ─────────────────────────────────────────────────────────────────
 
 const toReason = (error: JitRpcAttemptFailure): "Protocol" | "Unknown" =>
-  error instanceof TransportRequestFailed || error instanceof RecoveryExhausted
+  error instanceof TransportRequestFailed ||
+    error instanceof RecoveryExhausted ||
+    error instanceof RpcOutcomeUnknown
     ? "Unknown"
     : "Protocol"
 

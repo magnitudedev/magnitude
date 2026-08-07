@@ -6,9 +6,9 @@
 import { Effect, Exit, Layer, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
-  AcnEnsurer,
+  AcnInstanceManager,
   makeAcnJitRuntime,
-  makeRemoteAcnEnsurer,
+  makeRemoteAcnInstanceManager,
 } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 
@@ -115,13 +115,13 @@ const browserDialogs: Dialogs = {
 export async function createBrowserPlatform(
   proxyUrl: string = window.location.origin,
 ): Promise<Platform> {
-  const ensurer = await Effect.runPromise(
-    makeRemoteAcnEnsurer(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
+  const manager = await Effect.runPromise(
+    makeRemoteAcnInstanceManager(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
   )
   const acnScope = await Effect.runPromise(Scope.make())
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnEnsurer, ensurer),
+      Effect.provideService(AcnInstanceManager, manager),
       Effect.provideService(Scope.Scope, acnScope),
       Effect.provide(FetchHttpClient.layer),
     ),

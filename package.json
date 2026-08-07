@@ -37,15 +37,15 @@
     "logs:copy": "bun session logs --copy",
     "cs": "changeset",
     "changeset": "changeset",
-    "version": "changeset version",
+    "version": "changeset version && bun run packages/version/scripts/advance-acn-revision.ts",
     "publish": "changeset publish",
     "pre:alpha": "changeset pre enter alpha",
     "pre:beta": "changeset pre enter beta",
     "pre:exit": "changeset pre exit",
     "prepare": "effect-language-service patch",
     "els": "effect-language-service",
-    "web": "bun run web/scripts/dev-server.ts",
-    "desktop": "cd desktop && bun run dev",
+    "web": "bun run dev:version && bun run web/scripts/dev-server.ts",
+    "desktop": "bun run dev:version && cd desktop && bun run dev",
     "icn:generate": "bun run --cwd packages/icn-protocol generate",
     "icn:check-generated": "bun run --cwd packages/icn-protocol check-generated",
     "icn:openapi": "cargo run --manifest-path inference/Cargo.toml -p icn-api --bin export-openapi --",
@@ -99,7 +99,8 @@
   },
   "trustedDependencies": [
     "electron",
-    "protobufjs"
+    "protobufjs",
+    "sqlite3"
   ],
   "patchedDependencies": {
     "@opentui/core@0.1.88": "patches/@opentui%2Fcore@0.1.88.patch",

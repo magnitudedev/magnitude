@@ -1,4 +1,5 @@
 import { RpcGroup } from "@effect/rpc"
+import { Context } from "effect"
 import * as Agent from "./agent"
 import * as Session from "./session"
 import * as Connection from "./connection"
@@ -13,6 +14,7 @@ import * as Onboarding from "./onboarding"
 import * as ClientLease from "./client-lease"
 import { AcnRpcDemand } from "./middleware"
 import { WatchMirroredStates } from "./mirrored-state"
+import { AcnRpcRecoveryPolicyTag } from "./recovery-policy"
 
 /**
  * `AcnRpcDemand` scopes an ACN residency lease to the complete RPC effect.
@@ -33,23 +35,15 @@ const AcnSubscriptions = RpcGroup.make(
   Files.WatchFile,
 )
 
-const AcnDemandRpcs = RpcGroup.make(
-  Session.PreloadSession,
+const ReplaySafeDemandRpcs = RpcGroup.make(
   Session.ReleaseSessionPreload,
-  Session.CreateSession,
   Session.ListSessions,
   Session.ListSessionCwds,
   Session.GetSession,
-  Session.DeleteSession,
-  Agent.SendMessage,
-  Agent.StartGoal,
-  Agent.Interrupt,
-  Files.UploadAttachment,
   Config.UpdateProviderAuth,
   Config.GetProviderAuth,
   Config.ListProviderAuth,
   Config.ProviderModelCatalogMirror.getRpc,
-  Config.RefreshModelCatalog,
   Config.ModelSlotsMirror.getRpc,
   Config.AssignSlot,
   Config.ClearSlot,
@@ -57,14 +51,7 @@ const AcnDemandRpcs = RpcGroup.make(
   Config.GetCloudUsage,
   LocalInference.LocalInferenceHardwareMirror.getRpc,
   LocalInference.LocalModelsMirror.getRpc,
-  LocalInference.CreateLocalModelOffering,
-  LocalInference.DownloadModel,
-  LocalInference.CancelModelDownload,
-  LocalInference.DismissModelDownloadFailure,
-  LocalInference.DeleteLocalModel,
   LocalInference.PreviewModelLoad,
-  LocalInference.LoadModel,
-  LocalInference.StopModel,
   Onboarding.OnboardingMirror.getRpc,
   Onboarding.UpdateOnboardingState,
   Files.ListFiles,
@@ -76,10 +63,30 @@ const AcnDemandRpcs = RpcGroup.make(
   Git.GetGitRecentFiles,
   Skills.ListSkills,
   Skills.GetSkill,
-  Shell.RunBash,
   Stream.ResyncDisplayView,
   Stream.SetDisplayViewShape,
-).middleware(AcnRpcDemand)
+).annotateRpcs(AcnRpcRecoveryPolicyTag, "ReplaySafe")
+
+const AtMostOnceDemandRpcs = RpcGroup.make(
+  Session.PreloadSession,
+  Session.CreateSession,
+  Session.DeleteSession,
+  Agent.SendMessage,
+  Agent.StartGoal,
+  Agent.Interrupt,
+  Files.UploadAttachment,
+  Config.RefreshModelCatalog,
+  LocalInference.CreateLocalModelOffering,
+  LocalInference.DownloadModel,
+  LocalInference.CancelModelDownload,
+  LocalInference.DismissModelDownloadFailure,
+  LocalInference.DeleteLocalModel,
+  LocalInference.LoadModel,
+  LocalInference.StopModel,
+  Shell.RunBash,
+).annotateRpcs(AcnRpcRecoveryPolicyTag, "AtMostOnce")
+
+const AcnDemandRpcs = ReplaySafeDemandRpcs.merge(AtMostOnceDemandRpcs).middleware(AcnRpcDemand)
 
 /**
  * The group structure is the lifecycle policy: health is neutral,
@@ -90,9 +97,17 @@ const AcnNeutralRpcs = RpcGroup.make(
   Connection.Health,
   ClientLease.RenewClientLease,
   ClientLease.ReleaseClientLease,
-)
+).annotateRpcs(AcnRpcRecoveryPolicyTag, "ReplaySafe")
 
 export const MagnitudeRpcs = AcnNeutralRpcs.merge(
   AcnSubscriptions,
   AcnDemandRpcs,
 )
+
+export const acnRpcRecoveryPolicy = (tag: string) => {
+  const rpc = MagnitudeRpcs.requests.get(tag)
+  if (rpc === undefined) throw new TypeError(`Unknown ACN RPC ${tag}`)
+  const policy = Context.getOption(rpc.annotations, AcnRpcRecoveryPolicyTag)
+  if (policy._tag === "None") throw new TypeError(`Finite ACN RPC ${tag} has no recovery policy`)
+  return policy.value
+}

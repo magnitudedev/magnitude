@@ -23,17 +23,20 @@ presentation of `Starting`, not an admission mode. Startup or runtime failure en
 ## Process admission
 
 A JIT candidate starts only a stable health/shutdown control server. It remains parent-bound until
-durable process state names its exact process and may not construct application or ICN services.
+it acquires the owner lock and publishes its exact process metadata, and may not construct
+application or ICN services before that.
 
-After binding its control endpoint, the candidate atomically changes its exact candidate-owned
-revision to `Assigned`. That compare-and-set is process admission. Losing to takeover makes the
+After binding its control endpoint, the candidate acquires `owner-lock.sqlite`, rereads the selected
+revision to confirm it is still selected, and publishes `owner.json` with its exact PID, process-start
+identity, and port. That publication is process admission. Losing the lock or selection makes the
 candidate stop and exit without expensive initialization. Successful admission removes dependence
 on its launching manager and permits application startup.
 
-An assigned ACN does not poll coordination state or self-revoke on missing, unreadable, or newer
-state. Retirement begins only through exact explicit shutdown, idle policy, its own terminal failure,
-or process signals. Replacement state continues to carry the exact predecessor until an external
-manager proves the ACN absent.
+An admitted ACN observes the revision store for a greater selected revision and retires when one
+appears. It does not self-revoke on missing, unreadable, or indeterminate coordination state.
+Retirement begins only through exact explicit shutdown, idle policy, its own terminal failure, or
+process signals. A successor initializes nothing until it owns the lock and the predecessor ACN/ICN
+tree is proven absent.
 
 ## Readiness and admission
 
@@ -71,7 +74,7 @@ commit Stopping and close admission
   -> close application and session scopes
   -> terminate and reap private ICN
   -> exit ACN
-  -> external manager proves ACN exit and advances process state
+  -> external manager proves ACN tree absent and may acquire ownership
 ```
 
 Caller interruption cannot abandon shutdown. Application-scope closure, notification, fiber,
@@ -86,9 +89,9 @@ cannot stop the process.
 ## Guarantees
 
 - One lifecycle value governs health, readiness, work admission, idleness, and shutdown.
-- No application or ICN work starts before exact process admission.
-- Losing candidate admission cannot initialize expensive resources.
-- No application work is admitted outside the exact assigned `Ready` ACN.
-- Missing or unreadable process state cannot make a healthy assigned ACN self-destruct.
+- No application or ICN work starts before exact owner lock acquisition and metadata publication.
+- Losing owner acquisition cannot initialize expensive resources.
+- No application work is admitted outside the exact admitted `Ready` ACN.
+- Missing or unreadable coordination state cannot make a healthy admitted ACN self-destruct.
 - Observation cannot retain ACN, and operation duration cannot replace it.
 - Shutdown is single-flight and bounded; the scoped child handle owns exact termination and reap.

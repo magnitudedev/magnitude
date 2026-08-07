@@ -1,1 +1,6 @@
-export { MAGNITUDE_VERSION } from "./version.generated"
+export {
+  ACN_BUILD_KIND,
+  ACN_COORDINATION_REVISION,
+  ACN_DEVELOPMENT_KEY,
+  MAGNITUDE_VERSION,
+} from "./version.generated"

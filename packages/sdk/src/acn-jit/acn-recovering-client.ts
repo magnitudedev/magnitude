@@ -1,20 +1,25 @@
 import * as HttpClient from "@effect/platform/HttpClient"
+import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import {
   ClientIdSchema,
   MagnitudeRpcs,
+  AcnReady,
+  acnRpcRecoveryPolicy,
+  type AcnInstance,
   type AcnIdentity,
+  type AcnTarget,
   type ClientId,
   type ClientLeaseMutationResult,
   type ModelSlotsState,
 } from "@magnitudedev/acn-protocol"
-import { compareAcnIdentities } from "@magnitudedev/acn-protocol/acn-identity"
-import { RpcClient, RpcClientError } from "@effect/rpc"
+import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
 import {
   Cause,
   Data,
   Deferred,
   Duration,
   Effect,
+  Either,
   Exit,
   Fiber,
   Layer,
@@ -26,14 +31,21 @@ import {
   SubscriptionRef,
 } from "effect"
 import { isInterruptedExit, recoveringProtocolLayer as jitRecoveringProtocolLayer } from "../jit-rpc"
-import { SDK_VERSION } from "../version"
+import { SDK_ACN_TARGET } from "../version"
 import type { AcnClient } from "../protocol"
-import { AcnEnsurer, runAcnEnsure, type ReadyAcn } from "./acn-ensurer"
+import {
+  AcnInstanceManager,
+  runAcnEnsure,
+} from "./acn-instance-manager"
 import { acnSubscriptionProtocol } from "./acn-subscription-protocol"
 import { type AcnEnsuranceError, AcnEnsuranceFailed } from "./errors"
 import { makeAcnLifecycle, type AcnLifecycle, type AcnLifecycleState } from "./lifecycle"
 
+type ReadyInstance = AcnInstance<AcnReady>
+
 const CLIENT_LEASE_RENEWAL_INTERVAL = Duration.seconds(15)
+const CLIENT_LEASE_ESTABLISH_TIMEOUT = Duration.seconds(5)
+const CLIENT_LEASE_ESTABLISH_RETRY_DELAY = Duration.millis(250)
 const CLIENT_LEASE_RELEASE_TIMEOUT = Duration.seconds(2)
 const CLIENT_CLOSE_OBSERVATION_TIMEOUT = Duration.seconds(2)
 
@@ -45,30 +57,41 @@ type ClientLeaseRpcClient = Pick<AcnClient, "RenewClientLease" | "ReleaseClientL
 
 export interface AcnClientLeaseOwner {
   readonly clientId: ClientId
-  readonly start: Effect.Effect<void>
+  readonly establishThrough: (
+    client: ClientLeaseRpcClient,
+  ) => Effect.Effect<void, RpcClientError.RpcClientError>
   readonly stop: Effect.Effect<void>
   readonly releaseThrough: ReleaseClientLeaseThrough
 }
 
 export const makeAcnClientLeaseOwner = (
   clientId: ClientId,
-  client: ClientLeaseRpcClient,
 ): Effect.Effect<AcnClientLeaseOwner, never, Scope.Scope> =>
   Effect.gen(function* () {
     const released = yield* Ref.make(Option.none<ClientLeaseMutationResult>())
     const releaseLock = yield* Effect.makeSemaphore(1)
     const started = yield* Deferred.make<void>()
-    const renew = client.RenewClientLease({ clientId }).pipe(
+    const currentClient = yield* Ref.make(Option.none<ClientLeaseRpcClient>())
+    const renew = Ref.get(currentClient).pipe(Effect.flatMap(Option.match({
+      onNone: () => Effect.void,
+      onSome: (client) => client.RenewClientLease({ clientId }).pipe(
       Effect.tapError((error) => Effect.logWarning("Failed to renew ACN client lease").pipe(
         Effect.annotateLogs({ clientId, error: String(error) }),
       )),
       Effect.ignore,
-    )
+      ),
+    })))
     const heartbeat = yield* Deferred.await(started).pipe(
+      Effect.zipRight(Effect.sleep(CLIENT_LEASE_RENEWAL_INTERVAL)),
       Effect.zipRight(renew.pipe(Effect.repeat(Schedule.spaced(CLIENT_LEASE_RENEWAL_INTERVAL)))),
       Effect.forkScoped,
     )
-    const start = Deferred.succeed(started, undefined).pipe(Effect.asVoid)
+    const establishThrough: AcnClientLeaseOwner["establishThrough"] = (client) =>
+      client.RenewClientLease({ clientId }).pipe(
+        Effect.tap(() => Ref.set(currentClient, Option.some(client))),
+        Effect.tap(() => Deferred.succeed(started, undefined)),
+        Effect.asVoid,
+      )
     const stop = Fiber.interrupt(heartbeat)
     const releaseThrough: ReleaseClientLeaseThrough = (releaseClient) =>
       releaseLock.withPermits(1)(Ref.get(released).pipe(
@@ -83,7 +106,7 @@ export const makeAcnClientLeaseOwner = (
         })),
       ))
     yield* Effect.addFinalizer(() => stop)
-    return { clientId, start, stop, releaseThrough }
+    return { clientId, establishThrough, stop, releaseThrough }
   })
 
 export interface AcnStartup {
@@ -107,15 +130,15 @@ export interface AcnJitRuntime {
 }
 
 interface AcnAssociation {
-  readonly identity: AcnIdentity
-  readonly selected: Option.Option<ReadyAcn>
+  readonly target: AcnTarget
+  readonly selected: Option.Option<ReadyInstance>
 }
 
 class AcnRuntimeClosed extends Data.TaggedError("AcnRuntimeClosed") {}
 type SelectionError = AcnEnsuranceError | AcnRuntimeClosed
 const runtimeClosed = () => new AcnRuntimeClosed()
 
-const sameReadyOccurrence = (left: ReadyAcn, right: ReadyAcn): boolean =>
+const sameReadyOccurrence = (left: ReadyInstance, right: ReadyInstance): boolean =>
   left.id === right.id &&
   left.pid === right.pid &&
   left.processStartIdentity === right.processStartIdentity
@@ -139,33 +162,48 @@ const unavailableError = (cause: SelectionError): RpcClientError.RpcClientError 
 export const makeAcnJitRuntime = (): Effect.Effect<
   AcnJitRuntime,
   never,
-  AcnEnsurer | HttpClient.HttpClient | Scope.Scope
+  AcnInstanceManager | HttpClient.HttpClient | Scope.Scope
 > => Effect.gen(function* () {
-  const ensurer = yield* AcnEnsurer
+  const manager = yield* AcnInstanceManager
   const httpClient = yield* HttpClient.HttpClient
   const runtimeScope = yield* Scope.Scope
   const selectionScope = yield* Scope.make()
   yield* Effect.addFinalizer(() => Scope.close(selectionScope, Exit.void))
   const lifecycle = yield* makeAcnLifecycle()
   const association = yield* SubscriptionRef.make<AcnAssociation>({
-    identity: SDK_VERSION,
+    target: SDK_ACN_TARGET,
     selected: Option.none(),
   })
   const admission = yield* Effect.makeSemaphore(1)
   const activeSelection = yield* Ref.make(
-    Option.none<Deferred.Deferred<ReadyAcn, SelectionError>>(),
+    Option.none<Deferred.Deferred<ReadyInstance, SelectionError>>(),
   )
   const open = yield* Ref.make(true)
   yield* Effect.addFinalizer(() => Ref.set(open, false))
   const clientId = ClientIdSchema.make(globalThis.crypto.randomUUID())
+  const owner = yield* makeAcnClientLeaseOwner(clientId)
 
-  // The lease client depends on the recovering protocol built below. No
-  // selection is admitted until this is replaced with the inert owner's start.
-  let installLease: Effect.Effect<void> = Effect.dieMessage("lease installer was not initialized")
+  const exactClient = (instance: ReadyInstance) => Layer.buildWithScope(
+    RpcClient.layerProtocolHttp({
+      url: `${instance.url}/rpc`,
+      transformClient: HttpClient.mapRequest(
+        HttpClientRequest.setHeader("x-magnitude-acn-id", instance.id),
+      ),
+    }).pipe(
+      Layer.provide(RpcSerialization.layerNdjson),
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, httpClient)),
+    ),
+    selectionScope,
+  ).pipe(
+    Effect.flatMap((context) => RpcClient.make(MagnitudeRpcs).pipe(
+      Effect.provide(context),
+      Effect.provideService(Scope.Scope, selectionScope),
+    )),
+  )
 
   const finishSelection = (
-    deferred: Deferred.Deferred<ReadyAcn, SelectionError>,
-    exit: Exit.Exit<ReadyAcn, AcnEnsuranceError>,
+    deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
+    exit: Exit.Exit<ReadyInstance, AcnEnsuranceError>,
   ) => admission.withPermits(1)(Effect.gen(function* () {
     const current = yield* Ref.get(activeSelection)
     if (Option.isNone(current) || current.value !== deferred) return
@@ -182,57 +220,67 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     }
     const ready = exit.value
     const previous = yield* SubscriptionRef.get(association)
-    const identity = compareAcnIdentities(ready.identity, previous.identity) > 0
-      ? ready.identity
-      : previous.identity
-    yield* SubscriptionRef.set(association, { identity, selected: Option.some(ready) })
+    const target = ready.revision > previous.target.revision
+      ? { revision: ready.revision, identity: ready.identity }
+      : previous.target
+    yield* SubscriptionRef.set(association, { target, selected: Option.some(ready) })
     yield* lifecycle.ready
-    yield* installLease
     yield* Deferred.succeed(deferred, ready)
   })).pipe(Effect.uninterruptible)
 
   const launchSelection = (
-    deferred: Deferred.Deferred<ReadyAcn, SelectionError>,
-    identity: AcnIdentity,
-  ) => Effect.uninterruptibleMask((restore) =>
-    restore(runAcnEnsure(ensurer.ensure({ minimumIdentity: identity }).pipe(
-      Stream.tap((event) => event._tag === "Observation"
-        ? lifecycle.report(event.observation)
-        : Effect.void),
-    ))).pipe(
-      Effect.exit,
-      Effect.flatMap((exit) => finishSelection(deferred, exit)),
-    ),
-  )
+    deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
+    target: AcnTarget,
+  ): Effect.Effect<void> => Effect.suspend(() => runAcnEnsure(manager.ensure({ target }).pipe(
+    Stream.tap((event) => event._tag === "Observation"
+      ? lifecycle.report(event.observation)
+      : Effect.void),
+  )).pipe(
+    Effect.exit,
+    Effect.flatMap((exit) => {
+      if (Exit.isFailure(exit)) return finishSelection(deferred, exit)
+      return exactClient(exit.value).pipe(
+        Effect.flatMap((client) => owner.establishThrough(client)),
+        Effect.timeout(CLIENT_LEASE_ESTABLISH_TIMEOUT),
+        Effect.either,
+        Effect.flatMap(Either.match({
+          onLeft: () => Effect.sleep(CLIENT_LEASE_ESTABLISH_RETRY_DELAY).pipe(
+            Effect.zipRight(launchSelection(deferred, target)),
+          ),
+          onRight: () => finishSelection(deferred, exit),
+        })),
+      )
+    }),
+  ))
 
   const admitSelectionUnlocked: Effect.Effect<
-    Effect.Effect<ReadyAcn, SelectionError>
+    Effect.Effect<ReadyInstance, SelectionError>
   > = Effect.gen(function* () {
     if (!(yield* Ref.get(open))) return yield* Effect.succeed(Effect.fail(runtimeClosed()))
     const selected = (yield* SubscriptionRef.get(association)).selected
     if (Option.isSome(selected)) return yield* Effect.succeed(
-      Effect.succeed(selected.value) as Effect.Effect<ReadyAcn, SelectionError>,
+      Effect.succeed(selected.value) as Effect.Effect<ReadyInstance, SelectionError>,
     )
     const active = yield* Ref.get(activeSelection)
     if (Option.isSome(active)) return yield* Effect.succeed(Deferred.await(active.value))
-    const deferred = yield* Deferred.make<ReadyAcn, SelectionError>()
-    const identity = (yield* SubscriptionRef.get(association)).identity
+    const deferred = yield* Deferred.make<ReadyInstance, SelectionError>()
+    const target = (yield* SubscriptionRef.get(association)).target
     yield* Ref.set(activeSelection, Option.some(deferred))
-    yield* Effect.forkIn(launchSelection(deferred, identity), selectionScope)
+    yield* Effect.forkIn(launchSelection(deferred, target), selectionScope)
     return yield* Effect.succeed(Deferred.await(deferred))
   })
 
-  const endpoint: Effect.Effect<ReadyAcn, SelectionError> = Effect.flatten(
+  const endpoint: Effect.Effect<ReadyInstance, SelectionError> = Effect.flatten(
     admission.withPermits(1)(admitSelectionUnlocked),
   )
 
-  const recover = (failed: ReadyAcn): Effect.Effect<ReadyAcn, SelectionError> =>
+  const recover = (failed: ReadyInstance): Effect.Effect<ReadyInstance, SelectionError> =>
     Effect.flatten(admission.withPermits(1)(Effect.gen(function* () {
       if (!(yield* Ref.get(open))) return yield* Effect.succeed(Effect.fail(runtimeClosed()))
       const current = yield* SubscriptionRef.get(association)
       if (Option.isSome(current.selected) && !sameReadyOccurrence(current.selected.value, failed)) {
         return yield* Effect.succeed(
-          Effect.succeed(current.selected.value) as Effect.Effect<ReadyAcn, SelectionError>,
+          Effect.succeed(current.selected.value) as Effect.Effect<ReadyInstance, SelectionError>,
         )
       }
       if (Option.isSome(current.selected) && sameReadyOccurrence(current.selected.value, failed)) {
@@ -248,12 +296,8 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     streamProtocol: acnSubscriptionProtocol,
     isEndpointRetirementExit: isInterruptedExit,
     classifyInfraError: unavailableError,
+    recoveryPolicy: acnRpcRecoveryPolicy,
   })
-
-  const leaseProtocolContext = yield* Layer.build(recoveringProtocolLayer)
-  const leaseClient = yield* RpcClient.make(MagnitudeRpcs).pipe(Effect.provide(leaseProtocolContext))
-  const owner = yield* makeAcnClientLeaseOwner(clientId, leaseClient)
-  installLease = owner.start
 
   yield* lifecycle.report({ _tag: "Starting", phase: "Discovering" })
   yield* Effect.forkIn(endpoint.pipe(Effect.ignore), selectionScope)
@@ -302,6 +346,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
             streamProtocol: acnSubscriptionProtocol,
             isEndpointRetirementExit: isInterruptedExit,
             classifyInfraError: unavailableError,
+            recoveryPolicy: acnRpcRecoveryPolicy,
           }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, httpClient))),
           runtimeScope,
         )
@@ -328,9 +373,9 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   ))
 
   return {
-    identity: SubscriptionRef.get(association).pipe(Effect.map((current) => current.identity)),
+    identity: SubscriptionRef.get(association).pipe(Effect.map((current) => current.target.identity)),
     identityChanges: association.changes.pipe(
-      Stream.map((current) => current.identity),
+      Stream.map((current) => current.target.identity),
       Stream.changes,
     ),
     startup: { state: lifecycle, prepare, retry },

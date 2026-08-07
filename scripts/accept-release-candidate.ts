@@ -4,11 +4,10 @@ import { RpcClient } from "@effect/rpc"
 import {
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
-  AcnEnsurer,
+  AcnInstanceManager,
   MagnitudeRpcs,
   makeAcnJitRuntime,
-  makeLocalAcnEnsurer,
-  makeLocalAcnDaemonAdministrator,
+  makeLocalAcnInstanceManager,
 } from "@magnitudedev/sdk"
 import { Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
 import {
@@ -99,15 +98,10 @@ const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let serverRunning = true
 const ensurerScope = await Effect.runPromise(Scope.make())
 
-const ensurer = await Effect.runPromise(
-  makeLocalAcnEnsurer({ dataDir }).pipe(
+const manager = await Effect.runPromise(
+  makeLocalAcnInstanceManager({ dataDir }).pipe(
     Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
     Effect.provideService(Scope.Scope, ensurerScope),
-    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-  ),
-)
-const administrator = await Effect.runPromise(
-  makeLocalAcnDaemonAdministrator({ dataDir }).pipe(
     Effect.provide([BunContext.layer, FetchHttpClient.layer]),
   ),
 )
@@ -178,7 +172,7 @@ const terminateBootstrap = async (pid?: number): Promise<void> => {
   const registered = pid === undefined ? undefined : await registeredProcess(pid)
   let terminationFailure: unknown
   try {
-    await Effect.runPromise(administrator.stopCurrent)
+    await Effect.runPromise(manager.stop)
   } catch (cause) {
     terminationFailure = cause
   }
@@ -213,7 +207,7 @@ const terminateBootstrap = async (pid?: number): Promise<void> => {
 
 const probeBootstrap = Effect.gen(function* () {
   const runtime = yield* makeAcnJitRuntime().pipe(
-    Effect.provideService(AcnEnsurer, ensurer),
+    Effect.provideService(AcnInstanceManager, manager),
   )
 
   yield* runtime.startup.prepare
@@ -252,6 +246,7 @@ const acceptBootstrap = async (): Promise<void> => {
     if (
       health.service !== "magnitude-acn" ||
       health.version !== manifest.version ||
+      health.revision !== manifest.acnRevision ||
       health.state._tag !== "Ready"
     ) {
       throw new Error(

@@ -21,7 +21,7 @@ not substitutes for it.
 ## Client lifetime
 
 `AcnJitRuntime` creates one random `ClientId`, a dedicated lease protocol, and one inert scoped
-lease owner. Its first `ReadyAcn` selection opens the owner's deferred start gate; renewal then
+lease owner. Its first `AcnInstance<AcnReady>` selection opens the owner's deferred start gate; renewal then
 runs immediately and every 15 seconds.
 The lease is not an initial ACN bootstrap trigger. `RpcClient.Protocol` is single-consumer, so the lease
 client must not share a protocol instance with application RPC clients. The protocol instances do

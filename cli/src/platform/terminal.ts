@@ -8,14 +8,14 @@ import { Array as Arr, Effect, Exit, Layer, Option, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
-  AcnEnsurer,
+  AcnInstanceManager,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
-  makeLocalAcnDaemonAdministrator,
   makeAcnJitRuntime,
-  makeLocalAcnEnsurer,
-  SDK_VERSION,
+  makeLocalAcnInstanceManager,
+  SDK_ACN_TARGET,
 } from "@magnitudedev/sdk"
+import { BunSqliteMutexLayer } from "@magnitudedev/sdk/bun"
 import type {
   Platform,
   Storage,
@@ -76,17 +76,17 @@ export interface TerminalPlatformOptions {
   readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
 }
 
-const makeTerminalAcnEnsurer = (
+const makeTerminalAcnInstanceManager = (
   debug: boolean,
   scope: Scope.CloseableScope,
   launchCommand: Option.Option<Arr.NonEmptyReadonlyArray<string>>,
-) => makeLocalAcnEnsurer({
+) => makeLocalAcnInstanceManager({
   ...(debug ? { debug: true } : {}),
   ...Option.match(launchCommand, {
     onNone: () => ({}),
     onSome: (command) => ({
       launchOverride: {
-        identity: SDK_VERSION,
+        target: SDK_ACN_TARGET,
         command,
       },
     }),
@@ -94,16 +94,19 @@ const makeTerminalAcnEnsurer = (
 }).pipe(
   Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
   Effect.provideService(Scope.Scope, scope),
-  Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+  Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteMutexLayer]),
 )
 
 export async function stopTerminalAcn(): Promise<void> {
-  const administrator = await Effect.runPromise(
-    makeLocalAcnDaemonAdministrator().pipe(
-      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+  const scope = await Effect.runPromise(Scope.make())
+  const manager = await Effect.runPromise(
+    makeLocalAcnInstanceManager().pipe(
+      Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
+      Effect.provideService(Scope.Scope, scope),
+      Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteMutexLayer]),
     ),
   )
-  await Effect.runPromise(administrator.stopCurrent)
+  await Effect.runPromise(manager.stop.pipe(Effect.ensuring(Scope.close(scope, Exit.void))))
 }
 
 export async function createTerminalPlatform(options: TerminalPlatformOptions): Promise<Platform> {
@@ -112,12 +115,12 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions): 
     () => makeCliEffectLoggingLayer({ debug: options.debug }),
   )
   const managerScope = await Effect.runPromise(Scope.make())
-  const ensurer = await Effect.runPromise(
-    makeTerminalAcnEnsurer(options.debug, managerScope, options.launchCommand),
+  const manager = await Effect.runPromise(
+    makeTerminalAcnInstanceManager(options.debug, managerScope, options.launchCommand),
   )
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnEnsurer, ensurer),
+      Effect.provideService(AcnInstanceManager, manager),
       Effect.provideService(Scope.Scope, managerScope),
       Effect.provide(FetchHttpClient.layer),
     ),

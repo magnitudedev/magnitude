@@ -5,14 +5,14 @@
  * delegated to the host over HTTP.
  */
 export {
-  AcnEnsurer,
+  AcnInstanceManager,
   AcnEnsureEventSchema,
   AcnEnsureRequestSchema,
-  ReadyAcnSchema,
+  AcnReadyInstanceSchema,
   RemoteAcnEnsureMessageSchema,
-} from "./acn-jit/acn-ensurer"
-export type { AcnEnsureEvent, AcnEnsureRequest, ReadyAcn } from "./acn-jit/acn-ensurer"
-export { makeRemoteAcnEnsurer } from "./acn-jit/remote-acn-ensurer"
+} from "./acn-jit/acn-instance-manager"
+export type { AcnEnsureEvent, AcnEnsureRequest, AcnInstance } from "./acn-jit/acn-instance-manager"
+export { makeRemoteAcnInstanceManager } from "./acn-jit/remote-acn-instance-manager"
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
@@ -23,7 +23,9 @@ export type {
 } from "./acn-jit/acn-recovering-client"
 export {
   AcnEnsuranceFailed,
+  AcnAdministrationFailed,
   BinaryNotFound,
+  BinaryRevisionMismatch,
   BinaryVersionMismatch,
   DownloadFailed,
   ChecksumMismatch,

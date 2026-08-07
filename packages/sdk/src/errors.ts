@@ -1,5 +1,6 @@
 export {
   BinaryNotFound,
+  BinaryRevisionMismatch,
   BinaryVersionMismatch,
   ChecksumMismatch,
   AcnAdministrationFailed,

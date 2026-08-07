@@ -187,7 +187,7 @@ const ClientAcnLifecycleFsm = FSM.defineFSM(
     Checking: ["Starting", "Installing", "Ready", "Failed"],
     Starting: ["Starting", "Installing", "Ready", "Failed"],
     Installing: ["Starting", "Installing", "Ready", "Failed"],
-    Ready: ["Starting"],
+    Ready: [],
     Failed: ["Starting", "Installing", "Ready", "Failed"],
   } as const
 );
@@ -305,6 +305,8 @@ const ensuranceErrorMessage = (error: AcnEnsuranceError): string => {
       return `Magnitude executable was not found at ${error.path}`;
     case "BinaryVersionMismatch":
       return `Magnitude executable ${error.path} has version ${error.actual}; expected ${error.expected}`;
+    case "BinaryRevisionMismatch":
+      return `Magnitude executable ${error.path} has ACN revision ${error.actual}; expected ${error.expected}`;
     case "DownloadFailed":
       return error.reason;
     case "ChecksumMismatch":
@@ -352,6 +354,7 @@ export const makeAcnLifecycle = (): Effect.Effect<AcnLifecycleOwner> =>
       transitionLock.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* SubscriptionRef.get(internal);
+          if (current._tag === "Ready") return;
           if (observation._tag === "Starting") {
             if (
               current._tag === "Installing" &&

@@ -8,11 +8,12 @@ import { Effect, Exit, Layer, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   AcnEnsuranceFailed,
+  AcnAdministrationFailed,
   AcnEnsuranceError,
-  AcnEnsurer,
+  AcnInstanceManager,
   makeAcnJitRuntime,
   type AcnEnsureEvent,
-  type AcnEnsurer as AcnEnsurerService,
+  type AcnInstanceManager as AcnInstanceManagerService,
 } from "@magnitudedev/sdk"
 import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
@@ -65,8 +66,8 @@ const ensuranceError = (cause: unknown) => Schema.is(AcnEnsuranceError)(cause)
   ? cause
   : new AcnEnsuranceFailed({ reason: errorMessage(cause) })
 
-function createDesktopAcnEnsurer(desktopApi: DesktopApi): AcnEnsurerService {
-  return AcnEnsurer.of({
+function createDesktopAcnManager(desktopApi: DesktopApi): AcnInstanceManagerService {
+  return AcnInstanceManager.of({
     ensure: (request) => Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceError>((emit) =>
       Effect.acquireRelease(
         Effect.sync(() => desktopApi.acnEnsurer.ensure(
@@ -78,16 +79,19 @@ function createDesktopAcnEnsurer(desktopApi: DesktopApi): AcnEnsurerService {
         (unsubscribe) => Effect.sync(unsubscribe),
       ).pipe(Effect.asVoid),
     ),
+    stop: Effect.fail(new AcnAdministrationFailed({
+      reason: "Desktop renderer cannot administer the ACN",
+    })),
   })
 }
 
 export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
   api = desktopApi
-  const ensurer = createDesktopAcnEnsurer(desktopApi)
+  const manager = createDesktopAcnManager(desktopApi)
   const acnScope = await Effect.runPromise(Scope.make())
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnEnsurer, ensurer),
+      Effect.provideService(AcnInstanceManager, manager),
       Effect.provideService(Scope.Scope, acnScope),
       Effect.provide(FetchHttpClient.layer),
     ),

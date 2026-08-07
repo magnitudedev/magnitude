@@ -2,39 +2,39 @@ import { Command, Options } from "@effect/cli"
 import * as PlatformCommand from "@effect/platform/Command"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { FetchHttpClient } from "@effect/platform"
-import { Console, Data, Effect, Layer, Option } from "effect"
+import { Console, Data, Effect, Layer } from "effect"
 import { launchAcnServer } from "./server"
-import { ACN_VERSION } from "./version"
+import { ACN_REVISION, ACN_VERSION } from "./version"
 import { resolveRgPath } from "@magnitudedev/ripgrep"
 import { defaultDataDir } from "./data-dir"
 
-const register = Options.boolean("register")
+const waitForHandoff = Options.boolean("wait-for-handoff")
 const debug = Options.boolean("debug")
 const dataDir = Options.text("data-dir").pipe(Options.withDefault(defaultDataDir()))
-const changeRevision = Options.text("change-revision").pipe(Options.optional)
 
 const launchServer = (options: {
-  readonly register: boolean
+  readonly waitForHandoff: boolean
   readonly debug: boolean
   readonly dataDir: string
-  readonly changeRevision: Option.Option<string>
-}) =>
-  launchAcnServer({
-    ...options,
-    changeRevision: Option.map(options.changeRevision, Number),
-  })
+}) => launchAcnServer(options)
 
-const serve = Command.make("serve", { register, debug, dataDir, changeRevision }, launchServer).pipe(
+const serve = Command.make("serve", { waitForHandoff, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Start the ACN server"),
 )
 
-const server = Command.make("server", { register, debug, dataDir, changeRevision }, launchServer).pipe(
+const server = Command.make("server", { waitForHandoff, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Alias for serve"),
 )
 
 const version = Command.make("version", {}, () => Console.log(ACN_VERSION)).pipe(
   Command.withDescription("Print the ACN version"),
 )
+
+const coordinationRevision = Command.make(
+  "coordination-revision",
+  {},
+  () => Console.log(String(ACN_REVISION)),
+).pipe(Command.withDescription("Print the embedded scalar ACN coordination revision"))
 
 class RipgrepVerificationError extends Data.TaggedError("RipgrepVerificationError")<{
   readonly cause: unknown
@@ -69,9 +69,9 @@ const doctor = Command.make("doctor", {}, () =>
   ),
 ).pipe(Command.withDescription("Verify packaged ACN runtime dependencies"))
 
-const acn = Command.make("magnitude-acn", { register, debug, dataDir, changeRevision }, launchServer).pipe(
+const acn = Command.make("magnitude-acn", { waitForHandoff, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Magnitude Agent Control Node"),
-  Command.withSubcommands([serve, server, version, doctor]),
+  Command.withSubcommands([serve, server, version, coordinationRevision, doctor]),
 )
 
 const cli = Command.run(acn, {

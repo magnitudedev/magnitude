@@ -25,22 +25,23 @@ import { layer as nodePathLayer } from "@effect/platform-node-shared/NodePath"
 import { inheritLoginShellEnv } from "./shell-env"
 import { DesktopRpcError, DesktopRpcs, type MenuAction } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
+import { NodeSqliteMutexLayer } from "./sqlite-mutex"
 
 // SDK imports — these run in the main process (Node)
 import {
-  makeLocalAcnEnsurer,
+  makeLocalAcnInstanceManager,
   ChildProcessSpawner,
   scopePreHandoffCandidate,
   AcnEnsuranceFailed,
-  SDK_VERSION,
-  type AcnEnsurer as AcnEnsurerService,
+  SDK_ACN_TARGET,
+  type AcnInstanceManager as AcnInstanceManagerService,
 } from "@magnitudedev/sdk"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
-let acnEnsurerPromise: Promise<AcnEnsurerService> | null = null
+let acnManagerPromise: Promise<AcnInstanceManagerService> | null = null
 const acnEnsurerScope = Effect.runPromise(Scope.make())
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
 
@@ -387,7 +388,7 @@ function defaultLaunchCommand(): Option.Option<Arr.NonEmptyReadonlyArray<string>
   const isDev = !app.isPackaged
   const acnSourcePath = nodePath.resolve(__dirname, "..", "..", "..", "packages", "acn", "src", "binary.ts")
   return isDev
-    ? Option.some(["bun", acnSourcePath, "serve", "--register"])
+    ? Option.some(["bun", acnSourcePath, "serve"])
     : Option.none()
 }
 
@@ -402,7 +403,7 @@ function localDaemonOptions() {
       onNone: () => ({}),
       onSome: (command) => ({
         launchOverride: {
-          identity: SDK_VERSION,
+          target: SDK_ACN_TARGET,
           command,
         },
       }),
@@ -410,18 +411,18 @@ function localDaemonOptions() {
   }
 }
 
-async function getAcnEnsurer(): Promise<AcnEnsurerService> {
+async function getAcnManager(): Promise<AcnInstanceManagerService> {
   const scope = await acnEnsurerScope
-  acnEnsurerPromise ??= makeLocalAcnEnsurer(localDaemonOptions()).pipe(
+  acnManagerPromise ??= makeLocalAcnInstanceManager(localDaemonOptions()).pipe(
     Effect.provideService(ChildProcessSpawner, nodeSpawn),
     Effect.provideService(Scope.Scope, scope),
-    Effect.provide(nodePlatformLayer),
+    Effect.provide(Layer.merge(nodePlatformLayer, NodeSqliteMutexLayer)),
     Effect.runPromise,
   )
-  return acnEnsurerPromise
+  return acnManagerPromise
 }
 
-const acnEnsurer = Effect.promise(getAcnEnsurer)
+const acnManager = Effect.promise(getAcnManager)
 
 function messageFromUnknown(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
@@ -439,8 +440,8 @@ const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpc
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
   AcnEnsure: (request) => Stream.unwrap(
-    acnEnsurer.pipe(
-      Effect.map((ensurer) => ensurer.ensure(request)),
+    acnManager.pipe(
+      Effect.map((manager) => manager.ensure(request)),
     ),
   ),
   StorageGet: ({ key }) => Effect.sync(() => storageGet(key)),

@@ -34,6 +34,7 @@ import {
   verifyOwnedLoaderPaths,
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
+import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 
@@ -190,6 +191,12 @@ const smokeHostArchives = async (
         "version",
       ])).trim() !== version
     ) throw new Error(`${host.id} ACN archive returned the wrong version`)
+    if (
+      Number((await run([
+        resolve(acnRoot, `bin/magnitude-acn${extension}`),
+        "coordination-revision",
+      ])).trim()) !== ACN_COORDINATION_REVISION
+    ) throw new Error(`${host.id} ACN archive returned the wrong coordination revision`)
     if (!(await run([
       resolve(acnRoot, `bin/magnitude-acn${extension}`),
       "doctor",

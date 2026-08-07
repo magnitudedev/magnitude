@@ -50,8 +50,9 @@ const manifestBytes = (
   overrides: Readonly<Record<string, unknown>> = {},
 ): Uint8Array =>
   new TextEncoder().encode(JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     version,
+    acnRevision: 1_000_000,
     tag,
     sourceCommit,
     artifacts: [Schema.encodeSync(ReleaseArtifactSchema)(artifact)],

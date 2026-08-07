@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest"
 import {
   AcnInstanceIdSchema,
+  type AcnInstance,
   AcnReady,
   MagnitudeRpcs,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
   ProcessStartIdentitySchema,
+  AcnRevisionSchema,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/acn-protocol"
 import * as HttpClient from "@effect/platform/HttpClient"
@@ -14,11 +16,14 @@ import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { Rpc, RpcClient } from "@effect/rpc"
 import { Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { AcnEnsuranceFailed } from "./errors"
-import { AcnEnsurer, type ReadyAcn } from "./acn-ensurer"
+import { AcnInstanceManager } from "./acn-instance-manager"
 import { makeAcnJitRuntime } from "./acn-recovering-client"
 import { SDK_VERSION } from "../version"
 
-const ready: ReadyAcn = {
+type ReadyInstance = AcnInstance<AcnReady>
+
+const ready: ReadyInstance = {
+  revision: AcnRevisionSchema.make(1_000_000),
   id: AcnInstanceIdSchema.make("ready-acn"),
   identity: SDK_VERSION,
   url: "http://ready-acn",
@@ -36,7 +41,7 @@ const bodyText = (request: Parameters<typeof HttpClientResponse.fromWeb>[0]): st
 
 const rpcClient = (
   tags: string[],
-  instances: ReadonlyArray<ReadyAcn> = [ready],
+  instances: ReadonlyArray<ReadyInstance> = [ready],
   refuseHealthFor: ReadonlySet<string> = new Set(),
   failRpcTags: ReadonlySet<string> = new Set(),
 ) => HttpClient.make((request) => Effect.suspend(() => {
@@ -55,6 +60,7 @@ const rpcClient = (
   const success = message.tag === "Health"
     ? {
         service: "magnitude-acn" as const,
+        revision: instance.revision,
         version: instance.identity,
         id: instance.id,
         pid: instance.pid,
@@ -94,16 +100,17 @@ describe("AcnJitRuntime", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const release = yield* Deferred.make<void>()
       let calls = 0
-      const ensurer = AcnEnsurer.of({
+      const manager = AcnInstanceManager.of({
         ensure: () => Stream.unwrap(Effect.gen(function* () {
           calls += 1
           yield* Deferred.await(release)
           return Stream.succeed({ _tag: "Ready" as const, instance: ready })
         })),
+        stop: Effect.void,
       })
       const tags: string[] = []
       const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnEnsurer, ensurer),
+        Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       )
       const retry = yield* runtime.startup.retry.pipe(Effect.fork)
@@ -124,7 +131,10 @@ describe("AcnJitRuntime", () => {
   it("scope finalization before readiness does not create a lease", async () => {
     const tags: string[] = []
     await Effect.runPromise(Effect.scoped(makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnEnsurer, AcnEnsurer.of({ ensure: () => Stream.never })),
+      Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
+        ensure: () => Stream.never,
+        stop: Effect.void,
+      })),
       Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       Effect.asVoid,
     )))
@@ -136,11 +146,12 @@ describe("AcnJitRuntime", () => {
     let entered = 0
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnEnsurer, AcnEnsurer.of({
+        Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
           ensure: () => Stream.unwrap(Effect.sync(() => {
             entered += 1
             return Stream.never
           })),
+          stop: Effect.void,
         })),
         Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       )
@@ -154,15 +165,16 @@ describe("AcnJitRuntime", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const release = yield* Deferred.make<void>()
       let calls = 0
-      const ensurer = AcnEnsurer.of({
+      const manager = AcnInstanceManager.of({
         ensure: () => Stream.unwrap(Effect.gen(function* () {
           calls += 1
           yield* Deferred.await(release)
           return Stream.fail(new AcnEnsuranceFailed({ reason: "deterministic failure" }))
         })),
+        stop: Effect.void,
       })
       const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnEnsurer, ensurer),
+        Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient([])),
       )
       const waiters = yield* Effect.all([
@@ -180,7 +192,7 @@ describe("AcnJitRuntime", () => {
   })
 
   it("recovers an application RPC by replacing only its failed exact endpoint", async () => {
-    const successor: ReadyAcn = {
+    const successor: ReadyInstance = {
       ...ready,
       id: AcnInstanceIdSchema.make("successor-acn"),
       url: "http://successor-acn",
@@ -188,20 +200,22 @@ describe("AcnJitRuntime", () => {
       processStartIdentity: ProcessStartIdentitySchema.make("successor-process"),
     }
     let ensures = 0
-    const ensurer = AcnEnsurer.of({
+    const manager = AcnInstanceManager.of({
       ensure: () => Stream.sync(() => ({
         _tag: "Ready" as const,
         instance: ensures++ === 0 ? ready : successor,
       })),
+      stop: Effect.void,
     })
     const tags: string[] = []
     const http = rpcClient(tags, [ready, successor], new Set([ready.id]))
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnEnsurer, ensurer),
+        Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, http),
       )
       yield* runtime.startup.retry
+      expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
       const client = yield* RpcClient.make(MagnitudeRpcs).pipe(
         Effect.provide(runtime.protocolLayer.pipe(
           Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
@@ -211,21 +225,68 @@ describe("AcnJitRuntime", () => {
       expect(health.id).toBe(successor.id)
       expect(ensures).toBe(2)
       expect(tags.filter((tag) => tag === "Health")).toHaveLength(2)
+      expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(2)
+      expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
+    })))
+  })
+
+  it("treats lease loss after readiness as convergence instead of startup failure", async () => {
+    const successor: ReadyInstance = {
+      ...ready,
+      id: AcnInstanceIdSchema.make("lease-successor-acn"),
+      url: "http://lease-successor-acn",
+      pid: 789,
+      processStartIdentity: ProcessStartIdentitySchema.make("lease-successor-process"),
+    }
+    let ensures = 0
+    let refusedFirstLease = false
+    const manager = AcnInstanceManager.of({
+      ensure: () => Stream.succeed({
+        _tag: "Ready" as const,
+        instance: ensures++ === 0 ? ready : successor,
+      }),
+      stop: Effect.void,
+    })
+    const tags: string[] = []
+    const healthy = rpcClient(tags, [ready, successor])
+    const http = HttpClient.make((request) => {
+      const message = JSON.parse(bodyText(request).split("\n")[0]!) as { tag: string }
+      if (message.tag === "RenewClientLease" && request.url.startsWith(ready.url) && !refusedFirstLease) {
+        refusedFirstLease = true
+        return Effect.fail(new HttpClientError.RequestError({
+          request,
+          reason: "Transport",
+          cause: new Error("owner retired before lease establishment"),
+        }))
+      }
+      return healthy.execute(request)
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const runtime = yield* makeAcnJitRuntime().pipe(
+        Effect.provideService(AcnInstanceManager, manager),
+        Effect.provideService(HttpClient.HttpClient, http),
+      )
+      yield* runtime.startup.retry.pipe(Effect.timeout(Duration.seconds(2)))
+      expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
+      expect(ensures).toBe(2)
+      expect(refusedFirstLease).toBe(true)
     })))
   })
 
   it("releases one lease when close observation fails and never ensures again", async () => {
     const tags: string[] = []
     let ensures = 0
-    const ensurer = AcnEnsurer.of({
+    const manager = AcnInstanceManager.of({
       ensure: () => Stream.sync(() => {
         ensures += 1
         return { _tag: "Ready" as const, instance: ready }
       }),
+      stop: Effect.void,
     })
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnEnsurer, ensurer),
+        Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient(
           tags,
           [ready],

@@ -106,7 +106,6 @@ async function main() {
           "bun",
           acnSourcePath,
           "serve",
-          "--register",
           ...(opts.debug ? ["--debug"] : []),
         ])
       : Option.none();

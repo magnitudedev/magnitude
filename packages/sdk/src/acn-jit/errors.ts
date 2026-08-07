@@ -26,6 +26,15 @@ export class BinaryVersionMismatch extends Schema.TaggedError<BinaryVersionMisma
   },
 ) {}
 
+export class BinaryRevisionMismatch extends Schema.TaggedError<BinaryRevisionMismatch>()(
+  "BinaryRevisionMismatch",
+  {
+    path: Schema.String,
+    expected: Schema.Number.pipe(Schema.int(), Schema.positive()),
+    actual: Schema.Number.pipe(Schema.int(), Schema.positive()),
+  },
+) {}
+
 export class DownloadFailed extends Schema.TaggedError<DownloadFailed>()(
   "DownloadFailed",
   {
@@ -48,6 +57,7 @@ export const AcnEnsuranceError = Schema.Union(
   AcnEnsuranceFailed,
   BinaryNotFound,
   BinaryVersionMismatch,
+  BinaryRevisionMismatch,
   DownloadFailed,
   ChecksumMismatch,
 )

@@ -39,6 +39,9 @@ export interface ResourceUseGate {
   readonly acquire: (
     label: string
   ) => Effect.Effect<Effect.Effect<void>, ResourceRetired>;
+  readonly acquireRetention: (
+    label: string
+  ) => Effect.Effect<Effect.Effect<void>, ResourceRetired>;
   readonly joinIfBusy: (
     label: string
   ) => Effect.Effect<Option.Option<Effect.Effect<void>>, ResourceRetired>;
@@ -53,6 +56,8 @@ export interface ResourceUseGate {
   readonly retireNow: (reason: string) => Effect.Effect<boolean>;
   /** Atomically rejects new admission while allowing exact existing leases to release. */
   readonly closeAdmission: Effect.Effect<void>;
+  /** Completes when every admitted work use has released. Idle retention is intentionally ignored. */
+  readonly awaitDrained: Effect.Effect<void>;
   readonly snapshot: Effect.Effect<ResourceUseGateSnapshot>;
   readonly awaitRetired: Effect.Effect<void>;
 }
@@ -74,6 +79,7 @@ interface OpenState {
   readonly phase: "open";
   readonly accepting: boolean;
   readonly leases: ReadonlyMap<number, string>;
+  readonly retentions: ReadonlyMap<number, string>;
   readonly idleSince: number | null;
   readonly revision: number;
   readonly changed: Deferred.Deferred<void>;
@@ -157,6 +163,7 @@ export const makeResourceUseGate = <E = never, R = never>(
       phase: "open",
       accepting: true,
       leases: new Map(),
+      retentions: new Map(),
       idleSince: startedAt,
       revision: 0,
       changed: initialChanged,
@@ -170,25 +177,32 @@ export const makeResourceUseGate = <E = never, R = never>(
         generation: options.generation,
       });
 
-    const release = (token: number): Effect.Effect<void> =>
+    const release = (token: number, retention: boolean): Effect.Effect<void> =>
       Effect.gen(function* () {
         const now = yield* monotonicMillis;
         const nextChanged = yield* Deferred.make<void>();
         const changed = yield* Ref.modify(
           state,
           (current): readonly [Deferred.Deferred<void> | null, GateState] => {
-            if (current.phase !== "open" || !current.leases.has(token))
+            if (current.phase !== "open")
               return [null, current];
+            const currentTokens: ReadonlyMap<number, string> = retention
+              ? current.retentions
+              : current.leases;
+            if (!currentTokens.has(token)) return [null, current];
 
-            const leases = new Map(current.leases);
-            leases.delete(token);
+            const tokens = new Map<number, string>(currentTokens);
+            tokens.delete(token);
+            const leases = retention ? current.leases : tokens;
+            const retentions = retention ? tokens : current.retentions;
             return [
               current.changed,
               {
                 phase: "open",
                 accepting: current.accepting,
                 leases,
-                idleSince: leases.size === 0 ? now : null,
+                retentions,
+                idleSince: leases.size === 0 && retentions.size === 0 ? now : null,
                 revision: current.revision + 1,
                 changed: nextChanged,
               },
@@ -200,7 +214,8 @@ export const makeResourceUseGate = <E = never, R = never>(
 
     const admit = (
       label: string,
-      onlyIfBusy: boolean
+      onlyIfBusy: boolean,
+      retention = false,
     ): Effect.Effect<Option.Option<Effect.Effect<void>>, ResourceRetired> =>
       Effect.suspend(() =>
         Effect.uninterruptibleMask((restore) =>
@@ -224,13 +239,19 @@ export const makeResourceUseGate = <E = never, R = never>(
                   return [null, current];
 
                 const token = ++nextToken;
-                const leases = new Map(current.leases).set(token, label);
+                const leases = retention
+                  ? current.leases
+                  : new Map(current.leases).set(token, label);
+                const retentions = retention
+                  ? new Map(current.retentions).set(token, label)
+                  : current.retentions;
                 return [
                   { _tag: "acquired", token, notify: current.changed },
                   {
                     phase: "open",
                     accepting: current.accepting,
                     leases,
+                    retentions,
                     idleSince: null,
                     revision: current.revision + 1,
                     changed,
@@ -246,11 +267,11 @@ export const makeResourceUseGate = <E = never, R = never>(
                 Deferred.await(admission.resolution)
               );
               if (resolution === "retired") return yield* resourceRetired();
-              return yield* restore(admit(label, onlyIfBusy));
+              return yield* restore(admit(label, onlyIfBusy, retention));
             }
 
             yield* completeChange(admission.notify);
-            return Option.some(release(admission.token));
+            return Option.some(release(admission.token, retention));
           })
         )
       );
@@ -283,7 +304,7 @@ export const makeResourceUseGate = <E = never, R = never>(
                 current,
               ];
             }
-            if (current.leases.size > 0) {
+            if (current.leases.size > 0 || current.retentions.size > 0) {
               return [
                 { _tag: "wait", changed: current.changed, delayMs: null },
                 current,
@@ -364,6 +385,7 @@ export const makeResourceUseGate = <E = never, R = never>(
                 phase: "open",
                 accepting: true,
                 leases: new Map(),
+                retentions: new Map(),
                 idleSince: now,
                 revision: current.revision + 1,
                 changed: nextChanged,
@@ -471,8 +493,12 @@ export const makeResourceUseGate = <E = never, R = never>(
           resource: options.resource,
           generation: options.generation,
           phase: current.phase,
-          leaseCount: current.phase === "open" ? current.leases.size : 0,
-          leaseLabels: current.phase === "open" ? [...current.leases.values()] : [],
+          leaseCount: current.phase === "open"
+            ? current.leases.size + current.retentions.size
+            : 0,
+          leaseLabels: current.phase === "open"
+            ? [...current.leases.values(), ...current.retentions.values()]
+            : [],
           idleSince: current.phase === "open" ? current.idleSince : null,
           revision: current.revision,
         })
@@ -492,10 +518,24 @@ export const makeResourceUseGate = <E = never, R = never>(
         (lease) => (Option.isSome(lease) ? lease.value : Effect.void)
       );
 
+    const awaitDrained: Effect.Effect<void> = Effect.suspend(() =>
+      Ref.get(state).pipe(Effect.flatMap((current) =>
+        current.phase !== "open" || current.leases.size === 0
+          ? Effect.void
+          : Deferred.await(current.changed).pipe(Effect.zipRight(awaitDrained)),
+      )),
+    );
+
     return {
       resource: options.resource,
       generation: options.generation,
       acquire,
+      acquireRetention: (label) => admit(label, false, true).pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.fail(resourceRetired()),
+          onSome: Effect.succeed,
+        })),
+      ),
       joinIfBusy: (label) => admit(label, true),
       withUse: (label, effect) =>
         Effect.acquireUseRelease(
@@ -506,6 +546,7 @@ export const makeResourceUseGate = <E = never, R = never>(
       withBusyUse,
       retireNow,
       closeAdmission,
+      awaitDrained,
       snapshot,
       awaitRetired: Deferred.await(retired),
     };

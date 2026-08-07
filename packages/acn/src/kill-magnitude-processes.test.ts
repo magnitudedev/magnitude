@@ -10,7 +10,7 @@ describe("classifyMagnitudeProcess", () => {
     ["target/debug/icn-server serve --fake", "ICN"],
     ["cargo run -p icn-server -- serve --fake", "ICN"],
     ["bun run icn:serve", "ICN"],
-    ["/Users/me/.magnitude/bin/magnitude-acn serve --register", "ACN"],
+    ["/Users/me/.magnitude/bin/magnitude-acn serve --wait-for-handoff", "ACN"],
     ["bun run packages/acn/src/binary.ts serve --debug", "ACN"],
     ["/tmp/bin/magnitude-cli --debug", "CLI"],
     ["bun run cli/src/index.tsx --debug", "CLI"],
@@ -32,8 +32,8 @@ describe("classifyMagnitudeProcess", () => {
 
 describe("parseProcessList", () => {
   it("parses ps output while preserving the command", () => {
-    expect(parseProcessList("  12     1 /tmp/magnitude-acn serve --register\n  25    12 /tmp/magnitude-icn serve\n")).toEqual([
-      { pid: 12, parentPid: 1, command: "/tmp/magnitude-acn serve --register" },
+    expect(parseProcessList("  12     1 /tmp/magnitude-acn serve --wait-for-handoff\n  25    12 /tmp/magnitude-icn serve\n")).toEqual([
+      { pid: 12, parentPid: 1, command: "/tmp/magnitude-acn serve --wait-for-handoff" },
       { pid: 25, parentPid: 12, command: "/tmp/magnitude-icn serve" },
     ])
   })
