@@ -9,7 +9,7 @@
  * Local UI state uses plain atoms (spec §6.3).
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react"
-import { Option, Effect, Runtime, Cause } from "effect"
+import { Option, Effect, Runtime } from "effect"
 import { useAtomValue, useAtomSet, useAtomMount, Atom, Result } from "@effect-atom/atom-react"
 import {
   type CommandContext,
@@ -49,15 +49,12 @@ import {
   sidebarSearchAtom,
   sidebarCwdFilterAtom,
   sidebarVisibleAtom,
-  apiKeyVerifiedAtom,
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
 import { ToastContainer } from "./components/toast"
 import { showToast } from "./stores/toast-store"
-import { LoginScreen } from "./components/login-screen"
 import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
-import { Loader2 } from "lucide-react"
 import {
   useSlotProfiles,
   useModelConfig,
@@ -68,26 +65,21 @@ import {
 import {
   isRoleId,
   PRIMARY_SLOT_ID,
-  ProviderIdSchema,
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
   SLOT_DISPLAY_NAMES,
   SLOT_DESCRIPTIONS,
 } from "@magnitudedev/sdk"
 import type {
-  CloudUsageResponse,
   DisplayActor,
   ListSessionsResult,
   ReadFileResult,
   SessionCwdSummary,
   SessionMetadata,
-  UsagePeriod,
 } from "@magnitudedev/sdk"
-import type { SlotId, ProviderAuth } from "@magnitudedev/sdk"
+import type { SlotId } from "@magnitudedev/sdk"
 
 const SESSION_PAGE_SIZE = 50
-const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make("magnitude")
-
 type SessionPageState = {
   sessions: SessionMetadata[]
   nextCursor: string | null
@@ -148,7 +140,6 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
   const searchQuery = useAtomValue(sidebarSearchAtom)
   const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setUsageOpen = useAtomSet(usageOpenAtom)
   const sessionPageGenerationRef = useRef(0)
   const [sessionPage, setSessionPage] = useState<SessionPageState>({
     sessions: [],
@@ -234,22 +225,7 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
 
   const sessionsLoading = Result.isInitial(firstPageResult) && sessionPage.sessions.length === 0
   const sessions = sessionPage.sessions
-  const apiKeyResult = useAtomValue(
-    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
-  )
-  const accountState = Result.match(apiKeyResult, {
-    onInitial: () => ({ label: "Account", subLabel: null as string | null }),
-    onFailure: () => ({ label: "Account", subLabel: null as string | null }),
-    onSuccess: (success) => {
-      const value = success.value as { auth: Option.Option<ProviderAuth> }
-      if (value.auth._tag !== "Some" || value.auth.value.type !== "api" || value.auth.value.key.length === 0) {
-        return { label: "Account", subLabel: null as string | null }
-      }
-      const key = value.auth.value.key
-      const masked = key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : "configured"
-      return { label: "Signed in", subLabel: masked }
-    },
-  })
+  // Cloud is disabled.
 
   // Listen for __magnitude:focus-search custom event → focus the search input
   const focusSearchAtom = useMemo(
@@ -312,8 +288,6 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
       cwdOptions={cwdOptions}
       loadingMore={sessionPage.loadingMore}
       hasMore={sessionPage.hasMore}
-      accountLabel={accountState.label}
-      accountSubLabel={accountState.subLabel}
       onCwdFilterChange={setCwdFilter}
       onLoadMore={loadMoreSessions}
       onSelectSession={(id) => {
@@ -321,7 +295,6 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
       }}
       onNewSession={handleNewSession}
       onOpenSettings={() => setSettingsOpen(true)}
-      onOpenUsage={() => setUsageOpen(true)}
       overlay={props?.overlay}
       onCloseOverlay={props?.onCloseOverlay}
     />
@@ -455,40 +428,10 @@ function SettingsPanelContainer({
   slotProfiles: SlotProfiles | null
   initialTab: "settings" | "usage"
 }): ReactNode {
-  const client = useAgentClient()
-  const setApiKeyVerified = useAtomSet(apiKeyVerifiedAtom)
-  const [period, setPeriod] = useState<UsagePeriod>("24h")
   const modelConfig = useModelConfig()
 
-  // ── API key state ──
-  const apiKeyResult = useAtomValue(
-    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
-  )
-  const apiKeyState: ApiKeyState = Result.match(apiKeyResult, {
-    onInitial: () => ({ status: "none" } as ApiKeyState),
-    onFailure: () => ({ status: "none" } as ApiKeyState),
-    onSuccess: (s) => {
-      const value = s.value as { auth: Option.Option<ProviderAuth> }
-      if (value.auth._tag === "Some" && value.auth.value.type === "api") {
-        const key = value.auth.value.key
-        const masked = key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : "****"
-        return { status: "config" as const, maskedKey: masked }
-      }
-      return { status: "none" as const }
-    },
-  })
-
-  const updateProviderAuth = useAtomSet(
-    client.mutation("UpdateProviderAuth"),
-    { mode: "promise" },
-  )
-  const handleSave = async (key: string) => {
-    await updateProviderAuth({ payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } }, reactivityKeys: ["apiKey"] })
-  }
-  const handleDisconnect = async () => {
-    await updateProviderAuth({ payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } }, reactivityKeys: ["apiKey"] })
-    setApiKeyVerified(false)
-  }
+  // Cloud is disabled.
+  const apiKeyState: ApiKeyState = { status: "none" }
 
   // ── Slots ──
   const slots = useMemo(() => {
@@ -504,35 +447,15 @@ function SettingsPanelContainer({
     }))
   }, [slotProfiles])
 
-  // ── Cloud subscription and usage limits ──
-  const tz = useMemo(() => {
-    try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return "UTC" }
-  }, [])
-  const cloudUsageAtom = useMemo(
-    () => client.query("GetCloudUsage", { period, days: 30, tz }),
-    [client, period, tz],
-  )
-  const cloudUsageResult = useAtomValue(cloudUsageAtom)
-  const usageLoading = Result.isInitial(cloudUsageResult)
-  const usageError = Result.isFailure(cloudUsageResult)
-    ? (Cause.pretty(cloudUsageResult.cause) || "Failed to load usage data.")
-    : null
-  const usageData = Result.isSuccess(cloudUsageResult)
-    ? (cloudUsageResult.value as CloudUsageResponse)
-    : null
+  // Cloud is disabled.
 
   return (
     <SettingsPanel
       apiKey={apiKeyState}
-      onSaveApiKey={handleSave}
-      onDisconnectApiKey={handleDisconnect}
       slots={slots}
       modelConfig={modelConfig}
-      usageLoading={usageLoading}
-      usageError={usageError}
-      usageData={usageData}
-      usagePeriod={period}
-      onUsagePeriodChange={setPeriod}
+      usagePeriod="24h"
+      onUsagePeriodChange={() => {}}
       initialTab={initialTab}
     />
   )
@@ -757,8 +680,6 @@ function useInterruptAllListener(): void {
 
 /** Inner app — has display view + AgentClient context */
 function AppInner(): ReactNode {
-  const apiKeyVerified = useAtomValue(apiKeyVerifiedAtom)
-  const platform = usePlatform()
   const sidebarVisible = useAtomValue(sidebarVisibleAtom)
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
 
@@ -783,57 +704,7 @@ function AppInner(): ReactNode {
   useMenuActions()
   useInterruptAllListener()
 
-  // Check if API key is already set — gate the login screen from the parent
-  // to avoid setState-during-render in LoginScreen.
-  // The apiKeyVerified atom is only set by LoginScreen in an event handler
-  // (after the user submits a key). Here we gate purely on the query result.
-  const client = useAgentClient()
-  const apiKeyResult = useAtomValue(
-    client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
-  )
-
-  // Distinguish loading from failure:
-  // - Initial (loading) → spinner
-  // - Failure → show login screen (user can enter a key)
-  // - Success → check if key is set
-  const apiKeyLoading = Result.isInitial(apiKeyResult)
-  const keyAlreadySet = Result.match(apiKeyResult, {
-    onInitial: () => false,
-    onFailure: () => false,
-    onSuccess: (s) => {
-      const value = s.value as { auth: Option.Option<ProviderAuth> }
-      return value.auth._tag === "Some" && value.auth.value.type === "api" && value.auth.value.key.length > 0
-    },
-  })
-
-  // Key exists → show app. Loading → spinner. Missing/failed → login screen.
-  if (apiKeyLoading && !apiKeyVerified) {
-    return (
-      <div style={{ position: "fixed", inset: 0, background: "var(--bg-base)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
-        <Loader2 size={24} style={{ color: "var(--accent-primary)", animation: "spin 1s linear infinite" }} />
-      </div>
-    )
-  }
-
-  if (Result.isFailure(apiKeyResult) && !apiKeyVerified) {
-    return (
-      <DaemonConnectionError
-        message="Failed to connect to the Magnitude daemon."
-        reconnecting={false}
-        invariantViolation={false}
-        onRetry={() => window.location.reload()}
-        onQuit={() => {
-          if (platform.quit) {
-            platform.quit()
-          }
-        }}
-      />
-    )
-  }
-
-  if (!keyAlreadySet && !apiKeyVerified) {
-    return <LoginScreen />
-  }
+  // Cloud is disabled.
 
   return <AuthenticatedAppContent isNarrow={isNarrow} />
 }

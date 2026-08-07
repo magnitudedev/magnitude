@@ -194,20 +194,22 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
     ...(config?.exaEndpoint === undefined ? {} : { endpoint: config.exaEndpoint }),
   })
   const sessionId = config?.sessionId ?? null
-  const webSearchSource: WebSearchSource =
-    magnitudeInstance.authentication._tag === "Configured"
-      ? "magnitude"
-      : exaInstance.configured
-        ? "exa"
-        : "unavailable"
-  const webSearch = webSearchSource === "magnitude"
-    ? magnitudeInstance.provider.webSearch
-    : webSearchSource === "exa"
-      ? exaInstance.webSearch
-      : () => Effect.fail(new WebSearchNotConfigured())
+  // Cloud is disabled.
+  const webSearchSource: WebSearchSource = exaInstance.configured
+    ? "exa"
+    : "unavailable"
+  const webSearch = webSearchSource === "exa"
+    ? exaInstance.webSearch
+    : () => Effect.fail(new WebSearchNotConfigured())
+  // const webSearch = webSearchSource === "magnitude"
+  //   ? magnitudeInstance.provider.webSearch
+  //   : webSearchSource === "exa"
+  //     ? exaInstance.webSearch
+  //     : () => Effect.fail(new WebSearchNotConfigured())
 
   const registry = makeProviderRegistry({
-    magnitude: magnitudeInstance,
+    // magnitude: magnitudeInstance,
+    magnitude: null,
     discoverableProviders: config?.discoverableProviders ?? [],
   })
 

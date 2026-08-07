@@ -30,23 +30,14 @@ describe('routeSlashCommand', () => {
     expect(ctx.resetConversation).toHaveBeenCalledTimes(1)
   })
 
-  test('opens cloud usage from /usage and /limits', () => {
-    const ctx = createContext()
-    expect(routeSlashCommand('/usage', ctx)).toBe(true)
-    expect(routeSlashCommand('/limits', ctx)).toBe(true)
-    expect(ctx.openUsage).toHaveBeenCalledTimes(2)
-  })
-
   test('opens each model menu directly', () => {
     const ctx = createContext()
     expect(routeSlashCommand('/models', ctx)).toBe(true)
     expect(routeSlashCommand('/catalog', ctx)).toBe(true)
     expect(routeSlashCommand('/hardware', ctx)).toBe(true)
-    expect(routeSlashCommand('/cloud', ctx)).toBe(true)
     expect(ctx.openModelMenu).toHaveBeenNthCalledWith(1, 'models')
     expect(ctx.openModelMenu).toHaveBeenNthCalledWith(2, 'catalog')
     expect(ctx.openModelMenu).toHaveBeenNthCalledWith(3, 'hardware')
-    expect(ctx.openModelMenu).toHaveBeenNthCalledWith(4, 'cloud')
   })
 
   test('/settings opens the Models menu', () => {

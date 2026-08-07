@@ -17,10 +17,11 @@ export function registerCliCommands(): void {
       label: "hardware",
       description: "Inspect local inference hardware",
     },
-    {
-      id: "cloud",
-      label: "cloud",
-      description: "Manage Magnitude Cloud connection",
-    },
+    // Cloud is disabled.
+    // {
+    //   id: "cloud",
+    //   label: "cloud",
+    //   description: "Manage Magnitude Cloud connection",
+    // },
   ])
 }
