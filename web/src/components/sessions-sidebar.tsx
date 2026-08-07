@@ -618,7 +618,8 @@ export function SessionsSidebar({
             gap: 8,
           }}
         >
-          <button
+          {/* Cloud is disabled. */}
+          {/* <button
             type="button"
             onClick={onOpenSettings}
             className="hover-surface-flat"
@@ -690,9 +691,10 @@ export function SessionsSidebar({
               )}
             </span>
             <ChevronDown size={14} style={{ color: "var(--fg-tertiary)", flexShrink: 0 }} />
-          </button>
+          </button> */}
 
-          <button
+          {/* Cloud is disabled. */}
+          {/* <button
             type="button"
             onClick={onOpenUsage}
             className="hover-surface-flat"
@@ -713,7 +715,7 @@ export function SessionsSidebar({
             }}
           >
             <BarChart3 size={16} />
-          </button>
+          </button> */}
 
           <button
             type="button"

@@ -69,7 +69,8 @@ import {
   type CatalogLayout,
 } from "./catalog-layout"
 
-const ROOTS = ["models", "catalog", "hardware", "cloud"] as const
+// Cloud is disabled.
+const ROOTS = ["models", "catalog", "hardware"] as const
 const ROOT_LABELS: Record<ModelMenuRoot, string> = {
   models: "MODELS",
   catalog: "CATALOG",
@@ -82,7 +83,7 @@ const MAGNITUDE_CLOUD_URL = "https://app.magnitude.dev"
 type CloudActionId = "add" | "update" | "disconnect" | "link"
 const EMPTY_MODEL_ACTIONS = [
   { label: "Find a local model", root: "catalog" },
-  { label: "Connect cloud models", root: "cloud" },
+  // { label: "Connect cloud models", root: "cloud" },
 ] as const satisfies readonly { readonly label: string; readonly root: ModelMenuRoot }[]
 
 interface ModelsMenuProps {
@@ -101,7 +102,7 @@ interface CloudMenuProps {
 }
 
 const nextRoot = (root: ModelMenuRoot, direction: -1 | 1): ModelMenuRoot => {
-  const index = ROOTS.indexOf(root)
+  const index = ROOTS.findIndex((candidate) => candidate === root)
   return ROOTS[(index + direction + ROOTS.length) % ROOTS.length]!
 }
 
@@ -206,7 +207,8 @@ export function ModelMenusContainer({
         {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "catalog" && <CatalogMenu initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "hardware" && <HardwareMenu />}
-        {menu.root === "cloud" && <CloudMenu setRootSwitchingEnabled={setAtRootLevel} />}
+        {/* Cloud is disabled. */}
+        {/* {menu.root === "cloud" && <CloudMenu setRootSwitchingEnabled={setAtRootLevel} />} */}
       </box>
       <box
         style={{
@@ -685,7 +687,7 @@ const ModelsMenu = memo(function ModelsMenu({
       <MenuHeader
         title="Models"
         subtitle="Choose a model"
-        summary={`${eligible.filter((model) => model.providerId === LOCAL_PROVIDER_ID).length} local · ${eligible.filter((model) => model.providerId !== LOCAL_PROVIDER_ID).length} cloud`}
+        summary={`${eligible.filter((model) => model.providerId === LOCAL_PROVIDER_ID).length} local`}
         hints={eligible.length === 0
           ? "↑↓ choose · Enter open · R refresh · Esc close"
           : "↑↓ choose · Enter select · F favorite · D details · R refresh · Esc close"}

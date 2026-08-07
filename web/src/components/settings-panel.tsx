@@ -99,57 +99,17 @@ export function SettingsPanel({
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      {/* Tab bar */}
-      <div
-        style={{
-          display: "flex",
-          gap: 0,
-          borderBottom: "1px solid var(--border-subtle)",
-          flexShrink: 0,
-        }}
-      >
-        {(["settings", "usage"] as Tab[]).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            style={{
-              background: "transparent",
-              border: "none",
-              borderBottom: t === tab ? "2px solid var(--accent-primary)" : "2px solid transparent",
-              color: t === tab ? "var(--accent-primary)" : "var(--fg-secondary)",
-              fontFamily: "var(--font-sans)",
-              fontSize: 13,
-              fontWeight: 500,
-              padding: "10px 16px",
-              cursor: "pointer",
-              marginBottom: -1,
-              textTransform: "capitalize",
-            }}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
+      {/* Cloud is disabled. */}
 
       {/* Tab content */}
       <div style={{ overflowY: "auto", padding: 16, flex: 1 }}>
-        {tab === "settings" ? (
-          <SettingsTab
-            apiKey={apiKey}
-            onSaveApiKey={onSaveApiKey}
-            onDisconnectApiKey={onDisconnectApiKey}
-            slots={slots}
-            modelConfig={modelConfig}
-          />
-        ) : (
-          <UsageTab
-            loading={usageLoading}
-            error={usageError}
-            data={usageData}
-            period={usagePeriod}
-            onPeriodChange={onUsagePeriodChange}
-          />
-        )}
+        <SettingsTab
+          apiKey={apiKey}
+          onSaveApiKey={onSaveApiKey}
+          onDisconnectApiKey={onDisconnectApiKey}
+          slots={slots}
+          modelConfig={modelConfig}
+        />
       </div>
     </div>
   )
@@ -214,7 +174,8 @@ function SettingsTab({
 
   return (
     <div className="settings-api-key-section">
-      <h3
+      {/* Cloud is disabled. */}
+      {/* <h3
         style={{
           fontFamily: "var(--font-sans)",
           fontSize: 15,
@@ -298,7 +259,7 @@ function SettingsTab({
             <SettingsButton onClick={() => setMode("view")}>Cancel</SettingsButton>
           </div>
         </div>
-      )}
+      )} */}
 
       {/* Model Selection Section */}
       {slots.length > 0 && (

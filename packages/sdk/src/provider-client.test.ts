@@ -4,8 +4,6 @@ import { createProviderClient } from "./provider-client"
 
 describe("provider client web-search routing", () => {
   it.each([
-    { cloud: "cloud-key", exa: "exa-key", expected: "magnitude" },
-    { cloud: "cloud-key", exa: " ", expected: "magnitude" },
     { cloud: " ", exa: "exa-key", expected: "exa" },
     { cloud: " ", exa: " ", expected: "unavailable" },
   ] as const)(

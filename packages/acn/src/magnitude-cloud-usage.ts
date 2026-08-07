@@ -42,9 +42,14 @@ export const MagnitudeCloudUsageLive: Layer.Layer<
     return yield* new SessionOperationFailed({ operation: "get cloud usage", reason: "No Magnitude API key found" })
   })
   return MagnitudeCloudUsage.of({
-    get: (query) => authenticatedClient.pipe(
-      Effect.flatMap((authenticated) => authenticated.usage(query).pipe(Effect.provide(FetchHttpClient.layer))),
-      Effect.mapError(failure("get cloud usage")),
-    ),
+    // Cloud is disabled.
+    get: (_query) => Effect.fail(new SessionOperationFailed({
+      operation: "get cloud usage",
+      reason: "Magnitude Cloud is disabled",
+    })),
+    // get: (query) => authenticatedClient.pipe(
+    //   Effect.flatMap((authenticated) => authenticated.usage(query).pipe(Effect.provide(FetchHttpClient.layer))),
+    //   Effect.mapError(failure("get cloud usage")),
+    // ),
   })
 }))

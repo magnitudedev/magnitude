@@ -62,15 +62,13 @@ started by an already-active Harness, but it never changes the route of an in-fl
 
 ## Web-search routing
 
-Web search has exactly one configured route:
+Cloud is disabled. Web search has exactly one configured route:
 
-1. Magnitude Cloud when a nonblank stored or environment Magnitude key exists;
-2. direct Exa when Cloud is not configured and `EXA_API_KEY` is nonblank; or
-3. unavailable when neither route is configured.
+1. direct Exa when `EXA_API_KEY` is nonblank; or
+2. unavailable when Exa is not configured.
 
-Cloud configuration takes precedence even if a later Cloud request is rejected or fails.
-Operational failures never fall through to another route because doing so would silently change
-data handling and billing.
+The disabled Cloud route remains implemented but does not participate in provider registration or
+web-search routing.
 
 When unavailable, `webSearch` remains in the tool universe but is absent from every effective
 toolkit that would otherwise include it. `webFetch` is independent and remains eligible.
@@ -96,12 +94,11 @@ Keys never enter ambients, events, projections, display state, introspection, or
 
 ## Acceptance criteria
 
-1. Cloud configured with or without Exa selects Cloud.
-2. Exa without Cloud selects direct Exa.
-3. Neither configured removes `web_search` from model tool definitions.
-4. Current unavailability never prevents historical web-search events from replaying.
-5. Resident sessions reflect availability changes in their next effective toolkit, while searches
+1. Exa selects direct Exa regardless of stored or environment Magnitude credentials.
+2. Without Exa, `web_search` is removed from model tool definitions.
+3. Current unavailability never prevents historical web-search events from replaying.
+4. Resident sessions reflect availability changes in their next effective toolkit, while searches
    started after a provider-client refresh use the refreshed route.
-6. Effective toolkit selection is identical across normal turns, compaction, and exported tool
+5. Effective toolkit selection is identical across normal turns, compaction, and exported tool
    definitions.
-7. Provider failures retain typed semantic detail without unknown cause bags.
+6. Provider failures retain typed semantic detail without unknown cause bags.
