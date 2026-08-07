@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.36
+
+### Patch Changes
+
+- [`847d612`](https://github.com/magnitudedev/magnitude/commit/847d612bf97fd27e5598d0a3d93f06d50957fa1c) Thanks [@anerli](https://github.com/anerli)! - local
+
 ## 0.0.1-alpha.35
 
 ### Patch Changes
