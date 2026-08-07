@@ -152,6 +152,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
+      - run: bun run packages/version/scripts/generate-version.ts
       - uses: actions/download-artifact@v4
         with:
           pattern: host-*
@@ -167,7 +168,6 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-      - run: bun run packages/version/scripts/generate-version.ts
       - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
       - name: Commit-point recheck
         run: bun run packages/release/scripts/preflight.ts
