@@ -9,6 +9,7 @@ import {
   makeAcnJitRuntime,
   makeLocalAcnInstanceManager,
 } from "@magnitudedev/sdk"
+import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
 import { Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
 import {
   mkdir,
@@ -102,7 +103,11 @@ const manager = await Effect.runPromise(
   makeLocalAcnInstanceManager({ dataDir }).pipe(
     Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
     Effect.provideService(Scope.Scope, ensurerScope),
-    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+    Effect.provide([
+      BunContext.layer,
+      FetchHttpClient.layer,
+      BunSqliteDriverLayer,
+    ]),
   ),
 )
 
