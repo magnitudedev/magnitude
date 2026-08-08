@@ -93,6 +93,10 @@ newer unsupported selection, and launchable absence. Every state has an explicit
 deadline. One ensurance occurrence launches at most one candidate and cannot silently turn a failed
 launch into a respawn.
 
+Candidate stderr is drained while the process runs and retained only as a bounded tail. A candidate
+exit reports its exit code and retained diagnostic instead of being collapsed into generic
+coordination loss.
+
 Because selection and owner are separate ordinary reads, observation uses an owner–selection–owner
 sandwich. If the complete owner differs, the manager re-observes instead of interpreting a mixed
 pair. Mutation and final ready adoption then perform the narrower rereads required by their action.

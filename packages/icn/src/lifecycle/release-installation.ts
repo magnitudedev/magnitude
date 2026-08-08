@@ -22,7 +22,7 @@ import {
 import { IcnPreparationReporter } from "./preparation.js"
 import { installationLoaderEnvironment } from "./installation-environment.js"
 import { selectCudaArtifact } from "./cuda-compatibility.js"
-import { Data, Effect, Option, Schema } from "effect"
+import { Data, Effect, Fiber, Option, Schema, Stream } from "effect"
 type SelectedBackend = {
   readonly backend: "cpu" | "metal" | "cuda" | "vulkan"
   readonly pack: Option.Option<ReleaseArtifact>
@@ -49,6 +49,19 @@ const installationError = (
 const executableName = () =>
   process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn"
 
+const MAXIMUM_COMMAND_OUTPUT = 64 * 1024
+
+const outputTail = (stream: Stream.Stream<Uint8Array, unknown>): Effect.Effect<string, unknown> =>
+  stream.pipe(
+    Stream.decodeText(),
+    Stream.runFold("", (tail, chunk) => {
+      const combined = tail + chunk
+      return combined.length <= MAXIMUM_COMMAND_OUTPUT
+        ? combined
+        : combined.slice(combined.length - MAXIMUM_COMMAND_OUTPUT)
+    }),
+  )
+
 const run = (
   command: readonly [string, ...string[]],
   environment: Readonly<Record<string, string>>
@@ -57,13 +70,38 @@ const run = (
   ReleaseIcnInstallationError,
   CommandExecutor.CommandExecutor
 > =>
-  Command.make(...command).pipe(
-    Command.env(environment),
-    Command.string,
-    Effect.timeout("15 seconds"),
-    Effect.mapError(() =>
-      installationError("probe", `ICN command failed: ${command[1] ?? ""}`)
-    )
+  Effect.scoped(Effect.gen(function* () {
+    const process = yield* Command.start(Command.make(...command).pipe(
+      Command.env(environment),
+    ))
+    const stdout = yield* outputTail(process.stdout).pipe(Effect.forkScoped)
+    const stderr = yield* outputTail(process.stderr).pipe(Effect.forkScoped)
+    const exitCode = Number(yield* process.exitCode)
+    const [stdoutText, stderrText] = yield* Effect.all([
+      Fiber.join(stdout),
+      Fiber.join(stderr),
+    ])
+    if (exitCode !== 0) {
+      return yield* installationError(
+        "probe",
+        `ICN command ${command[1] ?? ""} exited with code ${exitCode}${stderrText.trim() ? `:\n${stderrText.trim()}` : ""}`,
+      )
+    }
+    return stdoutText
+  })).pipe(
+    Effect.mapError((cause) => cause instanceof ReleaseIcnInstallationError
+      ? cause
+      : installationError(
+        "probe",
+        `ICN command ${command[1] ?? ""} failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      )),
+    Effect.timeoutFail({
+      duration: "15 seconds",
+      onTimeout: () => installationError(
+        "probe",
+        `ICN command ${command[1] ?? ""} timed out`,
+      ),
+    }),
   )
 
 const isNonEmptyFile = (
@@ -168,11 +206,13 @@ const readIdentity = (
 > =>
   Effect.gen(function* () {
     const path = yield* Path.Path
-    const value = yield* run(
+    const output = yield* run(
       [path.join(base, "bin", executableName()), "version", "--json"],
       installationLoaderEnvironment(path.join(base, "runtime"))
+    )
+    const value = yield* Schema.decodeUnknown(Schema.parseJson(IcnBinaryIdentity))(
+      output,
     ).pipe(
-      Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(IcnBinaryIdentity))),
       Effect.mapError(() =>
         installationError("verify", "ICN base identity is malformed")
       )
@@ -225,17 +265,17 @@ const selectBackend = (
 > =>
   Effect.gen(function* () {
     const path = yield* Path.Path
-    const report = yield* run(
+    const output = yield* run(
       [
         path.join(base, "bin", executableName()),
         "backend-eligibility",
         "--json",
       ],
       installationLoaderEnvironment(path.join(base, "runtime"))
-    ).pipe(
-      Effect.flatMap(
-        Schema.decodeUnknown(Schema.parseJson(BackendEligibilityReport))
-      ),
+    )
+    const report = yield* Schema.decodeUnknown(
+      Schema.parseJson(BackendEligibilityReport),
+    )(output).pipe(
       Effect.mapError(() =>
         installationError(
           "probe",

@@ -24,6 +24,7 @@ jobs:
     outputs:
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
+      linuxHosts: ${{ steps.matrix.outputs.linuxHosts }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -128,7 +129,24 @@ jobs:
           echo "CXX=clang++" >> "$GITHUB_ENV"
       - name: Install Linux Vulkan tools
         if: runner.os == 'Linux' && matrix.backend == 'vulkan'
-        run: sudo apt-get install -y libvulkan-dev glslc spirv-headers
+        shell: bash
+        run: |
+          sudo apt-get install -y libvulkan-dev spirv-headers ninja-build python3
+          shaderc_root="$RUNNER_TEMP/shaderc-v2023.8"
+          git clone --filter=blob:none https://github.com/google/shaderc.git "$shaderc_root"
+          git -C "$shaderc_root" checkout --detach f8a25c591bf5edbb462ca4aea99dcc666f096d13
+          python3 "$shaderc_root/utils/git-sync-deps"
+          cmake \
+            -S "$shaderc_root" \
+            -B "$shaderc_root/build" \
+            -G Ninja \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D SHADERC_SKIP_TESTS=ON \
+            -D SHADERC_SKIP_EXAMPLES=ON
+          cmake --build "$shaderc_root/build" --target glslc_exe
+          test -x "$shaderc_root/build/glslc/glslc"
+          "$shaderc_root/build/glslc/glslc" --version
+          echo "$shaderc_root/build/glslc" >> "$GITHUB_PATH"
       - name: Install Windows Vulkan SDK
         if: runner.os == 'Windows' && matrix.backend == 'vulkan'
         shell: pwsh
@@ -187,10 +205,30 @@ jobs:
           path: release/${{ matrix.id }}/
           if-no-files-found: error
 
+  linux-consumer:
+    needs: [matrix, host]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.linuxHosts) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-${{ matrix.id }}
+          path: release/${{ matrix.id }}
+      - run: bun run packages/release/scripts/validate-host.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+
   candidate:
-    needs: [matrix, host, backend]
+    needs: [matrix, host, backend, linux-consumer]
     if: inputs.validate_candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -203,6 +241,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global "npm@${NPM_VERSION}"
+      - run: sudo apt-get update && sudo apt-get install -y binutils
       - run: bun install --frozen-lockfile
       - run: bun run packages/version/scripts/generate-version.ts
       - uses: actions/download-artifact@v4

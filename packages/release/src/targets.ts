@@ -67,7 +67,7 @@ export const releaseHosts = [
   },
   {
     id: "linux-arm64-gnu",
-    runner: "ubuntu-24.04-arm",
+    runner: "ubuntu-22.04-arm",
     bunTarget: "bun-linux-arm64",
     rustTarget: "aarch64-unknown-linux-gnu",
     executableExtension: "",
@@ -75,7 +75,7 @@ export const releaseHosts = [
   },
   {
     id: "linux-x64-gnu",
-    runner: "ubuntu-latest",
+    runner: "ubuntu-22.04",
     bunTarget: "bun-linux-x64-baseline",
     rustTarget: "x86_64-unknown-linux-gnu",
     executableExtension: "",
@@ -99,11 +99,11 @@ const cudaBuilds = [
 const cudaHosts = [
   {
     host: "linux-arm64-gnu",
-    runners: { "11.8": "ubuntu-22.04-arm", "12.9": "ubuntu-24.04-arm" },
+    runners: { "11.8": "ubuntu-22.04-arm", "12.9": "ubuntu-22.04-arm" },
   },
   {
     host: "linux-x64-gnu",
-    runners: { "11.8": "ubuntu-22.04", "12.9": "ubuntu-24.04" },
+    runners: { "11.8": "ubuntu-22.04", "12.9": "ubuntu-22.04" },
   },
 ] as const
 
@@ -137,7 +137,7 @@ export const backendPacks: readonly BackendPack[] = [
     id: "vulkan1-linux-arm64-gnu",
     host: "linux-arm64-gnu",
     backend: "vulkan",
-    runner: "ubuntu-24.04-arm",
+    runner: "ubuntu-22.04-arm",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
     runtimeLibraries: [],
@@ -147,7 +147,7 @@ export const backendPacks: readonly BackendPack[] = [
     id: "vulkan1-linux-x64-gnu",
     host: "linux-x64-gnu",
     backend: "vulkan",
-    runner: "ubuntu-latest",
+    runner: "ubuntu-22.04",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
     runtimeLibraries: [],

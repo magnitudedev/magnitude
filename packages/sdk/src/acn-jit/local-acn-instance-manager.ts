@@ -99,7 +99,12 @@ type ConvergenceState =
     }
   | { readonly _tag: "OwnerWithoutSelection"; readonly owner: AcnOwnerRecord }
   | { readonly _tag: "CandidatePending" }
-  | { readonly _tag: "CandidateExited"; readonly candidate: LaunchedCandidate }
+  | {
+      readonly _tag: "CandidateExited"
+      readonly candidate: LaunchedCandidate
+      readonly code: number
+      readonly stderr: string
+    }
   | { readonly _tag: "CandidateAdmissionExpired"; readonly candidate: LaunchedCandidate }
   | { readonly _tag: "AwaitingNewerSelectedOwner" }
   | { readonly _tag: "LaunchCandidate" }
@@ -399,7 +404,9 @@ export const makeLocalAcnInstanceManager = (
         if (Option.isSome(launched)) {
           const candidate = launched.value
           const exited = yield* candidate.child.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
-          if (Option.isSome(exited)) return { _tag: "CandidateExited", candidate }
+          if (Option.isSome(exited)) {
+            return { _tag: "CandidateExited", candidate, ...exited.value }
+          }
           return now - candidate.launchedAt >= Duration.toMillis(CANDIDATE_ADMISSION_TIMEOUT)
             ? { _tag: "CandidateAdmissionExpired", candidate }
             : { _tag: "CandidatePending" }
@@ -524,8 +531,8 @@ export const makeLocalAcnInstanceManager = (
             })),
           Match.tag("CandidatePending", () =>
             Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
-          Match.tag("CandidateExited", ({ candidate }) => Effect.fail(new AcnEnsuranceFailed({
-            reason: `ACN candidate ${candidate.process.pid} exited before admission`,
+          Match.tag("CandidateExited", ({ candidate, code, stderr }) => Effect.fail(new AcnEnsuranceFailed({
+            reason: `ACN candidate ${candidate.process.pid} exited with code ${code} before admission${stderr ? `:\n${stderr}` : ""}`,
           }))),
           Match.tag("CandidateAdmissionExpired", ({ candidate }) => Effect.fail(new AcnEnsuranceFailed({
             reason: `ACN candidate ${candidate.process.pid} did not commit admission`,
@@ -554,16 +561,21 @@ export const makeLocalAcnInstanceManager = (
             }
             const child = yield* spawner.spawn(argv)
             hasLaunched = true
-            const identity = yield* inspectProcess(processes, child.pid).pipe(
-              Effect.flatMap(Option.match({
-                onNone: () => Effect.fail(new AcnEnsuranceFailed({
-                  reason: `Spawned ACN ${child.pid} exited before identity inspection`,
-                })),
-                onSome: Effect.succeed,
-              })),
-            )
+            const identity = yield* inspectProcess(processes, child.pid)
+            if (Option.isNone(identity)) {
+              const exit = yield* child.exited.pipe(
+                Effect.timeoutOption(Duration.millis(100)),
+              )
+              return yield* new AcnEnsuranceFailed({
+                reason: Option.match(exit, {
+                  onNone: () => `Spawned ACN ${child.pid} exited before identity inspection`,
+                  onSome: ({ code, stderr }) =>
+                    `Spawned ACN ${child.pid} exited with code ${code} before identity inspection${stderr ? `:\n${stderr}` : ""}`,
+                }),
+              })
+            }
             launched = Option.some({
-              process: { pid: child.pid, processStartIdentity: identity },
+              process: { pid: child.pid, processStartIdentity: identity.value },
               child,
               launchedAt: now,
             })
