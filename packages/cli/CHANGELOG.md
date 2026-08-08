@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.40
+
+### Patch Changes
+
+- [`fedb8dc`](https://github.com/magnitudedev/magnitude/commit/fedb8dc8b56315d8b799d4bd4f556ee16b6db935) Thanks [@anerli](https://github.com/anerli)! - fix: remove unnecessary acn coordination historical revision check
+
+- [`c7d2298`](https://github.com/magnitudedev/magnitude/commit/c7d2298b503f7d8852572488746a6adbca43120f) Thanks [@anerli](https://github.com/anerli)! - improve icn lifecycle error specificity
+
 ## 0.0.1-alpha.39
 
 ### Patch Changes
