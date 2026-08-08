@@ -7,7 +7,7 @@ let cleanupRan = false
  * Reset terminal state by writing escape sequences.
  * This ensures the terminal is left in a usable state after exit.
  */
-function restoreTerminalState() {
+export function restoreTerminalState() {
   const sequences = [
     '\x1b[?1000l', // Disable X10 mouse mode
     '\x1b[?1002l', // Disable button event mouse mode
@@ -75,22 +75,39 @@ export function installGracefulShutdownHandlers(
   afterCleanup?: () => void,
 ) {
   const cleanup = (code: number) => () => { performCleanupAndExit(renderer, code, beforeExit, afterCleanup) }
-
-  process.on('SIGTERM', cleanup(0))
-  process.on('SIGHUP', cleanup(0))
-  process.on('SIGINT', cleanup(0))
-  process.on('beforeExit', cleanup(0))
-  process.on('exit', () => {
+  const onSigterm = cleanup(0)
+  const onSighup = cleanup(0)
+  const onSigint = cleanup(0)
+  const onBeforeExit = cleanup(0)
+  const onExit = () => {
     // On exit, we can only do synchronous cleanup
     if (!cleanupRan) {
       cleanupRan = true
       restoreTerminalState()
     }
-  })
-  process.on('uncaughtException', (err) => {
+  }
+  const onUncaughtException = (err: unknown) => {
     handleCrashAndExit(renderer, 'Uncaught exception', err)
-  })
-  process.on('unhandledRejection', (reason) => {
+  }
+  const onUnhandledRejection = (reason: unknown) => {
     handleCrashAndExit(renderer, 'Unhandled rejection', reason)
-  })
+  }
+
+  process.on('SIGTERM', onSigterm)
+  process.on('SIGHUP', onSighup)
+  process.on('SIGINT', onSigint)
+  process.on('beforeExit', onBeforeExit)
+  process.on('exit', onExit)
+  process.on('uncaughtException', onUncaughtException)
+  process.on('unhandledRejection', onUnhandledRejection)
+
+  return () => {
+    process.off('SIGTERM', onSigterm)
+    process.off('SIGHUP', onSighup)
+    process.off('SIGINT', onSigint)
+    process.off('beforeExit', onBeforeExit)
+    process.off('exit', onExit)
+    process.off('uncaughtException', onUncaughtException)
+    process.off('unhandledRejection', onUnhandledRejection)
+  }
 }

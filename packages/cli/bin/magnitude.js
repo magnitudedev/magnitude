@@ -4,8 +4,75 @@
 ':' //; echo "Magnitude requires Node.js or Bun to start." >&2; exit 127
 
 const { ensureBinary } = require('../lib/download.js');
+const { existsSync, realpathSync } = require('fs');
+const path = require('path');
 
 const version = require('../package.json').version;
+const magnitudePackageRoot = realpathSync(path.join(__dirname, '..'));
+
+function isPnpmOwnedMagnitudeInstall(nodeModulesDir) {
+  if (!existsSync(path.join(nodeModulesDir, '.modules.yaml'))) {
+    return false;
+  }
+
+  try {
+    return realpathSync(path.join(nodeModulesDir, '@magnitudedev', 'cli')) ===
+      magnitudePackageRoot;
+  } catch {
+    return false;
+  }
+}
+
+function detectPackageManager() {
+  const entrypointDir = path.dirname(path.resolve(process.argv[1]));
+  for (const startDir of new Set([magnitudePackageRoot, entrypointDir])) {
+    const filesystemRoot = path.parse(startDir).root;
+    for (
+      let currentDir = startDir;
+      currentDir !== filesystemRoot;
+      currentDir = path.dirname(currentDir)
+    ) {
+      if (isPnpmOwnedMagnitudeInstall(path.join(currentDir, 'node_modules'))) {
+        return 'pnpm';
+      }
+    }
+
+    if (isPnpmOwnedMagnitudeInstall(path.join(filesystemRoot, 'node_modules'))) {
+      return 'pnpm';
+    }
+  }
+
+  const userAgent = process.env.npm_config_user_agent || '';
+  if (/\bbun\//.test(userAgent)) return 'bun';
+
+  const execPath = process.env.npm_execpath || '';
+  if (execPath.includes('bun')) return 'bun';
+
+  if (
+    __dirname.includes('.bun/install/global') ||
+    __dirname.includes('.bun\\install\\global')
+  ) return 'bun';
+
+  return userAgent ? 'npm' : null;
+}
+
+function managedEnvironment() {
+  const packageManager = detectPackageManager();
+  const variable = packageManager === 'bun'
+    ? 'MAGNITUDE_MANAGED_BY_BUN'
+    : packageManager === 'pnpm'
+      ? 'MAGNITUDE_MANAGED_BY_PNPM'
+      : 'MAGNITUDE_MANAGED_BY_NPM';
+  const environment = {
+    ...process.env,
+    MAGNITUDE_MANAGED_PACKAGE_ROOT: magnitudePackageRoot,
+  };
+  delete environment.MAGNITUDE_MANAGED_BY_NPM;
+  delete environment.MAGNITUDE_MANAGED_BY_BUN;
+  delete environment.MAGNITUDE_MANAGED_BY_PNPM;
+  environment[variable] = '1';
+  return environment;
+}
 
 async function main() {
   try {
@@ -14,7 +81,7 @@ async function main() {
     // Spawn the binary with inherited stdio
     const result = require('child_process').spawnSync(binaryPath, process.argv.slice(2), {
       stdio: 'inherit',
-      env: process.env,
+      env: managedEnvironment(),
     });
     
     process.exit(result.status ?? 1);

@@ -166,7 +166,10 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded).toEqual({ onboarding: Option.none() })
+    expect(loaded).toEqual({
+      onboarding: Option.none(),
+      checkForUpdateOnStartup: Option.none(),
+    })
     expect(await Bun.file(paths.configFile).json()).toEqual({})
     const backup = (await readdir(root)).find((name) => name.startsWith("config.json.corrupt-"))
     expect(backup).toBeDefined()
@@ -183,7 +186,10 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded).toEqual({ onboarding: Option.none() })
+    expect(loaded).toEqual({
+      onboarding: Option.none(),
+      checkForUpdateOnStartup: Option.none(),
+    })
     const backup = (await readdir(root)).find((name) => name.startsWith("config.json.corrupt-"))
     expect(backup).toBeDefined()
     expect(await readFile(join(root, backup!), "utf8")).toBe(original)
@@ -239,6 +245,7 @@ describe("config storage onboarding state", () => {
       yield* config.save({
         contextLimits: { softCapRatio: 0, softCapMaxTokens: null },
         onboarding: Option.none(),
+        checkForUpdateOnStartup: Option.none(),
       })
       yield* Effect.all(
         Array.from({ length: 20 }, () => config.update((current) => ({

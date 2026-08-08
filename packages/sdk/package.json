@@ -36,6 +36,7 @@
     "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/release": "workspace:*",
     "@magnitudedev/storage": "workspace:*",
+    "semver": "^7.7.3",
 
     "@magnitudedev/roles": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
@@ -43,6 +44,7 @@
   },
   "devDependencies": {
     "@effect/platform-bun": "^0.90.0",
+    "@types/semver": "^7.7.1",
     "vitest": "^3.2.4"
   }
 }

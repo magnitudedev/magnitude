@@ -53,5 +53,6 @@ A conforming release satisfies all of the following:
 The concrete host dependency contracts are defined in
 [Platform contracts](./platform-contracts.md). Build acceptance is defined in
 [Build and validation](./build-and-validation.md). Runtime installation is defined in
-[Acquisition](./acquisition.md), and remote publication is defined in
+[Acquisition](./acquisition.md), native CLI package-manager updates are defined in
+[CLI updates](./client-updates.md), and remote publication is defined in
 [Publication](./publication.md).

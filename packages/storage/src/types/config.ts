@@ -77,6 +77,10 @@ export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   models: Schema.optional(ModelConfigSchema),
   onboarding: Schema.optionalWith(OnboardingConfigSchema, { as: 'Option', exact: true }),
+  checkForUpdateOnStartup: Schema.optionalWith(Schema.Boolean, {
+    as: 'Option',
+    exact: true,
+  }),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>
