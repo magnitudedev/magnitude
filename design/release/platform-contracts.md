@@ -57,7 +57,8 @@ Both `linux-x64-gnu` and `linux-arm64-gnu` target Ubuntu 22.04-compatible usersp
 | Maximum glibc requirement | `GLIBC_2.35` | `GLIBC_2.35` |
 | Maximum libstdc++ requirement | `GLIBCXX_3.4.30` | `GLIBCXX_3.4.30` |
 
-Linux artifacts may dynamically require only these platform libraries:
+Linux artifacts may dynamically require their architecture's interpreter listed above and only
+these platform libraries:
 
 - `libc.so.6`
 - `libdl.so.2`

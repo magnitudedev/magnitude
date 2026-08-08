@@ -42,11 +42,7 @@ ELF file is inspected with `readelf`; release inputs are never executed through 
 Assembly rejects:
 
 - the wrong ELF class, machine architecture, or program interpreter;
-- glibc requirements above 2.35 or GLIBCXX requirements above 3.4.30;
-- absolute, build-host, or non-installation-relative loader paths;
-- conflicting providers for one filename or SONAME;
-- dependencies not supplied by the artifact composition or allowed by its platform contract; and
-- CUDA or Vulkan driver dependencies in a CPU composition.
+- glibc requirements above 2.35 or GLIBCXX requirements above 3.4.30.
 
 Archive layout, artifact size and digest, native-build identity, backend ABI, planner-input equality,
 and backend compatibility metadata are also validated before the manifest is emitted.
