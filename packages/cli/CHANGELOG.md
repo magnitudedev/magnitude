@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.38
+
+### Patch Changes
+
+- [`b0e72cc`](https://github.com/magnitudedev/magnitude/commit/b0e72cc96232d81967eeb969468a51de30ca643a) Thanks [@anerli](https://github.com/anerli)! - fix: build linux with ubuntu 22 to lower floor of required glibc support
+
 ## 0.0.1-alpha.37
 
 ### Patch Changes
