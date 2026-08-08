@@ -53,7 +53,6 @@ import {
 } from "./errors"
 import {
   acnLifecycleObservationFromHealthState,
-  acnStartupProgressKey,
 } from "./lifecycle"
 
 type ReadyInstance = AcnInstance<AcnReady>
@@ -197,7 +196,8 @@ const artifactProgress = (
 const sameTarget = (left: AcnTarget, right: AcnTarget): boolean =>
   left.revision === right.revision && left.identity === right.identity
 
-export const makeLocalAcnInstanceManager = (
+/** @internal Effect-DI constructor used by the live wrapper and deterministic tests. */
+export const makeLocalAcnInstanceManagerWithProcessController = (
   options: LocalAcnInstanceManagerOptions = {},
 ): Effect.Effect<
   AcnInstanceManager,
@@ -208,6 +208,7 @@ export const makeLocalAcnInstanceManager = (
   | Path.Path
   | ChildProcessSpawner
   | SqliteDriver
+  | ExactProcessController
   | Scope.Scope
 > => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -379,10 +380,10 @@ export const makeLocalAcnInstanceManager = (
       let prepared = Option.none<PreparedCommand>()
       let launched = Option.none<LaunchedCandidate>()
       let hasLaunched = false
-      let stateOwner = ""
-      let stateKey = ""
-      let stateSince = yield* monotonicMillis
-      let ownerObservedAt = stateSince
+      let observedOwner = ""
+      let observedHealthState = ""
+      let observedHealthStateSince = yield* monotonicMillis
+      let ownerObservedAt = observedHealthStateSince
 
       const prepare = Effect.gen(function* () {
         if (Option.isSome(prepared)) return prepared.value
@@ -455,8 +456,8 @@ export const makeLocalAcnInstanceManager = (
                 return { _tag: "SurvivingPredecessorTree", owner: current }
               }
               if (treeAbsent) {
-                stateOwner = ""
-                stateKey = ""
+                observedOwner = ""
+                observedHealthState = ""
                 return yield* classifyWithoutLiveOwner(selected, now)
               }
               return yield* Option.match(selected, {
@@ -490,16 +491,15 @@ export const makeLocalAcnInstanceManager = (
           Match.tag("ObservableOwner", ({ owner, selected, observed, now }) =>
             Effect.gen(function* () {
               const currentOwnerKey = ownerKey(owner)
-              const nextStateKey = Option.match(observed, {
+              const nextHealthState = Option.match(observed, {
                 onNone: () => "Unavailable",
-                onSome: ({ health, status }) =>
-                  `${status}:${health.revision}:${acnStartupProgressKey(health.state)}`,
+                onSome: ({ health }) => health.state._tag,
               })
-              if (stateOwner !== currentOwnerKey || stateKey !== nextStateKey) {
-                if (stateOwner !== currentOwnerKey) ownerObservedAt = now
-                stateOwner = currentOwnerKey
-                stateKey = nextStateKey
-                stateSince = now
+              if (observedOwner !== currentOwnerKey || observedHealthState !== nextHealthState) {
+                if (observedOwner !== currentOwnerKey) ownerObservedAt = now
+                observedOwner = currentOwnerKey
+                observedHealthState = nextHealthState
+                observedHealthStateSince = now
               }
               if (Option.isSome(observed)) {
                 const { health, status } = observed.value
@@ -516,17 +516,14 @@ export const makeLocalAcnInstanceManager = (
                 if (health.state._tag === "Starting" &&
                   now - ownerObservedAt >= Duration.toMillis(STARTUP_CEILING)) {
                   yield* retireOwner(owner)
-                  return yield* Effect.fail(new AcnEnsuranceFailed({
+                  return yield* new AcnEnsuranceFailed({
                     reason: "Magnitude daemon did not become ready within the startup deadline",
-                  }))
+                  })
                 }
               }
-              // Live Starting health is bounded only by STARTUP_CEILING. Long install
-              // phases (Resolving, PreparingBackend, Starting) often hold a stable
-              // progress key for more than HEALTH_GRACE while still making progress;
-              // retiring them produces the cryptic "candidate … no longer available"
-              // failure during first install. HEALTH_GRACE applies when health is
-              // unobservable or the owner is Stopping.
+              // Live Starting health is bounded only by STARTUP_CEILING. Progress is
+              // presentation-only and cannot establish liveness. Unobservable health
+              // uses HEALTH_GRACE, while Stopping uses STOPPING_GRACE.
               const grace = Option.match(observed, {
                 onNone: () => Option.some(HEALTH_GRACE),
                 onSome: ({ health }) =>
@@ -536,7 +533,8 @@ export const makeLocalAcnInstanceManager = (
                       ? Option.none<Duration.Duration>()
                       : Option.some(HEALTH_GRACE),
               })
-              if (Option.isSome(grace) && now - stateSince >= Duration.toMillis(grace.value)) {
+              if (Option.isSome(grace) &&
+                now - observedHealthStateSince >= Duration.toMillis(grace.value)) {
                 yield* retireOwner(owner)
               } else {
                 yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
@@ -633,4 +631,10 @@ export const makeLocalAcnInstanceManager = (
       })))
 
   return AcnInstanceManager.of({ ensure, stop })
-}).pipe(Effect.provideService(ExactProcessController, ExactProcessControllerLive))
+})
+
+export const makeLocalAcnInstanceManager = (
+  options: LocalAcnInstanceManagerOptions = {},
+) => makeLocalAcnInstanceManagerWithProcessController(options).pipe(
+  Effect.provideService(ExactProcessController, ExactProcessControllerLive),
+)

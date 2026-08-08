@@ -1,29 +1,97 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import { FetchHttpClient } from "@effect/platform"
+import * as HttpClient from "@effect/platform/HttpClient"
+import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import { BunContext } from "@effect/platform-bun"
 import {
   AcnIdentitySchema,
+  AcnHealthResponseSchema,
   AcnInstanceIdSchema,
   AcnReady,
   AcnRevisionSchema,
   AcnStarting,
+  AcnStopping,
+  type AcnHealthState,
+  type AcnInstanceId,
   type AcnTarget,
 } from "@magnitudedev/acn-protocol"
 import {
+  ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
   makeAcnRevisionStore,
 } from "@magnitudedev/acn-protocol/coordination"
-import { Duration, Effect, Exit, Fiber, Layer, Option, TestClock, TestContext } from "effect"
+import { Duration, Effect, Exit, Fiber, Layer, Option, Schema, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { runAcnEnsure } from "./acn-instance-manager"
 import { ChildProcessSpawner } from "./child-process"
 import { AcnEnsuranceFailed } from "./errors"
-import { makeLocalAcnInstanceManager } from "./local-acn-instance-manager"
+import {
+  makeLocalAcnInstanceManager,
+  makeLocalAcnInstanceManagerWithProcessController,
+} from "./local-acn-instance-manager"
 import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bun"
 import { SDK_ACN_TARGET, SDK_VERSION } from "../version"
 
 const platform = Layer.mergeAll(BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer)
+
+const makeExactProcessFixture = Effect.gen(function* () {
+  const exact = yield* ExactProcessControllerLive.current
+  let live = true
+  const stop = () => { live = false }
+  const controller = ExactProcessController.of({
+    inspect: (pid) => Effect.succeed(pid === exact.pid && live
+      ? Option.some(exact.processStartIdentity)
+      : Option.none()),
+    current: Effect.succeed(exact),
+    signal: () => Effect.sync(() => {
+      const wasLive = live
+      stop()
+      return wasLive
+    }),
+    signalTree: () => Effect.sync(() => {
+      const wasLive = live
+      stop()
+      return wasLive
+    }),
+    treeAbsent: () => Effect.succeed(!live),
+  })
+  return { controller, exact, stop }
+})
+
+const makeOwnerHttp = (
+  owner: { readonly pid: number },
+  id: AcnInstanceId,
+  health: () => Option.Option<{ readonly status: number; readonly state: AcnHealthState }>,
+  stopOwner: () => void,
+) => {
+  const requests = { health: 0, shutdown: 0 }
+  const client = HttpClient.make((request) => Effect.sync(() => {
+    if (request.method === "POST") {
+      requests.shutdown += 1
+      stopOwner()
+      return HttpClientResponse.fromWeb(request, Response.json({}))
+    }
+    requests.health += 1
+    const observed = health()
+    if (Option.isNone(observed)) {
+      return HttpClientResponse.fromWeb(request, new Response("not health json", { status: 503 }))
+    }
+    const response = Schema.encodeSync(AcnHealthResponseSchema)({
+      service: "magnitude-acn",
+      version: SDK_VERSION,
+      revision: SDK_ACN_TARGET.revision,
+      id,
+      pid: owner.pid,
+      state: observed.value.state,
+    })
+    return HttpClientResponse.fromWeb(request, new Response(JSON.stringify(response), {
+      status: observed.value.status,
+      headers: { "content-type": "application/json" },
+    }))
+  }))
+  return { client, requests }
+}
 
 describe("LocalAcnInstanceManager", () => {
   it("adopts a newer selected owner without resolving or spawning the caller's older artifact", async () => {
@@ -206,33 +274,18 @@ describe("LocalAcnInstanceManager", () => {
     }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
   })
 
-  it("does not retire a live Starting owner when its progress key is stable past health grace", async () => {
+  it("does not retire a live Starting owner when its activity is stable past health grace", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-starting-grace-" })
-      const exact = yield* ExactProcessControllerLive.current
+      const processFixture = yield* makeExactProcessFixture
+      const exact = processFixture.exact
       const id = AcnInstanceIdSchema.make("starting-owner")
       let ready = false
-      const server = Bun.serve({
-        hostname: "127.0.0.1",
-        port: 0,
-        fetch: () => {
-          if (ready) {
-            return Response.json({
-              service: "magnitude-acn",
-              version: SDK_VERSION,
-              revision: SDK_ACN_TARGET.revision,
-              id,
-              pid: exact.pid,
-              state: new AcnReady({}),
-            })
-          }
-          return new Response(JSON.stringify({
-            service: "magnitude-acn",
-            version: SDK_VERSION,
-            revision: SDK_ACN_TARGET.revision,
-            id,
-            pid: exact.pid,
+      const http = makeOwnerHttp(exact, id, () => Option.some(ready
+        ? { status: 200, state: new AcnReady({}) }
+        : {
+            status: 503,
             state: new AcnStarting({
               activity: {
                 _tag: "PreparingBackend",
@@ -240,40 +293,153 @@ describe("LocalAcnInstanceManager", () => {
               },
               progress: Option.none(),
             }),
-          }), {
-            status: 503,
-            headers: { "content-type": "application/json" },
-          })
-        },
-      })
-      yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
-      if (server.port === undefined) return yield* Effect.dieMessage("test server has no TCP port")
+          }), processFixture.stop)
       const revisions = yield* makeAcnRevisionStore(dataDir)
       const owners = yield* makeAcnOwnerStore(dataDir)
       yield* revisions.register(SDK_ACN_TARGET.revision)
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: server.port }, SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
 
-      const manager = yield* makeLocalAcnInstanceManager({
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
         dataDir,
         binaryPath: `${dataDir}/must-not-be-resolved`,
-      }).pipe(Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
-        spawn: () => Effect.dieMessage("live starting owner must not spawn"),
-      })))
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http.client),
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.dieMessage("live starting owner must not spawn"),
+        })),
+      )
 
       const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(
         Effect.fork,
       )
-      // Let real async process inspect / health complete before advancing TestClock.
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 100)))
-      // Beyond former HEALTH_GRACE (30s): still Starting with a stable progress key.
+      while (http.requests.health === 0) yield* Effect.yieldNow()
+      // Beyond former HEALTH_GRACE (30s): still Starting with stable activity.
       // Under the old policy this would retire the owner and fail install.
       yield* TestClock.adjust(Duration.seconds(45))
+      expect(http.requests.shutdown).toBe(0)
       ready = true
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)))
-      // Advance past coordination polls so ensure observes Ready.
-      yield* TestClock.adjust(Duration.seconds(2))
+      yield* TestClock.adjust(Duration.seconds(1))
       const result = yield* Fiber.join(ensuring)
       expect(result.id).toBe(id)
+    }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
+  })
+
+  it("fails a continuously observable Starting owner at the absolute startup ceiling", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-startup-ceiling-" })
+      const processFixture = yield* makeExactProcessFixture
+      const exact = processFixture.exact
+      const id = AcnInstanceIdSchema.make("startup-ceiling-owner")
+      const http = makeOwnerHttp(exact, id, () => Option.some({
+        status: 503,
+        state: new AcnStarting({ activity: "Resolving", progress: Option.none() }),
+      }), processFixture.stop)
+      const revisions = yield* makeAcnRevisionStore(dataDir)
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      yield* revisions.register(SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        binaryPath: `${dataDir}/must-not-be-resolved`,
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http.client),
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.dieMessage("expired starting owner must not spawn"),
+        })),
+      )
+
+      const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(
+        Effect.either,
+        Effect.fork,
+      )
+      while (http.requests.health === 0) yield* Effect.yieldNow()
+      yield* TestClock.adjust(Duration.seconds(298))
+      expect(http.requests.shutdown).toBe(0)
+      yield* TestClock.adjust(Duration.seconds(3))
+      while (http.requests.shutdown === 0) yield* Effect.yieldNow()
+      yield* TestClock.adjust(Duration.seconds(1))
+      const result = yield* Fiber.join(ensuring)
+      expect(result).toMatchObject({
+        _tag: "Left",
+        left: { reason: "Magnitude daemon did not become ready within the startup deadline" },
+      })
+    }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
+  }, 15_000)
+
+  it("retires an owner only after health is continuously unobservable for health grace", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-health-grace-" })
+      const processFixture = yield* makeExactProcessFixture
+      const exact = processFixture.exact
+      const id = AcnInstanceIdSchema.make("unobservable-owner")
+      const http = makeOwnerHttp(exact, id, Option.none, processFixture.stop)
+      const revisions = yield* makeAcnRevisionStore(dataDir)
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      yield* revisions.register(SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        binaryPath: `${dataDir}/must-not-be-resolved`,
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http.client),
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.dieMessage("unobservable owner must not spawn during grace"),
+        })),
+      )
+
+      const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.fork)
+      while (http.requests.health === 0) yield* Effect.yieldNow()
+      yield* TestClock.adjust(Duration.seconds(29))
+      expect(http.requests.shutdown).toBe(0)
+      yield* TestClock.adjust(Duration.seconds(2))
+      while (http.requests.shutdown === 0) yield* Effect.yieldNow()
+      expect(http.requests.shutdown).toBe(1)
+      yield* Fiber.interrupt(ensuring)
+    }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
+  })
+
+  it("retires an observable Stopping owner after stopping grace", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-stopping-grace-" })
+      const processFixture = yield* makeExactProcessFixture
+      const exact = processFixture.exact
+      const id = AcnInstanceIdSchema.make("stopping-owner")
+      const http = makeOwnerHttp(exact, id, () => Option.some({
+        status: 503,
+        state: new AcnStopping({
+          reason: "administrative",
+          safeDetail: Option.none(),
+        }),
+      }), processFixture.stop)
+      const revisions = yield* makeAcnRevisionStore(dataDir)
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      yield* revisions.register(SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        binaryPath: `${dataDir}/must-not-be-resolved`,
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http.client),
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.dieMessage("stopping owner must not spawn during grace"),
+        })),
+      )
+
+      const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.fork)
+      while (http.requests.health === 0) yield* Effect.yieldNow()
+      yield* TestClock.adjust(Duration.seconds(4))
+      expect(http.requests.shutdown).toBe(0)
+      yield* TestClock.adjust(Duration.seconds(2))
+      while (http.requests.shutdown === 0) yield* Effect.yieldNow()
+      expect(http.requests.shutdown).toBe(1)
+      yield* Fiber.interrupt(ensuring)
     }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
   })
 

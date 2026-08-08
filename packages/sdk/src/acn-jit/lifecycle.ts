@@ -124,24 +124,6 @@ export const acnLifecycleObservationFromHealthState = (
   return Option.some({ _tag: "Starting", phase: phase[state.activity] });
 };
 
-/** Stable liveness key: changes only for authoritative phase or measured progress. */
-export const acnStartupProgressKey = (state: AcnHealthState): string => {
-  if (state._tag !== "Starting") return state._tag;
-  const activity =
-    typeof state.activity === "string"
-      ? state.activity
-      : state.activity._tag === "PreparingBackend"
-      ? `${state.activity._tag}:${state.activity.backend._tag}:${state.activity.backend.hardwareLabel}`
-      : `${state.activity._tag}:${state.activity.phase}:${state.activity.plan.daemonBytes}:${state.activity.plan.inferenceEngineBytes}`;
-  return Option.match(state.progress, {
-    onNone: () => activity,
-    onSome: (progress) =>
-      `${activity}:${progress.completed}:${progress.totalBytes}:${
-        progress.unit
-      }:${Option.getOrUndefined(progress.attempt) ?? ""}`,
-  });
-};
-
 export interface AcnLifecycle {
   readonly get: Effect.Effect<AcnLifecycleState>;
   readonly changes: Stream.Stream<AcnLifecycleState>;

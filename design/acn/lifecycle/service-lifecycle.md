@@ -47,10 +47,11 @@ the complete application and private ICN exist.
 activity admission before becoming observable. The first stop reason wins; both transitions are
 monotonic and idempotent.
 
-External JIT ensurance treats thirty seconds without authoritative phase change or monotonic
-measured progress as a stalled exact `Starting` instance and begins coordinated replacement. ACN
-independently owns a five-minute absolute application-startup ceiling that never restarts. Expiry
-commits `Stopping(startup-failed)`.
+External JIT ensurance treats observable `Starting` health as live regardless of whether optional
+phase or measured-progress diagnostics change. It bounds startup with an absolute five-minute
+ceiling and separately bounds loss of observable health. ACN independently owns a five-minute
+absolute application-startup ceiling that never restarts. Expiry commits
+`Stopping(startup-failed)`.
 
 ## Activity and idleness
 
