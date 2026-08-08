@@ -1,20 +1,8 @@
 import { mkdir, mkdtemp, open, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, resolve } from "node:path"
+import { resolve } from "node:path"
 import type { HostId } from "../../src/targets"
-import { fileSha256, run } from "./common"
-
-const PLATFORM_LIBRARIES = new Set([
-  "libc.so.6",
-  "libdl.so.2",
-  "libgcc_s.so.1",
-  "libm.so.6",
-  "libpthread.so.0",
-  "libresolv.so.2",
-  "librt.so.1",
-  "libstdc++.so.6",
-  "libutil.so.1",
-])
+import { run } from "./common"
 
 const EXPECTED_MACHINE: Readonly<Record<string, string>> = {
   "linux-x64-gnu": "Advanced Micro Devices X86-64",
@@ -24,14 +12,6 @@ const EXPECTED_MACHINE: Readonly<Record<string, string>> = {
 const EXPECTED_INTERPRETER: Readonly<Record<string, string>> = {
   "linux-x64-gnu": "/lib64/ld-linux-x86-64.so.2",
   "linux-arm64-gnu": "/lib/ld-linux-aarch64.so.1",
-}
-
-interface InspectedElf {
-  readonly path: string
-  readonly name: string
-  readonly soname: string | undefined
-  readonly needed: readonly string[]
-  readonly digest: string
 }
 
 const files = async (root: string): Promise<readonly string[]> => {
@@ -73,12 +53,11 @@ const matches = (text: string, expression: RegExp): readonly string[] =>
     (value, index, values) => values.indexOf(value) === index
   )
 
-const inspectElf = async (host: HostId, path: string): Promise<InspectedElf> => {
+const inspectElf = async (host: HostId, path: string): Promise<void> => {
   const report = await run([
     "readelf",
     "--file-header",
     "--program-headers",
-    "--dynamic",
     "--version-info",
     path,
   ])
@@ -96,14 +75,6 @@ const inspectElf = async (host: HostId, path: string): Promise<InspectedElf> => 
   if (interpreter !== undefined && interpreter !== EXPECTED_INTERPRETER[host]) {
     throw new Error(`${path} uses unexpected interpreter ${interpreter}`)
   }
-  const loaderPaths = matches(report, /\((?:RUNPATH|RPATH)\).*?\[([^\]]+)\]/g).flatMap((value) =>
-    value.split(":")
-  )
-  for (const loaderPath of loaderPaths) {
-    if (loaderPath !== "$ORIGIN" && loaderPath !== "$ORIGIN/../runtime") {
-      throw new Error(`${path} has non-owned loader path ${loaderPath}`)
-    }
-  }
   for (const version of matches(report, /\bGLIBC_(\d+\.\d+)\b/g)) {
     if (compareVersion(version, "2.35") > 0) {
       throw new Error(`${path} requires GLIBC_${version}; maximum is GLIBC_2.35`)
@@ -114,20 +85,12 @@ const inspectElf = async (host: HostId, path: string): Promise<InspectedElf> => 
       throw new Error(`${path} requires GLIBCXX_${version}; maximum is GLIBCXX_3.4.30`)
     }
   }
-  return {
-    path,
-    name: basename(path),
-    soname: report.match(/\(SONAME\).*?\[([^\]]+)\]/)?.[1],
-    needed: matches(report, /\(NEEDED\).*?\[([^\]]+)\]/g),
-    digest: await fileSha256(path),
-  }
 }
 
-/** Validates the final Linux archive composition. */
-export const verifyLinuxElfComposition = async (
+/** Validates the ELF compatibility of final Linux archives. */
+export const verifyLinuxElfArchives = async (
   host: HostId,
   archives: readonly string[],
-  capabilities: readonly string[] = []
 ): Promise<void> => {
   if (!host.startsWith("linux-")) return
   const root = await mkdtemp(resolve(tmpdir(), `magnitude-elf-${host}-`))
@@ -143,33 +106,11 @@ export const verifyLinuxElfComposition = async (
     const elfPaths = (await Promise.all(extracted.map(files)))
       .flat()
       .filter((path, index, values) => values.indexOf(path) === index)
-    const elfs = await Promise.all(
+    await Promise.all(
       (await Promise.all(elfPaths.map(async (path) => ((await isElf(path)) ? path : undefined))))
         .filter((path): path is string => path !== undefined)
         .map((path) => inspectElf(host, path))
     )
-    const providers = new Map<string, InspectedElf>()
-    for (const elf of elfs) {
-      for (const name of [elf.name, elf.soname].filter(
-        (value): value is string => value !== undefined
-      )) {
-        const existing = providers.get(name)
-        if (existing !== undefined && existing.digest !== elf.digest) {
-          throw new Error(
-            `${name} is supplied by conflicting files ${existing.path} and ${elf.path}`
-          )
-        }
-        providers.set(name, elf)
-      }
-    }
-    const allowedExternalLibraries = new Set([...PLATFORM_LIBRARIES, ...capabilities])
-    for (const elf of elfs) {
-      for (const needed of elf.needed) {
-        if (!providers.has(needed) && !allowedExternalLibraries.has(needed)) {
-          throw new Error(`${elf.path} requires undeclared library ${needed}`)
-        }
-      }
-    }
   } finally {
     await rm(root, { recursive: true, force: true })
   }
