@@ -14,8 +14,6 @@ import { FSM } from "@magnitudedev/utils";
 import { dirname, join } from "node:path";
 import {
   Context,
-  Cause,
-  Data,
   Deferred,
   Duration,
   Effect,
@@ -31,6 +29,27 @@ import {
 } from "effect";
 import { installationLoaderEnvironment } from "./installation-environment.js";
 import {
+  IcnApiIncompatible,
+  IcnBinaryNotExecutable,
+  IcnBinaryNotFound,
+  IcnCapabilityMissing,
+  IcnExitedBeforeReady,
+  IcnHealthIdentityMismatch,
+  IcnIdentityProbeTimedOut,
+  IcnNativeBuildIncompatible,
+  IcnReadinessCommitRejected,
+  IcnReadinessTimedOut,
+  IcnShutdownTimedOut,
+  IcnStartupIdentityMismatch,
+  IcnStartupOriginInvalid,
+  IcnStartupOriginNotLoopback,
+  IcnStartupRecordTimedOut,
+  IcnTargetIncompatible,
+  IcnUnexpectedExit,
+  type IcnBinaryResolutionError,
+  type IcnLifecycleError,
+} from "./errors.js";
+import {
   makeIcnApiClient,
 } from "@magnitudedev/icn-protocol/client";
 import { resolveReleaseIcnInstallation } from "./release-installation.js";
@@ -41,6 +60,7 @@ import {
 } from "./preparation.js";
 
 export * from "./preparation.js";
+export * from "./errors.js";
 
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0));
 const NonEmpty = Schema.String.pipe(Schema.minLength(1));
@@ -104,65 +124,6 @@ export interface ResolvedIcnBinary {
   readonly environment: Readonly<Record<string, string>>;
 }
 
-export const IcnLifecycleOperation = Schema.Literal(
-  "resolve",
-  "verify",
-  "spawn",
-  "startup-record",
-  "readiness",
-  "observe-exit",
-  "shutdown"
-);
-export type IcnLifecycleOperation = typeof IcnLifecycleOperation.Type;
-
-export const IcnLifecycleFailureReason = Schema.Literal(
-  "not-found",
-  "invalid-configuration",
-  "not-executable",
-  "invalid-manifest",
-  "probe-failed",
-  "probe-timeout",
-  "invalid-identity",
-  "incompatible-api",
-  "incompatible-build",
-  "target-mismatch",
-  "missing-capability",
-  "checksum-mismatch",
-  "download-failed",
-  "invalid-archive",
-  "spawn-failed",
-  "invalid-startup-record",
-  "startup-timeout",
-  "exited-before-ready",
-  "readiness-failed",
-  "identity-mismatch",
-  "unexpected-exit",
-  "shutdown-failed"
-);
-export type IcnLifecycleFailureReason = typeof IcnLifecycleFailureReason.Type;
-
-export class IcnLifecycleError extends Data.TaggedError("IcnLifecycleError")<{
-  readonly operation: IcnLifecycleOperation;
-  readonly reason: IcnLifecycleFailureReason;
-  readonly message: string;
-  readonly diagnostic: Option.Option<string>;
-}> {}
-
-const lifecycleError = <CauseValue>(
-  operation: IcnLifecycleOperation,
-  reason: IcnLifecycleFailureReason,
-  message: string,
-  ...cause: readonly [] | readonly [CauseValue]
-) =>
-  new IcnLifecycleError({
-    operation,
-    reason,
-    message,
-    diagnostic: Option.fromIterable(cause).pipe(
-      Option.map((value) => Cause.pretty(Cause.fail(value))),
-    ),
-  });
-
 const resolveCandidate = (
   source: IcnBinarySource,
 ) =>
@@ -185,15 +146,6 @@ const resolveCandidate = (
       source.version,
       source.dataDir,
       source.releaseBaseUrl,
-    ).pipe(
-      Effect.mapError((cause) =>
-        lifecycleError(
-          "resolve",
-          "download-failed",
-          `unable to prepare the release ICN installation (${cause.stage}: ${cause.message})`,
-          cause
-        )
-      )
     );
     return {
       path: installation.binaryPath,
@@ -205,7 +157,7 @@ const resolveCandidate = (
 export interface IcnBinaryResolverService {
   readonly resolve: (
     config: IcnBinaryResolutionConfig
-  ) => Effect.Effect<ResolvedIcnBinary, IcnLifecycleError>;
+  ) => Effect.Effect<ResolvedIcnBinary, IcnBinaryResolutionError>;
 }
 
 export class IcnBinaryResolver extends Context.Tag(
@@ -227,49 +179,17 @@ export const makeIcnBinaryResolver = () => Layer.effect(
             const candidate = yield* resolveCandidate(config.source).pipe(
               Effect.provideService(IcnPreparationReporter, preparation),
             );
-            const exists = yield* fs
-              .exists(candidate.path)
-              .pipe(Effect.orElseSucceed(() => false));
+            const exists = yield* fs.exists(candidate.path);
             if (!exists)
-              return yield* lifecycleError(
-                "resolve",
-                "not-found",
-                `ICN binary was not found at ${candidate.path}`
-              );
-            const canonical = yield* fs
-              .realPath(candidate.path)
-              .pipe(
-                Effect.mapError((cause) =>
-                  lifecycleError(
-                    "resolve",
-                    "not-found",
-                    `unable to resolve ${candidate.path}`,
-                    cause
-                  )
-                )
-              );
-            const info = yield* fs
-              .stat(canonical)
-              .pipe(
-                Effect.mapError((cause) =>
-                  lifecycleError(
-                    "resolve",
-                    "not-executable",
-                    "unable to inspect the ICN binary",
-                    cause
-                  )
-                )
-              );
+              return yield* new IcnBinaryNotFound({ path: candidate.path });
+            const canonical = yield* fs.realPath(candidate.path);
+            const info = yield* fs.stat(canonical);
             if (
               info.type !== "File" ||
               (!canonical.toLowerCase().endsWith(".exe") &&
                 (info.mode & 0o111) === 0)
             )
-              return yield* lifecycleError(
-                "resolve",
-                "not-executable",
-                "the resolved ICN binary is not executable"
-              );
+              return yield* new IcnBinaryNotExecutable({ path: canonical });
             const output = yield* Command.string(
               Command.make(canonical, "version", "--json").pipe(
                 Command.env(candidate.environment)
@@ -278,72 +198,48 @@ export const makeIcnBinaryResolver = () => Layer.effect(
               Effect.provideService(CommandExecutor.CommandExecutor, executor),
               Effect.timeoutFail({
                 duration: config.probeTimeout,
-                onTimeout: () =>
-                  lifecycleError(
-                    "verify",
-                    "probe-timeout",
-                    "ICN identity probe timed out"
-                  ),
+                onTimeout: () => new IcnIdentityProbeTimedOut({
+                  path: canonical,
+                  timeout: config.probeTimeout,
+                }),
               }),
-              Effect.mapError((cause) =>
-                cause instanceof IcnLifecycleError
-                  ? cause
-                  : lifecycleError(
-                      "verify",
-                      "probe-failed",
-                      "ICN identity probe failed",
-                      cause
-                    )
-              )
             );
             const identity = yield* Schema.decodeUnknown(
               Schema.parseJson(IcnBinaryIdentity)
-            )(output).pipe(
-              Effect.mapError((cause) =>
-                cause instanceof IcnLifecycleError
-                  ? cause
-                  : lifecycleError(
-                      "verify",
-                      "invalid-identity",
-                      "ICN identity did not match the protocol",
-                      cause
-                    )
-              )
-            );
+            )(output);
             if (identity.api_version !== config.supportedApiVersion)
-              return yield* lifecycleError(
-                "verify",
-                "incompatible-api",
-                `ICN API ${identity.api_version} is incompatible with ${config.supportedApiVersion}`
-              );
+              return yield* new IcnApiIncompatible({
+                path: canonical,
+                expected: config.supportedApiVersion,
+                actual: identity.api_version,
+              });
             if (
               Option.isSome(config.expectedNativeBuild) &&
               identity.native_build !== config.expectedNativeBuild.value
             )
-              return yield* lifecycleError(
-                "verify",
-                "incompatible-build",
-                "ICN native build does not match the release"
-              );
+              return yield* new IcnNativeBuildIncompatible({
+                path: canonical,
+                expected: config.expectedNativeBuild.value,
+                actual: identity.native_build,
+              });
             if (
               Option.isSome(config.expectedTarget) &&
               identity.target !== config.expectedTarget.value
             )
-              return yield* lifecycleError(
-                "verify",
-                "target-mismatch",
-                `ICN target ${identity.target} does not match ${config.expectedTarget.value}`
-              );
+              return yield* new IcnTargetIncompatible({
+                path: canonical,
+                expected: config.expectedTarget.value,
+                actual: identity.target,
+              });
             const missing = config.requiredCapabilities.find(
               (capability) => !identity.capabilities.includes(capability)
             );
             const missingCapability = Option.fromNullable(missing);
             if (Option.isSome(missingCapability))
-              return yield* lifecycleError(
-                "verify",
-                "missing-capability",
-                `ICN binary does not provide required capability ${missingCapability.value}`
-              );
+              return yield* new IcnCapabilityMissing({
+                path: canonical,
+                capability: missingCapability.value,
+              });
             return {
               path: canonical,
               identity,
@@ -442,23 +338,6 @@ const appendBounded = (ref: Ref.Ref<string>, chunk: string, limit: number) =>
     return new TextDecoder().decode(bytes.subarray(start));
   });
 
-const withDiagnostic = (error: IcnLifecycleError, output: Ref.Ref<string>) =>
-  Ref.get(output).pipe(
-    Effect.flatMap((diagnostic) =>
-      Effect.fail(
-        new IcnLifecycleError({
-          ...error,
-          diagnostic: diagnostic.trim() === ""
-            ? error.diagnostic
-            : Option.some(Option.match(error.diagnostic, {
-                onNone: () => diagnostic,
-                onSome: (cause) => `${cause}\n${diagnostic}`,
-              })),
-        })
-      )
-    )
-  );
-
 const opaqueInstanceId = Effect.gen(function* () {
   const parts: Array<string> = [];
   for (let index = 0; index < 4; index++)
@@ -497,16 +376,7 @@ export const renderIcnArguments = (
 
 const acquireIcn = (input: IcnLifecycleConfig) =>
   Effect.gen(function* () {
-    const config = yield* Schema.validate(IcnLifecycleConfig)(input).pipe(
-      Effect.mapError((cause) =>
-        lifecycleError(
-          "resolve",
-          "invalid-configuration",
-          "invalid ICN lifecycle configuration",
-          cause
-        )
-      )
-    );
+    const config = yield* Schema.validate(IcnLifecycleConfig)(input);
     const resolver = yield* IcnBinaryResolver;
     const reporter = yield* IcnPreparationReporter;
     const binary = yield* resolver.resolve(config.binary);
@@ -536,73 +406,26 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
             }),
             Command.stdin(Stream.never),
           )
-        ).pipe(
-          Effect.mapError((cause) =>
-            lifecycleError(
-              "spawn",
-              "spawn-failed",
-              "failed to spawn ICN",
-              cause
-            )
-          )
         );
-        const waitForProcessExit = process.exitCode.pipe(
-          Effect.mapError((cause) =>
-            lifecycleError(
-              "observe-exit",
-              "unexpected-exit",
-              "failed to observe ICN exit",
-              cause,
-            ),
-          ),
-        );
-        const isProcessRunning = process.isRunning.pipe(
-          Effect.mapError((cause) =>
-            lifecycleError(
-              "observe-exit",
-              "unexpected-exit",
-              "failed to inspect ICN process state",
-              cause,
-            ),
-          ),
-        );
+        const waitForProcessExit = process.exitCode;
+        const isProcessRunning = process.isRunning;
         const stopAndProve = Effect.gen(function* () {
           if (!(yield* isProcessRunning)) return;
-          yield* process.kill("SIGTERM").pipe(
-            Effect.mapError((cause) =>
-              lifecycleError(
-                "shutdown",
-                "shutdown-failed",
-                "failed to terminate ICN",
-                cause,
-              ),
-            ),
-          );
+          yield* process.kill("SIGTERM");
           const graceful = yield* waitForProcessExit.pipe(
             Effect.timeoutOption(config.gracefulShutdownTimeout),
           );
           if (Option.isSome(graceful)) return;
           if (yield* isProcessRunning) {
-            yield* process.kill("SIGKILL").pipe(
-              Effect.mapError((cause) =>
-                lifecycleError(
-                  "shutdown",
-                  "shutdown-failed",
-                  "failed to force-kill ICN",
-                  cause,
-                ),
-              ),
-            );
+            yield* process.kill("SIGKILL");
           }
           yield* waitForProcessExit.pipe(
             Effect.timeoutFail({
               duration: config.forceShutdownTimeout,
-              onTimeout: () =>
-                lifecycleError(
-                  "shutdown",
-                  "shutdown-failed",
-                  "ICN did not exit after force-kill",
-                ),
+              onTimeout: () => new IcnShutdownTimedOut({
+                pid: Number(process.pid),
+                timeout: config.forceShutdownTimeout,
+              }),
             }),
           );
         });
@@ -622,16 +445,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         return { process, terminateProcess } as const;
       })
     );
-    const waitForProcessExit = process.exitCode.pipe(
-      Effect.mapError((cause) =>
-        lifecycleError(
-          "observe-exit",
-          "unexpected-exit",
-          "failed to observe ICN exit",
-          cause,
-        ),
-      ),
-    )
+    const waitForProcessExit = process.exitCode;
     const output = yield* Ref.make("");
     const startupRecord = yield* Deferred.make<
       IcnStartupRecord,
@@ -646,18 +460,10 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         Effect.gen(function* () {
           yield* appendBounded(output, `${line}\n`, config.outputLimitBytes);
           if (line.startsWith("MAGNITUDE_ICN_PROGRESS ")) {
+            const encoded = line.slice("MAGNITUDE_ICN_PROGRESS ".length);
             const record = yield* Schema.decodeUnknown(
               Schema.parseJson(IcnStartupProgressRecord)
-            )(line.slice("MAGNITUDE_ICN_PROGRESS ".length)).pipe(
-              Effect.mapError((cause) =>
-                lifecycleError(
-                  "startup-record",
-                  "invalid-startup-record",
-                  "invalid ICN startup progress record",
-                  cause
-                )
-              )
-            );
+            )(encoded);
             yield* reporter.report({
               _tag: "PreparingBackend",
               backend: icnPreparationBackend(record.backend),
@@ -665,34 +471,14 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
             return;
           }
           if (!line.startsWith("MAGNITUDE_ICN_READY ")) return;
+          const encoded = line.slice("MAGNITUDE_ICN_READY ".length);
           const record = yield* Schema.decodeUnknown(
             Schema.parseJson(IcnStartupRecord)
-          )(line.slice("MAGNITUDE_ICN_READY ".length)).pipe(
-            Effect.mapError((cause) =>
-              cause instanceof IcnLifecycleError
-                ? cause
-                : lifecycleError(
-                    "startup-record",
-                    "invalid-startup-record",
-                    "invalid startup record",
-                    cause
-                  )
-            )
-          );
+          )(encoded);
           yield* Deferred.complete(startupRecord, Effect.succeed(record));
         }).pipe(Effect.catchAll((error) => Deferred.fail(startupRecord, error)))
       ),
-      Effect.catchAll((cause) =>
-        Deferred.fail(
-          startupRecord,
-          lifecycleError(
-            "startup-record",
-            "invalid-startup-record",
-            "stdout closed before startup",
-            cause
-          )
-        )
-      ),
+      Effect.catchAll((error) => Deferred.fail(startupRecord, error)),
       Effect.forkScoped
     );
     yield* process.stderr.pipe(
@@ -725,69 +511,54 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
           )
         )
       ),
-      Effect.catchAll((cause) =>
-        Deferred.fail(
-          exited,
-          lifecycleError(
-            "observe-exit",
-            "unexpected-exit",
-            "failed to observe ICN exit",
-            cause
-          )
-        )
-      ),
+      Effect.catchAll((error) => Deferred.fail(exited, error)),
       Effect.forkScoped
     );
 
     const earlyExit = Deferred.await(exited).pipe(
-      Effect.flatMap(({ code }) =>
-        Effect.fail(
-          lifecycleError(
-            "startup-record",
-            "exited-before-ready",
-            `ICN exited with ${code} before readiness`
-          )
-        )
-      )
+      Effect.flatMap(({ code, diagnostic }) => Effect.fail(new IcnExitedBeforeReady({
+        pid: Number(process.pid),
+        code,
+        output: diagnostic,
+      })))
     );
-    const startup = yield* Effect.raceFirst(
+    const startupResult = yield* Effect.raceFirst(
       Deferred.await(startupRecord),
       earlyExit
-    ).pipe(
-      Effect.timeoutFail({
-        duration: config.startupTimeout,
-        onTimeout: () =>
-          lifecycleError(
-            "startup-record",
-            "startup-timeout",
-            "ICN startup record timed out"
-          ),
-      }),
-      Effect.catchAll((error) => withDiagnostic(error, output))
-    );
+    ).pipe(Effect.timeoutOption(config.startupTimeout));
+    const startup = yield* Option.match(startupResult, {
+      onNone: () => Ref.get(output).pipe(
+        Effect.flatMap((currentOutput) => Effect.fail(new IcnStartupRecordTimedOut({
+          pid: Number(process.pid),
+          timeout: config.startupTimeout,
+          output: currentOutput,
+        }))),
+      ),
+      onSome: Effect.succeed,
+    });
     if (
       startup.instanceId !== instanceId ||
       startup.pid !== Number(process.pid) ||
       startup.apiVersion !== binary.identity.api_version ||
       startup.nativeBuild !== binary.identity.native_build
-    )
-      return yield* withDiagnostic(
-        lifecycleError(
-          "startup-record",
-          "identity-mismatch",
-          "ICN startup identity does not match its owner or binary"
-        ),
-        output
-      );
+    ) {
+      const currentOutput = yield* Ref.get(output);
+      return yield* new IcnStartupIdentityMismatch({
+        pid: Number(process.pid),
+        expectedInstanceId: instanceId,
+        expectedApiVersion: binary.identity.api_version,
+        expectedNativeBuild: binary.identity.native_build,
+        actual: startup,
+        output: currentOutput,
+      });
+    }
+    const startupOutput = yield* Ref.get(output);
     const origin = yield* Effect.try({
       try: () => new URL(startup.origin),
-      catch: (cause) =>
-        lifecycleError(
-          "startup-record",
-          "invalid-startup-record",
-          "ICN startup origin is invalid",
-          cause
-        ),
+      catch: () => new IcnStartupOriginInvalid({
+        origin: startup.origin,
+        output: startupOutput,
+      }),
     });
     if (
       (origin.hostname !== "127.0.0.1" &&
@@ -795,79 +566,65 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         origin.hostname !== "::1") ||
       origin.protocol !== "http:"
     )
-      return yield* lifecycleError(
-        "startup-record",
-        "invalid-startup-record",
-        "ICN did not bind a loopback HTTP origin"
-      );
+      return yield* new IcnStartupOriginNotLoopback({
+        origin: startup.origin,
+        output: startupOutput,
+      });
     const client = yield* makeIcnApiClient({
       baseUrl: origin,
       headers: { authorization: `Bearer ${authorization}` },
     });
-    yield* client.system.health({}).pipe(
-      Effect.flatMap((value) =>
-        value.ready &&
-        value.instanceId === instanceId &&
-        value.apiVersion === binary.identity.api_version &&
-        value.nativeBuild === binary.identity.native_build
-          ? Effect.succeed(value)
-          : Effect.fail(
-              lifecycleError(
-                "readiness",
-                "identity-mismatch",
-                "ICN health identity does not match startup"
-              )
-            )
-      ),
+    const healthResult = yield* client.system.health({}).pipe(
       Effect.retry({
         schedule: Schedule.spaced("50 millis"),
         while: (cause) =>
           cause instanceof GeneratedClientTransportError &&
           cause.cause instanceof HttpClientError.RequestError,
       }),
-      Effect.mapError((cause) =>
-        cause instanceof IcnLifecycleError
-          ? cause
-          : lifecycleError(
-              "readiness",
-              "readiness-failed",
-              "ICN readiness probe failed",
-              cause
-            )
-      ),
-      Effect.timeoutFail({
-        duration: config.startupTimeout,
-        onTimeout: () =>
-          lifecycleError(
-            "readiness",
-            "startup-timeout",
-            "ICN readiness timed out"
-          ),
-      }),
-      Effect.catchAll((error) => withDiagnostic(error, output))
+      Effect.timeoutOption(config.startupTimeout),
     );
+    const health = yield* Option.match(healthResult, {
+      onNone: () => Ref.get(output).pipe(
+        Effect.flatMap((currentOutput) => Effect.fail(new IcnReadinessTimedOut({
+          pid: Number(process.pid),
+          timeout: config.startupTimeout,
+          output: currentOutput,
+        }))),
+      ),
+      onSome: Effect.succeed,
+    });
+    if (!health.ready ||
+      health.instanceId !== instanceId ||
+      health.apiVersion !== binary.identity.api_version ||
+      health.nativeBuild !== binary.identity.native_build) {
+      const currentOutput = yield* Ref.get(output);
+      return yield* new IcnHealthIdentityMismatch({
+        expectedInstanceId: instanceId,
+        expectedApiVersion: binary.identity.api_version,
+        expectedNativeBuild: binary.identity.native_build,
+        actualReady: health.ready,
+        actualInstanceId: health.instanceId,
+        actualApiVersion: health.apiVersion,
+        actualNativeBuild: health.nativeBuild,
+        output: currentOutput,
+      });
+    }
     yield* lifecycleLock.withPermits(1)(
       Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(lifecycle)
         if (current._tag === "Exited") {
-          return yield* withDiagnostic(
-            lifecycleError(
-              "readiness",
-              "exited-before-ready",
-              `ICN exited with ${current.code} before readiness completed`,
-            ),
-            output,
-          )
+          const currentOutput = yield* Ref.get(output);
+          return yield* new IcnExitedBeforeReady({
+            pid: Number(process.pid),
+            code: current.code,
+            output: currentOutput,
+          });
         }
         if (current._tag !== "Starting") {
-          return yield* withDiagnostic(
-            lifecycleError(
-              "readiness",
-              "readiness-failed",
-              "ICN stopped while readiness was being committed",
-            ),
-            output,
-          )
+          const currentOutput = yield* Ref.get(output);
+          return yield* new IcnReadinessCommitRejected({
+            output: currentOutput,
+          });
         }
         yield* SubscriptionRef.set(
           lifecycle,
@@ -924,19 +681,17 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         lifecycleChanges: lifecycle.changes,
         exit,
         unexpectedExit: exit.pipe(
-          Effect.flatMap(({ code }) =>
+          Effect.flatMap(({ code, diagnostic }) =>
             SubscriptionRef.get(lifecycle).pipe(
               Effect.flatMap((state) =>
                 (state._tag === "Stopping" ||
                   (state._tag === "Exited" && state.expected))
                   ? Effect.never
-                  : Effect.fail(
-                      lifecycleError(
-                        "observe-exit",
-                        "unexpected-exit",
-                        `ICN exited unexpectedly with ${code}`
-                      )
-                    )
+                  : Effect.fail(new IcnUnexpectedExit({
+                      pid: Number(process.pid),
+                      code,
+                      output: diagnostic,
+                    }))
               )
             )
           )

@@ -10,7 +10,6 @@ import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
 import {
-  Cause,
   Context,
   Data,
   Deferred,
@@ -614,12 +613,10 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
 
     const startup = application.pipe(
       Effect.timeout(Duration.minutes(5)),
-      Effect.tapErrorCause((cause) => lifecycle.beginStopping({
+      Effect.tapError((error) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: "Magnitude could not prepare local inference",
-      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed").pipe(
-        Effect.annotateLogs({ cause: Cause.pretty(cause) }),
-      )))),
+      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", error)))),
     )
     const started = yield* Effect.raceFirst(
       startup.pipe(Effect.disconnect, Effect.map(Option.some)),

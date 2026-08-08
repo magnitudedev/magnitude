@@ -36,7 +36,7 @@ export const scopeAcnCandidate = (
         : [false, current])
       if (!firstAttempt) {
         return yield* new AcnEnsuranceFailed({
-          reason: `ACN candidate ${candidate.pid} admission was already acknowledged`,
+          reason: `Magnitude daemon ${candidate.pid} startup admission was already acknowledged`,
         })
       }
       yield* restore(candidate.releaseParentChannel)

@@ -419,14 +419,21 @@ discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
 
 ## Failure semantics
 
-Lifecycle errors are typed by phase and preserve a safe cause plus bounded diagnostic evidence:
+The lifecycle error channel is a union of existing upstream typed errors and semantic ICN tagged
+errors. Filesystem, command, schema, generated-client, and release-installation errors propagate
+unchanged. The lifecycle creates a new tagged error only when it discovers a new domain fact, such
+as an absent or non-executable binary, incompatible identity, bounded timeout, non-loopback origin,
+premature exit, or unexpected exit.
 
-- resolution and executable verification;
-- spawn and startup protocol;
-- readiness timeout or incompatible identity;
-- unexpected exit;
-- graceful-shutdown timeout, forced termination, or reap failure; and
-- startup-probe protocol failures mapped from the generated client with their safe cause retained.
+Each lifecycle tag names one failure variant and carries only the facts belonging to that variant.
+Human messages are derived from those facts. There is no generic phase/reason/message/diagnostic
+envelope and no wrapper whose primary payload is another error. Bounded native output is owned only
+by variants for which process output is relevant, including startup timeout and process exit.
+
+ACN observes ordinary startup failure with the typed Effect error channel, logs that error value
+directly, commits `Stopping(startup-failed)`, and lets the same error continue unchanged. It does not
+convert typed errors to `Cause` or render them through `Cause.pretty`. Defects remain defects and
+propagate to the process runtime; scoped finalizers, rather than error taps, guarantee cleanup.
 
 Generated client failures distinguish invalid local input, transport failure, a declared remote
 failure, undeclared or invalid response, incomplete stream, and cancellation. Declared ICN error
