@@ -91,9 +91,10 @@ pending/exited/stalled candidate, and launchable absence. Every state has an exp
 fixed deadline. One ensurance occurrence launches at most one candidate and cannot silently turn a
 failed launch into a respawn.
 
-Candidate stderr is drained while the process runs and retained only as a bounded tail. A candidate
-exit reports its exit code and retained diagnostic instead of being collapsed into generic
-coordination loss.
+Candidate stderr is drained while the process runs and retained only as a bounded tail. Admission
+disarms candidate cleanup but does not discard the spawning manager's exit observation. Until
+readiness, an exit before or after admission reports its exit code and retained diagnostic instead
+of being collapsed into generic coordination loss.
 
 Mutation and final ready adoption reread the complete owner required by their action. Health
 revision has authority only while exact process inspection proves that same owner occurrence live.

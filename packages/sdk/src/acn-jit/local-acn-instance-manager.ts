@@ -82,6 +82,7 @@ interface LaunchedCandidate {
   readonly process: ExactProcess
   readonly child: SpawnedAcnCandidate
   readonly launchedAt: number
+  readonly admitted: boolean
 }
 
 type ConvergenceState =
@@ -109,6 +110,7 @@ const STARTUP_CEILING = Duration.minutes(5)
 const STOPPING_GRACE = Duration.seconds(5)
 const CANDIDATE_ADMISSION_TIMEOUT = Duration.seconds(30)
 const CANDIDATE_PARENT_RELEASE_TIMEOUT = Duration.seconds(2)
+const CANDIDATE_EXIT_DIAGNOSTIC_TIMEOUT = Duration.seconds(2)
 const GRACEFUL_STOP_WAIT = Duration.seconds(5)
 const STORE_RETRY_INTERVAL = Duration.millis(25)
 const STORE_OPERATION_TIMEOUT = Duration.seconds(30)
@@ -381,10 +383,13 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
       ): Effect.Effect<ConvergenceState> => Effect.gen(function* () {
         if (Option.isSome(launched)) {
           const candidate = launched.value
-          const exited = yield* candidate.child.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
+          const exited = yield* candidate.child.exited.pipe(Effect.timeoutOption(
+            candidate.admitted ? CANDIDATE_EXIT_DIAGNOSTIC_TIMEOUT : Duration.millis(1),
+          ))
           if (Option.isSome(exited)) {
             return { _tag: "CandidateExited", candidate, ...exited.value }
           }
+          if (candidate.admitted) return { _tag: "LaunchOccurrenceLost" }
           return now - candidate.launchedAt >= Duration.toMillis(CANDIDATE_ADMISSION_TIMEOUT)
             ? { _tag: "CandidateAdmissionExpired", candidate }
             : { _tag: "CandidatePending" }
@@ -402,8 +407,28 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
           onNone: () => classifyWithoutLiveOwner(now),
           onSome: (current): Effect.Effect<ConvergenceState, AcnEnsuranceFailed> =>
             Effect.gen(function* () {
-              if (Option.isSome(launched) && ownerNamesProcess(current, launched.value.process)) {
-                yield* launched.value.child.admit.pipe(
+              if (Option.isSome(launched) &&
+                launched.value.admitted &&
+                !ownerNamesProcess(current, launched.value.process)) {
+                const candidate = launched.value
+                const exited = yield* candidate.child.exited.pipe(
+                  Effect.timeoutOption(CANDIDATE_EXIT_DIAGNOSTIC_TIMEOUT),
+                )
+                return Option.match(exited, {
+                  onNone: (): ConvergenceState => ({ _tag: "CandidatePending" }),
+                  onSome: ({ code, stderr }): ConvergenceState => ({
+                    _tag: "CandidateExited",
+                    candidate,
+                    code,
+                    stderr,
+                  }),
+                })
+              }
+              if (Option.isSome(launched) &&
+                !launched.value.admitted &&
+                ownerNamesProcess(current, launched.value.process)) {
+                const candidate = launched.value
+                yield* candidate.child.admit.pipe(
                   Effect.timeoutFail({
                     duration: CANDIDATE_PARENT_RELEASE_TIMEOUT,
                     onTimeout: () => new AcnEnsuranceFailed({
@@ -411,7 +436,7 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
                     }),
                   }),
                 )
-                launched = Option.none()
+                launched = Option.some({ ...candidate, admitted: true })
               }
               const exactIdentity = yield* inspectProcess(processes, current.pid)
               const rootLive = Option.contains(exactIdentity, current.processStartIdentity)
@@ -503,10 +528,12 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
           Match.tag("CandidatePending", () =>
             Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
           Match.tag("CandidateExited", ({ candidate, code, stderr }) => Effect.fail(new AcnEnsuranceFailed({
-            reason: `ACN candidate ${candidate.process.pid} exited with code ${code} before admission${stderr ? `:\n${stderr}` : ""}`,
+            reason: candidate.admitted
+              ? `Magnitude daemon ${candidate.process.pid} exited with code ${code} after admission before it became ready${stderr ? `:\n${stderr}` : ""}`
+              : `Magnitude daemon ${candidate.process.pid} exited with code ${code} before startup admission${stderr ? `:\n${stderr}` : ""}`,
           }))),
           Match.tag("CandidateAdmissionExpired", ({ candidate }) => Effect.fail(new AcnEnsuranceFailed({
-            reason: `ACN candidate ${candidate.process.pid} did not commit admission`,
+            reason: `Magnitude daemon ${candidate.process.pid} did not complete startup admission`,
           }))),
           Match.tag("LaunchOccurrenceLost", () => Effect.fail(new AcnEnsuranceFailed({
             reason: "Magnitude daemon exited during startup before it became ready",
@@ -542,6 +569,7 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
               process: { pid: child.pid, processStartIdentity: identity.value },
               child,
               launchedAt: now,
+              admitted: false,
             })
             return Option.none<ReadyInstance>()
           })),

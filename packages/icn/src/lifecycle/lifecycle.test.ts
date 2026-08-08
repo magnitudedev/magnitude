@@ -1,4 +1,6 @@
 import { Duration, Effect, Layer, Option } from "effect";
+import * as FileSystem from "@effect/platform/FileSystem";
+import { SystemError } from "@effect/platform/Error";
 import * as BunContext from "@effect/platform-bun/BunContext";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
 import {
@@ -15,6 +17,8 @@ import { describe, expect, it } from "vitest";
 import {
   IcnBinaryResolutionConfig,
   IcnBinaryResolver,
+  IcnBinaryNotFound,
+  IcnExitedBeforeReady,
   makeIcnBinaryResolver,
   IcnLifecycleConfig,
   IcnStorageConfig,
@@ -49,6 +53,21 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
   });
 
 describe("ICN managed launch", () => {
+  it("uses semantic tagged errors with derived messages and owned output", () => {
+    const error = new IcnExitedBeforeReady({
+      pid: 42,
+      code: 17,
+      output: "native startup failure",
+    });
+
+    expect(error._tag).toBe("IcnExitedBeforeReady");
+    expect(error.message).toBe("Inference server process 42 exited with code 17 before readiness");
+    expect(error.output).toBe("native startup failure");
+    expect(error).not.toHaveProperty("operation");
+    expect(error).not.toHaveProperty("reason");
+    expect(error).not.toHaveProperty("diagnostic");
+  });
+
   it("renders a model-free, owner-bound, port-zero command", () => {
     const args = renderIcnArguments(
       config(),
@@ -141,5 +160,90 @@ describe("ICN managed launch", () => {
       }
     }
   );
+
+  it("reports an absent resolved binary as its exact domain variant", async () => {
+    const missing = "/definitely-missing/magnitude/installation.json";
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const resolver = yield* IcnBinaryResolver;
+        return yield* Effect.either(resolver.resolve(
+          new IcnBinaryResolutionConfig({
+            source: { _tag: "Installation", path: missing },
+            supportedApiVersion: 1,
+            expectedNativeBuild: Option.none(),
+            expectedTarget: Option.none(),
+            requiredCapabilities: [],
+            probeTimeout: Duration.seconds(2),
+          }),
+        ));
+      }).pipe(
+        Effect.provide(
+          makeIcnBinaryResolver().pipe(
+            Layer.provide(Layer.succeed(IcnPreparationReporter, {
+              report: () => Effect.void,
+            })),
+            Layer.provideMerge(Layer.merge(BunContext.layer, FetchHttpClient.layer)),
+          ),
+        ),
+      ),
+    );
+
+    expect(result).toMatchObject({
+      _tag: "Left",
+      left: {
+        _tag: "IcnBinaryNotFound",
+        path: join(
+          "/definitely-missing/magnitude",
+          "bin",
+          `magnitude-icn${process.platform === "win32" ? ".exe" : ""}`,
+        ),
+      },
+    });
+    if (result._tag === "Left") expect(result.left).toBeInstanceOf(IcnBinaryNotFound);
+  });
+
+  it("propagates filesystem failures while checking binary existence", async () => {
+    const failure = new SystemError({
+      reason: "PermissionDenied",
+      module: "FileSystem",
+      method: "exists",
+      pathOrDescriptor: "/restricted/magnitude/installation.json",
+    });
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const baseFs = yield* FileSystem.FileSystem;
+        const failingFs: FileSystem.FileSystem = {
+          ...baseFs,
+          exists: () => Effect.fail(failure),
+        };
+        return yield* Effect.gen(function* () {
+          const resolver = yield* IcnBinaryResolver;
+          return yield* Effect.either(resolver.resolve(
+            new IcnBinaryResolutionConfig({
+              source: { _tag: "Installation", path: failure.pathOrDescriptor as string },
+              supportedApiVersion: 1,
+              expectedNativeBuild: Option.none(),
+              expectedTarget: Option.none(),
+              requiredCapabilities: [],
+              probeTimeout: Duration.seconds(2),
+            }),
+          ));
+        }).pipe(
+          Effect.provide(
+            makeIcnBinaryResolver().pipe(
+              Layer.provide(Layer.succeed(FileSystem.FileSystem, failingFs)),
+              Layer.provide(Layer.succeed(IcnPreparationReporter, {
+                report: () => Effect.void,
+              })),
+              Layer.provideMerge(Layer.merge(BunContext.layer, FetchHttpClient.layer)),
+            ),
+          ),
+        );
+      }).pipe(Effect.provide(BunContext.layer)),
+    );
+
+    expect(result._tag).toBe("Left");
+    if (result._tag === "Left") expect(result.left).toBe(failure);
+  });
 
 });
