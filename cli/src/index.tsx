@@ -1,8 +1,10 @@
 import { resolve } from "path";
 import { createCliRenderer } from "@opentui/core";
-import { createRoot } from "@opentui/react";
+import { createRoot, type Root } from "@opentui/react";
 import { Command } from "@commander-js/extra-typings";
 import { Atom, RegistryProvider } from "@effect-atom/atom-react";
+import { FetchHttpClient } from "@effect/platform";
+import { BunContext } from "@effect/platform-bun";
 import {
   createAgentClient,
   AgentClientProvider,
@@ -11,14 +13,86 @@ import {
   deriveCliExitNotice,
   stopDisplayViewController,
 } from "@magnitudedev/client-common";
+import {
+  isDevelopmentVersion,
+  makeCliUpdater,
+  updateCommandString,
+  type CliUpdaterShape,
+  type UpdateAction,
+} from "@magnitudedev/sdk";
 import { CliApp, type SessionStart } from "./app";
+import {
+  UpdatePrompt,
+  type UpdatePromptOutcome,
+} from "./features/update/prompt";
 import type { AuthSource } from "./state/cli-atoms";
 import { getLastSessionId } from "./state/last-session";
 import { CLI_VERSION } from "./version";
-import { installGracefulShutdownHandlers } from "./utils/graceful-shutdown";
+import {
+  installGracefulShutdownHandlers,
+  restoreTerminalState,
+} from "./utils/graceful-shutdown";
 import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
 import { Array as Arr, Effect, Option } from "effect";
+
+const isDevelopmentBuild = (): boolean =>
+  import.meta.url.endsWith(".tsx") ||
+  (process.argv[1]?.endsWith(".tsx") ?? false) ||
+  isDevelopmentVersion(CLI_VERSION);
+
+const createUpdater = (developmentBuild: boolean): Promise<CliUpdaterShape> =>
+  Effect.runPromise(
+    makeCliUpdater({
+      currentVersion: CLI_VERSION,
+      developmentBuild,
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
+  );
+
+const waitForUpdatePrompt = (
+  root: Root,
+  latestVersion: string,
+  action: UpdateAction,
+): Effect.Effect<UpdatePromptOutcome> => Effect.async((resume) => {
+  let resolved = false;
+  root.render(
+    <RegistryProvider defaultIdleTTL={5000}>
+      <UpdatePrompt
+        currentVersion={CLI_VERSION}
+        latestVersion={latestVersion}
+        action={action}
+        onSelect={(outcome) => {
+          if (resolved) return;
+          resolved = true;
+          resume(Effect.succeed(outcome));
+        }}
+      />
+    </RegistryProvider>,
+  );
+});
+
+const executeUpdate = (
+  updater: CliUpdaterShape,
+  action: UpdateAction,
+): Effect.Effect<void> => {
+  const command = updateCommandString(action);
+  return Effect.gen(function* () {
+    yield* Effect.sync(() => {
+      process.stdout.write(`\nUpdating Magnitude via \`${command}\`...\n`);
+    });
+    yield* updater.runUpdate(action);
+    yield* Effect.sync(() => {
+      process.stdout.write(
+        "\nUpdate ran successfully. Please restart Magnitude.\n",
+      );
+    });
+  }).pipe(
+    Effect.catchAll((error) => Effect.sync(() => {
+      process.stderr.write(`\n\`${command}\` failed: ${error.reason}\n`);
+      process.exitCode = 1;
+    })),
+  );
+};
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
@@ -71,6 +145,29 @@ async function main() {
       }
     });
 
+  program
+    .command("update")
+    .description("Update Magnitude with the package manager that installed it")
+    .action(async () => {
+      const developmentBuild = isDevelopmentBuild();
+      if (developmentBuild) {
+        process.stderr.write(
+          "`magnitude update` is not available in development builds.\n",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const updater = await createUpdater(developmentBuild);
+      if (Option.isNone(updater.updateAction)) {
+        process.stderr.write(
+          "Could not detect how Magnitude was installed. Update manually with `npm install -g @magnitudedev/cli`.\n",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      await Effect.runPromise(executeUpdate(updater, updater.updateAction.value));
+    });
+
   program.action(async (opts) => {
     const sessionStart: SessionStart =
       opts.resume === undefined
@@ -89,9 +186,7 @@ async function main() {
       process.exit(1);
     }
 
-    const isDev =
-      import.meta.url.endsWith(".tsx") ||
-      (process.argv[1]?.endsWith(".tsx") ?? false);
+    const isDev = isDevelopmentBuild();
     const acnSourcePath = resolve(
       import.meta.dir,
       "..",
@@ -114,19 +209,58 @@ async function main() {
       debug: opts.debug === true,
     });
     Atom.runtime.addGlobalLayer(effectLoggingLayer);
-    const platform = await createTerminalPlatform({
-      launchCommand,
-      debug: opts.debug === true,
-      effectLoggingLayer: Option.some(effectLoggingLayer),
-    });
-    const initialAcnLifecycleState = await Effect.runPromise(
-      platform.acnStartup.prepare
-    );
-    const agentClientTag = createAgentClient(platform.protocolLayer);
+    const updater = await createUpdater(isDev);
+    const shouldPromptForUpdate =
+      (opts.prompt?.length ?? 0) === 0 &&
+      process.stdin.isTTY === true &&
+      process.stdout.isTTY === true;
+    const upgradeVersion = shouldPromptForUpdate
+      ? await Effect.runPromise(
+          updater.getUpgradeVersion.pipe(Effect.provide(effectLoggingLayer)),
+        )
+      : Option.none();
     const renderer = await createCliRenderer({
       exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
     });
+    const removePromptShutdownHandlers = installGracefulShutdownHandlers(
+      renderer,
+    );
+
+    if (Option.isSome(upgradeVersion) && Option.isSome(updater.updateAction)) {
+      const promptRoot = createRoot(renderer);
+      const outcome = await Effect.runPromise(waitForUpdatePrompt(
+        promptRoot,
+        upgradeVersion.value,
+        updater.updateAction.value,
+      ));
+      promptRoot.unmount();
+      if (outcome._tag === "Dismiss") {
+        await Effect.runPromise(updater.dismissVersion(upgradeVersion.value));
+      }
+      if (outcome._tag === "Update") {
+        removePromptShutdownHandlers();
+        restoreTerminalState();
+        renderer.destroy();
+        await Effect.runPromise(executeUpdate(updater, updater.updateAction.value));
+        return;
+      }
+    }
+
+    let platform;
+    try {
+      platform = await createTerminalPlatform({
+        launchCommand,
+        debug: opts.debug === true,
+        effectLoggingLayer: Option.some(effectLoggingLayer),
+      });
+    } catch (error) {
+      removePromptShutdownHandlers();
+      restoreTerminalState();
+      renderer.destroy();
+      throw error;
+    }
     let modelExitNotice: string | undefined;
+    removePromptShutdownHandlers();
 
     // Terminal background detection is handled by useTerminalBgDetection
     // inside the React tree (needs atom registry to write to themeAtom)
@@ -155,7 +289,13 @@ async function main() {
       }
     );
 
-    createRoot(renderer).render(
+    const initialAcnLifecycleState = await Effect.runPromise(
+      platform.acnStartup.prepare
+    );
+    const agentClientTag = createAgentClient(platform.protocolLayer);
+
+    const root = createRoot(renderer);
+    root.render(
       <PlatformProvider platform={platform}>
         <RegistryProvider defaultIdleTTL={5000}>
           <AgentClientProvider tag={agentClientTag}>
@@ -184,7 +324,7 @@ async function main() {
     );
   });
 
-  program.parse();
+  await program.parseAsync();
 }
 
-main();
+void main();
