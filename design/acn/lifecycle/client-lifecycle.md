@@ -43,9 +43,9 @@ ActiveSelection
 ```
 
 The association starts at the bundled SDK identity. Only successful ready selection adopts a newer
-identity. The durable `AcnRevisionStore` prevents an older client from launching an older ACN
-while a newer revision is selected, so waiting until readiness cannot permit downgrade. Losing the
-selected endpoint never regresses identity.
+identity. The instance manager compares the client's target only with exact live owner health: it
+adopts equal or newer revisions and replaces lower revisions. A historical or dead revision has no
+authority, and losing the selected endpoint never regresses the client's effective identity.
 
 Selection is a true single-flight operation. Bootstrap, retry, lease, and application demand share
 one scoped owner and one exact outcome while selection is active; a semaphore that merely queues

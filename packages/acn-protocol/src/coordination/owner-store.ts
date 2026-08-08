@@ -1,7 +1,6 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { Context, Effect, Layer, type Option } from "effect"
-import type { AcnRevision } from "../acn-revision"
 import {
   makeAcnCoordinationDatabase,
   type ReplaceOwnerResult,
@@ -15,7 +14,6 @@ export interface AcnOwnerStore {
   readonly replaceOwner: (
     expectedOwner: Option.Option<AcnOwnerRecord>,
     candidateOwner: AcnOwnerRecord,
-    candidateRevision: AcnRevision,
   ) => Effect.Effect<ReplaceOwnerResult, AcnProcessStoreError>
 }
 

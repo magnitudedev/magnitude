@@ -41,11 +41,8 @@ import {
   ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
-  makeAcnRevisionStore,
-  COORDINATION_POLL_INTERVAL,
   type AcnProcessStoreError,
   type AcnOwnerStore,
-  type AcnRevisionStore,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/coordination"
 import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bun"
@@ -504,13 +501,9 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     const debug = options.debug === true
     const parentBinding = yield* makeParentBinding(options.parentBound === true)
 
-    const revisionStore = yield* makeAcnRevisionStore(dataDir).pipe(
-      Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
-    )
     const ownerStore = yield* makeAcnOwnerStore(dataDir).pipe(
       Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
     )
-    yield* retryCoordination(revisionStore.register(ACN_REVISION))
 
     const currentProcess = yield* ExactProcessController.pipe(
       Effect.flatMap((processes) => processes.current),
@@ -565,7 +558,6 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       ownerStore.replaceOwner(
         expectedOwner,
         { ...currentProcess, port: address.port },
-        ACN_REVISION,
       ),
       (result) => result._tag === "Replaced",
     ).pipe(retryCoordination)
@@ -574,18 +566,6 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     yield* Layer.buildWithScope(AcnProcessHandlersLive, applicationScope).pipe(
       Effect.provide(infrastructure),
     )
-
-    const observeReplacement = revisionStore.selected.pipe(
-      Effect.flatMap((selected) => Option.exists(selected, (revision) => revision > ACN_REVISION)
-        ? lifecycle.beginStopping({ reason: "replacement" }).pipe(Effect.asVoid)
-        : Effect.sleep(COORDINATION_POLL_INTERVAL)),
-      Effect.catchAll((error) =>
-        Effect.logWarning("ACN revision selection is indeterminate").pipe(
-          Effect.annotateLogs({ error: error._tag, path: error.path }),
-          Effect.zipRight(Effect.sleep(COORDINATION_POLL_INTERVAL)),
-        )),
-    )
-    yield* Effect.forever(observeReplacement).pipe(Effect.forkIn(applicationScope))
 
     yield* lifecycle.reportStarting("Resolving", Option.none())
     const application = Effect.gen(function* () {
