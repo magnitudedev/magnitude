@@ -162,10 +162,12 @@
       "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
       "formats": ["UD-Q4_K_XL", "UD-Q8_K_XL"],
       "license": "mit",
-      "qualityScore": 61.8,
+      "qualityScore": 82.7,
       "qualityScoreProvenance": "measured_terminal_bench_2.1",
       "qualityEvidence": [
+        "Publisher-reported DeepSeek-V4-Flash-0731 result using the DeepSeek Harness in max-effort mode; not an exact GGUF quantization measurement.",
         "Quantization fidelity is curated independently from hardware fit.",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731",
         "https://arxiv.org/abs/2606.19558"
       ]
     },
@@ -188,12 +190,14 @@
       "displayName": "GLM 5.2 753B-A40B",
       "description": "Largest catalog tier, intended only for exceptionally high-memory systems.",
       "repository": "unsloth/GLM-5.2-GGUF",
-      "formats": ["BF16"],
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
       "license": "mit",
-      "qualityScore": 77.9,
+      "qualityScore": 81.0,
       "qualityScoreProvenance": "measured_terminal_bench_2.1",
       "qualityEvidence": [
+        "Publisher-reported Terminal-Bench v2.1 result using the Terminus-2 harness; not an exact GGUF quantization measurement.",
         "Quantization fidelity is curated independently from hardware fit.",
+        "https://huggingface.co/unsloth/GLM-5.2-GGUF",
         "https://arxiv.org/abs/2606.19558"
       ]
     }
