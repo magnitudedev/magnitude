@@ -14,7 +14,6 @@ import {
   ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
-  makeAcnRevisionStore,
   SqliteDriver,
   COORDINATION_POLL_INTERVAL,
   TREE_KILL_WAIT,
@@ -86,17 +85,13 @@ interface LaunchedCandidate {
 }
 
 type ConvergenceState =
-  | { readonly _tag: "CoordinationChanged" }
-  | { readonly _tag: "AdvanceSelection" }
   | { readonly _tag: "SurvivingPredecessorTree"; readonly owner: AcnOwnerRecord }
   | {
       readonly _tag: "ObservableOwner"
       readonly owner: AcnOwnerRecord
-      readonly selected: AcnTarget["revision"]
       readonly observed: Option.Option<HealthObservation>
       readonly now: number
     }
-  | { readonly _tag: "OwnerWithoutSelection"; readonly owner: AcnOwnerRecord }
   | { readonly _tag: "CandidatePending" }
   | {
       readonly _tag: "CandidateExited"
@@ -105,7 +100,6 @@ type ConvergenceState =
       readonly stderr: string
     }
   | { readonly _tag: "CandidateAdmissionExpired"; readonly candidate: LaunchedCandidate }
-  | { readonly _tag: "AwaitingNewerSelectedOwner" }
   | { readonly _tag: "LaunchCandidate" }
   | { readonly _tag: "LaunchOccurrenceLost" }
 
@@ -128,14 +122,6 @@ const sameOwner = (left: AcnOwnerRecord, right: AcnOwnerRecord): boolean =>
   left.pid === right.pid &&
   left.processStartIdentity === right.processStartIdentity &&
   left.port === right.port
-
-const sameOptionalOwner = (
-  left: Option.Option<AcnOwnerRecord>,
-  right: Option.Option<AcnOwnerRecord>,
-): boolean => Option.match(left, {
-  onNone: () => Option.isNone(right),
-  onSome: (owner) => Option.exists(right, (other) => sameOwner(owner, other)),
-})
 
 const ownerNamesProcess = (owner: AcnOwnerRecord, process: ExactProcess): boolean =>
   owner.pid === process.pid && owner.processStartIdentity === process.processStartIdentity
@@ -218,10 +204,6 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
   const spawner = yield* ChildProcessSpawner
   const processes = yield* ExactProcessController
   const dataDirectory = options.dataDir ?? defaultDataDir()
-  const revisions = yield* makeAcnRevisionStore(dataDirectory).pipe(
-    Effect.provideService(FileSystem.FileSystem, fs),
-    Effect.provideService(Path.Path, path),
-  )
   const owners = yield* makeAcnOwnerStore(dataDirectory).pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.provideService(Path.Path, path),
@@ -254,7 +236,7 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
       return sameTarget(options.launchOverride.target, target)
         ? Effect.succeed(options.launchOverride)
         : Effect.fail(new AcnEnsuranceFailed({
-            reason: `This client cannot launch selected ACN revision ${target.revision}`,
+            reason: `This client cannot launch ACN revision ${target.revision}`,
           }))
     }
     let plan = Option.none<{
@@ -348,15 +330,12 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
   })
 
   const readyInstance = (
-    selected: AcnTarget["revision"],
     owner: AcnOwnerRecord,
     observed: HealthObservation,
   ): Effect.Effect<Option.Option<ReadyInstance>, AcnEnsuranceFailed> =>
     Effect.gen(function* () {
       const { health, status } = observed
       if (status !== 200 || health.state._tag !== "Ready") return Option.none()
-      const confirmedRevision = yield* retryStore(revisions.selected)
-      if (!Option.contains(confirmedRevision, selected)) return Option.none()
       const confirmedOwner = yield* retryStore(owners.current)
       if (!Option.exists(confirmedOwner, (current) => sameOwner(current, owner))) return Option.none()
       const identity = yield* inspectProcess(processes, owner.pid)
@@ -393,13 +372,11 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
           })
         }
         const value = yield* resolveCommand(target, emit)
-        yield* retryStore(revisions.register(target.revision))
         prepared = Option.some(value)
         return value
       })
 
       const classifyWithoutLiveOwner = (
-        selected: Option.Option<AcnTarget["revision"]>,
         now: number,
       ): Effect.Effect<ConvergenceState> => Effect.gen(function* () {
         if (Option.isSome(launched)) {
@@ -412,9 +389,6 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
             ? { _tag: "CandidateAdmissionExpired", candidate }
             : { _tag: "CandidatePending" }
         }
-        if (Option.exists(selected, (revision) => revision > target.revision)) {
-          return { _tag: "AwaitingNewerSelectedOwner" }
-        }
         return hasLaunched
           ? { _tag: "LaunchOccurrenceLost" }
           : { _tag: "LaunchCandidate" }
@@ -422,16 +396,10 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
 
       while (true) {
         const now = yield* monotonicMillis
-        const ownerBeforeSelection = yield* retryStore(owners.current)
-        const selected = yield* retryStore(revisions.selected)
         const owner = yield* retryStore(owners.current)
 
-        const state = !sameOptionalOwner(ownerBeforeSelection, owner)
-          ? { _tag: "CoordinationChanged" as const }
-          : Option.isSome(owner) && Option.exists(selected, (revision) => revision < target.revision)
-            ? { _tag: "AdvanceSelection" as const }
-          : yield* Option.match(owner, {
-          onNone: () => classifyWithoutLiveOwner(selected, now),
+        const state = yield* Option.match(owner, {
+          onNone: () => classifyWithoutLiveOwner(now),
           onSome: (current): Effect.Effect<ConvergenceState, AcnEnsuranceFailed> =>
             Effect.gen(function* () {
               if (Option.isSome(launched) && ownerNamesProcess(current, launched.value.process)) {
@@ -458,37 +426,23 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
               if (treeAbsent) {
                 observedOwner = ""
                 observedHealthState = ""
-                return yield* classifyWithoutLiveOwner(selected, now)
+                return yield* classifyWithoutLiveOwner(now)
               }
-              return yield* Option.match(selected, {
-                onNone: () => Effect.succeed<ConvergenceState>({
-                  _tag: "OwnerWithoutSelection",
+              return yield* probeHealth(current).pipe(
+                Effect.map((observed): ConvergenceState => ({
+                  _tag: "ObservableOwner",
                   owner: current,
-                }),
-                onSome: (revision) => probeHealth(current).pipe(
-                  Effect.map((observed): ConvergenceState => ({
-                    _tag: "ObservableOwner",
-                    owner: current,
-                    selected: revision,
-                    observed,
-                    now,
-                  })),
-                ),
-              })
+                  observed,
+                  now,
+                })),
+              )
             }),
         })
 
         const completed = yield* Match.value(state).pipe(
-          Match.tag("CoordinationChanged", () =>
-            Effect.yieldNow().pipe(Effect.as(Option.none<ReadyInstance>()))),
-          Match.tag("AdvanceSelection", () =>
-            prepare.pipe(Effect.as(Option.none<ReadyInstance>()))),
           Match.tag("SurvivingPredecessorTree", ({ owner }) =>
             retireOwner(owner).pipe(Effect.as(Option.none<ReadyInstance>()))),
-          Match.tag("OwnerWithoutSelection", ({ owner }) => Effect.fail(new AcnEnsuranceFailed({
-            reason: `ACN owner ${owner.pid} exists without a selected revision`,
-          }))),
-          Match.tag("ObservableOwner", ({ owner, selected, observed, now }) =>
+          Match.tag("ObservableOwner", ({ owner, observed, now }) =>
             Effect.gen(function* () {
               const currentOwnerKey = ownerKey(owner)
               const nextHealthState = Option.match(observed, {
@@ -503,15 +457,20 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
               }
               if (Option.isSome(observed)) {
                 const { health, status } = observed.value
-                if (health.pid !== owner.pid || health.revision !== selected ||
+                if (health.pid !== owner.pid ||
                   (status === 200) !== (health.state._tag === "Ready") ||
                   (status !== 200 && status !== 503)) {
                   yield* retireOwner(owner)
                   return Option.none<ReadyInstance>()
                 }
+                if (health.revision < target.revision) {
+                  yield* prepare
+                  yield* retireOwner(owner)
+                  return Option.none<ReadyInstance>()
+                }
                 const progress = acnLifecycleObservationFromHealthState(health.state)
                 if (Option.isSome(progress)) emit({ _tag: "Observation", observation: progress.value })
-                const ready = yield* readyInstance(selected, owner, observed.value)
+                const ready = yield* readyInstance(owner, observed.value)
                 if (Option.isSome(ready)) return ready
                 if (health.state._tag === "Starting" &&
                   now - ownerObservedAt >= Duration.toMillis(STARTUP_CEILING)) {
@@ -549,18 +508,11 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
           Match.tag("CandidateAdmissionExpired", ({ candidate }) => Effect.fail(new AcnEnsuranceFailed({
             reason: `ACN candidate ${candidate.process.pid} did not commit admission`,
           }))),
-          Match.tag("AwaitingNewerSelectedOwner", () =>
-            Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
           Match.tag("LaunchOccurrenceLost", () => Effect.fail(new AcnEnsuranceFailed({
             reason: "Magnitude daemon exited during startup before it became ready",
           }))),
           Match.tag("LaunchCandidate", () => Effect.gen(function* () {
             const command = yield* prepare
-            const confirmed = yield* retryStore(revisions.selected)
-            if (!Option.contains(confirmed, target.revision)) {
-              yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
-              return Option.none<ReadyInstance>()
-            }
             const argv = [
               ...command.command,
               ...(options.debug === true && !command.command.includes("--debug") ? ["--debug"] : []),

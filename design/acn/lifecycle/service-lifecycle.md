@@ -27,15 +27,14 @@ its exact owner row commits, and may not construct application or ICN services b
 
 After binding its control endpoint, the candidate reads the complete current owner, proves that
 predecessor's dedicated process tree absent, then atomically replaces the singleton SQLite owner
-row only if both owner and selected revision remain unchanged. That commit is process admission.
-Owner or selection mismatch makes the candidate stop and exit without expensive initialization.
-Successful admission removes dependence on its launching manager and permits application startup.
+row only if the complete owner remains unchanged. That commit is process admission. Owner mismatch
+makes the candidate stop and exit without expensive initialization. Successful admission removes
+dependence on its launching manager and permits application startup.
 
-An admitted ACN observes the revision store for a greater selected revision and retires when one
-appears. It does not self-revoke on missing, unreadable, or indeterminate coordination state.
-Retirement begins only through exact explicit shutdown, idle policy, its own terminal failure, or
-process signals. A successor initializes nothing until its owner row commits and the predecessor
-ACN/ICN tree has been proven absent.
+An admitted ACN does not poll durable version intent. A manager prepares a successor before asking
+a lower-revision live owner to stop, then proves the predecessor ACN/ICN tree absent before the
+successor may commit ownership. Retirement otherwise begins only through exact explicit shutdown,
+idle policy, the ACN's own terminal failure, or process signals.
 
 ## Readiness and admission
 
