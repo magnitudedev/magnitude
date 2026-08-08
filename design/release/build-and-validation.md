@@ -29,9 +29,10 @@ archives, not only on intermediate build outputs.
 Every Linux host, CPU base, CUDA pack, and Vulkan pack builds on its architecture's Ubuntu 22.04
 runner. CUDA 11.8 and CUDA 12.9 use the same userspace baseline.
 
-Ubuntu 22.04 supplies Vulkan headers but not the required shader compiler. Vulkan jobs therefore
-build pinned shaderc `v2023.8` `glslc` as a build-only tool. It is not included in the release and
-does not become a customer dependency.
+Ubuntu 22.04's Vulkan headers are older than the Vulkan API types used by the pinned llama.cpp.
+Vulkan jobs therefore construct a build-only SDK prefix from Vulkan-Headers 1.4.313 and shaderc
+`v2023.8` `glslc`, while linking against Jammy's system Vulkan loader. The headers and shader
+compiler are not included in the release and do not become customer dependencies.
 
 ## Archive validation
 
