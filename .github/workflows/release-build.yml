@@ -132,9 +132,11 @@ jobs:
         shell: bash
         run: |
           sudo apt-get install -y libvulkan-dev spirv-headers ninja-build python3
+          vulkan_root="$RUNNER_TEMP/vulkan-sdk-1.4.313"
+          headers_root="$RUNNER_TEMP/vulkan-headers-1.4.313"
           shaderc_root="$RUNNER_TEMP/shaderc-v2023.8"
           git clone --filter=blob:none https://github.com/google/shaderc.git "$shaderc_root"
-          git -C "$shaderc_root" checkout --detach f8a25c591bf5edbb462ca4aea99dcc666f096d13
+          git -C "$shaderc_root" checkout --detach e6edd6d48fa5bdd9d176794c6810fae7f8e938e1
           python3 "$shaderc_root/utils/git-sync-deps"
           cmake \
             -S "$shaderc_root" \
@@ -145,8 +147,19 @@ jobs:
             -D SHADERC_SKIP_EXAMPLES=ON
           cmake --build "$shaderc_root/build" --target glslc_exe
           test -x "$shaderc_root/build/glslc/glslc"
-          "$shaderc_root/build/glslc/glslc" --version
-          echo "$shaderc_root/build/glslc" >> "$GITHUB_PATH"
+          git clone --filter=blob:none https://github.com/KhronosGroup/Vulkan-Headers.git "$headers_root"
+          git -C "$headers_root" checkout --detach 409c16be502e39fe70dd6fe2d9ad4842ef2c9a53
+          cmake \
+            -S "$headers_root" \
+            -B "$headers_root/build" \
+            -D CMAKE_INSTALL_PREFIX="$vulkan_root"
+          cmake --build "$headers_root/build" --target install
+          mkdir -p "$vulkan_root/bin"
+          cp "$shaderc_root/build/glslc/glslc" "$vulkan_root/bin/glslc"
+          "$vulkan_root/bin/glslc" --version
+          test -f "$vulkan_root/include/vulkan/vulkan.hpp"
+          echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
+          echo "$vulkan_root/bin" >> "$GITHUB_PATH"
       - name: Install Windows Vulkan SDK
         if: runner.os == 'Windows' && matrix.backend == 'vulkan'
         shell: pwsh
