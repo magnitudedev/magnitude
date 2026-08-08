@@ -509,13 +509,27 @@ export const makeLocalAcnInstanceManager = (
                 if (health.state._tag === "Starting" &&
                   now - ownerObservedAt >= Duration.toMillis(STARTUP_CEILING)) {
                   yield* retireOwner(owner)
-                  return Option.none<ReadyInstance>()
+                  return yield* Effect.fail(new AcnEnsuranceFailed({
+                    reason: "Magnitude daemon did not become ready within the startup deadline",
+                  }))
                 }
               }
-              const grace = Option.exists(observed, ({ health }) => health.state._tag === "Stopping")
-                ? STOPPING_GRACE
-                : HEALTH_GRACE
-              if (now - stateSince >= Duration.toMillis(grace)) {
+              // Live Starting health is bounded only by STARTUP_CEILING. Long install
+              // phases (Resolving, PreparingBackend, Starting) often hold a stable
+              // progress key for more than HEALTH_GRACE while still making progress;
+              // retiring them produces the cryptic "candidate … no longer available"
+              // failure during first install. HEALTH_GRACE applies when health is
+              // unobservable or the owner is Stopping.
+              const grace = Option.match(observed, {
+                onNone: () => Option.some(HEALTH_GRACE),
+                onSome: ({ health }) =>
+                  health.state._tag === "Stopping"
+                    ? Option.some(STOPPING_GRACE)
+                    : health.state._tag === "Starting"
+                      ? Option.none<Duration.Duration>()
+                      : Option.some(HEALTH_GRACE),
+              })
+              if (Option.isSome(grace) && now - stateSince >= Duration.toMillis(grace.value)) {
                 yield* retireOwner(owner)
               } else {
                 yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
@@ -533,7 +547,7 @@ export const makeLocalAcnInstanceManager = (
           Match.tag("AwaitingNewerSelectedOwner", () =>
             Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
           Match.tag("LaunchOccurrenceLost", () => Effect.fail(new AcnEnsuranceFailed({
-            reason: "The ACN candidate launched by this ensure occurrence is no longer available",
+            reason: "Magnitude daemon exited during startup before it became ready",
           }))),
           Match.tag("LaunchCandidate", () => Effect.gen(function* () {
             const command = yield* prepare

@@ -98,10 +98,14 @@ sandwich. If the complete owner differs, the manager re-observes instead of inte
 pair. Mutation and final ready adoption then perform the narrower rereads required by their action.
 
 Policy uses Effect `Duration`, monotonic `Clock`, bounded `Schedule`, and `TestClock`. Initial bounds
-are one second polling, two seconds per health request, thirty seconds without health or startup
-progress, thirty seconds for candidate admission, five minutes absolute application startup, five
-seconds for stopping, two seconds after TERM, two seconds after KILL, and ten minutes absolute per
-ensurance occurrence. Progress never extends either absolute ceiling.
+are one second polling, two seconds per health request, thirty seconds without an observable health
+response, thirty seconds for candidate admission, five minutes absolute application startup while
+health remains `Starting` (including long install phases that hold a stable progress key, such as
+Resolving, PreparingBackend, and Starting), five seconds for stopping, two seconds after TERM, two
+seconds after KILL, and ten minutes absolute per ensurance occurrence. A live `Starting` owner is
+not retired merely because its progress key is unchanged; only the absolute startup ceiling and loss
+of health observation authorize retirement during startup. Progress never extends either absolute
+ceiling.
 
 ## Administrative stop
 
