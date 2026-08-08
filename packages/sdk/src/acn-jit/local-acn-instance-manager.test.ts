@@ -6,6 +6,7 @@ import {
   AcnInstanceIdSchema,
   AcnReady,
   AcnRevisionSchema,
+  AcnStarting,
   type AcnTarget,
 } from "@magnitudedev/acn-protocol"
 import {
@@ -202,6 +203,77 @@ describe("LocalAcnInstanceManager", () => {
       expect(Exit.isFailure(result)).toBe(true)
       expect(spawns).toBe(1)
       expect(cleanups).toBe(1)
+    }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
+  })
+
+  it("does not retire a live Starting owner when its progress key is stable past health grace", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-starting-grace-" })
+      const exact = yield* ExactProcessControllerLive.current
+      const id = AcnInstanceIdSchema.make("starting-owner")
+      let ready = false
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () => {
+          if (ready) {
+            return Response.json({
+              service: "magnitude-acn",
+              version: SDK_VERSION,
+              revision: SDK_ACN_TARGET.revision,
+              id,
+              pid: exact.pid,
+              state: new AcnReady({}),
+            })
+          }
+          return new Response(JSON.stringify({
+            service: "magnitude-acn",
+            version: SDK_VERSION,
+            revision: SDK_ACN_TARGET.revision,
+            id,
+            pid: exact.pid,
+            state: new AcnStarting({
+              activity: {
+                _tag: "PreparingBackend",
+                backend: { _tag: "Metal", hardwareLabel: "Apple M3 Pro" },
+              },
+              progress: Option.none(),
+            }),
+          }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          })
+        },
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
+      if (server.port === undefined) return yield* Effect.dieMessage("test server has no TCP port")
+      const revisions = yield* makeAcnRevisionStore(dataDir)
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      yield* revisions.register(SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: server.port }, SDK_ACN_TARGET.revision)
+
+      const manager = yield* makeLocalAcnInstanceManager({
+        dataDir,
+        binaryPath: `${dataDir}/must-not-be-resolved`,
+      }).pipe(Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+        spawn: () => Effect.dieMessage("live starting owner must not spawn"),
+      })))
+
+      const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(
+        Effect.fork,
+      )
+      // Let real async process inspect / health complete before advancing TestClock.
+      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 100)))
+      // Beyond former HEALTH_GRACE (30s): still Starting with a stable progress key.
+      // Under the old policy this would retire the owner and fail install.
+      yield* TestClock.adjust(Duration.seconds(45))
+      ready = true
+      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)))
+      // Advance past coordination polls so ensure observes Ready.
+      yield* TestClock.adjust(Duration.seconds(2))
+      const result = yield* Fiber.join(ensuring)
+      expect(result.id).toBe(id)
     }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
   })
 
