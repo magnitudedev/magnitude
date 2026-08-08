@@ -138,7 +138,7 @@ jobs:
   publish:
     needs: [preflight, build]
     if: needs.preflight.outputs.action == 'release'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,6 +152,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
+      - run: sudo apt-get update && sudo apt-get install -y binutils
       - run: bun run packages/version/scripts/generate-version.ts
       - uses: actions/download-artifact@v4
         with:
@@ -198,7 +199,7 @@ jobs:
 
   public-smoke:
     needs: [preflight, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/setup-node@v4
         with:

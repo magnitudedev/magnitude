@@ -18,12 +18,18 @@ const matrices = {
       toolkit: "cuda" in pack ? pack.cuda.toolkitVersion : "",
     })),
   },
+  linuxHosts: {
+    include: releaseHosts
+      .filter((host) => host.id.startsWith("linux-"))
+      .map((host) => ({ id: host.id, runner: host.runner })),
+  },
 }
 
 const output = process.env.GITHUB_OUTPUT
 if (output) {
   await appendFile(output, `hosts=${JSON.stringify(matrices.hosts)}\n`)
   await appendFile(output, `backends=${JSON.stringify(matrices.backends)}\n`)
+  await appendFile(output, `linuxHosts=${JSON.stringify(matrices.linuxHosts)}\n`)
 } else {
   console.log(JSON.stringify(matrices, null, 2))
 }

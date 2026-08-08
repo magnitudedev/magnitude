@@ -59,9 +59,9 @@ Linux x64 and ARM64 build the same two compiler configurations independently:
 | CUDA 11.8 | ordinary `80` |
 | CUDA 12.9 | ordinary `80`, ordinary `90`, ordinary `120` |
 
-These four host/toolkit jobs run concurrently. CUDA 11.8 jobs use Ubuntu 22.04, which CUDA
-11.8 supports on x64 and SBSA ARM64; CUDA 12.9 jobs use Ubuntu 24.04. Host CPU architecture never
-selects a CUDA toolkit generation.
+These four host/toolkit jobs run concurrently on Ubuntu 22.04 for both x64 and SBSA ARM64 so every
+Linux pack retains the release userspace ABI baseline. Host CPU architecture never selects a CUDA
+toolkit generation.
 
 Release compatibility inspection consumes `cuobjdump` output as a stream and retains only the
 distinct PTX image facts. Its memory use must not scale with the textual PTX dump.

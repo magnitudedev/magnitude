@@ -154,7 +154,7 @@ const smokeIcnServer = async (
   }
 }
 
-const smokeHostArchives = async (
+export const smokeHostArchives = async (
   host: ReturnType<typeof hostById>,
   cliArchivePath: string,
   acnArchivePath: string,

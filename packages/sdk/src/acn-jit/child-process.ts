@@ -1,16 +1,21 @@
 import { Array as Arr, Context, Effect, Ref, Scope } from "effect"
 import { AcnEnsuranceFailed } from "./errors"
 
+export interface AcnCandidateExit {
+  readonly code: number
+  readonly stderr: string
+}
+
 /** An ACN candidate whose cleanup remains armed until owner admission is observed. */
 export interface SpawnedAcnCandidate {
   readonly pid: number
-  readonly exited: Effect.Effect<number>
+  readonly exited: Effect.Effect<AcnCandidateExit>
   readonly admit: Effect.Effect<void, AcnEnsuranceFailed>
 }
 
 interface ScopedAcnCandidate {
   readonly pid: number
-  readonly exited: Effect.Effect<number>
+  readonly exited: Effect.Effect<AcnCandidateExit>
   readonly stopAndReap: Effect.Effect<void, AcnEnsuranceFailed>
   readonly releaseParentChannel: Effect.Effect<void, AcnEnsuranceFailed>
 }

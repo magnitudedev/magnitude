@@ -25,6 +25,7 @@ import {
   releaseHosts,
 } from "../src/targets"
 import { fileSha256, run } from "./build/common"
+import { verifyLinuxElfComposition } from "./build/linux-elf"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../..")
 const input = resolve(process.argv[2] ?? "release-artifacts")
@@ -228,6 +229,26 @@ for (const pack of candidateBackendPacks) {
       Option.getOrThrow(base.backendModuleAbi)
   ) {
     throw new Error(`${artifact.id} is incompatible with ${base.id}`)
+  }
+}
+
+for (const host of candidateHosts.filter((candidate) => candidate.id.startsWith("linux-"))) {
+  const base = archiveById.get(`icn-base-${host.id}`)!
+  await verifyLinuxElfComposition(host.id, [
+    archiveById.get(`cli-${host.id}`)!,
+    archiveById.get(`acn-${host.id}`)!,
+    base,
+  ])
+  for (const pack of candidateBackendPacks.filter((candidate) => candidate.host === host.id)) {
+    const capability = pack.backend === "cuda"
+      ? "libcuda.so.1"
+      : pack.backend === "vulkan"
+        ? "libvulkan.so.1"
+        : undefined
+    await verifyLinuxElfComposition(host.id, [
+      base,
+      archiveById.get(`icn-backend-${pack.id}`)!,
+    ], capability === undefined ? [] : [capability])
   }
 }
 

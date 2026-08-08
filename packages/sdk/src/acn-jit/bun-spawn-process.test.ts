@@ -15,12 +15,15 @@ describe("BunDetachedChildProcessSpawner", () => {
             globalThis.process.execPath,
             "-e",
             [
-              `process.stdout.write("x".repeat(${70 * 1024}), () => {`,
-              `  process.stderr.write("candidate failed\\n", () => process.exit(7))`,
-              "})",
+              `process.stderr.write("x".repeat(${70 * 1024}))`,
+              `process.stderr.write("\\ncandidate failed\\n", () => process.exit(7))`,
             ].join(";"),
           ])
           expect(spawned.pid).toBeGreaterThan(0)
+          const exit = yield* spawned.exited
+          expect(exit.code).toBe(7)
+          expect(new TextEncoder().encode(exit.stderr).length).toBeLessThanOrEqual(64 * 1024)
+          expect(exit.stderr).toMatch(/candidate failed$/)
         }),
       ),
     )

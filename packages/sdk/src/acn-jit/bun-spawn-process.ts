@@ -2,6 +2,26 @@ import { Duration, Effect, Option, Schedule } from "effect"
 import { AcnEnsuranceFailed } from "./errors"
 import { scopeAcnCandidate, type ChildProcessSpawner } from "./child-process"
 
+const MAXIMUM_STDERR_BYTES = 64 * 1024
+
+const readStderrTail = async (
+  stream: ReadableStream<Uint8Array>,
+): Promise<string> => {
+  const reader = stream.getReader()
+  let tail = new Uint8Array(0)
+  while (true) {
+    const next = await reader.read()
+    if (next.done) break
+    const combined = new Uint8Array(tail.length + next.value.length)
+    combined.set(tail)
+    combined.set(next.value, tail.length)
+    tail = combined.length <= MAXIMUM_STDERR_BYTES
+      ? combined
+      : combined.slice(combined.length - MAXIMUM_STDERR_BYTES)
+  }
+  return new TextDecoder().decode(tail).trim()
+}
+
 const spawnFailure = (operation: string, cause: unknown) =>
   new AcnEnsuranceFailed({
     reason: `${operation}: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -14,12 +34,16 @@ export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
       try: () => Bun.spawn({
         cmd: Array.from(command),
         detached: true,
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: ["pipe", "ignore", "pipe"],
         env: globalThis.process.env,
       }),
       catch: (cause) => spawnFailure("Failed to spawn Magnitude", cause),
     })
-    const exited = Effect.promise(() => child.exited)
+    const stderr = readStderrTail(child.stderr)
+    const exited = Effect.promise(async () => ({
+      code: await child.exited,
+      stderr: await stderr,
+    }))
     child.unref()
 
     const treeAbsent = Effect.sync(() => {
