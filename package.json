@@ -42,7 +42,7 @@
     "pre:alpha": "changeset pre enter alpha",
     "pre:beta": "changeset pre enter beta",
     "pre:exit": "changeset pre exit",
-    "prepare": "effect-language-service patch",
+    "prepare": "bun run packages/version/scripts/generate-version.ts && effect-language-service patch",
     "els": "effect-language-service",
     "web": "bun run dev:version && bun run web/scripts/dev-server.ts",
     "desktop": "bun run dev:version && cd desktop && bun run dev",

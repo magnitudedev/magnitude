@@ -89,7 +89,6 @@ jobs:
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
       - run: bun install --frozen-lockfile
-      - run: bun run packages/version/scripts/generate-version.ts
       - uses: actions/download-artifact@v4
         with:
           name: catalog-inputs
@@ -256,7 +255,6 @@ jobs:
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: sudo apt-get update && sudo apt-get install -y binutils
       - run: bun install --frozen-lockfile
-      - run: bun run packages/version/scripts/generate-version.ts
       - uses: actions/download-artifact@v4
         with:
           pattern: host-*
