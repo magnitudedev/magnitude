@@ -709,9 +709,6 @@ fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
     {
         return (58, true);
     }
-    if declaration_id == "glm-5.2" {
-        return (100, false);
-    }
     let rank = if format.contains("Q8") {
         80
     } else if format.contains("Q6") {
@@ -1233,7 +1230,12 @@ mod tests {
             ["UD-Q4_K_XL", "MXFP4_MOE"]
         );
         assert_eq!(formats("deepseek-v4-flash"), ["UD-Q4_K_XL", "UD-Q8_K_XL"]);
-        assert_eq!(formats("glm-5.2"), ["BF16"]);
+        assert_eq!(
+            formats("glm-5.2"),
+            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
+        );
+        assert_eq!(fidelity("glm-5.2", "UD-Q4_K_XL"), (40, false));
+        assert_eq!(fidelity("glm-5.2", "UD-Q8_K_XL"), (80, false));
     }
 
     #[test]
