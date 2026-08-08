@@ -153,7 +153,6 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
       - run: sudo apt-get update && sudo apt-get install -y binutils
-      - run: bun run packages/version/scripts/generate-version.ts
       - uses: actions/download-artifact@v4
         with:
           pattern: host-*

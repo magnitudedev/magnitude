@@ -35,7 +35,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun install --frozen-lockfile
-      - run: bun run packages/version/scripts/generate-version.ts
       - name: Test Linux CPU MTP memory-domain accounting
         run: >-
           cargo test
