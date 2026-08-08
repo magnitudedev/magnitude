@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.39
+
+### Patch Changes
+
+- [#19](https://github.com/magnitudedev/magnitude/pull/19) [`fcdd491`](https://github.com/magnitudedev/magnitude/commit/fcdd491ad6e813feb47601b084b4187645be123a) Thanks [@nicolasdmolina](https://github.com/nicolasdmolina)! - Fix first-run install failing with "ACN candidate … no longer available" when daemon startup phases (Resolving / PreparingBackend / Starting) hold a stable progress key longer than 30s
+
+- [`9151adc`](https://github.com/magnitudedev/magnitude/commit/9151adca5170626bebd76c213a3f7196c44cc174) Thanks [@nicolasdmolina](https://github.com/nicolasdmolina)! - fix: do not retire live Starting ACN on stable progress key
+
 ## 0.0.1-alpha.38
 
 ### Patch Changes
