@@ -87,6 +87,7 @@ const candidate = (input: {
           },
         },
       },
+      profile,
       displayName: input.id,
       description: "Test fixture",
       license: "test",

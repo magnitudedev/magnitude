@@ -5,9 +5,10 @@ downloads, and active runtime state. CLI and web actions call ACN RPCs; ACN tran
 to the generated ICN client. ACN never treats its own host as the inference machine.
 
 The curated model recipes are Magnitude-owned metadata. They group quantized choices under
-stable checkpoint identities and record repositories, artifact selectors, product context
-profiles, reviewed performance and fidelity evidence, and license policy. It does not pin Hugging
-Face commits or copy filenames, shard lists, sizes, or hashes into source.
+stable checkpoint identities and record repositories, artifact selectors, exact product context
+profiles, required companion paths and roles, reviewed performance and fidelity evidence, and
+license policy. It does not pin Hugging Face commits or copy resolved shard lists, sizes, or hashes
+into source.
 
 ICN queries Hugging Face, resolves `main` to an immutable snapshot, and returns current files,
 sizes, identities, license data, and commit provenance. Preview and download then use that exact
@@ -20,8 +21,9 @@ and GGUF headers plus fit/performance assessments are content-addressed by immut
 hardware evidence. No model weights are downloaded until the user chooses a model.
 
 For each usage choice the ICN recipe service submits the applicable context and parallel-sequence
-profiles to preview. Catalog and discovered local models use one 100K context configuration,
-bounded by the model's native maximum, for fit, catalog availability, recommendations, and loading.
+profiles to preview. Catalog models use their one reviewed context configuration. Discovered local
+models use one 100K context configuration bounded by the model's native maximum. The selected
+configuration is used consistently for fit, catalog availability, recommendations, and loading.
 Each configuration carries speed estimates at 25K, 50K, 75K, and full context, with points above
 its configured context omitted. Recommendations require at least 8 expected baseline tokens per
 second at full context. Ranking and relative speed comparisons use the 50K estimate, bounded by the
