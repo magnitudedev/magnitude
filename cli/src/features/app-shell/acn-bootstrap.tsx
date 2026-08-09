@@ -16,9 +16,8 @@ const PHASE_LABELS: Readonly<Record<AcnInstallationPhase, string>> = {
 };
 
 const STARTING_PHASE_LABELS: Readonly<Record<Extract<AcnStartingPhase, string>, string>> = {
-  Discovering: "Looking for Magnitude",
+  PreparingAcn: "Preparing background server",
   WaitingForOwner: "Waiting for previous Magnitude process",
-  LaunchingAcn: "Starting Magnitude",
   ResolvingLocalInference: "Preparing local inference",
   LaunchingLocalInference: "Starting local inference",
 };
