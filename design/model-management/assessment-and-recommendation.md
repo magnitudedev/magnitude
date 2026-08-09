@@ -98,8 +98,9 @@ ACN selects at most one configuration for each intent:
 Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
 A recommendation references a candidate; it does not create another model identity.
 
-A candidate is usable only when its full-context expected generation speed is at least 8 tokens per
-second. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
+A catalog candidate is eligible for recommendation only when its full-context expected generation
+speed is at least 5 tokens per second. Balanced speed utility uses 5 tokens per second as its zero
+point. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
 bounded by the configured context for shorter models. Clients present the expected-speed range from
 the samples at 25K and 75K, likewise bounded by the configured context, without treating those
 samples as separate configurations.
@@ -134,8 +135,8 @@ Cached assessment never authorizes loading.
 - All missing profiles for one target are submitted together.
 - Equivalent concurrent misses perform one native assessment.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
-- The usability floor uses full-context performance; ranking and relative comparisons use the
-  bounded 50K sample.
+- The recommendation eligibility floor uses full-context performance; ranking and relative
+  comparisons use the bounded 50K sample.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
 - Lightweight is hardware-relative, capability-maximizing within its memory tier, and independent
   of the capability ceiling outside that tier.
