@@ -6,8 +6,10 @@ applies_to:
 # Catalog presentation
 
 The local-model catalog list supports comparison and navigation. The catalog detail view owns the
-complete descriptive, recommendation, calibration, quality, license, and action evidence for one
-candidate.
+complete descriptive, recommendation, calibration, quantization-fidelity label, license, source
+repository, and actions for one candidate. Catalog-maintainer scoring evidence is not presented to
+users. Hugging Face repositories are presented as themed, underlined links that open in the user's
+browser and provide pointer-hover feedback.
 
 ## Responsive information hierarchy
 
