@@ -6,7 +6,9 @@
   "types": "src/index.tsx",
   "scripts": {
     "dev": "bun run scripts/dev-server.ts",
-    "build": "vite build"
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run"
   },
   "dependencies": {
     "@magnitudedev/sdk": "workspace:*",

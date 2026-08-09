@@ -8,8 +8,9 @@
  * StreamDisplayView uses the display view store (spec §6.1).
  * Local UI state uses plain atoms (spec §6.3).
  */
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react"
-import { Option, Effect, Runtime } from "effect"
+import { useCallback, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react"
+import { Menu } from "lucide-react"
+import { Option, Effect } from "effect"
 import { useAtomValue, useAtomSet, useAtomMount, Atom, Result } from "@effect-atom/atom-react"
 import {
   type CommandContext,
@@ -23,6 +24,11 @@ import {
   useComposerState,
   useSessionPreload,
   useSessionActions,
+  usePaginatedSessions,
+  useOnboardingState,
+  useModelSlots,
+  deriveCurrentLocalModel,
+  modelSlotResidentAllocation,
   useActiveSessionStatusesSubscription,
   activeSessionStatusesAtom,
 } from "@magnitudedev/client-common"
@@ -35,13 +41,15 @@ import { FileViewerPanel } from "./components/file-viewer-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
-import { SettingsPanel, type ApiKeyState } from "./components/settings-panel"
+import { SettingsPanel } from "./components/settings-panel"
+import { ModelCenter } from "./components/model-center"
+import { LocalModelOnboarding } from "./components/local-model-onboarding"
+import { formatBytes } from "./components/local-inference-format"
 import { ChatColumnPage } from "./components/chat-column-page"
 import {
   selectedCwdAtom,
   selectedFilePathAtom,
   settingsOpenAtom,
-  usageOpenAtom,
   bashModeAtom,
   nextEscWillKillAllAtom,
 } from "@magnitudedev/client-common"
@@ -49,6 +57,7 @@ import {
   sidebarSearchAtom,
   sidebarCwdFilterAtom,
   sidebarVisibleAtom,
+  modelCenterTabAtom,
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
@@ -57,7 +66,6 @@ import { showToast } from "./stores/toast-store"
 import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
 import {
   useSlotProfiles,
-  useModelConfig,
   findSlotProfile,
   type SlotProfile,
   type SlotProfiles,
@@ -67,39 +75,17 @@ import {
   PRIMARY_SLOT_ID,
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
-  SLOT_DISPLAY_NAMES,
-  SLOT_DESCRIPTIONS,
 } from "@magnitudedev/sdk"
 import type {
   DisplayActor,
-  ListSessionsResult,
   ReadFileResult,
   SessionCwdSummary,
   SessionMetadata,
 } from "@magnitudedev/sdk"
 import type { SlotId } from "@magnitudedev/sdk"
+import { registerWebCommands } from "./commands/register"
 
-const SESSION_PAGE_SIZE = 50
-type SessionPageState = {
-  sessions: SessionMetadata[]
-  nextCursor: string | null
-  hasMore: boolean
-  loadingMore: boolean
-}
-
-function appendUniqueSessions(
-  existing: readonly SessionMetadata[],
-  incoming: readonly SessionMetadata[],
-): SessionMetadata[] {
-  const seen = new Set(existing.map((session) => session.sessionId))
-  const next = [...existing]
-  for (const session of incoming) {
-    if (seen.has(session.sessionId)) continue
-    seen.add(session.sessionId)
-    next.push(session)
-  }
-  return next
-}
+registerWebCommands()
 
 function formatRoleLabel(role: string | null | undefined): string {
   if (!role) return "Leader"
@@ -140,92 +126,14 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
   const searchQuery = useAtomValue(sidebarSearchAtom)
   const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const sessionPageGenerationRef = useRef(0)
-  const [sessionPage, setSessionPage] = useState<SessionPageState>({
-    sessions: [],
-    nextCursor: null,
-    hasMore: false,
-    loadingMore: false,
-  })
+  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
 
   const trimmedSearchQuery = searchQuery.trim()
-  const firstPageAtom = useMemo(
-    () => client.query("ListSessions", {
-      cwd: cwdFilter ? Option.some(cwdFilter) : Option.none(),
-      query: trimmedSearchQuery ? Option.some(trimmedSearchQuery) : Option.none(),
-      cursor: Option.none(),
-      limit: SESSION_PAGE_SIZE,
-    }, { reactivityKeys: ["sessions"] }),
-    [client, cwdFilter, trimmedSearchQuery],
-  )
-  const firstPageResult = useAtomValue(firstPageAtom)
-  const listSessionsMutation = useAtomSet(client.mutation("ListSessions"), { mode: "promise" })
-
-  useEffect(() => {
-    sessionPageGenerationRef.current += 1
-    if (Result.isSuccess(firstPageResult)) {
-      const page = firstPageResult.value as ListSessionsResult
-      setSessionPage({
-        sessions: [...page.items],
-        nextCursor: page.nextCursor._tag === "Some" ? page.nextCursor.value : null,
-        hasMore: page.hasMore,
-        loadingMore: false,
-      })
-      return
-    }
-    if (Result.isInitial(firstPageResult)) {
-      setSessionPage((prev) => ({
-        ...prev,
-        loadingMore: false,
-      }))
-      return
-    }
-    setSessionPage({
-      sessions: [],
-      nextCursor: null,
-      hasMore: false,
-      loadingMore: false,
-    })
-  }, [firstPageResult])
-
-  const loadMoreSessions = useCallback(async () => {
-    if (sessionPage.loadingMore || !sessionPage.hasMore || !sessionPage.nextCursor) return
-    const generation = sessionPageGenerationRef.current
-    setSessionPage((prev) => ({ ...prev, loadingMore: true }))
-    try {
-      const page = await listSessionsMutation({
-        payload: {
-          cwd: cwdFilter ? Option.some(cwdFilter) : Option.none(),
-          query: trimmedSearchQuery ? Option.some(trimmedSearchQuery) : Option.none(),
-          cursor: Option.some(sessionPage.nextCursor as string),
-          limit: SESSION_PAGE_SIZE,
-        },
-        reactivityKeys: ["sessions"],
-      })
-      if (generation !== sessionPageGenerationRef.current) return
-      setSessionPage((prev) => ({
-        sessions: appendUniqueSessions(prev.sessions, page.items),
-        nextCursor: page.nextCursor._tag === "Some" ? page.nextCursor.value : null,
-        hasMore: page.hasMore,
-        loadingMore: false,
-      }))
-    } catch (err) {
-      console.error("[SessionsSidebar] Failed to load more sessions:", err)
-      if (generation !== sessionPageGenerationRef.current) return
-      setSessionPage((prev) => ({ ...prev, loadingMore: false }))
-    }
-  }, [
-    listSessionsMutation,
-    cwdFilter,
-    sessionPage.hasMore,
-    sessionPage.loadingMore,
-    sessionPage.nextCursor,
-    trimmedSearchQuery,
-  ])
-
-  const sessionsLoading = Result.isInitial(firstPageResult) && sessionPage.sessions.length === 0
-  const sessions = sessionPage.sessions
-  // Cloud is disabled.
+  const sessionPage = usePaginatedSessions({
+    ...(cwdFilter ? { cwd: cwdFilter } : {}),
+    ...(trimmedSearchQuery ? { query: trimmedSearchQuery } : {}),
+    pageSize: 50,
+  })
 
   // Listen for __magnitude:focus-search custom event → focus the search input
   const focusSearchAtom = useMemo(
@@ -262,9 +170,9 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
 
   return (
     <SessionsSidebar
-      loading={sessionsLoading}
-      sessions={sessions.map((s) => {
-        const liveStatus = activeSessionStatuses[s.sessionId]
+      loading={sessionPage.loading}
+      sessions={sessionPage.sessions.map((s) => {
+        const liveStatus = activeSessionStatuses[s.id]
         const statusFields = liveStatus
           ? {
               updatedAt: liveStatus.lastMessageAt,
@@ -272,14 +180,14 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
               activeWorkerCount: liveStatus.activeWorkerCount,
             }
           : {
-              updatedAt: s.updatedAt,
+              updatedAt: s.timestamp,
               workStatus: "idle" as const,
               activeWorkerCount: 0,
             }
         return {
-          sessionId: s.sessionId,
+          sessionId: s.id,
           title: s.title,
-          cwd: s.cwd,
+          cwd: s.workingDirectory,
           messageCount: s.messageCount,
           ...statusFields,
         }
@@ -289,12 +197,21 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
       loadingMore={sessionPage.loadingMore}
       hasMore={sessionPage.hasMore}
       onCwdFilterChange={setCwdFilter}
-      onLoadMore={loadMoreSessions}
+      onLoadMore={sessionPage.loadMore}
       onSelectSession={(id) => {
         resumeSession(id)
       }}
       onNewSession={handleNewSession}
-      onOpenSettings={() => setSettingsOpen(true)}
+      onOpenSettings={() => {
+        setModelCenterTab(null)
+        setSettingsOpen(true)
+        props?.onCloseOverlay?.()
+      }}
+      onOpenModels={() => {
+        setSettingsOpen(false)
+        setModelCenterTab("models")
+        props?.onCloseOverlay?.()
+      }}
       overlay={props?.overlay}
       onCloseOverlay={props?.onCloseOverlay}
     />
@@ -419,48 +336,6 @@ function deriveWorkerInfo(
   return { forkId, role: actor.role, name: actor.name }
 }
 
-/** Unified settings+usage panel container.
- *  Receives `slotProfiles` from parent to avoid a duplicate subscription. */
-function SettingsPanelContainer({
-  slotProfiles,
-  initialTab,
-}: {
-  slotProfiles: SlotProfiles | null
-  initialTab: "settings" | "usage"
-}): ReactNode {
-  const modelConfig = useModelConfig()
-
-  // Cloud is disabled.
-  const apiKeyState: ApiKeyState = { status: "none" }
-
-  // ── Slots ──
-  const slots = useMemo(() => {
-    return ([
-      PRIMARY_SLOT_ID,
-      // "secondary", // Secondary model settings are temporarily hidden.
-    ] as const).map((slotId) => ({
-      slotId,
-      label: SLOT_DISPLAY_NAMES.primary,
-      description: SLOT_DESCRIPTIONS.primary,
-      modelDisplayName: slotProfiles?.primary?.modelDisplayName ?? "—",
-      contextWindow: slotProfiles?.primary?.contextWindow ?? null,
-    }))
-  }, [slotProfiles])
-
-  // Cloud is disabled.
-
-  return (
-    <SettingsPanel
-      apiKey={apiKeyState}
-      slots={slots}
-      modelConfig={modelConfig}
-      usagePeriod="24h"
-      onUsagePeriodChange={() => {}}
-      initialTab={initialTab}
-    />
-  )
-}
-
 /** Work status container — timer + active task table above composer */
 function WorkStatusBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | null }): ReactNode {
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
@@ -491,12 +366,23 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
   const platform = usePlatform()
   const setBashMode = useAtomSet(bashModeAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setUsageOpen = useAtomSet(usageOpenAtom)
+  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
   const setFilePath = useAtomSet(selectedFilePathAtom)
   const sidebarVisible = useAtomValue(sidebarVisibleAtom)
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
   const { startNewSession } = useSessionActions()
   const sendRef = useRef<(text: string) => void>(() => {})
+  const slotsResult = useModelSlots()
+  const slots = Option.getOrNull(Result.value(slotsResult))
+  const primary = slots?.slots.primary ?? null
+  const modelReady = primary?._tag === "ConfiguredLocal"
+    && primary.availability._tag === "Available"
+    && Option.exists(primary.instance, ({ lifecycle }) => lifecycle._tag === "Ready")
+  const disabledReason = modelReady
+    ? null
+    : Result.isFailure(slotsResult)
+      ? "Model runtime state is unavailable"
+      : "Load a local model before sending"
 
   const commandContext: CommandContext = useMemo(() => ({
     resetConversation: () => startNewSession(),
@@ -517,7 +403,12 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
       showToast("info", "Project initialization is not available in the web app yet.")
     },
     openSettings: () => setSettingsOpen(true),
-    openUsage: () => setUsageOpen(true),
+    openModelMenu: (menu) => {
+      if (menu === "models" || menu === "catalog" || menu === "hardware") {
+        setSettingsOpen(false)
+        setModelCenterTab(menu)
+      }
+    },
     toggleAutopilot: () => {
       showToast("info", "Autopilot mode is not yet available in the web app.")
     },
@@ -528,7 +419,7 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
     setSidebarVisible,
     setBashMode,
     setSettingsOpen,
-    setUsageOpen,
+    setModelCenterTab,
   ])
 
   const composer = useComposerState(commandContext)
@@ -552,6 +443,8 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
       mentionClient={composer.mentionClient}
       cwd={composer.cwd}
       docked={docked}
+      disabledReason={disabledReason}
+      onDisabledAction={() => setModelCenterTab("models")}
     />
   )
 }
@@ -568,6 +461,16 @@ function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nul
   const nextEscWillKillAll = useAtomValue(nextEscWillKillAllAtom)
   const { displayMode } = useDisplayViewController()
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
+  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
+  const slotsResult = useModelSlots()
+  const slots = Option.getOrNull(Result.value(slotsResult))
+  const currentModel = deriveCurrentLocalModel(Option.fromNullable(slots?.slots.primary))
+  const allocation = slots ? modelSlotResidentAllocation(slots.slots.primary) : Option.none()
+  const residentBytes = Option.match(allocation, {
+    onNone: () => null,
+    onSome: ({ memoryDomains }) => memoryDomains.reduce((total, domain) => total
+      + domain.modelBytes + domain.contextBytes + domain.computeBytes + domain.auxiliaryBytes, 0),
+  })
   const selectedSessionAtom = useMemo(
     () => selectedSessionId
       ? client.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
@@ -583,16 +486,20 @@ function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nul
   const thinkingLevel = profile?.reasoningEffort
     ? profile.reasoningEffort.charAt(0).toUpperCase() + profile.reasoningEffort.slice(1)
     : null
-  const openSettings = useCallback(() => setSettingsOpen(true), [setSettingsOpen])
+  const openModels = useCallback(() => { setSettingsOpen(false); setModelCenterTab("models") }, [setModelCenterTab, setSettingsOpen])
+  const openSettings = useCallback(() => { setModelCenterTab(null); setSettingsOpen(true) }, [setModelCenterTab, setSettingsOpen])
+  const modelLabel = currentModel._tag === "NoSelection"
+    ? "Choose model"
+    : `${currentModel.displayName} · ${currentModel._tag === "Running" ? "Ready" : currentModel._tag === "Loading" ? `Loading ${currentModel.percentage}%` : currentModel._tag === "Stopping" ? "Stopping" : currentModel._tag === "Failed" ? "Failed" : "Not loaded"}${residentBytes === null ? "" : ` · ${formatBytes(residentBytes)} mem`}`
 
   return (
     <FooterBar
       context={context}
       tokenCap={tokenCap}
       cwd={cwd}
-      model={profile?.modelDisplayName ?? null}
+      model={modelLabel}
       thinkingLevel={thinkingLevel}
-      onModelClick={openSettings}
+      onModelClick={openModels}
       onThinkingClick={openSettings}
       bashMode={bashMode}
       nextEscWillKillAll={nextEscWillKillAll}
@@ -619,7 +526,7 @@ function BottomDockContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nu
   )
 }
 
-function ChatTitleBar(): ReactNode {
+function ChatTitleBar({ onOpenSidebar }: { onOpenSidebar?: () => void }): ReactNode {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const displaySession = useDisplayState((state) => state.session)
@@ -642,6 +549,17 @@ function ChatTitleBar(): ReactNode {
 
   return (
     <div className="chat-title-bar" title={title}>
+      {onOpenSidebar && (
+        <button
+          type="button"
+          className="icon-button mobile-sidebar-button"
+          aria-label="Open sessions"
+          title="Open sessions"
+          onClick={onOpenSidebar}
+        >
+          <Menu size={17} />
+        </button>
+      )}
       <span className="chat-title-bar-title">{title}</span>
     </div>
   )
@@ -704,9 +622,27 @@ function AppInner(): ReactNode {
   useMenuActions()
   useInterruptAllListener()
 
-  // Cloud is disabled.
+  const onboarding = useOnboardingState()
+  const onboardingState = Option.getOrNull(Result.value(onboarding.state))
 
+  if (Result.isFailure(onboarding.state)) {
+    return <div className="full-page-state"><AlertTriangleIcon /><h1>Couldn’t load local setup</h1><p>The daemon did not return onboarding state.</p><button className="primary-button" type="button" onClick={() => window.location.reload()}>Retry</button></div>
+  }
+  if (onboardingState === null) {
+    return <div className="full-page-state"><div className="state-spinner" /><h1>Connecting to local inference</h1><p>Reading the current daemon state…</p></div>
+  }
+  if (!onboardingState.completed) {
+    return <LocalModelOnboarding
+      onSkip={() => { void onboarding.update(true) }}
+      completing={Result.isWaiting(onboarding.updateResult)}
+      completionFailed={Result.isFailure(onboarding.updateResult)}
+    />
+  }
   return <AuthenticatedAppContent isNarrow={isNarrow} />
+}
+
+function AlertTriangleIcon(): ReactNode {
+  return <span className="state-error-icon">!</span>
 }
 
 function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode {
@@ -721,14 +657,13 @@ function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode
   const { profiles: slotProfiles } = useSlotProfiles()
   const showOverlaySidebar = isNarrow && sidebarVisible === true
   const settingsOpen = useAtomValue(settingsOpenAtom)
-  const usageOpen = useAtomValue(usageOpenAtom)
+  const modelCenterTab = useAtomValue(modelCenterTabAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setUsageOpen = useAtomSet(usageOpenAtom)
+  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
   const controller = useDisplayViewController()
   const forkStack = controller.expandedForkStack
 
-  const panelOpen = settingsOpen || usageOpen
-  const panelTab: "settings" | "usage" = usageOpen && !settingsOpen ? "usage" : "settings"
+  const panelOpen = settingsOpen || modelCenterTab !== null
   const workerDetailOpen = !panelOpen && forkStack.length > 0
 
   return (
@@ -760,7 +695,7 @@ function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode
             minHeight: 0,
           }}
         >
-          <ChatTitleBar />
+          <ChatTitleBar onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined} />
           <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
           <BottomDockContainer slotProfiles={slotProfiles} />
         </div>
@@ -777,11 +712,13 @@ function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode
           >
             {panelOpen && (
               <ChatColumnPage
-                title={panelTab === "usage" ? "Usage" : "Settings"}
+                title={modelCenterTab !== null ? "Model Center" : "Settings"}
                 backLabel="Back to session"
-                onBack={() => { setSettingsOpen(false); setUsageOpen(false) }}
+                onBack={() => { setSettingsOpen(false); setModelCenterTab(null) }}
               >
-                <SettingsPanelContainer slotProfiles={slotProfiles} initialTab={panelTab} />
+                {modelCenterTab !== null
+                  ? <ModelCenter tab={modelCenterTab} onTabChange={setModelCenterTab} />
+                  : <SettingsPanel onOpenModels={() => { setSettingsOpen(false); setModelCenterTab("models") }} />}
               </ChatColumnPage>
             )}
             {workerDetailOpen && (

@@ -60,7 +60,7 @@ const nodeSpawn: ChildProcessSpawner = {
           const [executable, ...args] = command
           const proc = spawn(executable, args, {
             detached: true,
-            stdio: ["pipe", "ignore", "ignore"],
+            stdio: ["pipe", "ignore", "pipe"],
             env: process.env,
           })
           const cleanup = () => {
@@ -87,9 +87,18 @@ const nodeSpawn: ChildProcessSpawner = {
             reason: "Spawned ACN has no process ID",
           })
         }
-        const exitedPromise = new Promise<number>((resolve) => {
-          proc.once("close", (code) => resolve(code ?? 1))
-          proc.once("error", () => resolve(1))
+        const diagnosticLimit = 64 * 1024
+        let stderr = ""
+        proc.stderr?.setEncoding("utf8")
+        proc.stderr?.on("data", (chunk: string) => {
+          stderr = `${stderr}${chunk}`.slice(-diagnosticLimit)
+        })
+        const exitedPromise = new Promise<{ readonly code: number; readonly stderr: string }>((resolve) => {
+          proc.once("close", (code) => resolve({ code: code ?? 1, stderr }))
+          proc.once("error", (cause) => resolve({
+            code: 1,
+            stderr: `${stderr}\n${cause.message}`.trim().slice(-diagnosticLimit),
+          }))
         })
         const exited = Effect.promise(() => exitedPromise)
         proc.unref()
@@ -341,7 +350,10 @@ function createWindow(): void {
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    show: false,
+    // The renderer has an explicit connecting state, so showing immediately is
+    // both safe and more reliable than waiting on ready-to-show for a
+    // transparent macOS window.
+    show: true,
     ...(isMac
       ? {
           titleBarStyle: "hidden" as const,
@@ -375,10 +387,6 @@ function createWindow(): void {
         ],
       },
     })
-  })
-
-  mainWindow.once("ready-to-show", () => {
-    mainWindow?.show()
   })
 
   if (!app.isPackaged) {
@@ -422,7 +430,9 @@ function defaultLaunchCommand(): Option.Option<Arr.NonEmptyReadonlyArray<string>
 
 function localDaemonOptions() {
   const binaryPath = findBinaryPath()
+  const developmentDataDir = process.env["MAGNITUDE_DEV_DATA_DIR"]
   return {
+    ...(developmentDataDir === undefined ? {} : { dataDir: developmentDataDir }),
     ...Option.match(binaryPath, {
       onNone: () => ({}),
       onSome: (path) => ({ binaryPath: path }),

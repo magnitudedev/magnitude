@@ -109,6 +109,7 @@ export {
   ModelAssessmentIdSchema,
   AssessmentEnvironmentIdSchema,
   LocalModelsStateSchema,
+  AcnInstanceIdSchema,
 } from "@magnitudedev/acn-protocol"
 
 export type {

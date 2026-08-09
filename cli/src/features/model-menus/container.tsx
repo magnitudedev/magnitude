@@ -24,6 +24,7 @@ import {
   truncateToDisplayWidth,
   usePlatform,
   useLocalInferenceHardware,
+  useLocalConfigurationSelection,
   useLocalModelActions,
   useLocalModels,
   useModelSlotActions,
@@ -39,7 +40,6 @@ import {
   type LocalModel,
   type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
-  type ProviderModelId,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -987,6 +987,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const localModels = useLocalModels()
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
+  const configurationSelection = useLocalConfigurationSelection()
   const snapshot = Result.value(localModels)
   const catalogCandidates = Option.match(snapshot, {
     onNone: () => [] as readonly LocalModelCatalogCandidate[],
@@ -1051,29 +1052,17 @@ const CatalogMenu = memo(function CatalogMenu({
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.availability._tag !== "Available"
-      || Result.isWaiting(modelActions.createOfferingResult)) return
-    const providerModelId = Option.flatMap(snapshot, ({ models }) => Option.fromNullable(
-      models.find(({ targetId }) => targetId === candidate.targetId)
-        ?.offerings.find(({ configurationId }) => configurationId === candidate.configurationId)
-        ?.providerModelId,
-    ))
-    const assign = (id: ProviderModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
-      providerId: LOCAL_PROVIDER_ID,
-      providerModelId: id,
+      || Result.isWaiting(configurationSelection.result)) return
+    configurationSelection.select({
+      slotId: PRIMARY_SLOT_ID,
+      targetId: candidate.targetId,
+      configurationId: candidate.configurationId,
       reasoningEffort: Option.getOrElse(
         candidate.capabilities.reasoning.defaultEffort,
         () => ReasoningEffortSchema.make("none"),
       ),
     })
-    if (Option.isSome(providerModelId)) {
-      void assign(providerModelId.value)
-      return
-    }
-    void modelActions.createOffering(candidate.configurationId).then(
-      assign,
-      () => undefined,
-    )
-  }, [modelActions, slotActions, snapshot])
+  }, [configurationSelection])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
@@ -1223,7 +1212,7 @@ const CatalogMenu = memo(function CatalogMenu({
             {catalogStatus(detail)}
           </text>
           {failed && <text style={{ fg: theme.error }}>{detail.download.failure.message}</text>}
-          {Result.isFailure(modelActions.createOfferingResult) && (
+          {Result.isFailure(configurationSelection.result) && (
             <text style={{ fg: theme.error }}>Failed to create the local model offering.</text>
           )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>

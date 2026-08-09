@@ -9,6 +9,8 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/utils/**
   - cli/src/features/local-inference/**
+  - web/src/components/local-model-onboarding.tsx
+  - web/src/components/model-center.tsx
 ---
 
 # Model instance lifecycle

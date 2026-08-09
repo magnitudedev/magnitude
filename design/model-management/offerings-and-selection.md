@@ -10,7 +10,10 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/config.ts
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts
+  - packages/client-common/src/hooks/use-local-inference-state.ts
   - cli/src/features/model-menus/**
+  - web/src/components/local-model-onboarding.tsx
+  - web/src/components/model-center.tsx
 ---
 
 # Model offerings and selection

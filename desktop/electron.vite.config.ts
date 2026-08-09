@@ -6,6 +6,9 @@ export default defineConfig({
   main: {
     build: {
       rollupOptions: {
+        // sqlite3 is a native CommonJS addon. It must remain a runtime Node
+        // dependency; bundling its tracing helper into ESM erases __filename.
+        external: ["sqlite3"],
         input: {
           main: resolve(__dirname, "src/main.ts"),
         },
@@ -53,7 +56,6 @@ export default defineConfig({
     optimizeDeps: {
       exclude: [
         "@magnitudedev/sdk",
-        "@magnitudedev/acn-protocol",
         "@magnitudedev/client-common",
         "@magnitudedev/generate-id",
         "@magnitudedev/web",

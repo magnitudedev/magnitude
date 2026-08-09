@@ -35,9 +35,11 @@ import { resolve } from "node:path"
 const rt = Runtime.defaultRuntime
 const ensurerScope = await Runtime.runPromise(rt)(Scope.make())
 const acnSourcePath = resolve(import.meta.dir, "..", "..", "packages", "acn", "src", "binary.ts")
+const developmentDataDir = process.env.MAGNITUDE_DEV_DATA_DIR
 
 async function createEnsurer() {
   return Runtime.runPromise(rt)(makeLocalAcnInstanceManager({
+    dataDir: developmentDataDir,
     launchOverride: {
       target: SDK_ACN_TARGET,
       command: ["bun", acnSourcePath, "serve"],
@@ -124,6 +126,10 @@ const server = createServer(async (req, res) => {
               if (!res.destroyed) res.write(`${encoded}\n`)
             }),
           ),
+          // Every message originates from the schema-typed instance manager. An
+          // encode failure is therefore an internal invariant violation, not an
+          // ensurance-domain failure that can be represented on this same stream.
+          Effect.orDie,
         )
       }
       const observer = Runtime.runFork(rt)(manager.ensure(body).pipe(

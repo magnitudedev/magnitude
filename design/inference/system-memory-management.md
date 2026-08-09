@@ -19,6 +19,7 @@ applies_to:
   - cli/src/features/local-inference/footer-status.tsx
   - cli/src/features/model-menus/**
   - cli/src/features/agent-status/**
+  - web/src/components/model-center.tsx
 ---
 
 # System memory management

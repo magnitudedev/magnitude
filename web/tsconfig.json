@@ -9,11 +9,8 @@
       "@magnitudedev/sdk": ["../packages/sdk/src"],
       "@magnitudedev/sdk/*": ["../packages/sdk/src/*"],
       "@magnitudedev/client-common": ["../packages/client-common/src"],
-      "@magnitudedev/generate-id": ["../packages/generate-id/src"],
-
-      "@magnitudedev/providers": ["../packages/providers/src"],
-      "@magnitudedev/ai": ["../packages/ai/src"]
+      "@magnitudedev/generate-id": ["../packages/generate-id/src"]
     }
   },
-  "include": ["src"]
+  "include": ["src", "scripts"]
 }

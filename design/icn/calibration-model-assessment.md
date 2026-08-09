@@ -10,6 +10,8 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - cli/src/features/model-setup/**
   - cli/src/features/model-menus/**
+  - web/src/components/local-model-onboarding.tsx
+  - web/src/components/model-center.tsx
 ---
 
 # Hardware calibration and model assessment
