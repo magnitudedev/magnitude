@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.41
+
+### Patch Changes
+
+- [`e948b25`](https://github.com/magnitudedev/magnitude/commit/e948b256416245846b7c4f60695b0c97076f650d) Thanks [@anerli](https://github.com/anerli)! - fix: support macOS 13 and above instead of only 15 and above
+
 ## 0.0.1-alpha.40
 
 ### Patch Changes
