@@ -28,10 +28,6 @@
     "Anders Lie <anders@magnitude.dev>",
     "Tom Greenwald <tom@magnitude.dev>"
   ],
-  "os": [
-    "darwin",
-    "linux"
-  ],
   "bin": {
     "magnitude": "bin/magnitude.js"
   },
