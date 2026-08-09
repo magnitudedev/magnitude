@@ -1,11 +1,21 @@
 import { describe, expect, test } from "vitest"
 import type { KeyEvent } from "@opentui/core"
+import { Option } from "effect"
+import { ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
 import {
+  buildModelsMenuEntries,
   huggingFaceRepositoryUrls,
+  modelsMenuSelectionAction,
   resolveRootNavigationDirection,
   scrollCatalogCandidateIntoView,
 } from "./container"
-import { makeCatalogCandidate } from "../local-inference/test-fixtures"
+import {
+  makeCatalogCandidate,
+  makeModel,
+  makeView,
+  TEST_MODEL_ID,
+} from "../local-inference/test-fixtures"
+import { buildInstalledLocalModelChoices } from "../local-inference/view-model"
 
 const key = (
   name: string,
@@ -99,5 +109,51 @@ describe("catalog repository links", () => {
     })
 
     expect(huggingFaceRepositoryUrls(candidate)).toEqual([])
+  })
+})
+
+describe("models menu entries", () => {
+  test("represents an installed target once before and after offering creation", () => {
+    const withoutOffering = makeView({
+      ready: false,
+      models: [makeModel({ offerings: [] })],
+      catalogCandidates: [makeCatalogCandidate({
+        download: { _tag: "Downloaded", installedBytes: 16 },
+        availability: { _tag: "Available" },
+      })],
+    })
+    const withOffering = makeView({
+      ready: false,
+      catalogCandidates: [makeCatalogCandidate({
+        download: { _tag: "Downloaded", installedBytes: 16 },
+        availability: { _tag: "Available" },
+      })],
+    })
+    const entriesFor = (view: ReturnType<typeof makeView>) => buildModelsMenuEntries(
+      buildInstalledLocalModelChoices(view.models, view.catalog, view.slots),
+      ProviderModelCatalogLifecycle.match(view.catalog, {
+        Loading: () => [],
+        Ready: ({ models }) => models,
+        Refreshing: ({ models }) => models,
+        Degraded: ({ models }) => models,
+        Unavailable: () => [],
+      }),
+    )
+
+    const before = entriesFor(withoutOffering)
+    const after = entriesFor(withOffering)
+    expect(before).toHaveLength(1)
+    expect(after).toHaveLength(1)
+    expect(before[0]?.id).toBe(after[0]?.id)
+    expect(before[0]?._tag).toBe("Local")
+    expect(after[0]?._tag).toBe("Local")
+    expect(Option.getOrThrow(modelsMenuSelectionAction(before[0]!))).toMatchObject({
+      _tag: "CreateOffering",
+      configurationId: makeCatalogCandidate().configurationId,
+    })
+    expect(Option.getOrThrow(modelsMenuSelectionAction(after[0]!))).toMatchObject({
+      _tag: "AssignOffering",
+      providerModel: { providerModelId: TEST_MODEL_ID },
+    })
   })
 })
