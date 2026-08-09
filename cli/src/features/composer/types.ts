@@ -57,6 +57,7 @@ export type ComposerProps = {
   interruptAll: () => void
   openSettings: () => void
   openHardware: () => void
+  openCatalog: () => void
   thinkingOptions: readonly { value: ReasoningEffort; label: string }[]
   applyThinking: (effort: ReasoningEffort) => void
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
