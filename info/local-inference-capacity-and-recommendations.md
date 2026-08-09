@@ -25,9 +25,10 @@ profiles to preview. Catalog models use their one reviewed context configuration
 models use one 100K context configuration bounded by the model's native maximum. The selected
 configuration is used consistently for fit, catalog availability, recommendations, and loading.
 Each configuration carries speed estimates at 25K, 50K, 75K, and full context, with points above
-its configured context omitted. Recommendations require at least 8 expected baseline tokens per
-second at full context. Ranking and relative speed comparisons use the 50K estimate, bounded by the
-configured context. The UI shows the expected-speed range between the bounded 25K and 75K points.
+its configured context omitted. Recommendations require at least 5 expected tokens per second at
+full context, and Balanced speed utility uses 5 tokens per second as its zero point. Ranking and
+relative speed comparisons use the 50K estimate, bounded by the configured context. The UI shows
+the expected-speed range between the bounded 25K and 75K points.
 The service ranks
 eligible candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using
 common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
