@@ -34,6 +34,19 @@ Vulkan jobs therefore construct a build-only SDK prefix from Vulkan-Headers 1.4.
 `v2023.8` `glslc`, while linking against Jammy's system Vulkan loader. The headers and shader
 compiler are not included in the release and do not become customer dependencies.
 
+## Apple build baseline
+
+Apple arm64 and Apple x64 target macOS 13.0. The release configuration passes that floor through
+both `MACOSX_DEPLOYMENT_TARGET` and `CMAKE_OSX_DEPLOYMENT_TARGET`, ensuring that Rust, Cargo build
+scripts, cc, CMake, Clang, and the linker share one minimum-version contract. The selected SDK may be
+newer than macOS 13: newer operating-system APIs must remain weak-linked and availability-guarded,
+while Metal kernels and GPU features continue to specialize for the actual runtime device.
+
+The runner image is only a build environment. Changing or advancing that image must not change the
+deployment target recorded in release artifacts. Before packaging, the Apple build validates every
+executable and native library with Apple's `vtool`, selecting the expected release architecture and
+rejecting a missing deployment declaration or a minimum newer than 13.0.
+
 ## Archive validation
 
 Assembly validates every host base and every legal base-plus-backend composition. For Linux, every
@@ -43,6 +56,10 @@ Assembly rejects:
 
 - the wrong ELF class, machine architecture, or program interpreter;
 - glibc requirements above 2.35 or GLIBCXX requirements above 3.4.30.
+
+Apple compatibility is validated on the Apple build host, using Apple's own Mach-O tooling against
+the exact files subsequently passed to the deterministic archive builder. Assembly does not
+reimplement Mach-O parsing.
 
 Archive layout, artifact size and digest, native-build identity, backend ABI, planner-input equality,
 and backend compatibility metadata are also validated before the manifest is emitted.
