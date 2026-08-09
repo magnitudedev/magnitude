@@ -45,8 +45,8 @@ export interface CommandContext {
   initProject: () => void
   /** Legacy settings entry point for clients without the model-menu surface. */
   openSettings: () => void
-  /** Open the usage overlay */
-  openUsage: () => void
+  /** Open the usage overlay, when the active client provides one. */
+  openUsage?: () => void
   /** Open the client-owned cloud model setup surface, when available. */
   openCloud?: () => void
   /** Open a client-owned model menu root, when available. */
@@ -171,6 +171,7 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
       return true
 
     case 'usage':
+      if (!ctx.openUsage) return false
       ctx.openUsage()
       return true
 

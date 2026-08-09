@@ -10,6 +10,8 @@ applies_to:
   - packages/acn/src/local-models.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - cli/src/features/model-setup/**
+  - web/src/components/local-model-onboarding.tsx
+  - web/src/components/model-center.tsx
 ---
 
 # Model assessment and recommendation

@@ -63,6 +63,10 @@ export interface ComposerProps {
   cwd?: string | null
   /** Remove outer margins when the composer is inside the main bottom dock */
   docked?: boolean
+  /** Why agent submission is unavailable. Bash commands remain available. */
+  disabledReason?: string | null
+  /** Navigate to the action that resolves disabled submission. */
+  onDisabledAction?: () => void
 }
 
 export function Composer({
@@ -78,6 +82,8 @@ export function Composer({
   mentionClient,
   cwd = null,
   docked = false,
+  disabledReason = null,
+  onDisabledAction,
 }: ComposerProps): ReactNode {
   const text = useAtomValue(composerTextAtom)
   const setText = useAtomSet(composerTextAtom)
@@ -186,6 +192,11 @@ export function Composer({
       return
     }
 
+    if (disabledReason) {
+      onDisabledAction?.()
+      return
+    }
+
     onSend(text, attachments.length > 0 ? attachments.map(mentionOccurrenceFromInputSegment) : undefined)
     // Push to message history (most recent first, dedup consecutive)
     setMessageHistory((prev: string[]) =>
@@ -199,7 +210,7 @@ export function Composer({
     // Keep lastUserTextRef in sync so the restore-focus Effect doesn't
     // re-focus after submit clears text.
     lastUserTextRef.current = ""
-  }, [text, attachments, bashMode, onRunBash, onSend, setMessageHistory, setHistoryIndex, setText, setAttachments])
+  }, [text, attachments, bashMode, onRunBash, disabledReason, onDisabledAction, onSend, setMessageHistory, setHistoryIndex, setText, setAttachments])
 
   const canSend = text.trim().length > 0 || attachments.length > 0
 
@@ -475,8 +486,10 @@ export function Composer({
           onClick={() => {
             if (canSend) handleSubmit()
             else if (isStreaming && onInterrupt) onInterrupt()
+            else if (disabledReason) onDisabledAction?.()
           }}
-          disabled={!isStreaming && !canSend}
+          disabled={!isStreaming && !canSend && !disabledReason}
+          aria-disabled={!isStreaming && !!disabledReason}
           className="composer-send-button"
           data-can-send={canSend ? "true" : "false"}
           style={{
@@ -487,15 +500,15 @@ export function Composer({
             height: 28,
             borderRadius: 4,
             border: "none",
-            cursor: isStreaming || canSend ? "pointer" : "default",
+            cursor: isStreaming || canSend || disabledReason ? "pointer" : "default",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             opacity: isStreaming || canSend ? 1 : 0.45,
             transition: "opacity 100ms",
           }}
-          title={!canSend && isStreaming ? "Interrupt" : "Send"}
-          aria-label={!canSend && isStreaming ? "Interrupt" : "Send message"}
+          title={!canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"}
+          aria-label={!canSend && isStreaming ? "Interrupt" : disabledReason ? `${disabledReason}. Open Model Center` : "Send message"}
         >
           {!canSend && isStreaming ? (
             <Square size={16} fill="currentColor" style={{ color: "var(--accent-error)" }} />
@@ -504,7 +517,7 @@ export function Composer({
               size={17}
               strokeWidth={2.4}
               className="composer-send-arrow"
-              style={{ color: canSend ? "var(--accent-primary)" : "var(--fg-tertiary)" }}
+              style={{ color: canSend && !disabledReason ? "var(--accent-primary)" : "var(--fg-tertiary)" }}
             />
           )}
         </button>

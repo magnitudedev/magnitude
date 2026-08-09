@@ -11,7 +11,7 @@
  * - Responsive overlay mode (§12): ≤640px sidebar becomes overlay
  */
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react"
-import { Loader2, Plus, Search, X, GripVertical, Pencil, Trash2, Settings, BarChart3, ChevronDown } from "lucide-react"
+import { ChevronDown, Cpu, Loader2, Plus, Search, X, GripVertical, Pencil, Trash2, Settings } from "lucide-react"
 import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import { formatCwdForDisplay, formatRelativeTime } from "@magnitudedev/client-common"
 import {
@@ -45,14 +45,12 @@ export interface SessionsSidebarProps {
   hasMore?: boolean
   cwdFilter?: string | null
   cwdOptions?: string[]
-  accountLabel?: string | null
-  accountSubLabel?: string | null
   onCwdFilterChange?: (cwd: string | null) => void
   onSelectSession?: (sessionId: string) => void
   onNewSession?: () => void
   onLoadMore?: () => void
   onOpenSettings?: () => void
-  onOpenUsage?: () => void
+  onOpenModels?: () => void
   /** Overlay mode — sidebar is an overlay (responsive ≤640px) */
   overlay?: boolean
   /** Close overlay sidebar (used in overlay mode) */
@@ -283,14 +281,12 @@ export function SessionsSidebar({
   hasMore = false,
   cwdFilter = null,
   cwdOptions = [],
-  accountLabel = "Account",
-  accountSubLabel = null,
   onCwdFilterChange,
   onSelectSession,
   onNewSession,
   onLoadMore,
   onOpenSettings,
-  onOpenUsage,
+  onOpenModels,
   overlay = false,
   onCloseOverlay,
 }: SessionsSidebarProps): ReactNode {
@@ -618,88 +614,12 @@ export function SessionsSidebar({
             gap: 8,
           }}
         >
-          {/* Cloud is disabled. */}
-          {/* <button
+          <button
             type="button"
-            onClick={onOpenSettings}
+            onClick={onOpenModels}
             className="hover-surface-flat"
-            style={{
-              minWidth: 0,
-              flex: 1,
-              height: 38,
-              border: "none",
-              borderRadius: 6,
-              background: "transparent",
-              color: "var(--fg-primary)",
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "0 6px",
-              cursor: "pointer",
-              fontFamily: "var(--font-sans)",
-              textAlign: "left",
-            }}
-            aria-label="Account"
-            title="Account"
-          >
-            <span
-              aria-hidden="true"
-              style={{
-                width: 24,
-                height: 24,
-                borderRadius: "50%",
-                border: "1px solid var(--border-default)",
-                background: "var(--bg-surface-elevated)",
-                color: "var(--fg-secondary)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: 11,
-                fontWeight: 650,
-                flexShrink: 0,
-              }}
-            >
-              {(accountLabel?.trim()?.[0] ?? "A").toUpperCase()}
-            </span>
-            <span style={{ minWidth: 0, flex: 1 }}>
-              <span
-                style={{
-                  display: "block",
-                  color: "var(--fg-primary)",
-                  fontSize: 13,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {accountLabel}
-              </span>
-              {accountSubLabel && (
-                <span
-                  style={{
-                    display: "block",
-                    marginTop: 1,
-                    color: "var(--fg-tertiary)",
-                    fontSize: 11,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {accountSubLabel}
-                </span>
-              )}
-            </span>
-            <ChevronDown size={14} style={{ color: "var(--fg-tertiary)", flexShrink: 0 }} />
-          </button> */}
-
-          {/* Cloud is disabled. */}
-          {/* <button
-            type="button"
-            onClick={onOpenUsage}
-            className="hover-surface-flat"
-            aria-label="Usage"
-            title="Usage"
+            aria-label="Model Center"
+            title="Model Center"
             style={{
               width: 32,
               height: 32,
@@ -714,8 +634,8 @@ export function SessionsSidebar({
               flexShrink: 0,
             }}
           >
-            <BarChart3 size={16} />
-          </button> */}
+            <Cpu size={16} />
+          </button>
 
           <button
             type="button"

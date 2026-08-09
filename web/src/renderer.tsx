@@ -1,9 +1,9 @@
 /**
  * Browser renderer entry — spec §4.3
  *
- * The dev server owns the browser's same-origin boundary: `/current` and
- * `/launch` manage the daemon, while `/rpc`, `/health`, and `/logs` proxy ACN
- * traffic. The browser never connects cross-origin to the ACN.
+ * The dev server owns the browser's same-origin boundary: `/acn/ensure`
+ * selects or launches the daemon, while `/rpc`, `/health`, and `/logs` proxy
+ * ACN traffic. The browser never connects cross-origin to the ACN.
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"

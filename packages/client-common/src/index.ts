@@ -52,6 +52,7 @@ export * from './utils/model-memory'
 export * from './utils/hardware-memory'
 export * from './utils/actor-status'
 export * from './utils/root-detail'
+export * from './utils/local-inference-selections'
 export * from './attachments/images'
 
 // Commands
@@ -98,4 +99,5 @@ export * from './hooks/use-local-inference-state'
 export * from './hooks/use-mirrored-state'
 export * from './hooks/use-onboarding-state'
 export * from './hooks/use-onboarding-model-setup'
+export * from './hooks/onboarding-model-view'
 export * from './display-view-controller/timeline-scroll-controller'

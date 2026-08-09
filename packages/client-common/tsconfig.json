@@ -8,10 +8,7 @@
       "@magnitudedev/sdk": ["../sdk/src"],
       "@magnitudedev/sdk/*": ["../sdk/src/*"],
       "@magnitudedev/client-common": ["./src"],
-      "@magnitudedev/generate-id": ["../generate-id/src"],
-
-      "@magnitudedev/providers": ["../providers/src"],
-      "@magnitudedev/ai": ["../ai/src"]
+      "@magnitudedev/generate-id": ["../generate-id/src"]
     }
   },
   "include": ["src"]

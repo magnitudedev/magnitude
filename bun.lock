@@ -68,7 +68,6 @@
         "@effect/platform": "^0.96.1",
         "@effect/platform-node-shared": "^0.60.0",
         "@effect/rpc": "0.75.1",
-        "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/client-common": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
         "@magnitudedev/web": "workspace:*",

@@ -14,10 +14,9 @@ import { Atom, useAtomSet, useAtomValue, useAtomMount } from "@effect-atom/atom-
 import { useDisplayViewController, usePlatform, useSessionActions } from "@magnitudedev/client-common"
 import {
   settingsOpenAtom,
-  usageOpenAtom,
   nextEscWillKillAllAtom,
 } from "@magnitudedev/client-common"
-import { sidebarSearchAtom } from "../state/web-atoms"
+import { modelCenterTabAtom, sidebarSearchAtom } from "../state/web-atoms"
 
 /** Check if the platform uses Cmd (macOS) vs Ctrl (other). */
 function isModKey(e: KeyboardEvent): boolean {
@@ -34,11 +33,11 @@ export function useMenuActions(): void {
   const { startNewSession } = useSessionActions()
   const setSearchQuery = useAtomSet(sidebarSearchAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setUsageOpen = useAtomSet(usageOpenAtom)
+  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
   const setNextEscWillKillAll = useAtomSet(nextEscWillKillAllAtom)
   const { popFork, togglePresentationMode, displayMode, expandedForkStack } = useDisplayViewController()
   const settingsOpen = useAtomValue(settingsOpenAtom)
-  const usageOpen = useAtomValue(usageOpenAtom)
+  const modelCenterTab = useAtomValue(modelCenterTabAtom)
 
   // Menu subscription atom — subscribes on mount, unsubscribes on dispose.
   // Only present in desktop mode (platform.onMenuAction is undefined in browser).
@@ -60,6 +59,7 @@ export function useMenuActions(): void {
                 togglePresentationMode()
                 break
               case "open-settings":
+                setModelCenterTab(null)
                 setSettingsOpen(true)
                 break
               case "quit":
@@ -70,7 +70,7 @@ export function useMenuActions(): void {
           yield* Effect.addFinalizer(() => Effect.sync(unsub))
         }),
       ),
-    [platform, displayMode, startNewSession, setSearchQuery, togglePresentationMode, setSettingsOpen],
+    [platform, displayMode, startNewSession, setSearchQuery, togglePresentationMode, setSettingsOpen, setModelCenterTab],
   )
 
   // Keyboard handler atom — Esc handling (always) + browser-mode shortcuts.
@@ -88,10 +88,9 @@ export function useMenuActions(): void {
               const isDoubleEsc = now - lastEscTime < 400
               lastEscTime = now
 
-              // Close settings/usage panel first
-              if (settingsOpen || usageOpen) {
+              if (settingsOpen || modelCenterTab !== null) {
                 setSettingsOpen(false)
-                setUsageOpen(false)
+                setModelCenterTab(null)
                 e.preventDefault()
                 return
               }
@@ -141,6 +140,7 @@ export function useMenuActions(): void {
                 case ",":
                   // Cmd/Ctrl+, → open settings
                   e.preventDefault()
+                  setModelCenterTab(null)
                   setSettingsOpen(true)
                   break
               }
@@ -152,7 +152,7 @@ export function useMenuActions(): void {
           )
         }),
       ),
-    [expandedForkStack.length, platform.id, displayMode, settingsOpen, usageOpen, popFork, startNewSession, setSearchQuery, togglePresentationMode, setSettingsOpen, setUsageOpen, setNextEscWillKillAll],
+    [expandedForkStack.length, platform.id, displayMode, settingsOpen, modelCenterTab, popFork, startNewSession, setSearchQuery, togglePresentationMode, setSettingsOpen, setModelCenterTab, setNextEscWillKillAll],
   )
 
   useAtomMount(menuAtom)

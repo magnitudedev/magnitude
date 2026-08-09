@@ -1,7 +1,7 @@
 /**
  * Web-only UI atoms — sidebar state that is specific to the web/desktop layout.
  *
- * Shared atoms (settings, usage, composer state, etc.) are imported from
+ * Shared atoms (settings, composer state, etc.) are imported from
  * `@magnitudedev/client-common`. This file holds only the atoms that have no
  * CLI counterpart.
  */
@@ -9,7 +9,6 @@ import { Atom } from "@effect-atom/atom-react"
 import {
   selectedCwdAtom,
   settingsOpenAtom,
-  usageOpenAtom,
   selectedFilePathAtom,
   composerTextAtom,
   composerAttachmentsAtom,
@@ -25,7 +24,6 @@ import {
 export {
   selectedCwdAtom,
   settingsOpenAtom,
-  usageOpenAtom,
   selectedFilePathAtom,
   composerTextAtom,
   composerAttachmentsAtom,
@@ -43,7 +41,8 @@ export {
  * Sidebar width in pixels.
  */
 export const sidebarWidthAtom = Atom.keepAlive(Atom.make(260))
-export const apiKeyVerifiedAtom = Atom.make(false)
+export type ModelCenterTab = "models" | "catalog" | "hardware"
+export const modelCenterTabAtom = Atom.keepAlive(Atom.make<ModelCenterTab | null>(null))
 
 /**
  * Sidebar visibility for responsive overlay mode (≤640px).

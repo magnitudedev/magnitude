@@ -20,7 +20,6 @@ export default defineConfig({
   optimizeDeps: {
     exclude: [
       "@magnitudedev/sdk",
-      "@magnitudedev/acn-protocol",
       "@magnitudedev/client-common",
       "@magnitudedev/generate-id",
     ],

@@ -7,9 +7,7 @@
     "paths": {
       "@magnitudedev/web": ["../web/src/index.tsx"],
       "@magnitudedev/sdk": ["../packages/sdk/src"],
-      "@magnitudedev/sdk/*": ["../packages/sdk/src/*"],
-
-      "@magnitudedev/ai": ["../packages/ai/src"]
+      "@magnitudedev/sdk/*": ["../packages/sdk/src/*"]
     }
   },
   "include": ["src"]
