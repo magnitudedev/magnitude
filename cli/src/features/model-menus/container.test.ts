@@ -1,9 +1,11 @@
 import { describe, expect, test } from "vitest"
 import type { KeyEvent } from "@opentui/core"
 import {
+  huggingFaceRepositoryUrls,
   resolveRootNavigationDirection,
   scrollCatalogCandidateIntoView,
 } from "./container"
+import { makeCatalogCandidate } from "../local-inference/test-fixtures"
 
 const key = (
   name: string,
@@ -53,5 +55,49 @@ describe("catalog keyboard navigation", () => {
 
   test("does nothing before the catalog scrollbox is mounted", () => {
     expect(() => scrollCatalogCandidateIntoView(null, "qwen-config")).not.toThrow()
+  })
+})
+
+describe("catalog repository links", () => {
+  test("derives unique Hugging Face repository URLs from package sources", () => {
+    const candidate = makeCatalogCandidate({
+      sources: [
+        {
+          source: {
+            _tag: "HuggingFace",
+            repository: "LiquidAI/LFM2.5-2.6B-GGUF",
+            revision: "revision",
+          },
+          files: [],
+        },
+        {
+          source: {
+            _tag: "HuggingFace",
+            repository: "LiquidAI/LFM2.5-2.6B-GGUF",
+            revision: "revision",
+          },
+          files: [],
+        },
+        {
+          source: { _tag: "Local", path: "/models/liquid" },
+          files: [],
+        },
+      ],
+    })
+
+    expect(huggingFaceRepositoryUrls(candidate)).toEqual([
+      "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF",
+    ])
+  })
+
+  test("returns no repository URL for local-only packages", () => {
+    const candidate = makeCatalogCandidate({
+      sources: [{
+        source: { _tag: "Local", path: "/models/local-only" },
+        files: [],
+      }],
+    })
+
+    expect(huggingFaceRepositoryUrls(candidate)).toEqual([])
   })
 })

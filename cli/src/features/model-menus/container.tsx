@@ -819,11 +819,13 @@ const recommendationEvidenceLabel = (candidate: LocalModelCatalogCandidate): str
     ? "recommendation evidence unavailable"
     : `intelligence ${intelligenceLabel(candidate)} · ${qualityLabel(candidate)}`
 
-const qualityEvidence = ({ recommendationEvidence }: LocalModelCatalogCandidate): readonly string[] =>
-  Option.match(recommendationEvidence, {
-    onNone: () => [],
-    onSome: ({ qualityEvidence: evidence }) => evidence,
-  })
+export const huggingFaceRepositoryUrls = (
+  { sources }: LocalModelCatalogCandidate,
+): readonly string[] => [...new Set(sources.flatMap(({ source }) =>
+  source._tag === "HuggingFace"
+    ? [`https://huggingface.co/${source.repository}`]
+    : [],
+))]
 
 const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
   if (candidate.download._tag === "NotDownloaded"
@@ -980,6 +982,7 @@ const CatalogMenu = memo(function CatalogMenu({
   setRootSwitchingEnabled,
 }: CatalogMenuProps) {
   const theme = useTheme()
+  const platform = usePlatform()
   const menuSize = useLocalWidth()
   const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const menuWidth = menuSize.width ?? 80
@@ -1013,6 +1016,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const [hoveredRepositoryUrl, setHoveredRepositoryUrl] = useState<string | null>(null)
   const cursorIndex = Math.max(0, candidates.findIndex(({ configurationId }) =>
     configurationId === cursorId))
   const cursor = candidates[cursorIndex]
@@ -1239,7 +1243,24 @@ const CatalogMenu = memo(function CatalogMenu({
             ))}
           </box>
           <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {detail.license}</text>
-          {qualityEvidence(detail).map((evidence) => <text key={evidence} style={{ fg: theme.muted }} wrapMode="word">{evidence}</text>)}
+          {huggingFaceRepositoryUrls(detail).map((url) => (
+            <box key={url} style={{ flexDirection: "row", alignSelf: "flex-start" }}>
+              <text style={{ fg: theme.muted }}>Hugging Face: </text>
+              <Button
+                onClick={() => { void platform.openLink(url) }}
+                onMouseOver={() => setHoveredRepositoryUrl(url)}
+                onMouseOut={() => setHoveredRepositoryUrl((hovered) => hovered === url ? null : hovered)}
+              >
+                <text
+                  style={{ fg: hoveredRepositoryUrl === url ? theme.primary : theme.link }}
+                  attributes={TextAttributes.UNDERLINE}
+                  wrapMode="word"
+                >
+                  {url}
+                </text>
+              </Button>
+            </box>
+          ))}
         </scrollbox>
       </box>
     )
