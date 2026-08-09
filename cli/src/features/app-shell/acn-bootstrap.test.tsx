@@ -30,9 +30,8 @@ vi.mock("../../hooks/use-theme", () => ({
 const { AcnBootstrapScreen } = await import("./acn-bootstrap")
 
 test.each([
-  ["Discovering", "Looking for Magnitude"],
+  ["PreparingAcn", "Preparing background server"],
   ["WaitingForOwner", "Waiting for previous Magnitude process"],
-  ["LaunchingAcn", "Starting Magnitude"],
   ["ResolvingLocalInference", "Preparing local inference"],
   ["LaunchingLocalInference", "Starting local inference"],
 ] as const)("renders the %s startup phase", async (phase, label) => {
@@ -159,7 +158,7 @@ test("quits on Ctrl-C during startup without consuming unrelated keys", async ()
   const onQuit = vi.fn()
   const view = await testRender(
     <AcnBootstrapScreen
-      state={{ _tag: "Starting", phase: "LaunchingAcn" }}
+      state={{ _tag: "Starting", phase: "PreparingAcn" }}
       onRetry={() => undefined}
       onQuit={onQuit}
     />,
