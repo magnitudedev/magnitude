@@ -78,6 +78,7 @@ import {
 } from "./features/overlays/container";
 import { FileViewerPanelContainer } from "./features/file-viewer/container";
 import { ModelMenusContainer } from "./features/model-menus/container";
+import { deriveLocalModelDownloadSummary } from "./features/local-inference/footer-status";
 import {
   useRecentChatsWidgetState,
   RecentChatsWidgetView,
@@ -282,19 +283,14 @@ function CliAppContent(
     getEphemeralMessageSnapshot
   );
   const onboardingSetup = useOnboardingModelSetup();
-  const downloadingModelCount = Result.match(onboardingSetup.models, {
-    onInitial: () => 0,
-    onFailure: () => 0,
-    onSuccess: ({ value }) =>
-      value.models.filter((model) => model.download._tag === "Downloading")
-        .length,
-  });
-  const downloadSummary =
-    downloadingModelCount === 0
-      ? null
-      : `${downloadingModelCount} ${
-          downloadingModelCount === 1 ? "model" : "models"
-        } downloading`;
+  const downloadSummary = deriveLocalModelDownloadSummary(Result.match(
+    onboardingSetup.models,
+    {
+      onInitial: () => null,
+      onFailure: () => null,
+      onSuccess: ({ value }) => value,
+    },
+  ));
   const { rootSlotId } = useSlotProfiles();
   const localModelLoadActivity = Result.match(onboardingSetup.slots, {
     onInitial: () => null,

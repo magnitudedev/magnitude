@@ -11,6 +11,9 @@ applies_to:
   - packages/acn/src/local-models.ts
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
+  - cli/src/features/composer/**
+  - cli/src/features/local-inference/**
+  - cli/src/features/model-menus/**
 ---
 
 # Model catalog and acquisition
@@ -143,6 +146,11 @@ never configuration or provider identity.
 Download state stores no assessment evidence and determines neither configuration, offering, nor
 slot identity. Exact admission snapshots are merged immediately into ACN observation, while ICN
 attempt state remains authoritative for completion.
+
+Every CLI download summary is a pure projection of the mirrored local-model snapshot. Closing the
+Models menu leaves active download status visible in the persistent composer footer, and the client
+does not retain a second download counter or lifecycle. The composer footer and Models menu use the
+same projection and remove it when the snapshot contains no active downloads.
 
 ## Concurrency and recovery
 

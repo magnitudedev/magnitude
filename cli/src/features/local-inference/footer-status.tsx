@@ -10,6 +10,17 @@ export interface LocalInferenceFooterView {
   readonly memoryLabel: string | null
 }
 
+export const deriveLocalModelDownloadSummary = (
+  models: LocalModelsState | null,
+): string | null => {
+  if (models === null) return null
+  const count = models.models.filter(({ download }) =>
+    download._tag === "Downloading").length
+  return count === 0
+    ? null
+    : `${count} ${count === 1 ? "model" : "models"} downloading`
+}
+
 const compactGiB = (bytes: number): string =>
   (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, "")
 
