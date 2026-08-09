@@ -124,6 +124,12 @@ ACN builds stable target-level models by joining:
 - current download attempts; and
 - complete configuration availability.
 
+Exact target identity also joins presentation metadata. A target present in the recommendable
+catalog retains its curated display name and description regardless of installation or
+recommendation status. Repository and filename-derived presentation is used only for targets with
+no curated metadata under that exact identity; similarity of repository, filename, family, or
+quantization never transfers presentation between targets.
+
 Installed targets remain visible when catalog loading or recommendation generation fails.
 Catalog-only targets remain visible as not downloaded. ACN may immediately merge an exact command response into its
 observer to reduce presentation latency, but only ICN observations confirm package state.
@@ -157,6 +163,8 @@ the release catalog, changes identity, or creates a permanent failed state.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
 - Package identity is independent of paths, display names, and mutable upstream references.
+- Exact catalog target identity preserves curated presentation across installation and
+  recommendation changes; fallback presentation cannot overwrite it.
 - Acquisition uses target identity; configuration selection uses serving-configuration identity;
   provider-model identity begins with the resulting offering.
 - Catalog failure cannot hide installed targets.
