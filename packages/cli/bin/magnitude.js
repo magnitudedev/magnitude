@@ -3,20 +3,11 @@
 ':' //; if command -v bun >/dev/null 2>&1; then exec bun "$0" "$@"; fi
 ':' //; echo "Magnitude requires Node.js or Bun to start." >&2; exit 127
 
-// Releases only ship macOS and Linux artifacts for x64/arm64. Keep this list in
-// sync with lib/download.js and releaseHosts in packages/release/src/targets.ts.
-// MAGNITUDE_ALLOW_UNSUPPORTED_HOST=1 skips the check, e.g. to test prerelease
-// artifacts served from MAGNITUDE_RELEASE_BASE_URL.
-const supportedHost =
-  Boolean(process.env.MAGNITUDE_ALLOW_UNSUPPORTED_HOST) ||
-  (['darwin', 'linux'].includes(process.platform) &&
-    ['x64', 'arm64'].includes(process.arch));
+const { ensureBinary, unsupportedHostReason } = require('../lib/download.js');
+const version = require('../package.json').version;
 
 async function main() {
   try {
-    const { ensureBinary } = require('../lib/download.js');
-    const version = require('../package.json').version;
-
     const binaryPath = await ensureBinary(version);
 
     // Spawn the binary with inherited stdio
@@ -28,28 +19,34 @@ async function main() {
     if (result.error) throw result.error;
 
     if (result.signal) {
-      // Re-raise so callers see the same signal that killed the CLI binary;
-      // the exit code is a fallback in case the signal does not terminate us.
-      process.kill(process.pid, result.signal);
-      process.exitCode = 128 + (require('os').constants.signals[result.signal] ?? 0);
-      return;
+      // Encode the child's fatal signal the way shells do (128 + number).
+      // Deliberately not re-raised: re-raising SIGUSR1 would start Node's
+      // inspector instead of terminating the launcher.
+      process.exit(128 + (require('os').constants.signals[result.signal] ?? 0));
     }
 
-    process.exitCode = result.status ?? 1;
+    process.exit(result.status ?? 1);
   } catch (err) {
     console.error('Failed to launch Magnitude:', err.message);
-    process.exitCode = 1;
+    process.exit(1);
   }
 }
 
-if (supportedHost) {
+const reason = unsupportedHostReason();
+if (reason === null) {
   main();
-} else if (process.platform === 'win32') {
-  console.error('Magnitude supports macOS and Linux (x64/arm64). On Windows, run Magnitude inside WSL:');
-  console.error('  https://learn.microsoft.com/windows/wsl/install');
-  console.error('Already inside WSL? Then this Node.js is the Windows one; install Node.js or Bun inside your distro and try again.');
-  process.exitCode = 1;
 } else {
-  console.error(`Magnitude supports macOS and Linux (x64/arm64); ${process.platform}-${process.arch} is not supported.`);
+  if (process.platform === 'win32') {
+    console.error('Magnitude supports macOS and Linux (x64/arm64). On Windows, run Magnitude inside WSL:');
+    console.error('  https://learn.microsoft.com/windows/wsl/install');
+    console.error('Already inside WSL? Then this Node.js is the Windows one; install Node.js or Bun inside your distro and try again.');
+  } else {
+    console.error(`Magnitude supports macOS and Linux on x64/arm64 with glibc; ${reason}.`);
+  }
+  if (process.env.MAGNITUDE_RELEASE_BASE_URL) {
+    console.error('Set MAGNITUDE_ALLOW_UNSUPPORTED_HOST=1 to bypass this check and use artifacts from MAGNITUDE_RELEASE_BASE_URL.');
+  }
+  // exitCode instead of process.exit so the message above always flushes on
+  // Windows; nothing else is pending, so the process exits immediately.
   process.exitCode = 1;
 }
