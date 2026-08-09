@@ -439,7 +439,9 @@ export function OnboardingModelChooser({
     1,
     detailWidth - (recommendationIntent ? recommendationIntent.length + 3 : 0),
   )
-  const emptySelectionMessage = "No compatible models found."
+  const emptySelectionMessage = selections.length === 0
+    ? "No catalog model fits this hardware at supported context lengths. Try another model from /settings."
+    : "No compatible models found."
   const regularDetails = selected ? (
     <>
       <DetailRow width={detailWidth}>
@@ -491,7 +493,9 @@ export function OnboardingModelChooser({
       </DetailRow>
     </>
   ) : (
-    <text style={{ fg: theme.muted }}>{emptySelectionMessage}</text>
+    <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="word">
+      {emptySelectionMessage}
+    </text>
   )
   const detailsContent = operation?._tag === "Downloading" ? (
     <OnboardingModelDownloadDetails

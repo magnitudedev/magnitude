@@ -349,10 +349,31 @@ const preferNewCheckpointWithin = (
 ): RecommendationCandidate | undefined => candidates.find((candidate) =>
   !usedCheckpointIds.has(candidate.checkpointId)) ?? candidates.at(0)
 
+/**
+ * Among usable Fits for the same recommendable checkpoint and artifact, keep
+ * only the highest configured context.
+ */
+export const collapseHighestContextUsableCandidates = (
+  input: readonly RecommendationCandidate[],
+): readonly RecommendationCandidate[] => {
+  const bestByKey = new Map<string, RecommendationCandidate>()
+  for (const candidate of input.filter(usable)) {
+    const key = `${candidate.checkpointId}:${candidate.artifactId}`
+    const existing = bestByKey.get(key)
+    if (
+      existing === undefined
+      || candidate.profile.contextLength > existing.profile.contextLength
+    ) {
+      bestByKey.set(key, candidate)
+    }
+  }
+  return [...bestByKey.values()]
+}
+
 export const selectRecommendationPortfolio = (
   input: readonly RecommendationCandidate[],
 ): readonly Recommendation[] => {
-  const feasible = preferScoredCandidates(input.filter(usable))
+  const feasible = preferScoredCandidates(collapseHighestContextUsableCandidates(input))
   if (feasible.length === 0) return []
 
   const bestQuality = [...feasible].sort(compareBestQuality).at(0)

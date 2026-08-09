@@ -30,7 +30,9 @@ import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { makeObservedState } from "./mirrored-state"
 import {
   localModelAssessmentProfiles,
+  localModelFallbackAssessmentProfiles,
   LocalModelAssessments,
+  type LocalModelAssessmentResult,
 } from "./local-model-assessments"
 import { LocalModelPackages } from "./local-model-packages"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
@@ -76,6 +78,51 @@ export const localModelRecommendationFailure = (
           "Local model recommendations are temporarily unavailable",
         retryable: error?.retryable ?? true,
       }
+
+/** True when preferred assessment is memory DoesNotFit and no Fits exist yet. */
+export const needsFallbackAssessment = (
+  result: LocalModelAssessmentResult | undefined,
+  preferredContextLength: number | undefined,
+): boolean => {
+  if (result?._tag !== "Assessed" || preferredContextLength === undefined) {
+    return false
+  }
+  if (result.assessments.some((assessment) => assessment._tag === "Fits")) {
+    return false
+  }
+  return result.assessments.some((assessment) =>
+    assessment._tag === "DoesNotFit"
+    && assessment.profile.contextLength === preferredContextLength)
+}
+
+export const mergeAssessmentResults = (
+  preferred: LocalModelAssessmentResult,
+  fallback: LocalModelAssessmentResult,
+): LocalModelAssessmentResult => {
+  if (preferred._tag !== "Assessed" || fallback._tag !== "Assessed") {
+    return preferred
+  }
+  return {
+    _tag: "Assessed",
+    targetId: preferred.targetId,
+    environmentId: fallback.environmentId,
+    assessments: [...preferred.assessments, ...fallback.assessments],
+  }
+}
+
+const highestContextFits = (
+  result: LocalModelAssessmentResult,
+): Extract<
+  LocalModelAssessmentResult,
+  { readonly _tag: "Assessed" }
+>["assessments"][number] & { readonly _tag: "Fits" } | undefined => {
+  if (result._tag !== "Assessed") return undefined
+  return result.assessments
+    .flatMap((assessment) => assessment._tag === "Fits" ? [assessment] : [])
+    .sort((left, right) =>
+      right.assessment.profile.contextLength - left.assessment.profile.contextLength)
+    .at(0)
+}
 
 export interface LocalModelRecommendationsApi {
   readonly snapshot: Effect.Effect<{
@@ -442,10 +489,12 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             const catalogAssessmentTargets = catalogModels.map((model) => ({
               ...model,
               profiles: localModelAssessmentProfiles(model.target),
+              fallbackProfiles: localModelFallbackAssessmentProfiles(model.target),
             }))
             const installedAssessmentTargets = installedTargets.map((model) => ({
               ...model,
               profiles: localModelAssessmentProfiles(model.target),
+              fallbackProfiles: localModelFallbackAssessmentProfiles(model.target),
             }))
             const assessmentTargets = [
               ...catalogAssessmentTargets,
@@ -459,6 +508,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 targetId: model.targetId,
                 checkpointId: model.checkpointId,
                 assessmentProfiles: model.profiles,
+                fallbackAssessmentProfiles: model.fallbackProfiles,
                 displayName: model.displayName,
                 description: model.description,
                 license: model.license,
@@ -475,6 +525,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               installed: installedAssessmentTargets.map((model) => ({
                 targetId: model.targetId,
                 assessmentProfiles: model.profiles,
+                fallbackAssessmentProfiles: model.fallbackProfiles,
                 target: model.target,
                 capabilities: model.capabilities,
                 tensorStorageBytes: Option.getOrNull(
@@ -555,45 +606,80 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               total: assessmentTargets.length,
             })
             yield* publishProgress(progress)
-            const requests = assessableTargets.map(({ targetId, target, profiles }) => ({
-              targetId,
-              target,
-              profiles,
-            }))
-            const assessedResults = yield* assessments.assess(
-              requests,
-              (completed, total) =>
-                Effect.gen(function* () {
-                  const elapsedMs = Math.max(
-                    0,
-                    Date.now() - assessmentStartedAt
-                  )
-                  const estimatedRemainingMs =
-                    completed > 0
-                      ? Math.max(
-                          0,
-                          Math.round(
-                            (elapsedMs / completed) * (total - completed)
-                          )
+            const publishAssessmentProgress = (
+              completed: number,
+              total: number,
+            ) =>
+              Effect.gen(function* () {
+                const elapsedMs = Math.max(
+                  0,
+                  Date.now() - assessmentStartedAt
+                )
+                const estimatedRemainingMs =
+                  completed > 0
+                    ? Math.max(
+                        0,
+                        Math.round(
+                          (elapsedMs / completed) * (total - completed)
                         )
-                      : 0
-                  progress = updateProgress(progress, "assessment", {
-                    completedItems: Option.some(rejectedCount + completed),
-                    totalItems: Option.some(rejectedCount + total),
-                    estimatedRemainingMs:
-                      completed > 0
-                        ? Option.some(estimatedRemainingMs)
-                        : Option.none(),
-                  })
-                  yield* publishProgress(progress)
+                      )
+                    : 0
+                progress = updateProgress(progress, "assessment", {
+                  completedItems: Option.some(rejectedCount + completed),
+                  totalItems: Option.some(rejectedCount + total),
+                  estimatedRemainingMs:
+                    completed > 0
+                      ? Option.some(estimatedRemainingMs)
+                      : Option.none(),
                 })
+                yield* publishProgress(progress)
+              })
+            const preferredRequests = assessableTargets.map(
+              ({ targetId, target, profiles }) => ({
+                targetId,
+                target,
+                profiles,
+              }),
+            )
+            const preferredResults = yield* assessments.assess(
+              preferredRequests,
+              (completed, total) => publishAssessmentProgress(completed, total),
             )
             const results = new Map(
               assessableTargets.map(({ targetId }, assessedIndex) => [
                 targetId,
-                assessedResults[assessedIndex],
-              ])
+                preferredResults[assessedIndex],
+              ]),
             )
+            const fallbackRequests = assessableTargets.flatMap(
+              ({ targetId, target, profiles, fallbackProfiles }) => {
+                if (
+                  !needsFallbackAssessment(results.get(targetId), profiles[0]?.contextLength)
+                  || fallbackProfiles.length === 0
+                ) {
+                  return []
+                }
+                return [{ targetId, target, profiles: fallbackProfiles }]
+              },
+            )
+            if (fallbackRequests.length > 0) {
+              const preferredCount = preferredRequests.length
+              const totalWithFallbacks = preferredCount + fallbackRequests.length
+              const fallbackResults = yield* assessments.assess(
+                fallbackRequests,
+                (completed, _total) =>
+                  publishAssessmentProgress(
+                    preferredCount + completed,
+                    totalWithFallbacks,
+                  ),
+              )
+              fallbackRequests.forEach(({ targetId }, index) => {
+                const preferred = results.get(targetId)
+                const fallback = fallbackResults[index]
+                if (preferred === undefined || fallback === undefined) return
+                results.set(targetId, mergeAssessmentResults(preferred, fallback))
+              })
+            }
             progress = yield* completeStep(
               progress,
               "assessment",
@@ -666,8 +752,8 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             ).map(catalogProjection)
             const installedCandidates = installedTargets.flatMap((model) => {
               const result = results.get(model.targetId)
-              if (result?._tag !== "Assessed") return []
-              const assessment = result.assessments.find((item) => item._tag === "Fits")
+              if (result === undefined) return []
+              const assessment = highestContextFits(result)
               return assessment === undefined
                 ? []
                 : [installedCatalogProjection(model, assessment.assessment)]

@@ -30,9 +30,10 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 ```text
 recommendable target
   -> exact tensor-storage rejection proof
-  -> local profile: 100K (bounded by target maximum)
+  -> preferred local profile: 100K (bounded by target maximum)
   -> cached or native ICN assessment with 25K, 50K, 75K, and full-context speed samples
-  -> completed configuration candidates
+  -> on memory DoesNotFit: assess descending fallback profiles together
+  -> highest-context usable Fits candidates per checkpoint
   -> recommendation portfolio
 ```
 
@@ -45,8 +46,13 @@ ACN exposes one assessment service accepting a batch of exact targets and profil
 scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
 One catalog projection assesses release-catalog and discovered installed targets together;
 recommendation policy consumes the release-catalog candidates from that projection.
-Release-catalog and discovered installed targets use the single 100K product profile, bounded by
-the target maximum. A speculative pair uses the lower component maximum.
+
+Release-catalog and discovered installed targets prefer the 100K product profile, bounded by the
+target maximum. A speculative pair uses the lower component maximum. When the target maximum sits
+between the preferred ceiling and a lower ladder rung, that exact maximum is the preferred profile.
+When the preferred profile completes as memory `DoesNotFit`, ACN submits the missing lower ladder
+profiles for that target together. The fallback ladder is 75K, 50K, and 25K, each bounded by the
+target maximum, strictly below the preferred length, and not below the product minimum context.
 
 ICN persists every completed exact profile result, including `DoesNotFit`, and performs
 single-flight native work. Repeated reads consume current results and do not trigger native
@@ -60,7 +66,8 @@ operation owner awaits its bounded request.
 
 A catalog candidate exists only for one completed `Fits` configuration. It contains its exact
 target, serving configuration, profile, assessment environment, memory, performance, capability,
-acquisition, and source evidence.
+acquisition, and source evidence. The configured context may be below the preferred 100K product
+profile when only a lower ladder rung Fits.
 
 Candidate performance is an ordered set of samples for the same configuration. Samples above the
 configured context are omitted, and the final sample is always the configured context.
@@ -69,8 +76,14 @@ Recommendation evidence is present only when the target comes from the recommend
 Discovered installed targets remain selectable catalog candidates without fabricated intelligence,
 fidelity, or quality values.
 
+Among multiple `Fits` results for the same recommendable checkpoint and artifact, recommendation
+input keeps the highest-context usable Fits. Lower rungs remain assessment evidence and do not
+compete as separate portfolio rows for that checkpoint.
+
 `DoesNotFit` and `Incompatible` are completed evidence but are not selectable candidates. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.
+An empty portfolio after complete preferred and fallback assessment is a valid Ready result;
+clients explain hardware and context limits rather than presenting a bare empty list.
 Installed targets remain present independently of assessment and offering publication.
 
 ## Assessment lifecycle
@@ -127,11 +140,16 @@ Cached assessment never authorizes loading.
 
 ## Conformance
 
-- Every release-catalog and discovered installed target has one 100K profile, bounded by its exact
-  target maximum.
-- All missing profiles for one target are submitted together.
+- Every release-catalog and discovered installed target prefers the 100K product profile, bounded
+  by its exact target maximum.
+- When the preferred profile is memory `DoesNotFit`, ACN assesses the descending fallback ladder
+  for that target; all missing fallback profiles for one target are submitted together.
 - Equivalent concurrent misses perform one native assessment.
+- Recommendation input keeps the highest-context usable Fits per recommendable checkpoint and
+  artifact.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
+- An empty Ready portfolio after complete assessment is valid; clients explain hardware/context
+  limits instead of a bare empty list.
 - The usability floor uses full-context performance; ranking and relative comparisons use the
   bounded 50K sample.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.

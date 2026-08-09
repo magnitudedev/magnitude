@@ -14,6 +14,7 @@ import {
 import {
   MINIMUM_EXPECTED_TOKENS_PER_SECOND,
   assembleRecommendationCatalogCandidates,
+  collapseHighestContextUsableCandidates,
   conservativeGenerationSpeed,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
@@ -168,6 +169,55 @@ describe("local model multicriteria recommendation policy", () => {
       expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
     })
     expect(selectRecommendationPortfolio([slow])).toEqual([])
+  })
+
+  it("collapses same checkpoint and artifact to the highest usable context", () => {
+    const collapsed = collapseHighestContextUsableCandidates([
+      candidate({
+        id: "small-50",
+        checkpoint: "small",
+        artifact: "small:q4",
+        score: 30,
+        context: 50_000,
+        expected: 20,
+      }),
+      candidate({
+        id: "small-25",
+        checkpoint: "small",
+        artifact: "small:q4",
+        score: 30,
+        context: 25_000,
+        expected: 40,
+      }),
+      candidate({
+        id: "small-75-slow",
+        checkpoint: "small",
+        artifact: "small:q4",
+        score: 30,
+        context: 75_000,
+        expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 1,
+      }),
+    ])
+    expect(collapsed.map(({ profile, model }) => [
+      model.displayName,
+      profile.contextLength,
+    ])).toEqual([["small-50", 50_000]])
+  })
+
+  it("recommends a model that only Fits below the preferred 100K profile", () => {
+    const recommendations = selectRecommendationPortfolio([
+      candidate({
+        id: "compact-50",
+        score: 35,
+        context: 50_000,
+        expected: 18,
+        runtimeGiB: 2.2,
+        capacityGiB: 3.5,
+      }),
+    ])
+    expect(byIntent(recommendations, "balanced")?.displayName).toBe("compact-50")
+    expect(byIntent(recommendations, "balanced")?.configuration.profile.contextLength)
+      .toBe(50_000)
   })
 
   it("uses full-context speed for eligibility and 50K speed for comparisons", () => {

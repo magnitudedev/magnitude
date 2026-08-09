@@ -6,6 +6,7 @@ import {
   completeAssessmentLifecycle,
   formatLocalModelAssessmentFailure,
   localModelAssessmentProfiles,
+  localModelFallbackAssessmentProfiles,
   localModelAssessmentResultFromIcn,
   performanceSampleContextTokens,
 } from "./local-model-assessments"
@@ -62,6 +63,50 @@ describe("localModelAssessmentProfiles", () => {
 
   it("does not invent a profile below the product minimum", () => {
     expect(localModelAssessmentProfiles(packageTarget(2_048))).toEqual([])
+  })
+})
+
+describe("localModelFallbackAssessmentProfiles", () => {
+  it("returns the descending ladder below the preferred 100K profile", () => {
+    expect(localModelFallbackAssessmentProfiles(packageTarget(131_072))).toEqual([
+      { contextLength: 75_000 },
+      { contextLength: 50_000 },
+      { contextLength: 25_000 },
+    ])
+  })
+
+  it("excludes the preferred length when the target max is below 100K", () => {
+    expect(localModelFallbackAssessmentProfiles(packageTarget(80_000))).toEqual([
+      { contextLength: 75_000 },
+      { contextLength: 50_000 },
+      { contextLength: 25_000 },
+    ])
+  })
+
+  it("keeps only rungs below a preferred profile already below 100K", () => {
+    expect(localModelFallbackAssessmentProfiles(packageTarget(60_000))).toEqual([
+      { contextLength: 50_000 },
+      { contextLength: 25_000 },
+    ])
+  })
+
+  it("bounds fallback rungs by the speculative pair lower maximum", () => {
+    const target = {
+      _tag: "SpeculativeDecodingPair",
+      target: { properties: { maximumContextLength: 131_072 } },
+      draft: { properties: { maximumContextLength: 40_000 } },
+    } as unknown as ModelOfferingTarget
+    expect(localModelFallbackAssessmentProfiles(target)).toEqual([
+      { contextLength: 25_000 },
+    ])
+  })
+
+  it("returns no fallbacks when the preferred profile is already at the minimum rung", () => {
+    expect(localModelFallbackAssessmentProfiles(packageTarget(25_000))).toEqual([])
+  })
+
+  it("returns no fallbacks below the product minimum", () => {
+    expect(localModelFallbackAssessmentProfiles(packageTarget(2_048))).toEqual([])
   })
 })
 

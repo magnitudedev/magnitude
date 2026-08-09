@@ -43,6 +43,7 @@ const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const ASSESSMENT_OPERATION_TIMEOUT_MS = 5 * 60 * 1_000
 const MINIMUM_CONTEXT_LENGTH = 4_096
 const LOCAL_MODEL_CONTEXT_LENGTH = 100_000
+const FALLBACK_CONTEXT_LENGTHS = [75_000, 50_000, 25_000] as const
 const PERFORMANCE_SAMPLE_CONTEXT_LENGTHS = [25_000, 50_000, 75_000] as const
 type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
@@ -58,11 +59,36 @@ const targetMaximumContextLength = (
 const assessmentProfile = (contextLength: number): AssessmentProfiles =>
   contextLength >= MINIMUM_CONTEXT_LENGTH ? [{ contextLength }] : []
 
+const preferredContextLength = (target: ModelOfferingTarget): number =>
+  Math.min(LOCAL_MODEL_CONTEXT_LENGTH, targetMaximumContextLength(target))
+
+/** Preferred product profile: 100K bounded by the target maximum. */
 export const localModelAssessmentProfiles = (
   target: ModelOfferingTarget,
-): readonly ServingProfile[] => assessmentProfile(
-  Math.min(LOCAL_MODEL_CONTEXT_LENGTH, targetMaximumContextLength(target)),
-)
+): readonly ServingProfile[] => assessmentProfile(preferredContextLength(target))
+
+/**
+ * Descending fallback profiles below the preferred length, bounded by the target
+ * maximum and not below the product minimum. Includes the exact target maximum when
+ * it sits between ladder rungs.
+ */
+export const localModelFallbackAssessmentProfiles = (
+  target: ModelOfferingTarget,
+): readonly ServingProfile[] => {
+  const preferred = preferredContextLength(target)
+  if (preferred < MINIMUM_CONTEXT_LENGTH) return []
+  const targetMax = targetMaximumContextLength(target)
+  const lengths = new Set<number>()
+  for (const rung of FALLBACK_CONTEXT_LENGTHS) {
+    const length = Math.min(rung, targetMax)
+    if (length >= MINIMUM_CONTEXT_LENGTH && length < preferred) {
+      lengths.add(length)
+    }
+  }
+  return [...lengths]
+    .sort((left, right) => right - left)
+    .map((contextLength) => ({ contextLength }))
+}
 
 export const performanceSampleContextTokens = (
   profile: ServingProfile,
