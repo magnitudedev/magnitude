@@ -14,6 +14,7 @@ import {
   describeLocalHardwareSummary,
   formatDownloadBytes,
   localInferenceProgressLines,
+  performanceRange,
   selectionCapacityWarning,
   selectionMetadata,
 } from "./view-model"
@@ -32,6 +33,33 @@ const selectionsFor = (view: ReturnType<typeof makeView>) =>
 describe("local inference onboarding presentation", () => {
   it("formats model artifacts in decimal gigabytes", () => {
     expect(formatDownloadBytes(73_395_172_000)).toBe("73.4 GB")
+  })
+
+  it("bounds the displayed speed range to a 50K catalog profile", () => {
+    expect(performanceRange(makeCatalogCandidate({
+      profile: { contextLength: 50_000 },
+      performance: [
+        {
+          contextTokens: 25_000,
+          lowerTokensPerSecond: 26,
+          estimatedTokensPerSecond: 30,
+          upperTokensPerSecond: 34,
+          confidence: "moderate",
+        },
+        {
+          contextTokens: 50_000,
+          lowerTokensPerSecond: 16,
+          estimatedTokensPerSecond: 20,
+          upperTokensPerSecond: 24,
+          confidence: "moderate",
+        },
+      ],
+    }))).toEqual({
+      lowerContext: 25_000,
+      upperContext: 50_000,
+      lowerTokensPerSecond: 20,
+      upperTokensPerSecond: 30,
+    })
   })
 })
 

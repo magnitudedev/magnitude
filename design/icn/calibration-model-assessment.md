@@ -112,15 +112,16 @@ is not a model result and creates no cache entry.
 
 ## Profiles
 
-ACN chooses one profile for each target:
+ACN chooses one profile for each target. Release-catalog targets carry their reviewed profile in
+the catalog. Discovered installed targets use:
 
 ```text
 min(100,000 tokens, exact target maximum)
 ```
 
-This applies to release-catalog and discovered installed targets. A pair uses the lower component
-maximum. Profiles below 4,096 tokens are not submitted. ICN does not search a context range or
-choose a profile.
+A pair uses the lower component maximum. Profiles below 4,096 tokens are not submitted. Catalog
+generation rejects a reviewed profile above its artifact maximum. ICN does not search a context
+range or choose a profile.
 
 For that one profile, ACN requests performance samples at 25K, 50K, 75K, and full configured
 context. Sample depths above the configured context are omitted and duplicates are removed. The

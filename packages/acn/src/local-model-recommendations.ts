@@ -441,7 +441,10 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             )
             const catalogAssessmentTargets = catalogModels.map((model) => ({
               ...model,
-              profiles: localModelAssessmentProfiles(model.target),
+              profiles: localModelAssessmentProfiles(
+                model.target,
+                model.profile.contextLength,
+              ),
             }))
             const installedAssessmentTargets = installedTargets.map((model) => ({
               ...model,

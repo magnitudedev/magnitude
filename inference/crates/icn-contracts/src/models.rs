@@ -357,6 +357,7 @@ pub struct RecommendableModel {
     pub checkpoint_id: String,
     pub target_id: ModelOfferingTargetId,
     pub target: ModelOfferingTarget,
+    pub profile: ServingProfile,
     pub display_name: String,
     pub description: String,
     pub license: String,

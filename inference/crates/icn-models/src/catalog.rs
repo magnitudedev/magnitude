@@ -8,14 +8,15 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, ModelFailure, ModelOfferingTarget, ModelOfferingTargetId, ModelPackage,
-    ModelPackageSource, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedModelTarget,
+    CatalogDiagnostic, ModelFailure, ModelFileRole, ModelOfferingTarget, ModelOfferingTargetId,
+    ModelPackage, ModelPackageSource, RecommendableModel, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedModelTarget, ServingProfile,
 };
 use icn_contracts::{
-    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
-    InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
-    ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
+    ModelComponent, ModelId, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
+    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,7 @@ use planner_bundle::PlannerBundle;
 
 const CATALOG_SOURCE: &str = include_str!("../../../catalog/models.json");
 const CATALOG_LOCK: &str = include_str!("../../../catalog/models.lock.json");
+const MIN_CATALOG_CONTEXT_LENGTH: u32 = 4_096;
 const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -48,10 +50,34 @@ struct CatalogModel {
     description: String,
     repository: String,
     formats: Vec<String>,
+    context_length: u32,
+    #[serde(default)]
+    companions: Vec<CatalogCompanion>,
     license: String,
     quality_score: f64,
     quality_score_provenance: String,
     quality_evidence: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogCompanion {
+    path: PathBuf,
+    role: CatalogCompanionRole,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum CatalogCompanionRole {
+    Mtp,
+}
+
+impl From<CatalogCompanionRole> for ModelPreviewComponentRole {
+    fn from(role: CatalogCompanionRole) -> Self {
+        match role {
+            CatalogCompanionRole::Mtp => Self::Mtp,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -105,12 +131,29 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     let mut ids = BTreeSet::new();
     for model in &source.models {
         let formats = model.formats.iter().collect::<BTreeSet<_>>();
+        let companion_paths = model
+            .companions
+            .iter()
+            .map(|companion| &companion.path)
+            .collect::<BTreeSet<_>>();
+        let companion_roles = model
+            .companions
+            .iter()
+            .map(|companion| companion.role)
+            .collect::<BTreeSet<_>>();
         if model.id.is_empty()
             || model.display_name.is_empty()
             || model.description.is_empty()
             || model.repository.is_empty()
             || model.formats.is_empty()
             || formats.len() != model.formats.len()
+            || model.context_length < MIN_CATALOG_CONTEXT_LENGTH
+            || companion_paths.len() != model.companions.len()
+            || companion_roles.len() != model.companions.len()
+            || model
+                .companions
+                .iter()
+                .any(|companion| companion.path.as_os_str().is_empty())
             || model.license.is_empty()
             || !model.quality_score.is_finite()
             || model.quality_score < 0.0
@@ -285,17 +328,23 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
     if catalog.models.is_empty()
         || model_ids.len() != catalog.models.len()
         || target_ids.len() != catalog.models.len()
-        || catalog.models.iter().any(|model| match &model.target {
-            ModelOfferingTarget::Package { package } => match &package.source {
-                ModelPackageSource::HuggingFace { revision, .. } => {
-                    revision.len() != 40
-                        || !revision
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || catalog.models.iter().any(|model| {
+            model.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
+                || match &model.target {
+                    ModelOfferingTarget::Package { package } => {
+                        model.profile.context_length > package.properties.maximum_context_length
+                            || match &package.source {
+                                ModelPackageSource::HuggingFace { revision, .. } => {
+                                    revision.len() != 40
+                                        || !revision.bytes().all(|byte| {
+                                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                        })
+                                }
+                                ModelPackageSource::Local { .. } => true,
+                            }
+                    }
+                    ModelOfferingTarget::SpeculativeDecodingPair { .. } => true,
                 }
-                ModelPackageSource::Local { .. } => true,
-            },
-            ModelOfferingTarget::SpeculativeDecodingPair { .. } => true,
         })
     {
         return Err(InventoryError::Integrity(
@@ -668,15 +717,30 @@ fn validate_resolved_catalog(
                 model.checkpoint_id
             ))
         })?;
-        let package_source = match &model.target {
-            ModelOfferingTarget::Package { package } => &package.source,
+        let package = match &model.target {
+            ModelOfferingTarget::Package { package } => package,
             ModelOfferingTarget::SpeculativeDecodingPair { .. } => {
                 return Err(InventoryError::Integrity(
                     "release catalog contains an unsupported speculative target".to_owned(),
                 ));
             }
         };
-        if !package_source_matches(package_source, declaration, expected_commit) {
+        let expected_mtp_paths = declaration
+            .companions
+            .iter()
+            .filter(|companion| matches!(companion.role, CatalogCompanionRole::Mtp))
+            .map(|companion| companion.path.as_path())
+            .collect::<BTreeSet<_>>();
+        let actual_mtp_paths = package
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Mtp)
+            .map(|file| file.path.as_path())
+            .collect::<BTreeSet<_>>();
+        if model.profile.context_length != declaration.context_length
+            || expected_mtp_paths != actual_mtp_paths
+            || !package_source_matches(&package.source, declaration, expected_commit)
+        {
             return Err(InventoryError::Integrity(format!(
                 "release catalog target {} does not match models.json and models.lock.json",
                 model.id.0
@@ -715,6 +779,8 @@ fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
         60
     } else if format.contains("Q5") {
         50
+    } else if format.contains("Q1") {
+        10
     } else {
         40
     };
@@ -733,6 +799,9 @@ fn recommendable_model(
         checkpoint_id: declaration.id.clone(),
         target_id: offering_target_id(&[&package.id]),
         target: ModelOfferingTarget::Package { package },
+        profile: ServingProfile {
+            context_length: declaration.context_length,
+        },
         display_name: declaration.display_name.clone(),
         description: declaration.description.clone(),
         license: declaration.license.clone(),
@@ -839,6 +908,14 @@ impl ResolvingRecommendableCatalog {
             )));
         }
         let primary = matches.remove(0);
+        let additional_components = declaration
+            .companions
+            .iter()
+            .map(|companion| ModelPreviewComponentSource {
+                path: companion.path.clone(),
+                role: companion.role.into(),
+            })
+            .collect();
         let prepared = self
             .models
             .prepare_preview_from_repository_snapshot(
@@ -846,12 +923,20 @@ impl ResolvingRecommendableCatalog {
                     repository: snapshot.repository.clone(),
                     revision: snapshot.commit.clone(),
                     primary_gguf: primary.path.clone(),
-                    additional_components: Vec::new(),
+                    additional_components,
                 },
                 snapshot,
             )
             .await?;
         let package = package_from_resolved(&prepared.model)?;
+        if declaration.context_length > package.properties.maximum_context_length {
+            return Err(InventoryError::Integrity(format!(
+                "{} configures {} context tokens above the artifact maximum of {}",
+                declaration.id,
+                declaration.context_length,
+                package.properties.maximum_context_length
+            )));
+        }
         let model = recommendable_model(
             declaration,
             format,
@@ -922,8 +1007,10 @@ impl ResolvingRecommendableCatalog {
                 }
                 let kind = if component.path == primary.path {
                     PlannerStubComponent::Primary
+                } else if component.role == ComponentRole::Shard {
+                    PlannerStubComponent::Shard
                 } else {
-                    PlannerStubComponent::Auxiliary
+                    PlannerStubComponent::Companion
                 };
                 let stub = compact_planner_stub(source, &context, kind)
                     .map_err(|error| InventoryError::Integrity(error.to_string()))?;
@@ -1236,6 +1323,48 @@ mod tests {
         );
         assert_eq!(fidelity("glm-5.2", "UD-Q4_K_XL"), (40, false));
         assert_eq!(fidelity("glm-5.2", "UD-Q8_K_XL"), (80, false));
+    }
+
+    #[test]
+    fn small_model_catalog_uses_curated_profiles_and_formats() {
+        let source = catalog_source().expect("catalog source");
+        let model = |id: &str| {
+            source
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("catalog model")
+        };
+        assert_eq!(model("qwen3.5-4b").context_length, 50_000);
+        assert_eq!(model("gemma-4-e4b-it-qat").context_length, 50_000);
+        assert_eq!(model("gemma-4-12b-it-qat").context_length, 100_000);
+        assert_eq!(
+            model("lfm2.5-2.6b").formats,
+            ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"]
+        );
+        assert_eq!(model("bonsai-8b-q1").formats, ["Q1_0"]);
+        assert_eq!(fidelity("bonsai-8b-q1", "Q1_0"), (10, false));
+    }
+
+    #[test]
+    fn gemma_catalog_declares_root_mtp_companions() {
+        let source = catalog_source().expect("catalog source");
+        for model in source
+            .models
+            .iter()
+            .filter(|model| model.id.starts_with("gemma-4-"))
+        {
+            let [companion] = model.companions.as_slice() else {
+                panic!("{} must declare one MTP companion", model.id);
+            };
+            assert!(matches!(companion.role, CatalogCompanionRole::Mtp));
+            assert!(
+                companion
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("mtp-gemma-4-"))
+            );
+        }
     }
 
     #[test]

@@ -1611,6 +1611,7 @@ export const RecommendableModel = S.Struct({
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<RecommendableModelId, RecommendableModelIdEncoded> => RecommendableModelId),
   license: S.String,
+  profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
   qualityEvidence: S.Array(S.String),
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,

@@ -31,14 +31,16 @@ selection, and runtime residency remain separate facts.
 ## Release catalog
 
 The recommendable catalog is immutable release data. Human-reviewed declarations identify curated
-targets and evidence. A separate lock maps each declaration to an immutable upstream revision.
-Advancing that lock is an explicit development operation.
+targets, one exact serving profile, required companion components, and recommendation evidence. A
+separate lock maps each declaration to an immutable upstream revision. Advancing that lock is an
+explicit development operation.
 
 Catalog generation resolves only locked revisions through production package construction,
 inspection, template analysis, and native planning. It emits a self-contained planner-input bundle
 and proves that compact planner inputs yield the same native assessments as their source metadata
-at the 100K catalog profile. Any unresolved entry, incomplete coverage, integrity mismatch, or
-assessment mismatch fails generation or ICN readiness.
+at each declaration's catalog profile. A declared profile above the exact artifact maximum, a
+missing or differently typed companion, an unresolved entry, incomplete coverage, integrity
+mismatch, or assessment mismatch fails generation or ICN readiness.
 
 Runtime catalog use performs no upstream discovery and does not follow mutable revisions. Adding a
 model, format, or upstream revision requires a new reviewed release catalog.
@@ -149,6 +151,8 @@ the release catalog, changes identity, or creates a permanent failed state.
 ## Conformance
 
 - Catalog membership implies only eligibility for assessment and recommendation.
+- Every catalog target publishes the exact reviewed serving profile and required companion set used
+  to construct its package.
 - Runtime setup requires no network access to reconstruct the release catalog.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
