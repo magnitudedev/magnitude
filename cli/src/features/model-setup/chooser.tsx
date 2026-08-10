@@ -1,5 +1,5 @@
-import { useCallback, useMemo, useState, type ReactNode } from "react"
-import { TextAttributes, type KeyEvent } from "@opentui/core"
+import { useCallback, useMemo, useRef, useState, type ReactNode, type Ref } from "react"
+import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
@@ -40,6 +40,16 @@ const DESCRIPTION_ROWS = 5
 const DETAIL_FIXED_ROWS = 10
 const WIDE_LIST_WIDTH = 42
 
+const onboardingModelRowId = (selectionId: string): string =>
+  `onboarding-model:${selectionId}`
+
+export const scrollOnboardingModelIntoView = (
+  scrollbox: Pick<ScrollBoxRenderable, "scrollChildIntoView"> | null,
+  selectionId: string,
+): void => {
+  scrollbox?.scrollChildIntoView(onboardingModelRowId(selectionId))
+}
+
 const setupCardWidth = (width: number): number => Math.max(1, Math.min(96, width - 2))
 
 const intentLabel = (intent: "balanced" | "best_quality" | "fastest" | "lightweight"): string => {
@@ -73,6 +83,7 @@ const ModelRow = ({
   selected,
   disabled,
   width,
+  rowId,
   onHover,
   onChoose,
 }: {
@@ -80,6 +91,7 @@ const ModelRow = ({
   readonly selected: boolean
   readonly disabled: boolean
   readonly width: number
+  readonly rowId: string
   readonly onHover: () => void
   readonly onChoose: () => void
 }): ReactNode => {
@@ -92,6 +104,7 @@ const ModelRow = ({
   const nameWidth = Math.max(1, width - markerWidth - gap - action.length - 1)
   return (
     <Button
+      id={rowId}
       onClick={() => { if (enabled && !disabled) onChoose() }}
       onMouseOver={() => { if (!disabled) onHover() }}
       cursor={enabled && !disabled ? "pointer" : "default"}
@@ -115,6 +128,35 @@ const ModelRow = ({
     </Button>
   )
 }
+
+const ModelSectionViewport = ({
+  scrollRef,
+  children,
+}: {
+  readonly scrollRef: Ref<ScrollBoxRenderable | null>
+  readonly children: ReactNode
+}): ReactNode => (
+  <scrollbox
+    ref={scrollRef}
+    scrollX={false}
+    scrollbarOptions={{ visible: false }}
+    style={{
+      flexShrink: 0,
+      rootOptions: {
+        height: SECTION_VIEWPORT_ROWS,
+        minHeight: SECTION_VIEWPORT_ROWS,
+        maxHeight: SECTION_VIEWPORT_ROWS,
+        flexShrink: 0,
+        backgroundColor: "transparent",
+      },
+      wrapperOptions: { border: false, backgroundColor: "transparent" },
+      viewportOptions: { backgroundColor: "transparent" },
+      contentOptions: { flexDirection: "column" },
+    }}
+  >
+    {children}
+  </scrollbox>
+)
 
 const DetailRow = ({
   width,
@@ -264,6 +306,8 @@ export function OnboardingModelChooser({
         || selection.recommendation._tag === "Recommended"),
   [catalog, models, slots])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
+  const localScrollRef = useRef<ScrollBoxRenderable | null>(null)
+  const downloadScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const selectionConfigurationId = (selection: LocalInferenceSelection) =>
     selection.kind === "recommendation"
       ? selection.recommendation._tag === "Recommended"
@@ -285,15 +329,6 @@ export function OnboardingModelChooser({
   const locked = operation !== null
   const local = selections.filter(({ kind }) => kind === "running" || kind === "stored")
   const downloads = selections.filter(({ kind }) => kind === "recommendation")
-  const selectedLocalIndex = Math.min(selectedIndex, Math.max(0, local.length - 1))
-  const localWindowStart = Math.min(
-    Math.max(0, selectedLocalIndex - SECTION_VIEWPORT_ROWS + 1),
-    Math.max(0, local.length - SECTION_VIEWPORT_ROWS),
-  )
-  const visibleLocal = local.slice(
-    localWindowStart,
-    localWindowStart + SECTION_VIEWPORT_ROWS,
-  )
   const cardWidth = setupCardWidth(width)
   const wide = cardWidth >= 82
   const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
@@ -348,6 +383,16 @@ export function OnboardingModelChooser({
     }
   }, [onContinue, onLoad, onSelectConfiguration])
 
+  const moveSelectionTo = useCallback((index: number) => {
+    const selection = selections[index]
+    if (!selection) return
+    setSelectedId(Option.some(selection.id))
+    scrollOnboardingModelIntoView(
+      selection.kind === "recommendation" ? downloadScrollRef.current : localScrollRef.current,
+      selection.id,
+    )
+  }, [selections])
+
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) {
       key.preventDefault()
@@ -355,15 +400,15 @@ export function OnboardingModelChooser({
     }
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
-      setSelectedId(Option.fromNullable(selections[Math.max(0, selectedIndex - 1)]?.id))
+      moveSelectionTo(Math.max(0, selectedIndex - 1))
       return
     }
     if (key.name === "down" || key.name === "j" || key.name === "tab") {
       key.preventDefault()
-      setSelectedId(Option.fromNullable(selections[Math.min(
+      moveSelectionTo(Math.min(
         Math.max(0, selections.length - 1),
         selectedIndex + 1,
-      )]?.id))
+      ))
       return
     }
     if ((key.name === "return" || key.name === "enter") && selected) {
@@ -375,32 +420,26 @@ export function OnboardingModelChooser({
       key.preventDefault()
       onSkip()
     }
-  }, [choose, locked, onSkip, selected, selectedIndex, selections]))
+  }, [choose, locked, moveSelectionTo, onSkip, selected, selectedIndex, selections.length]))
 
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
       {local.length > 0 && <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>ON THIS COMPUTER</text>}
       {local.length > 0 && (
-        <box style={{
-          height: SECTION_VIEWPORT_ROWS,
-          minHeight: SECTION_VIEWPORT_ROWS,
-          maxHeight: SECTION_VIEWPORT_ROWS,
-          flexShrink: 0,
-          flexDirection: "column",
-          overflow: "hidden",
-        }}>
-          {visibleLocal.map((selection) => (
+        <ModelSectionViewport scrollRef={localScrollRef}>
+          {local.map((selection) => (
             <ModelRow
               key={selection.id}
               selection={selection}
               selected={selection.id === selected?.id}
               disabled={locked}
               width={leftWidth}
+              rowId={onboardingModelRowId(selection.id)}
               onHover={() => setSelectedId(Option.some(selection.id))}
               onChoose={() => choose(selection)}
             />
           ))}
-        </box>
+        </ModelSectionViewport>
       )}
       {downloads.length > 0 && (
         <text style={{ fg: theme.muted, marginTop: local.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
@@ -408,14 +447,7 @@ export function OnboardingModelChooser({
         </text>
       )}
       {downloads.length > 0 && (
-        <box style={{
-          height: SECTION_VIEWPORT_ROWS,
-          minHeight: SECTION_VIEWPORT_ROWS,
-          maxHeight: SECTION_VIEWPORT_ROWS,
-          flexShrink: 0,
-          flexDirection: "column",
-          overflow: "hidden",
-        }}>
+        <ModelSectionViewport scrollRef={downloadScrollRef}>
           {downloads.map((selection) => (
             <ModelRow
               key={selection.id}
@@ -423,11 +455,12 @@ export function OnboardingModelChooser({
               selected={selection.id === selected?.id}
               disabled={locked}
               width={leftWidth}
+              rowId={onboardingModelRowId(selection.id)}
               onHover={() => setSelectedId(Option.some(selection.id))}
               onChoose={() => choose(selection)}
             />
           ))}
-        </box>
+        </ModelSectionViewport>
       )}
     </box>
   )
