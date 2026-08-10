@@ -13,6 +13,7 @@ import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
   deriveCurrentLocalModel,
+  catalogCandidateMemoryConditions,
   modelMemoryStatusDetail,
   modelMemoryStatusLabel,
   modelSlotInstanceId,
@@ -41,6 +42,7 @@ import {
   type LocalModelRecommendation,
   type ProviderModelId,
   type ProviderModelCatalogEntry,
+  type ReasoningEffort,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { HardwareMemoryDomain } from "../../components/hardware-memory-domain"
@@ -55,10 +57,12 @@ import {
 } from "../../state/cli-atoms"
 import { SingleLineInput } from "../composer/single-line-input"
 import {
+  buildInstalledLocalModelChoices,
   describeLocalHardware,
   formatBytes,
   localInferenceProgressLines,
   performanceRangeSpeedLabel,
+  type InstalledLocalModelChoice,
 } from "../local-inference/view-model"
 import { deriveSettingsAuthInfo } from "../overlays/auth-display"
 import {
@@ -149,6 +153,92 @@ const catalogModels = (
     })),
   () => [],
 )
+
+type ModelsMenuEntry =
+  | {
+      readonly _tag: "Local"
+      readonly id: string
+      readonly choice: InstalledLocalModelChoice
+    }
+  | {
+      readonly _tag: "Cloud"
+      readonly id: string
+      readonly model: ProviderModelCatalogEntry
+    }
+
+const modelsMenuProviderModel = (
+  entry: ModelsMenuEntry,
+): ProviderModelCatalogEntry | undefined => entry._tag === "Cloud"
+  ? entry.model
+  : Option.getOrUndefined(entry.choice.providerModel)
+
+const modelsMenuCandidate = (
+  entry: ModelsMenuEntry,
+): LocalModelCatalogCandidate | undefined => entry._tag === "Local"
+  ? Option.getOrUndefined(entry.choice.candidate)
+  : undefined
+
+const modelsMenuDisplayName = (entry: ModelsMenuEntry): string => entry._tag === "Local"
+  ? entry.choice.model.displayName
+  : entry.model.displayName
+
+const modelsMenuContextLength = (entry: ModelsMenuEntry): number => entry._tag === "Local"
+  ? entry.choice.contextLength
+  : entry.model.contextWindow
+
+const modelsMenuProviderKey = (entry: ModelsMenuEntry): string | null => {
+  const providerModel = modelsMenuProviderModel(entry)
+  return providerModel === undefined ? null : providerModelKey(providerModel)
+}
+
+export const buildModelsMenuEntries = (
+  choices: readonly InstalledLocalModelChoice[],
+  providerModels: readonly ProviderModelCatalogEntry[],
+): readonly ModelsMenuEntry[] => [
+  ...choices.map((choice): ModelsMenuEntry => ({
+    _tag: "Local",
+    id: choice.id,
+    choice,
+  })),
+  ...providerModels
+    .filter(({ providerId }) => providerId !== LOCAL_PROVIDER_ID)
+    .map((model): ModelsMenuEntry => ({
+      _tag: "Cloud",
+      id: providerModelKey(model),
+      model,
+    })),
+]
+
+export type ModelsMenuSelectionAction =
+  | {
+      readonly _tag: "AssignOffering"
+      readonly providerModel: ProviderModelCatalogEntry
+    }
+  | {
+      readonly _tag: "CreateOffering"
+      readonly configurationId: InstalledLocalModelChoice["configurationId"]
+      readonly reasoningEffort: Option.Option<ReasoningEffort>
+    }
+
+export const modelsMenuSelectionAction = (
+  entry: ModelsMenuEntry,
+): Option.Option<ModelsMenuSelectionAction> => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (providerModel !== undefined) {
+    return providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
+      && providerModel.availability._tag === "Available"
+      ? Option.some({ _tag: "AssignOffering", providerModel })
+      : Option.none()
+  }
+  if (entry._tag === "Cloud"
+    || !Option.exists(entry.choice.candidate, ({ availability }) =>
+      availability._tag === "Available")) return Option.none()
+  return Option.some({
+    _tag: "CreateOffering",
+    configurationId: entry.choice.configurationId,
+    reasoningEffort: entry.choice.reasoningEffort,
+  })
+}
 
 export function ModelMenusContainer({
   downloadSummary,
@@ -385,11 +475,13 @@ const ModelsMenu = memo(function ModelsMenu({
   const theme = useTheme()
   const config = useModelConfig()
   const localModels = useLocalModels()
+  const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
   const hardware = Option.getOrUndefined(Result.value(useLocalInferenceHardware()))
-  const models = catalogModels(config)
+  const providerModels = catalogModels(config)
   const catalogSnapshot = Result.value(config.catalog)
   const slotsSnapshot = Result.value(config.slots)
+  const localSnapshot = Result.value(localModels)
   const selected = Option.flatMap(
     Option.all({ catalog: catalogSnapshot, slots: slotsSnapshot }),
     ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
@@ -408,49 +500,84 @@ const ModelsMenu = memo(function ModelsMenu({
     recentModelIds: currentRecentModelIds,
     favoriteKeys: currentFavoriteKeys,
   }))
-  const eligible = models
-    .filter((model) =>
-      model.supportedSlots.includes(PRIMARY_SLOT_ID)
-      && (model.availability._tag === "Available"
-        || providerModelKey(model) === selectedKey
-        || (model.providerId === LOCAL_PROVIDER_ID
-          && model.availability.reason === "insufficient_resources")))
+  const installedChoices = Option.match(
+    Option.all({ models: localSnapshot, catalog: catalogSnapshot, slots: slotsSnapshot }),
+    {
+      onNone: () => [] as readonly InstalledLocalModelChoice[],
+      onSome: ({ models, catalog, slots }) =>
+        buildInstalledLocalModelChoices(models, catalog.state, slots.state),
+    },
+  )
+  const entries = buildModelsMenuEntries(installedChoices, providerModels)
+  const isSelected = (entry: ModelsMenuEntry): boolean =>
+    modelsMenuProviderKey(entry) === selectedKey
+  const isFavorite = (entry: ModelsMenuEntry): boolean => {
+    const key = modelsMenuProviderKey(entry)
+    return key !== null && currentFavoriteKeys.has(key)
+  }
+  const isEligible = (entry: ModelsMenuEntry): boolean => {
+    const providerModel = modelsMenuProviderModel(entry)
+    if (entry._tag === "Cloud") {
+      return providerModel !== undefined
+        && providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
+        && (providerModel.availability._tag === "Available" || isSelected(entry))
+    }
+    const candidate = modelsMenuCandidate(entry)
+    return isSelected(entry)
+      || providerModel?.availability._tag === "Available"
+      || (providerModel?.availability._tag === "Disabled"
+        && providerModel.availability.reason === "insufficient_resources")
+      || candidate?.availability._tag === "Available"
+  }
+  const eligible = entries
+    .filter(isEligible)
     .sort((left, right) => {
-      const leftFavorite = ordering.favoriteKeys.has(providerModelKey(left))
-      const rightFavorite = ordering.favoriteKeys.has(providerModelKey(right))
+      const leftKey = modelsMenuProviderKey(left)
+      const rightKey = modelsMenuProviderKey(right)
+      const leftFavorite = leftKey !== null && ordering.favoriteKeys.has(leftKey)
+      const rightFavorite = rightKey !== null && ordering.favoriteKeys.has(rightKey)
       if (leftFavorite !== rightFavorite) return leftFavorite ? -1 : 1
-      const leftSelected = providerModelKey(left) === ordering.selectedKey
-      const rightSelected = providerModelKey(right) === ordering.selectedKey
+      const leftSelected = leftKey === ordering.selectedKey
+      const rightSelected = rightKey === ordering.selectedKey
       if (leftSelected !== rightSelected) return leftSelected ? -1 : 1
-      const leftRecency = ordering.recentModelIds.indexOf(left.providerModelId)
-      const rightRecency = ordering.recentModelIds.indexOf(right.providerModelId)
+      const leftProviderModel = modelsMenuProviderModel(left)
+      const rightProviderModel = modelsMenuProviderModel(right)
+      const leftRecency = leftProviderModel === undefined
+        ? -1
+        : ordering.recentModelIds.indexOf(leftProviderModel.providerModelId)
+      const rightRecency = rightProviderModel === undefined
+        ? -1
+        : ordering.recentModelIds.indexOf(rightProviderModel.providerModelId)
       if (leftRecency !== rightRecency) {
         if (leftRecency < 0) return 1
         if (rightRecency < 0) return -1
         return leftRecency - rightRecency
       }
-      const leftLocal = left.providerId === LOCAL_PROVIDER_ID
-      const rightLocal = right.providerId === LOCAL_PROVIDER_ID
+      const leftLocal = left._tag === "Local"
+      const rightLocal = right._tag === "Local"
       if (leftLocal !== rightLocal) return leftLocal ? -1 : 1
-      return left.displayName.localeCompare(right.displayName)
+      return modelsMenuDisplayName(left).localeCompare(modelsMenuDisplayName(right))
     })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(null)
-  const cursorIndex = Math.max(0, eligible.findIndex((model) => providerModelKey(model) === cursorId))
+  const cursorIndex = Math.max(0, eligible.findIndex(({ id }) => id === cursorId))
   const cursor = eligible[cursorIndex]
-  const detail = eligible.find((model) => providerModelKey(model) === detailId) ?? null
-  const localSnapshot = Result.value(localModels)
+  const detail = eligible.find(({ id }) => id === detailId) ?? null
   const localCatalogCandidates = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModelCatalogCandidate[],
     onSome: (models) =>
       models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
   })
-  const requirementFor = (model: ProviderModelCatalogEntry): string => {
-    if (model.providerId !== LOCAL_PROVIDER_ID) return "Cloud"
-    return Option.match(model.memory, {
-      onNone: () => "—",
-      onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
-    })
+  const requirementFor = (entry: ModelsMenuEntry): string => {
+    if (entry._tag === "Cloud") return "Cloud"
+    const providerModel = modelsMenuProviderModel(entry)
+    const candidate = modelsMenuCandidate(entry)
+    return providerModel === undefined
+      ? candidate === undefined ? "—" : formatBytes(requiredMemoryBytes(candidate.memory))
+      : Option.match(providerModel.memory, {
+          onNone: () => candidate === undefined ? "—" : formatBytes(requiredMemoryBytes(candidate.memory)),
+          onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
+        })
   }
   const assessingRequirementFor = (model: LocalModel): string => {
     const candidate = localCatalogCandidates.find(({ targetId }) => targetId === model.targetId)
@@ -468,28 +595,27 @@ const ModelsMenu = memo(function ModelsMenu({
   const residentAllocation = primarySlot === null
     ? Option.none()
     : modelSlotResidentAllocation(primarySlot)
-  const detailIsLocal = detail?.providerId === LOCAL_PROVIDER_ID
-  const detailIsSelected = detail !== null && providerModelKey(detail) === selectedKey
-  const detailLocalModel = detailIsLocal && detail
-    ? Option.match(localSnapshot, {
-        onNone: () => undefined,
-        onSome: (models) => models.models.find(({ offerings }) =>
-          offerings.some(({ providerModelId }) => providerModelId === detail.providerModelId)),
-      })
-    : undefined
-  const detailCatalogCandidate = detailLocalModel && detail
-    ? localCatalogCandidates.find(({ configurationId }) =>
-        detailLocalModel.offerings.some((offering) =>
-          offering.providerModelId === detail.providerModelId
-          && offering.configurationId === configurationId))
-    : undefined
+  const memoryConditionsFor = (entry: ModelsMenuEntry) => {
+    const providerModel = modelsMenuProviderModel(entry)
+    const candidate = modelsMenuCandidate(entry)
+    return providerModel !== undefined
+      ? providerModelMemoryConditions(providerModel, hardware, residentAllocation)
+      : candidate !== undefined
+        ? catalogCandidateMemoryConditions(candidate, hardware, residentAllocation)
+        : {
+            exceedsCapacity: false,
+            belowWarningReserve: false,
+            lacksCurrentHeadroom: false,
+            evidenceUnavailable: true,
+          }
+  }
+  const detailIsLocal = detail?._tag === "Local"
+  const detailIsSelected = detail !== null && isSelected(detail)
+  const detailCatalogCandidate = detail === null ? undefined : modelsMenuCandidate(detail)
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
     const actions: ("select" | "load" | "stop" | "catalog")[] = []
-    const memoryConditions = providerModelMemoryConditions(detail, hardware, residentAllocation)
-    if (!detailIsSelected
-      && detail.availability._tag === "Available"
-      && detail.supportedSlots.includes(PRIMARY_SLOT_ID)) actions.push("select")
+    if (!detailIsSelected && Option.isSome(modelsMenuSelectionAction(detail))) actions.push("select")
     if (detailIsLocal
       && detailIsSelected
       && primarySlot?._tag === "ConfiguredLocal"
@@ -503,34 +629,56 @@ const ModelsMenu = memo(function ModelsMenu({
       && primarySlot.actions.includes("Stop")) actions.push("stop")
     if (detailCatalogCandidate) actions.push("catalog")
     return actions
-  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, hardware, primarySlot, residentAllocation])
+  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, primarySlot])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
 
-  const statusFor = useCallback((model: ProviderModelCatalogEntry): string => {
-    const isSelected = providerModelKey(model) === selectedKey
-    if (model.providerId === LOCAL_PROVIDER_ID) {
-      const memoryConditions = providerModelMemoryConditions(model, hardware, residentAllocation)
-      if (isSelected
+  const statusFor = (entry: ModelsMenuEntry): string => {
+    const selectedEntry = isSelected(entry)
+    if (entry._tag === "Local") {
+      const memoryConditions = memoryConditionsFor(entry)
+      if (selectedEntry
         && primarySlot?._tag === "ConfiguredLocal"
         && Option.isSome(primarySlot.instance)
         && memoryConditions.lacksCurrentHeadroom) return "Selected"
       const memoryLabel = modelMemoryStatusLabel(memoryConditions)
       if (memoryLabel !== "") return memoryLabel
-      if (model.availability._tag === "Disabled") return "Unavailable"
+      const providerModel = modelsMenuProviderModel(entry)
+      const candidate = modelsMenuCandidate(entry)
+      if (providerModel?.availability._tag === "Disabled"
+        || candidate?.availability._tag === "Unavailable") return "Unavailable"
     }
-    if (isSelected) return "Selected"
-    return model.providerId === LOCAL_PROVIDER_ID ? "Installed" : "Available"
-  }, [hardware, primarySlot, residentAllocation, selectedKey])
+    if (selectedEntry) return "Selected"
+    return entry._tag === "Local" ? "Installed" : "Available"
+  }
 
-  const choose = useCallback((model: ProviderModelCatalogEntry) => {
-    if (!model.supportedSlots.includes(PRIMARY_SLOT_ID)) return
-    if (model.availability._tag !== "Available") return
-    config.updateSlotModel(PRIMARY_SLOT_ID, model.providerId, model.providerModelId)
-  }, [config])
+  const choose = useCallback((entry: ModelsMenuEntry) => {
+    const action = modelsMenuSelectionAction(entry)
+    if (Option.isNone(action)) return
+    if (action.value._tag === "AssignOffering") {
+      const { providerModel } = action.value
+      config.updateSlotModel(PRIMARY_SLOT_ID, providerModel.providerId, providerModel.providerModelId)
+      return
+    }
+    const createAction = action.value
+    if (Result.isWaiting(modelActions.createOfferingResult)) return
+    void modelActions.createOffering(createAction.configurationId).then(
+      (providerModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId,
+        reasoningEffort: Option.getOrElse(
+          createAction.reasoningEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      }),
+      () => undefined,
+    )
+  }, [config, modelActions, slotActions])
 
-  const toggleFavorite = useCallback((model: ProviderModelCatalogEntry) => {
+  const toggleFavorite = useCallback((entry: ModelsMenuEntry) => {
+    const model = modelsMenuProviderModel(entry)
+    if (model === undefined) return
     config.setModelFavorite({
       providerId: model.providerId,
       providerModelId: model.providerModelId,
@@ -553,7 +701,8 @@ const ModelsMenu = memo(function ModelsMenu({
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (detail) {
-      if (key.name === "f" && !key.ctrl && !key.meta && !key.option) {
+      if (key.name === "f" && !key.ctrl && !key.meta && !key.option
+        && modelsMenuProviderModel(detail) !== undefined) {
         key.preventDefault()
         toggleFavorite(detail)
         return
@@ -599,12 +748,12 @@ const ModelsMenu = memo(function ModelsMenu({
     }
     if ((key.name === "up" || key.name === "k") && eligible.length > 0) {
       key.preventDefault()
-      setCursorId(providerModelKey(eligible[Math.max(0, cursorIndex - 1)]!))
+      setCursorId(eligible[Math.max(0, cursorIndex - 1)]!.id)
       return
     }
     if ((key.name === "down" || key.name === "j") && eligible.length > 0) {
       key.preventDefault()
-      setCursorId(providerModelKey(eligible[Math.min(eligible.length - 1, cursorIndex + 1)]!))
+      setCursorId(eligible[Math.min(eligible.length - 1, cursorIndex + 1)]!.id)
       return
     }
     if ((key.name === "return" || key.name === "enter") && cursor) {
@@ -612,7 +761,8 @@ const ModelsMenu = memo(function ModelsMenu({
       choose(cursor)
       return
     }
-    if (key.name === "f" && !key.ctrl && !key.meta && !key.option && cursor) {
+    if (key.name === "f" && !key.ctrl && !key.meta && !key.option && cursor
+      && modelsMenuProviderModel(cursor) !== undefined) {
       key.preventDefault()
       toggleFavorite(cursor)
       return
@@ -620,7 +770,7 @@ const ModelsMenu = memo(function ModelsMenu({
     if (key.name === "d" && cursor) {
       key.preventDefault()
       detailActionCursor.reset()
-      setDetailId(providerModelKey(cursor))
+      setDetailId(cursor.id)
       setRootSwitchingEnabled(false)
       return
     }
@@ -632,6 +782,11 @@ const ModelsMenu = memo(function ModelsMenu({
   }, [choose, config, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, eligible, emptyActionCursor, focusedDetailAction, openRoot, runDetailAction, setRootSwitchingEnabled, toggleFavorite]))
 
   if (detail) {
+    const detailProviderModel = modelsMenuProviderModel(detail)
+    const detailCandidate = modelsMenuCandidate(detail)
+    const detailCapabilities = detailProviderModel?.capabilities ?? detailCandidate?.capabilities
+    const detailFavorite = isFavorite(detail)
+    const detailMemoryConditions = memoryConditionsFor(detail)
     const detailActionLabel = {
       select: "Use this model",
       load: "Load model",
@@ -642,28 +797,34 @@ const ModelsMenu = memo(function ModelsMenu({
       <>
         <MenuHeader
           title="Models"
-          selection={detail.displayName}
+          selection={modelsMenuDisplayName(detail)}
           onSectionClick={() => {
             setDetailId(null)
             setRootSwitchingEnabled(true)
           }}
-          hints={detailActions.length > 0 ? "↑↓ navigate · Enter choose · F favorite · Esc back" : "F favorite · Esc back"}
+          hints={detailActions.length > 0
+            ? detailProviderModel === undefined
+              ? "↑↓ navigate · Enter choose · Esc back"
+              : "↑↓ navigate · Enter choose · F favorite · Esc back"
+            : detailProviderModel === undefined ? "Esc back" : "F favorite · Esc back"}
         />
         <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
           <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
-            {currentFavoriteKeys.has(providerModelKey(detail)) ? "★ " : ""}{detail.displayName}
+            {detailFavorite ? "★ " : ""}{modelsMenuDisplayName(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
-            {detailIsLocal ? "Local" : "Cloud"} · {formatContextWindow(detail.contextWindow)} context · {statusFor(detail)}
+            {detailIsLocal ? "Local" : "Cloud"} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
           </text>
-          {detailIsLocal && modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware, residentAllocation)) !== "" && (
+          {detailIsLocal && modelMemoryStatusDetail(detailMemoryConditions) !== "" && (
             <text style={{ fg: theme.warning }}>
-              {modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware, residentAllocation))}
+              {modelMemoryStatusDetail(detailMemoryConditions)}
             </text>
           )}
-          <text style={{ fg: theme.muted }}>
-            {detail.capabilities.vision ? "Vision" : "No vision"} · Tools · {detail.capabilities.reasoning.supported ? "Reasoning" : "No reasoning"}
-          </text>
+          {detailCapabilities && (
+            <text style={{ fg: theme.muted }}>
+              {detailCapabilities.vision ? "Vision" : "No vision"} · Tools · {detailCapabilities.reasoning.supported ? "Reasoning" : "No reasoning"}
+            </text>
+          )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             {detailIsSelected && <text style={{ fg: theme.success }}>● Current model</text>}
             {detailActions.map((action, index) => (
@@ -687,7 +848,7 @@ const ModelsMenu = memo(function ModelsMenu({
       <MenuHeader
         title="Models"
         subtitle="Choose a model"
-        summary={`${eligible.filter((model) => model.providerId === LOCAL_PROVIDER_ID).length} local`}
+        summary={`${eligible.filter(({ _tag }) => _tag === "Local").length} local`}
         hints={eligible.length === 0
           ? "↑↓ choose · Enter open · R refresh · Esc close"
           : "↑↓ choose · Enter select · F favorite · D details · R refresh · Esc close"}
@@ -741,16 +902,16 @@ const ModelsMenu = memo(function ModelsMenu({
               />
             ))}
           </box>
-        ) : eligible.map((model, index) => {
+        ) : eligible.map((entry, index) => {
           const focused = index === cursorIndex
-          const active = providerModelKey(model) === selectedKey
-          const favorite = currentFavoriteKeys.has(providerModelKey(model))
+          const active = isSelected(entry)
+          const favorite = isFavorite(entry)
           const rowIndex = assessing.length + index
           return (
             <Button
-              key={providerModelKey(model)}
-              onClick={() => choose(model)}
-              onMouseOver={() => setCursorId(providerModelKey(model))}
+              key={entry.id}
+              onClick={() => choose(entry)}
+              onMouseOver={() => setCursorId(entry.id)}
               style={{
                 flexDirection: "row",
                 width: "100%",
@@ -763,10 +924,10 @@ const ModelsMenu = memo(function ModelsMenu({
             >
               <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, width: 2 }}>{active ? "●" : focused ? "›" : " "}</text>
               <text style={{ fg: active ? theme.menuBg : theme.warning, width: 2 }}>{favorite ? "★" : " "}</text>
-              <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{model.displayName}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(model)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{formatContextWindow(model.contextWindow)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 23 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{statusFor(model)}</text>
+              <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{modelsMenuDisplayName(entry)}</text>
+              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(entry)}</text>
+              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{formatContextWindow(modelsMenuContextLength(entry))}</text>
+              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 23 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{statusFor(entry)}</text>
             </Button>
           )
         })}
@@ -775,6 +936,9 @@ const ModelsMenu = memo(function ModelsMenu({
         )}
         {Result.isFailure(config.slotUpdate) && (
           <text style={{ fg: theme.error }}>Failed to update model selection.</text>
+        )}
+        {Result.isFailure(modelActions.createOfferingResult) && (
+          <text style={{ fg: theme.error }}>Failed to configure the installed model.</text>
         )}
         {Result.isFailure(config.favoriteUpdate) && (
           <text style={{ fg: theme.error }}>Failed to update model favorite.</text>
@@ -819,11 +983,13 @@ const recommendationEvidenceLabel = (candidate: LocalModelCatalogCandidate): str
     ? "recommendation evidence unavailable"
     : `intelligence ${intelligenceLabel(candidate)} · ${qualityLabel(candidate)}`
 
-const qualityEvidence = ({ recommendationEvidence }: LocalModelCatalogCandidate): readonly string[] =>
-  Option.match(recommendationEvidence, {
-    onNone: () => [],
-    onSome: ({ qualityEvidence: evidence }) => evidence,
-  })
+export const huggingFaceRepositoryUrls = (
+  { sources }: LocalModelCatalogCandidate,
+): readonly string[] => [...new Set(sources.flatMap(({ source }) =>
+  source._tag === "HuggingFace"
+    ? [`https://huggingface.co/${source.repository}`]
+    : [],
+))]
 
 const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
   if (candidate.download._tag === "NotDownloaded"
@@ -980,6 +1146,7 @@ const CatalogMenu = memo(function CatalogMenu({
   setRootSwitchingEnabled,
 }: CatalogMenuProps) {
   const theme = useTheme()
+  const platform = usePlatform()
   const menuSize = useLocalWidth()
   const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const menuWidth = menuSize.width ?? 80
@@ -1013,6 +1180,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const [hoveredRepositoryUrl, setHoveredRepositoryUrl] = useState<string | null>(null)
   const cursorIndex = Math.max(0, candidates.findIndex(({ configurationId }) =>
     configurationId === cursorId))
   const cursor = candidates[cursorIndex]
@@ -1239,7 +1407,24 @@ const CatalogMenu = memo(function CatalogMenu({
             ))}
           </box>
           <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {detail.license}</text>
-          {qualityEvidence(detail).map((evidence) => <text key={evidence} style={{ fg: theme.muted }} wrapMode="word">{evidence}</text>)}
+          {huggingFaceRepositoryUrls(detail).map((url) => (
+            <box key={url} style={{ flexDirection: "row", alignSelf: "flex-start" }}>
+              <text style={{ fg: theme.muted }}>Hugging Face: </text>
+              <Button
+                onClick={() => { void platform.openLink(url) }}
+                onMouseOver={() => setHoveredRepositoryUrl(url)}
+                onMouseOut={() => setHoveredRepositoryUrl((hovered) => hovered === url ? null : hovered)}
+              >
+                <text
+                  style={{ fg: hoveredRepositoryUrl === url ? theme.primary : theme.link }}
+                  attributes={TextAttributes.UNDERLINE}
+                  wrapMode="word"
+                >
+                  {url}
+                </text>
+              </Button>
+            </box>
+          ))}
         </scrollbox>
       </box>
     )

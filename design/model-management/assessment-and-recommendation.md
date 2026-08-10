@@ -30,7 +30,7 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 ```text
 recommendable target
   -> exact tensor-storage rejection proof
-  -> local profile: 100K (bounded by target maximum)
+  -> catalog-owned profile, or 100K default for discovered installed targets
   -> cached or native ICN assessment with 25K, 50K, 75K, and full-context speed samples
   -> completed configuration candidates
   -> recommendation portfolio
@@ -44,9 +44,10 @@ physical capacity. Uncertain targets proceed. File/download size is not rejectio
 ACN exposes one assessment service accepting a batch of exact targets and profiles. It owns the
 scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
 One catalog projection assesses release-catalog and discovered installed targets together;
-recommendation policy consumes the release-catalog candidates from that projection.
-Release-catalog and discovered installed targets use the single 100K product profile, bounded by
-the target maximum. A speculative pair uses the lower component maximum.
+recommendation policy consumes the release-catalog candidates from that projection. Each
+release-catalog target uses its one reviewed catalog profile. A discovered installed target uses
+the 100K product default, bounded by the target maximum. A speculative pair is additionally bounded
+by the lower component maximum.
 
 ICN persists every completed exact profile result, including `DoesNotFit`, and performs
 single-flight native work. Repeated reads consume current results and do not trigger native
@@ -97,8 +98,9 @@ ACN selects at most one configuration for each intent:
 Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
 A recommendation references a candidate; it does not create another model identity.
 
-A candidate is usable only when its full-context expected generation speed is at least 8 tokens per
-second. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
+A catalog candidate is eligible for recommendation only when its full-context expected generation
+speed is at least 5 tokens per second. Balanced speed utility uses 5 tokens per second as its zero
+point. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
 bounded by the configured context for shorter models. Clients present the expected-speed range from
 the samples at 25K and 75K, likewise bounded by the configured context, without treating those
 samples as separate configurations.
@@ -127,13 +129,14 @@ Cached assessment never authorizes loading.
 
 ## Conformance
 
-- Every release-catalog and discovered installed target has one 100K profile, bounded by its exact
-  target maximum.
+- Every release-catalog target has one reviewed profile that does not exceed its exact target
+  maximum. Every discovered installed target has one 100K profile bounded by its exact target
+  maximum.
 - All missing profiles for one target are submitted together.
 - Equivalent concurrent misses perform one native assessment.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
-- The usability floor uses full-context performance; ranking and relative comparisons use the
-  bounded 50K sample.
+- The recommendation eligibility floor uses full-context performance; ranking and relative
+  comparisons use the bounded 50K sample.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
 - Lightweight is hardware-relative, capability-maximizing within its memory tier, and independent
   of the capability ceiling outside that tier.

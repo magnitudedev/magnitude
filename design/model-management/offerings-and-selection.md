@@ -48,6 +48,9 @@ a current `Fits` assessment.
 Assessment publishes configuration candidates independently of offering existence. Offering
 creation occurs only through explicit configuration selection. Provider projection observes the
 persisted offering and authoritative package and assessment state; it never creates offerings.
+Model-selection surfaces join installed targets with their eligible assessed configurations
+independently of provider projection, so an installable choice remains visible before explicit
+selection creates its offering. This presentation join creates no durable state.
 
 ## Selecting a catalog option
 
@@ -115,6 +118,10 @@ preference and recency changes affect the next menu entry.
 - Acquisition actions address target identity; offering-creation actions address configuration
   identity; neither uses provider-model identity before the offering exists.
 - Provider projection never creates or substitutes an offering.
+- Installed targets with an eligible assessed configuration remain visible in model-selection
+  surfaces before offering creation.
+- Selecting an installed target without an offering creates its exact assessed offering before
+  assigning the slot.
 - Catalog row identity is not persisted as user intent.
 - Assignment commits durable selection and published configuration atomically.
 - Selection, acquisition, assignment, and loading remain distinct mutations even when composed by a client.

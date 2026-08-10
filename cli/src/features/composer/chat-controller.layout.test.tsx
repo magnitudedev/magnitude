@@ -7,10 +7,16 @@ import { TextAttributes } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
 import { violet } from '../../utils/theme'
 import type { ComposerProps } from './types'
-import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@magnitudedev/sdk'
+import {
+  DownloadAttemptIdSchema,
+  PRIMARY_SLOT_ID,
+  ReasoningEffortSchema,
+  type TaskDisplayRow,
+} from '@magnitudedev/sdk'
 import {
   GIB,
   LOCAL_PROVIDER_ID,
+  makeModel,
   makeView,
   TEST_MEMORY_DOMAIN_ID,
 } from '../local-inference/test-fixtures'
@@ -250,6 +256,7 @@ function makeProps(): ComposerProps {
     interruptAll: noop,
     openSettings: noop,
     openHardware: noop,
+    openCatalog: noop,
     thinkingOptions: [],
     applyThinking: noop,
     handleWidgetKeyEvent: () => false,
@@ -352,6 +359,89 @@ test('shows resident memory three spaces after context and links it to hardware'
     (memoryButton!.props.onClick as () => void)()
   })
   expect(openHardware).toHaveBeenCalledOnce()
+  act(() => { view.unmount() })
+})
+
+test('shows active model downloads in the persistent footer and links to the catalog', () => {
+  const openCatalog = vi.fn()
+  const localInferenceState = makeView({
+    models: [makeModel({
+      download: {
+        _tag: 'Downloading',
+        attemptIds: [DownloadAttemptIdSchema.make('download-1')],
+        stage: 'downloading',
+        completedBytes: GIB,
+        totalBytes: 16 * GIB,
+        bytesPerSecond: Option.none(),
+      },
+    })],
+  })
+  const mediumHtml = render(
+    <Composer
+      {...makeProps()}
+      chatColumnWidth={60}
+      localModels={localInferenceState.models}
+      openCatalog={openCatalog}
+    />,
+  )
+  expect(mediumHtml).toContain(
+    'height:1px;flex-direction:row;justify-content:flex-end',
+  )
+  expect(mediumHtml.match(/justify-content:space-between/g)).toHaveLength(1)
+
+  const narrowHtml = render(
+    <Composer
+      {...makeProps()}
+      chatColumnWidth={45}
+      localModels={localInferenceState.models}
+      openCatalog={openCatalog}
+    />,
+  )
+  expect(narrowHtml).not.toContain(
+    'height:1px;flex-direction:row;justify-content:flex-end',
+  )
+  expect(narrowHtml.match(/justify-content:space-between/g)).toHaveLength(2)
+  let view!: ReturnType<typeof create>
+  act(() => {
+    view = create(
+      <Composer
+        {...makeProps()}
+        localModels={localInferenceState.models}
+        openCatalog={openCatalog}
+      />,
+    )
+  })
+
+  const textOf = (node: ReactTestInstance): string => node.children
+    .map((child) => typeof child === 'string' ? child : textOf(child))
+    .join('')
+  const downloadButton = view.root.findAll(
+    (node) => typeof node.props.onClick === 'function',
+  ).find((node) => textOf(node) === '1 model downloading')
+  expect(downloadButton).toBeDefined()
+  const downloadText = view.root.findAll(
+    (node) => node.type === 'text' && textOf(node) === '1 model downloading',
+  )[0]!
+  expect(downloadText.props.style).toEqual({ fg: theme.primary })
+
+  act(() => { (downloadButton!.props.onMouseOver as () => void)() })
+  expect(downloadText.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
+  act(() => { (downloadButton!.props.onMouseOut as () => void)() })
+  act(() => { (downloadButton!.props.onClick as () => void)() })
+  expect(openCatalog).toHaveBeenCalledOnce()
+
+  act(() => {
+    view.update(
+      <Composer
+        {...makeProps()}
+        localModels={makeView().models}
+        openCatalog={openCatalog}
+      />,
+    )
+  })
+  expect(view.root.findAll(
+    (node) => node.type === 'text' && textOf(node) === '1 model downloading',
+  )).toHaveLength(0)
   act(() => { view.unmount() })
 })
 

@@ -1,10 +1,12 @@
 import { Option } from "effect"
 import { expect, test } from "vitest"
 import {
+  DownloadAttemptIdSchema,
   ModelSlotConfiguredLocal,
   ModelInstanceIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
+  ModelOfferingTargetIdSchema,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
 import {
@@ -17,7 +19,10 @@ import {
   TEST_REASONING_EFFORT,
 } from "./test-fixtures"
 
-const { deriveLocalInferenceFooterView } = await import("./footer-status")
+const {
+  deriveLocalInferenceFooterView,
+  deriveLocalModelDownloadSummary,
+} = await import("./footer-status")
 const instanceId = ModelInstanceIdSchema.make("test-instance")
 const selection = {
   providerId: LOCAL_PROVIDER_ID,
@@ -78,6 +83,31 @@ test("ready status exposes the model, residency, and complete resident allocatio
     residency: "loaded",
     memoryLabel: "16 GB mem",
   })
+})
+
+test("download summary is derived from active target downloads", () => {
+  const ready = makeView()
+  const downloading = {
+    ...ready.models.models[0]!,
+    download: {
+      _tag: "Downloading" as const,
+      attemptIds: [DownloadAttemptIdSchema.make("download-1")] as const,
+      stage: "downloading" as const,
+      completedBytes: GIB,
+      totalBytes: 16 * GIB,
+      bytesPerSecond: Option.none(),
+    },
+  }
+  expect(deriveLocalModelDownloadSummary(null)).toBeNull()
+  expect(deriveLocalModelDownloadSummary(ready.models)).toBeNull()
+  expect(deriveLocalModelDownloadSummary({
+    ...ready.models,
+    models: [downloading],
+  })).toBe("1 model downloading")
+  expect(deriveLocalModelDownloadSummary({
+    ...ready.models,
+    models: [downloading, { ...downloading, targetId: ModelOfferingTargetIdSchema.make("target-2") }],
+  })).toBe("2 models downloading")
 })
 
 test("slot residency remains visible when local-model inventory is unavailable", () => {

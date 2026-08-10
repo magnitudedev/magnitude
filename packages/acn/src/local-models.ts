@@ -30,6 +30,9 @@ import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 interface TargetProjection {
   readonly id: ModelOfferingTargetId
   readonly target: ModelOfferingTarget
+}
+
+interface TargetPresentation {
   readonly displayName: string
   readonly description: string
 }
@@ -42,6 +45,15 @@ const sourceName = (target: ModelOfferingTarget): string => {
   return primary.source._tag === "HuggingFace"
     ? primary.source.repository.split("/").at(-1) ?? primary.source.repository
     : primary.files[0]?.path.split("/").at(-1) ?? primary.id
+}
+
+export const resolveTargetPresentation = (
+  targetId: ModelOfferingTargetId,
+  target: ModelOfferingTarget,
+  curatedByTargetId: ReadonlyMap<ModelOfferingTargetId, TargetPresentation>,
+): TargetPresentation => curatedByTargetId.get(targetId) ?? {
+  displayName: sourceName(target),
+  description: "",
 }
 
 const aggregateDownload = (
@@ -270,10 +282,16 @@ export const LocalModelsLive: Layer.Layer<
           : []),
     ])
     const targets = new Map<ModelOfferingTargetId, TargetProjection>()
+    const curatedPresentationByTargetId = new Map<
+      ModelOfferingTargetId,
+      TargetPresentation
+    >()
     for (const model of catalogModels) {
       targets.set(model.targetId, {
         id: model.targetId,
         target: model.target,
+      })
+      curatedPresentationByTargetId.set(model.targetId, {
         displayName: model.displayName,
         description: model.description,
       })
@@ -285,25 +303,22 @@ export const LocalModelsLive: Layer.Layer<
       targets.set(entry.targetId.value, {
         id: entry.targetId.value,
         target: { _tag: "Package", package: entry.package },
-        displayName: sourceName({ _tag: "Package", package: entry.package }),
-        description: "",
       })
     }
     for (const recommendation of recommendationEntries) {
       targets.set(recommendation.targetId, {
         id: recommendation.targetId,
         target: recommendation.configuration.target,
+      })
+      curatedPresentationByTargetId.set(recommendation.targetId, {
         displayName: recommendation.displayName,
         description: recommendation.description,
       })
     }
     for (const offering of configured) {
-      const current = targets.get(offering.targetId)
       targets.set(offering.targetId, {
         id: offering.targetId,
         target: offering.configuration.target,
-        displayName: current?.displayName ?? sourceName(offering.configuration.target),
-        description: current?.description ?? "",
       })
     }
     const providerIdByConfiguration = new Map<ModelServingConfigurationId, ProviderModelId>()
@@ -331,6 +346,11 @@ export const LocalModelsLive: Layer.Layer<
     }))
     const models: LocalModel[] = [...targets.values()].map((projection): LocalModel => {
       const modelPackages = targetPackages(projection.target)
+      const presentation = resolveTargetPresentation(
+        projection.id,
+        projection.target,
+        curatedPresentationByTargetId,
+      )
       return {
         targetId: projection.id,
         offerings: configured
@@ -339,8 +359,8 @@ export const LocalModelsLive: Layer.Layer<
             configurationId: configuration.id,
             providerModelId,
           })),
-        displayName: projection.displayName,
-        description: projection.description,
+        displayName: presentation.displayName,
+        description: presentation.description,
         kind: projection.target._tag === "Package" ? "Standalone" : "SpeculativePair",
         quantization: modelPackages.map(({ properties }) => properties.quantization).join(" + "),
         maximumContextLength: Math.min(

@@ -14,7 +14,10 @@ import { SlashCommandMenu } from './slash-menu'
 import { MultilineInput, type MultilineInputHandle } from './multiline-input'
 import { AttachmentsBar } from './attachment-bar'
 import { AutopilotIndicator } from './autopilot-indicator'
-import { deriveLocalInferenceFooterView } from '../local-inference/footer-status'
+import {
+  deriveLocalInferenceFooterView,
+  deriveLocalModelDownloadSummary,
+} from '../local-inference/footer-status'
 import { useFileMentions, type MentionSearchClient } from '@magnitudedev/client-common'
 import { useSlashCommands } from '@magnitudedev/client-common'
 import { readClipboardBitmap, readClipboardText } from '../../utils/clipboard'
@@ -198,6 +201,7 @@ export function Composer(props: ComposerProps) {
     interruptAll,
     openSettings,
     openHardware,
+    openCatalog,
     thinkingOptions,
     applyThinking,
     handleWidgetKeyEvent,
@@ -256,6 +260,7 @@ export function Composer(props: ComposerProps) {
   const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
   const [memoryLabelHovered, setMemoryLabelHovered] = useState(false)
+  const [downloadLabelHovered, setDownloadLabelHovered] = useState(false)
   const [thinkingOpen, setThinkingOpen] = useState(false)
   const currentThinkingIndex = Math.max(
     0,
@@ -272,6 +277,10 @@ export function Composer(props: ComposerProps) {
       selectedSlotId,
     ),
     [localModels, modelSlots, modelSummary?.model, selectedProviderId, selectedSlotId],
+  )
+  const downloadSummary = useMemo(
+    () => deriveLocalModelDownloadSummary(localModels),
+    [localModels],
   )
   const workingDirectoryLabel = displayWorkingDirectory(clientWorkingDirectory)
   const modelNameLabel = modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'
@@ -300,9 +309,15 @@ export function Composer(props: ComposerProps) {
             + (modelFooter.memoryLabel === null
               ? 0
               : 3 + stringWidth(modelFooter.memoryLabel)))
-  const footerLeftWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
+  const footerDownloadWidth = downloadSummary === null
+    ? 0
+    : 3 + stringWidth(downloadSummary)
+  const footerBaseWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
-  const footerStacks = footerLeftWidth + footerRightWidth + 8 > chatColumnWidth
+  const footerDownloadStacks = downloadSummary !== null
+    && footerBaseWidth + footerDownloadWidth + 4 > chatColumnWidth
+  const footerEnvironmentStacks = footerDownloadStacks
+    || footerBaseWidth + footerDownloadWidth + footerRightWidth + 8 > chatColumnWidth
   const openThinking = useCallback(() => {
     if (thinkingOptions.length === 0) return
     setThinkingIndex(currentThinkingIndex)
@@ -647,6 +662,20 @@ export function Composer(props: ComposerProps) {
     }
   }, [inputValue, attachments.length, handleSubmit, setComposerHistoryIndex])
 
+  const downloadStatus = downloadSummary === null ? null : (
+    <Button
+      onClick={openCatalog}
+      onMouseOver={() => setDownloadLabelHovered(true)}
+      onMouseOut={() => setDownloadLabelHovered(false)}
+    >
+      <text style={{ fg: theme.primary }}>
+        <span attributes={downloadLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+          {downloadSummary}
+        </span>
+      </text>
+    </Button>
+  )
+
   const footerStatus = (
     <box style={{ flexDirection: 'row', alignItems: 'center' }}>
       {bashMode ? (
@@ -723,6 +752,12 @@ export function Composer(props: ComposerProps) {
               )}
             </>
           )}
+        </>
+      )}
+      {!footerDownloadStacks && downloadStatus !== null && (
+        <>
+          <box style={{ width: 3, flexShrink: 0 }} />
+          {downloadStatus}
         </>
       )}
       {displayMode === 'transcript' && (
@@ -865,10 +900,15 @@ export function Composer(props: ComposerProps) {
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, flexDirection: 'column' }}>
         <box style={{ height: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
           {footerStatus}
-          {!footerStacks && footerEnvironment}
+          {!footerEnvironmentStacks && footerEnvironment}
         </box>
-        {footerStacks && (
-          <box style={{ height: 1, flexDirection: 'row', justifyContent: 'flex-end' }}>
+        {footerEnvironmentStacks && (
+          <box style={{
+            height: 1,
+            flexDirection: 'row',
+            justifyContent: footerDownloadStacks ? 'space-between' : 'flex-end',
+          }}>
+            {footerDownloadStacks && downloadStatus}
             {footerEnvironment}
           </box>
         )}
