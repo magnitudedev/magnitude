@@ -1,0 +1,42 @@
+diff --git a/dist/changesets-assemble-release-plan.cjs.js b/dist/changesets-assemble-release-plan.cjs.js
+index a91112a7ddf4b6f242965e0bf99ba2f60f988ede..4a7585bfe756490f7892fbd1970c0a6e6220b678 100644
+--- a/dist/changesets-assemble-release-plan.cjs.js
++++ b/dist/changesets-assemble-release-plan.cjs.js
+@@ -547,7 +547,8 @@ snapshot) {
+       // If a package had a prerelease, but didn't trigger a version bump in the regular release,
+       // we want to give it a patch release.
+       // Detailed explanation at https://github.com/changesets/changesets/pull/382#discussion_r434434182
+-      if (preInfo.preVersions.get(pkg.packageJson.name) !== 0) {
++      const preVersion = preInfo.preVersions.get(pkg.packageJson.name);
++      if (preVersion !== undefined && preVersion !== 0) {
+         const existingRelease = releases.get(pkg.packageJson.name);
+         if (!existingRelease) {
+           releases.set(pkg.packageJson.name, {
+diff --git a/dist/changesets-assemble-release-plan.esm.js b/dist/changesets-assemble-release-plan.esm.js
+index f169d0a18a4acfc6672d52337fc757a21050ae72..23d59b31415203c7c0443d4ccf890cff46a1870e 100644
+--- a/dist/changesets-assemble-release-plan.esm.js
++++ b/dist/changesets-assemble-release-plan.esm.js
+@@ -534,7 +534,8 @@ snapshot) {
+       // If a package had a prerelease, but didn't trigger a version bump in the regular release,
+       // we want to give it a patch release.
+       // Detailed explanation at https://github.com/changesets/changesets/pull/382#discussion_r434434182
+-      if (preInfo.preVersions.get(pkg.packageJson.name) !== 0) {
++      const preVersion = preInfo.preVersions.get(pkg.packageJson.name);
++      if (preVersion !== undefined && preVersion !== 0) {
+         const existingRelease = releases.get(pkg.packageJson.name);
+         if (!existingRelease) {
+           releases.set(pkg.packageJson.name, {
+diff --git a/src/index.ts b/src/index.ts
+index 5ebe2dbba619156233b1c510a557bd32368bf83b..eb2b76840629127f395763986b2971ead6306bc3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -221,7 +221,8 @@ function assembleReleasePlan(
+       // If a package had a prerelease, but didn't trigger a version bump in the regular release,
+       // we want to give it a patch release.
+       // Detailed explanation at https://github.com/changesets/changesets/pull/382#discussion_r434434182
+-      if (preInfo.preVersions.get(pkg.packageJson.name) !== 0) {
++      const preVersion = preInfo.preVersions.get(pkg.packageJson.name);
++      if (preVersion !== undefined && preVersion !== 0) {
+         const existingRelease = releases.get(pkg.packageJson.name);
+         if (!existingRelease) {
+           releases.set(pkg.packageJson.name, {
