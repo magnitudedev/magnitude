@@ -1313,6 +1313,10 @@ mod tests {
             ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
         );
         assert_eq!(
+            formats("muse-glimmer-30b"),
+            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
+        );
+        assert_eq!(
             formats("nemotron-3-super-120b-a12b"),
             ["UD-Q4_K_XL", "MXFP4_MOE"]
         );

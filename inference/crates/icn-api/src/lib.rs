@@ -1496,6 +1496,7 @@ async fn recommendable_model_catalog(
     request_body(content = AssessModelsRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Exact target and profile assessments", body = AssessModelsResponse),
+        (status = 409, description = "Model assessment could not be completed", body = ErrorResponse),
         (status = 500, description = "Assessment operation failed", body = ErrorResponse)
     )
 )]
@@ -3783,6 +3784,16 @@ mod tests {
         ] {
             assert!(schemas["Timings"]["properties"][field].is_object());
         }
+    }
+
+    #[test]
+    fn exported_assessment_operation_declares_conflict_response() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        assert_eq!(
+            value["paths"]["/v1/models/assess"]["post"]["responses"]["409"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ErrorResponse"
+        );
     }
 
     #[test]

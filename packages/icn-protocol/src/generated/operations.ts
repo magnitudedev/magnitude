@@ -55,6 +55,11 @@ export const assessModelsOperation = {
   ],
   errors: [
     {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",

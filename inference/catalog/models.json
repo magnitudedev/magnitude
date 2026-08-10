@@ -61,6 +61,23 @@
       ]
     },
     {
+      "id": "muse-glimmer-30b",
+      "displayName": "Muse Glimmer 30B",
+      "description": "Dense multimodal model purpose-built for autonomous agentic tasks on consumer hardware.",
+      "repository": "unsloth/Muse-Glimmer-30B-GGUF",
+      "formats": ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
+      "contextLength": 100000,
+      "license": "apache-2.0",
+      "qualityScore": 51.7,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Publisher-reported Terminal-Bench v2.1 result using the Terminus-2 harness; not an exact GGUF quantization measurement.",
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://huggingface.co/meta-models/Muse-Glimmer-30B",
+        "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF"
+      ]
+    },
+    {
       "id": "gemma-4-e2b-it-qat",
       "displayName": "Gemma 4 E2B",
       "description": "Very small sparse model optimized for on-device use.",
