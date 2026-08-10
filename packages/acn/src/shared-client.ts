@@ -2,18 +2,21 @@ import { Context, Effect, Layer, Ref, Schema, Stream, SubscriptionRef } from "ef
 import type { ToolAvailabilityState } from "@magnitudedev/agent"
 import {
   ProviderClient,
+  createCustomEndpointProvider,
   createProviderClient,
   type ProviderClientShape,
   type WebSearchSource,
 } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
+  CustomEndpointNameSchema,
   type AuthStorageShape,
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import { IcnProvider, createLocalProvider } from "@magnitudedev/icn/provider"
 import { ModelConfiguration } from "./model-configuration"
 import { SlotIdSchema } from "@magnitudedev/acn-protocol"
+import { CustomEndpoints } from "./custom-endpoints"
 
 const resolveMagnitudeApiKey = (
   storage: MagnitudeStorageShape,
@@ -115,22 +118,26 @@ export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry"
 export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   never,
-  MagnitudeStorage | IcnProvider | ModelConfiguration
+  MagnitudeStorage | IcnProvider | ModelConfiguration | CustomEndpoints
 > = Layer.effect(
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
     const local = createLocalProvider(yield* IcnProvider)
     const modelConfiguration = yield* ModelConfiguration
+    const customEndpoints = yield* CustomEndpoints
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
 
     const makeConcrete = (sessionId: string | null) => Effect.gen(function* () {
       const apiKey = yield* resolveMagnitudeApiKey(storage)
+      const declarations = yield* customEndpoints.get
+      const customProviders = Object.entries(declarations).map(([name, declaration]) =>
+        createCustomEndpointProvider(CustomEndpointNameSchema.make(name), declaration))
       const client = createProviderClient({
         ...(apiKey ? { apiKey } : {}),
         ...(sessionId ? { sessionId } : {}),
-        discoverableProviders: [local],
+        discoverableProviders: [{ ...local, kind: "Local" }, ...customProviders],
       })
       return {
         ...client,

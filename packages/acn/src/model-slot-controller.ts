@@ -58,6 +58,11 @@ import {
 } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
+  selectedSlotSelection,
+  slotSelectionOption,
+  unassignedSlotSelection,
+} from "@magnitudedev/storage"
+import {
   ReasoningEffortSchema,
   type ProviderId,
   type ProviderModelId,
@@ -465,8 +470,8 @@ export const ModelSlotControllerLive: Layer.Layer<
 
     const state: ModelSlotsState = {
       slots: {
-        primary: buildSlot(PRIMARY_SLOT_ID, configured.slots.primary),
-        secondary: buildSlot(SECONDARY_SLOT_ID, configured.slots.secondary),
+        primary: buildSlot(PRIMARY_SLOT_ID, slotSelectionOption(configured.slots.primary)),
+        secondary: buildSlot(SECONDARY_SLOT_ID, slotSelectionOption(configured.slots.secondary)),
       },
       recentModelIds: configured.localModelRecency,
       favoriteModels: configured.favoriteModels,
@@ -484,8 +489,8 @@ export const ModelSlotControllerLive: Layer.Layer<
           )
         : Option.none())
     const loadTargets: ControllerAggregate["loadTargets"] = {
-      primary: loadTargetFor(configured.slots.primary),
-      secondary: loadTargetFor(configured.slots.secondary),
+      primary: loadTargetFor(slotSelectionOption(configured.slots.primary)),
+      secondary: loadTargetFor(slotSelectionOption(configured.slots.secondary)),
     }
     const nextBindingFor = (
       key: "primary" | "secondary",
@@ -984,7 +989,10 @@ export const ModelSlotControllerLive: Layer.Layer<
         if (Option.isNone(normalized) && previous._tag === "Unassigned") return previous
         if (Option.isSome(normalized) && previous._tag !== "Unassigned"
           && sameSelection(previous.selection, normalized.value)) return previous
-        yield* configuration.updateSlot(slotId, normalized).pipe(
+        yield* configuration.updateSlot(slotId, Option.match(normalized, {
+          onNone: unassignedSlotSelection,
+          onSome: selectedSlotSelection,
+        })).pipe(
           Effect.mapError((error) => new ModelSlotMutationFailed({
             slotId,
             code: "model_slot_persistence_failed",
@@ -998,7 +1006,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       if (previous._tag === "ConfiguredLocal" && Option.isSome(previous.instance)) {
         const configured = (yield* configuration.get).slots
         const stillSelected = [configured.primary, configured.secondary].some((candidate) =>
-          Option.exists(candidate, (value) =>
+          Option.exists(slotSelectionOption(candidate), (value) =>
             value.providerId === LOCAL_PROVIDER_ID
             && value.providerModelId === previous.selection.providerModelId))
         if (!stillSelected) {

@@ -1,4 +1,4 @@
-import { Schema } from 'effect'
+import { Option, Schema } from 'effect'
 import { ProviderModelIdSchema } from '@magnitudedev/ai'
 import {
   ModelOfferingTargetIdSchema,
@@ -10,6 +10,7 @@ import {
   type ModelPackageId,
   type SlotId,
 } from '@magnitudedev/acn-protocol'
+import { CustomEndpointDeclarationsSchema } from './custom-endpoints'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
@@ -24,6 +25,9 @@ export interface ContextLimitPolicy extends Omit<Schema.Schema.Type<typeof Conte
   softCapMaxTokens: number | null
 }
 
+const SerializableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
+  Schema.optionalWith(schema, { as: 'Option', exact: true } as const)
+
 // =============================================================================
 // Slot-based model configuration
 // =============================================================================
@@ -33,6 +37,25 @@ export type { ModelPackageId, SlotId }
 
 export const SlotModelConfigSchema = SlotSelectionSchema
 export type SlotModelConfig = Schema.Schema.Type<typeof SlotModelConfigSchema>
+
+export const SlotSelectionStateSchema = Schema.Union(
+  Schema.TaggedStruct('Unassigned', {}),
+  Schema.TaggedStruct('Selected', {
+    selection: SlotModelConfigSchema,
+  }),
+)
+export type SlotSelectionState = Schema.Schema.Type<typeof SlotSelectionStateSchema>
+
+export const unassignedSlotSelection = (): SlotSelectionState => ({ _tag: 'Unassigned' })
+export const selectedSlotSelection = (selection: SlotModelConfig): SlotSelectionState => ({
+  _tag: 'Selected',
+  selection,
+})
+export const slotSelectionOption = (
+  state: SlotSelectionState,
+): Option.Option<SlotModelConfig> => state._tag === 'Selected'
+  ? Option.some(state.selection)
+  : Option.none()
 
 export const PersistedLocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
@@ -44,8 +67,8 @@ export type PersistedLocalProviderOffering =
 
 export const ModelConfigSchema = Schema.Struct({
   slots: Schema.Struct({
-    primary: Schema.optionalWith(SlotModelConfigSchema, { as: 'Option', exact: true }),
-    secondary: Schema.optionalWith(SlotModelConfigSchema, { as: 'Option', exact: true }),
+    primary: SlotSelectionStateSchema,
+    secondary: SlotSelectionStateSchema,
   }),
   localModelRecency: Schema.optionalWith(Schema.Struct({
     primary: Schema.Array(ProviderModelIdSchema),
@@ -77,6 +100,7 @@ export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   models: Schema.optional(ModelConfigSchema),
   onboarding: Schema.optionalWith(OnboardingConfigSchema, { as: 'Option', exact: true }),
+  providers: SerializableOptional(CustomEndpointDeclarationsSchema),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

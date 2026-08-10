@@ -291,10 +291,12 @@ test('composer shell renders without an embedded task list (task list is the Age
   expect(html).toContain('5k / 100k (5%)')
 })
 
-test('shows a single no-provider label instead of model and reasoning effort', () => {
+test('shows the unassigned-slot prompt instead of model and reasoning effort', () => {
   const html = render(<Composer {...makeProps()} modelsConfigured={false} />)
 
   expect(html).toContain('No model configured')
+  expect(html).toContain('/models')
+  expect(html).toContain('to see available models')
   expect(html).not.toContain('>model<')
   expect(html).not.toContain('>high<')
 })

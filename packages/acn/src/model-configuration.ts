@@ -3,13 +3,15 @@ import type {
   ProviderModelId,
   ProviderModelIdentity,
   SlotId,
-  SlotSelection,
 } from "@magnitudedev/sdk"
 import {
   MagnitudeStorage,
+  slotSelectionOption,
+  unassignedSlotSelection,
   type ConfigStorageShape,
   type MagnitudeConfig,
   type ResolvedContextLimitPolicy,
+  type SlotSelectionState,
   resolveContextLimitPolicy,
 } from "@magnitudedev/storage"
 
@@ -30,7 +32,7 @@ export interface ModelConfigurationApi {
   readonly changes: Stream.Stream<ModelConfigurationState>
   readonly updateSlot: (
     slotId: SlotId,
-    selection: Option.Option<SlotSelection>,
+    selection: SlotSelectionState,
   ) => Effect.Effect<void, ModelConfigurationError>
   readonly recordUse: (
     slotId: SlotId,
@@ -48,7 +50,7 @@ export class ModelConfiguration extends Context.Tag("ModelConfiguration")<
 >() {}
 
 const EMPTY_MODEL_CONFIGURATION: StoredModelConfiguration = {
-  slots: { primary: Option.none(), secondary: Option.none() },
+  slots: { primary: unassignedSlotSelection(), secondary: unassignedSlotSelection() },
   localModelRecency: { primary: [], secondary: [] },
   favoriteModels: [],
   localProviderOfferings: [],
@@ -95,7 +97,7 @@ export const makeModelConfiguration = (
       const persisted = yield* persist((current) => ({
         ...current,
         slots: { ...current.slots, [slotId]: selection },
-        localModelRecency: Option.match(selection, {
+        localModelRecency: Option.match(slotSelectionOption(selection), {
           onNone: () => current.localModelRecency,
           onSome: (selected) => ({
             ...current.localModelRecency,

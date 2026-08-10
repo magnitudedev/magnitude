@@ -36,7 +36,7 @@ const model = (providerId: typeof providerA, name: string): ProviderModel => ({
   },
   servingCapabilities: { tools: true, structuredOutput: false },
   availability: { _tag: "Available" },
-  pricing: { input: 0, output: 0, cached_input: null },
+  pricing: Option.some({ input: 0, output: 0, cached_input: null }),
 })
 
 describe("provider model catalog", () => {
@@ -81,8 +81,8 @@ describe("provider model catalog", () => {
           }),
         },
         listProviders: Effect.succeed([
-          { id: providerA, displayName: "Provider A", authStatus: { _tag: "authenticated" }, status: "ok" },
-          { id: providerB, displayName: "Provider B", authStatus: { _tag: "authenticated" }, status: "error", message: failure.message },
+          { id: providerA, displayName: "Provider A", kind: "Hosted", authStatus: { _tag: "authenticated" }, status: "ok" },
+          { id: providerB, displayName: "Provider B", kind: "Hosted", authStatus: { _tag: "authenticated" }, status: "error", message: failure.message },
         ]),
         sessionId: null,
         resolveModel: () => Effect.die("not used"),

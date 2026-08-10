@@ -221,6 +221,8 @@ export { normalizeReferencedPath } from "./path-utils"
 
 export {
   ProviderClient,
+  createCustomEndpointProvider,
+  customEndpointProviderId,
   createProviderClient,
   type ProviderClientShape,
   type ProviderClientConfig,

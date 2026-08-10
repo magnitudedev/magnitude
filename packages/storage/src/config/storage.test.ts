@@ -5,7 +5,12 @@ import { tmpdir } from "node:os"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import { Effect, Layer, Option } from "effect"
 import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/ai"
-import { SlotIdSchema } from "../types/config"
+import {
+  SlotIdSchema,
+  selectedSlotSelection,
+  slotSelectionOption,
+  unassignedSlotSelection,
+} from "../types/config"
 import { makeGlobalStoragePaths } from "../paths"
 import { GlobalStorage } from "../services"
 import { makeConfigStorage } from "./storage"
@@ -41,8 +46,8 @@ describe("config storage onboarding state", () => {
         ...current,
         models: {
           slots: {
-            primary: Option.some(selection("local", "model")),
-            secondary: Option.some(selection("local", "model")),
+            primary: selectedSlotSelection(selection("local", "model")),
+            secondary: selectedSlotSelection(selection("local", "model")),
           },
           localModelRecency: { primary: [], secondary: [] },
           favoriteModels: [],
@@ -56,7 +61,7 @@ describe("config storage onboarding state", () => {
     }).pipe(Effect.provide(base)))
 
     expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(result.models), (models) =>
-      models.slots.primary))).toEqual(selection("local", "model"))
+      slotSelectionOption(models.slots.primary)))).toEqual(selection("local", "model"))
     const persisted = await Bun.file(makeGlobalStoragePaths(root).configFile).json()
     expect(persisted.futureDomain).toEqual({ enabled: true })
     expect(result.onboarding).toEqual(Option.some({ completed: true }))
@@ -102,8 +107,8 @@ describe("config storage onboarding state", () => {
     }).pipe(Effect.provide(makeBase())))
 
     expect(result.onboarding).toEqual(Option.none())
-    expect(Option.flatMap(Option.fromNullable(result.loaded.models), (models) =>
-      models.slots.primary)).toEqual(Option.none())
+    expect(Option.map(Option.fromNullable(result.loaded.models), (models) =>
+      models.slots.primary)).toEqual(Option.some(unassignedSlotSelection()))
     const persisted = await Bun.file(paths.configFile).json()
     expect(persisted.onboarding).toBeUndefined()
     expect(persisted.futureDomain).toEqual({ enabled: true })
@@ -125,9 +130,11 @@ describe("config storage onboarding state", () => {
       return (yield* config.load()).models ?? null
     }).pipe(Effect.provide(makeBase())))
 
-    expect(Option.flatMap(Option.fromNullable(models), (value) => value.slots.primary)).toEqual(Option.none())
+    expect(Option.map(Option.fromNullable(models), (value) => value.slots.primary)).toEqual(
+      Option.some(unassignedSlotSelection()),
+    )
     expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(models), (value) =>
-      value.slots.secondary))).toEqual({
+      slotSelectionOption(value.slots.secondary)))).toEqual({
       providerId: "cloud",
       providerModelId: "secondary-model",
       reasoningEffort: "high",
@@ -153,7 +160,7 @@ describe("config storage onboarding state", () => {
 
     expect(loaded.onboarding).toEqual(Option.some({ completed: true }))
     expect(Option.getOrThrow(Option.flatMap(Option.fromNullable(loaded.models), (models) =>
-      models.slots.primary)).providerModelId).toBe("local:model")
+      slotSelectionOption(models.slots.primary))).providerModelId).toBe("local:model")
   })
 
   test("backs up malformed JSON and resets to the root default", async () => {
@@ -166,7 +173,7 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded).toEqual({ onboarding: Option.none() })
+    expect(loaded).toEqual({ onboarding: Option.none(), providers: Option.none() })
     expect(await Bun.file(paths.configFile).json()).toEqual({})
     const backup = (await readdir(root)).find((name) => name.startsWith("config.json.corrupt-"))
     expect(backup).toBeDefined()
@@ -183,7 +190,7 @@ describe("config storage onboarding state", () => {
       return yield* config.load()
     }).pipe(Effect.provide(makeBase())))
 
-    expect(loaded).toEqual({ onboarding: Option.none() })
+    expect(loaded).toEqual({ onboarding: Option.none(), providers: Option.none() })
     const backup = (await readdir(root)).find((name) => name.startsWith("config.json.corrupt-"))
     expect(backup).toBeDefined()
     expect(await readFile(join(root, backup!), "utf8")).toBe(original)
@@ -206,7 +213,10 @@ describe("config storage onboarding state", () => {
 
     const persisted = await Bun.file(paths.configFile).json()
     expect(persisted.futureDomain).toEqual({ value: 42 })
-    expect(persisted.models.slots.primary.providerModelId).toBe("model")
+    expect(persisted.models.slots.primary).toEqual({
+      _tag: "Selected",
+      selection: expect.objectContaining({ providerModelId: "model" }),
+    })
   })
 
   test("discards removed model configuration without erasing unrelated unknown fields", async () => {
@@ -239,6 +249,7 @@ describe("config storage onboarding state", () => {
       yield* config.save({
         contextLimits: { softCapRatio: 0, softCapMaxTokens: null },
         onboarding: Option.none(),
+        providers: Option.none(),
       })
       yield* Effect.all(
         Array.from({ length: 20 }, () => config.update((current) => ({
