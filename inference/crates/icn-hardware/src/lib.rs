@@ -129,6 +129,8 @@ pub struct PlanningOptions {
     pub use_mmap: bool,
     /// Whether model pages should be locked in memory.
     pub use_mlock: bool,
+    /// Whether model loading includes multi-token-prediction layers.
+    pub load_mtp: bool,
     /// K-cache data type.
     pub cache_type_k: CacheType,
     /// V-cache data type.
@@ -180,6 +182,7 @@ impl Default for PlanningOptions {
             tensor_split: None,
             use_mmap: true,
             use_mlock: false,
+            load_mtp: false,
             cache_type_k: CacheType::F16,
             cache_type_v: CacheType::F16,
             flash_attention: PlanningFlashAttention::Auto,
@@ -948,6 +951,14 @@ fn planning_request(
             tensor_split: plan.execution.tensor_split.clone(),
             use_mmap: plan.execution.use_mmap,
             use_mlock: plan.execution.use_mlock,
+            load_mtp: mtp_context
+                || matches!(
+                    plan.mtp,
+                    MtpConfig::Enabled {
+                        source: MtpSource::Bundled,
+                        ..
+                    }
+                ),
             cache_type_k,
             cache_type_v,
             flash_attention: plan.execution.flash_attention,
@@ -2439,6 +2450,7 @@ fn native_model_params(options: &PlanningOptions) -> Result<LlamaModelParams, Na
         })
         .with_use_mmap(options.use_mmap)
         .with_use_mlock(options.use_mlock)
+        .with_load_mtp(options.load_mtp)
         .with_split_mode(match options.split_mode {
             SplitMode::None => llama_cpp_2::model::params::LlamaSplitMode::None,
             SplitMode::Layer => llama_cpp_2::model::params::LlamaSplitMode::Layer,
@@ -2595,6 +2607,14 @@ mod tests {
         };
         assert_eq!(policy.reserve_for_domain(&MemoryDomainId::system()), 10);
         assert_eq!(policy.reserve_for_domain(&MemoryDomainId::new("device")), 2);
+    }
+
+    #[test]
+    fn native_model_params_preserve_mtp_layer_loading_policy() {
+        let mut options = PlanningOptions::default();
+        assert!(!native_model_params(&options).unwrap().load_mtp());
+        options.load_mtp = true;
+        assert!(native_model_params(&options).unwrap().load_mtp());
     }
 
     fn discovered_device(

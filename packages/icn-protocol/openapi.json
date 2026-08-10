@@ -335,6 +335,16 @@
               }
             }
           },
+          "409": {
+            "description": "Model assessment could not be completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Assessment operation failed",
             "content": {
