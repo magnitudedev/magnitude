@@ -66,6 +66,12 @@ export const sameProviderOfferingPackageEvidence = (
     })
 })
 
+export const providerOfferingPackageEvidenceChanged = (
+  current: Option.Option<ProviderOfferingPackageEvidence>,
+  next: ProviderOfferingPackageEvidence,
+): boolean => !Option.exists(current, (evidence) =>
+  sameProviderOfferingPackageEvidence(evidence, next))
+
 export interface LocalProviderOfferingProjectionState {
   readonly packageEvidence: Option.Option<ProviderOfferingPackageEvidence>
   readonly entries: readonly ProviderModelCatalogEntry[]
@@ -217,14 +223,32 @@ export const LocalProviderOfferingProjectionLive: Layer.Layer<
     )),
   )
 
-  yield* Stream.make(undefined).pipe(
+  const readPackageEvidence = Effect.all({
+    configured: offerings.list,
+    packages: packages.snapshot,
+  }).pipe(Effect.map(({ configured, packages: snapshot }) => {
+    const entries = new Map(
+      snapshot.state.entries.map((entry) => [entry.package.id, entry]),
+    )
+    return providerOfferingPackageEvidence(configured, entries)
+  }))
+  const projectIfPackageEvidenceChanged = Effect.gen(function* () {
+    const next = yield* readPackageEvidence
+    const current = (yield* observed.get).state.packageEvidence
+    if (!providerOfferingPackageEvidenceChanged(current, next)) return
+    yield* project
+  })
+
+  yield* Stream.make("Refresh" as const).pipe(
     Stream.concat(Stream.mergeAll([
-      offerings.changes,
-      catalog.changes.pipe(Stream.map(() => undefined)),
-      packages.changes.pipe(Stream.map(() => undefined)),
-      hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
+      offerings.changes.pipe(Stream.map(() => "Refresh" as const)),
+      catalog.changes.pipe(Stream.map(() => "Refresh" as const)),
+      packages.changes.pipe(Stream.map(() => "Packages" as const)),
+      hardware.assessmentChanges.pipe(Stream.map(() => "Refresh" as const)),
     ], { concurrency: "unbounded" })),
-    Stream.runForEach(() => project),
+    Stream.runForEach((trigger) => trigger === "Packages"
+      ? projectIfPackageEvidenceChanged
+      : project),
     Effect.forkScoped,
   )
 
