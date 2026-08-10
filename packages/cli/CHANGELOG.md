@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.2
+
+### Patch Changes
+
+- [`5635b0a`](https://github.com/magnitudedev/magnitude/commit/5635b0a667fab490974e11aebfae768167e8da74) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add Muse Glimmer 30B to catalog, update llama.cpp version
+
 ## 0.0.1
 
 ### Patch Changes
