@@ -11,6 +11,9 @@ applies_to:
   - packages/acn/src/local-models.ts
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
+  - cli/src/features/composer/**
+  - cli/src/features/local-inference/**
+  - cli/src/features/model-menus/**
 ---
 
 # Model catalog and acquisition
@@ -31,14 +34,16 @@ selection, and runtime residency remain separate facts.
 ## Release catalog
 
 The recommendable catalog is immutable release data. Human-reviewed declarations identify curated
-targets and evidence. A separate lock maps each declaration to an immutable upstream revision.
-Advancing that lock is an explicit development operation.
+targets, one exact serving profile, required companion components, and recommendation evidence. A
+separate lock maps each declaration to an immutable upstream revision. Advancing that lock is an
+explicit development operation.
 
 Catalog generation resolves only locked revisions through production package construction,
 inspection, template analysis, and native planning. It emits a self-contained planner-input bundle
 and proves that compact planner inputs yield the same native assessments as their source metadata
-at the 100K catalog profile. Any unresolved entry, incomplete coverage, integrity mismatch, or
-assessment mismatch fails generation or ICN readiness.
+at each declaration's catalog profile. A declared profile above the exact artifact maximum, a
+missing or differently typed companion, an unresolved entry, incomplete coverage, integrity
+mismatch, or assessment mismatch fails generation or ICN readiness.
 
 Runtime catalog use performs no upstream discovery and does not follow mutable revisions. Adding a
 model, format, or upstream revision requires a new reviewed release catalog.
@@ -122,6 +127,12 @@ ACN builds stable target-level models by joining:
 - current download attempts; and
 - complete configuration availability.
 
+Exact target identity also joins presentation metadata. A target present in the recommendable
+catalog retains its curated display name and description regardless of installation or
+recommendation status. Repository and filename-derived presentation is used only for targets with
+no curated metadata under that exact identity; similarity of repository, filename, family, or
+quantization never transfers presentation between targets.
+
 Installed targets remain visible when catalog loading or recommendation generation fails.
 Catalog-only targets remain visible as not downloaded. ACN may immediately merge an exact command response into its
 observer to reduce presentation latency, but only ICN observations confirm package state.
@@ -136,6 +147,11 @@ Download state stores no assessment evidence and determines neither configuratio
 slot identity. Exact admission snapshots are merged immediately into ACN observation, while ICN
 attempt state remains authoritative for completion.
 
+Every CLI download summary is a pure projection of the mirrored local-model snapshot. Closing the
+Models menu leaves active download status visible in the persistent composer footer, and the client
+does not retain a second download counter or lifecycle. The composer footer and Models menu use the
+same projection and remove it when the snapshot contains no active downloads.
+
 ## Concurrency and recovery
 
 Operations that could publish or remove the same package serialize. Reads may share in-flight
@@ -149,10 +165,14 @@ the release catalog, changes identity, or creates a permanent failed state.
 ## Conformance
 
 - Catalog membership implies only eligibility for assessment and recommendation.
+- Every catalog target publishes the exact reviewed serving profile and required companion set used
+  to construct its package.
 - Runtime setup requires no network access to reconstruct the release catalog.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
 - Package identity is independent of paths, display names, and mutable upstream references.
+- Exact catalog target identity preserves curated presentation across installation and
+  recommendation changes; fallback presentation cannot overwrite it.
 - Acquisition uses target identity; configuration selection uses serving-configuration identity;
   provider-model identity begins with the resulting offering.
 - Catalog failure cannot hide installed targets.

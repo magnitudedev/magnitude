@@ -218,6 +218,7 @@ export function ComposerContainer({
       interruptAll={interruptAll}
       openSettings={() => setMenu({ open: true, root: 'models' })}
       openHardware={() => setMenu({ open: true, root: 'hardware' })}
+      openCatalog={() => setMenu({ open: true, root: 'catalog' })}
       thinkingOptions={thinkingOptions}
       applyThinking={applyThinking}
       handleWidgetKeyEvent={handleWidgetKeyEvent}

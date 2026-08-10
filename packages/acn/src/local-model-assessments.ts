@@ -42,7 +42,7 @@ import {
 const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const ASSESSMENT_OPERATION_TIMEOUT_MS = 5 * 60 * 1_000
 const MINIMUM_CONTEXT_LENGTH = 4_096
-const LOCAL_MODEL_CONTEXT_LENGTH = 100_000
+const DEFAULT_LOCAL_MODEL_CONTEXT_LENGTH = 100_000
 const PERFORMANCE_SAMPLE_CONTEXT_LENGTHS = [25_000, 50_000, 75_000] as const
 type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
@@ -60,8 +60,9 @@ const assessmentProfile = (contextLength: number): AssessmentProfiles =>
 
 export const localModelAssessmentProfiles = (
   target: ModelOfferingTarget,
+  contextLength: number = DEFAULT_LOCAL_MODEL_CONTEXT_LENGTH,
 ): readonly ServingProfile[] => assessmentProfile(
-  Math.min(LOCAL_MODEL_CONTEXT_LENGTH, targetMaximumContextLength(target)),
+  Math.min(contextLength, targetMaximumContextLength(target)),
 )
 
 export const performanceSampleContextTokens = (

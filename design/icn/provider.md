@@ -45,6 +45,12 @@ system-domain load admission, and warning presentation from that one value. They
 parallel aggregate or capacity-label fields. Generic and cloud provider entries do not fabricate local
 memory accounting.
 
+Package notifications invalidate the local-offering projection, but download byte progress is not
+assessment input. Before reassessing, the projection rereads configured-package evidence and proceeds
+only when installation or inspection truth changed. Offering, catalog, and stable hardware-assessment
+changes remain assessment triggers. Clients therefore observe `Assessing` only for real assessment
+work, never as a side effect of transfer progress.
+
 The aggregate provider catalog remains usable when aggregation completes with typed provider or
 catalog failures. Such a snapshot is `Degraded`, including when every successful source contributes
 an empty model list; an empty result does not turn a partial provider failure into aggregate

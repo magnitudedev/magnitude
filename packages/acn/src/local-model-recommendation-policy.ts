@@ -7,10 +7,9 @@ import {
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
-export const MINIMUM_EXPECTED_TOKENS_PER_SECOND = 8
-
 const MAX_RECOMMENDATIONS = 4
 const COMPARISON_CONTEXT_LENGTH = 50_000
+const MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND = 5
 const SPEED_UTILITY_CEILING = 60
 const DOWNLOAD_UTILITY_BYTES = 16 * 1024 ** 3
 const LIGHTWEIGHT_CAPACITY_RATIO = 0.2
@@ -65,7 +64,8 @@ const measuredCapability = (candidate: RecommendationCandidate): boolean =>
   candidate.capability?.provenance === "measured_terminal_bench_2.1"
 
 const meetsUsabilityFloor = (tokensPerSecond: number): boolean =>
-  Math.round(tokensPerSecond * 10) / 10 >= MINIMUM_EXPECTED_TOKENS_PER_SECOND
+  Math.round(tokensPerSecond * 10) / 10
+    >= MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND
 
 const stableCompare = (
   left: RecommendationCandidate,
@@ -114,8 +114,10 @@ const withinCapabilityGuard = (
 const clamp = (value: number): number => Math.max(0, Math.min(1, value))
 
 const speedUtility = (tokensPerSecond: number): number => clamp(
-  Math.log(tokensPerSecond / MINIMUM_EXPECTED_TOKENS_PER_SECOND)
-    / Math.log(SPEED_UTILITY_CEILING / MINIMUM_EXPECTED_TOKENS_PER_SECOND),
+  Math.log(tokensPerSecond / MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND)
+    / Math.log(
+      SPEED_UTILITY_CEILING / MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND,
+    ),
 )
 
 export const balancedUtility = (candidate: RecommendationCandidate): number => {

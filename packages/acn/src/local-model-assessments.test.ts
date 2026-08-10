@@ -23,12 +23,24 @@ const packageTarget = (maximumContextLength: number): ModelOfferingTarget => ({
 } as unknown as ModelOfferingTarget)
 
 describe("localModelAssessmentProfiles", () => {
-  it("caps every local model at the 100K baseline", () => {
+  it("defaults discovered local models to the 100K baseline", () => {
     expect(localModelAssessmentProfiles(packageTarget(131_072))).toEqual([
       { contextLength: 100_000 },
     ])
     expect(localModelAssessmentProfiles(packageTarget(300_000))).toEqual([
       { contextLength: 100_000 },
+    ])
+  })
+
+  it("uses the catalog context when provided", () => {
+    expect(localModelAssessmentProfiles(packageTarget(131_072), 50_000)).toEqual([
+      { contextLength: 50_000 },
+    ])
+  })
+
+  it("bounds a catalog context by the target maximum", () => {
+    expect(localModelAssessmentProfiles(packageTarget(40_000), 50_000)).toEqual([
+      { contextLength: 40_000 },
     ])
   })
 

@@ -4678,6 +4678,7 @@
           "checkpointId",
           "targetId",
           "target",
+          "profile",
           "displayName",
           "description",
           "license",
@@ -4700,6 +4701,9 @@
           },
           "target": {
             "$ref": "#/components/schemas/ModelOfferingTarget"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ServingProfile"
           },
           "displayName": {
             "type": "string"

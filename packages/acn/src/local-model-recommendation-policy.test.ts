@@ -12,8 +12,8 @@ import {
   type Recommendation,
 } from "@magnitudedev/acn-protocol"
 import {
-  MINIMUM_EXPECTED_TOKENS_PER_SECOND,
   assembleRecommendationCatalogCandidates,
+  balancedUtility,
   conservativeGenerationSpeed,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
@@ -87,6 +87,7 @@ const candidate = (input: {
           },
         },
       },
+      profile,
       displayName: input.id,
       description: "Test fixture",
       license: "test",
@@ -165,9 +166,17 @@ describe("local model multicriteria recommendation policy", () => {
     const slow = candidate({
       id: "slow",
       score: 90,
-      expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
+      expected: 4.9,
     })
     expect(selectRecommendationPortfolio([slow])).toEqual([])
+  })
+
+  it("admits five expected tokens per second to recommendations", () => {
+    const recommendations = selectRecommendationPortfolio([
+      candidate({ id: "floor", score: 50, expected: 5 }),
+    ])
+
+    expect(byIntent(recommendations, "balanced")?.displayName).toBe("floor")
   })
 
   it("uses full-context speed for eligibility and 50K speed for comparisons", () => {
@@ -175,13 +184,13 @@ describe("local model multicriteria recommendation policy", () => {
       id: "usable",
       score: 50,
       expected: 40,
-      fullContextExpected: MINIMUM_EXPECTED_TOKENS_PER_SECOND,
+      fullContextExpected: 5,
     })
     const tooSlowAtFullContext = candidate({
       id: "too-slow",
       score: 90,
       expected: 60,
-      fullContextExpected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.1,
+      fullContextExpected: 4.9,
     })
 
     expect(conservativeGenerationSpeed(usable)).toBe(40)
@@ -193,7 +202,7 @@ describe("local model multicriteria recommendation policy", () => {
     const slow = candidate({
       id: "slow",
       score: 80,
-      expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 1,
+      expected: 4.9,
     })
 
     const recommendations = selectRecommendationPortfolio([slow])
@@ -207,11 +216,18 @@ describe("local model multicriteria recommendation policy", () => {
     const recommendations = selectRecommendationPortfolio([
       candidate({
         id: "rounded-baseline",
-        expected: MINIMUM_EXPECTED_TOKENS_PER_SECOND - 0.049,
+        expected: 4.951,
       }),
     ])
 
     expect(byIntent(recommendations, "balanced")?.displayName).toBe("rounded-baseline")
+  })
+
+  it("awards speed utility above the five-token recommendation floor", () => {
+    const five = candidate({ id: "five", expected: 5 })
+    const eight = candidate({ id: "eight", expected: 8 })
+
+    expect(balancedUtility(eight)).toBeGreaterThan(balancedUtility(five))
   })
 
   it("builds a useful 64 GiB-class portfolio and prefers capability inside Lightweight", () => {

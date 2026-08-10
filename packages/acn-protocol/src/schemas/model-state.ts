@@ -353,6 +353,7 @@ export const RecommendableModelSchema = Schema.Struct({
   checkpointId: NonEmptyString,
   targetId: ModelOfferingTargetIdSchema,
   target: ModelOfferingTargetSchema,
+  profile: ServingProfileSchema,
   displayName: NonEmptyString,
   description: Schema.String,
   license: NonEmptyString,
