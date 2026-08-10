@@ -143,3 +143,5 @@ Cached assessment never authorizes loading.
 - Candidate identity remains the serving-configuration identity.
 - Loading never treats cached assessment as admission authority.
 - ACN startup and service publication never wait for model assessment.
+- Onboarding keeps installed and downloadable model groups at a stable layout height while making
+  every presented model reachable by keyboard navigation and pointer scrolling.
