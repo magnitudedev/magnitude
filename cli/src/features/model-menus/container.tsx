@@ -40,6 +40,7 @@ import {
   type LocalModel,
   type LocalModelCatalogCandidate,
   type LocalModelRecommendation,
+  type ProviderCatalogEntry,
   type ProviderModelId,
   type ProviderModelCatalogEntry,
   type ReasoningEffort,
@@ -140,35 +141,52 @@ const formatContextWindow = (tokens: number): string =>
 const providerModelKey = (model: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">): string =>
   `${model.providerId}:${model.providerModelId}`
 
-const catalogModels = (
+interface CatalogContents {
+  readonly providers: readonly ProviderCatalogEntry[]
+  readonly models: readonly ProviderModelCatalogEntry[]
+}
+
+const catalogContents = (
   config: ReturnType<typeof useModelConfig>,
-): readonly ProviderModelCatalogEntry[] => Option.getOrElse(
-  Option.flatMap(Result.value(config.catalog), ({ state }) =>
+): CatalogContents => Option.getOrElse(
+  Option.map(Result.value(config.catalog), ({ state }) =>
     ProviderModelCatalogLifecycle.match(state, {
-      Loading: () => Option.none(),
-      Ready: ({ models }) => Option.some(models),
-      Refreshing: ({ models }) => Option.some(models),
-      Degraded: ({ models }) => Option.some(models),
-      Unavailable: () => Option.none(),
+      Loading: () => ({ providers: [], models: [] }),
+      Ready: ({ providers, models }) => ({ providers, models }),
+      Refreshing: ({ providers, models }) => ({ providers, models }),
+      Degraded: ({ providers, models }) => ({ providers, models }),
+      Unavailable: ({ providers }) => ({ providers, models: [] }),
     })),
-  () => [],
+  () => ({ providers: [], models: [] }),
 )
 
-type ModelsMenuEntry =
+const catalogModels = (config: ReturnType<typeof useModelConfig>) =>
+  catalogContents(config).models
+
+const providerKindLabel = (kind: ProviderCatalogEntry["kind"]): string => {
+  switch (kind) {
+    case "Custom": return "Custom"
+    case "Local": return "Local"
+    case "Hosted": return "Cloud"
+  }
+}
+
+export type ModelsMenuEntry =
   | {
       readonly _tag: "Local"
       readonly id: string
       readonly choice: InstalledLocalModelChoice
     }
   | {
-      readonly _tag: "Cloud"
+      readonly _tag: "Provider"
       readonly id: string
       readonly model: ProviderModelCatalogEntry
+      readonly provider: ProviderCatalogEntry
     }
 
 const modelsMenuProviderModel = (
   entry: ModelsMenuEntry,
-): ProviderModelCatalogEntry | undefined => entry._tag === "Cloud"
+): ProviderModelCatalogEntry | undefined => entry._tag === "Provider"
   ? entry.model
   : Option.getOrUndefined(entry.choice.providerModel)
 
@@ -186,27 +204,45 @@ const modelsMenuContextLength = (entry: ModelsMenuEntry): number => entry._tag =
   ? entry.choice.contextLength
   : entry.model.contextWindow
 
-const modelsMenuProviderKey = (entry: ModelsMenuEntry): string | null => {
+const modelsMenuOfferingKey = (entry: ModelsMenuEntry): Option.Option<string> => {
   const providerModel = modelsMenuProviderModel(entry)
-  return providerModel === undefined ? null : providerModelKey(providerModel)
+  return Option.fromNullable(providerModel).pipe(Option.map(providerModelKey))
 }
+
+const sameProviderModel = (
+  left: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">,
+  right: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">,
+): boolean => left.providerId === right.providerId
+  && left.providerModelId === right.providerModelId
+
+export const modelsMenuEntryIsSelected = (
+  entry: ModelsMenuEntry,
+  selectedModel: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): boolean => Option.exists(
+  Option.fromNullable(modelsMenuProviderModel(entry)),
+  (model) => Option.exists(selectedModel, (selected) => sameProviderModel(model, selected)),
+)
 
 export const buildModelsMenuEntries = (
   choices: readonly InstalledLocalModelChoice[],
   providerModels: readonly ProviderModelCatalogEntry[],
+  providers: readonly ProviderCatalogEntry[],
 ): readonly ModelsMenuEntry[] => [
   ...choices.map((choice): ModelsMenuEntry => ({
     _tag: "Local",
     id: choice.id,
     choice,
   })),
-  ...providerModels
-    .filter(({ providerId }) => providerId !== LOCAL_PROVIDER_ID)
-    .map((model): ModelsMenuEntry => ({
-      _tag: "Cloud",
+  ...providerModels.flatMap((model): readonly ModelsMenuEntry[] => {
+    if (model.providerId === LOCAL_PROVIDER_ID) return []
+    const provider = providers.find(({ providerId }) => providerId === model.providerId)
+    return provider === undefined ? [] : [{
+      _tag: "Provider",
       id: providerModelKey(model),
       model,
-    })),
+      provider,
+    }]
+  }),
 ]
 
 export type ModelsMenuSelectionAction =
@@ -230,7 +266,7 @@ export const modelsMenuSelectionAction = (
       ? Option.some({ _tag: "AssignOffering", providerModel })
       : Option.none()
   }
-  if (entry._tag === "Cloud"
+  if (entry._tag === "Provider"
     || !Option.exists(entry.choice.candidate, ({ availability }) =>
       availability._tag === "Available")) return Option.none()
   return Option.some({
@@ -478,7 +514,7 @@ const ModelsMenu = memo(function ModelsMenu({
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
   const hardware = Option.getOrUndefined(Result.value(useLocalInferenceHardware()))
-  const providerModels = catalogModels(config)
+  const catalog = catalogContents(config)
   const catalogSnapshot = Result.value(config.catalog)
   const slotsSnapshot = Result.value(config.slots)
   const localSnapshot = Result.value(localModels)
@@ -486,17 +522,14 @@ const ModelsMenu = memo(function ModelsMenu({
     Option.all({ catalog: catalogSnapshot, slots: slotsSnapshot }),
     ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
   )
-  const selectedKey = Option.match(selected, {
-    onNone: () => null,
-    onSome: ({ model }) => providerModelKey(model),
-  })
+  const selectedModel = Option.map(selected, ({ model }) => model)
   const currentRecentModelIds = Option.match(slotsSnapshot, {
     onNone: () => [] as readonly string[],
     onSome: ({ state }) => state.recentModelIds.primary,
   })
   const currentFavoriteKeys = new Set(config.favoriteModels.map(providerModelKey))
   const [ordering] = useState(() => ({
-    selectedKey,
+    selectedModel,
     recentModelIds: currentRecentModelIds,
     favoriteKeys: currentFavoriteKeys,
   }))
@@ -508,16 +541,14 @@ const ModelsMenu = memo(function ModelsMenu({
         buildInstalledLocalModelChoices(models, catalog.state, slots.state),
     },
   )
-  const entries = buildModelsMenuEntries(installedChoices, providerModels)
+  const entries = buildModelsMenuEntries(installedChoices, catalog.models, catalog.providers)
   const isSelected = (entry: ModelsMenuEntry): boolean =>
-    modelsMenuProviderKey(entry) === selectedKey
-  const isFavorite = (entry: ModelsMenuEntry): boolean => {
-    const key = modelsMenuProviderKey(entry)
-    return key !== null && currentFavoriteKeys.has(key)
-  }
+    modelsMenuEntryIsSelected(entry, selectedModel)
+  const isFavorite = (entry: ModelsMenuEntry): boolean =>
+    Option.exists(modelsMenuOfferingKey(entry), (key) => currentFavoriteKeys.has(key))
   const isEligible = (entry: ModelsMenuEntry): boolean => {
     const providerModel = modelsMenuProviderModel(entry)
-    if (entry._tag === "Cloud") {
+    if (entry._tag === "Provider") {
       return providerModel !== undefined
         && providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
         && (providerModel.availability._tag === "Available" || isSelected(entry))
@@ -532,13 +563,13 @@ const ModelsMenu = memo(function ModelsMenu({
   const eligible = entries
     .filter(isEligible)
     .sort((left, right) => {
-      const leftKey = modelsMenuProviderKey(left)
-      const rightKey = modelsMenuProviderKey(right)
-      const leftFavorite = leftKey !== null && ordering.favoriteKeys.has(leftKey)
-      const rightFavorite = rightKey !== null && ordering.favoriteKeys.has(rightKey)
+      const leftKey = modelsMenuOfferingKey(left)
+      const rightKey = modelsMenuOfferingKey(right)
+      const leftFavorite = Option.exists(leftKey, (key) => ordering.favoriteKeys.has(key))
+      const rightFavorite = Option.exists(rightKey, (key) => ordering.favoriteKeys.has(key))
       if (leftFavorite !== rightFavorite) return leftFavorite ? -1 : 1
-      const leftSelected = leftKey === ordering.selectedKey
-      const rightSelected = rightKey === ordering.selectedKey
+      const leftSelected = modelsMenuEntryIsSelected(left, ordering.selectedModel)
+      const rightSelected = modelsMenuEntryIsSelected(right, ordering.selectedModel)
       if (leftSelected !== rightSelected) return leftSelected ? -1 : 1
       const leftProviderModel = modelsMenuProviderModel(left)
       const rightProviderModel = modelsMenuProviderModel(right)
@@ -569,7 +600,9 @@ const ModelsMenu = memo(function ModelsMenu({
       models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
   })
   const requirementFor = (entry: ModelsMenuEntry): string => {
-    if (entry._tag === "Cloud") return "Cloud"
+    if (entry._tag === "Provider") {
+      return providerKindLabel(entry.provider.kind)
+    }
     const providerModel = modelsMenuProviderModel(entry)
     const candidate = modelsMenuCandidate(entry)
     return providerModel === undefined
@@ -813,7 +846,7 @@ const ModelsMenu = memo(function ModelsMenu({
             {detailFavorite ? "★ " : ""}{modelsMenuDisplayName(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
-            {detailIsLocal ? "Local" : "Cloud"} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
+            {detailIsLocal ? "Local" : providerKindLabel(detail.provider.kind)} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
           </text>
           {detailIsLocal && modelMemoryStatusDetail(detailMemoryConditions) !== "" && (
             <text style={{ fg: theme.warning }}>

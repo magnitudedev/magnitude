@@ -29,7 +29,11 @@ import {
   ProviderModelIdSchema,
   ReasoningEffortSchema,
 } from "@magnitudedev/sdk"
-import { resolveContextLimitPolicy } from "@magnitudedev/storage"
+import {
+  resolveContextLimitPolicy,
+  selectedSlotSelection,
+  unassignedSlotSelection,
+} from "@magnitudedev/storage"
 import {
   IcnClient,
   IcnInstances,
@@ -127,15 +131,18 @@ const makeHarness = (options: {
   const configuration = yield* SubscriptionRef.make({
     slots: {
       primary: options.initiallyAssigned === false
-        ? Option.none<SlotSelection>()
-        : Option.some(selection),
-      secondary: Option.none<SlotSelection>(),
+        ? unassignedSlotSelection()
+        : selectedSlotSelection(selection),
+      secondary: unassignedSlotSelection(),
     },
     localModelRecency: { primary: [providerModelId], secondary: [] },
     favoriteModels: [],
     localProviderOfferings: [],
     dismissedDownloadFailures: [],
-    contextLimits: resolveContextLimitPolicy({ onboarding: Option.none() }),
+    contextLimits: resolveContextLimitPolicy({
+      onboarding: Option.none(),
+      providers: Option.none(),
+    }),
   })
   const instances = yield* SubscriptionRef.make<Generated.ModelInstancesSnapshot>({
     revision: 0,
@@ -147,6 +154,7 @@ const makeHarness = (options: {
       providers: [{
         providerId: ProviderIdSchema.make("local"),
         displayName: "Local",
+        kind: "Local" as const,
         authentication: "NotRequired" as const,
         availability: { _tag: "Available" as const },
       }],

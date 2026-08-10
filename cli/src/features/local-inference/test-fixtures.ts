@@ -186,6 +186,7 @@ export const makeView = (options: {
       providers: [{
         providerId: LOCAL_PROVIDER_ID,
         displayName: "Local",
+        kind: "Local",
         authentication: "NotRequired",
         availability: { _tag: "Available" },
       }],

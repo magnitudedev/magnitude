@@ -199,7 +199,7 @@
     },
     "packages/cli": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.1-alpha.35",
+      "version": "0.0.1-alpha.41",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
@@ -357,6 +357,7 @@
         "@effect/platform-bun": "^0.90.0",
         "@magnitudedev/ai": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
+        "@magnitudedev/storage": "workspace:*",
         "@magnitudedev/utils": "workspace:*",
         "effect": "3.21.2",
       },

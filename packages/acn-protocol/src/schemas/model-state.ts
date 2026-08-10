@@ -652,6 +652,8 @@ export const LocalProviderOfferingSchema = Schema.Struct({
 export type LocalProviderOffering = typeof LocalProviderOfferingSchema.Type
 
 export const ProviderAuthenticationSchema = Schema.Literal("Authenticated", "NotConfigured", "NotRequired")
+export const ProviderKindSchema = Schema.Literal("Hosted", "Local", "Custom")
+export type ProviderKind = typeof ProviderKindSchema.Type
 export const ProviderAvailabilitySchema = Schema.Union(
   Schema.TaggedStruct("Available", {}),
   Schema.TaggedStruct("Loading", {
@@ -666,6 +668,7 @@ export const ProviderAvailabilitySchema = Schema.Union(
 export const ProviderCatalogEntrySchema = Schema.Struct({
   providerId: ProviderIdSchema,
   displayName: Schema.String,
+  kind: ProviderKindSchema,
   authentication: ProviderAuthenticationSchema,
   availability: ProviderAvailabilitySchema,
 })

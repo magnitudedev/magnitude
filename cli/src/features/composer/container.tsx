@@ -38,7 +38,7 @@ import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-
 import { useTheme } from '../../hooks/use-theme'
 import { INIT_PROMPT } from '../../commands/init-prompt'
 import { Composer } from './composer'
-import { allowProviderMessageSend } from './provider-send-guard'
+import { allowModelMessageSend } from './provider-send-guard'
 
 export function ComposerContainer({
   chatColumnWidth,
@@ -104,7 +104,7 @@ export function ComposerContainer({
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
     if (modelSetupInProgress) return
-    if (!allowProviderMessageSend(modelsConfigured, showErrorToast)) return
+    if (!allowModelMessageSend(modelsConfigured, showErrorToast)) return
     composer.handleSend(text)
   }
 

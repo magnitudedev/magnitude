@@ -2,7 +2,12 @@ import { Effect, Option, Ref } from "effect"
 import { describe, expect, it } from "vitest"
 import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/ai"
 import { PRIMARY_SLOT_ID } from "@magnitudedev/acn-protocol"
-import type { MagnitudeConfig } from "@magnitudedev/storage"
+import {
+  selectedSlotSelection,
+  slotSelectionOption,
+  unassignedSlotSelection,
+  type MagnitudeConfig,
+} from "@magnitudedev/storage"
 import { makeModelConfiguration } from "./model-configuration"
 
 const selection = (model: string) => ({
@@ -35,10 +40,11 @@ describe("model configuration ownership", () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const state = yield* Ref.make<MagnitudeConfig>({
         onboarding: Option.none(),
+        providers: Option.none(),
         models: {
           slots: {
-            primary: Option.some(selection("primary-old")),
-            secondary: Option.some(selection("secondary-old")),
+            primary: selectedSlotSelection(selection("primary-old")),
+            secondary: selectedSlotSelection(selection("secondary-old")),
           },
           localModelRecency: { primary: [], secondary: [] },
           favoriteModels: [],
@@ -47,23 +53,24 @@ describe("model configuration ownership", () => {
         },
       })
       const configuration = yield* makeModelConfiguration(updateStorage(state))
-      yield* configuration.updateSlot(PRIMARY_SLOT_ID, Option.some(selection("primary-new")))
+      yield* configuration.updateSlot(PRIMARY_SLOT_ID, selectedSlotSelection(selection("primary-new")))
       return yield* Ref.get(state)
     }))
 
     if (!result.models) return expect.fail("model configuration was not persisted")
-    expect(Option.getOrThrow(result.models.slots.primary).providerModelId).toBe("primary-new")
-    expect(Option.getOrThrow(result.models.slots.secondary).providerModelId).toBe("secondary-old")
+    expect(Option.getOrThrow(slotSelectionOption(result.models.slots.primary)).providerModelId).toBe("primary-new")
+    expect(Option.getOrThrow(slotSelectionOption(result.models.slots.secondary)).providerModelId).toBe("secondary-old")
   })
 
   it("records local model use as bounded per-slot recency", async () => {
     const state = await Effect.runPromise(Effect.gen(function* () {
       const stored = yield* Ref.make<MagnitudeConfig>({
         onboarding: Option.none(),
+        providers: Option.none(),
         models: {
           slots: {
-            primary: Option.some(localSelection("local-a")),
-            secondary: Option.none(),
+            primary: selectedSlotSelection(localSelection("local-a")),
+            secondary: unassignedSlotSelection(),
           },
           localModelRecency: {
             primary: [ProviderModelIdSchema.make("local-b"), ProviderModelIdSchema.make("local-a")],
@@ -85,7 +92,10 @@ describe("model configuration ownership", () => {
 
   it("persists provider-qualified model favorites", async () => {
     const state = await Effect.runPromise(Effect.gen(function* () {
-      const stored = yield* Ref.make<MagnitudeConfig>({ onboarding: Option.none() })
+      const stored = yield* Ref.make<MagnitudeConfig>({
+        onboarding: Option.none(),
+        providers: Option.none(),
+      })
       const configuration = yield* makeModelConfiguration(updateStorage(stored))
       yield* configuration.setFavorite(modelIdentity("local", "shared"), true)
       yield* configuration.setFavorite(modelIdentity("magnitude", "shared"), true)

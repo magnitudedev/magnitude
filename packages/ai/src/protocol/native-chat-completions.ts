@@ -1,9 +1,12 @@
-import { Data, Effect, Schema } from "effect"
 import type { OptionDef, InferCallOptions } from "../options/option"
-import { Option, applyOptionDefs } from "../options/option"
+import { Option as CallOption, applyOptionDefs } from "../options/option"
 import type { ChatCompletionsRequest, ChatToolChoice } from "../wire/chat-completions"
-import { ChatCompletionsStreamChunk } from "../wire/chat-completions"
 import { nativeChatCompletionsCodec } from "../codec/native-chat-completions/index"
+import type { NormalizedChatCompletionsStreamChunk } from "../codec/native-chat-completions/chunk"
+import {
+  type ChatCompletionChunkDecoder,
+  standardChatCompletionChunkDecoder,
+} from "../codec/native-chat-completions/chunk-decoder"
 import type {
   ProviderCall,
   RejectedHttpResponse,
@@ -19,19 +22,19 @@ import type { ProviderModelCapabilities } from "../model/capabilities"
 // ---------------------------------------------------------------------------
 
 const options = {
-  maxTokens: Option.define(
+  maxTokens: CallOption.define(
     (v: number) => ({ max_tokens: v }),
   ),
-  temperature: Option.define(
+  temperature: CallOption.define(
     (v: number) => ({ temperature: v }),
   ),
-  stop: Option.define(
+  stop: CallOption.define(
     (v: readonly string[]) => ({ stop: [...v] }),
   ),
-  topP: Option.define(
+  topP: CallOption.define(
     (v: number) => ({ top_p: v }),
   ),
-  toolChoice: Option.define(
+  toolChoice: CallOption.define(
     (v: ChatToolChoice) => ({ tool_choice: v }),
   ),
 } as const
@@ -47,6 +50,7 @@ interface NativeChatCompletionsModelConfig<
   readonly endpoint: string
   readonly path?: string
   readonly options: TOptions
+  readonly chunkDecoder?: ChatCompletionChunkDecoder
 
   readonly compose?: (
     wire: Partial<ChatCompletionsRequest>,
@@ -58,46 +62,6 @@ interface NativeChatCompletionsModelConfig<
   ) => StreamStartProviderRejection | StreamStartProviderCorrectnessViolation
   readonly capabilities?: ProviderModelCapabilities
 }
-
-// ---------------------------------------------------------------------------
-// decodePayload — JSON.parse + Schema.decode for stream chunks
-// ---------------------------------------------------------------------------
-
-class ChatPayloadJsonParseError extends Data.TaggedError("ChatPayloadJsonParseError")<{
-  readonly message: string
-  readonly raw: string
-  readonly cause: unknown
-}> {}
-
-class ChatPayloadSchemaDecodeError extends Data.TaggedError("ChatPayloadSchemaDecodeError")<{
-  readonly message: string
-  readonly raw: string
-  readonly cause: unknown
-}> {}
-
-const decodeChatCompletionsPayload = (raw: string): Effect.Effect<
-  ChatCompletionsStreamChunk,
-  ChatPayloadJsonParseError | ChatPayloadSchemaDecodeError
-> =>
-  Effect.flatMap(
-    Effect.try({
-      try: () => JSON.parse(raw) as unknown,
-      catch: (cause) => new ChatPayloadJsonParseError({
-        message: `Invalid JSON: ${raw} (${String(cause)})`,
-        raw,
-        cause,
-      }),
-    }),
-    (parsed) =>
-      Effect.mapError(
-        Schema.decodeUnknown(ChatCompletionsStreamChunk)(parsed),
-        (cause) => new ChatPayloadSchemaDecodeError({
-          message: `Chunk decode failed: ${String(cause)}`,
-          raw,
-          cause,
-        }),
-      ),
-  )
 
 // ---------------------------------------------------------------------------
 // NativeChatCompletions.model()
@@ -113,14 +77,14 @@ function model<
   return modelDefine<
     TCallOptions,
     ChatCompletionsRequest,
-    ChatCompletionsStreamChunk
+    NormalizedChatCompletionsStreamChunk
   >({
     modelId: config.modelId,
     endpoint: config.endpoint,
     path: config.path ?? "/chat/completions",
     codec: nativeChatCompletionsCodec,
     doneSignal: "[DONE]",
-    decodePayload: decodeChatCompletionsPayload,
+    decodePayload: (config.chunkDecoder ?? standardChatCompletionChunkDecoder).decode,
 
     classifyRejectedResponse: config.classifyRejectedResponse,
     capabilities: config.capabilities,

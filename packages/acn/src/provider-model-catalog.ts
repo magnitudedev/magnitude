@@ -93,7 +93,7 @@ const toCatalogModel = (
       },
     },
     availability: model.availability,
-    pricing: Option.map(Option.fromNullable(model.pricing), (pricing) => ({
+    pricing: Option.map(model.pricing, (pricing) => ({
       input: pricing.input,
       output: pricing.output,
       cachedInput: Option.fromNullable(pricing.cached_input),
@@ -104,6 +104,7 @@ const toCatalogModel = (
 const providerEntry = (provider: ProviderRegistryInfo): ProviderCatalogEntry => ({
   providerId: provider.id,
   displayName: provider.displayName,
+  kind: provider.kind,
   authentication: Match.value(provider.authStatus).pipe(
     Match.tag("authenticated", () => "Authenticated" as const),
     Match.tag("no_auth_required", () => "NotRequired" as const),

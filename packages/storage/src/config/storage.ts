@@ -19,6 +19,9 @@ import { GlobalStorage } from "../services";
 import {
   MagnitudeConfigSchema,
   resolveContextLimitPolicy,
+  selectedSlotSelection,
+  SlotSelectionStateSchema,
+  unassignedSlotSelection,
   type ContextLimitPolicy,
   type MagnitudeConfig,
 } from "../types/config";
@@ -52,6 +55,38 @@ const discardRemovedModelConfiguration = (config: MagnitudeConfig): {
 
 const safeRecoveryMessage = (message: string): string =>
   message.replace(/, actual[\s\S]*$/, "").slice(0, 500);
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const parseJsonOrUndefined = (text: string): unknown => {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+};
+
+const normalizePersistedSlotStates = (value: unknown): boolean => {
+  if (!isRecord(value) || !isRecord(value.models) || !isRecord(value.models.slots)) return false;
+  let changed = false;
+  for (const slotId of ["primary", "secondary"] as const) {
+    const current = value.models.slots[slotId];
+    const migrated = current === undefined
+      ? unassignedSlotSelection()
+      : isRecord(current) && current._tag !== "Unassigned" && current._tag !== "Selected"
+        ? { _tag: "Selected", selection: current }
+        : current;
+    const normalized = Schema.is(SlotSelectionStateSchema)(migrated)
+      ? migrated
+      : unassignedSlotSelection();
+    if (normalized !== current) {
+      value.models.slots[slotId] = normalized;
+      changed = true;
+    }
+  }
+  return changed;
+};
 
 export function makeConfigStorage(): Effect.Effect<
   ConfigStorageShape,
@@ -96,6 +131,15 @@ export function makeConfigStorage(): Effect.Effect<
 
     const readConfigUnlocked = (): Effect.Effect<MagnitudeConfig, PlatformError | JsonError> =>
       Effect.gen(function* () {
+        const legacyText = yield* fs.readFileString(g.configFile).pipe(Effect.either);
+        if (legacyText._tag === "Right") {
+          const parsed = parseJsonOrUndefined(legacyText.right);
+          if (parsed !== undefined && normalizePersistedSlotStates(parsed)) {
+            yield* writeTextFileAtomic(g.configFile, `${JSON.stringify(parsed, null, 2)}\n`).pipe(
+              Effect.provideService(FileSystem.FileSystem, fs),
+            );
+          }
+        }
         const result = yield* readRecoverableStructuredFile(
           g.configFile,
           MagnitudeConfigSchema,
@@ -152,7 +196,7 @@ export function makeConfigStorage(): Effect.Effect<
       io.withPathLock(g.configFile, readConfigUnlocked());
 
     const emptyModelConfig = () => ({
-      slots: { primary: Option.none(), secondary: Option.none() },
+      slots: { primary: unassignedSlotSelection(), secondary: unassignedSlotSelection() },
       localModelRecency: { primary: [], secondary: [] },
       favoriteModels: [],
       localProviderOfferings: [],
@@ -204,7 +248,13 @@ export function makeConfigStorage(): Effect.Effect<
               ...current,
               models: {
                 ...existingModels,
-                slots: { ...existingModels.slots, [slotId]: selection },
+                slots: {
+                  ...existingModels.slots,
+                  [slotId]: Option.match(selection, {
+                    onNone: unassignedSlotSelection,
+                    onSome: selectedSlotSelection,
+                  }),
+                },
               },
             });
           })

@@ -34,7 +34,7 @@ import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom, co
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
-import { allowProviderMessageSend } from './provider-send-guard'
+import { allowModelMessageSend } from './provider-send-guard'
 import { ContextUsage, contextUsageWidth } from './context-usage'
 import { ResidencyIndicator } from './residency-indicator'
 import {
@@ -297,7 +297,7 @@ export function Composer(props: ComposerProps) {
   const footerPrimaryWidth = bashMode
     ? 'Bash Mode'.length
     : !modelsConfigured
-      ? 'No model configured'.length
+      ? 'No model configured · /models to see available models'.length
       : (modelFooter.residency === null ? 0 : 2)
         + stringWidth(modelNameLabel)
         + 2
@@ -626,7 +626,7 @@ export function Composer(props: ComposerProps) {
       clearComposer()
       return
     }
-    if (!allowProviderMessageSend(modelsConfigured, showToast)) return
+    if (!allowModelMessageSend(modelsConfigured, showToast)) return
 
     clearSystemBanners()
 
@@ -681,9 +681,21 @@ export function Composer(props: ComposerProps) {
       {bashMode ? (
         <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
       ) : !modelsConfigured ? (
-        <Button onClick={openSettings}>
-          <text style={{ fg: theme.foreground }}>No model configured</text>
-        </Button>
+        <>
+          <text style={{ fg: theme.foreground }}>No model configured · </text>
+          <Button
+            onClick={openSettings}
+            onMouseOver={() => setModelLabelHovered(true)}
+            onMouseOut={() => setModelLabelHovered(false)}
+          >
+            <text style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}>
+              <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                /models
+              </span>
+            </text>
+          </Button>
+          <text style={{ fg: theme.foreground }}> to see available models</text>
+        </>
       ) : (
         <>
           {modelFooter.residency !== null && (

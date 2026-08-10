@@ -19,6 +19,7 @@ import { installGracefulShutdownHandlers } from "./utils/graceful-shutdown";
 import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
 import { Array as Arr, Effect, Option } from "effect";
+import { registerDocsCommand } from "./commands/docs";
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
@@ -70,6 +71,8 @@ async function main() {
         process.exitCode = 1;
       }
     });
+
+  registerDocsCommand(program);
 
   program.action(async (opts) => {
     const sessionStart: SessionStart =

@@ -86,6 +86,8 @@ import { LocalProviderOfferingProjectionLive } from "./local-provider-offering-p
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
+import { CustomEndpointsLive } from "./custom-endpoints"
+import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { SessionStoreLive } from "./session-store"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -350,9 +352,13 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ModelSlotControllerLive,
     withCloudUsage
   )
+  const withCustomEndpointReconciliation = Layer.provideMerge(
+    CustomEndpointReconcilerLive,
+    withModelSlots,
+  )
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withModelSlots
+    withCustomEndpointReconciliation
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
@@ -372,9 +378,13 @@ const addLocalInferenceServices = <A, E, R>(
     makeModelConfigurationLayer(),
     withResidencyPolicy
   )
+  const withCustomEndpoints = Layer.provideMerge(
+    CustomEndpointsLive,
+    withConfiguration,
+  )
   const withHardware = Layer.provideMerge(
     LocalInferenceHardwareLive,
-    withConfiguration
+    withCustomEndpoints
   )
   const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
   const withAssessments = Layer.provideMerge(

@@ -32,7 +32,7 @@ const configState = (
         ...overrides,
       },
     },
-    secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'Unassigned' },
+    secondary: { _tag: 'Unassigned', slotId: 'secondary' },
   },
 })
 

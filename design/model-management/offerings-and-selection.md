@@ -92,7 +92,9 @@ Assignment validates the exact offering before commit. A successful assignment m
 
 A rejected assignment leaves the previous selection unchanged. Assignment never creates a blocked
 slot. Conditions may degrade after assignment; the slot then projects the authoritative
-unavailability without discarding user intent.
+unavailability without discarding user intent. Authoritative deletion of an authored provider or
+model is not temporary unavailability: it clears slots selecting that deleted identity without
+substituting another model.
 
 ## Composite client workflows
 

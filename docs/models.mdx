@@ -6,6 +6,8 @@ icon: boxes
 
 Magnitude detects your hardware, recommends local models for your machine, and lets you browse other compatible configurations in the catalog. Open `/settings` to manage models, browse the catalog, or inspect your hardware.
 
+You can also connect a custom OpenAI-compatible Chat Completions endpoint by declaring it and its models in `~/.magnitude/config.json`. See [Custom endpoints](/custom-endpoints) for a complete setup example.
+
 ## Hardware detection and profiling
 
 Magnitude detects your processor, memory, system architecture, and acceleration such as Metal or CUDA. It then runs short local inference tests to estimate which model configurations will fit and how fast they should run without downloading complete model weights.

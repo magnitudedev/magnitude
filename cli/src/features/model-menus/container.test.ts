@@ -1,10 +1,18 @@
 import { describe, expect, test } from "vitest"
 import type { KeyEvent } from "@opentui/core"
 import { Option } from "effect"
-import { ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
+import {
+  PRIMARY_SLOT_ID,
+  SECONDARY_SLOT_ID,
+  ProviderIdSchema,
+  ProviderModelCatalogLifecycle,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+} from "@magnitudedev/sdk"
 import {
   buildModelsMenuEntries,
   huggingFaceRepositoryUrls,
+  modelsMenuEntryIsSelected,
   modelsMenuSelectionAction,
   resolveRootNavigationDirection,
   scrollCatalogCandidateIntoView,
@@ -113,6 +121,45 @@ describe("catalog repository links", () => {
 })
 
 describe("models menu entries", () => {
+  test("joins custom provider metadata into its model entry", () => {
+    const providerId = ProviderIdSchema.make("custom:openrouter")
+    const entries = buildModelsMenuEntries([], [{
+      providerId,
+      providerModelId: ProviderModelIdSchema.make("z-ai/glm-5.2"),
+      modelFamilyId: Option.none(),
+      displayName: "GLM 5.2",
+      supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+      contextWindow: 1048576,
+      maxOutputTokens: 128000,
+      memory: Option.none(),
+      capabilities: {
+        vision: false,
+        tools: true,
+        structuredOutput: false,
+        reasoning: {
+          supported: true,
+          efforts: [ReasoningEffortSchema.make("high")],
+          defaultEffort: Option.some(ReasoningEffortSchema.make("high")),
+        },
+      },
+      availability: { _tag: "Available" },
+      pricing: Option.none(),
+    }], [{
+      providerId,
+      displayName: "OpenRouter",
+      kind: "Custom",
+      authentication: "Authenticated",
+      availability: { _tag: "Available" },
+    }])
+
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      _tag: "Provider",
+      provider: { displayName: "OpenRouter", kind: "Custom" },
+      model: { displayName: "GLM 5.2" },
+    })
+  })
+
   test("represents an installed target once before and after offering creation", () => {
     const withoutOffering = makeView({
       ready: false,
@@ -138,6 +185,13 @@ describe("models menu entries", () => {
         Degraded: ({ models }) => models,
         Unavailable: () => [],
       }),
+      ProviderModelCatalogLifecycle.match(view.catalog, {
+        Loading: () => [],
+        Ready: ({ providers }) => providers,
+        Refreshing: ({ providers }) => providers,
+        Degraded: ({ providers }) => providers,
+        Unavailable: ({ providers }) => providers,
+      }),
     )
 
     const before = entriesFor(withoutOffering)
@@ -147,6 +201,12 @@ describe("models menu entries", () => {
     expect(before[0]?.id).toBe(after[0]?.id)
     expect(before[0]?._tag).toBe("Local")
     expect(after[0]?._tag).toBe("Local")
+    expect(modelsMenuEntryIsSelected(before[0]!, Option.none())).toBe(false)
+    expect(modelsMenuEntryIsSelected(after[0]!, Option.none())).toBe(false)
+    expect(modelsMenuEntryIsSelected(
+      after[0]!,
+      Option.some({ providerId: ProviderIdSchema.make("local"), providerModelId: TEST_MODEL_ID }),
+    )).toBe(true)
     expect(Option.getOrThrow(modelsMenuSelectionAction(before[0]!))).toMatchObject({
       _tag: "CreateOffering",
       configurationId: makeCatalogCandidate().configurationId,

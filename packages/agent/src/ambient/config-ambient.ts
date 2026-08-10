@@ -36,6 +36,9 @@ export const SlotConfigSchema = Schema.Struct({
 export type SlotConfig = typeof SlotConfigSchema.Type
 
 export const AgentSlotStateSchema = Schema.Union(
+  Schema.TaggedStruct('Unassigned', {
+    slotId: Schema.Literal('primary', 'secondary'),
+  }),
   Schema.TaggedStruct('Ready', {
     config: SlotConfigSchema,
   }),
@@ -45,6 +48,7 @@ export const AgentSlotStateSchema = Schema.Union(
   }),
 )
 export type AgentSlotState = typeof AgentSlotStateSchema.Type
+export type UnassignedAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unassigned' }>
 export type ReadyAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Ready' }>
 export type UnavailableAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unavailable' }>
 
@@ -64,7 +68,7 @@ export const sameConfigStateValue = (left: ConfigState, right: ConfigState): boo
 
 export function getSlotConfig(state: ConfigState, slotId: SlotId): SlotConfig {
   const slot = state.bySlot[slotId]
-  if (slot._tag === 'Unavailable') throw new NoModelForSlotError(slotId)
+  if (slot._tag !== 'Ready') throw new NoModelForSlotError(slotId)
   return slot.config
 }
 
@@ -106,7 +110,10 @@ export function buildConfigStateFromSlots(
   const buildSlot = (slotId: SlotId): AgentSlotState => {
     const slot = slots[slotId]
     if (slot._tag === 'Unassigned') {
-      return { _tag: 'Unavailable', slotId, reason: slot._tag }
+      return { _tag: 'Unassigned', slotId }
+    }
+    if (slot.availability._tag === 'Unavailable') {
+      return { _tag: 'Unavailable', slotId, reason: slot.availability.failure.code }
     }
     const selectedModel = catalogModels.find((model) => model.providerId === slot.selection.providerId
       && model.providerModelId === slot.selection.providerModelId)

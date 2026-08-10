@@ -113,7 +113,7 @@ export const ProviderModelFields = {
     structuredOutput: Schema.Boolean,
   }),
   availability: ProviderModelAvailabilitySchema,
-  pricing: ModelPricingInfoSchema,
+  pricing: Schema.optionalWith(ModelPricingInfoSchema, { as: "Option", exact: true }),
 } as const
 export const ProviderModelSchema = Schema.Struct(ProviderModelFields).pipe(Schema.filter((model) => {
   const reasoning = model.properties.reasoning
