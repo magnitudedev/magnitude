@@ -1,5 +1,0 @@
----
-"@magnitudedev/cli": patch
----
-
-local
