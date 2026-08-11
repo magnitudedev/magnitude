@@ -1,6 +1,6 @@
 import { useMemo } from "react"
-import { Cause, Duration, Effect, Schedule, Schema, Stream } from "effect"
-import { Result, useAtomMount, useAtomValue, type Atom } from "@effect-atom/atom-react"
+import { Cause, Duration, Effect, Equivalence, Option, Schedule, Schema, Stream } from "effect"
+import { Atom, Result, useAtomMount, useAtomValue } from "@effect-atom/atom-react"
 import * as Reactivity from "@effect/experimental/Reactivity"
 import type * as Rpc from "@effect/rpc/Rpc"
 import type * as RpcGroup from "@effect/rpc/RpcGroup"
@@ -91,6 +91,52 @@ export function useMirroredState<
 }): Result.Result<Snapshot, Error | RpcClientError> {
   const queryAtom = useMirroredStateAtom(definition)
   return useAtomValue(queryAtom)
+}
+
+/**
+ * Selects a semantically stable value from one mirrored-state query.
+ *
+ * The selector remains a read-only projection of the canonical query atom. Its
+ * retained value is only an equality cache: when a fresh snapshot projects to
+ * an equivalent value, consumers keep the previous reference and do not
+ * rerender. No server state is copied into a writable client atom.
+ */
+export function useMirroredStateSelector<
+  const Id extends Rpc.Tag<MagnitudeRpc>,
+  Snapshot,
+  SnapshotEncoded,
+  SnapshotRequirements,
+  Error,
+  ErrorEncoded,
+  ErrorRequirements,
+  Selection,
+>(
+  definition: {
+    readonly id: Id
+    readonly getPayload: RpcPayload<Id>
+    readonly snapshotSchema: Schema.Schema<Snapshot, SnapshotEncoded, SnapshotRequirements>
+    readonly errorSchema: Schema.Schema<Error, ErrorEncoded, ErrorRequirements>
+  },
+  selector: (snapshot: Snapshot) => Selection,
+  equivalent: Equivalence.Equivalence<Selection>,
+): Option.Option<Selection> {
+  const queryAtom = useMirroredStateAtom(definition)
+  const selectorAtom = useMemo(() => {
+    let previousSelection = Option.none<Selection>()
+    return Atom.make((get) => Option.map(
+      Result.value(get(queryAtom)),
+      (snapshot) => {
+        const nextSelection = selector(snapshot)
+        if (Option.isSome(previousSelection)
+          && equivalent(previousSelection.value, nextSelection)) {
+          return previousSelection.value
+        }
+        previousSelection = Option.some(nextSelection)
+        return nextSelection
+      },
+    ))
+  }, [equivalent, queryAtom, selector])
+  return useAtomValue(selectorAtom)
 }
 
 /**

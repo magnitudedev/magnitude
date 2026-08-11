@@ -7,7 +7,7 @@
  * terminal layout. No feature logic, no rendering primitives beyond layout
  * boxes and the startup header slot.
  */
-import { useCallback, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, type ReactNode } from "react";
 import { Cause, Option } from "effect";
 import {
   useAtomValue,
@@ -26,20 +26,23 @@ import {
   selectedCwdAtom,
   sessionCreateOptionsAtom,
   useSessionPreload,
-  subscribeEphemeralMessage,
-  getEphemeralMessageSnapshot,
   useFileWatchBridge,
   useOnboardingModelSetup,
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
+  notificationAreaStateAtom,
+  deriveLocalModelPersistentNotificationStates,
+  notificationStatesEquivalent,
+  resolveActiveNotificationState,
+  useLocalModelsSelector,
   useAcnLifecycle,
   type OnboardingModelCommandFailed,
 } from "@magnitudedev/client-common";
 import {
   ReasoningEffortSchema,
   type LocalModelsState,
+  type LocalModel,
   type ModelSlotsState,
-  type ProviderModelCatalogState,
   type SessionOptions,
   type AcnLifecycleState,
 } from "@magnitudedev/sdk";
@@ -78,7 +81,6 @@ import {
 } from "./features/overlays/container";
 import { FileViewerPanelContainer } from "./features/file-viewer/container";
 import { ModelMenusContainer } from "./features/model-menus/container";
-import { deriveLocalModelDownloadSummary } from "./features/local-inference/footer-status";
 import {
   useRecentChatsWidgetState,
   RecentChatsWidgetView,
@@ -278,19 +280,33 @@ function CliAppContent(
 
   const widget = useRecentChatsWidgetState();
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
-  const ephemeralMessage = useSyncExternalStore(
-    subscribeEphemeralMessage,
-    getEphemeralMessageSnapshot
-  );
+  const notificationAreaState = useAtomValue(notificationAreaStateAtom);
   const onboardingSetup = useOnboardingModelSetup();
-  const downloadSummary = deriveLocalModelDownloadSummary(Result.match(
-    onboardingSetup.models,
-    {
-      onInitial: () => null,
-      onFailure: () => null,
-      onSuccess: ({ value }) => value,
-    },
-  ));
+  const modelSlotsState = Result.match(onboardingSetup.slots, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: ({ value }) => value,
+  });
+  const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
+    === "ConfiguredLocal"
+    ? modelSlotsState.slots.primary.selection.providerModelId
+    : null;
+  const selectPersistentNotificationStates = useCallback(
+    (modelsState: LocalModelsState) =>
+      deriveLocalModelPersistentNotificationStates(
+        modelsState,
+        selectedLocalProviderModelId,
+      ),
+    [selectedLocalProviderModelId],
+  );
+  const persistentNotificationStates = useLocalModelsSelector(
+    selectPersistentNotificationStates,
+    notificationStatesEquivalent,
+  );
+  const notificationState = resolveActiveNotificationState(
+    notificationAreaState,
+    Option.getOrElse(persistentNotificationStates, () => []),
+  );
   const { rootSlotId } = useSlotProfiles();
   const localModelLoadActivity = Result.match(onboardingSetup.slots, {
     onInitial: () => null,
@@ -349,7 +365,7 @@ function CliAppContent(
   });
 
   const setupPreparation = (
-    progress: LocalModelsState["recommendations"]["progress"],
+    progress: LocalModelsState["discoveryState"]["progress"],
     error: string | null
   ) => ({
     surface: (
@@ -365,25 +381,15 @@ function CliAppContent(
   });
   const setupWithDomains = (
     models: LocalModelsState,
-    catalog: ProviderModelCatalogState,
     slots: ModelSlotsState
   ) => {
-    if (models.recommendations._tag === "Loading") {
-      return setupPreparation(models.recommendations.progress, null);
+    if (models.discoveryState._tag === "Loading") {
+      return setupPreparation(models.discoveryState.progress, null);
     }
-    if (models.recommendations._tag === "Failed") {
+    if (models.discoveryState._tag === "Failed") {
       return setupPreparation(
-        models.recommendations.progress,
-        models.recommendations.failure.message
-      );
-    }
-    if (catalog._tag === "Loading") {
-      return setupPreparation(models.recommendations.progress, null);
-    }
-    if (catalog._tag === "Unavailable") {
-      return setupPreparation(
-        models.recommendations.progress,
-        "The model catalog is unavailable."
+        models.discoveryState.progress,
+        models.discoveryState.failure.message
       );
     }
     const setupView = deriveOnboardingModelSetupView({
@@ -394,6 +400,17 @@ function CliAppContent(
       models,
       slots,
     });
+    const retryConfiguration = (model: LocalModel) => {
+      if (model.servingState._tag !== "Assessed") return;
+      configureOnboardingModel({
+        configurationId: model.servingState.configuration.id,
+        displayName: model.presentation.displayName,
+        reasoningEffort: Option.getOrElse(
+          model.servingState.capabilities.reasoning.defaultEffort,
+          () => ReasoningEffortSchema.make("none")
+        ),
+      });
+    };
     const surface = (() => {
       switch (setupView._tag) {
         case "Inactive":
@@ -403,25 +420,16 @@ function CliAppContent(
             <OnboardingModelChooser
               hardware={onboardingSetup.hardware}
               models={models}
-              catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
               error={configurationMutationError}
               operation={{
                 _tag: "Downloading",
-                candidate: setupView.candidate,
+                model: setupView.model,
                 cancelling: onboardingSetup.cancelling,
                 cancelError: cancelDownloadError,
                 onCancel: cancelOnboardingModelSetup,
-                onRetry: () =>
-                  configureOnboardingModel({
-                    configurationId: setupView.candidate.configurationId,
-                    displayName: setupView.candidate.displayName,
-                    reasoningEffort: Option.getOrElse(
-                      setupView.candidate.capabilities.reasoning.defaultEffort,
-                      () => ReasoningEffortSchema.make("none")
-                    ),
-                  }),
+                onRetry: () => retryConfiguration(setupView.model),
               }}
               onLoad={loadOnboardingModel}
               onSelectConfiguration={configureOnboardingModel}
@@ -434,23 +442,14 @@ function CliAppContent(
             <OnboardingModelChooser
               hardware={onboardingSetup.hardware}
               models={models}
-              catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
               error={null}
               operation={{
                 _tag: "DownloadFailed",
-                candidate: setupView.candidate,
+                model: setupView.model,
                 onChooseAnother: cancelOnboardingModelSetup,
-                onRetry: () =>
-                  configureOnboardingModel({
-                    configurationId: setupView.candidate.configurationId,
-                    displayName: setupView.candidate.displayName,
-                    reasoningEffort: Option.getOrElse(
-                      setupView.candidate.capabilities.reasoning.defaultEffort,
-                      () => ReasoningEffortSchema.make("none")
-                    ),
-                  }),
+                onRetry: () => retryConfiguration(setupView.model),
               }}
               onLoad={loadOnboardingModel}
               onSelectConfiguration={configureOnboardingModel}
@@ -463,13 +462,12 @@ function CliAppContent(
             <OnboardingModelChooser
               hardware={onboardingSetup.hardware}
               models={models}
-              catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
               error={configurationMutationError}
               operation={{
                 _tag: "Configuring",
-                candidate: setupView.candidate,
+                model: setupView.model,
               }}
               onLoad={loadOnboardingModel}
               onSelectConfiguration={configureOnboardingModel}
@@ -482,7 +480,6 @@ function CliAppContent(
             <OnboardingModelChooser
               hardware={onboardingSetup.hardware}
               models={models}
-              catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
               error={
@@ -514,7 +511,6 @@ function CliAppContent(
             <OnboardingModelChooser
               hardware={onboardingSetup.hardware}
               models={models}
-              catalog={catalog}
               slots={slots}
               width={chatColumnWidth}
               error={
@@ -543,26 +539,15 @@ function CliAppContent(
         onFailure: () =>
           setupPreparation([], "Local model discovery is unavailable."),
         onSuccess: ({ value: models }) =>
-          Result.match(onboardingSetup.catalog, {
+          Result.match(onboardingSetup.slots, {
             onInitial: () =>
-              setupPreparation(models.recommendations.progress, null),
+              setupPreparation(models.discoveryState.progress, null),
             onFailure: () =>
               setupPreparation(
-                models.recommendations.progress,
-                "The model catalog is unavailable."
+                models.discoveryState.progress,
+                "Model selection is unavailable."
               ),
-            onSuccess: ({ value: catalog }) =>
-              Result.match(onboardingSetup.slots, {
-                onInitial: () =>
-                  setupPreparation(models.recommendations.progress, null),
-                onFailure: () =>
-                  setupPreparation(
-                    models.recommendations.progress,
-                    "Model selection is unavailable."
-                  ),
-                onSuccess: ({ value: slots }) =>
-                  setupWithDomains(models, catalog, slots),
-              }),
+            onSuccess: ({ value: slots }) => setupWithDomains(models, slots),
           }),
       });
   const setupSurface = setupPresentation.surface;
@@ -659,7 +644,7 @@ function CliAppContent(
                 )}
               </box>
               {menu.open && !props.modelSetupActive ? (
-                <ModelMenusContainer downloadSummary={downloadSummary} />
+                <ModelMenusContainer notificationState={notificationState} />
               ) : (
                 <ComposerContainer
                   chatColumnWidth={chatColumnWidth}
@@ -673,6 +658,7 @@ function CliAppContent(
                   modelSetupPlaceholder={
                     props.modelSetupActive ? modelSetupPlaceholder : null
                   }
+                  notificationState={notificationState}
                 />
               )}
             </box>
@@ -683,18 +669,6 @@ function CliAppContent(
               color={theme.success}
               background={theme.surface}
               text="Copied to clipboard"
-            />
-          )}
-          {ephemeralMessage && (
-            <Toast
-              color={
-                ephemeralMessage.color ??
-                (ephemeralMessage.tone === "warning"
-                  ? theme.warning
-                  : theme.error)
-              }
-              background={theme.surface}
-              text={ephemeralMessage.text}
             />
           )}
         </box>

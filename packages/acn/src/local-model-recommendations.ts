@@ -11,17 +11,13 @@ import {
 import { createHash } from "node:crypto"
 import {
   LocalModelMutationFailed,
-  LocalModelCatalogCandidateMetadataSchema,
   ModelFailureSchema,
-  ModelServingConfigurationSchema,
   LocalModelRecommendationProgressStepSchema,
-  RecommendationSchema,
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
   type ServableModelBundle,
   type ModelFailure,
   type ModelServingConfiguration,
-  type Recommendation,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
@@ -33,6 +29,7 @@ import {
   assembleRecommendationCatalogCandidates,
   selectRecommendationPortfolio,
   type RecommendationCandidate,
+  type RecommendationSelection,
 } from "./local-model-recommendation-policy"
 
 type RecommendationState =
@@ -42,8 +39,8 @@ type RecommendationState =
     }
   | {
       readonly _tag: "Ready"
-      readonly recommendations: readonly Recommendation[]
-      readonly catalog: readonly CatalogEntry[]
+      readonly recommendations: readonly RecommendationSelection[]
+      readonly catalog: readonly RecommendationCandidate[]
       readonly progress: readonly LocalModelRecommendationProgressStep[]
     }
   | {
@@ -81,9 +78,6 @@ export interface LocalModelRecommendationsApi {
     readonly revision: number
     readonly state: RecommendationState
   }>
-  readonly getCatalogByConfigurationId: (
-    configurationId: ModelServingConfiguration["id"]
-  ) => Effect.Effect<Option.Option<CatalogEntry>>
 }
 
 export class LocalModelRecommendations extends Context.Tag(
@@ -119,51 +113,6 @@ const exactTensorStorageBytes = (
   }
   return Option.some(total)
 }
-
-const bundlePackages = (model: RecommendableModel) =>
-  model.configuration.bundle._tag === "Standalone"
-    ? [model.configuration.bundle.package]
-    : [model.configuration.bundle.target, model.configuration.bundle.draft]
-
-const CatalogEntrySchema = Schema.Struct({
-  candidate: LocalModelCatalogCandidateMetadataSchema,
-  configuration: ModelServingConfigurationSchema,
-})
-type CatalogEntry = typeof CatalogEntrySchema.Type
-
-const catalogProjection = (
-  candidate: RecommendationCandidate,
-): CatalogEntry => ({
-  candidate: {
-    configurationId: candidate.assessment.configurationId,
-    assessmentId: candidate.assessment.assessmentId,
-    environmentId: candidate.assessment.environmentId,
-    displayName: candidate.model.displayName,
-    description: candidate.model.description,
-    license: candidate.model.license,
-    profile: candidate.profile,
-    downloadBytes: candidate.totalDownloadBytes,
-    quantization: bundlePackages(candidate.model)
-      .map(({ properties }) => properties.quantization)
-      .join(" + "),
-    quantizationName: bundlePackages(candidate.model)
-      .map(({ properties }) => properties.quantizationName)
-      .join(" + "),
-    memory: candidate.assessment.memory,
-    recommendationEvidence: Option.some({
-      intelligence: Option.fromNullable(candidate.capability),
-      fidelityRank: candidate.fidelityRank,
-      qualityEvidence: candidate.model.qualityEvidence,
-    }),
-    performance: candidate.assessment.performance,
-    capabilities: candidate.model.capabilities,
-    sources: bundlePackages(candidate.model).map((modelPackage) => ({
-      source: modelPackage.source,
-      files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
-    })),
-  },
-  configuration: candidate.model.configuration,
-})
 
 const pendingProgress = (
   id: LocalModelRecommendationProgressStepId
@@ -213,12 +162,23 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       const lastInputDigest = yield* Ref.make<Option.Option<string>>(
         Option.none()
       )
-      const recommendationsEquivalent = Schema.equivalence(
-        Schema.Array(RecommendationSchema)
-      )
-      const catalogEquivalent = Schema.equivalence(
-        Schema.Array(CatalogEntrySchema)
-      )
+      const recommendationsEquivalent = (
+        left: readonly RecommendationSelection[],
+        right: readonly RecommendationSelection[],
+      ): boolean => left.length === right.length && left.every((entry, index) => {
+        const other = right[index]
+        return other !== undefined
+          && entry.id === other.id
+          && entry.configurationId === other.configurationId
+          && entry.recommendableModelId === other.recommendableModelId
+          && entry.displayName === other.displayName
+          && entry.intent === other.intent
+          && entry.explanation === other.explanation
+      })
+      const catalogEquivalent = (
+        left: readonly RecommendationCandidate[],
+        right: readonly RecommendationCandidate[],
+      ): boolean => JSON.stringify(left) === JSON.stringify(right)
       const failuresEquivalent = Schema.equivalence(ModelFailureSchema)
       const progressEquivalent = Schema.equivalence(
         Schema.Array(LocalModelRecommendationProgressStepSchema)
@@ -535,7 +495,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             const catalogCandidates = assembleRecommendationCatalogCandidates(
               evaluated,
               selected
-            ).map(catalogProjection)
+            )
             progress = updateProgress(progress, "recommendations", {
               status: {
                 _tag: "Completed",
@@ -627,17 +587,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       return LocalModelRecommendations.of({
         snapshot: mirror.get,
         changes: mirror.changes,
-        getCatalogByConfigurationId: (configurationId) =>
-          mirror.get.pipe(
-            Effect.map(({ state }) =>
-              state._tag === "Ready"
-                ? Option.fromNullable(state.catalog.find(
-                    (entry) =>
-                      entry.configuration.id === configurationId
-                  ))
-                : Option.none()
-            )
-          ),
       })
     })
   )

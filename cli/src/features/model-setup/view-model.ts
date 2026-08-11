@@ -1,8 +1,12 @@
 import { Option } from "effect"
-import type { OnboardingModelSubmission } from "@magnitudedev/client-common"
+import {
+  findLocalModelByConfigurationId,
+  type OnboardingModelSubmission,
+} from "@magnitudedev/client-common"
 import type {
-  LocalModelCatalogCandidate,
+  LocalModel,
   LocalModelsState,
+  ModelInstanceFailure,
   ModelSlotsState,
   ProviderModelId,
   ReasoningEffort,
@@ -11,16 +15,16 @@ import type {
 export type OnboardingModelSetupView =
   | { readonly _tag: "Inactive" }
   | { readonly _tag: "Choosing" }
-  | { readonly _tag: "Downloading"; readonly candidate: LocalModelCatalogCandidate }
-  | { readonly _tag: "DownloadFailed"; readonly candidate: LocalModelCatalogCandidate }
-  | { readonly _tag: "Configuring"; readonly candidate: LocalModelCatalogCandidate }
+  | { readonly _tag: "Downloading"; readonly model: LocalModel }
+  | { readonly _tag: "DownloadFailed"; readonly model: LocalModel }
+  | { readonly _tag: "Configuring"; readonly model: LocalModel }
   | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
       readonly reasoningEffort: ReasoningEffort
       readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
-      readonly failure: string | null
+      readonly failure: ModelInstanceFailure | null
     }
 
 type ActivatingView = Extract<OnboardingModelSetupView, { readonly _tag: "Activating" }>
@@ -29,7 +33,7 @@ const activatingView = (
   choice: OnboardingModelSubmission["choice"],
   providerModelId: ProviderModelId,
   phase: ActivatingView["phase"],
-  failure: string | null = null,
+  failure: ModelInstanceFailure | null = null,
 ): ActivatingView => ({
   _tag: "Activating",
   providerModelId,
@@ -71,23 +75,24 @@ export const deriveOnboardingModelSetupView = ({
   if (submission === null) return { _tag: "Choosing" }
 
   const choice = submission.choice
-  const candidate = submission._tag === "ConfigureThenLoad"
-    && models.recommendations._tag === "Ready"
-    ? models.recommendations.catalog.find(({ configurationId }) =>
-        configurationId === submission.choice.configurationId)
+  const model = submission._tag === "ConfigureThenLoad"
+    ? Option.getOrUndefined(findLocalModelByConfigurationId(
+        models.models,
+        submission.choice.configurationId,
+      ))
     : undefined
-  if (candidate?.download._tag === "Failed") {
-    return { _tag: "DownloadFailed", candidate }
+  if (model?.acquisitionState._tag === "Failed") {
+    return { _tag: "DownloadFailed", model }
   }
-  if (candidate?.download._tag === "Cancelled") return { _tag: "Choosing" }
-  if (candidate?.download._tag === "Downloading") {
-    return { _tag: "Downloading", candidate }
+  if (model?.acquisitionState._tag === "Cancelled") return { _tag: "Choosing" }
+  if (model?.acquisitionState._tag === "Downloading") {
+    return { _tag: "Downloading", model }
   }
   if (submission._tag === "ConfigureThenLoad"
-    && candidate?.download._tag === "Downloaded"
+    && model?.acquisitionState._tag === "Installed"
     && submitting
     && Option.isNone(providerModelId)) {
-    return { _tag: "Configuring", candidate }
+    return { _tag: "Configuring", model }
   }
 
   const primary = slots.slots.primary
@@ -106,7 +111,7 @@ export const deriveOnboardingModelSetupView = ({
         choice,
         primary.selection.providerModelId,
         "Failed",
-        lifecycle.failure.message,
+        lifecycle.failure,
       )
     }
   }
@@ -114,9 +119,9 @@ export const deriveOnboardingModelSetupView = ({
 
   if (!submitting) return { _tag: "Choosing" }
   if (submission._tag === "ConfigureThenLoad"
-    && candidate !== undefined
-    && candidate.download._tag !== "Downloaded") {
-    return { _tag: "Downloading", candidate }
+    && model !== undefined
+    && model.acquisitionState._tag !== "Installed") {
+    return { _tag: "Downloading", model }
   }
   return Option.match(providerModelId, {
     onNone: () => ({ _tag: "Choosing" as const }),
@@ -128,9 +133,9 @@ export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView):
   switch (view._tag) {
     case "Inactive": return null
     case "Choosing": return "Select a model to start coding…"
-    case "Downloading": return `Downloading ${view.candidate.displayName}…`
-    case "DownloadFailed": return `Couldn’t download ${view.candidate.displayName}`
-    case "Configuring": return `Configuring ${view.candidate.displayName}…`
+    case "Downloading": return `Downloading ${view.model.presentation.displayName}…`
+    case "DownloadFailed": return `Couldn’t download ${view.model.presentation.displayName}`
+    case "Configuring": return `Configuring ${view.model.presentation.displayName}…`
     case "Activating":
       return view.phase === "Loading"
         ? `Loading ${view.displayName}…`

@@ -253,7 +253,6 @@ const makeHarness = (options: {
         },
       }),
       changes: Stream.empty,
-      getCatalogByConfigurationId: () => Effect.succeed(Option.none()),
     })),
     Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
       list: Ref.get(offerings),

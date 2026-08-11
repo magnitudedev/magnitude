@@ -1,4 +1,5 @@
 import { useCallback, useMemo } from "react"
+import type { Equivalence } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
   LocalInferenceHardwareMirror,
@@ -7,6 +8,7 @@ import {
   ProviderModelCatalogMirror,
   type ModelInstanceId,
   type DownloadAttemptId,
+  type LocalModelsState,
   type ModelServingConfigurationId,
   type ProviderModelId,
   type ProviderModelIdentity,
@@ -14,7 +16,7 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { useMirroredState } from "./use-mirrored-state"
+import { useMirroredState, useMirroredStateSelector } from "./use-mirrored-state"
 
 export const useLocalInferenceHardware = () =>
   Result.map(useMirroredState(LocalInferenceHardwareMirror), ({ state }) => state)
@@ -22,6 +24,21 @@ export type LocalInferenceHardwareResult = ReturnType<typeof useLocalInferenceHa
 
 export const useLocalModels = () =>
   Result.map(useMirroredState(LocalModelsMirror), ({ state }) => state)
+
+export const useLocalModelsSelector = <Selection,>(
+  selector: (state: LocalModelsState) => Selection,
+  equivalent: Equivalence.Equivalence<Selection>,
+) => {
+  const snapshotSelector = useCallback(
+    ({ state }: { readonly state: LocalModelsState }) => selector(state),
+    [selector],
+  )
+  return useMirroredStateSelector(
+    LocalModelsMirror,
+    snapshotSelector,
+    equivalent,
+  )
+}
 
 export const useModelSlots = () =>
   Result.map(useMirroredState(ModelSlotsMirror), ({ state }) => state)

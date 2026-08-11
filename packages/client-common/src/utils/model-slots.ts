@@ -6,30 +6,22 @@ import {
   type ModelInstanceId,
   type ModelReleaseReason,
   type ModelSlot,
-  type LocalModelCatalogCandidate,
+  type LocalModel,
   type LocalModelsState,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
   type SlotId,
 } from "@magnitudedev/sdk"
-export const deriveSelectedLocalModelCandidate = (
+import { localModelProviderModelId } from "../local-models/projection"
+export const deriveSelectedLocalModel = (
   models: LocalModelsState,
   slots: ModelSlotsState,
-): LocalModelCatalogCandidate | null => {
+): LocalModel | null => {
   const primary = slots.slots.primary
-  if (primary._tag === "Unassigned" || models.recommendations._tag !== "Ready") return null
-  const configurationId = Option.getOrUndefined(Option.firstSomeOf(models.models.map((model) =>
-    model.readiness._tag === "Assessed" && Option.exists(
-      model.readiness.offering,
-      ({ providerModelId }) => providerModelId === primary.selection.providerModelId,
-    )
-      ? Option.some(model.readiness.configuration.id)
-      : Option.none())))
-  if (configurationId === undefined) return null
-  return models.recommendations.catalog.find((candidate) =>
-    candidate.configurationId === configurationId)
-    ?? null
+  if (primary._tag === "Unassigned") return null
+  return models.models.find((model) =>
+    Option.contains(localModelProviderModelId(model), primary.selection.providerModelId)) ?? null
 }
 
 type AssignedSlot = Exclude<ModelSlot, { readonly _tag: "Unassigned" }>

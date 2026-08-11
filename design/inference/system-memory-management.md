@@ -2,23 +2,14 @@
 applies_to:
   - inference/crates/icn-hardware/**
   - inference/crates/icn-contracts/src/**
-  - inference/crates/icn-server/src/main.rs
-  - inference/crates/icn-server/src/memory_supervisor.rs
-  - packages/acn/src/local-inference-hardware.ts
-  - packages/acn/src/local-model-*.ts
-  - packages/acn/src/model-slot-controller.ts
-  - packages/acn/src/model-slot-projection.ts
-  - packages/acn/src/model-request-preparation.ts
-  - packages/agent/src/errors/model-start.ts
-  - packages/acn-protocol/src/schemas/model-state.ts
-  - packages/sdk/src/index.ts
-  - packages/client-common/src/utils/model-memory.ts
-  - packages/client-common/src/utils/model-slots.ts
-  - cli/src/app.tsx
-  - cli/src/features/composer/**
-  - cli/src/features/local-inference/footer-status.tsx
-  - cli/src/features/model-menus/**
-  - cli/src/features/agent-status/**
+  - inference/crates/icn-server/**
+  - packages/acn/src/local-inference-**
+  - packages/acn/src/local-model-**
+  - packages/acn/src/model-slot-**
+  - packages/acn-protocol/src/**
+  - packages/client-common/src/hooks/**
+  - cli/src/features/local-inference/**
+  - cli/src/features/model-*/**
 ---
 
 # System memory management
@@ -28,15 +19,22 @@ Assessment decides what a machine can normally serve, admission decides whether 
 now, and eviction protects the machine when conditions change. These decisions must use the same
 physical memory domains and peak-memory evidence.
 
+The ownership and normalization rules in
+[Client, ACN, and ICN ownership](../cross-boundary/client-acn-icn-ownership.md) apply. In
+particular, platform-specific memory mechanisms terminate inside ICN, while Magnitude warning
+policy belongs to ACN.
+
 ## Policy
 
-For total physical system memory `T`:
+For total physical system memory `T`, ICN owns:
 
 ```text
-warning reserve W = max(20% of T, 4 GiB)
 assess reserve  S = max(10% of T, 2 GiB)
 abort reserve   B = max( 5% of T, 1 GiB)
 ```
+
+ACN independently owns recommended application headroom `H = max(20% of T, 4 GiB)`. `H` is
+advisory product policy; it does not participate in assessment, admission, or eviction.
 
 For a serving profile, `M` is the native planner's complete predicted system-domain allocation:
 weights, context and KV, compute buffers, projector allocations, and target/draft allocations.
@@ -53,18 +51,17 @@ configured per-request context.
 Stable compatibility ignores current activity:
 
 ```text
-compatible iff M + max(product reserve, S) <= T
-capacity warning iff compatible and M + W > T
+compatible iff M + S <= T
 ```
 
 Assessment publishes the factual byte accounting for every physical memory domain: capacity,
-required allocation, compatibility reserve, warning reserve, and remaining compatible headroom.
-It does not persist presentation categories such as comfortable, tight, or too large. ACN and
-clients derive compatibility and warning presentation directly from those quantities; catalog
-availability is not a second capacity signal.
+required allocation, compatibility reserve, and remaining compatible headroom. It does not publish
+or persist application warning thresholds or presentation categories. ACN trusts the terminal
+`Fits` / `DoesNotFit` result and applies its own recommended-headroom policy only to fitting
+configurations; catalog availability is not a second capacity signal.
 
-Internal capacity assessments name the post-reserve quantity `usable_capacity_bytes`. The term
-`available` is reserved for live observations such as `current_available_bytes`; it never denotes
+Internal capacity assessments name the post-reserve quantity `usable_capacity_bytes`. The terms
+`physical available` and `allocation headroom` are reserved for live observations; neither denotes
 cached compatibility capacity.
 
 Reserve selection produces one fingerprinted hardware snapshot whose topology contains the
@@ -72,17 +69,18 @@ resulting stable capacity for every domain and device-local limit. Planning work
 accounting, and cache validation consume that same snapshot. They cannot receive or apply a second
 reserve policy after topology capture.
 
-Load admission uses a fresh whole-system availability sample `A`, taken again after planning and
-immediately before the worker is created:
+Load admission uses a fresh normalized allocation-headroom sample `A`, taken again after planning
+and immediately before the worker is created:
 
 ```text
 admit iff A > M + B
 ```
 
 Unknown peak evidence and a native `DoesNotFit` result fail closed. Every successful hardware
-snapshot includes a current whole-system availability measurement; inability to obtain one fails
-the snapshot rather than publishing an unknown value. Windows commit availability is an additional
-independent gate using the same admission, eviction, and recovery boundaries.
+snapshot includes both physical memory and normalized system-allocation capacity/headroom;
+inability to obtain any platform input required for the normalized observation fails the snapshot
+rather than publishing an unknown value. On Windows, commit accounting is an internal platform
+input to the common allocation values and never appears as a separate public contract branch.
 
 Memory-domain identity is one typed physical-topology concept shared by discovery, planning,
 assessment, cache validation, and resident allocation accounting. The planner and hardware topology
@@ -124,24 +122,29 @@ enter pressure recovery.
 ## Memory domains
 
 A physical allocation is charged once. Unified CPU/GPU allocations use the system reserve.
-Dedicated device domains retain their independent product reserve; the larger system reserve is
-never subtracted from dedicated VRAM. UI loadability compares current system availability only
-with the assessment's system-domain requirement. Because loading replaces the singleton worker
-before admission, the UI adds the current resident worker's system-domain allocation to predicted
-post-unload availability.
+Dedicated device domains retain their independent ICN assessment reserve; the larger system
+reserve is never subtracted from dedicated VRAM. ACN current-headroom guidance compares ICN's
+normalized allocation headroom with the assessment's system-domain requirement. Because loading
+replaces the singleton worker before admission, ACN credits the current resident worker's
+system-domain allocation once, capped by ICN's normalized allocation capacity.
 
 ## Product behavior
 
-ICN owns and publishes the thresholds. ACN and clients consume the values rather than reconstructing
-the formulas. A resident worker failure is published with its configuration identity and becomes a
-typed slot residency-loss state.
+ICN owns and publishes the assessment and abort thresholds. ACN owns the recommended-headroom
+formula and publishes derived application guidance; clients consume that guidance rather than
+reconstructing it. A resident worker failure is published with its configuration identity and
+becomes a typed slot residency-loss state.
 
 An assigned model remains configured while it is loading, unloaded, or blocked. Loadability is
 separate, transient state; a failed load must not erase the selection or make the client report that
-no provider is configured. Admission failures are generic model-not-ready results from the
-pre-provider preparation phase, not provider or network failures, so they do not enter connection
-retry/backoff handling. Their typed code, message, and whether a later manual retry may succeed are
-preserved without exposing local-inference concepts in the provider contract.
+no provider is configured. Admission failures are model-not-ready results from the pre-provider
+preparation phase, not provider or network failures, so they do not enter connection retry/backoff
+handling. A low-memory failure preserves the required allocation, normalized allocation headroom,
+safety reserve, strict load boundary, minimum additional availability, and
+parallel sequence count. Other operation failures preserve their typed code, message, and whether
+a later manual retry may succeed. These facts stay on the model-instance boundary without exposing
+local-inference concepts in the provider contract, and clients own their presentation rather than
+parsing server prose.
 
 The Models menu keeps `REQUIREMENTS` and uses `STATUS` for:
 
@@ -153,6 +156,22 @@ The Models menu keeps `REQUIREMENTS` and uses `STATUS` for:
 low-memory rejection during load or termination during serving appears in the activity rail as:
 
 `Model stopped · Low memory - close memory-intensive apps and try again`
+
+The CLI footer notification area also projects insufficient current headroom for the selected
+local model as `! Low memory: close memory-intensive apps (need X.Y GB) to load model`, using the
+published minimum additional availability. In the composer's two-row footer layout, it is presented
+compactly as `! Low memory: Free X.Y GB to load`. This warning persists while the authoritative
+current-headroom state remains insufficient and takes precedence over download activity; it is not
+an ephemeral response to the selection event.
+
+Onboarding keeps its recommendation and action labels unchanged in the model list. The selected
+model's right-hand detail pane preserves the recommendation explanation and independently presents
+stable fit and current loadability. When current headroom is insufficient, it shows model
+allocation, safety reserve, strict load requirement, current availability, and shortfall before a
+load is attempted. This live guidance is advisory: it neither changes recommendation rank nor
+authorizes loading. If authoritative admission still rejects the attempt, the same pane presents
+the structured low-memory facts and a retry action without exposing the raw diagnostic as primary
+copy.
 
 While the selected local model is ready, the composer footer shows its correlated model-instance allocation
 after context: the sum of the server-published model, context, compute, and auxiliary allocations

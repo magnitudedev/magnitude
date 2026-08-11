@@ -8,13 +8,13 @@ import {
   ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
   RecommendableModelIdSchema,
-  type Recommendation,
 } from "@magnitudedev/acn-protocol"
 import {
   assembleRecommendationCatalogCandidates,
   balancedUtility,
   conservativeGenerationSpeed,
   selectRecommendationPortfolio,
+  type RecommendationSelection,
   type RecommendationCandidate,
 } from "./local-model-recommendation-policy"
 
@@ -120,7 +120,6 @@ const candidate = (input: {
         capacityBytes,
         requiredBytes: runtimeBytes,
         compatibilityReserveBytes: 0,
-        warningReserveBytes: 0,
         remainingBytes: capacityBytes - runtimeBytes,
       }],
       performance: performanceContexts.map((contextTokens) => {
@@ -157,9 +156,9 @@ const candidate = (input: {
 }
 
 const byIntent = (
-  recommendations: readonly Recommendation[],
-  intent: Recommendation["intent"],
-): Recommendation | undefined =>
+  recommendations: readonly RecommendationSelection[],
+  intent: RecommendationSelection["intent"],
+): RecommendationSelection | undefined =>
   recommendations.find((recommendation) => recommendation.intent === intent)
 
 describe("local model multicriteria recommendation policy", () => {
@@ -318,7 +317,6 @@ describe("local model multicriteria recommendation policy", () => {
             capacityBytes: 80 * GIB,
             requiredBytes: 8 * GIB,
             compatibilityReserveBytes: 0,
-            warningReserveBytes: 0,
             remainingBytes: 72 * GIB,
           },
           {
@@ -326,7 +324,6 @@ describe("local model multicriteria recommendation policy", () => {
             capacityBytes: 20 * GIB,
             requiredBytes: 10 * GIB,
             compatibilityReserveBytes: 0,
-            warningReserveBytes: 0,
             remainingBytes: 10 * GIB,
           },
         ],

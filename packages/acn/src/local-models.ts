@@ -2,20 +2,28 @@ import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsMirror,
   ServableModelBundleSchema,
-  type LocalModel,
-  type LocalModelCatalogDownloadState,
-  type LocalModelInstallation,
-  type LocalModelCatalogCandidateAvailability,
-  type LocalModelsState,
-  type ModelFailure,
-  type ServableModelBundle,
-  type ModelPackageEntry,
-  type ProviderModelCatalogEntry,
   servableModelBundlePackageIds,
+  type LocalInferenceHardware,
+  type LocalModel,
+  type LocalModelAcquisitionState,
+  type LocalModelAssessment,
+  type LocalModelAvailabilityState,
+  type LocalModelMemory,
+  type LocalModelPresentation,
+  type LocalModelRecommendation,
+  type LocalModelsState,
+  type MemoryAssessment,
+  type ModelFailure,
+  type ModelPackageEntry,
+  type ModelServingConfiguration,
+  type ProviderModelCatalogEntry,
+  type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
-import type { ModelServingConfigurationId, ProviderModelId } from "@magnitudedev/sdk"
-import { IcnCatalog } from "@magnitudedev/icn"
+import type { ProviderModelId } from "@magnitudedev/ai"
+import { IcnCatalog, IcnInstances } from "@magnitudedev/icn"
+import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
+import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
@@ -33,13 +41,21 @@ import {
   localModelBundleIdentity as bundleIdentity,
 } from "./local-model-configuration-resolver"
 
-interface ModelPresentation {
+const GIB = 1024 ** 3
+
+interface ModelPresentationInput {
   readonly displayName: string
   readonly description: string
+  readonly license?: string
 }
 
 const bundlePackages = (bundle: ServableModelBundle) =>
   bundle._tag === "Standalone" ? [bundle.package] : [bundle.target, bundle.draft]
+
+const bundleDownloadBytes = (bundle: ServableModelBundle): number =>
+  bundlePackages(bundle).reduce((total, modelPackage) => total
+    + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0)
+
 const sourceName = (bundle: ServableModelBundle): string => {
   const primary = bundle._tag === "Standalone" ? bundle.package : bundle.target
   return primary.source._tag === "HuggingFace"
@@ -49,47 +65,50 @@ const sourceName = (bundle: ServableModelBundle): string => {
 
 export const resolveBundlePresentation = (
   bundle: ServableModelBundle,
-  curated: ModelPresentation | undefined,
-): ModelPresentation => curated ?? {
-  displayName: sourceName(bundle),
-  description: "",
-}
+  curated: ModelPresentationInput | undefined,
+): LocalModelPresentation => ({
+  displayName: curated?.displayName ?? sourceName(bundle),
+  description: curated?.description ?? "",
+  license: Option.fromNullable(curated?.license),
+  quantization: bundlePackages(bundle)
+    .map(({ properties }) => properties.quantization)
+    .join(" + "),
+  quantizationName: bundlePackages(bundle)
+    .map(({ properties }) => properties.quantizationName)
+    .join(" + "),
+})
 
 const installedBundle = (
   bundle: ServableModelBundle,
   entries: ReadonlyMap<string, ModelPackageEntry>,
-): LocalModelInstallation | undefined => {
+): Extract<LocalModelAcquisitionState, { readonly _tag: "Installed" }> | undefined => {
   const packages = bundlePackages(bundle)
   const packageEntries = packages.map((modelPackage) => entries.get(modelPackage.id))
   if (!packageEntries.every((entry) => entry?.localState._tag === "Installed")) {
     return undefined
   }
-  const installedBytes = packages.reduce((total, modelPackage, index) =>
-    total + (packageEntries[index]?.localState._tag === "Installed"
-      ? modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0)
-      : 0), 0)
+  const installedBytes = bundleDownloadBytes(bundle)
   const [origin, ...remainingOrigins] = [...new Set(packageEntries.flatMap((entry) =>
     entry?.localState._tag === "Installed" ? [entry.localState.origin] : []))]
   if (origin === undefined) {
     throw new Error("Installed servable model bundle has no installation origin")
   }
-  return { installedBytes, origins: [origin, ...remainingOrigins] }
+  return { _tag: "Installed", installedBytes, origins: [origin, ...remainingOrigins] }
 }
 
-const aggregateDownload = (
+const aggregateAcquisitionState = (
   bundle: ServableModelBundle,
   entries: ReadonlyMap<string, ModelPackageEntry>,
-): LocalModelCatalogDownloadState => {
+): LocalModelAcquisitionState => {
   const packages = bundlePackages(bundle)
   const packageEntries = packages.map((modelPackage) => entries.get(modelPackage.id))
-  const totalBytes = packages.reduce((total, modelPackage) =>
-    total + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0)
+  const totalBytes = bundleDownloadBytes(bundle)
   const installedBytes = packages.reduce((total, modelPackage, index) =>
     total + (packageEntries[index]?.localState._tag === "Installed"
       ? modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0)
       : 0), 0)
   const installation = installedBundle(bundle, entries)
-  if (installation !== undefined) return { _tag: "Downloaded", ...installation }
+  if (installation !== undefined) return installation
 
   const downloading = packageEntries.flatMap((entry) =>
     entry?.localState._tag === "Downloading" ? [entry.localState] : [])
@@ -149,7 +168,7 @@ const aggregateDownload = (
         completedBytes,
         totalBytes,
       }
-    : { _tag: "NotDownloaded", completedBytes, totalBytes }
+    : { _tag: "NotInstalled", completedBytes, totalBytes }
 }
 
 type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
@@ -159,16 +178,17 @@ export const availabilityFromProviderProjection = (
   providerEntries: ReadonlyMap<ProviderModelId, ProviderAvailabilityProjection>,
   projectionCurrent: boolean,
   providerProjectionFailure: Option.Option<ModelFailure>,
-): LocalModelCatalogCandidateAvailability | undefined => {
-  if (providerModelId === undefined) return { _tag: "Available" }
-  if (!projectionCurrent) return undefined
+): LocalModelAvailabilityState => {
+  if (providerModelId === undefined) return { _tag: "Installable" }
+  if (!projectionCurrent) return { _tag: "Preparing", providerModelId }
   const providerEntry = providerEntries.get(providerModelId)
   if (providerEntry?.availability._tag === "Available") {
-    return { _tag: "Available" }
+    return { _tag: "Selectable", providerModelId }
   }
   if (providerEntry?.availability._tag === "Disabled") {
     return {
       _tag: "Unavailable",
+      providerModelId: Option.some(providerModelId),
       failure: {
         code: providerEntry.availability.reason,
         message: providerEntry.availability.reason === "insufficient_resources"
@@ -179,39 +199,123 @@ export const availabilityFromProviderProjection = (
     }
   }
   if (Option.isSome(providerProjectionFailure)) {
-    return { _tag: "Unavailable", failure: providerProjectionFailure.value }
+    return {
+      _tag: "Unavailable",
+      providerModelId: Option.some(providerModelId),
+      failure: providerProjectionFailure.value,
+    }
   }
-  return undefined
+  return { _tag: "Preparing", providerModelId }
 }
 
-const aggregateAvailability = (
-  bundle: ServableModelBundle,
-  entries: ReadonlyMap<string, ModelPackageEntry>,
+const unavailableAssessment = (
+  assessment: Exclude<LocalModelAssessment, { readonly _tag: "Fits" }>,
   providerModelId: ProviderModelId | undefined,
-  providerEntries: ReadonlyMap<ProviderModelId, ProviderModelCatalogEntry>,
-  providerProjectionCurrent: boolean,
-  providerProjectionFailure: Option.Option<ModelFailure>,
-): LocalModelCatalogCandidateAvailability | undefined => {
-  const bundleEntries = servableModelBundlePackageIds(bundle).map((packageId) => entries.get(packageId))
-  if (!bundleEntries.every((entry) => entry?.localState._tag === "Installed")) {
-    return { _tag: "NotDownloaded" }
-  }
-  const failure = bundleEntries.flatMap((entry): readonly ModelFailure[] => {
-    if (entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible") {
-      return [entry.inspection.failure]
+): LocalModelAvailabilityState => ({
+  _tag: "Unavailable",
+  providerModelId: Option.fromNullable(providerModelId),
+  failure: assessment._tag === "Incompatible"
+    ? assessment.failure
+    : {
+        code: "insufficient_resources",
+        message: `This model exceeds available ${assessment.limitingResource} capacity by ${assessment.deficitBytes} bytes`,
+        retryable: false,
+      },
+})
+
+const recommendedSystemHeadroomBytes = (totalBytes: number): number =>
+  Math.max(Math.floor(totalBytes / 5), 4 * GIB)
+
+const allocationBytes = (allocation: Generated.ModelInstanceAllocation["memoryDomains"][number]): number =>
+  allocation.modelBytes
+  + allocation.contextBytes
+  + allocation.computeBytes
+  + allocation.auxiliaryBytes
+
+const residentSystemAllocationBytes = (
+  instances: Generated.ModelInstancesSnapshot,
+  systemDomains: ReadonlySet<string>,
+): number => {
+  const allocations = new Map<string, Generated.ModelInstanceAllocation>()
+  for (const instance of instances.instances) {
+    if (instance.lifecycle._tag === "Ready") {
+      allocations.set(instance.id, instance.lifecycle.allocation)
+    } else if (instance.lifecycle._tag === "Stopping"
+      && instance.lifecycle.allocation._tag === "Resident") {
+      allocations.set(instance.id, instance.lifecycle.allocation.allocation)
     }
-    return []
-  })[0]
-  if (failure) return { _tag: "Unavailable", failure }
-  if (bundleEntries.some((entry) => entry?.inspection._tag === "Pending")) {
-    return undefined
   }
-  return availabilityFromProviderProjection(
-    providerModelId,
-    providerEntries,
-    providerProjectionCurrent,
-    providerProjectionFailure,
+  if (allocations.size > 1) {
+    throw new Error("local-model projection observed multiple resident model instances")
+  }
+  const allocation = allocations.values().next().value as Generated.ModelInstanceAllocation | undefined
+  return allocation?.memoryDomains.reduce((total, domain) =>
+    systemDomains.has(domain.memoryDomainId)
+      ? total + allocationBytes(domain)
+      : total, 0) ?? 0
+}
+
+const projectMemory = (
+  domains: readonly MemoryAssessment[],
+  hardware: LocalInferenceHardware,
+  instances: Generated.ModelInstancesSnapshot,
+): LocalModelMemory => {
+  const systemDomains = new Set(hardware.memoryDomains
+    .filter(({ sharesSystemMemory }) => sharesSystemMemory)
+    .map(({ memoryDomainId }) => memoryDomainId))
+  const systemEvidence = domains.filter(({ memoryDomainId }) =>
+    systemDomains.has(memoryDomainId))
+  const requiredSystemMemoryBytes = systemEvidence.reduce(
+    (total, { requiredBytes }) => total + requiredBytes,
+    0,
   )
+  const totalRequiredBytes = domains.reduce((total, { requiredBytes }) =>
+    total + requiredBytes, 0)
+  const recommendedHeadroomBytes = recommendedSystemHeadroomBytes(
+    hardware.totalSystemMemoryBytes,
+  )
+  const predictedHeadroomBytes = Math.max(
+    0,
+    hardware.totalSystemMemoryBytes - requiredSystemMemoryBytes,
+  )
+  if (systemEvidence.length === 0) {
+    return {
+      domains,
+      totalRequiredBytes,
+      requiredSystemMemoryBytes,
+      systemUseState: predictedHeadroomBytes < recommendedHeadroomBytes
+        ? { _tag: "High", recommendedHeadroomBytes, predictedHeadroomBytes }
+        : { _tag: "WithinRecommendedHeadroom", recommendedHeadroomBytes, predictedHeadroomBytes },
+      currentHeadroomState: { _tag: "NotObserved" },
+    }
+  }
+  const residentBytes = residentSystemAllocationBytes(instances, systemDomains)
+  const allocationHeadroomBytes = Math.min(
+    hardware.systemAllocationCapacityBytes,
+    hardware.systemAllocationHeadroomBytes + residentBytes,
+  )
+  const loadBoundaryBytes = requiredSystemMemoryBytes + hardware.abortReserveBytes
+  const observation = {
+    requiredSystemMemoryBytes,
+    allocationHeadroomBytes,
+    abortReserveBytes: hardware.abortReserveBytes,
+    loadBoundaryBytes,
+  }
+  return {
+    domains,
+    totalRequiredBytes,
+    requiredSystemMemoryBytes,
+    systemUseState: predictedHeadroomBytes < recommendedHeadroomBytes
+      ? { _tag: "High", recommendedHeadroomBytes, predictedHeadroomBytes }
+      : { _tag: "WithinRecommendedHeadroom", recommendedHeadroomBytes, predictedHeadroomBytes },
+    currentHeadroomState: allocationHeadroomBytes > loadBoundaryBytes
+      ? { _tag: "Sufficient", observation }
+      : {
+          _tag: "Insufficient",
+          observation,
+          minimumAdditionalAvailableBytes: loadBoundaryBytes - allocationHeadroomBytes + 1,
+        },
+  }
 }
 
 export interface LocalModelsApi {
@@ -225,21 +329,20 @@ export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
   IcnCatalog | LocalModelPackages | LocalModelRecommendations
-    | LocalModelConfigurationResolver | LocalProviderOfferings | MirroredStateChanges
+    | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
+    | IcnInstances | MirroredStateChanges
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const packages = yield* LocalModelPackages
   const recommendations = yield* LocalModelRecommendations
   const resolver = yield* LocalModelConfigurationResolver
   const offerings = yield* LocalProviderOfferings
+  const hardware = yield* LocalInferenceHardwareService
+  const instances = yield* IcnInstances
   const mirror = yield* makeMirroredState(LocalModelsMirror, {
-    inventory: { _tag: "Initializing" },
+    inventoryState: { _tag: "Initializing" },
     models: [],
-    downloads: [],
-    recommendations: {
-      _tag: "Loading",
-      progress: [],
-    },
+    discoveryState: { _tag: "Loading", progress: [] },
   })
   const equivalent = Schema.equivalence(LocalModelsMirror.stateSchema)
   const lock = yield* Effect.makeSemaphore(1)
@@ -254,14 +357,16 @@ export const LocalModelsLive: Layer.Layer<
     const resolvedConfigurations = yield* resolver.get
     const configured = yield* offerings.list
     const projectedOfferings = yield* offerings.state
+    const hardwareState = (yield* hardware.snapshot).state
+    const instanceState = yield* instances.get
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
     )
     const sameBundle = Schema.equivalence(ServableModelBundleSchema)
-    const providerIdByConfiguration = new Map<ModelServingConfigurationId, ProviderModelId>()
-    for (const offering of configured) {
-      providerIdByConfiguration.set(offering.configuration.id, offering.providerModelId)
-    }
+    const providerIdByConfiguration = new Map(configured.map((offering) => [
+      offering.configuration.id,
+      offering.providerModelId,
+    ]))
     const providerEntries = new Map(
       projectedOfferings.entries.map((entry) => [entry.providerModelId, entry]),
     )
@@ -276,16 +381,13 @@ export const LocalModelsLive: Layer.Layer<
         currentProviderPackageEvidence,
       ),
     )
-    const providerProjectionFailure = Option.map(projectedOfferings.failure, (error): ModelFailure => ({
-      code: "local_model_assessment_unavailable",
-      message: error.message,
-      retryable: "retryable" in error ? error.retryable : true,
-    }))
-    const knownConfigurations = new Map(
-      [...resolvedConfigurations.values()].map(({ configuration }) => [
-        configuration.id,
-        configuration,
-      ]),
+    const providerProjectionFailure = Option.map(
+      projectedOfferings.failure,
+      (error): ModelFailure => ({
+        code: "local_model_assessment_unavailable",
+        message: error.message,
+        retryable: "retryable" in error ? error.retryable : true,
+      }),
     )
 
     const groups = new Map<string, ServableModelBundle>()
@@ -298,174 +400,200 @@ export const LocalModelsLive: Layer.Layer<
         throw new Error(`Servable model bundle ${identity} has conflicting package definitions`)
       }
     }
-    knownConfigurations.forEach((configuration) => {
-      if (installedBundle(configuration.bundle, packageEntries) !== undefined) {
-        addBundle(configuration.bundle)
-      }
-    })
+    for (const { configuration } of resolvedConfigurations.values()) {
+      addBundle(configuration.bundle)
+    }
     for (const entry of packageState.entries) {
       if (entry.localState._tag !== "Installed") continue
       const independentlyServable = entry.package.files.some(({ role }) =>
         role === "weights" || role === "draft")
       if (independentlyServable) addBundle({ _tag: "Standalone", package: entry.package })
     }
-    const configuredById = new Map(configured.map((offering) => [
-      offering.configuration.id,
-      offering,
+
+    const catalogByBundle = new Map(catalogModels.map((model) => [
+      bundleIdentity(model.configuration.bundle),
+      model,
     ]))
-    const downloads = [...knownConfigurations.values()].flatMap((configuration) => {
-      const download = aggregateDownload(configuration.bundle, packageEntries)
-      if (download._tag === "NotDownloaded") return []
-      const catalogModel = catalogModels.find((model) => model.configuration.id === configuration.id)
-      const configuredOffering = configuredById.get(configuration.id)
-      const primaryPackage = configuration.bundle._tag === "Standalone"
-        ? configuration.bundle.package
-        : configuration.bundle.target
-      const inspection = packageEntries.get(primaryPackage.id)?.inspection
-      const capabilities = Option.firstSomeOf([
-        Option.fromNullable(catalogModel).pipe(Option.map(({ capabilities }) => capabilities)),
-        Option.fromNullable(configuredOffering).pipe(
-          Option.map(({ capabilities }) => capabilities),
-        ),
-        inspection?._tag === "Inspected"
-          ? Option.some(inspection.capabilities)
-          : Option.none(),
-      ])
-      return [{
-        configuration,
-        presentation: resolveBundlePresentation(configuration.bundle, catalogModel && {
-          displayName: catalogModel.displayName,
-          description: catalogModel.description,
-        }),
-        capabilities,
-        state: download,
-      }]
-    })
+    const recommendationCandidates = recommendationState._tag === "Ready"
+      ? recommendationState.catalog
+      : []
+    const recommendationsByConfiguration = new Map<string, LocalModelRecommendation[]>()
+    if (recommendationState._tag === "Ready") {
+      for (const recommendation of recommendationState.recommendations) {
+        const entries = recommendationsByConfiguration.get(recommendation.configurationId) ?? []
+        entries.push({
+          id: recommendation.id,
+          intent: recommendation.intent,
+          explanation: recommendation.explanation,
+        })
+        recommendationsByConfiguration.set(recommendation.configurationId, entries)
+      }
+    }
+    const recommendationOrder = new Map(recommendationCandidates.map((candidate, index) => [
+      candidate.model.configuration.id,
+      index,
+    ]))
+
     const models: LocalModel[] = [...groups.values()].map((bundle): LocalModel => {
-      const curated = catalogModels.find((model) =>
-        bundleIdentity(model.configuration.bundle) === bundleIdentity(bundle))
+      const identity = bundleIdentity(bundle)
+      const curated = catalogByBundle.get(identity)
       const presentation = resolveBundlePresentation(bundle, curated && {
         displayName: curated.displayName,
         description: curated.description,
+        license: curated.license,
       })
-      const primaryPackage = bundle._tag === "Standalone"
-        ? bundle.package
-        : bundle.target
+      const acquisitionState = aggregateAcquisitionState(bundle, packageEntries)
       const bundleEntries = bundlePackages(bundle).map((modelPackage) =>
         packageEntries.get(modelPackage.id))
-      const installation = installedBundle(bundle, packageEntries)
-      if (installation === undefined) {
-        throw new Error(
-          `Installed servable model bundle ${bundleIdentity(bundle)} disappeared during projection`,
-        )
-      }
       const inspectionFailure = bundleEntries.flatMap((entry) =>
         entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible"
           ? [entry.inspection.failure]
           : [])[0]
-      const inspectedCapabilities = packageEntries.get(primaryPackage.id)?.inspection
-      const inspectionComplete = bundleEntries.every((entry) =>
-        entry?.inspection._tag === "Inspected")
-      const resolved = resolvedConfigurations.get(bundleIdentity(bundle))
+      const primaryPackage = bundle._tag === "Standalone" ? bundle.package : bundle.target
+      const primaryInspection = packageEntries.get(primaryPackage.id)?.inspection
+      const inspectionComplete = acquisitionState._tag !== "Installed"
+        || bundleEntries.every((entry) => entry?.inspection._tag === "Inspected")
+      const resolved = resolvedConfigurations.get(identity)
       const configuration = resolved?.configuration
-      const assessment = resolved === undefined
+      const coordinatedAssessment = resolved === undefined
         ? undefined
         : Option.getOrUndefined(resolved.assessment)
-      const configuredOffering = configuration === undefined
-        ? undefined
-        : configuredById.get(configuration.id)
-      const projectedOffering = configuredOffering === undefined
-        ? undefined
-        : providerEntries.get(configuredOffering.providerModelId)
+      const capabilities = curated?.capabilities
+        ?? (primaryInspection?._tag === "Inspected" ? primaryInspection.capabilities : undefined)
+      const catalogMembershipState: LocalModel["catalogMembershipState"] = curated === undefined
+        ? { _tag: "NotInCatalog" }
+        : {
+            _tag: "InCatalog",
+            catalogData: {
+              intelligenceScore: curated.qualityScore,
+              intelligenceScoreSource: curated.qualityScoreProvenance,
+              fidelityRank: curated.fidelityRank,
+              qualityNotes: curated.qualityEvidence,
+            },
+          }
+
+      let servingState: LocalModel["servingState"]
+      if (inspectionFailure !== undefined) {
+        servingState = {
+          _tag: "Failed",
+          configuration: Option.fromNullable(configuration),
+          failure: inspectionFailure,
+        }
+      } else if (configuration === undefined) {
+        servingState = localModelAssessmentProfiles(bundle).length === 0
+          ? {
+              _tag: "Failed",
+              configuration: Option.none(),
+              failure: {
+                code: "unsupported_model_context_length",
+                message: `Model context length is below the ${MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH.toLocaleString("en-US")}-token minimum`,
+                retryable: false,
+              },
+            }
+          : { _tag: "Resolving" }
+      } else if (!inspectionComplete || coordinatedAssessment === undefined
+        || coordinatedAssessment._tag === "Assessing") {
+        servingState = { _tag: "Assessing", configuration }
+      } else if (coordinatedAssessment._tag === "Failed") {
+        servingState = {
+          _tag: "Failed",
+          configuration: Option.some(configuration),
+          failure: coordinatedAssessment.failure,
+        }
+      } else {
+        if (capabilities === undefined) {
+          throw new Error(`Assessed local model ${configuration.id} has no capabilities`)
+        }
+        const assessment: LocalModelAssessment = coordinatedAssessment._tag === "Fits"
+          ? {
+              _tag: "Fits",
+              assessmentId: coordinatedAssessment.assessment.assessmentId,
+              environmentId: coordinatedAssessment.assessment.environmentId,
+              profile: coordinatedAssessment.assessment.profile,
+              memory: projectMemory(
+                coordinatedAssessment.assessment.memory,
+                hardwareState,
+                instanceState,
+              ),
+              performance: coordinatedAssessment.assessment.performance,
+            }
+          : coordinatedAssessment._tag === "DoesNotFit"
+            ? {
+                _tag: "DoesNotFit",
+                assessmentId: coordinatedAssessment.assessmentId,
+                environmentId: coordinatedAssessment.environmentId,
+                memoryDomains: coordinatedAssessment.memory,
+                totalRequiredBytes: coordinatedAssessment.totalRequiredBytes,
+                deficitBytes: coordinatedAssessment.deficitBytes,
+                limitingResource: coordinatedAssessment.limitingResource,
+              }
+            : {
+                _tag: "Incompatible",
+                environmentId: coordinatedAssessment.environmentId,
+                failure: coordinatedAssessment.failure,
+              }
+        const providerModelId = providerIdByConfiguration.get(configuration.id)
+        const availabilityState = assessment._tag !== "Fits"
+          ? unavailableAssessment(assessment, providerModelId)
+          : acquisitionState._tag !== "Installed" || providerModelId === undefined
+            ? { _tag: "Installable" as const }
+            : availabilityFromProviderProjection(
+                providerModelId,
+                providerEntries,
+                providerProjectionCurrent,
+                providerProjectionFailure,
+              )
+        servingState = {
+          _tag: "Assessed",
+          configuration,
+          capabilities,
+          assessment,
+          availabilityState,
+          recommendations: recommendationsByConfiguration.get(configuration.id) ?? [],
+        }
+      }
       return {
         bundle,
         presentation,
-        installation,
-        readiness: inspectionFailure !== undefined
-          ? { _tag: "Failed", failure: inspectionFailure }
-          : !inspectionComplete || inspectedCapabilities?._tag !== "Inspected"
-            ? { _tag: "Assessing" }
-            : configuration !== undefined
-              && assessment !== undefined
-              && assessment._tag !== "Assessing"
-              ? {
-                  _tag: "Assessed",
-                  capabilities: curated?.capabilities ?? inspectedCapabilities.capabilities,
-                  configuration,
-                  offering: Option.fromNullable(projectedOffering),
-                  assessment,
-                }
-              : localModelAssessmentProfiles(bundle).length === 0
-                ? {
-                    _tag: "Failed",
-                    failure: {
-                      code: "unsupported_model_context_length",
-                      message: `Model context length is below the ${MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH.toLocaleString("en-US")}-token minimum`,
-                      retryable: false,
-                    },
-                  }
-                : { _tag: "Assessing" },
+        downloadBytes: bundleDownloadBytes(bundle),
+        catalogMembershipState,
+        acquisitionState,
+        servingState,
       }
-    }).sort((left, right) =>
-      left.presentation.displayName.localeCompare(right.presentation.displayName))
-    const catalogCandidates = recommendationState._tag === "Ready"
-      ? recommendationState.catalog.flatMap(({ candidate, configuration }) => {
-          const availability = aggregateAvailability(
-            configuration.bundle,
-            packageEntries,
-            providerIdByConfiguration.get(candidate.configurationId),
-            providerEntries,
-            providerProjectionCurrent,
-            providerProjectionFailure,
-          )
-          return availability === undefined
-            ? []
-            : [{
-                ...candidate,
-                download: aggregateDownload(configuration.bundle, packageEntries),
-                availability,
-              }]
-        })
-      : []
-    const catalogCandidatesByConfigurationId = new Map(
-      catalogCandidates.map((candidate) => [candidate.configurationId, candidate]),
-    )
-    const recommendationLifecycle = recommendationState._tag === "Loading"
-      ? {
-          _tag: "Loading" as const,
-          progress: recommendationState.progress,
-        }
+    }).sort((left, right) => {
+      const leftConfigurationId = left.servingState._tag === "Resolving"
+        ? undefined
+        : Option.getOrUndefined(left.servingState._tag === "Failed"
+          ? left.servingState.configuration
+          : Option.some(left.servingState.configuration))?.id
+      const rightConfigurationId = right.servingState._tag === "Resolving"
+        ? undefined
+        : Option.getOrUndefined(right.servingState._tag === "Failed"
+          ? right.servingState.configuration
+          : Option.some(right.servingState.configuration))?.id
+      const leftOrder = leftConfigurationId === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : recommendationOrder.get(leftConfigurationId) ?? Number.MAX_SAFE_INTEGER
+      const rightOrder = rightConfigurationId === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : recommendationOrder.get(rightConfigurationId) ?? Number.MAX_SAFE_INTEGER
+      return leftOrder - rightOrder
+        || left.presentation.displayName.localeCompare(right.presentation.displayName)
+    })
+
+    const discoveryState = recommendationState._tag === "Loading"
+      ? { _tag: "Loading" as const, progress: recommendationState.progress }
       : recommendationState._tag === "Failed"
         ? {
             _tag: "Failed" as const,
             failure: recommendationState.failure,
             progress: recommendationState.progress,
           }
-        : {
-            _tag: "Ready" as const,
-            entries: recommendationState.recommendations.flatMap((recommendation) => {
-              const entry = recommendationState.catalog.find(({ configuration }) =>
-                configuration.id === recommendation.configuration.id)
-              const candidate = entry
-                ? catalogCandidatesByConfigurationId.get(entry.configuration.id)
-                : undefined
-              return candidate
-                ? [{
-                    id: recommendation.id,
-                    intent: recommendation.intent,
-                    explanation: recommendation.explanation,
-                    candidate,
-                  }]
-                : []
-            }),
-            catalog: catalogCandidates,
-            progress: recommendationState.progress,
-          }
+        : { _tag: "Ready" as const, progress: recommendationState.progress }
     yield* mirror.setIfChanged({
-      inventory: packageState.inventory,
+      inventoryState: packageState.inventory,
       models,
-      downloads,
-      recommendations: recommendationLifecycle,
+      discoveryState,
     }, equivalent)
   })).pipe(Effect.catchAllCause((cause) =>
     Effect.logWarning("Unable to project local models").pipe(
@@ -480,6 +608,8 @@ export const LocalModelsLive: Layer.Layer<
     resolver.changes,
     offerings.changes,
     offerings.catalogChanges,
+    hardware.changes,
+    instances.changes,
   ], { concurrency: "unbounded" }).pipe(
     Stream.debounce("25 millis"),
     Stream.runForEach(() => project),

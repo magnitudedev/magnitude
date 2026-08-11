@@ -29,9 +29,10 @@ import {
   useModelConfig,
   useLocalModels,
   useModelSlots,
+  pushNotificationAtom,
+  type NotificationState,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
-import { addEphemeralMessage } from '@magnitudedev/client-common'
 import { Option } from 'effect'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
@@ -48,6 +49,7 @@ export function ComposerContainer({
   modelsConfigured,
   modelSetupInProgress,
   modelSetupPlaceholder,
+  notificationState,
 }: {
   chatColumnWidth: number
   clientWorkingDirectory: string
@@ -56,6 +58,7 @@ export function ComposerContainer({
   modelsConfigured: boolean
   modelSetupInProgress: boolean
   modelSetupPlaceholder: string | null
+  notificationState: NotificationState | null
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
@@ -72,9 +75,15 @@ export function ComposerContainer({
   const usageOpen = useAtomValue(usageOpenAtom)
   const { startNewSession } = useSessionActions()
 
+  const pushNotification = useAtomSet(pushNotificationAtom)
   const showErrorToast = useCallback((message: string) => {
-    addEphemeralMessage(message, theme.error)
-  }, [theme.error])
+    pushNotification({
+      message,
+      priority: 'error',
+      action: Option.none(),
+      dismissAfterMilliseconds: 5_000,
+    })
+  }, [pushNotification])
 
   // Slash commands may trigger a send (skills, /init) — the hook that owns
   // sending is constructed with this context, so route through a ref.
@@ -207,6 +216,7 @@ export function ComposerContainer({
       composerCanFocus={composerCanFocus}
       widgetNavActive={widgetNavActive}
       isWorkerView={false}
+      notificationState={notificationState}
       enableAutopilot={false}
       autopilotEnabled={false}
       autopilotGenerating={false}
@@ -224,7 +234,7 @@ export function ComposerContainer({
       handleWidgetKeyEvent={handleWidgetKeyEvent}
       enterBashMode={() => setBashMode(true)}
       exitBashMode={() => setBashMode(false)}
-      showToast={(message: string) => addEphemeralMessage(message, theme.error)}
+      showToast={showErrorToast}
       toggleAutopilot={() => { /* disabled */ }}
       displayMessages={displayMessages}
       selectedForkId={null}

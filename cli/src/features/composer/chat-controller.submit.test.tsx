@@ -74,6 +74,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       modelsConfigured: true,
       modelSetupInProgress: false,
       modelSetupPlaceholder: null,
+      notificationState: null,
       modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
       localModels: null,
       modelSlots: null,

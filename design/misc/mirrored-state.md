@@ -46,12 +46,13 @@ currently consumed mirrors.
 ## Ownership
 
 ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `ModelSlots`,
-`LocalInferenceHardware`, and `Onboarding`. `LocalModels` groups by servable-bundle identity while
-preserving every catalog, retained, and ICN-issued standard configuration. Every independently
-servable installed package contributes the same `LocalModel` shape, regardless of catalog
-association. Raw package, download-attempt, and recommendation working state remain private ACN
-observations. Private ICN types, native paths, and native field names do not cross the protocol
-boundary. The complete local-model projection is defined by
+`LocalInferenceHardware`, and `Onboarding`. `LocalModels` groups by servable-bundle identity and
+publishes acquisition, serving, recommendation, provider availability, and advisory memory facets
+on the same row. Every catalog bundle and independently servable installed package contributes the
+same `LocalModel` shape. Raw package, download-attempt, recommendation-policy, provider-offering,
+and memory-observation working state remain private ACN observations. Private ICN types, native
+paths, and native field names do not cross the protocol boundary. The complete local-model
+projection is defined by
 [Local-model product projection](../model-management/local-model-product-projection.md).
 A backend may bind directly only when it owns the exact public schema and versioned replay.
 
@@ -89,6 +90,12 @@ Waiting, refresh, failure, and connection loss never become an empty authoritati
 Independent mirrors remain independently renderable: failure or waiting in catalog, slot, hardware,
 or recommendation observation cannot erase a successful `LocalModels` value.
 
+Client surfaces subscribe through read-only selector atoms when they consume only part of a mirror.
+A selector may retain its prior result reference while its newly derived value is semantically
+equivalent. This is an equality cache over the same query atom, not copied state: it has no writer,
+authority, synchronization, or independent lifetime. Volatile source fields therefore invalidate
+only consumers whose selected meaning changed.
+
 A mirrored nonterminal state is valid only while its owning backend service has a live operation
 capable of terminalizing it. The initiating RPC and its progress stream are never the owner.
 Disconnecting every client does not alter admitted shared work; a later client receives the same
@@ -101,3 +108,5 @@ authoritative current snapshot.
 - Public query Results survive component unmount for the client-connection lifetime.
 - Only a complete successful empty snapshot renders authoritative emptiness.
 - One mirror's observation lifecycle cannot erase another mirror's successful value.
+- Selector atoms preserve one mirror authority while preventing unrelated source-field changes from
+  invalidating a complete presentation surface.

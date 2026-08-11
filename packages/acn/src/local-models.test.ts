@@ -147,7 +147,7 @@ describe("local model configuration resolution", () => {
 describe("local model availability", () => {
   const providerModelIds = [ProviderModelIdSchema.make("test-configuration")]
 
-  it("withholds provider availability until it matches the package snapshot", () => {
+  it("reports provider publication as preparing until it matches the package snapshot", () => {
     expect(availabilityFromProviderProjection(
       providerModelIds[0],
       new Map([[providerModelIds[0]!, {
@@ -155,16 +155,16 @@ describe("local model availability", () => {
       }]]),
       false,
       Option.none(),
-    )).toBeUndefined()
+    )).toEqual({ _tag: "Preparing", providerModelId: providerModelIds[0] })
   })
 
-  it("keeps an assessed installed configuration available before it has an offering", () => {
+  it("keeps an assessed configuration installable before it has an offering", () => {
     expect(availabilityFromProviderProjection(
       undefined,
       new Map(),
       false,
       Option.none(),
-    )).toEqual({ _tag: "Available" })
+    )).toEqual({ _tag: "Installable" })
   })
 
   it("exposes an authoritative current provider incompatibility", () => {
@@ -177,6 +177,7 @@ describe("local model availability", () => {
       Option.none(),
     )).toEqual({
       _tag: "Unavailable",
+      providerModelId: Option.some(providerModelIds[0]),
       failure: {
         code: "incompatible_runtime",
         message: "This model configuration is not available to the local runtime",
@@ -222,6 +223,9 @@ describe("local model presentation", () => {
     )).toEqual({
       displayName: "Liquid LFM2.5 2.6B",
       description: "Curated model description.",
+      license: Option.none(),
+      quantization: "Q4_K - Medium",
+      quantizationName: "4-bit",
     })
   })
 
@@ -232,6 +236,9 @@ describe("local model presentation", () => {
     )).toEqual({
       displayName: "LFM2.5-2.6B-GGUF",
       description: "",
+      license: Option.none(),
+      quantization: "Q4_K - Medium",
+      quantizationName: "4-bit",
     })
   })
 
@@ -242,6 +249,9 @@ describe("local model presentation", () => {
     )).toEqual({
       displayName: "local-model.gguf",
       description: "",
+      license: Option.none(),
+      quantization: "Q4_K - Medium",
+      quantizationName: "4-bit",
     })
   })
 })

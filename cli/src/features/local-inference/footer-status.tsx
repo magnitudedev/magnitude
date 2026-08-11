@@ -10,17 +10,6 @@ export interface LocalInferenceFooterView {
   readonly memoryLabel: string | null
 }
 
-export const deriveLocalModelDownloadSummary = (
-  models: LocalModelsState | null,
-): string | null => {
-  if (models === null) return null
-  const count = models.downloads.filter(({ state }) =>
-    state._tag === "Downloading").length
-  return count === 0
-    ? null
-    : `${count} ${count === 1 ? "model" : "models"} downloading`
-}
-
 const compactGiB = (bytes: number): string =>
   (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, "")
 
@@ -67,14 +56,12 @@ export const deriveLocalInferenceFooterView = (
     ? selectedSlot
     : undefined
   const activeModel = slot && models !== null
-    ? models.models.find((model) => model.readiness._tag === "Assessed"
-      && Option.exists(
-        model.readiness.offering,
-        ({ providerModelId }) => providerModelId === slot.selection.providerModelId,
-      ))
+    ? models.models.find((model) => model.servingState._tag === "Assessed"
+      && model.servingState.availabilityState._tag === "Selectable"
+      && model.servingState.availabilityState.providerModelId === slot.selection.providerModelId)
     : undefined
-  const download = models?.downloads.find(({ state }) =>
-    state._tag === "Downloading" || state._tag === "Failed")
+  const download = models?.models.find(({ acquisitionState }) =>
+    acquisitionState._tag === "Downloading" || acquisitionState._tag === "Failed")
   const lifecycle = slot?._tag === "ConfiguredLocal"
     ? Option.getOrNull(slot.instance)?.lifecycle
     : undefined

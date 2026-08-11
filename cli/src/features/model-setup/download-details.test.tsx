@@ -4,7 +4,7 @@ import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
 import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
-import { makeCatalogCandidate, GIB } from "../local-inference/test-fixtures"
+import { makeAcquiringModel, GIB } from "../local-inference/test-fixtures"
 
 const keyboard = vi.hoisted(() => ({
   handler: undefined as ((key: KeyEvent) => void) | undefined,
@@ -29,11 +29,8 @@ const { OnboardingModelDownloadDetails } = await import("./download-details")
 
 const onCancel = vi.fn()
 const onRetry = vi.fn()
-const candidate = makeCatalogCandidate({
-  displayName: "Qwen Test",
-  quantization: "Q6_K",
-  downloadBytes: 30 * GIB,
-  download: {
+const model = makeAcquiringModel(
+  {
     _tag: "Downloading",
     attemptIds: [DownloadAttemptIdSchema.make("download_qwen")],
     stage: "downloading",
@@ -41,7 +38,16 @@ const candidate = makeCatalogCandidate({
     totalBytes: 30 * GIB,
     bytesPerSecond: Option.some(48 * 1024 ** 2),
   },
-})
+  {
+    presentation: {
+      displayName: "Qwen Test",
+      description: "Test model",
+      license: Option.none(),
+      quantization: "Q6_K",
+      quantizationName: "Q6_K",
+    },
+  },
+)
 
 beforeEach(() => {
   onCancel.mockClear()
@@ -64,7 +70,7 @@ const press = (name: string) => keyboard.handler?.(new KeyEvent({
 test("shows compact download details with progress, rate, and ETA", async () => {
   const view = await testRender(
     <OnboardingModelDownloadDetails
-      candidate={candidate}
+      model={model}
       width={56}
       height={11}
       operation={{
@@ -91,7 +97,7 @@ test("shows compact download details with progress, rate, and ETA", async () => 
 test("requires confirmation before cancelling and supports keyboard choice", async () => {
   const view = await testRender(
     <OnboardingModelDownloadDetails
-      candidate={candidate}
+      model={model}
       width={56}
       height={11}
       operation={{
@@ -128,9 +134,7 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
 })
 
 test("shows failed-download actions in the details pane", async () => {
-  const failedCandidate = makeCatalogCandidate({
-    downloadBytes: 30 * GIB,
-    download: {
+  const failedModel = makeAcquiringModel({
       _tag: "Failed",
       attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
       completedBytes: 19 * GIB,
@@ -140,11 +144,10 @@ test("shows failed-download actions in the details pane", async () => {
         message: "Download failed",
         retryable: true,
       },
-    },
   })
   const view = await testRender(
     <OnboardingModelDownloadDetails
-      candidate={failedCandidate}
+      model={failedModel}
       width={56}
       height={11}
       operation={{

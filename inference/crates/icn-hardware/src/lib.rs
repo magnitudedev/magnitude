@@ -45,7 +45,6 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// these values in the hardware layer gives every caller one authoritative policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SystemMemoryThresholds {
-    pub warning_reserve_bytes: u64,
     pub assess_reserve_bytes: u64,
     pub abort_reserve_bytes: u64,
 }
@@ -53,9 +52,90 @@ pub struct SystemMemoryThresholds {
 #[must_use]
 pub fn system_memory_thresholds(total_bytes: u64) -> SystemMemoryThresholds {
     SystemMemoryThresholds {
-        warning_reserve_bytes: (total_bytes / 5).max(4 * GIB),
         assess_reserve_bytes: (total_bytes / 10).max(2 * GIB),
         abort_reserve_bytes: (total_bytes / 20).max(GIB),
+    }
+}
+
+/// Cross-platform system-memory facts used by inference allocation.
+///
+/// Platform-specific constraints are collapsed into the binding allocation capacity and
+/// headroom. Callers never need to know which operating-system mechanism supplied the limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemMemoryObservation {
+    pub physical_capacity_bytes: u64,
+    pub physical_available_bytes: u64,
+    pub allocation_capacity_bytes: u64,
+    pub allocation_headroom_bytes: u64,
+}
+
+pub fn observe_system_memory() -> Result<SystemMemoryObservation, String> {
+    let mut system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    system.refresh_memory_specifics(MemoryRefreshKind::everything());
+    normalize_system_memory(system.total_memory(), system.available_memory())
+}
+
+/// Normalizes an already-sampled physical-memory observation into ICN's allocation contract.
+///
+/// Long-lived observers can reuse their platform sampler while this function keeps operating-
+/// system allocation constraints private to the hardware layer.
+pub fn normalize_system_memory(
+    physical_capacity_bytes: u64,
+    physical_available_bytes: u64,
+) -> Result<SystemMemoryObservation, String> {
+    if physical_capacity_bytes == 0 || physical_available_bytes > physical_capacity_bytes {
+        return Err(format!(
+            "invalid system memory observation: total={physical_capacity_bytes}, available={physical_available_bytes}"
+        ));
+    }
+    let platform_limit = platform_allocation_limit()?;
+    Ok(SystemMemoryObservation {
+        physical_capacity_bytes,
+        physical_available_bytes,
+        allocation_capacity_bytes: platform_limit.map_or(physical_capacity_bytes, |limit| {
+            physical_capacity_bytes.min(limit.capacity)
+        }),
+        allocation_headroom_bytes: platform_limit.map_or(physical_available_bytes, |limit| {
+            physical_available_bytes.min(limit.headroom)
+        }),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PlatformAllocationLimit {
+    capacity: u64,
+    headroom: u64,
+}
+
+#[cfg(not(windows))]
+fn platform_allocation_limit() -> Result<Option<PlatformAllocationLimit>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn platform_allocation_limit() -> Result<Option<PlatformAllocationLimit>, String> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
+
+    // SAFETY: the structure is initialized to its documented size and remains valid for the call.
+    unsafe {
+        let mut performance: PERFORMANCE_INFORMATION = zeroed();
+        performance.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+        if GetPerformanceInfo(&mut performance, performance.cb) == 0 {
+            return Err(format!(
+                "GetPerformanceInfo failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let page_size = performance.PageSize as u64;
+        let capacity = (performance.CommitLimit as u64).saturating_mul(page_size);
+        let allocated = (performance.CommitTotal as u64).saturating_mul(page_size);
+        Ok(Some(PlatformAllocationLimit {
+            capacity,
+            headroom: capacity.saturating_sub(allocated),
+        }))
     }
 }
 // ICN policy for work not represented by the synthetic matrix-operation calibration.
@@ -228,8 +308,8 @@ pub enum NativePlanningError {
     NativeBridge(#[from] FitReportError),
 }
 
-/// Stable Magnitude capacity policy. It intentionally uses total capacity,
-/// not volatile process-external free memory.
+/// Stable ICN assessment-capacity policy. It intentionally uses total capacity,
+/// not volatile process-external free memory or application warning policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct CapacityPolicy {
     pub reserve_bytes_per_domain: u64,
@@ -292,11 +372,13 @@ pub fn discover_hardware(
     );
     system.refresh_memory();
     let total_bytes = system.total_memory();
+    let available_bytes = system.available_memory();
     let thresholds = system_memory_thresholds(total_bytes);
     let mut system_memory = HardwareSystemMemory {
-        total_bytes,
-        current_available_bytes: system.available_memory(),
-        warning_reserve_bytes: thresholds.warning_reserve_bytes,
+        physical_capacity_bytes: total_bytes,
+        physical_available_bytes: available_bytes,
+        allocation_capacity_bytes: total_bytes,
+        allocation_headroom_bytes: available_bytes,
         assess_reserve_bytes: thresholds.assess_reserve_bytes,
         abort_reserve_bytes: thresholds.abort_reserve_bytes,
     };
@@ -319,15 +401,15 @@ pub fn discover_hardware(
             free_bytes: u64::try_from(device.memory_free).ok(),
         })
         .collect::<Vec<_>>();
-    if system_memory.total_bytes == 0 {
-        system_memory.total_bytes = devices
+    if system_memory.physical_capacity_bytes == 0 {
+        system_memory.physical_capacity_bytes = devices
             .iter()
             .filter(|device| device.kind == HardwareDeviceKind::Cpu)
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
-        let thresholds = system_memory_thresholds(system_memory.total_bytes);
-        system_memory.warning_reserve_bytes = thresholds.warning_reserve_bytes;
+        system_memory.allocation_capacity_bytes = system_memory.physical_capacity_bytes;
+        let thresholds = system_memory_thresholds(system_memory.physical_capacity_bytes);
         system_memory.assess_reserve_bytes = thresholds.assess_reserve_bytes;
         system_memory.abort_reserve_bytes = thresholds.abort_reserve_bytes;
     }
@@ -387,14 +469,14 @@ fn hardware_snapshot_from_devices(
     }
 
     let mut domains = Vec::new();
-    if !shared.is_empty() || environment.system_memory.total_bytes > 0 {
+    if !shared.is_empty() || environment.system_memory.physical_capacity_bytes > 0 {
         let backend_total = shared
             .iter()
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
-        let total = if environment.system_memory.total_bytes > 0 {
-            environment.system_memory.total_bytes
+        let total = if environment.system_memory.physical_capacity_bytes > 0 {
+            environment.system_memory.physical_capacity_bytes
         } else {
             backend_total
         };
@@ -412,7 +494,7 @@ fn hardware_snapshot_from_devices(
             total_capacity_bytes: total,
             stable_capacity_bytes: total
                 .saturating_sub(policy.reserve_for_domain(&MemoryDomainId::system())),
-            current_free_bytes: Some(environment.system_memory.current_available_bytes),
+            current_free_bytes: Some(environment.system_memory.physical_available_bytes),
             shares_system_memory: true,
             devices: shared
                 .into_iter()
@@ -534,6 +616,34 @@ pub fn with_capacity_policy(
                     .total_bytes
                     .saturating_sub(policy.reserve_for_domain(&domain.id));
             }
+        }
+    }
+    snapshot.topology_fingerprint = topology_fingerprint(&snapshot.memory_domains);
+    snapshot
+}
+
+/// Replaces volatile system-memory fields with one freshly normalized observation.
+#[must_use]
+pub fn with_system_memory_observation(
+    mut snapshot: HardwareSnapshot,
+    observation: SystemMemoryObservation,
+) -> HardwareSnapshot {
+    let thresholds = system_memory_thresholds(observation.physical_capacity_bytes);
+    snapshot.system_memory = HardwareSystemMemory {
+        physical_capacity_bytes: observation.physical_capacity_bytes,
+        physical_available_bytes: observation.physical_available_bytes,
+        allocation_capacity_bytes: observation.allocation_capacity_bytes,
+        allocation_headroom_bytes: observation.allocation_headroom_bytes,
+        assess_reserve_bytes: thresholds.assess_reserve_bytes,
+        abort_reserve_bytes: thresholds.abort_reserve_bytes,
+    };
+    for domain in &mut snapshot.memory_domains {
+        if domain.id.is_system() {
+            domain.total_capacity_bytes = observation.physical_capacity_bytes;
+            domain.stable_capacity_bytes = observation
+                .physical_capacity_bytes
+                .saturating_sub(thresholds.assess_reserve_bytes);
+            domain.current_free_bytes = Some(observation.physical_available_bytes);
         }
     }
     snapshot.topology_fingerprint = topology_fingerprint(&snapshot.memory_domains);
@@ -2584,7 +2694,6 @@ mod tests {
         assert_eq!(
             system_memory_thresholds(16 * gib),
             SystemMemoryThresholds {
-                warning_reserve_bytes: 4 * gib,
                 assess_reserve_bytes: 2 * gib,
                 abort_reserve_bytes: gib,
             },
@@ -2592,7 +2701,6 @@ mod tests {
         assert_eq!(
             system_memory_thresholds(64 * gib),
             SystemMemoryThresholds {
-                warning_reserve_bytes: 64 * gib / 5,
                 assess_reserve_bytes: 64 * gib / 10,
                 abort_reserve_bytes: 64 * gib / 20,
             },
@@ -2655,9 +2763,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: system_memory_bytes,
-                    current_available_bytes: system_memory_bytes,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: system_memory_bytes,
+                    physical_available_bytes: system_memory_bytes,
+                    allocation_capacity_bytes: system_memory_bytes,
+                    allocation_headroom_bytes: system_memory_bytes,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2728,9 +2837,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 32_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 32_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 32_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2809,9 +2919,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 32_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 32_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 32_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2866,9 +2977,10 @@ mod tests {
                 system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 40_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 40_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 40_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2890,9 +3002,10 @@ mod tests {
                 system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 1,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 1,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 1,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2917,7 +3030,7 @@ mod tests {
                 current_free_bytes: Some(20_000),
             })
         );
-        assert_eq!(first.system_memory.total_bytes, 64_000);
+        assert_eq!(first.system_memory.physical_capacity_bytes, 64_000);
         assert_ne!(
             first.memory_domains[0].current_free_bytes,
             second.memory_domains[0].current_free_bytes
@@ -2957,9 +3070,10 @@ mod tests {
                 system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 40_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 40_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 40_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2976,7 +3090,7 @@ mod tests {
 
         assert_eq!(selected.memory_domains[0].total_capacity_bytes, 64_000);
         assert_eq!(selected.memory_domains[0].stable_capacity_bytes, 54_000);
-        assert_eq!(selected.system_memory.current_available_bytes, 40_000);
+        assert_eq!(selected.system_memory.physical_available_bytes, 40_000);
         let metal = selected.memory_domains[0]
             .devices
             .iter()
@@ -3034,9 +3148,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 40_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 40_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 40_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -3515,9 +3630,10 @@ mod tests {
                 system_product_name: Some("Mac".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 50_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 50_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 50_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },

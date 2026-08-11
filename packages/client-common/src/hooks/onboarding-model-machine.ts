@@ -227,24 +227,29 @@ export const reduceDownloadObservation = (
   configurationId: ModelServingConfigurationId,
   attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
 ): readonly [ObservationCorrelation, Option.Option<DownloadObservation>] => {
+  const model = state.models.find(({ servingState }) =>
+    servingState._tag !== "Resolving"
+    && (servingState._tag !== "Failed"
+      ? servingState.configuration.id === configurationId
+      : Option.exists(servingState.configuration, ({ id }) => id === configurationId)))
   return Option.match(
-    Option.fromNullable(state.downloads.find(({ configuration }) =>
-      configuration.id === configurationId)),
+    Option.fromNullable(model),
     {
       onNone: () => [correlation, Option.none()],
-      onSome: ({ state: download }) => {
-        if (download._tag === "Downloaded") {
+      onSome: ({ acquisitionState }) => {
+        if (acquisitionState._tag === "Installed") {
           return [correlation, Option.some("Downloaded")]
         }
+        if (acquisitionState._tag === "NotInstalled") return [correlation, Option.none()]
         const admitted = new Set<DownloadAttemptId>(attemptIds)
-        const exact = download.attemptIds.some((attemptId) => admitted.has(attemptId))
+        const exact = acquisitionState.attemptIds.some((attemptId) => admitted.has(attemptId))
         if (!exact) {
           return correlation.exactIdentitySeen
             ? [correlation, Option.some("Superseded")]
             : [correlation, Option.none()]
         }
         const next = { exactIdentitySeen: true }
-        switch (download._tag) {
+        switch (acquisitionState._tag) {
           case "Downloading": return [next, Option.none()]
           case "Failed": return [next, Option.some("Failed")]
           case "Cancelled": return [next, Option.some("Cancelled")]

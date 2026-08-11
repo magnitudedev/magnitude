@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState, type ReactNode } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
-import type { LocalModelCatalogCandidate } from "@magnitudedev/sdk"
+import type { LocalModel } from "@magnitudedev/sdk"
 import { truncateToDisplayWidth } from "@magnitudedev/client-common"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
@@ -42,12 +42,12 @@ type DownloadDetailsOperation =
     }
 
 export function OnboardingModelDownloadDetails({
-  candidate,
+  model,
   width,
   height,
   operation,
 }: {
-  readonly candidate: LocalModelCatalogCandidate
+  readonly model: LocalModel
   readonly width: number
   readonly height: number
   readonly operation: DownloadDetailsOperation
@@ -58,7 +58,7 @@ export function OnboardingModelDownloadDetails({
   const [hovered, setHovered] = useState<string | null>(null)
   const cancelling = operation._tag === "Active" && operation.cancelling
   const contentWidth = Math.max(1, width)
-  const download = candidate.download
+  const download = model.acquisitionState
   const downloading = download._tag === "Downloading"
   const failed = download._tag === "Failed"
   const cancelable = downloading
@@ -69,8 +69,8 @@ export function OnboardingModelDownloadDetails({
   const percentageLabel = `${percentage}%`
   const barWidth = Math.max(8, contentWidth - percentageLabel.length - 2)
   const heading = failed
-    ? `Couldn’t download ${candidate.displayName} · ${candidate.quantization}`
-    : `Downloading ${candidate.displayName} · ${candidate.quantization}`
+    ? `Couldn’t download ${model.presentation.displayName} · ${model.presentation.quantization}`
+    : `Downloading ${model.presentation.displayName} · ${model.presentation.quantization}`
   const rate = downloading ? Option.getOrNull(download.bytesPerSecond) : null
   const detail = useMemo(() => {
     if (failed) return download.failure.message
@@ -165,7 +165,7 @@ export function OnboardingModelDownloadDetails({
           </text>
         )}
         <box style={{ height: 1 }} />
-        {(download._tag === "NotDownloaded" || downloading || failed) && (
+        {(download._tag === "NotInstalled" || downloading || failed) && (
           <text style={{ fg: theme.muted }}>
             {formatDownloadBytes(download.completedBytes)} / {formatDownloadBytes(download.totalBytes)}
           </text>

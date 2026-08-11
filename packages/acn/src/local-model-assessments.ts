@@ -33,7 +33,6 @@ import {
   bundleToIcnInput,
 } from "./local-model-icn-adapter"
 
-const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const ASSESSMENT_OPERATION_TIMEOUT_MS = 5 * 60 * 1_000
 export const MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH = 4_096
 const DEFAULT_LOCAL_MODEL_CONTEXT_LENGTH = 100_000
@@ -146,7 +145,6 @@ const memoryAssessmentFromIcn = (
   capacityBytes: memory.capacityBytes,
   requiredBytes: memory.requiredBytes,
   compatibilityReserveBytes: memory.compatibilityReserveBytes,
-  warningReserveBytes: memory.warningReserveBytes,
   remainingBytes: memory.remainingBytes,
 })
 
@@ -187,6 +185,10 @@ const assessmentFromIcn = (
           configuration: yield* modelServingConfigurationFromIcn(assessment.configuration),
           assessmentId: ModelAssessmentIdSchema.make(assessment.assessmentId),
           memory: assessment.memory.map(memoryAssessmentFromIcn),
+          totalRequiredBytes: assessment.memory.reduce(
+            (total, memory) => total + memory.requiredBytes,
+            0,
+          ),
           deficitBytes: Number(assessment.deficitBytes),
           limitingResource: String(assessment.limitingResource),
         }
@@ -271,7 +273,6 @@ export const LocalModelAssessmentsLive: Layer.Layer<
                   performanceContextTokens: performanceSampleContextTokens(profile),
                 })),
               })),
-              capacityPolicy: { requiredReserveBytesPerMemoryDomain: REQUIRED_RESERVE_BYTES },
             },
           })
           const environmentId = AssessmentEnvironmentIdSchema.make(response.environmentId)

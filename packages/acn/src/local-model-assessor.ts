@@ -188,6 +188,10 @@ const completedAssessment = (
         assessmentId: resultForConfiguration.assessmentId,
         environmentId: result.environmentId,
         memory: resultForConfiguration.memory,
+        totalRequiredBytes: resultForConfiguration.memory.reduce(
+          (total, memory) => total + memory.requiredBytes,
+          0,
+        ),
         deficitBytes: resultForConfiguration.deficitBytes,
         limitingResource: resultForConfiguration.limitingResource,
       },
@@ -247,7 +251,7 @@ export const LocalModelAssessorLive: Layer.Layer<
     const hardwareEvidence = {
       nativeBuild: hardwareState.native_build,
       topology: hardwareState.topology_fingerprint,
-      totalSystemMemoryBytes: hardwareState.system_memory.total_bytes,
+      totalSystemMemoryBytes: hardwareState.system_memory.physical_capacity_bytes,
       assessmentReserveBytes: hardwareState.system_memory.assess_reserve_bytes,
       backends: [...hardwareState.enabled_backends],
     }

@@ -58,7 +58,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
-    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

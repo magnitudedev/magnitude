@@ -8,7 +8,7 @@ import {
   ModelServingConfigurationIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-  type LocalModelDownloadState,
+  type LocalModelAcquisitionState,
   type LocalModelsState,
   type ModelSlotsState,
 } from "@magnitudedev/sdk"
@@ -37,11 +37,38 @@ const submission = {
   },
 }
 
-const modelsState = (download: LocalModelDownloadState): LocalModelsState => ({
-  inventory: { _tag: "Ready" },
-  models: [],
-  downloads: [{
-    configuration: {
+const modelsState = (acquisitionState: LocalModelAcquisitionState): LocalModelsState => ({
+  inventoryState: { _tag: "Ready" },
+  models: [{
+    bundle: {
+      _tag: "Standalone",
+      package: {
+        id: ModelPackageIdSchema.make("package_test"),
+        source: { _tag: "Local", path: "/models/test.gguf" },
+        files: [],
+        relationships: [],
+        properties: {
+          format: "gguf",
+          quantization: "Q4_K_M",
+          quantizationName: "4-bit",
+          architecture: "test",
+          maximumContextLength: 32_768,
+        },
+      },
+    },
+    presentation: {
+      displayName: "Test model",
+      description: "",
+      license: Option.none(),
+      quantization: "Q4_K_M",
+      quantizationName: "4-bit",
+    },
+    downloadBytes: 1,
+    catalogMembershipState: { _tag: "NotInCatalog" },
+    acquisitionState,
+    servingState: {
+      _tag: "Assessing",
+      configuration: {
       id: configurationId,
       bundle: {
         _tag: "Standalone",
@@ -61,16 +88,9 @@ const modelsState = (download: LocalModelDownloadState): LocalModelsState => ({
       },
       profile: { contextLength: 32_768 },
     },
-    presentation: { displayName: "Test model", description: "" },
-    capabilities: Option.some({
-      vision: false,
-      tools: true,
-      structuredOutput: true,
-      reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
-    }),
-    state: download,
+    },
   }],
-  recommendations: { _tag: "Loading", progress: [] },
+  discoveryState: { _tag: "Loading", progress: [] },
 })
 
 const slotsState = (
@@ -224,7 +244,7 @@ describe("admitted model observation", () => {
   it("accepts the desired downloaded condition without requiring attempt history", () => {
     const [, observation] = reduceDownloadObservation(
       initialObservationCorrelation,
-      modelsState({ _tag: "Downloaded", installedBytes: 2, origins: ["Magnitude"] }),
+      modelsState({ _tag: "Installed", installedBytes: 2, origins: ["Magnitude"] }),
       configurationId,
       [admittedAttempt],
     )
@@ -233,7 +253,7 @@ describe("admitted model observation", () => {
 
   it("does not treat an invalidated query's stale successful value as post-admission truth", async () => {
     const stale = Result.waiting(Result.success({
-      state: modelsState({ _tag: "Downloaded", installedBytes: 2, origins: ["Magnitude"] }),
+      state: modelsState({ _tag: "Installed", installedBytes: 2, origins: ["Magnitude"] }),
     }))
     const active = Result.success({
       state: modelsState({

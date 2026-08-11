@@ -16,7 +16,7 @@ import {
 import {
   GIB,
   LOCAL_PROVIDER_ID,
-  makeDownload,
+  makeAcquiringModel,
   makeModel,
   makeView,
   TEST_MEMORY_DOMAIN_ID,
@@ -230,6 +230,7 @@ function makeProps(): ComposerProps {
     modelsConfigured: true,
     modelSetupInProgress: false,
     modelSetupPlaceholder: null,
+    notificationState: null,
     modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
     localModels: null,
     modelSlots: null,
@@ -368,15 +369,13 @@ test('shows resident memory three spaces after context and links it to hardware'
 test('shows active model downloads in the persistent footer and links to the catalog', () => {
   const openCatalog = vi.fn()
   const localInferenceState = makeView({
-    downloads: [makeDownload({
-      state: {
+    models: [makeAcquiringModel({
         _tag: 'Downloading',
         attemptIds: [DownloadAttemptIdSchema.make('download-1')],
         stage: 'downloading',
         completedBytes: GIB,
         totalBytes: 16 * GIB,
         bytesPerSecond: Option.none(),
-      },
     })],
   })
   const mediumHtml = render(

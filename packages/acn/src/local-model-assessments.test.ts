@@ -135,6 +135,7 @@ describe("localModelAssessmentResultFromIcn", () => {
         configuration: nativeConfiguration("configuration-0", 50_000),
         assessmentId: "assessment-result-0",
         memory: [],
+        totalRequiredBytes: 0,
         limitingResource: "system_memory",
         deficitBytes: 1024,
       }, {
@@ -160,6 +161,7 @@ describe("localModelAssessmentResultFromIcn", () => {
         },
         assessmentId: "assessment-result-0",
         memory: [],
+        totalRequiredBytes: 0,
         limitingResource: "system_memory",
         deficitBytes: 1024,
       }, {

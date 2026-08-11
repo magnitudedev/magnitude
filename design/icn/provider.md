@@ -39,10 +39,11 @@ ACN's local-offering projection combines the durable configuration with installe
 observations to produce the provider model catalog entry. This is the only place that derives local
 provider availability. When ICN can assess the exact configuration, that catalog entry carries the
 complete per-domain memory accounting unchanged: capacity, required allocation, compatibility
-reserve, warning reserve, and remaining headroom. Consumers derive aggregate requirements,
-system-domain load admission, and warning presentation from that one value. They do not receive
-parallel aggregate or capacity-label fields. Generic and cloud provider entries do not fabricate local
-memory accounting.
+reserve, and remaining assessment headroom. The local-model product projection consumes that
+availability and derives application memory guidance from assessment, normalized hardware, and
+resident allocation evidence on the same model row. Provider offerings do not carry application
+warning policy, parallel aggregate fields, or capacity labels. Generic and cloud provider entries
+do not fabricate local memory accounting.
 
 Initial and invalidation-driven projection runs in one scoped background worker. Native assessment
 never gates ACN service readiness.

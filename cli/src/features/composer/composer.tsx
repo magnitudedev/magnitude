@@ -16,7 +16,6 @@ import { AttachmentsBar } from './attachment-bar'
 import { AutopilotIndicator } from './autopilot-indicator'
 import {
   deriveLocalInferenceFooterView,
-  deriveLocalModelDownloadSummary,
 } from '../local-inference/footer-status'
 import { useFileMentions, type MentionSearchClient } from '@magnitudedev/client-common'
 import { useSlashCommands } from '@magnitudedev/client-common'
@@ -43,6 +42,10 @@ import {
   thinkingSelectorWidth,
 } from './thinking-selector'
 import { BOX_CHARS } from '../../utils/ui-constants'
+import {
+  NotificationArea,
+  notificationAreaWidth,
+} from '../notification-area/notification-area'
 
 const displayWorkingDirectory = (cwd: string): string => {
   const home = process.env.HOME
@@ -190,6 +193,7 @@ export function Composer(props: ComposerProps) {
     composerCanFocus,
     widgetNavActive,
     isWorkerView,
+    notificationState,
     enableAutopilot,
     autopilotEnabled,
     autopilotGenerating,
@@ -260,7 +264,6 @@ export function Composer(props: ComposerProps) {
   const [modelLabelHovered, setModelLabelHovered] = useState(false)
   const [thinkingLabelHovered, setThinkingLabelHovered] = useState(false)
   const [memoryLabelHovered, setMemoryLabelHovered] = useState(false)
-  const [downloadLabelHovered, setDownloadLabelHovered] = useState(false)
   const [thinkingOpen, setThinkingOpen] = useState(false)
   const currentThinkingIndex = Math.max(
     0,
@@ -277,10 +280,6 @@ export function Composer(props: ComposerProps) {
       selectedSlotId,
     ),
     [localModels, modelSlots, modelSummary?.model, selectedProviderId, selectedSlotId],
-  )
-  const downloadSummary = useMemo(
-    () => deriveLocalModelDownloadSummary(localModels),
-    [localModels],
   )
   const workingDirectoryLabel = displayWorkingDirectory(clientWorkingDirectory)
   const modelNameLabel = modelFooter.modelName ?? modelSummary?.model ?? 'Choose a model'
@@ -309,15 +308,15 @@ export function Composer(props: ComposerProps) {
             + (modelFooter.memoryLabel === null
               ? 0
               : 3 + stringWidth(modelFooter.memoryLabel)))
-  const footerDownloadWidth = downloadSummary === null
+  const footerNotificationWidth = notificationState === null
     ? 0
-    : 3 + stringWidth(downloadSummary)
+    : 3 + notificationAreaWidth(notificationState)
   const footerBaseWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
-  const footerDownloadStacks = downloadSummary !== null
-    && footerBaseWidth + footerDownloadWidth + 4 > chatColumnWidth
-  const footerEnvironmentStacks = footerDownloadStacks
-    || footerBaseWidth + footerDownloadWidth + footerRightWidth + 8 > chatColumnWidth
+  const footerNotificationStacks = notificationState !== null
+    && footerBaseWidth + footerNotificationWidth + 4 > chatColumnWidth
+  const footerEnvironmentStacks = footerNotificationStacks
+    || footerBaseWidth + footerNotificationWidth + footerRightWidth + 8 > chatColumnWidth
   const openThinking = useCallback(() => {
     if (thinkingOptions.length === 0) return
     setThinkingIndex(currentThinkingIndex)
@@ -662,18 +661,15 @@ export function Composer(props: ComposerProps) {
     }
   }, [inputValue, attachments.length, handleSubmit, setComposerHistoryIndex])
 
-  const downloadStatus = downloadSummary === null ? null : (
-    <Button
-      onClick={openCatalog}
-      onMouseOver={() => setDownloadLabelHovered(true)}
-      onMouseOut={() => setDownloadLabelHovered(false)}
-    >
-      <text style={{ fg: theme.primary }}>
-        <span attributes={downloadLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
-          {downloadSummary}
-        </span>
-      </text>
-    </Button>
+  const notificationStatus = notificationState === null ? null : (
+    <NotificationArea
+      notificationState={notificationState}
+      theme={theme}
+      compact={footerNotificationStacks}
+      onAction={(action) => {
+        if (action === 'openCatalog') openCatalog()
+      }}
+    />
   )
 
   const footerStatus = (
@@ -766,10 +762,10 @@ export function Composer(props: ComposerProps) {
           )}
         </>
       )}
-      {!footerDownloadStacks && downloadStatus !== null && (
+      {!footerNotificationStacks && notificationStatus !== null && (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          {downloadStatus}
+          {notificationStatus}
         </>
       )}
       {displayMode === 'transcript' && (
@@ -918,9 +914,9 @@ export function Composer(props: ComposerProps) {
           <box style={{
             height: 1,
             flexDirection: 'row',
-            justifyContent: footerDownloadStacks ? 'space-between' : 'flex-end',
+            justifyContent: footerNotificationStacks ? 'space-between' : 'flex-end',
           }}>
-            {footerDownloadStacks && downloadStatus}
+            {footerNotificationStacks && notificationStatus}
             {footerEnvironment}
           </box>
         )}

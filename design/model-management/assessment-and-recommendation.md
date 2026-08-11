@@ -64,7 +64,7 @@ sequenceDiagram
 
     ACN->>Resolver: Publish configuration and assessment
     Resolver->>Resolver: Select retained, otherwise catalog, otherwise standard
-    ACN->>Recommender: Publish Fits catalog candidate
+    ACN->>Recommender: Evaluate Fits catalog configuration
 ```
 
 ACN always supplies the serving profile used for assessment. For catalog and retained intent it
@@ -137,11 +137,12 @@ state.
 
 ## Publication boundary
 
-A catalog candidate exists only for one completed `Fits` configuration. It contains its exact
-bundle, serving configuration, profile, assessment environment, memory, performance, capability,
-acquisition, and source evidence.
+Recommendation policy evaluates private inputs for catalog configurations with completed `Fits`
+assessment. The client-facing projection does not publish a parallel candidate entity. It publishes
+one `LocalModel` per exact bundle and annotates its assessed serving state with catalog ranking
+evidence and any selected recommendation intents.
 
-Candidate performance is an ordered set of samples for the same configuration. Samples above the
+Performance evidence is an ordered set of samples for the same configuration. Samples above the
 configured context are omitted, and the final sample is always the configured context.
 
 Recommendation evidence is present only when the bundle comes from the recommendable catalog.
@@ -149,7 +150,7 @@ Retained configurations outside the current catalog remain selectable provider o
 fabricated intelligence, fidelity, or quality values when exact assessment and package evidence
 make them available.
 
-`DoesNotFit` and `Incompatible` are completed evidence but are not selectable candidates. Missing,
+`DoesNotFit` and `Incompatible` are completed evidence but are not selectable. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.
 Retained configurations remain durable independently of recommendation publication. Installed
 packages remain present in the [local-model product projection](./local-model-product-projection.md)
@@ -183,9 +184,9 @@ ACN selects at most one configuration for each intent:
 | `lightweight` | Highest useful capability within a low-memory tier relative to stable hardware capacity |
 
 Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
-A recommendation references a candidate; it does not create another model identity.
+A recommendation annotates a local model; it does not copy model facts or create another identity.
 
-A catalog candidate is eligible for recommendation only when its full-context expected generation
+An assessed catalog configuration is eligible for recommendation only when its full-context expected generation
 speed is at least 5 tokens per second. Balanced speed utility uses 5 tokens per second as its zero
 point. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
 bounded by the configured context for shorter models. Clients present the expected-speed range from
@@ -207,6 +208,11 @@ unchanged Lightweight tier.
 Recommendation reuse requires unchanged catalog content, profiles, stable topology and capacity,
 native build and backends, hardware calibration, assessment method, and recommendation policy.
 Live memory availability does not invalidate assessment or recommendation.
+
+Onboarding therefore keeps recommendation-tier labels and explanations stable as availability
+changes. Current loadability is a separate right-hand detail alongside the explanation: stable
+assessment may report a tight fit while live admission headroom simultaneously reports that the
+model cannot load now. Neither condition replaces or relabels the recommendation.
 
 ## Loading
 
@@ -232,8 +238,11 @@ Cached assessment never authorizes loading.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
 - Lightweight is hardware-relative, capability-maximizing within its memory tier, and independent
   of the capability ceiling outside that tier.
-- Candidate identity remains the serving-configuration identity.
+- Recommendation-policy inputs remain private; client-visible recommendation annotations preserve
+  the local model's serving-configuration identity.
 - Loading never treats cached assessment as admission authority.
 - ACN startup and service publication never wait for model assessment.
 - Onboarding keeps installed and downloadable model groups at a stable layout height while making
   every presented model reachable by keyboard navigation and pointer scrolling.
+- Onboarding preserves recommendation labels in the model list and renders stable fit and current
+  loadability independently in the selected model's detail pane.

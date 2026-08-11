@@ -2,7 +2,12 @@ import { resolve } from "path";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { Command } from "@commander-js/extra-typings";
-import { Atom, RegistryProvider } from "@effect-atom/atom-react";
+import {
+  Atom,
+  Registry,
+  RegistryContext,
+  scheduleTask,
+} from "@effect-atom/atom-react";
 import {
   createAgentClient,
   AgentClientProvider,
@@ -10,6 +15,7 @@ import {
   DisplayViewControllerProvider,
   deriveCliExitNotice,
   stopDisplayViewController,
+  pushNotificationAtom,
 } from "@magnitudedev/client-common";
 import { CliApp, type SessionStart } from "./app";
 import type { AuthSource } from "./state/cli-atoms";
@@ -113,8 +119,15 @@ async function main() {
         ])
       : Option.none();
 
+    const atomRegistry = Registry.make({
+      scheduleTask,
+      defaultIdleTTL: 5_000,
+    });
     const effectLoggingLayer = makeCliEffectLoggingLayer({
       debug: opts.debug === true,
+      publishNotification: (notification) => {
+        atomRegistry.set(pushNotificationAtom, notification);
+      },
     });
     Atom.runtime.addGlobalLayer(effectLoggingLayer);
     const platform = await createTerminalPlatform({
@@ -160,7 +173,7 @@ async function main() {
 
     createRoot(renderer).render(
       <PlatformProvider platform={platform}>
-        <RegistryProvider defaultIdleTTL={5000}>
+        <RegistryContext.Provider value={atomRegistry}>
           <AgentClientProvider tag={agentClientTag}>
             <DisplayViewControllerProvider>
               <CliApp
@@ -182,7 +195,7 @@ async function main() {
               />
             </DisplayViewControllerProvider>
           </AgentClientProvider>
-        </RegistryProvider>
+        </RegistryContext.Provider>
       </PlatformProvider>
     );
   });
