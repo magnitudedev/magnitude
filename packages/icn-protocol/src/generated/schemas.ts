@@ -1064,37 +1064,34 @@ export const ModelAssessment = S.Union(
   S.extend(
     S.TaggedStruct("Fits", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
-      configurationId: S.suspend(
-        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+      configuration: S.suspend(
+        (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
       ),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
       performance: S.Array(
         S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
       ),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
     S.TaggedStruct("DoesNotFit", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
-      configurationId: S.suspend(
-        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+      configuration: S.suspend(
+        (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
       ),
       deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       limitingResource: S.String,
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
     S.TaggedStruct("Incompatible", {
-      configurationId: S.suspend(
-        (): S.Schema<ModelServingConfigurationId, ModelServingConfigurationIdEncoded> => ModelServingConfigurationId,
+      configuration: S.suspend(
+        (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
       ),
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),

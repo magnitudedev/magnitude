@@ -1,7 +1,6 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsMirror,
-  ModelServingConfigurationSchema,
   ServableModelBundleSchema,
   type LocalModel,
   type LocalModelCatalogDownloadState,
@@ -9,7 +8,6 @@ import {
   type LocalModelCatalogCandidateAvailability,
   type LocalModelsState,
   type ModelFailure,
-  type ModelServingConfiguration,
   type ServableModelBundle,
   type ModelPackageEntry,
   type ProviderModelCatalogEntry,
@@ -25,13 +23,15 @@ import {
   providerOfferingPackageEvidence,
   sameProviderOfferingPackageEvidence,
 } from "./local-provider-offerings"
-import { LocalModelAssessor } from "./local-model-assessor"
 import {
   localModelAssessmentProfiles,
   MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH,
 } from "./local-model-assessments"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
+import {
+  LocalModelConfigurationResolver,
+  localModelBundleIdentity as bundleIdentity,
+} from "./local-model-configuration-resolver"
 
 interface ModelPresentation {
   readonly displayName: string
@@ -40,36 +40,6 @@ interface ModelPresentation {
 
 const bundlePackages = (bundle: ServableModelBundle) =>
   bundle._tag === "Standalone" ? [bundle.package] : [bundle.target, bundle.draft]
-const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
-const bundleIdentity = (bundle: ServableModelBundle): string =>
-  bundle._tag === "Standalone"
-    ? `Standalone\0${bundle.package.id}`
-    : `SpeculativeDecodingPair\0${bundle.target.id}\0${bundle.draft.id}`
-
-export const decideLocalModelConfigurations = (input: {
-  readonly retained: readonly ModelServingConfiguration[]
-  readonly catalog: readonly ModelServingConfiguration[]
-  readonly assessed: readonly ModelServingConfiguration[]
-}): ReadonlyMap<string, ModelServingConfiguration> => {
-  const decided = new Map<string, ModelServingConfiguration>()
-  const authoredIds = new Set([
-    ...input.retained,
-    ...input.catalog,
-  ].map(({ id }) => id))
-  for (const configuration of input.assessed) {
-    if (!authoredIds.has(configuration.id)) {
-      decided.set(bundleIdentity(configuration.bundle), configuration)
-    }
-  }
-  for (const configuration of input.catalog) {
-    decided.set(bundleIdentity(configuration.bundle), configuration)
-  }
-  for (const configuration of input.retained) {
-    decided.set(bundleIdentity(configuration.bundle), configuration)
-  }
-  return decided
-}
-
 const sourceName = (bundle: ServableModelBundle): string => {
   const primary = bundle._tag === "Standalone" ? bundle.package : bundle.target
   return primary.source._tag === "HuggingFace"
@@ -255,15 +225,13 @@ export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
   IcnCatalog | LocalModelPackages | LocalModelRecommendations
-    | LocalModelAssessor | LocalProviderOfferings | MirroredStateChanges
-    | RetainedModelConfigurations
+    | LocalModelConfigurationResolver | LocalProviderOfferings | MirroredStateChanges
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const packages = yield* LocalModelPackages
   const recommendations = yield* LocalModelRecommendations
-  const assessments = yield* LocalModelAssessor
+  const resolver = yield* LocalModelConfigurationResolver
   const offerings = yield* LocalProviderOfferings
-  const retained = yield* RetainedModelConfigurations
   const mirror = yield* makeMirroredState(LocalModelsMirror, {
     inventory: { _tag: "Initializing" },
     models: [],
@@ -283,8 +251,7 @@ export const LocalModelsLive: Layer.Layer<
       recommendableModelFromIcn,
     )
     const recommendationState = (yield* recommendations.snapshot).state
-    const assessmentState = yield* assessments.state
-    const retainedConfigurations = yield* retained.get
+    const resolvedConfigurations = yield* resolver.get
     const configured = yield* offerings.list
     const projectedOfferings = yield* offerings.state
     const packageEntries = new Map(
@@ -314,22 +281,12 @@ export const LocalModelsLive: Layer.Layer<
       message: error.message,
       retryable: "retryable" in error ? error.retryable : true,
     }))
-    const knownConfigurations = new Map<
-      ModelServingConfigurationId,
-      (typeof configured)[number]["configuration"]
-    >()
-    const addKnownConfiguration = (
-      configuration: (typeof configured)[number]["configuration"],
-    ) => {
-      const existing = knownConfigurations.get(configuration.id)
-      if (existing !== undefined && !sameConfiguration(existing, configuration)) {
-        throw new Error(`Configuration ${configuration.id} has conflicting values`)
-      }
-      knownConfigurations.set(configuration.id, configuration)
-    }
-    retainedConfigurations.forEach(addKnownConfiguration)
-    catalogModels.forEach(({ configuration }) => addKnownConfiguration(configuration))
-    assessmentState.forEach(({ configuration }) => addKnownConfiguration(configuration))
+    const knownConfigurations = new Map(
+      [...resolvedConfigurations.values()].map(({ configuration }) => [
+        configuration.id,
+        configuration,
+      ]),
+    )
 
     const groups = new Map<string, ServableModelBundle>()
     const addBundle = (bundle: ServableModelBundle) => {
@@ -352,11 +309,6 @@ export const LocalModelsLive: Layer.Layer<
         role === "weights" || role === "draft")
       if (independentlyServable) addBundle({ _tag: "Standalone", package: entry.package })
     }
-    const configurationByBundle = decideLocalModelConfigurations({
-      retained: retainedConfigurations,
-      catalog: catalogModels.map(({ configuration }) => configuration),
-      assessed: [...assessmentState.values()].map(({ configuration }) => configuration),
-    })
     const configuredById = new Map(configured.map((offering) => [
       offering.configuration.id,
       offering,
@@ -414,10 +366,11 @@ export const LocalModelsLive: Layer.Layer<
       const inspectedCapabilities = packageEntries.get(primaryPackage.id)?.inspection
       const inspectionComplete = bundleEntries.every((entry) =>
         entry?.inspection._tag === "Inspected")
-      const configuration = configurationByBundle.get(bundleIdentity(bundle))
-      const assessment = configuration === undefined
+      const resolved = resolvedConfigurations.get(bundleIdentity(bundle))
+      const configuration = resolved?.configuration
+      const assessment = resolved === undefined
         ? undefined
-        : assessmentState.get(configuration.id)?.assessment
+        : Option.getOrUndefined(resolved.assessment)
       const configuredOffering = configuration === undefined
         ? undefined
         : configuredById.get(configuration.id)
@@ -524,8 +477,7 @@ export const LocalModelsLive: Layer.Layer<
     packages.changes,
     catalog.changes,
     recommendations.changes,
-    assessments.changes,
-    retained.changes,
+    resolver.changes,
     offerings.changes,
     offerings.catalogChanges,
   ], { concurrency: "unbounded" }).pipe(

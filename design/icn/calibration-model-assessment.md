@@ -19,6 +19,7 @@ applies_to:
 | Concern | Owner |
 |---|---|
 | Hardware discovery, calibration, native planning, memory and performance evidence | ICN |
+| Serving-configuration construction, canonical identity, validation | ICN |
 | Profile policy, assessment orchestration, recommendations | ACN |
 | Presentation | Clients |
 
@@ -211,11 +212,13 @@ persisted. Operational failures are never persisted.
 
 ## ACN demand boundary
 
-`LocalModelAssessor` is ACN's sole native-assessment demand owner for catalog-published, retained,
-and installed standalone configurations. Its semantic assessment key covers every native
-cache-identity input plus the exact configuration and requested performance-depth policy. Provider,
-recommendation, and product projections consume the resulting per-configuration state and do not
-invoke this endpoint directly.
+`LocalModelAssessor` is ACN's sole native-assessment demand owner for catalog-published and retained
+configurations, plus standard profile decisions for installed standalone bundles. ACN supplies the
+bundle and chosen profile for standard demand; ICN constructs and canonically identifies the exact
+configuration it assesses. The semantic assessment key covers every native cache-identity input
+plus that exact configuration and requested performance-depth policy. Provider, recommendation,
+and product projections consume the resulting per-configuration state and do not invoke this
+endpoint directly.
 
 Source revisions and notifications only request reconciliation. Download progress, attempt state,
 semantically equivalent inventory observations, catalog presentation, live memory, and client
@@ -225,9 +228,9 @@ configurations, and completion publishes only if that key remains current.
 ## Product behavior
 
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
-- One assessor evaluates catalog-published, retained, and installed standalone configurations
-  through the shared assessment service; recommendation policy consumes only recommendable catalog
-  candidates.
+- One assessor evaluates catalog-published and retained configurations plus ACN's standard profile
+  decisions through the shared assessment service; ICN constructs every resulting exact
+  configuration, and recommendation policy consumes only recommendable catalog candidates.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
 - Retained configurations remain visible while assessment is pending or fails.
 - Only completed `Fits` configurations become selectable catalog candidates or enabled provider
@@ -238,6 +241,9 @@ configurations, and completion publishes only if that key remains current.
 
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-bundle job returns one result per requested profile.
+- Every profile result carries the exact ICN-constructed serving configuration it assessed.
+- ACN standard demand supplies bundle and profile policy without constructing or predicting
+  configuration identity.
 - Every `Fits` result contains ordered performance samples ending at the profile context.
 - Multiple performance depths for one profile require only one native context graph.
 - Warm exact-cache reads invoke no native planner.

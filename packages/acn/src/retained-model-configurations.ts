@@ -1,8 +1,5 @@
-import { Context, Effect, Layer, Option, Schema, Stream } from 'effect'
+import { Context, Effect, Layer, Option, Stream } from 'effect'
 import {
-  ModelServingConfigurationIdSchema,
-  ModelServingConfigurationSchema,
-  ServingProfileSchema,
   sameServableModelBundleIdentity,
   type ModelServingConfiguration,
   type ModelServingConfigurationId,
@@ -14,14 +11,6 @@ import {
   type StateHandle,
 } from '@magnitudedev/storage'
 
-export class RetainedConfigurationConflict extends Schema.TaggedError<RetainedConfigurationConflict>()(
-  'RetainedConfigurationConflict',
-  {
-    configurationId: ModelServingConfigurationIdSchema,
-    reason: Schema.String,
-  },
-) {}
-
 export interface RetainedModelConfigurationsApi {
   readonly get: Effect.Effect<readonly ModelServingConfiguration[]>
   readonly recoveryCompleted: Effect.Effect<boolean>
@@ -31,53 +20,19 @@ export interface RetainedModelConfigurationsApi {
   ) => Effect.Effect<Option.Option<ModelServingConfiguration>>
   readonly materialize: (
     configuration: ModelServingConfiguration,
-  ) => Effect.Effect<ModelServingConfiguration, StateDocumentError | RetainedConfigurationConflict>
+  ) => Effect.Effect<ModelServingConfiguration, StateDocumentError>
   readonly remove: (
     id: ModelServingConfigurationId,
   ) => Effect.Effect<Option.Option<ModelServingConfiguration>, StateDocumentError>
   readonly completeRecovery: (
     defaults: readonly ModelServingConfiguration[],
-  ) => Effect.Effect<readonly ModelServingConfiguration[], StateDocumentError | RetainedConfigurationConflict>
+  ) => Effect.Effect<readonly ModelServingConfiguration[], StateDocumentError>
 }
 
 export class RetainedModelConfigurations extends Context.Tag('RetainedModelConfigurations')<
   RetainedModelConfigurations,
   RetainedModelConfigurationsApi
 >() {}
-
-const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
-const sameProfile = Schema.equivalence(ServingProfileSchema)
-
-type MaterializeResult =
-  | { readonly _tag: 'Saved'; readonly configuration: ModelServingConfiguration }
-  | { readonly _tag: 'Conflict'; readonly conflict: RetainedConfigurationConflict }
-
-type RecoveryResult =
-  | { readonly _tag: 'Completed'; readonly additions: readonly ModelServingConfiguration[] }
-  | { readonly _tag: 'Conflict'; readonly conflict: RetainedConfigurationConflict }
-
-const compatibilityConflict = (
-  current: readonly ModelServingConfiguration[],
-  incoming: ModelServingConfiguration,
-): RetainedConfigurationConflict | undefined => {
-  const sameId = current.find((candidate) => candidate.id === incoming.id)
-  if (sameId !== undefined && !sameConfiguration(sameId, incoming)) {
-    return new RetainedConfigurationConflict({
-      configurationId: incoming.id,
-      reason: 'The configuration ID already identifies different bundle or profile values',
-    })
-  }
-  const sameValue = current.find((candidate) =>
-    sameServableModelBundleIdentity(candidate.bundle, incoming.bundle)
-    && sameProfile(candidate.profile, incoming.profile))
-  if (sameValue !== undefined && sameValue.id !== incoming.id) {
-    return new RetainedConfigurationConflict({
-      configurationId: incoming.id,
-      reason: 'The bundle and profile already carry a different configuration ID',
-    })
-  }
-  return undefined
-}
 
 const removeReferences = (
   state: ModelState,
@@ -110,51 +65,44 @@ export const makeRetainedModelConfigurations = (
   changes: state.changes.pipe(Stream.map((current) => current.configurations)),
   resolve: (id) => state.get.pipe(Effect.map((current) =>
     Option.fromNullable(current.configurations.find((candidate) => candidate.id === id)))),
-  materialize: (configuration) => state.modify<MaterializeResult>((current) => {
-    const conflict = compatibilityConflict(current.configurations, configuration)
-    if (conflict !== undefined) return [{ _tag: 'Conflict' as const, conflict }, current] as const
+  materialize: (configuration) => state.modify((current) => {
     const existing = current.configurations.find((candidate) => candidate.id === configuration.id)
-    if (existing !== undefined) return [{ _tag: 'Saved' as const, configuration: existing }, current] as const
+    if (existing !== undefined) return [existing, current] as const
     const replaced = current.configurations.filter((candidate) =>
       sameServableModelBundleIdentity(candidate.bundle, configuration.bundle))
     const withoutReplacedReferences = replaced.reduce(
       (next, candidate) => removeReferences(next, candidate.id),
       current,
     )
-    return [{ _tag: 'Saved' as const, configuration }, {
+    return [configuration, {
       ...withoutReplacedReferences,
       configurations: [...withoutReplacedReferences.configurations, configuration],
     }] as const
-  }).pipe(Effect.flatMap((result) => result._tag === 'Conflict'
-    ? Effect.fail(result.conflict)
-    : Effect.succeed(result.configuration))),
+  }),
   remove: (id) => state.modify((current) => {
     const removed = Option.fromNullable(current.configurations.find((candidate) => candidate.id === id))
     return [removed, Option.isNone(removed) ? current : removeReferences(current, id)] as const
   }),
-  completeRecovery: (defaults) => state.modify<RecoveryResult>((latest) => {
+  completeRecovery: (defaults) => state.modify<readonly ModelServingConfiguration[]>((latest) => {
     if (latest.configurationRecoveryCompleted) {
-      return [{ _tag: 'Completed' as const, additions: [] }, latest] as const
+      return [[], latest] as const
     }
-    const acceptedDefaults = [...latest.configurations]
+    const additions: ModelServingConfiguration[] = []
     for (const candidate of defaults) {
-      const conflict = compatibilityConflict(acceptedDefaults, candidate)
-      if (conflict !== undefined) return [{ _tag: 'Conflict' as const, conflict }, latest] as const
-      if (!acceptedDefaults.some((accepted) => accepted.id === candidate.id)) {
-        acceptedDefaults.push(candidate)
-      }
+      const accepted = [...latest.configurations, ...additions]
+      if (
+        accepted.some((retained) => retained.id === candidate.id)
+        || accepted.some((retained) =>
+          sameServableModelBundleIdentity(retained.bundle, candidate.bundle))
+      ) continue
+      additions.push(candidate)
     }
-    const additions = acceptedDefaults.slice(latest.configurations.length).filter((candidate) =>
-      !latest.configurations.some((retained) =>
-        sameServableModelBundleIdentity(retained.bundle, candidate.bundle)))
-    return [{ _tag: 'Completed' as const, additions }, {
+    return [additions, {
       ...latest,
       configurations: [...latest.configurations, ...additions],
       configurationRecoveryCompleted: true,
     }] as const
-  }).pipe(Effect.flatMap((result) => result._tag === 'Conflict'
-    ? Effect.fail(result.conflict)
-    : Effect.succeed(result.additions))),
+  }),
 })
 
 export const RetainedModelConfigurationsLive: Layer.Layer<

@@ -26,7 +26,7 @@ use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
 use crate::package_service::{
     package_from_resolved, servable_model_bundle_key, servable_model_bundle_key_for_bundle,
-    serving_configuration_id,
+    serving_configuration_id, serving_configuration_identity_is_valid,
 };
 use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
 use crate::refresh_hugging_face_repository;
@@ -333,11 +333,7 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         || model_ids.len() != catalog.models.len()
         || configuration_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
-            model.configuration.id
-                != serving_configuration_id(
-                    &recommendable_model_bundle_key(model),
-                    &model.configuration.profile,
-                )
+            !serving_configuration_identity_is_valid(&model.configuration)
                 || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
                 || match &model.configuration.bundle {
                     ServableModelBundle::Standalone { package } => {

@@ -3455,19 +3455,15 @@
           {
             "type": "object",
             "required": [
-              "profile",
-              "configurationId",
+              "configuration",
               "assessmentId",
               "memory",
               "performance",
               "_tag"
             ],
             "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
               },
               "assessmentId": {
                 "$ref": "#/components/schemas/ModelAssessmentId"
@@ -3495,8 +3491,7 @@
           {
             "type": "object",
             "required": [
-              "profile",
-              "configurationId",
+              "configuration",
               "assessmentId",
               "memory",
               "limitingResource",
@@ -3504,11 +3499,8 @@
               "_tag"
             ],
             "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
               },
               "assessmentId": {
                 "$ref": "#/components/schemas/ModelAssessmentId"
@@ -3538,17 +3530,13 @@
           {
             "type": "object",
             "required": [
-              "profile",
-              "configurationId",
+              "configuration",
               "failure",
               "_tag"
             ],
             "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
               },
               "failure": {
                 "$ref": "#/components/schemas/ModelFailure"

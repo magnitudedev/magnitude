@@ -47,7 +47,7 @@ currently consumed mirrors.
 
 ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `ModelSlots`,
 `LocalInferenceHardware`, and `Onboarding`. `LocalModels` groups by servable-bundle identity while
-preserving every catalog, retained, and assessment-derived configuration. Every independently
+preserving every catalog, retained, and ICN-issued standard configuration. Every independently
 servable installed package contributes the same `LocalModel` shape, regardless of catalog
 association. Raw package, download-attempt, and recommendation working state remain private ACN
 observations. Private ICN types, native paths, and native field names do not cross the protocol

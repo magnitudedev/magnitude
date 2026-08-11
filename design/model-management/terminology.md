@@ -25,7 +25,7 @@ language, not an identity-bearing domain type.
 | **Model package** | One immutable set of exact files, roles, relationships, inspected properties, and one source. |
 | **Servable model bundle** | The complete artifact structure that can be served: one standalone package or an ordered speculative-decoding pair. |
 | **Serving profile** | Provider intent for serving a bundle, currently its context length. |
-| **Model serving configuration** | One exact servable bundle plus one serving profile, identified by `ModelServingConfigurationId`. |
+| **Model serving configuration** | One exact servable bundle plus one serving profile, constructed and canonically identified by ICN. |
 | **Download attempt** | One admitted attempt to install one exact package. |
 
 The bundle is structural data, not an independently identified entity:
@@ -43,9 +43,11 @@ ServableModelBundle
 `target` is the established speculative-decoding term for the primary model in a pair. It is not
 the name or identity of the enclosing bundle.
 
-Two bundles are the same when their tag and ordered package identities are the same. Implementations
-may derive private canonical keys for maps, caches, and deterministic configuration identity. Such
-keys are not serialized product data and never cross the protocol as bundle identity.
+Two bundles are the same when their tag and ordered package identities are the same. Components may
+derive private canonical keys for maps and caches, but those keys are not configuration identity.
+ICN alone derives canonical serving-configuration identity from the exact ordered bundle and
+profile. Private bundle keys are not serialized product data and never cross the protocol as bundle
+identity.
 
 ## Assessment terms
 
@@ -55,7 +57,7 @@ keys are not serialized product data and never cross the protocol as bundle iden
 | **Model assessment** | Compatibility, capacity, memory, and performance evidence for one exact serving configuration. |
 | **Semantic assessment key** | The configuration, immutable package evidence, stable hardware environment, native build, and assessment policy that determine reuse. |
 | **Assessing** | Ephemeral state for semantic assessment work currently owned by the assessor. |
-| **Standard standalone configuration** | A disposable configuration deterministically derived from an inspected standalone package and the local profile policy. |
+| **Standard profile decision** | ACN's disposable decision to apply its standard serving profile to an inspected standalone package with no retained or catalog configuration. |
 | **Eligible assessed configuration** | A configuration whose assessment is `Fits`. |
 | **Resolved execution plan** | Load-time native allocation evidence; it is not serving intent or durable identity. |
 
@@ -96,9 +98,11 @@ catalog association, assessment lifecycle and results, provider offerings, packa
 download progress, presentation, and model instances are derived or externally authoritative and
 are not stored in those documents.
 
-An assessment-derived standalone configuration becomes durable only when selection or installation
-materializes that exact configuration. Catalog removal therefore cannot erase an installed package,
-a retained configuration, or user selection.
+For a standard standalone model, ACN decides whether its standard profile applies and supplies that
+bundle/profile demand to ICN. ICN constructs and canonically identifies the corresponding serving
+configuration. That ICN-issued configuration becomes durable only when selection or installation
+materializes it. Catalog removal therefore cannot erase an installed package, retained
+configuration, or user selection.
 
 Installation origin does not determine durability. Magnitude-managed and Hugging Face cache
 packages follow the same rules:
@@ -108,13 +112,14 @@ packages follow the same rules:
 | Catalog bundle, not installed | Exact catalog configuration; no `LocalModel` exists | When installation is admitted |
 | Installed bundle with a retained configuration | Exact retained configuration | Already stored |
 | Installed bundle matching the catalog, with no retained configuration | Exact catalog configuration | On selection/installation, or during the single bounded recovery epoch |
-| Installed non-catalog standalone bundle | One standard configuration derived after package inspection | Only when selected/installed |
+| Installed non-catalog standalone bundle | ICN-issued configuration for ACN's standard profile decision after package inspection | Only when selected/installed |
 | Speculative-decoding bundle | Exact retained configuration, otherwise exact catalog configuration | On selection/installation, or bounded recovery |
 
-The standard configuration is generated only for an installed, inspected standalone bundle having
-neither a retained nor catalog configuration. It is disposable until materialized. Magnitude does
-not generate speculative-decoding pairs or replacement catalog configurations from package
-inventory.
+ACN makes a standard profile decision only for an installed, inspected standalone bundle having
+neither a retained nor catalog configuration. ICN constructs the corresponding configuration; ACN
+does not derive its identity or construct it independently. The result is disposable until
+materialized. Magnitude does not generate speculative-decoding pairs or replacement catalog
+configurations from package inventory.
 
 Recovery does not generate a configuration. It copies an exact catalog configuration into model
 state only when the exact bundle is already installed, no configuration is retained for that
@@ -149,9 +154,9 @@ LocalModelDownload
 
 Every independently servable installed package is represented as a `Standalone` bundle even when
 it has no catalog entry or retained configuration. Each installed bundle has one product
-configuration decision: retained first, otherwise exact catalog configuration, otherwise a standard
-configuration derived from inspected package facts. Catalog association enriches the same row with
-curated metadata; it does not decide whether the row exists.
+configuration decision: retained first, otherwise exact catalog configuration, otherwise the
+ICN-issued configuration for ACN's standard profile decision. Catalog association enriches the same
+row with curated metadata; it does not decide whether the row exists.
 
 ## Identity map
 
@@ -159,7 +164,7 @@ curated metadata; it does not decide whether the row exists.
 |---|---|---|
 | `ModelPackageId` | One immutable package | ICN |
 | `DownloadAttemptId` | One package-install attempt | ICN |
-| `ModelServingConfigurationId` | One bundle/profile combination | ICN |
+| `ModelServingConfigurationId` | One bundle/profile combination, canonically constructed and validated with its configuration | ICN |
 | `ModelInstanceId` | One physical loaded occurrence | ICN |
 | `(ProviderId, ProviderModelId)` | One provider offering | Provider boundary |
 | `SlotId` | One product role assignment | ACN |
