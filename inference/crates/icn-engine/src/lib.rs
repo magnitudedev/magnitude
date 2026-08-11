@@ -201,7 +201,8 @@ mod multimodal {
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
 use scheduler::{
-    BatchPlanner, BatchWork, PromptCheckpoint, SequenceCache, SequencePool, WorkCandidate, WorkKind,
+    ActiveSequence, BatchPlanner, BatchWork, PromptCheckpoint, ReusablePrefix, SequencePool,
+    WorkCandidate, WorkKind,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -313,8 +314,80 @@ enum RequestPhase {
     Terminal,
 }
 
+/// Request-state changes earned by one successful target and linked-draft native batch.
+/// Assembly records effects here so active requests never expose staged prompt progress.
+struct BatchCommit {
+    started_at: Instant,
+    prompt_ends: Vec<(i32, usize)>,
+    mtp_indices: Vec<(i32, Vec<i32>)>,
+    logits: Vec<(i32, i32)>,
+}
+
+impl BatchCommit {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            prompt_ends: Vec::new(),
+            mtp_indices: Vec::new(),
+            logits: Vec::new(),
+        }
+    }
+
+    fn prompt_start(&self, sequence_id: i32, committed: usize) -> usize {
+        self.prompt_ends
+            .iter()
+            .rev()
+            .find_map(|(id, end)| (*id == sequence_id).then_some(*end))
+            .unwrap_or(committed)
+    }
+
+    fn advance_prompt(&mut self, sequence_id: i32, end: usize) {
+        if let Some((_, current)) = self
+            .prompt_ends
+            .iter_mut()
+            .find(|(id, _)| *id == sequence_id)
+        {
+            *current = end;
+        } else {
+            self.prompt_ends.push((sequence_id, end));
+        }
+    }
+
+    fn record_mtp_indices(&mut self, sequence_id: i32, indices: Vec<i32>) {
+        self.mtp_indices.push((sequence_id, indices));
+    }
+
+    fn record_logits(&mut self, sequence_id: i32, batch_index: i32) {
+        self.logits.push((sequence_id, batch_index));
+    }
+
+    fn apply(self, active: &mut [ActiveRequest<'_>]) -> Result<(), InferenceError> {
+        for (sequence_id, processed_prompt_tokens) in self.prompt_ends {
+            let request = request_by_sequence(active, sequence_id)?;
+            request.prompt_started_at.get_or_insert(self.started_at);
+            request.processed_prompt_tokens = processed_prompt_tokens;
+            request.pending_progress = Some(InferenceProgress::Prefill {
+                completed_tokens: processed_prompt_tokens,
+                total_tokens: request.prompt_tokens,
+                cached_tokens: request.cached_prompt_tokens,
+            });
+        }
+        for (sequence_id, indices) in self.mtp_indices {
+            request_by_sequence(active, sequence_id)?.mtp_indices = indices;
+        }
+        for (sequence_id, batch_index) in self.logits {
+            let request = request_by_sequence(active, sequence_id)?;
+            if let RequestPhase::Decode { token, .. } = request.phase {
+                request.token_history.push(token);
+            }
+            request.phase = RequestPhase::ReadyToSample { batch_index };
+        }
+        Ok(())
+    }
+}
+
 struct ActiveRequest<'model> {
-    sequence_id: Option<i32>,
+    sequence: Option<ActiveSequence>,
     events: SyncSender<ExecutorItem>,
     span: tracing::Span,
     cancelled: Arc<AtomicBool>,
@@ -323,10 +396,10 @@ struct ActiveRequest<'model> {
     last_progress_emitted_at: Option<Instant>,
     phase: RequestPhase,
     prompt: Vec<LlamaToken>,
-    /// Tokens whose target KV state is known to be committed. The currently
-    /// sampled decode token is deliberately excluded until verification.
-    cache_history: Vec<LlamaToken>,
-    prompt_offset: usize,
+    /// Full logical prompt followed by generated tokens committed to target KV. During prefill,
+    /// `processed_prompt_tokens`, rather than this history, is the resident prompt boundary.
+    token_history: Vec<LlamaToken>,
+    processed_prompt_tokens: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
     prompt_checkpoints: Vec<PromptCheckpoint>,
@@ -343,7 +416,6 @@ struct ActiveRequest<'model> {
     draft_ms: f64,
     verification_ms: f64,
     cache_prompt: bool,
-    cacheable: bool,
     ignore_eos: bool,
     timings_per_token: bool,
     sampler: CommonSampler<'model>,
@@ -1480,18 +1552,15 @@ fn run_scheduler<'model>(
                         draft_context.synchronize();
                         draft_context.clear_memory(false);
                     }
+                    // The whole native context includes available sequences too. Remove their
+                    // reusable prefixes before later admission can observe a false cache hit.
+                    sequence_pool.invalidate_reuse();
                     let failure = if matches!(error, InferenceError::Cancelled) {
                         InferenceError::Cancelled
                     } else {
                         InferenceError::Backend(error.to_string())
                     };
-                    fail_active(
-                        context,
-                        mtp.as_deref_mut(),
-                        &mut sequence_pool,
-                        &mut active,
-                        failure,
-                    );
+                    fail_active_after_context_reset(&mut sequence_pool, &mut active, failure);
                     false
                 }
             }
@@ -1639,6 +1708,16 @@ fn admit_requests<'model>(
     shared_context_capacity: usize,
 ) {
     while !queued.is_empty() {
+        if queued
+            .front()
+            .is_some_and(|queued| queued.cancelled.load(Ordering::Acquire))
+        {
+            let cancelled = queued.pop_front().expect("queue front exists");
+            let _ = cancelled
+                .events
+                .try_send(ExecutorItem::Failed(InferenceError::Cancelled));
+            continue;
+        }
         let matching_prompt = queued.front().and_then(|queued| {
             (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
                 .then(|| {
@@ -1653,13 +1732,14 @@ fn admit_requests<'model>(
                 })
                 .flatten()
         });
-        let sequence_id = match matching_prompt.as_deref() {
+        let acquired = match matching_prompt.as_deref() {
             Some(prompt) => sequence_pool.acquire_matching(prompt),
             None => sequence_pool.acquire(),
         };
-        let Some(sequence_id) = sequence_id else {
+        let Some(mut acquired) = acquired else {
             break;
         };
+        let sequence_id = acquired.id();
         let queued_request = queued
             .pop_front()
             .expect("queue was checked before acquiring a sequence");
@@ -1667,10 +1747,10 @@ fn admit_requests<'model>(
             let _ = queued_request
                 .events
                 .try_send(ExecutorItem::Failed(InferenceError::Cancelled));
-            sequence_pool.release(sequence_id);
+            sequence_pool.release(acquired);
             continue;
         }
-        let cached = sequence_pool.take_cache(sequence_id);
+        let available_prefix = acquired.reusable_prefix.as_ref();
         let _ = queued_request
             .events
             .try_send(ExecutorItem::Event(InferenceStreamEvent {
@@ -1684,12 +1764,13 @@ fn admit_requests<'model>(
             shared_context_capacity,
             context.n_batch() as usize,
             context.n_ubatch() as usize,
-            sequence_id,
             queued_request,
-            cached.as_ref(),
+            available_prefix,
         ) {
             Ok(mut request) => {
-                let requested_start = request.prompt_offset;
+                let reusable_prefix = acquired.reusable_prefix.take();
+                let sequence = acquired.activate();
+                let requested_start = request.processed_prompt_tokens;
                 let partial = clear_sequence_range(
                     context,
                     mtp.as_deref_mut(),
@@ -1697,9 +1778,18 @@ fn admit_requests<'model>(
                     i32::try_from(requested_start).unwrap_or(i32::MAX),
                     -1,
                 );
-                if partial.is_err() && requested_start > 0 {
-                    let checkpoint = cached.as_ref().and_then(|cache| {
-                        cache
+                if partial.is_err() && requested_start == 0 {
+                    let _ = request
+                        .events
+                        .try_send(ExecutorItem::Failed(InferenceError::Backend(format!(
+                            "llama.cpp refused to reset sequence {sequence_id}"
+                        ))));
+                    sequence.quarantine();
+                    continue;
+                }
+                if partial.is_err() {
+                    let checkpoint = reusable_prefix.as_ref().and_then(|prefix| {
+                        prefix
                             .checkpoints
                             .iter()
                             .rev()
@@ -1713,12 +1803,12 @@ fn admit_requests<'model>(
                             checkpoint,
                         )
                     });
-                    request.prompt_offset = checkpoint
+                    request.processed_prompt_tokens = checkpoint
                         .filter(|_| restored)
                         .map_or(0, |value| value.prefix);
-                    request.cached_prompt_tokens = request.prompt_offset;
+                    request.cached_prompt_tokens = request.processed_prompt_tokens;
                     request.pending_progress = Some(InferenceProgress::Prefill {
-                        completed_tokens: request.prompt_offset,
+                        completed_tokens: request.processed_prompt_tokens,
                         total_tokens: request.prompt_tokens,
                         cached_tokens: request.cached_prompt_tokens,
                     });
@@ -1726,7 +1816,7 @@ fn admit_requests<'model>(
                         context,
                         mtp.as_deref_mut(),
                         sequence_id,
-                        i32::try_from(request.prompt_offset).unwrap_or(i32::MAX),
+                        i32::try_from(request.processed_prompt_tokens).unwrap_or(i32::MAX),
                         -1,
                     )
                     .is_err()
@@ -1737,19 +1827,17 @@ fn admit_requests<'model>(
                                 .try_send(ExecutorItem::Failed(InferenceError::Backend(format!(
                                     "llama.cpp refused to reset cached sequence {sequence_id}"
                                 ))));
-                        sequence_pool.quarantine(sequence_id);
+                        sequence.quarantine();
                         continue;
                     }
                 }
+                request.sequence = Some(sequence);
                 active.push(request);
             }
             Err((events, error)) => {
                 let _ = events.try_send(ExecutorItem::Failed(error));
-                if clear_sequence(context, mtp.as_deref_mut(), sequence_id).is_ok() {
-                    sequence_pool.release(sequence_id);
-                } else {
-                    sequence_pool.quarantine(sequence_id);
-                }
+                // Admission performs no native mutation before returning an error.
+                sequence_pool.release(acquired);
             }
         }
     }
@@ -1777,10 +1865,12 @@ fn sample_ready_requests<'model>(
             && request.multimodal_prompt.is_none()
             && let Some(operations) = mtp.as_deref_mut()
         {
-            let sequence_id = request.sequence_id.expect("ready request owns a sequence");
-            if let Err(error) = operations.begin(sequence_id, &request.cache_history) {
+            let sequence_id = request
+                .sequence_id()
+                .expect("ready request owns a sequence");
+            if let Err(error) = operations.begin(sequence_id, &request.token_history) {
                 fail_request(request, backend_error(error));
-                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                discard_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
                 continue;
             }
             request.mtp_started = true;
@@ -1820,17 +1910,17 @@ fn decode_batch<'model>(
     if can_checkpoint_prompt {
         for request in active.iter_mut().filter(|request| {
             request.cache_prompt
-                && request.cacheable
+                && request.multimodal_prompt.is_none()
                 && matches!(request.phase, RequestPhase::Prefill)
                 && request.pending_checkpoint_prefixes.front().copied()
-                    == Some(request.prompt_offset)
+                    == Some(request.processed_prompt_tokens)
         }) {
             let prefix = request
                 .pending_checkpoint_prefixes
                 .pop_front()
                 .expect("checkpoint position was matched");
             let sequence_id = request
-                .sequence_id
+                .sequence_id()
                 .expect("prefill request owns a sequence");
             let target_checkpoint = context
                 .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
@@ -1867,7 +1957,7 @@ fn decode_batch<'model>(
         let decode_count = active
             .iter()
             .filter(|request| {
-                request.sequence_id.is_some()
+                request.sequence_id().is_some()
                     && request.outbound.is_empty()
                     && matches!(request.phase, RequestPhase::Decode { .. })
             })
@@ -1876,7 +1966,7 @@ fn decode_batch<'model>(
         for request in active.iter_mut().filter(|request| {
             request.mtp_started
                 && request.mtp_draft.is_empty()
-                && request.sequence_id.is_some()
+                && request.sequence_id().is_some()
                 && request.outbound.is_empty()
                 && matches!(request.phase, RequestPhase::Decode { .. })
         }) {
@@ -1892,9 +1982,11 @@ fn decode_batch<'model>(
             if n_max == 0 {
                 continue;
             }
-            let sequence_id = request.sequence_id.expect("selected request owns sequence");
+            let sequence_id = request
+                .sequence_id()
+                .expect("selected request owns sequence");
             operations
-                .prepare_draft(sequence_id, position, token, &request.cache_history, n_max)
+                .prepare_draft(sequence_id, position, token, &request.token_history, n_max)
                 .map_err(backend_error)?;
             extra_budget -= n_max;
             drafted_sequences.push(sequence_id);
@@ -1928,12 +2020,12 @@ fn decode_batch<'model>(
     let candidates = active
         .iter()
         .filter(|request| {
-            request.sequence_id.is_some()
+            request.sequence_id().is_some()
                 && request.outbound.is_empty()
                 && !request.cancelled.load(Ordering::Acquire)
         })
         .filter_map(|request| {
-            let sequence_id = request.sequence_id?;
+            let sequence_id = request.sequence_id()?;
             let kind = match request.phase {
                 RequestPhase::Prefill => WorkKind::Prefill {
                     remaining: request
@@ -1941,8 +2033,13 @@ fn decode_batch<'model>(
                         .front()
                         .filter(|_| can_checkpoint_prompt && request.cache_prompt)
                         .map_or_else(
-                            || request.prompt.len().saturating_sub(request.prompt_offset),
-                            |prefix| prefix.saturating_sub(request.prompt_offset),
+                            || {
+                                request
+                                    .prompt
+                                    .len()
+                                    .saturating_sub(request.processed_prompt_tokens)
+                            },
+                            |prefix| prefix.saturating_sub(request.processed_prompt_tokens),
                         ),
                 },
                 RequestPhase::Decode { .. } => WorkKind::Decode,
@@ -1959,8 +2056,8 @@ fn decode_batch<'model>(
         return Ok(false);
     }
     batch.clear();
-    let mut logits = Vec::<(i32, i32)>::new();
     let batch_started = Instant::now();
+    let mut commit = BatchCommit::new(batch_started);
 
     for work in plan {
         match work {
@@ -1971,14 +2068,13 @@ fn decode_batch<'model>(
                         "scheduler selected sequence {sequence_id} for decode in the wrong state"
                     )));
                 };
-                request.mtp_indices.clear();
                 batch
                     .add(token, position, &[sequence_id], true)
                     .map_err(backend_error)?;
-                request.mtp_indices.push(batch.n_tokens() - 1);
                 if request.mtp_draft.is_empty() {
-                    logits.push((sequence_id, batch.n_tokens() - 1));
+                    commit.record_logits(sequence_id, batch.n_tokens() - 1);
                 } else {
+                    let mut indices = vec![batch.n_tokens() - 1];
                     for (offset, draft) in request.mtp_draft.iter().copied().enumerate() {
                         let draft_position = position
                             .checked_add(i32::try_from(offset + 1).map_err(backend_error)?)
@@ -1990,8 +2086,9 @@ fn decode_batch<'model>(
                         batch
                             .add(draft, draft_position, &[sequence_id], true)
                             .map_err(backend_error)?;
-                        request.mtp_indices.push(batch.n_tokens() - 1);
+                        indices.push(batch.n_tokens() - 1);
                     }
+                    commit.record_mtp_indices(sequence_id, indices);
                 }
             }
             BatchWork::Prefill {
@@ -1999,8 +2096,7 @@ fn decode_batch<'model>(
                 tokens,
             } => {
                 let request = request_by_sequence(active, sequence_id)?;
-                request.prompt_started_at.get_or_insert(batch_started);
-                let start = request.prompt_offset;
+                let start = commit.prompt_start(sequence_id, request.processed_prompt_tokens);
                 let end = start + tokens;
                 for (relative, token) in request.prompt[start..end].iter().enumerate() {
                     let absolute = start + relative;
@@ -2014,10 +2110,10 @@ fn decode_batch<'model>(
                         )
                         .map_err(backend_error)?;
                     if final_prompt_token {
-                        logits.push((sequence_id, batch.n_tokens() - 1));
+                        commit.record_logits(sequence_id, batch.n_tokens() - 1);
                     }
                 }
-                request.prompt_offset = end;
+                commit.advance_prompt(sequence_id, end);
             }
         }
     }
@@ -2027,23 +2123,8 @@ fn decode_batch<'model>(
     if let Some(operations) = mtp.as_mut() {
         operations.process(batch).map_err(backend_error)?;
     }
-    for request in active.iter_mut().filter(|request| {
-        request.sequence_id.is_some() && matches!(request.phase, RequestPhase::Prefill)
-    }) {
-        request.pending_progress = Some(InferenceProgress::Prefill {
-            completed_tokens: request.prompt_offset,
-            total_tokens: request.prompt_tokens,
-            cached_tokens: request.cached_prompt_tokens,
-        });
-    }
+    commit.apply(active)?;
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
-    for (sequence_id, batch_index) in logits {
-        let request = request_by_sequence(active, sequence_id)?;
-        if let RequestPhase::Decode { token, .. } = request.phase {
-            request.cache_history.push(token);
-        }
-        request.phase = RequestPhase::ReadyToSample { batch_index };
-    }
     if let Some(operations) = mtp.as_mut() {
         verify_mtp_batch(model, context, operations, active, verification_ms)?;
     }
@@ -2062,7 +2143,7 @@ fn verify_mtp_batch<'model>(
         .filter(|request| !request.mtp_draft.is_empty())
     {
         let sequence_id = request
-            .sequence_id
+            .sequence_id()
             .ok_or_else(|| InferenceError::Backend("MTP request lost its sequence".into()))?;
         let RequestPhase::Decode {
             token: pending,
@@ -2090,11 +2171,11 @@ fn verify_mtp_batch<'model>(
             )
             .map_err(backend_error)?;
 
-        request.cache_history.push(pending);
+        request.token_history.push(pending);
         request
-            .cache_history
+            .token_history
             .extend(accepted.iter().take(accepted_drafts).copied());
-        let next_position = i32::try_from(request.cache_history.len()).map_err(backend_error)?;
+        let next_position = i32::try_from(request.token_history.len()).map_err(backend_error)?;
         operations
             .remove_sequence_range(sequence_id, next_position, -1)
             .map_err(backend_error)?;
@@ -2138,7 +2219,7 @@ fn decode_multimodal_prefill<'model>(
     let Some(index) = active.iter().position(|request| {
         request.multimodal_prompt.is_some()
             && matches!(request.phase, RequestPhase::Prefill)
-            && request.sequence_id.is_some()
+            && request.sequence_id().is_some()
             && request.outbound.is_empty()
             && !request.cancelled.load(Ordering::Acquire)
     }) else {
@@ -2146,7 +2227,7 @@ fn decode_multimodal_prefill<'model>(
     };
     if active
         .iter()
-        .filter(|request| request.sequence_id.is_some())
+        .filter(|request| request.sequence_id().is_some())
         .count()
         != 1
     {
@@ -2159,7 +2240,7 @@ fn decode_multimodal_prefill<'model>(
     })?;
     let request = &mut active[index];
     let sequence_id = request
-        .sequence_id
+        .sequence_id()
         .ok_or_else(|| InferenceError::Backend("multimodal sequence lost ownership".into()))?;
     let batch_size = i32::try_from(context.n_batch()).map_err(backend_error)?;
     let started = Instant::now();
@@ -2180,7 +2261,7 @@ fn decode_multimodal_prefill<'model>(
     }
     let next_position = result?;
     request.next_position = next_position;
-    request.prompt_offset = request.prompt.len();
+    request.processed_prompt_tokens = request.prompt.len();
     request.pending_progress = Some(InferenceProgress::Prefill {
         completed_tokens: request.prompt_tokens,
         total_tokens: request.prompt_tokens,
@@ -2213,7 +2294,7 @@ fn request_by_sequence<'a, 'model>(
 ) -> Result<&'a mut ActiveRequest<'model>, InferenceError> {
     active
         .iter_mut()
-        .find(|request| request.sequence_id == Some(sequence_id))
+        .find(|request| request.sequence_id() == Some(sequence_id))
         .ok_or_else(|| {
             InferenceError::Backend(format!(
                 "scheduler referenced unowned sequence {sequence_id}"
@@ -2348,27 +2429,43 @@ fn release_sequence(
     sequence_pool: &mut SequencePool,
     request: &mut ActiveRequest<'_>,
 ) {
-    let Some(sequence_id) = request.sequence_id.take() else {
+    let Some(sequence) = request.sequence.take() else {
         return;
     };
-    if request.cache_prompt && request.cacheable {
-        sequence_pool.release_cached(
-            sequence_id,
-            SequenceCache {
-                prompt: request.prompt.clone(),
-                checkpoints: std::mem::take(&mut request.prompt_checkpoints),
-            },
-        );
+    if let Some(reusable_prefix) = request.take_reusable_prefix() {
+        sequence_pool.release(sequence.into_available(Some(reusable_prefix)));
         return;
     }
+    let sequence_id = sequence.id();
     // Full sequence removal is supported for every llama.cpp memory implementation. This is the
     // sole cache policy required by this milestone: a sequence is never reassigned while resident
     // state still belongs to the previous request.
     match clear_sequence(context, mtp, sequence_id) {
-        Ok(()) => sequence_pool.release(sequence_id),
+        Ok(()) => sequence_pool.release(sequence.into_available(None)),
         Err(error) => {
             // Never hand a sequence to another request unless native state removal succeeded.
-            sequence_pool.quarantine(sequence_id);
+            sequence.quarantine();
+            request.phase = RequestPhase::Terminal;
+            request.outbound.clear();
+            request.outbound.push_back(ExecutorItem::Failed(error));
+        }
+    }
+}
+
+fn discard_sequence(
+    context: &mut LlamaContext<'_>,
+    mtp: Option<&mut MtpOperations<'_>>,
+    sequence_pool: &mut SequencePool,
+    request: &mut ActiveRequest<'_>,
+) {
+    let Some(sequence) = request.sequence.take() else {
+        return;
+    };
+    let sequence_id = sequence.id();
+    match clear_sequence(context, mtp, sequence_id) {
+        Ok(()) => sequence_pool.release(sequence.into_available(None)),
+        Err(error) => {
+            sequence.quarantine();
             request.phase = RequestPhase::Terminal;
             request.outbound.clear();
             request.outbound.push_back(ExecutorItem::Failed(error));
@@ -2415,7 +2512,6 @@ fn clear_sequence_range(
 
 fn fail_request(request: &mut ActiveRequest<'_>, error: InferenceError) {
     request.phase = RequestPhase::Terminal;
-    request.cacheable = false;
     if request.outbound.len() >= OUTBOUND_QUEUE_CAPACITY {
         request.outbound.clear();
     }
@@ -2424,7 +2520,6 @@ fn fail_request(request: &mut ActiveRequest<'_>, error: InferenceError) {
 
 fn cancel_request(request: &mut ActiveRequest<'_>) {
     request.outbound.clear();
-    request.cacheable = false;
     fail_request(request, InferenceError::Cancelled);
 }
 
@@ -2448,6 +2543,21 @@ fn fail_active(
             fail_request(request, clone_inference_error(&reason));
         }
         release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+    }
+}
+
+fn fail_active_after_context_reset(
+    sequence_pool: &mut SequencePool,
+    active: &mut [ActiveRequest<'_>],
+    reason: InferenceError,
+) {
+    for request in active {
+        if !matches!(request.phase, RequestPhase::Terminal) {
+            fail_request(request, clone_inference_error(&reason));
+        }
+        if let Some(sequence) = request.sequence.take() {
+            sequence_pool.release(sequence.into_available(None));
+        }
     }
 }
 
@@ -2842,6 +2952,10 @@ fn validate_prompt_capacity(
 }
 
 impl<'model> ActiveRequest<'model> {
+    fn sequence_id(&self) -> Option<i32> {
+        self.sequence.as_ref().map(ActiveSequence::id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn admit(
         model: &'model LlamaModel,
@@ -2850,9 +2964,8 @@ impl<'model> ActiveRequest<'model> {
         context_capacity: usize,
         batch_size: usize,
         ubatch_size: usize,
-        sequence_id: i32,
         queued: QueuedCompletion,
-        cached: Option<&SequenceCache>,
+        reusable_prefix: Option<&ReusablePrefix>,
     ) -> Result<Self, (SyncSender<ExecutorItem>, InferenceError)> {
         let QueuedCompletion {
             request,
@@ -2896,8 +3009,8 @@ impl<'model> ActiveRequest<'model> {
             stops.extend(prepared.additional_stops().iter().cloned());
             let mut cached_prompt_tokens = if request.cache_prompt && tokenized.multimodal.is_none()
             {
-                cached.map_or(0, |cached| {
-                    common_token_prefix(&cached.prompt, &tokenized.text_tokens)
+                reusable_prefix.map_or(0, |prefix| {
+                    common_token_prefix(&prefix.tokens, &tokenized.text_tokens)
                 })
             } else {
                 0
@@ -2906,9 +3019,8 @@ impl<'model> ActiveRequest<'model> {
             if cached_prompt_tokens == tokenized.text_tokens.len() {
                 cached_prompt_tokens = cached_prompt_tokens.saturating_sub(1);
             }
-            let cacheable = tokenized.multimodal.is_none();
-            let prompt_checkpoints = cached.map_or_else(Vec::new, |cache| {
-                cache
+            let prompt_checkpoints = reusable_prefix.map_or_else(Vec::new, |prefix| {
+                prefix
                     .checkpoints
                     .iter()
                     .filter(|checkpoint| checkpoint.prefix <= cached_prompt_tokens)
@@ -2932,7 +3044,7 @@ impl<'model> ActiveRequest<'model> {
             pending_checkpoint_prefixes.dedup();
 
             Ok(Self {
-                sequence_id: Some(sequence_id),
+                sequence: None,
                 events: events.clone(),
                 span,
                 cancelled,
@@ -2944,9 +3056,9 @@ impl<'model> ActiveRequest<'model> {
                 }),
                 last_progress_emitted_at: None,
                 phase: RequestPhase::Prefill,
-                cache_history: tokenized.text_tokens.clone(),
+                token_history: tokenized.text_tokens.clone(),
                 prompt: tokenized.text_tokens,
-                prompt_offset: cached_prompt_tokens,
+                processed_prompt_tokens: cached_prompt_tokens,
                 prompt_tokens,
                 cached_prompt_tokens,
                 prompt_checkpoints,
@@ -2964,7 +3076,6 @@ impl<'model> ActiveRequest<'model> {
                 draft_ms: 0.0,
                 verification_ms: 0.0,
                 cache_prompt: request.cache_prompt,
-                cacheable,
                 ignore_eos: request.ignore_eos,
                 timings_per_token: request.timings_per_token,
                 sampler,
@@ -2981,6 +3092,25 @@ impl<'model> ActiveRequest<'model> {
             })
         })();
         result.map_err(|error| (events, error))
+    }
+
+    fn take_reusable_prefix(&mut self) -> Option<ReusablePrefix> {
+        if !self.cache_prompt || self.multimodal_prompt.is_some() {
+            return None;
+        }
+        let tokens = self.prompt.get(..self.processed_prompt_tokens)?.to_vec();
+        if tokens.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            self.prompt_checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.prefix <= self.processed_prompt_tokens)
+        );
+        Some(ReusablePrefix {
+            tokens,
+            checkpoints: std::mem::take(&mut self.prompt_checkpoints),
+        })
     }
 
     fn sample_next(
@@ -3783,6 +3913,109 @@ mod tests {
             ignore_eos: false,
             timings_per_token: false,
         }
+    }
+
+    #[test]
+    fn batch_commit_keeps_repeated_prompt_quanta_local_until_apply() {
+        let mut commit = BatchCommit::new(Instant::now());
+        assert_eq!(commit.prompt_start(2, 7), 7);
+        commit.advance_prompt(2, 9);
+        assert_eq!(commit.prompt_start(2, 7), 9);
+        commit.advance_prompt(2, 11);
+        assert_eq!(commit.prompt_ends, vec![(2, 11)]);
+    }
+
+    struct NoopLoadObserver;
+
+    impl ModelLoadObserver for NoopLoadObserver {
+        fn phase_started(&self, _phase: ModelLoadPhase) {}
+
+        fn phase_completed(&self, _phase: ModelLoadPhase) {}
+    }
+
+    #[test]
+    #[ignore = "loads the repository's real 18 MB GGUF acceptance fixture"]
+    fn interrupted_generation_reuses_prompt_prefix_with_real_model() {
+        disable_native_diagnostics();
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.parity-models/tinyllamas/stories15M-q4_0.gguf");
+        assert!(model_path.is_file(), "missing {}", model_path.display());
+
+        let native = NativeBackend::initialize().expect("initialize native backend");
+        let hardware = native.discover_hardware(
+            icn_hardware::CapacityPolicy::default(),
+            "real-model-prompt-retention-test",
+            Vec::new(),
+        );
+        let mut defaults = model_plan_defaults();
+        defaults.context_size = 512;
+        defaults.physical_context_size = 512;
+        defaults.batch_size = 128;
+        defaults.ubatch_size = 128;
+        defaults.max_sequences = 1;
+        defaults.prefill_quantum = 32;
+        let intent = execution_intent(model_path, None, &defaults);
+        let prepared = native
+            .prepare_load(
+                "stories15m-retention-test",
+                intent,
+                MtpCandidateSelection::Automatic(Vec::new()),
+                hardware,
+            )
+            .expect("prepare real model load");
+        let backend = prepared
+            .execute(Arc::new(NoopLoadObserver))
+            .expect("load real model");
+
+        let mut completion = request();
+        completion.template.messages = vec![ChatMessage::text(
+            ChatRole::User,
+            "Write one short continuation for this story. The small red fox walked through the quiet forest every morning. It knew every mossy stone, every narrow path, and every bird song. Today it found a bright blue box beneath the oldest oak tree. The box was warm, and something inside made a gentle ticking sound.",
+        )];
+        completion.max_tokens = 8;
+        completion.ignore_eos = true;
+
+        let mut reached_generation = false;
+        let interrupted = backend.complete(completion.clone(), &mut |event| {
+            if matches!(
+                event.delta,
+                InferenceEvent::StreamStart
+                    | InferenceEvent::ContentDelta { .. }
+                    | InferenceEvent::ReasoningDelta { .. }
+                    | InferenceEvent::ToolCallDelta { .. }
+            ) {
+                reached_generation = true;
+                return Err(InferenceError::Callback(
+                    "intentional real-model interruption".into(),
+                ));
+            }
+            Ok(())
+        });
+        assert!(
+            reached_generation,
+            "request produced no stream event before returning {interrupted:?}"
+        );
+        assert!(matches!(interrupted, Err(InferenceError::Callback(_))));
+
+        let mut observed_cached_tokens = 0;
+        let completed = backend
+            .complete(completion, &mut |event| {
+                if let InferenceEvent::Progress(InferenceProgress::Prefill {
+                    cached_tokens, ..
+                }) = event.delta
+                {
+                    observed_cached_tokens = observed_cached_tokens.max(cached_tokens);
+                }
+                Ok(())
+            })
+            .expect("complete request after interruption");
+
+        assert!(
+            observed_cached_tokens > 0,
+            "follow-up prefill did not report cached prompt tokens"
+        );
+        assert_eq!(completed.cached_prompt_tokens, observed_cached_tokens);
+        assert!(completed.generated_tokens > 0);
     }
 
     #[test]
