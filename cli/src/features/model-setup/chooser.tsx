@@ -302,6 +302,7 @@ export type OnboardingModelChooserOperation =
   | {
       readonly _tag: "Downloading"
       readonly model: LocalModel
+      readonly starting: boolean
       readonly cancelling: boolean
       readonly cancelError: string | null
       readonly onCancel: () => void
@@ -590,6 +591,7 @@ export function OnboardingModelChooser({
       height={detailContentHeight}
       operation={{
         _tag: "Active",
+        starting: operation.starting,
         cancelling: operation.cancelling,
         cancelError: operation.cancelError,
         onCancel: operation.onCancel,

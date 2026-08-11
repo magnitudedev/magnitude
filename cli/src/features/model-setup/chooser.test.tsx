@@ -32,6 +32,7 @@ describe("onboarding model chooser identity", () => {
     const operation: OnboardingModelChooserOperation = {
       _tag: "Downloading",
       model,
+      starting: false,
       cancelling: false,
       cancelError: null,
       onCancel: () => undefined,

@@ -30,6 +30,7 @@ type ConfirmationChoice = "yes" | "no"
 type DownloadDetailsOperation =
   | {
       readonly _tag: "Active"
+      readonly starting: boolean
       readonly cancelling: boolean
       readonly cancelError: string | null
       readonly onCancel: () => void
@@ -57,10 +58,11 @@ export function OnboardingModelDownloadDetails({
   const [choice, setChoice] = useState<ConfirmationChoice>("yes")
   const [hovered, setHovered] = useState<string | null>(null)
   const cancelling = operation._tag === "Active" && operation.cancelling
+  const starting = operation._tag === "Active" && operation.starting
   const contentWidth = Math.max(1, width)
   const download = model.acquisitionState
-  const downloading = download._tag === "Downloading"
-  const failed = download._tag === "Failed"
+  const downloading = !starting && download._tag === "Downloading"
+  const failed = !starting && download._tag === "Failed"
   const cancelable = downloading
   const fraction = downloading
     ? download.completedBytes / Math.max(1, download.totalBytes)
@@ -122,8 +124,6 @@ export function OnboardingModelDownloadDetails({
     }
   }, [cancelable, cancelling, choice, confirmCancellation, confirming, declineCancellation]))
 
-  if (detail === null) return null
-
   const choiceButton = (value: ConfirmationChoice, label: string) => (
     <Button
       onClick={() => value === "yes" ? confirmCancellation() : declineCancellation()}
@@ -165,12 +165,14 @@ export function OnboardingModelDownloadDetails({
           </text>
         )}
         <box style={{ height: 1 }} />
-        {(download._tag === "NotInstalled" || downloading || failed) && (
+        {(downloading || failed) && (
           <text style={{ fg: theme.muted }}>
             {formatDownloadBytes(download.completedBytes)} / {formatDownloadBytes(download.totalBytes)}
           </text>
         )}
-        <text style={{ fg: failed ? theme.error : theme.muted }}>{detail}</text>
+        {detail !== null && (
+          <text style={{ fg: failed ? theme.error : theme.muted }}>{detail}</text>
+        )}
         <box style={{ height: 1 }} />
         <box style={{ height: 2, flexDirection: "column" }}>
           {cancelling ? (

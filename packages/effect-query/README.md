@@ -351,3 +351,43 @@ const isMutatingAtom = Mutation.isMutating({ mutation: renameUser, scope: userSc
 Derive the latest invocation state with `mutationStates.at(-1)` and a pending boolean with
 `isMutating > 0`; these are consumer views rather than cache APIs. Resource lifecycle continues to
 come from its query.
+
+### Optimistic presentation from mutation state
+
+For updates whose immediate presentation can be derived from the submitted input, keep the query
+cache authoritative and project the latest pending mutation over it. This is the Effect Query
+equivalent of TanStack Query v5's simplified optimistic-update pattern: the mutation input is
+provisional intent, while the query result is confirmed state.
+
+```tsx
+const userScope = Mutation.MutationScope("user:1")
+const pendingNamesAtom = Mutation.state({
+  filters: {
+    mutation: renameUser,
+    scope: userScope,
+    status: "pending"
+  },
+  select: ({ input }) => input.name
+})
+
+function UserName() {
+  const user = useAtomValue(userQuery({ id: "1" }))
+  const pendingNames = useAtomValue(pendingNamesAtom)
+
+  if (!Result.isSuccess(user.result)) return <p>Loading…</p>
+
+  const presentedName = pendingNames.at(-1) ?? user.result.value.name
+  return <p>{presentedName}</p>
+}
+```
+
+The presentation changes as soon as the mutation invocation enters the cache. If the command
+fails, that invocation stops matching the pending filter and the presentation falls back to the
+authoritative query value. If the command succeeds, `synchronize` makes the accepted value visible
+through the query before the mutation stops being pending, so the presentation does not flicker
+back to stale data.
+
+This pattern requires no `QueryClient.setData`, snapshot, or rollback. Use a cache update instead
+only when consumers must observe a speculative query result and the mutation can correctly derive
+that complete result. Mutation state describes the submitted command; resource lifecycle and
+confirmed state continue to come from queries.

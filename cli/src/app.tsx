@@ -393,10 +393,7 @@ function CliAppContent(
       );
     }
     const setupView = deriveOnboardingModelSetupView({
-      active: true,
-      submission: onboardingSetup.submission,
-      providerModelId: onboardingSetup.providerModelId,
-      submitting: Result.isWaiting(onboardingSetup.workflowResult),
+      operationState: onboardingSetup.operationState,
       models,
       slots,
     });
@@ -413,8 +410,6 @@ function CliAppContent(
     };
     const surface = (() => {
       switch (setupView._tag) {
-        case "Inactive":
-          return undefined;
         case "Downloading":
           return (
             <OnboardingModelChooser
@@ -426,7 +421,8 @@ function CliAppContent(
               operation={{
                 _tag: "Downloading",
                 model: setupView.model,
-                cancelling: onboardingSetup.cancelling,
+                starting: setupView.starting,
+                cancelling: setupView.cancelling,
                 cancelError: cancelDownloadError,
                 onCancel: cancelOnboardingModelSetup,
                 onRetry: () => retryConfiguration(setupView.model),

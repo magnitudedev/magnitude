@@ -18,9 +18,6 @@ import {
   OnboardingIdle,
   OnboardingModelMachine,
   initialObservationCorrelation,
-  onboardingCancellationPending,
-  onboardingProviderModelId,
-  onboardingSubmission,
   observeAdmittedDownload,
   observeAdmittedLoad,
   reduceDownloadObservation,
@@ -37,6 +34,7 @@ import {
 export type {
   OnboardingConfigurationChoice,
   OnboardingLoadModelChoice,
+  OnboardingModelOperation,
   OnboardingModelSubmission,
 } from "./onboarding-model-machine"
 
@@ -423,9 +421,7 @@ export const useOnboardingModelSetup = () => {
         slots: Result.map(get(slotsAtom), ({ state }) => state),
         workflowResult: get(workflowAtom),
         cancelResult: get(cancelAtom),
-        submission: onboardingSubmission(operation),
-        providerModelId: onboardingProviderModelId(operation),
-        cancelling: onboardingCancellationPending(operation),
+        operationState: operation,
       }
     }),
     [
