@@ -82,6 +82,7 @@ import { ConfigurationRecoveryLive } from "./configuration-recovery"
 import { makeAcnIcn } from "./icn"
 import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelAssessorLive } from "./local-model-assessor"
+import { LocalModelConfigurationResolverLive } from "./local-model-configuration-resolver"
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { LocalModelInstallerLive } from "./local-model-installer"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
@@ -411,7 +412,14 @@ const addLocalInferenceServices = <A, E, R>(
     LocalModelAssessorLive,
     withAssessments,
   )
-  const withInstaller = Layer.provideMerge(LocalModelInstallerLive, withAssessor)
+  const withConfigurationResolver = Layer.provideMerge(
+    LocalModelConfigurationResolverLive,
+    withAssessor,
+  )
+  const withInstaller = Layer.provideMerge(
+    LocalModelInstallerLive,
+    withConfigurationResolver,
+  )
   const withOfferings = Layer.provideMerge(
     LocalProviderOfferingsLive,
     withInstaller

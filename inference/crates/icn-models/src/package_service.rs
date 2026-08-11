@@ -8,9 +8,9 @@ use icn_contracts::models::{
     InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessment,
     ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
     ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageInstallationOrigin,
-    ModelPackageOperand, ModelPackageProperties, ModelPackageSource, ModelServingConfigurationId,
-    RemoveInstalledModelPackageResponse, ResolvedServableModelBundle, ServableModelBundle,
-    ServableModelBundleKey, ServingProfile,
+    ModelPackageOperand, ModelPackageProperties, ModelPackageSource, ModelServingConfiguration,
+    ModelServingConfigurationId, RemoveInstalledModelPackageResponse, ResolvedServableModelBundle,
+    ServableModelBundle, ServableModelBundleKey, ServingProfile,
 };
 use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, InventoryError, InventoryModel,
@@ -138,6 +138,11 @@ pub fn serving_configuration_id(
     digest.update(bundle_key.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
     ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
+}
+
+pub fn serving_configuration_identity_is_valid(configuration: &ModelServingConfiguration) -> bool {
+    let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+    configuration.id == serving_configuration_id(&bundle_key, &configuration.profile)
 }
 
 fn package_relationship(

@@ -322,9 +322,43 @@ mod tests {
     use crate::test_support::system_memory_topology;
     use icn_contracts::MemoryDomainId;
     use icn_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, ModelServingConfigurationId, PerformanceConfidence,
-        PerformanceEvidence, ServingProfile,
+        MemoryAssessment, ModelAssessmentId, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
+        ModelPackageId, ModelPackageProperties, ModelPackageSource, ModelServingConfiguration,
+        ModelServingConfigurationId, PerformanceConfidence, PerformanceEvidence,
+        ServableModelBundle, ServingProfile,
     };
+
+    fn configuration(id: &str, context_length: u32) -> ModelServingConfiguration {
+        ModelServingConfiguration {
+            id: ModelServingConfigurationId(id.to_owned()),
+            bundle: ServableModelBundle::Standalone {
+                package: ModelPackage {
+                    id: ModelPackageId("package_test".to_owned()),
+                    source: ModelPackageSource::HuggingFace {
+                        repository: "owner/repository".to_owned(),
+                        revision: "a".repeat(40),
+                    },
+                    files: vec![ModelFile {
+                        id: ModelFileId(format!("file_{}", "b".repeat(64))),
+                        path: std::path::PathBuf::from("model.gguf"),
+                        role: ModelFileRole::Weights,
+                        size_bytes: 10,
+                        tensor_storage_bytes: None,
+                        sha256: "b".repeat(64),
+                    }],
+                    relationships: Vec::new(),
+                    properties: ModelPackageProperties {
+                        format: "gguf".to_owned(),
+                        quantization: "Q4".to_owned(),
+                        quantization_name: "4-bit".to_owned(),
+                        architecture: "test".to_owned(),
+                        maximum_context_length: context_length,
+                    },
+                },
+            },
+            profile: ServingProfile { context_length },
+        }
+    }
 
     #[test]
     fn namespaces_are_typed_and_fail_as_misses() {
@@ -464,10 +498,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let topology = system_memory_topology(100);
         let fits = ModelAssessment::Fits {
-            profile: ServingProfile {
-                context_length: 50_000,
-            },
-            configuration_id: ModelServingConfigurationId("fits-configuration".to_owned()),
+            configuration: configuration("fits-configuration", 50_000),
             assessment_id: ModelAssessmentId("fits-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),
@@ -486,10 +517,7 @@ mod tests {
             }],
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
-            profile: ServingProfile {
-                context_length: 100_000,
-            },
-            configuration_id: ModelServingConfigurationId("non-fit-configuration".to_owned()),
+            configuration: configuration("non-fit-configuration", 100_000),
             assessment_id: ModelAssessmentId("non-fit-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),

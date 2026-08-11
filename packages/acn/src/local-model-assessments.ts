@@ -12,7 +12,6 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   LocalModelMutationFailed,
   MemoryAssessmentSchema,
-  ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
   type FitsModelAssessment,
   type AssessmentEnvironmentId,
@@ -29,7 +28,7 @@ import type {
 import { IcnClient } from "@magnitudedev/icn"
 import { LocalModelPackages } from "./local-model-packages"
 import {
-  servingProfileFromIcn,
+  modelServingConfigurationFromIcn,
   servingProfileToIcn,
   bundleToIcnInput,
 } from "./local-model-icn-adapter"
@@ -69,11 +68,14 @@ export const performanceSampleContextTokens = (
 ])].sort((left, right) => left - right)
 
 export type LocalModelAssessment =
-  | { readonly _tag: "Fits"; readonly assessment: FitsModelAssessment }
+  | {
+      readonly _tag: "Fits"
+      readonly configuration: ModelServingConfiguration
+      readonly assessment: FitsModelAssessment
+    }
   | {
       readonly _tag: "DoesNotFit"
-      readonly profile: ServingProfile
-      readonly configurationId: ModelServingConfiguration["id"]
+      readonly configuration: ModelServingConfiguration
       readonly assessmentId: FitsModelAssessment["assessmentId"]
       readonly memory: FitsModelAssessment["memory"]
       readonly deficitBytes: number
@@ -81,8 +83,7 @@ export type LocalModelAssessment =
     }
   | {
       readonly _tag: "Incompatible"
-      readonly profile: ServingProfile
-      readonly configurationId: ModelServingConfiguration["id"]
+      readonly configuration: ModelServingConfiguration
       readonly failure: ModelFailure
     }
 
@@ -153,16 +154,19 @@ const modelAssessment = (
   assessment: Extract<ModelAssessment, { readonly _tag: "Fits" }>,
   environmentId: AssessmentEnvironmentId,
 ) => Effect.gen(function* () {
-  const profile = yield* servingProfileFromIcn(assessment.profile)
-  return FitsModelAssessmentSchema.make({
-    _tag: "Fits",
-    profile,
-    configurationId: ModelServingConfigurationIdSchema.make(assessment.configurationId),
-    assessmentId: ModelAssessmentIdSchema.make(assessment.assessmentId),
-    environmentId,
-    memory: assessment.memory.map(memoryAssessmentFromIcn),
-    performance: assessment.performance,
-  })
+  const configuration = yield* modelServingConfigurationFromIcn(assessment.configuration)
+  return {
+    configuration,
+    assessment: FitsModelAssessmentSchema.make({
+      _tag: "Fits",
+      profile: configuration.profile,
+      configurationId: configuration.id,
+      assessmentId: ModelAssessmentIdSchema.make(assessment.assessmentId),
+      environmentId,
+      memory: assessment.memory.map(memoryAssessmentFromIcn),
+      performance: assessment.performance,
+    }),
+  }
 })
 
 const assessmentFromIcn = (
@@ -171,24 +175,26 @@ const assessmentFromIcn = (
 ): Effect.Effect<LocalModelAssessment, ParseResult.ParseError> =>
   assessment._tag === "Fits"
     ? modelAssessment(assessment, environmentId).pipe(
-        Effect.map((value) => ({ _tag: "Fits" as const, assessment: value })),
+        Effect.map(({ assessment, configuration }) => ({
+          _tag: "Fits" as const,
+          configuration,
+          assessment,
+        })),
       )
     : assessment._tag === "DoesNotFit" ? Effect.gen(function* () {
         return {
           _tag: "DoesNotFit" as const,
-          profile: yield* servingProfileFromIcn(assessment.profile),
-          configurationId: ModelServingConfigurationIdSchema.make(assessment.configurationId),
+          configuration: yield* modelServingConfigurationFromIcn(assessment.configuration),
           assessmentId: ModelAssessmentIdSchema.make(assessment.assessmentId),
           memory: assessment.memory.map(memoryAssessmentFromIcn),
           deficitBytes: Number(assessment.deficitBytes),
           limitingResource: String(assessment.limitingResource),
         }
       })
-    : servingProfileFromIcn(assessment.profile).pipe(
-        Effect.map((profile) => ({
+    : modelServingConfigurationFromIcn(assessment.configuration).pipe(
+        Effect.map((configuration) => ({
           _tag: "Incompatible" as const,
-          profile,
-          configurationId: ModelServingConfigurationIdSchema.make(assessment.configurationId),
+          configuration,
           failure: assessment.failure,
         })),
       )

@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
 
 import {
@@ -11,6 +11,7 @@ import {
   AssessmentEnvironmentIdSchema,
   type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
+import type { ModelServingConfiguration as NativeModelServingConfiguration } from "@magnitudedev/icn-protocol/schemas"
 
 const standaloneBundle = (maximumContextLength: number): ServableModelBundle => ({
   _tag: "Standalone",
@@ -93,6 +94,37 @@ describe("performanceSampleContextTokens", () => {
 
 describe("localModelAssessmentResultFromIcn", () => {
   const environmentId = AssessmentEnvironmentIdSchema.make("environment-test")
+  const assessmentBundle = {
+    _tag: "Standalone" as const,
+    package: {
+      id: "package-test",
+      source: { _tag: "Local" as const, path: "/models/test.gguf" },
+      files: [{
+        id: "file-test",
+        path: "test.gguf",
+        role: "weights" as const,
+        sizeBytes: 1,
+        tensorStorageBytes: Option.none<number>(),
+        sha256: "a".repeat(64),
+      }],
+      relationships: [],
+      properties: {
+        format: "gguf",
+        quantization: "Q4_K_M",
+        quantizationName: "4-bit",
+        architecture: "test",
+        maximumContextLength: 100_000,
+      },
+    },
+  }
+  const nativeConfiguration = (
+    id: string,
+    contextLength: number,
+  ): NativeModelServingConfiguration => ({
+    id,
+    bundle: assessmentBundle,
+    profile: { contextLength },
+  }) as unknown as NativeModelServingConfiguration
 
   it("preserves terminal non-capacity assessment evidence", () => {
     const result = Effect.runSync(localModelAssessmentResultFromIcn({
@@ -100,16 +132,14 @@ describe("localModelAssessmentResultFromIcn", () => {
       requestId: "assessment-0",
       profiles: [{
         _tag: "DoesNotFit",
-        profile: { contextLength: 50_000 },
-        configurationId: "configuration-0",
+        configuration: nativeConfiguration("configuration-0", 50_000),
         assessmentId: "assessment-result-0",
         memory: [],
         limitingResource: "system_memory",
         deficitBytes: 1024,
       }, {
         _tag: "Incompatible",
-        profile: { contextLength: 100_000 },
-        configurationId: "configuration-1",
+        configuration: nativeConfiguration("configuration-1", 100_000),
         failure: {
           code: "unsupported_architecture",
           message: "Unsupported architecture",
@@ -123,16 +153,22 @@ describe("localModelAssessmentResultFromIcn", () => {
       environmentId,
       assessments: [{
         _tag: "DoesNotFit",
-        profile: { contextLength: 50_000 },
-        configurationId: "configuration-0",
+        configuration: {
+          id: "configuration-0",
+          bundle: assessmentBundle,
+          profile: { contextLength: 50_000 },
+        },
         assessmentId: "assessment-result-0",
         memory: [],
         limitingResource: "system_memory",
         deficitBytes: 1024,
       }, {
         _tag: "Incompatible",
-        profile: { contextLength: 100_000 },
-        configurationId: "configuration-1",
+        configuration: {
+          id: "configuration-1",
+          bundle: assessmentBundle,
+          profile: { contextLength: 100_000 },
+        },
         failure: {
           code: "unsupported_architecture",
           message: "Unsupported architecture",

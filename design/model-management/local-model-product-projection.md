@@ -2,6 +2,7 @@
 applies_to:
   - packages/acn/src/local-models.ts
   - packages/acn/src/local-model-assessor.ts
+  - packages/acn/src/local-model-configuration-resolver.ts
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/hooks/use-local-inference-state.ts
@@ -65,25 +66,30 @@ The backend decides exactly one serving configuration for each installed bundle,
 
 1. the bundle's retained configuration;
 2. otherwise its exact catalog configuration;
-3. otherwise its standard configuration derived from inspected package facts.
+3. otherwise the ICN-issued configuration for ACN's standard profile decision, made from inspected
+   package facts.
 
 Retained and catalog configurations may coexist as backend inputs, but they never become parallel
 product rows or parallel choices for one bundle. Retaining another configuration for the same
 bundle replaces the previous retained decision.
 
 ```text
-derived configurations --set----+
-catalog configurations --replace+--> Map<bundle identity, serving configuration>
-retained configurations -replace+
+ICN-issued standard configurations --set----+
+catalog configurations ------------replace+--> Map<bundle identity, serving configuration>
+retained configurations -----------replace+
 ```
 
 The map value is the configuration itself. Source provenance is not retained or published.
+This decision is the single authority used by both the product projection and first-time
+installation admission.
 
 Configuration durability and generation are defined in the
 [terminology durability boundary](./terminology.md#durability-boundary). In particular, package
-origin is irrelevant: catalog matching selects the exact catalog configuration, while only an
-installed, inspected, non-catalog standalone bundle receives a generated standard configuration.
-Generation is disposable observation; selection/installation materializes the decision durably.
+origin is irrelevant: catalog matching selects the exact catalog configuration, while ACN makes a
+standard profile decision only for an installed, inspected, non-catalog standalone bundle. ICN
+constructs and identifies the corresponding configuration. The standard decision and resulting
+configuration are disposable observation; selection/installation materializes the configuration
+durably.
 
 An installed independently servable package always contributes a standalone model. It does not
 need catalog membership, a retained configuration, or an existing provider offering. Catalog
@@ -139,6 +145,8 @@ empty arrays, optional capabilities, absent offerings, absent memory, or recomme
 - Catalog removal cannot hide an installed package.
 - Invalid installed artifacts remain visible with the exact failure.
 - Each installed bundle produces exactly one `LocalModel` and one decided serving configuration.
+- For the standard case, ACN chooses the profile and consumes the exact configuration constructed
+  by ICN; ACN never constructs or predicts configuration identity.
 - `Assessed` always contains capabilities, that configuration, and exactly one terminal result.
 - Inventory refresh does not reopen assessment for unchanged semantic evidence.
 - Download workflows observe `downloads`, never recommendations or model absence.

@@ -485,16 +485,14 @@ pub struct PerformanceEvidence {
 pub enum ModelAssessment {
     #[serde(rename_all = "camelCase")]
     Fits {
-        profile: ServingProfile,
-        configuration_id: ModelServingConfigurationId,
+        configuration: ModelServingConfiguration,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         performance: Vec<PerformanceEvidence>,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
-        profile: ServingProfile,
-        configuration_id: ModelServingConfigurationId,
+        configuration: ModelServingConfiguration,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,
@@ -502,8 +500,7 @@ pub enum ModelAssessment {
     },
     #[serde(rename_all = "camelCase")]
     Incompatible {
-        profile: ServingProfile,
-        configuration_id: ModelServingConfigurationId,
+        configuration: ModelServingConfiguration,
         failure: ModelFailure,
     },
 }

@@ -13,6 +13,7 @@ import {
   ServableModelBundleSchema,
   ModelPackageInspectionSchema,
   ModelPackageSchema,
+  ModelServingConfigurationSchema,
   RecommendableModelSchema,
   ServingProfileSchema,
 } from "@magnitudedev/acn-protocol"
@@ -101,16 +102,23 @@ export const modelServingConfigurationToIcn = (
     })),
   )
 
+export const modelServingConfigurationFromIcn = (
+  configuration: NativeModelServingConfiguration,
+): Effect.Effect<ModelServingConfiguration, ParseResult.ParseError> =>
+  Schema.validate(ModelServingConfigurationSchema)({
+    ...configuration,
+    bundle: normalizeBundleFromIcn(configuration.bundle),
+  })
+
 export const recommendableModelFromIcn = (
   model: NativeRecommendableModel,
 ): Effect.Effect<RecommendableModel, ParseResult.ParseError> =>
-  Schema.validate(RecommendableModelSchema)({
-    ...model,
-    configuration: {
-      ...model.configuration,
-      bundle: normalizeBundleFromIcn(model.configuration.bundle),
-    },
-  })
+  modelServingConfigurationFromIcn(model.configuration).pipe(
+    Effect.flatMap((configuration) => Schema.validate(RecommendableModelSchema)({
+      ...model,
+      configuration,
+    })),
+  )
 
 export const downloadAttemptFromIcn = (
   attempt: NativeDownloadAttempt,

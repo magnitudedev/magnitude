@@ -39,7 +39,7 @@ use icn_hardware::CapacityPolicy;
 use icn_models::{
     InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ReleaseCatalog,
     ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog,
-    servable_model_bundle_key, serving_configuration_id,
+    servable_model_bundle_key, serving_configuration_id, serving_configuration_identity_is_valid,
 };
 use llama_cpp_2::model::params::fit::{
     FitCalibration as NativeHardwareCalibration,
@@ -2005,6 +2005,7 @@ impl NativeModelAssessor {
             for (index, assessment) in missing.into_iter().zip(assessed) {
                 let assessment = model_assessment(
                     &resolved.bundle_key,
+                    &resolved.bundle,
                     profiles[index].clone(),
                     &environment.id,
                     reserve_bytes,
@@ -2035,6 +2036,7 @@ impl NativeModelAssessor {
 
 fn model_assessment(
     bundle_key: &icn_contracts::models::ServableModelBundleKey,
+    bundle: &DomainServableModelBundle,
     assessment_profile: DomainModelAssessmentProfile,
     environment_id: &AssessmentEnvironmentId,
     reserve_bytes: u64,
@@ -2047,6 +2049,11 @@ fn model_assessment(
         performance_context_tokens,
     } = assessment_profile;
     let configuration_id = serving_configuration_id(bundle_key, &profile);
+    let configuration = ModelServingConfiguration {
+        id: configuration_id,
+        bundle: bundle.clone(),
+        profile: profile.clone(),
+    };
     let mut digest = Sha256::new();
     digest.update(bundle_key.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
@@ -2077,8 +2084,7 @@ fn model_assessment(
                 ));
             }
             Ok(ModelAssessment::Fits {
-                profile,
-                configuration_id,
+                configuration,
                 assessment_id,
                 memory: memory
                     .domains
@@ -2113,8 +2119,7 @@ fn model_assessment(
             limiting_resource,
             ..
         } => Ok(ModelAssessment::DoesNotFit {
-            profile,
-            configuration_id,
+            configuration,
             assessment_id,
             memory: memory
                 .domains
@@ -2144,8 +2149,7 @@ fn model_assessment(
         }),
         HardwareAssessment::InvalidArtifact { code, message } => {
             Ok(ModelAssessment::Incompatible {
-                profile,
-                configuration_id,
+                configuration,
                 failure: DomainModelFailure {
                     code,
                     message,
@@ -2155,8 +2159,7 @@ fn model_assessment(
         }
         HardwareAssessment::IncompatibleArtifact { code, message } => {
             Ok(ModelAssessment::Incompatible {
-                profile,
-                configuration_id,
+                configuration,
                 failure: DomainModelFailure {
                     code,
                     message,
@@ -3557,6 +3560,12 @@ impl NativeModelInstanceController {
         ),
         InventoryError,
     > {
+        if !serving_configuration_identity_is_valid(configuration) {
+            return Err(InventoryError::InvalidRequest(format!(
+                "configuration {} does not identify its exact bundle and profile",
+                configuration.id.0
+            )));
+        }
         let (target, package_ids) = match &configuration.bundle {
             DomainServableModelBundle::Standalone { package } => (
                 ModelBundleInput::Standalone {

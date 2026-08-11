@@ -4,6 +4,7 @@ import {
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
+  servableModelBundlePackageIds,
   type ModelServingConfiguration,
   type ServableModelBundle,
   type ModelPackageSource,
@@ -11,9 +12,9 @@ import {
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import {
   availabilityFromProviderProjection,
-  decideLocalModelConfigurations,
   resolveBundlePresentation,
 } from "./local-models"
+import { resolveLocalModelConfigurations } from "./local-model-configuration-resolver"
 
 const standaloneBundle = (
   source: ModelPackageSource,
@@ -52,28 +53,94 @@ const configuration = (
   profile: { contextLength },
 })
 
-describe("local model configuration decision", () => {
-  it("constructs one decision per bundle with retained, catalog, derived precedence", () => {
+describe("local model configuration resolution", () => {
+  it("resolves one configuration per bundle with retained, catalog, standard precedence", () => {
     const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
-    const derived = configuration("configuration-derived", bundle, 50_000)
+    const standard = configuration("configuration-standard", bundle, 50_000)
     const catalog = configuration("configuration-catalog", bundle, 32_000)
     const retained = configuration("configuration-retained", bundle, 24_000)
 
-    expect([...decideLocalModelConfigurations({
+    expect([...resolveLocalModelConfigurations({
       retained: [],
       catalog: [],
-      assessed: [derived],
-    }).values()]).toEqual([derived])
-    expect([...decideLocalModelConfigurations({
+      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      assessed: new Map([[standard.id, {
+        configuration: standard,
+        origin: "Standard",
+        assessment: { _tag: "Assessing" },
+      }]]),
+    }).values()].map(({ configuration }) => configuration)).toEqual([standard])
+    expect([...resolveLocalModelConfigurations({
       retained: [],
       catalog: [catalog],
-      assessed: [derived, catalog],
-    }).values()]).toEqual([catalog])
-    expect([...decideLocalModelConfigurations({
+      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      assessed: new Map([
+        [standard.id, {
+          configuration: standard,
+          origin: "Standard",
+          assessment: { _tag: "Assessing" },
+        }],
+        [catalog.id, {
+          configuration: catalog,
+          origin: "Authored",
+          assessment: { _tag: "Assessing" },
+        }],
+      ]),
+    }).values()].map(({ configuration }) => configuration)).toEqual([catalog])
+    expect([...resolveLocalModelConfigurations({
       retained: [retained],
       catalog: [catalog],
-      assessed: [derived, catalog, retained],
-    }).values()]).toEqual([retained])
+      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      assessed: new Map([
+        [standard.id, {
+          configuration: standard,
+          origin: "Standard",
+          assessment: { _tag: "Assessing" },
+        }],
+        [catalog.id, {
+          configuration: catalog,
+          origin: "Authored",
+          assessment: { _tag: "Assessing" },
+        }],
+        [retained.id, {
+          configuration: retained,
+          origin: "Authored",
+          assessment: { _tag: "Assessing" },
+        }],
+      ]),
+    }).values()].map(({ configuration }) => configuration)).toEqual([retained])
+  })
+
+  it("does not reinterpret removed authored configurations as standard resolutions", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
+    const staleCatalog = configuration("configuration-catalog", bundle, 32_000)
+
+    expect(resolveLocalModelConfigurations({
+      retained: [],
+      catalog: [],
+      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      assessed: new Map([[staleCatalog.id, {
+        configuration: staleCatalog,
+        origin: "Authored",
+        assessment: { _tag: "Assessing" },
+      }]]),
+    }).size).toBe(0)
+  })
+
+  it("drops a generated resolution when its installed package disappears", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
+    const standard = configuration("configuration-standard", bundle, 50_000)
+
+    expect(resolveLocalModelConfigurations({
+      retained: [],
+      catalog: [],
+      installedPackageIds: new Set(),
+      assessed: new Map([[standard.id, {
+        configuration: standard,
+        origin: "Standard",
+        assessment: { _tag: "Assessing" },
+      }]]),
+    }).size).toBe(0)
   })
 })
 

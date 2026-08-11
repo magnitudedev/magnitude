@@ -181,15 +181,17 @@ configurations, and marks recovery complete in the same durable commit. It perfo
 no filesystem scan, package inspection, model assessment, or recommendation work. Later inventory
 changes do not create retained configurations. An installed independently servable package remains
 visible regardless of recovery and
-receives only the deterministic standard configuration produced after successful inspection.
-That standard is derived only when neither a retained nor catalog configuration exists for the
-bundle.
+receives only the ICN-issued configuration for ACN's standard profile decision after successful
+inspection. ACN makes that profile decision only when neither a retained nor catalog configuration
+exists for the bundle; ICN constructs and canonically identifies the configuration.
 
 ## Conformance
 
 - Catalog membership implies only eligibility for assessment and recommendation.
 - Every catalog bundle publishes the exact reviewed serving profile and required companion set used
   to construct its package.
+- Every catalog and standard serving configuration carries canonical identity constructed by ICN;
+  ACN never recreates that identity.
 - Runtime setup requires no network access to reconstruct the release catalog.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
