@@ -488,6 +488,11 @@ local view    = f(presentation state)
 
 Components compose these views; they do not merge them into another authority.
 
+A client-owned composite workflow exposes its canonical operation state directly to presentation.
+Consumers must not decompose that state and reconstruct its phase from mutation waiting and later
+query snapshots. The workflow state may present that a command has been requested immediately;
+authoritative resource progress and lifecycle still come only from the correlated query state.
+
 Client synchronization is declarative:
 
 ```text

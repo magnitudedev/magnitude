@@ -94,6 +94,40 @@ test("shows compact download details with progress, rate, and ETA", async () => 
   }
 })
 
+test("shows zero-percent download details while admission is starting", async () => {
+  const startingModel = makeAcquiringModel({
+    _tag: "NotInstalled",
+    completedBytes: 0,
+    totalBytes: 30 * GIB,
+  })
+  const view = await testRender(
+    <OnboardingModelDownloadDetails
+      model={startingModel}
+      width={56}
+      height={11}
+      operation={{
+        _tag: "Active",
+        starting: true,
+        cancelling: false,
+        cancelError: null,
+        onCancel,
+        onRetry,
+      }}
+    />,
+    { width: 100, height: 24 },
+  )
+  try {
+    await act(view.renderOnce)
+    const frame = view.captureCharFrame()
+    expect(frame).toContain("Downloading Qwen Test")
+    expect(frame).toContain("0%")
+    expect(frame).not.toContain("0 B /")
+    expect(frame).not.toContain("Cancel (Esc)")
+  } finally {
+    await act(async () => view.renderer.destroy())
+  }
+})
+
 test("requires confirmation before cancelling and supports keyboard choice", async () => {
   const view = await testRender(
     <OnboardingModelDownloadDetails
@@ -102,6 +136,7 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
       height={11}
       operation={{
         _tag: "Active",
+        starting: false,
         cancelling: false,
         cancelError: null,
         onCancel,
@@ -152,6 +187,7 @@ test("shows failed-download actions in the details pane", async () => {
       height={11}
       operation={{
         _tag: "Active",
+        starting: false,
         cancelling: false,
         cancelError: null,
         onCancel,

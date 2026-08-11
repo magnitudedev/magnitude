@@ -29,7 +29,9 @@ export type OnboardingModelSubmission =
   | { readonly _tag: "InstallThenLoad"; readonly choice: OnboardingConfigurationChoice }
 
 type SubmissionProps = { readonly submission: OnboardingModelSubmission }
-type DownloadProps = SubmissionProps & {
+type InstallationSubmission = Extract<OnboardingModelSubmission, { readonly _tag: "InstallThenLoad" }>
+type InstallationSubmissionProps = { readonly submission: InstallationSubmission }
+type DownloadProps = InstallationSubmissionProps & {
   readonly configurationId: ModelServingConfigurationId
   readonly providerModelId: ProviderModelId
   readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
@@ -41,7 +43,7 @@ type LoadProps = SubmissionProps & {
 
 export class OnboardingIdle extends Data.TaggedClass("Idle")<{}> {}
 export class OnboardingRequestingInstallation extends Data.TaggedClass("RequestingInstallation")<
-  SubmissionProps & { readonly cancellationRequested: boolean }
+  InstallationSubmissionProps & { readonly cancellationRequested: boolean }
 > {}
 export class OnboardingDownloadAdmitted extends Data.TaggedClass("DownloadAdmitted")<DownloadProps> {}
 export class OnboardingRequestingDownloadCancellation extends Data.TaggedClass(
@@ -119,55 +121,6 @@ export const resetOnboardingOperation = (
     case "AwaitingLoadStop":
     case "Completing":
       throw new Error(`Cannot replace active onboarding operation ${state._tag}`)
-  }
-}
-
-export const onboardingSubmission = (
-  state: OnboardingModelOperation,
-): OnboardingModelSubmission | null => state._tag === "Idle" ? null : state.submission
-
-export const onboardingProviderModelId = (
-  state: OnboardingModelOperation,
-): Option.Option<ProviderModelId> => {
-  if (state._tag === "Idle") return Option.none()
-  if (state.submission._tag === "Load") return Option.some(state.submission.choice.providerModelId)
-  switch (state._tag) {
-    case "DownloadAdmitted":
-    case "RequestingDownloadCancellation":
-    case "AwaitingDownloadCancellation":
-    case "DownloadCancellationFailed":
-      return Option.none()
-    case "Assigning":
-    case "AdmittingLoad":
-    case "LoadAdmitted":
-    case "RequestingLoadStop":
-    case "AwaitingLoadStop":
-    case "LoadStopFailed":
-    case "Completing":
-      return Option.some(state.providerModelId)
-    case "RequestingInstallation":
-      return Option.none()
-  }
-}
-
-export const onboardingCancellationPending = (state: OnboardingModelOperation): boolean => {
-  switch (state._tag) {
-    case "RequestingInstallation":
-    case "Assigning":
-    case "AdmittingLoad":
-      return state.cancellationRequested
-    case "RequestingDownloadCancellation":
-    case "AwaitingDownloadCancellation":
-    case "RequestingLoadStop":
-    case "AwaitingLoadStop":
-      return true
-    case "Idle":
-    case "DownloadAdmitted":
-    case "DownloadCancellationFailed":
-    case "LoadAdmitted":
-    case "LoadStopFailed":
-    case "Completing":
-      return false
   }
 }
 

@@ -108,6 +108,10 @@ Onboarding may compose configuration installation, assignment, loading, completi
 explicit cancellation as one client-owned workflow. Its transient state retains the submitted
 choice through each finite mutation and contains only the exact command identities required to
 bridge admitted work. It does not duplicate download, slot, or instance lifecycle.
+That canonical operation state is exposed directly to onboarding presentation. Clients do not
+decompose it into parallel phase fields or reconstruct it from mutation waiting and later resource
+snapshots. A requested installation can therefore render immediately while acquisition progress
+remains sourced from the exact local-model row.
 
 Interruption or restart never reconstructs onboarding intent from server observations. Confirmed
 cancellation invokes ordinary download-cancellation or slot-clear mutations. Successful load closes
