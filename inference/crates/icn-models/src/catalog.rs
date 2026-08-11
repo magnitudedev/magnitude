@@ -8,9 +8,10 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, ModelFailure, ModelFileRole, ModelOfferingTarget, ModelOfferingTargetId,
-    ModelPackage, ModelPackageSource, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedModelTarget, ServingProfile,
+    CatalogDiagnostic, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
+    ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedServableModelBundle,
+    ServableModelBundle, ServableModelBundleKey, ServingProfile,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -23,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use crate::cache::ModelBlobKind;
 use crate::capabilities::model_capabilities;
 use crate::inventory::ModelManager;
-use crate::package_service::{offering_target_id, package_from_resolved};
+use crate::package_service::{
+    package_from_resolved, servable_model_bundle_key, servable_model_bundle_key_for_bundle,
+    serving_configuration_id,
+};
 use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
 use crate::refresh_hugging_face_repository;
 
@@ -83,7 +87,7 @@ impl From<CatalogCompanionRole> for ModelPreviewComponentRole {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerManifest {
-    planner_inputs: BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    planner_inputs: BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,7 +112,7 @@ struct ReleasePlannerComponent {
 
 pub struct GeneratedReleaseCatalog {
     pub catalog: RecommendableModelCatalog,
-    planner_inputs: BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    planner_inputs: BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
     source_headers: BTreeMap<String, Vec<u8>>,
     planner_stubs: BTreeMap<String, Vec<u8>>,
 }
@@ -116,7 +120,7 @@ pub struct GeneratedReleaseCatalog {
 #[derive(Clone)]
 pub struct ReleaseCatalog {
     catalog: RecommendableModelCatalog,
-    planner_inputs: Arc<BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>>,
+    planner_inputs: Arc<BTreeMap<ServableModelBundleKey, ReleasePlannerInput>>,
     planner_bundle: Arc<PlannerBundle<'static>>,
 }
 
@@ -320,19 +324,25 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         .iter()
         .map(|model| model.id.clone())
         .collect::<BTreeSet<_>>();
-    let target_ids = catalog
+    let configuration_ids = catalog
         .models
         .iter()
-        .map(|model| model.target_id.clone())
+        .map(|model| model.configuration.id.clone())
         .collect::<BTreeSet<_>>();
     if catalog.models.is_empty()
         || model_ids.len() != catalog.models.len()
-        || target_ids.len() != catalog.models.len()
+        || configuration_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
-            model.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
-                || match &model.target {
-                    ModelOfferingTarget::Package { package } => {
-                        model.profile.context_length > package.properties.maximum_context_length
+            model.configuration.id
+                != serving_configuration_id(
+                    &recommendable_model_bundle_key(model),
+                    &model.configuration.profile,
+                )
+                || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
+                || match &model.configuration.bundle {
+                    ServableModelBundle::Standalone { package } => {
+                        model.configuration.profile.context_length
+                            > package.properties.maximum_context_length
                             || match &package.source {
                                 ModelPackageSource::HuggingFace { revision, .. } => {
                                     revision.len() != 40
@@ -343,7 +353,7 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                                 ModelPackageSource::Local { .. } => true,
                             }
                     }
-                    ModelOfferingTarget::SpeculativeDecodingPair { .. } => true,
+                    ServableModelBundle::SpeculativeDecodingPair { .. } => true,
                 }
         })
     {
@@ -354,35 +364,39 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
     Ok(())
 }
 
+fn recommendable_model_bundle_key(model: &RecommendableModel) -> ServableModelBundleKey {
+    servable_model_bundle_key_for_bundle(&model.configuration.bundle)
+}
+
 fn validate_planner_inputs(
     catalog: &RecommendableModelCatalog,
-    artifacts: &BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    artifacts: &BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 ) -> Result<(), InventoryError> {
-    let catalog_targets = catalog
+    let catalog_bundles = catalog
         .models
         .iter()
-        .map(|model| model.target_id.clone())
+        .map(recommendable_model_bundle_key)
         .collect::<BTreeSet<_>>();
-    let artifact_targets = artifacts.keys().cloned().collect::<BTreeSet<_>>();
-    if artifact_targets != catalog_targets {
+    let artifact_bundles = artifacts.keys().cloned().collect::<BTreeSet<_>>();
+    if artifact_bundles != catalog_bundles {
         return Err(InventoryError::Integrity(
-            "release planner inputs do not exactly cover the catalog targets".to_owned(),
+            "release planner inputs do not exactly cover the catalog bundles".to_owned(),
         ));
     }
-    for (target_id, artifact) in artifacts {
+    for (bundle_key, artifact) in artifacts {
         let package_files = catalog
             .models
             .iter()
-            .find(|model| &model.target_id == target_id)
-            .and_then(|model| match &model.target {
-                ModelOfferingTarget::Package { package } => Some(
+            .find(|model| recommendable_model_bundle_key(model) == *bundle_key)
+            .and_then(|model| match &model.configuration.bundle {
+                ServableModelBundle::Standalone { package } => Some(
                     package
                         .files
                         .iter()
                         .map(|file| (file.path.clone(), file.size_bytes))
                         .collect::<BTreeSet<_>>(),
                 ),
-                ModelOfferingTarget::SpeculativeDecodingPair { .. } => None,
+                ServableModelBundle::SpeculativeDecodingPair { .. } => None,
             });
         let planner_files = artifact
             .components
@@ -411,7 +425,7 @@ fn validate_planner_inputs(
         {
             return Err(InventoryError::Integrity(format!(
                 "invalid release planner input {}",
-                target_id.0
+                bundle_key.0
             )));
         }
     }
@@ -438,31 +452,31 @@ impl GeneratedReleaseCatalog {
             .map_err(InventoryError::Integrity)
     }
 
-    pub fn resolve_source_planner_target(
+    pub fn resolve_source_planner_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
-    ) -> Result<ResolvedModelTarget, InventoryError> {
-        self.resolve_generated_planner_target(target_id, false)
+        bundle_key: &ServableModelBundleKey,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        self.resolve_generated_planner_bundle(bundle_key, false)
     }
 
-    pub fn resolve_compact_planner_target(
+    pub fn resolve_compact_planner_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
-    ) -> Result<ResolvedModelTarget, InventoryError> {
-        self.resolve_generated_planner_target(target_id, true)
+        bundle_key: &ServableModelBundleKey,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        self.resolve_generated_planner_bundle(bundle_key, true)
     }
 
-    fn resolve_generated_planner_target(
+    fn resolve_generated_planner_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
+        bundle_key: &ServableModelBundleKey,
         compact: bool,
-    ) -> Result<ResolvedModelTarget, InventoryError> {
-        let (artifact, target) =
-            planner_input_and_target(&self.catalog, &self.planner_inputs, target_id)?;
-        materialize_planner_target(
-            target_id,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        let (artifact, bundle) =
+            planner_input_and_bundle(&self.catalog, &self.planner_inputs, bundle_key)?;
+        materialize_planner_bundle(
+            bundle_key,
             artifact,
-            target,
+            bundle,
             |component| {
                 let (digest, expected_size) = if compact {
                     (
@@ -500,29 +514,29 @@ impl ReleaseCatalog {
         &self.catalog
     }
 
-    pub fn resolve_target(
+    pub fn resolve_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
-    ) -> Result<Option<ResolvedModelTarget>, InventoryError> {
-        let Some(artifact) = self.planner_inputs.get(target_id) else {
+        bundle_key: &ServableModelBundleKey,
+    ) -> Result<Option<ResolvedServableModelBundle>, InventoryError> {
+        let Some(artifact) = self.planner_inputs.get(bundle_key) else {
             return Ok(None);
         };
-        let target = self
+        let bundle = self
             .catalog
             .models
             .iter()
-            .find(|model| &model.target_id == target_id)
-            .map(|model| model.target.clone())
+            .find(|model| recommendable_model_bundle_key(model) == *bundle_key)
+            .map(|model| model.configuration.bundle.clone())
             .ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "catalog target {} has no model declaration",
-                    target_id.0
+                    "catalog bundle {} has no model declaration",
+                    bundle_key.0
                 ))
             })?;
-        Ok(Some(materialize_planner_target(
-            target_id,
+        Ok(Some(materialize_planner_bundle(
+            bundle_key,
             artifact,
-            target,
+            bundle,
             |component| {
                 let stub = self
                     .planner_bundle
@@ -535,43 +549,43 @@ impl ReleaseCatalog {
     }
 }
 
-fn planner_input_and_target<'a>(
+fn planner_input_and_bundle<'a>(
     catalog: &'a RecommendableModelCatalog,
-    artifacts: &'a BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
-    target_id: &ModelOfferingTargetId,
-) -> Result<(&'a ReleasePlannerInput, ModelOfferingTarget), InventoryError> {
-    let artifact = artifacts.get(target_id).ok_or_else(|| {
+    artifacts: &'a BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
+    bundle_key: &ServableModelBundleKey,
+) -> Result<(&'a ReleasePlannerInput, ServableModelBundle), InventoryError> {
+    let artifact = artifacts.get(bundle_key).ok_or_else(|| {
         InventoryError::Integrity(format!(
-            "catalog target {} has no planner input",
-            target_id.0
+            "catalog bundle {} has no planner input",
+            bundle_key.0
         ))
     })?;
-    let target = catalog
+    let bundle = catalog
         .models
         .iter()
-        .find(|model| &model.target_id == target_id)
-        .map(|model| model.target.clone())
+        .find(|model| recommendable_model_bundle_key(model) == *bundle_key)
+        .map(|model| model.configuration.bundle.clone())
         .ok_or_else(|| {
             InventoryError::Integrity(format!(
-                "catalog target {} has no model declaration",
-                target_id.0
+                "catalog bundle {} has no model declaration",
+                bundle_key.0
             ))
         })?;
-    Ok((artifact, target))
+    Ok((artifact, bundle))
 }
 
-fn materialize_planner_target<'a>(
-    target_id: &ModelOfferingTargetId,
+fn materialize_planner_bundle<'a>(
+    bundle_key: &ServableModelBundleKey,
     artifact: &ReleasePlannerInput,
-    target: ModelOfferingTarget,
+    bundle: ServableModelBundle,
     mut input_for: impl FnMut(&ReleasePlannerComponent) -> Result<(Cow<'a, [u8]>, u64), InventoryError>,
     integrity_method: &str,
-) -> Result<ResolvedModelTarget, InventoryError> {
-    let package = match &target {
-        ModelOfferingTarget::Package { package } => package,
-        ModelOfferingTarget::SpeculativeDecodingPair { .. } => {
+) -> Result<ResolvedServableModelBundle, InventoryError> {
+    let package = match &bundle {
+        ServableModelBundle::Standalone { package } => package,
+        ServableModelBundle::SpeculativeDecodingPair { .. } => {
             return Err(InventoryError::Integrity(
-                "release planner input requires a package target".to_owned(),
+                "release planner input requires a standalone bundle".to_owned(),
             ));
         }
     };
@@ -661,7 +675,7 @@ fn materialize_planner_target<'a>(
             .collect(),
     };
     Ok(
-        ResolvedModelTarget::new(target_id.clone(), target, resolved, None)
+        ResolvedServableModelBundle::new(bundle_key.clone(), bundle, resolved, None)
             .retain_resolution_guard(workspace),
     )
 }
@@ -707,7 +721,7 @@ fn validate_resolved_catalog(
             .find(|declaration| declaration.id == model.checkpoint_id)
             .ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "release catalog target {} has no source declaration",
+                    "release catalog bundle {} has no source declaration",
                     model.id.0
                 ))
             })?;
@@ -717,11 +731,11 @@ fn validate_resolved_catalog(
                 model.checkpoint_id
             ))
         })?;
-        let package = match &model.target {
-            ModelOfferingTarget::Package { package } => package,
-            ModelOfferingTarget::SpeculativeDecodingPair { .. } => {
+        let package = match &model.configuration.bundle {
+            ServableModelBundle::Standalone { package } => package,
+            ServableModelBundle::SpeculativeDecodingPair { .. } => {
                 return Err(InventoryError::Integrity(
-                    "release catalog contains an unsupported speculative target".to_owned(),
+                    "release catalog contains an unsupported speculative bundle".to_owned(),
                 ));
             }
         };
@@ -737,12 +751,12 @@ fn validate_resolved_catalog(
             .filter(|file| file.role == ModelFileRole::Mtp)
             .map(|file| file.path.as_path())
             .collect::<BTreeSet<_>>();
-        if model.profile.context_length != declaration.context_length
+        if model.configuration.profile.context_length != declaration.context_length
             || expected_mtp_paths != actual_mtp_paths
             || !package_source_matches(&package.source, declaration, expected_commit)
         {
             return Err(InventoryError::Integrity(format!(
-                "release catalog target {} does not match models.json and models.lock.json",
+                "release catalog bundle {} does not match models.json and models.lock.json",
                 model.id.0
             )));
         }
@@ -794,13 +808,17 @@ fn recommendable_model(
     properties: &InventoryProperties,
 ) -> RecommendableModel {
     let (fidelity_rank, quantization_aware) = fidelity(&declaration.id, format);
+    let bundle_key = servable_model_bundle_key(&[&package.id]);
+    let profile = ServingProfile {
+        context_length: declaration.context_length,
+    };
     RecommendableModel {
         id: RecommendableModelId(format!("{}:{format}", declaration.id)),
         checkpoint_id: declaration.id.clone(),
-        target_id: offering_target_id(&[&package.id]),
-        target: ModelOfferingTarget::Package { package },
-        profile: ServingProfile {
-            context_length: declaration.context_length,
+        configuration: ModelServingConfiguration {
+            id: serving_configuration_id(&bundle_key, &profile),
+            bundle: ServableModelBundle::Standalone { package },
+            profile,
         },
         display_name: declaration.display_name.clone(),
         description: declaration.description.clone(),
@@ -816,7 +834,7 @@ fn recommendable_model(
 
 fn catalog_from_planner_inputs(
     source: &CatalogSource,
-    inputs: &BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    inputs: &BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 ) -> Result<RecommendableModelCatalog, InventoryError> {
     let by_model_id = inputs
         .values()
@@ -843,9 +861,9 @@ fn catalog_from_planner_inputs(
                 input.package.clone(),
                 &input.properties,
             );
-            if !inputs.contains_key(&model.target_id) {
+            if !inputs.contains_key(&recommendable_model_bundle_key(&model)) {
                 return Err(InventoryError::Integrity(format!(
-                    "planner bundle target does not match catalog model {}",
+                    "planner bundle key does not match catalog model {}",
                     model_id.0
                 )));
             }
@@ -1213,7 +1231,7 @@ impl ResolvingRecommendableCatalog {
         for (_, _, declaration, format, result) in resolved {
             match result {
                 Ok((model, planner, model_headers, model_stubs)) => {
-                    planner_inputs.insert(model.target_id.clone(), planner);
+                    planner_inputs.insert(recommendable_model_bundle_key(&model), planner);
                     models.push(model);
                     for (digest, header) in model_headers {
                         if let Some(previous) =

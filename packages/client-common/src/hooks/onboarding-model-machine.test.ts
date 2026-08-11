@@ -3,12 +3,12 @@ import { Cause, Effect, Option, Stream } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import {
   DownloadAttemptIdSchema,
+  ModelPackageIdSchema,
   ModelInstanceIdSchema,
-  ModelOfferingTargetIdSchema,
   ModelServingConfigurationIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-  type LocalModelDownload,
+  type LocalModelDownloadState,
   type LocalModelsState,
   type ModelSlotsState,
 } from "@magnitudedev/sdk"
@@ -22,7 +22,6 @@ import {
   requestOnboardingCancellation,
 } from "./onboarding-model-machine"
 
-const targetId = ModelOfferingTargetIdSchema.make("target_test")
 const admittedAttempt = DownloadAttemptIdSchema.make("attempt_admitted")
 const replacementAttempt = DownloadAttemptIdSchema.make("attempt_replacement")
 const instanceId = ModelInstanceIdSchema.make("instance_admitted")
@@ -32,16 +31,47 @@ const configurationId = ModelServingConfigurationIdSchema.make("configuration_te
 const submission = {
   _tag: "ConfigureThenLoad" as const,
   choice: {
-    targetId,
     configurationId,
     displayName: "Test model",
     reasoningEffort: ReasoningEffortSchema.make("none"),
   },
 }
 
-const modelsState = (download: LocalModelDownload): LocalModelsState => ({
-  models: [{ targetId, download }],
-} as unknown as LocalModelsState)
+const modelsState = (download: LocalModelDownloadState): LocalModelsState => ({
+  inventory: { _tag: "Ready" },
+  models: [],
+  downloads: [{
+    configuration: {
+      id: configurationId,
+      bundle: {
+        _tag: "Standalone",
+        package: {
+          id: ModelPackageIdSchema.make("package_test"),
+          source: { _tag: "Local", path: "/models/test.gguf" },
+          files: [],
+          relationships: [],
+          properties: {
+            format: "gguf",
+            quantization: "Q4_K_M",
+            quantizationName: "4-bit",
+            architecture: "test",
+            maximumContextLength: 32_768,
+          },
+        },
+      },
+      profile: { contextLength: 32_768 },
+    },
+    presentation: { displayName: "Test model", description: "" },
+    capabilities: Option.some({
+      vision: false,
+      tools: true,
+      structuredOutput: true,
+      reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+    }),
+    state: download,
+  }],
+  recommendations: { _tag: "Loading", progress: [] },
+})
 
 const slotsState = (
   id: typeof instanceId,
@@ -70,7 +100,8 @@ describe("OnboardingModelMachine", () => {
       cancellationRequested: false,
     })
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
-      targetId,
+      configurationId,
+      providerModelId,
       attemptIds: [admittedAttempt],
     })
     const requesting = OnboardingModelMachine.transition(
@@ -89,25 +120,6 @@ describe("OnboardingModelMachine", () => {
       "DownloadCancellationFailed",
       {},
     )._tag).toBe("DownloadCancellationFailed")
-  })
-
-  it("retains the submitted choice while offering creation is in flight", () => {
-    const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "AdmittingDownload", {
-      submission,
-      cancellationRequested: false,
-    })
-    const creating = OnboardingModelMachine.transition(admitting, "CreatingOffering", {
-      submission,
-      cancellationRequested: false,
-    })
-    const cancellation = requestOnboardingCancellation(creating)
-
-    expect(cancellation._tag).toBe("Deferred")
-    expect(cancellation.state).toMatchObject({
-      _tag: "CreatingOffering",
-      submission,
-      cancellationRequested: true,
-    })
   })
 
   it("does not permit cancellation failure to transition directly to successful cancellation", () => {
@@ -145,7 +157,8 @@ describe("OnboardingModelMachine", () => {
     })
 
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
-      targetId,
+      configurationId,
+      providerModelId,
       attemptIds: [admittedAttempt],
     })
     const requesting = requestOnboardingCancellation(admitted)
@@ -171,7 +184,7 @@ describe("admitted model observation", () => {
         totalBytes: 1,
         failure: { code: "stale", message: "stale", retryable: true },
       }),
-      targetId,
+      configurationId,
       [admittedAttempt],
     )
     expect(Option.isNone(stale)).toBe(true)
@@ -186,7 +199,7 @@ describe("admitted model observation", () => {
         totalBytes: 2,
         bytesPerSecond: Option.none(),
       }),
-      targetId,
+      configurationId,
       [admittedAttempt],
     )
     expect(seenCorrelation.exactIdentitySeen).toBe(true)
@@ -202,7 +215,7 @@ describe("admitted model observation", () => {
         totalBytes: 2,
         bytesPerSecond: Option.none(),
       }),
-      targetId,
+      configurationId,
       [admittedAttempt],
     )
     expect(Option.getOrNull(superseded)).toBe("Superseded")
@@ -211,8 +224,8 @@ describe("admitted model observation", () => {
   it("accepts the desired downloaded condition without requiring attempt history", () => {
     const [, observation] = reduceDownloadObservation(
       initialObservationCorrelation,
-      modelsState({ _tag: "Downloaded", installedBytes: 2 }),
-      targetId,
+      modelsState({ _tag: "Downloaded", installedBytes: 2, origins: ["Magnitude"] }),
+      configurationId,
       [admittedAttempt],
     )
     expect(Option.getOrNull(observation)).toBe("Downloaded")
@@ -220,7 +233,7 @@ describe("admitted model observation", () => {
 
   it("does not treat an invalidated query's stale successful value as post-admission truth", async () => {
     const stale = Result.waiting(Result.success({
-      state: modelsState({ _tag: "Downloaded", installedBytes: 2 }),
+      state: modelsState({ _tag: "Downloaded", installedBytes: 2, origins: ["Magnitude"] }),
     }))
     const active = Result.success({
       state: modelsState({
@@ -251,7 +264,7 @@ describe("admitted model observation", () => {
         active,
         failed,
       ]),
-      targetId,
+      configurationId,
       [admittedAttempt],
     ))
     expect(observation).toBe("Failed")

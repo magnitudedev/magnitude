@@ -123,8 +123,9 @@ assessment and load admission. It may stop an instance but does not clear the du
 selection. Unexpected worker exit becomes typed instance failure and cannot be mistaken for a
 successful stop or provider incompatibility.
 
-After restart, ACN restores durable offerings and slot selections but does not reconstruct prior
-instance identity or residency. New demand creates a new admitted occurrence.
+After restart, ACN restores retained configurations and slot selections, projects their current
+provider offerings, and does not reconstruct prior instance identity or residency. New demand
+creates a new admitted occurrence.
 
 ## Conformance
 

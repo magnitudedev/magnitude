@@ -13,7 +13,6 @@ import {
 import {
   DownloadAttemptIdSchema,
   LocalModelMutationFailed,
-  ModelOfferingTargetIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
@@ -30,9 +29,9 @@ import {
   ReasoningEffortSchema,
 } from "@magnitudedev/sdk"
 import {
+  MagnitudeStorage,
   resolveContextLimitPolicy,
-  selectedSlotSelection,
-  unassignedSlotSelection,
+  type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import {
   IcnClient,
@@ -41,7 +40,7 @@ import {
 } from "@magnitudedev/icn"
 import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { ModelConfiguration } from "./model-configuration"
+import { ModelSelection } from "./model-selection"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
@@ -109,11 +108,10 @@ const catalogModel: ProviderModelCatalogEntry = {
 }
 const offering = {
   providerModelId,
-  targetId: ModelOfferingTargetIdSchema.make("test-model"),
   configuration: {
     id: configurationId,
-    target: {
-      _tag: "Package",
+    bundle: {
+      _tag: "Standalone",
       package: modelPackage,
     },
     profile: { contextLength: 8_192 },
@@ -131,18 +129,12 @@ const makeHarness = (options: {
   const configuration = yield* SubscriptionRef.make({
     slots: {
       primary: options.initiallyAssigned === false
-        ? unassignedSlotSelection()
-        : selectedSlotSelection(selection),
-      secondary: unassignedSlotSelection(),
+        ? Option.none<SlotSelection>()
+        : Option.some(selection),
+      secondary: Option.none<SlotSelection>(),
     },
-    localModelRecency: { primary: [providerModelId], secondary: [] },
-    favoriteModels: [],
-    localProviderOfferings: [],
-    dismissedDownloadFailures: [],
-    contextLimits: resolveContextLimitPolicy({
-      onboarding: Option.none(),
-      providers: Option.none(),
-    }),
+    recentModels: { primary: [selection], secondary: [] },
+    favorites: [],
   })
   const instances = yield* SubscriptionRef.make<Generated.ModelInstancesSnapshot>({
     revision: 0,
@@ -215,7 +207,7 @@ const makeHarness = (options: {
   } as unknown as IcnClientService
 
   const dependencies = Layer.mergeAll(
-    Layer.succeed(ModelConfiguration, ModelConfiguration.of({
+    Layer.succeed(ModelSelection, ModelSelection.of({
       get: SubscriptionRef.get(configuration),
       changes: configuration.changes,
       updateSlot: (slotId, next) => SubscriptionRef.update(configuration, (current) => ({
@@ -225,20 +217,30 @@ const makeHarness = (options: {
       recordUse: () => Effect.void,
       setFavorite: () => Effect.void,
     })),
+    Layer.succeed(MagnitudeStorage, {
+      config: {
+        getContextLimitPolicy: () => Effect.succeed(resolveContextLimitPolicy({
+          providers: Option.none(),
+        })),
+      },
+    } as unknown as MagnitudeStorageShape),
     Layer.succeed(LocalModelPackages, LocalModelPackages.of({
       initialized: Effect.succeed(true),
-      snapshot: Effect.succeed({ revision: 0, state: { entries: [] } }),
+      snapshot: Effect.succeed({
+        revision: 0,
+        state: { inventory: { _tag: "Ready" }, entries: [] },
+      }),
       changes: Stream.empty,
       installedPackageIds: Effect.succeed(
         new Set((options.projectedInstalled ?? options.installed) === false ? [] : [packageId]),
       ),
-      admitTarget: () => Effect.succeed({
+      admitBundle: () => Effect.succeed({
         _tag: "DownloadAdmitted",
         attemptIds: [DownloadAttemptIdSchema.make("test-download")],
       }),
       cancelAttempts: () => Effect.void,
-      dismissTargetFailure: () => Effect.void,
-      removeTargetPackages: () => Effect.void,
+      acknowledgeFailures: () => Effect.void,
+      removeBundlePackages: () => Effect.void,
     })),
     Layer.succeed(LocalModelRecommendations, LocalModelRecommendations.of({
       snapshot: Effect.succeed({
@@ -256,6 +258,13 @@ const makeHarness = (options: {
     Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
       list: Ref.get(offerings),
       changes: Stream.empty,
+      catalog: Effect.succeed([]),
+      state: Effect.succeed({
+        packageEvidence: Option.none(),
+        entries: [],
+        failure: Option.none(),
+      }),
+      catalogChanges: Stream.empty,
       resolve: (requestedProviderModelId) => Ref.get(offerings).pipe(
         Effect.flatMap((current) => {
           const resolved = current.find((item) =>
@@ -269,17 +278,6 @@ const makeHarness = (options: {
               }))
         }),
       ),
-      save: (targetId, savedConfiguration) => {
-        const saved = {
-          ...offering,
-          providerModelId: ProviderModelIdSchema.make(savedConfiguration.id),
-          targetId,
-          configuration: savedConfiguration,
-        }
-        return Ref.update(offerings, (current) => [...current, saved]).pipe(
-          Effect.as(saved),
-        )
-      },
     })),
     Layer.succeed(ProviderModelCatalog, ProviderModelCatalog.of({
       snapshot: SubscriptionRef.get(catalogSnapshot),

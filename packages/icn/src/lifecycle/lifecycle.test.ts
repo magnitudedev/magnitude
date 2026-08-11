@@ -42,7 +42,6 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     storage: new IcnStorageConfig({
       modelStore: Option.some("/data/models"),
       cacheRoot: Option.some("/data/cache"),
-      modelSources: ["/read-only/models"],
       huggingFaceCaches: ["/read-only/hf"],
     }),
     host,
@@ -87,8 +86,6 @@ describe("ICN managed launch", () => {
       "/data/models",
       "--cache-root",
       "/data/cache",
-      "--model-source",
-      "/read-only/models",
       "--hf-cache",
       "/read-only/hf",
     ]);

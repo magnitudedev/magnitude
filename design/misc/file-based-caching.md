@@ -1,9 +1,10 @@
 ---
 applies_to:
   - packages/storage/src/config/**
+  - packages/storage/src/state/**
+  - packages/storage/src/types/model-state.ts
   - packages/storage/src/io/structured-file.ts
   - packages/storage/src/sessions/storage.ts
-  - packages/acn/src/model-configuration.ts
   - packages/icn/src/catalog/**
   - packages/ai/src/provider/file-catalog.ts
   - inference/crates/icn-models/**
@@ -61,30 +62,30 @@ that metadata may independently be unavailable.
 
 ## No cache schema versions
 
-Recomputable caches and indexes must not contain, track, migrate, or gate reads on a file-format
-schema version. This prohibits version fields used to select a decoder, versioned cache filenames,
-whole-file invalidation because an application release changed, and cache migration code.
+Recomputable caches and indexes derive validity from domain evidence rather than a file-format
+schema version. Their filenames and decoders are stable across application releases, and evidence
+invalidates only the affected recovery unit.
 
 Current decoders instead accept the values they understand, preserve independently valid data, and
 default or discard invalid data at the smallest safe boundary. Unknown fields are ignored. A format
-change therefore costs, at worst, recomputation of affected entries rather than a migration or a
-whole-cache reset.
+change therefore costs, at worst, recomputation of affected entries rather than a whole-cache reset.
 
 Content identities, algorithm fingerprints, native-build fingerprints, and concrete configuration
 inputs are not schema versions. They are domain inputs to cache validity and belong in entry keys or
 evidence. An evidence mismatch invalidates only the entries whose computed result may have changed.
 
 Durable configuration should likewise evolve through tolerant decoding, optional fields, and
-defaults rather than a global format-version gate. If a historical configuration value has changed
-meaning in a way that cannot be inferred from its shape, any required semantic migration must be
-local to that value and must not prevent recovery of unrelated configuration.
+defaults rather than a global format-version gate. A missing owned document uses its current
+defaults and domain recovery authorities.
 
-The canonical model configuration contains a partial map of branded slot IDs to complete explicit
-slot selections (`providerId`, `providerModelId`, and `reasoningEffort`) and user preferences such
-as provider-qualified model favorites. A legacy selected local profile, raw native model identity,
-repository/configuration association, or local-slot-intent flag has no current meaning and is
-discarded rather than dual-read. An incomplete selection or favorite identity is removed as one
-invalid leaf; ACN never guesses its missing identity or reasoning value.
+The canonical internal model-state document contains exact retained
+`ModelServingConfiguration` values, a partial map of branded slot IDs to complete explicit slot
+selections (`providerId`, `providerModelId`, and `reasoningEffort`), provider-qualified recency and
+favorites, and one configuration-recovery completion fact. It contains no offering registry,
+package inventory, assessment, or runtime state. An incomplete
+selection or favorite identity inside the current model-state document is removed as one invalid
+leaf; ACN never guesses its
+missing identity or reasoning value.
 
 ## Granular recovery
 
@@ -101,7 +102,9 @@ The recovery unit is the smallest independently meaningful value:
 A field with a defined safe default is restored to that default. A malformed optional field is
 removed. If defaulting a field would create a misleading or internally inconsistent entity, the
 smallest enclosing entity with an independent identity is removed instead. References to missing or
-discarded entities are themselves removed or recomputed; they must not be left dangling.
+discarded entities are removed or recomputed unless the owning domain defines the complete reference
+itself as durable unresolved user intent. In that case it remains present and explicitly unavailable
+rather than being silently substituted.
 
 Recovery follows this conceptual flow:
 
@@ -179,9 +182,8 @@ intent:
 - invalid fields, map entries, and array elements recover independently wherever the schema defines
   a safe default or removal behavior;
 - unknown fields are preserved when rewriting so a temporarily older binary does not erase settings
-  it does not understand; fields explicitly tombstoned by a completed cutover are removed instead
-  of being preserved as unknown data, and closed owned namespaces such as model selection discard
-  fields outside their canonical shape;
+  it does not understand; closed owned namespaces such as model selection discard fields outside
+  their canonical shape;
 - recovery rewrites a normalized file only after the recovered value passes the current complete
   schema and semantic invariants;
 - if malformed syntax or an invalid root forces a whole-file reset, the original bytes are preserved
@@ -193,6 +195,20 @@ persistence exposes one addressed update per provider-qualified model. Neither e
 model-configuration patch or a second model-only read API. ACN loads the complete configuration
 into one resident source; each update durably writes the addressed value and then publishes that
 same configuration as one interruption-safe critical section.
+
+The model-state document is a closed owned schema containing exact retained configurations, slot
+selections, recency, favorites, and the bounded recovery-completion marker. Missing optional fields
+receive their defined defaults. An invalid document is preserved before the complete default is
+published; model-state decoding does not guess configuration meaning or interpret alternate
+contracts.
+
+Retained local configurations use the same resident model-state source. Conflicting entries that
+claim the same configuration identity, or the same bundle/profile identity with different values,
+invalidate the document rather than being resolved by array order. The default marks the bounded
+configuration-recovery epoch incomplete. Once complete catalog and installed-inventory snapshots
+are available, recovery adds exact catalog configurations for verified installed bundles with no
+retained configuration and marks the epoch complete in the same durable mutation. Ordinary catalog
+or inventory change never reopens it.
 
 Catastrophic configuration conditions are limited to cases where safe recovery cannot be completed:
 the current default itself violates the schema, the original authoritative bytes cannot be preserved
@@ -267,7 +283,7 @@ explicit failure only for the catastrophic cases defined above.
 ## Acceptance criteria
 
 - Removing any recomputable cache or index produces, at most, additional work.
-- No recomputable cache or index has a file-format schema version or migration path.
+- No recomputable cache or index has a file-format schema version.
 - Corrupting one independent value does not discard valid siblings.
 - Arbitrary cache-file contents and filesystem failures cannot crash the process or fail the user
   operation solely because caching was unavailable.

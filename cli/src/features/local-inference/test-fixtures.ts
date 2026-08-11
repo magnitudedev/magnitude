@@ -3,7 +3,7 @@ import {
   AssessmentEnvironmentIdSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
-  ModelOfferingTargetIdSchema,
+  ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelAssessmentIdSchema,
@@ -22,17 +22,36 @@ import {
   type ModelSlotsState,
   type LocalModel,
   type LocalModelCatalogCandidate,
+  type LocalModelDownload,
   type LocalModelRecommendation,
+  type ServableModelBundle,
   type ProviderModelCatalogState,
 } from "@magnitudedev/sdk"
 
 export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export const TEST_MODEL_ID = ProviderModelIdSchema.make("configuration_test")
-export const TEST_TARGET_ID = ModelOfferingTargetIdSchema.make("target_test")
+export const TEST_PACKAGE_ID = ModelPackageIdSchema.make("package_test")
 export const TEST_CONFIGURATION_ID = ModelServingConfigurationIdSchema.make("configuration_test")
 export const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
 export const TEST_REASONING_EFFORT = ReasoningEffortSchema.make("none")
+
+export const makeStandaloneBundle = (id: string = TEST_PACKAGE_ID): ServableModelBundle => ({
+  _tag: "Standalone",
+  package: {
+    id: ModelPackageIdSchema.make(id),
+    source: { _tag: "Local", path: `/models/${id}` },
+    files: [],
+    relationships: [],
+    properties: {
+      format: "gguf",
+      quantization: "Q4_K_M",
+      quantizationName: "4-bit",
+      architecture: "test",
+      maximumContextLength: 32_768,
+    },
+  },
+})
 
 export const makeHardware = (
   overrides: Partial<LocalInferenceHardware> = {},
@@ -64,19 +83,115 @@ export const makeHardware = (
   ...overrides,
 })
 
-export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => ({
-  targetId: TEST_TARGET_ID,
-  offerings: [{ configurationId: TEST_CONFIGURATION_ID, providerModelId: TEST_MODEL_ID }],
-  displayName: "Qwen Test",
-  description: "Test model",
-  kind: "Standalone",
-  quantization: "Q4_K_M",
-  maximumContextLength: 32_768,
-  downloadBytes: 16 * GIB,
-  download: { _tag: "Downloaded", installedBytes: 16 * GIB },
-  assessment: { _tag: "Unassessed" },
-  ...overrides,
-})
+export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
+  const bundle = overrides.bundle ?? makeStandaloneBundle()
+  const capabilities = {
+    vision: false,
+    tools: true,
+    structuredOutput: true,
+    reasoning: { supported: false as const, efforts: [], defaultEffort: Option.none() },
+  }
+  return {
+    bundle,
+    presentation: { displayName: "Qwen Test", description: "Test model" },
+    installation: { installedBytes: 16 * GIB, origins: ["Magnitude"] },
+    readiness: {
+      _tag: "Assessed",
+      capabilities,
+      configuration: {
+        id: TEST_CONFIGURATION_ID,
+        bundle,
+        profile: { contextLength: 32_768 },
+      },
+      offering: Option.some({
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: TEST_MODEL_ID,
+        modelFamilyId: Option.none(),
+        displayName: "Qwen Test",
+        supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+        contextWindow: 32_768,
+        maxOutputTokens: 32_768,
+        memory: Option.none(),
+        capabilities,
+        availability: { _tag: "Available" },
+        pricing: Option.none(),
+      }),
+      assessment: {
+        _tag: "Fits",
+        assessment: {
+          _tag: "Fits",
+          profile: { contextLength: 32_768 },
+          configurationId: TEST_CONFIGURATION_ID,
+          assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
+          environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
+          memory: [],
+          performance: [],
+        },
+      },
+    },
+    ...overrides,
+  }
+}
+
+export const makeCatalogOnlyModel = (
+  overrides: Partial<LocalModel> = {},
+  configurationId = TEST_CONFIGURATION_ID,
+): LocalModel => {
+  const model = makeModel(overrides)
+  if (model.readiness._tag !== "Assessed") return model
+  return {
+    ...model,
+    readiness: {
+      ...model.readiness,
+      configuration: { ...model.readiness.configuration, id: configurationId },
+      offering: Option.none(),
+    },
+  }
+}
+
+export const makeConfiguredModel = (
+  configurationId: ReturnType<typeof ModelServingConfigurationIdSchema.make>,
+  overrides: Partial<LocalModel> = {},
+): LocalModel => {
+  const model = makeModel(overrides)
+  if (model.readiness._tag !== "Assessed") return model
+  const configuredOffering = Option.map(model.readiness.offering, (offering) => ({
+    ...offering,
+    providerModelId: ProviderModelIdSchema.make(configurationId),
+  }))
+  return {
+    ...model,
+    readiness: {
+      ...model.readiness,
+      configuration: { ...model.readiness.configuration, id: configurationId },
+      offering: configuredOffering,
+    },
+  }
+}
+
+export const makeModelWithContext = (
+  contextLength: number,
+  overrides: Partial<LocalModel> = {},
+): LocalModel => {
+  const model = makeModel(overrides)
+  if (model.readiness._tag !== "Assessed") return model
+  const offering = Option.map(model.readiness.offering, (offering) => ({
+    ...offering,
+    contextWindow: contextLength,
+    maxOutputTokens: contextLength,
+  }))
+  return {
+    ...model,
+    readiness: {
+      ...model.readiness,
+      configuration: {
+        ...model.readiness.configuration,
+        profile: { contextLength },
+      },
+      offering,
+    },
+  }
+}
 
 export const makeCatalogCandidate = (
   overrides: Partial<LocalModelCatalogCandidate> = {},
@@ -101,7 +216,6 @@ export const makeCatalogCandidate = (
     configurationId: TEST_CONFIGURATION_ID,
     assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
     environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
-    targetId: TEST_TARGET_ID,
     displayName: "Qwen Test",
     description: "Test model",
     license: "Apache-2.0",
@@ -150,11 +264,33 @@ export const makeRecommendation = (
   ...overrides,
 })
 
+export const makeDownload = (
+  overrides: Partial<LocalModelDownload> = {},
+): LocalModelDownload => {
+  const candidate = makeCatalogCandidate()
+  const bundle = makeStandaloneBundle()
+  return {
+    configuration: {
+      id: candidate.configurationId,
+      bundle,
+      profile: candidate.profile,
+    },
+    presentation: {
+      displayName: candidate.displayName,
+      description: candidate.description,
+    },
+    capabilities: Option.some(candidate.capabilities),
+    state: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
+    ...overrides,
+  }
+}
+
 export const makeView = (options: {
   readonly hardware?: LocalInferenceHardware
   readonly models?: readonly LocalModel[]
   readonly recommendations?: readonly LocalModelRecommendation[]
   readonly catalogCandidates?: readonly LocalModelCatalogCandidate[]
+  readonly downloads?: readonly LocalModelDownload[]
   readonly providerContextWindow?: number
   readonly allocation?: ModelInstanceAllocation
   readonly ready?: boolean
@@ -174,7 +310,9 @@ export const makeView = (options: {
   return {
     hardware: options.hardware ?? makeHardware(),
     models: {
+      inventory: { _tag: "Ready" },
       models,
+      downloads: options.downloads ?? [],
       recommendations: {
         _tag: "Ready",
         entries: options.recommendations ?? [],
@@ -239,7 +377,10 @@ export const makeView = (options: {
             }),
         secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
       },
-      recentModelIds: { primary: [TEST_MODEL_ID], secondary: [] },
+      recentModels: {
+        primary: [{ providerId: LOCAL_PROVIDER_ID, providerModelId: TEST_MODEL_ID }],
+        secondary: [],
+      },
       favoriteModels: [],
     },
     providerModelId: Option.some(TEST_MODEL_ID),

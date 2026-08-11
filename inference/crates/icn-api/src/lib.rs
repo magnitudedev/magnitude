@@ -289,6 +289,10 @@ pub fn app(state: AppState) -> Router {
             post(cancel_model_download),
         )
         .route(
+            "/v1/models/downloads/{attempt_id}/acknowledge-failure",
+            post(acknowledge_model_download_failure),
+        )
+        .route(
             "/v1/hugging-face/models/search",
             post(search_hugging_face_models),
         )
@@ -1606,6 +1610,34 @@ async fn cancel_model_download(
         .map_err(ApiError::from_inventory)
 }
 
+#[utoipa::path(post, path = "/v1/models/downloads/{attempt_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
+    params(("attempt_id" = String, Path, description = "Failed download attempt ID")),
+    responses(
+        (status = 200, description = "Acknowledged failed model download attempt", body = DownloadAttempt),
+        (status = 400, description = "Attempt has not failed", body = ErrorResponse),
+        (status = 404, description = "Attempt not found", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(
+    name = "icn.models.downloads.acknowledge_failure",
+    skip_all,
+    err(Debug)
+)]
+async fn acknowledge_model_download_failure(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+) -> Result<Json<DownloadAttempt>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .acknowledge_failure(&DownloadAttemptId(attempt_id))
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
 #[utoipa::path(get, path = "/v1/props", operation_id = "getModelProperties", tag = "models", responses(
     (status = 200, description = "Loaded model and active template properties", body = PropsResponse),
     (status = 500, description = "Properties unavailable", body = ErrorResponse)
@@ -2738,6 +2770,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         model_downloads,
         model_download_attempt,
         cancel_model_download,
+        acknowledge_model_download_failure,
         preview_model_load,
         load_model_instance,
         model_instances,

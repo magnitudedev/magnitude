@@ -1,9 +1,7 @@
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
 
 import {
-  clearAssessmentLifecycle,
-  completeAssessmentLifecycle,
   formatLocalModelAssessmentFailure,
   localModelAssessmentProfiles,
   localModelAssessmentResultFromIcn,
@@ -11,41 +9,38 @@ import {
 } from "./local-model-assessments"
 import {
   AssessmentEnvironmentIdSchema,
-  ModelAssessmentIdSchema,
-  ModelOfferingTargetIdSchema,
-  ModelServingConfigurationIdSchema,
-  type ModelOfferingTarget,
+  type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
 
-const packageTarget = (maximumContextLength: number): ModelOfferingTarget => ({
-  _tag: "Package",
+const standaloneBundle = (maximumContextLength: number): ServableModelBundle => ({
+  _tag: "Standalone",
   package: { properties: { maximumContextLength } },
-} as unknown as ModelOfferingTarget)
+} as unknown as ServableModelBundle)
 
 describe("localModelAssessmentProfiles", () => {
   it("defaults discovered local models to the 100K baseline", () => {
-    expect(localModelAssessmentProfiles(packageTarget(131_072))).toEqual([
+    expect(localModelAssessmentProfiles(standaloneBundle(131_072))).toEqual([
       { contextLength: 100_000 },
     ])
-    expect(localModelAssessmentProfiles(packageTarget(300_000))).toEqual([
+    expect(localModelAssessmentProfiles(standaloneBundle(300_000))).toEqual([
       { contextLength: 100_000 },
     ])
   })
 
   it("uses the catalog context when provided", () => {
-    expect(localModelAssessmentProfiles(packageTarget(131_072), 50_000)).toEqual([
+    expect(localModelAssessmentProfiles(standaloneBundle(131_072), 50_000)).toEqual([
       { contextLength: 50_000 },
     ])
   })
 
-  it("bounds a catalog context by the target maximum", () => {
-    expect(localModelAssessmentProfiles(packageTarget(40_000), 50_000)).toEqual([
+  it("bounds a catalog context by the bundle maximum", () => {
+    expect(localModelAssessmentProfiles(standaloneBundle(40_000), 50_000)).toEqual([
       { contextLength: 40_000 },
     ])
   })
 
   it("uses the model maximum when it is below the local baseline", () => {
-    expect(localModelAssessmentProfiles(packageTarget(80_000))).toEqual([
+    expect(localModelAssessmentProfiles(standaloneBundle(80_000))).toEqual([
       { contextLength: 80_000 },
     ])
   })
@@ -55,7 +50,7 @@ describe("localModelAssessmentProfiles", () => {
       _tag: "SpeculativeDecodingPair",
       target: { properties: { maximumContextLength: 131_072 } },
       draft: { properties: { maximumContextLength: 32_768 } },
-    } as unknown as ModelOfferingTarget
+    } as unknown as ServableModelBundle
     expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 32_768 },
     ])
@@ -66,14 +61,14 @@ describe("localModelAssessmentProfiles", () => {
       _tag: "SpeculativeDecodingPair",
       target: { properties: { maximumContextLength: 262_144 } },
       draft: { properties: { maximumContextLength: 131_072 } },
-    } as unknown as ModelOfferingTarget
+    } as unknown as ServableModelBundle
     expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 100_000 },
     ])
   })
 
   it("does not invent a profile below the product minimum", () => {
-    expect(localModelAssessmentProfiles(packageTarget(2_048))).toEqual([])
+    expect(localModelAssessmentProfiles(standaloneBundle(2_048))).toEqual([])
   })
 })
 
@@ -96,46 +91,6 @@ describe("performanceSampleContextTokens", () => {
   })
 })
 
-describe("assessment lifecycle", () => {
-  const targetId = ModelOfferingTargetIdSchema.make("target-test")
-  const current = new Map([[targetId, {
-    _tag: "Assessing" as const,
-  }]])
-
-  it("clears active state when its serialized owner exits", () => {
-    expect(clearAssessmentLifecycle(current, [targetId]).get(targetId)).toEqual({
-      _tag: "Unassessed",
-    })
-  })
-
-  it("terminalizes completed assessment state", () => {
-    const configurationId = ModelServingConfigurationIdSchema.make("configuration-test")
-    const completed = [{
-      _tag: "Assessed" as const,
-      targetId,
-      environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
-      assessments: [{
-        _tag: "DoesNotFit" as const,
-        profile: { contextLength: 100_000 },
-        configurationId,
-        assessmentId: ModelAssessmentIdSchema.make("assessment-test"),
-        memory: [],
-        deficitBytes: 1,
-        limitingResource: "system",
-      }],
-    }]
-    expect(completeAssessmentLifecycle(
-      current,
-      [targetId],
-      completed,
-    ).get(targetId)).toEqual({
-      _tag: "Assessed",
-      environmentId: "environment-test",
-      configurationIds: [configurationId],
-    })
-  })
-})
-
 describe("localModelAssessmentResultFromIcn", () => {
   const environmentId = AssessmentEnvironmentIdSchema.make("environment-test")
 
@@ -143,7 +98,6 @@ describe("localModelAssessmentResultFromIcn", () => {
     const result = Effect.runSync(localModelAssessmentResultFromIcn({
       _tag: "Assessed",
       requestId: "assessment-0",
-      targetId: "target-0",
       profiles: [{
         _tag: "DoesNotFit",
         profile: { contextLength: 50_000 },
@@ -166,7 +120,6 @@ describe("localModelAssessmentResultFromIcn", () => {
 
     expect(result).toEqual({
       _tag: "Assessed",
-      targetId: "target-0",
       environmentId,
       assessments: [{
         _tag: "DoesNotFit",

@@ -16,6 +16,7 @@ import {
 import {
   GIB,
   LOCAL_PROVIDER_ID,
+  makeDownload,
   makeModel,
   makeView,
   TEST_MEMORY_DOMAIN_ID,
@@ -367,8 +368,8 @@ test('shows resident memory three spaces after context and links it to hardware'
 test('shows active model downloads in the persistent footer and links to the catalog', () => {
   const openCatalog = vi.fn()
   const localInferenceState = makeView({
-    models: [makeModel({
-      download: {
+    downloads: [makeDownload({
+      state: {
         _tag: 'Downloading',
         attemptIds: [DownloadAttemptIdSchema.make('download-1')],
         stage: 'downloading',

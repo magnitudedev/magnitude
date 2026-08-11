@@ -3,6 +3,36 @@ import * as HttpApiSchema from "@effect/platform/HttpApiSchema"
 import * as S from "effect/Schema"
 import * as Schemas from "./schemas.js"
 
+export const acknowledgeModelDownloadFailureOperation = {
+  operationId: "acknowledgeModelDownloadFailure",
+  transport: "http",
+  method: "POST",
+  path: "/v1/models/downloads/{attempt_id}/acknowledge-failure",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ attempt_id: S.String }),
+} as const
+
 export const applyChatTemplateOperation = {
   operationId: "applyChatTemplate",
   transport: "http",

@@ -28,7 +28,7 @@ export const makeIcnInstalledModels = (
       const client = yield* IcnClient
       const read = client.models.listInstalledModels({})
       const observed = yield* makeIcnObservedState(
-        { packages: [] },
+        { revision: 0, reconciliationComplete: false, packages: [] },
         read,
         Schema.equivalence(InstalledModelPackagesResponseSchema),
       )

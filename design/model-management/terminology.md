@@ -10,79 +10,148 @@ applies_to:
   - packages/acn/src/model-slot-**
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - packages/storage/src/types/config.ts
 ---
 
 # Model-management terminology
 
-This document defines the canonical vocabulary for Magnitude's local-model domain. More specific
-documents define behavior and lifecycle. An unqualified `model` is presentation language, not an
-identity-bearing domain type.
+This document defines the canonical local-model vocabulary. An unqualified `model` is presentation
+language, not an identity-bearing domain type.
 
-## Artifact and acquisition terms
-
-| Term | Meaning |
-|---|---|
-| **Model file** | One immutable, content-identified file with a role such as weights, shard, projector, draft, or MTP. |
-| **Model package** | One immutable bundle of exact model files, roles, relationships, properties, and one source. |
-| **Model package source** | One exact retrieval location. A mutable repository name or revision is not an exact source. |
-| **Speculative decoding pair** | An ordered target package and draft package with an explicit speculative method. |
-| **Model offering target** | The complete installable unit exposed for inference: one package or one speculative pair. |
-| **Download attempt** | One admitted attempt to install one exact package. Failure belongs to the attempt, not permanently to the package. |
-
-Package, target, and download-attempt identity are distinct. Installation changes local presence;
-it never changes package or target identity.
-
-## Configuration and assessment terms
+## Package and serving terms
 
 | Term | Meaning |
 |---|---|
-| **Serving profile** | Model-agnostic provider intent, currently the maximum context for one request. |
-| **Model serving configuration** | One exact offering target plus serving profile, with an ICN-issued stable identity. |
+| **Model file** | One immutable content-identified file with a role such as weights, shard, projector, draft, or MTP. |
+| **Model package** | One immutable set of exact files, roles, relationships, inspected properties, and one source. |
+| **Servable model bundle** | The complete artifact structure that can be served: one standalone package or an ordered speculative-decoding pair. |
+| **Serving profile** | Provider intent for serving a bundle, currently its context length. |
+| **Model serving configuration** | One exact servable bundle plus one serving profile, identified by `ModelServingConfigurationId`. |
+| **Download attempt** | One admitted attempt to install one exact package. |
+
+The bundle is structural data, not an independently identified entity:
+
+```text
+ServableModelBundle
+  +-- Standalone
+  |     package: ModelPackage
+  |
+  +-- SpeculativeDecodingPair
+        target: ModelPackage
+        draft: ModelPackage
+```
+
+`target` is the established speculative-decoding term for the primary model in a pair. It is not
+the name or identity of the enclosing bundle.
+
+Two bundles are the same when their tag and ordered package identities are the same. Implementations
+may derive private canonical keys for maps, caches, and deterministic configuration identity. Such
+keys are not serialized product data and never cross the protocol as bundle identity.
+
+## Assessment terms
+
+| Term | Meaning |
+|---|---|
 | **Hardware calibration** | Serializable model-free performance evidence for one native hardware/backend environment. |
-| **Model assessment** | Native assessment of one exact target and serving profile, producing compatibility, capacity, memory, and performance evidence. Expensive on an exact cache miss. |
-| **Assessing** | Ephemeral, deadline-bounded state owned by an active model-assessment operation. |
-| **Eligible assessed configuration** | A configuration whose complete assessment result is `Fits` and contains the evidence required by recommendation policy. |
-| **Resolved execution plan** | Load-time native allocation evidence, including acceleration and sequence capacity. It is not provider intent or serving-configuration identity. |
+| **Model assessment** | Compatibility, capacity, memory, and performance evidence for one exact serving configuration. |
+| **Semantic assessment key** | The configuration, immutable package evidence, stable hardware environment, native build, and assessment policy that determine reuse. |
+| **Assessing** | Ephemeral state for semantic assessment work currently owned by the assessor. |
+| **Standard standalone configuration** | A disposable configuration deterministically derived from an inspected standalone package and the local profile policy. |
+| **Eligible assessed configuration** | A configuration whose assessment is `Fits`. |
+| **Resolved execution plan** | Load-time native allocation evidence; it is not serving intent or durable identity. |
 
-Assessment predicts whether a configuration can normally run. Load admission decides whether it
-may run now. A cached assessment never authorizes a load.
+Assessment predicts whether a configuration normally fits. Load admission decides whether it may
+run now. Cached assessment never authorizes a load.
 
 ## Catalog and recommendation terms
 
 | Term | Meaning |
 |---|---|
-| **Recommendable model** | One curated offering target and serving profile plus presentation, capability, and recommendation evidence. |
-| **Recommendable model catalog** | The release-bound set of targets Magnitude is willing to assess and recommend. Membership implies no assessment result, installation, offering, selection, or residency. |
-| **Recommendation candidate** | An algorithm-local eligible assessed configuration enriched with ranking inputs. It has no independent lifecycle or persisted identity. |
-| **Catalog candidate** | ACN's presentation projection of one eligible assessed configuration, joined with acquisition and availability state. Its stable identity is the configuration identity. |
-| **Recommendation** | A policy-selected configuration labeled with an intent and explanation. |
-| **Recommendation portfolio** | The small set of recommendations selected for the current catalog, hardware, native build, backends, and policy identity. |
+| **Recommendable model** | One curated configuration plus presentation, capabilities, license, and ranking evidence. |
+| **Recommendable model catalog** | Release-bound curated configurations eligible for assessment and recommendation. |
+| **Catalog candidate** | A product projection of one catalog configuration with completed assessment and current acquisition state. |
+| **Recommendation** | A policy-selected catalog candidate labeled with an intent and explanation. |
 
-Candidate records are complete facts, not placeholders. Missing, pending, failed, or incompatible
-assessment is not a candidate state. Recommendation membership and intent belong to the portfolio,
-not to the candidate.
-
-`Candidate` must not be used unqualified outside recommendation or projection code. In native load
-planning, alternatives such as sequence counts one through four are **sequence-capacity options**,
-not catalog or recommendation candidates.
-
-A catalog candidate introduces no identity. Acquisition actions use its `ModelOfferingTargetId`;
-configuration selection uses its `ModelServingConfigurationId`. ACN resolves both identities
-against authoritative catalog state and creates a provider offering only when the configuration is
-selected.
+Catalog membership contributes metadata and a configuration. It implies no installation, retained
+state, offering, selection, or residency. Candidate identity is the configuration identity.
 
 ## Offering and runtime terms
 
 | Term | Meaning |
 |---|---|
-| **Provider offering** | One stable provider-facing choice containing provider identity, provider-model identity, and one exact serving configuration. |
-| **Slot selection** | The user's durable choice of provider offering and reasoning effort for one product role. |
-| **Model slot** | ACN's aggregate for durable product intent, availability, actions, and optional instance projection. |
+| **Retained configuration** | The exact serving configuration durably chosen for one bundle through installation or bounded recovery. At most one is retained per bundle. |
+| **Configuration recovery** | One bounded initialization epoch that retains exact catalog configurations for already-installed bundles after model state defaults. |
+| **Provider offering** | A provider-facing projection of one retained configuration. |
+| **Slot selection** | The user's durable provider-qualified choice and reasoning effort for one product role. |
+| **Model slot** | Durable role intent joined with availability, actions, and optional instance state. |
 | **Model instance** | One physical admitted occurrence of a serving configuration in ICN. |
 
-A provider offering may exist while its packages are absent or unavailable. A slot selection does
-not imply residency. An instance does not own durable user intent.
+A retained configuration and offering may remain while packages are absent or unavailable. A slot
+selection does not imply residency, and an instance does not own durable user intent.
+
+## Durability boundary
+
+Magnitude model state stores retained configurations, slot selections, recency, favorites, and the
+configuration-recovery completion marker. Onboarding state stores only completion. Bundle keys,
+catalog association, assessment lifecycle and results, provider offerings, package inventory,
+download progress, presentation, and model instances are derived or externally authoritative and
+are not stored in those documents.
+
+An assessment-derived standalone configuration becomes durable only when selection or installation
+materializes that exact configuration. Catalog removal therefore cannot erase an installed package,
+a retained configuration, or user selection.
+
+Installation origin does not determine durability. Magnitude-managed and Hugging Face cache
+packages follow the same rules:
+
+| Bundle case | Configuration used by the product | When it is stored in model state |
+|---|---|---|
+| Catalog bundle, not installed | Exact catalog configuration; no `LocalModel` exists | When installation is admitted |
+| Installed bundle with a retained configuration | Exact retained configuration | Already stored |
+| Installed bundle matching the catalog, with no retained configuration | Exact catalog configuration | On selection/installation, or during the single bounded recovery epoch |
+| Installed non-catalog standalone bundle | One standard configuration derived after package inspection | Only when selected/installed |
+| Speculative-decoding bundle | Exact retained configuration, otherwise exact catalog configuration | On selection/installation, or bounded recovery |
+
+The standard configuration is generated only for an installed, inspected standalone bundle having
+neither a retained nor catalog configuration. It is disposable until materialized. Magnitude does
+not generate speculative-decoding pairs or replacement catalog configurations from package
+inventory.
+
+Recovery does not generate a configuration. It copies an exact catalog configuration into model
+state only when the exact bundle is already installed, no configuration is retained for that
+bundle, and the one recovery epoch is still incomplete. Later discovery alone never writes model
+state.
+
+## Product projection
+
+`LocalModel` is one disposable product row grouped by exact servable-bundle structure:
+
+```text
+LocalModel
+  bundle: ServableModelBundle
+  presentation
+  installation
+  readiness:
+    Assessing
+    | Failed(failure)
+    | Assessed(
+        capabilities,
+        configuration: ModelServingConfiguration,
+        offering?,
+        assessment: Fits | DoesNotFit | Incompatible | Failed
+      )
+
+LocalModelDownload
+  configuration: ModelServingConfiguration
+  presentation
+  capabilities?
+  state: Downloading | Failed | Cancelled | Downloaded
+```
+
+Every independently servable installed package is represented as a `Standalone` bundle even when
+it has no catalog entry or retained configuration. Each installed bundle has one product
+configuration decision: retained first, otherwise exact catalog configuration, otherwise a standard
+configuration derived from inspected package facts. Catalog association enriches the same row with
+curated metadata; it does not decide whether the row exists.
 
 ## Identity map
 
@@ -90,37 +159,36 @@ not imply residency. An instance does not own durable user intent.
 |---|---|---|
 | `ModelPackageId` | One immutable package | ICN |
 | `DownloadAttemptId` | One package-install attempt | ICN |
-| `ModelOfferingTargetId` | One package or speculative pair | ICN |
-| `ModelServingConfigurationId` | One target/profile combination | ICN |
+| `ModelServingConfigurationId` | One bundle/profile combination | ICN |
 | `ModelInstanceId` | One physical loaded occurrence | ICN |
-| `(ProviderId, ProviderModelId)` | One provider offering | ACN/provider boundary |
+| `(ProviderId, ProviderModelId)` | One provider offering | Provider boundary |
 | `SlotId` | One product role assignment | ACN |
 
-There is no generic `ModelId`. Display names, paths, repository names, filenames, recommendation
-membership, cache keys, and array position are never operational identity.
-
-For the local provider, ACN may derive `ProviderModelId` deterministically from the selected
-`ModelServingConfigurationId`, but the branded identities are not interchangeable: configuration
-identity exists before an offering; provider-model identity exists only at the provider boundary.
+Display names, paths, repositories, filenames, recommendation membership, cache keys, and array
+positions are never operational identity. For the local provider, the configuration ID is
+represented in the `ProviderModelId` namespace without making the brands interchangeable.
 
 ## Canonical relationship
 
 ```text
-ModelPackage(s)
-  -> ModelOfferingTarget
-  + ServingProfile
-  -> ModelServingConfiguration
-  + HardwareCalibration + NativeEnvironment + CapacityPolicy
-  -> ModelAssessment
-  -> EligibleAssessedConfiguration
-  -> CatalogCandidate
-       -> optional Recommendation
-       -> DownloadModel(targetId), if packages are missing
-       -> CreateLocalModelOffering(configurationId) -> ProviderOffering / providerModelId
-       -> AssignSlot(slotId, providerModelId) -> SlotSelection
-       -> LoadModel(slotId) -> ModelInstance
-```
+ModelPackage(s) -> ServableModelBundle + ServingProfile
+                                      -> ModelServingConfiguration
+                                                   |
+                         +-------------------------+------------------+
+                         |                                            |
+                         v                                            v
+             LocalModelAssessor                           Install(configurationId)
+                         |                                            |
+                         v                                            v
+                  assessment                               retained configuration
+                         |                                            |
+                         +-> catalog candidate                         +-> provider offering
+                              +-> recommendation                       +-> slot -> instance
 
-The action pipeline deliberately changes identity at each ownership boundary: target identity for
-package acquisition, configuration identity for offering creation, provider-model identity for
-durable selection, and slot identity for loading.
+installed packages ----------------+--> LocalModel[]
+inspection and assessment ---------+
+provider offerings ----------------+
+
+known configurations --------------+--> LocalModelDownload[]
+download state --------------------+
+```

@@ -29,7 +29,11 @@ describe("ICN installed models", () => {
 
     expect(Option.getOrThrow(result)).toEqual({
       revision: 0,
-      state: { packages: [] },
+      state: {
+        revision: 0,
+        reconciliationComplete: false,
+        packages: [],
+      },
     })
   })
 })

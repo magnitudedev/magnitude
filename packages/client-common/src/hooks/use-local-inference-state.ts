@@ -7,7 +7,6 @@ import {
   ProviderModelCatalogMirror,
   type ModelInstanceId,
   type DownloadAttemptId,
-  type ModelOfferingTargetId,
   type ModelServingConfigurationId,
   type ProviderModelId,
   type ProviderModelIdentity,
@@ -45,41 +44,35 @@ export function usePreviewModelLoad(slotId: SlotId) {
 
 export function useLocalModelActions() {
   const client = useAgentClient()
-  const createOfferingAtom = useMemo(
-    () => client.mutation("CreateLocalModelOffering"),
+  const installAtom = useMemo(
+    () => client.mutation("InstallModel"),
     [client],
   )
-  const createOfferingResult = useAtomValue(createOfferingAtom)
-  const createOffering = useAtomSet(
-    createOfferingAtom,
+  const installResult = useAtomValue(installAtom)
+  const install = useAtomSet(
+    installAtom,
     { mode: "promise" },
   )
-  const download = useAtomSet(client.mutation("DownloadModel"))
   const cancel = useAtomSet(client.mutation("CancelModelDownload"))
   const dismiss = useAtomSet(client.mutation("DismissModelDownloadFailure"))
   const deleteModel = useAtomSet(client.mutation("DeleteLocalModel"))
 
   return {
-    createOfferingResult,
-    createOffering: useCallback((configurationId: ModelServingConfigurationId) => createOffering({
+    installResult,
+    install: useCallback((configurationId: ModelServingConfigurationId) => install({
       payload: { configurationId },
       reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
-    }), [createOffering]),
-    download: useCallback((targetId: ModelOfferingTargetId) =>
-      download({
-        payload: { targetId },
-        reactivityKeys: [LocalModelsMirror.id],
-      }), [download]),
+    }), [install]),
     cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => cancel({
       payload: { attemptIds },
       reactivityKeys: [LocalModelsMirror.id],
     }), [cancel]),
-    dismissFailure: useCallback((targetId: ModelOfferingTargetId) => dismiss({
-      payload: { targetId },
+    dismissFailure: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => dismiss({
+      payload: { attemptIds },
       reactivityKeys: [LocalModelsMirror.id],
     }), [dismiss]),
-    delete: useCallback((targetId: ModelOfferingTargetId) => deleteModel({
-      payload: { targetId },
+    delete: useCallback((configurationId: ModelServingConfigurationId) => deleteModel({
+      payload: { configurationId },
       reactivityKeys: [
         LocalModelsMirror.id,
         ProviderModelCatalogMirror.id,

@@ -52,6 +52,23 @@ describe("local model ICN adapter", () => {
     }
   })
 
+  it("preserves native failure acknowledgement", async () => {
+    const attempt = Schema.decodeUnknownSync(NativeDownloadAttemptSchema)({
+      _tag: "Failed",
+      id: "download_test",
+      packageId: "package_test",
+      completedBytes: 4_000,
+      totalBytes: 10_000,
+      failure: { code: "network", message: "offline", retryable: true },
+      acknowledged: true,
+    })
+
+    await expect(Effect.runPromise(downloadAttemptFromIcn(attempt))).resolves.toMatchObject({
+      _tag: "Failed",
+      acknowledged: true,
+    })
+  })
+
   it("projects nullable wire tensor storage into the domain Option", async () => {
     const modelPackage = Schema.decodeUnknownSync(NativeModelPackageSchema)({
       id: "package_test",

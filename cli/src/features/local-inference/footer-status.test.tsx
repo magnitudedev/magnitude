@@ -4,15 +4,18 @@ import {
   DownloadAttemptIdSchema,
   ModelSlotConfiguredLocal,
   ModelInstanceIdSchema,
+  ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
-  ModelOfferingTargetIdSchema,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
 import {
   GIB,
   LOCAL_PROVIDER_ID,
+  makeDownload,
+  makeModel,
   makeView,
+  makeStandaloneBundle,
   TEST_CONFIGURATION_ID,
   TEST_MEMORY_DOMAIN_ID,
   TEST_MODEL_ID,
@@ -85,11 +88,10 @@ test("ready status exposes the model, residency, and complete resident allocatio
   })
 })
 
-test("download summary is derived from active target downloads", () => {
+test("download summary is derived from active bundle downloads", () => {
   const ready = makeView()
-  const downloading = {
-    ...ready.models.models[0]!,
-    download: {
+  const downloading = makeDownload({
+    state: {
       _tag: "Downloading" as const,
       attemptIds: [DownloadAttemptIdSchema.make("download-1")] as const,
       stage: "downloading" as const,
@@ -97,16 +99,23 @@ test("download summary is derived from active target downloads", () => {
       totalBytes: 16 * GIB,
       bytesPerSecond: Option.none(),
     },
-  }
+  })
   expect(deriveLocalModelDownloadSummary(null)).toBeNull()
   expect(deriveLocalModelDownloadSummary(ready.models)).toBeNull()
   expect(deriveLocalModelDownloadSummary({
     ...ready.models,
-    models: [downloading],
+    downloads: [downloading],
   })).toBe("1 model downloading")
   expect(deriveLocalModelDownloadSummary({
     ...ready.models,
-    models: [downloading, { ...downloading, targetId: ModelOfferingTargetIdSchema.make("target-2") }],
+    downloads: [downloading, makeDownload({
+      configuration: {
+        ...downloading.configuration,
+        id: ModelServingConfigurationIdSchema.make("configuration-2"),
+        bundle: makeStandaloneBundle("package-2"),
+      },
+      state: downloading.state,
+    })],
   })).toBe("2 models downloading")
 })
 

@@ -76,7 +76,7 @@ describe("canonical model-slot helpers", () => {
         primary,
         secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
       },
-      recentModelIds: { primary: [], secondary: [] },
+      recentModels: { primary: [], secondary: [] },
       favoriteModels: [],
     }
     expect(deriveLocalModelLoadActivity(state, PRIMARY_SLOT_ID)).toBe(primary)

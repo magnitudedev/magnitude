@@ -65,8 +65,14 @@ pub(crate) struct InstalledPackageSnapshot {
 }
 
 impl InstalledPackageSnapshot {
-    pub(crate) fn response(&self) -> InstalledModelPackagesResponse {
+    pub(crate) fn response(
+        &self,
+        revision: u64,
+        reconciliation_complete: bool,
+    ) -> InstalledModelPackagesResponse {
         InstalledModelPackagesResponse {
+            revision,
+            reconciliation_complete,
             packages: self
                 .records
                 .values()
@@ -80,7 +86,6 @@ pub struct InventoryConfig {
     pub root: PathBuf,
     pub cache_root: PathBuf,
     pub hf_cache_dirs: Vec<PathBuf>,
-    pub model_sources: Vec<PathBuf>,
     pub max_concurrent_downloads: usize,
     pub disk_reserve_bytes: u64,
 }
@@ -114,7 +119,6 @@ impl InventoryConfig {
             root,
             cache_root,
             hf_cache_dirs: Vec::new(),
-            model_sources: Vec::new(),
             max_concurrent_downloads: 2,
             disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
         })
@@ -138,6 +142,7 @@ pub struct ModelManager {
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
     reconciliation_running: Arc<AtomicBool>,
+    reconciliation_complete: Arc<AtomicBool>,
 }
 
 struct ReconciliationLease(Arc<AtomicBool>);
@@ -166,11 +171,28 @@ impl Clone for ModelManager {
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
             reconciliation_running: Arc::clone(&self.reconciliation_running),
+            reconciliation_complete: Arc::clone(&self.reconciliation_complete),
         }
     }
 }
 
 impl ModelManager {
+    pub(crate) fn installed_packages_response(
+        &self,
+    ) -> Result<InstalledModelPackagesResponse, InventoryError> {
+        self.installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })
+            .map(|snapshot| {
+                snapshot.response(
+                    self.ensure_generation.load(Ordering::Acquire),
+                    self.reconciliation_complete.load(Ordering::Acquire),
+                )
+            })
+    }
+
     #[must_use]
     pub fn derived_cache(&self) -> &ModelCache {
         &self.cache
@@ -221,6 +243,7 @@ impl ModelManager {
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
             reconciliation_running: Arc::new(AtomicBool::new(false)),
+            reconciliation_complete: Arc::new(AtomicBool::new(false)),
         };
         manager.request_installed_model_reconciliation();
         manager.start_installed_model_reconciler();
@@ -381,6 +404,7 @@ impl ModelManager {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed_packages;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.reconciliation_complete.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -688,14 +712,10 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
             "max_concurrent_downloads must be positive".to_owned(),
         ));
     }
-    for root in config
-        .hf_cache_dirs
-        .iter()
-        .chain(config.model_sources.iter())
-    {
+    for root in &config.hf_cache_dirs {
         if !root.is_absolute() {
             return Err(InventoryError::InvalidRequest(format!(
-                "configured model source must be absolute: {}",
+                "configured Hugging Face cache root must be absolute: {}",
                 root.display()
             )));
         }
@@ -744,16 +764,8 @@ fn scan(
     for cache in &config.hf_cache_dirs {
         let canonical = cache.canonicalize().unwrap_or_else(|_| cache.clone());
         if canonical != config.root.join("hub") && distinct_hf.insert(canonical.clone()) {
-            roots.push((true, canonical, String::new()));
+            roots.push(canonical);
         }
-    }
-    for source in &config.model_sources {
-        let canonical = source.canonicalize().unwrap_or_else(|_| source.clone());
-        let source_id = format!(
-            "configured-{}",
-            fingerprint(canonical.to_string_lossy().as_bytes())
-        );
-        roots.push((false, canonical, source_id));
     }
     let concurrency = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -763,14 +775,10 @@ fn scan(
         let root_results = std::thread::scope(|scope| {
             roots
                 .iter()
-                .map(|(is_hf, root, source_id)| {
+                .map(|root| {
                     scope.spawn(move || {
                         let mut models = Vec::new();
-                        if *is_hf {
-                            scan_hf_cache(root, &mut models)?;
-                        } else {
-                            scan_directory(root, source_id, &mut models)?;
-                        }
+                        scan_hf_cache(root, &mut models)?;
                         Ok::<_, InventoryError>(models)
                     })
                 })
@@ -980,49 +988,6 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
                 })));
             }
         }
-    }
-    Ok(())
-}
-
-fn scan_directory(
-    root: &Path,
-    source_id: &str,
-    output: &mut Vec<DiscoveryCandidate>,
-) -> Result<(), InventoryError> {
-    if !root.is_dir() {
-        return Ok(());
-    }
-    let canonical_root = root.canonicalize().map_err(io_error)?;
-    let groups = discover_groups(&canonical_root, &canonical_root)?;
-    for group in groups {
-        let components = components_for_group(&canonical_root, &group)?;
-        let primary = match primary_path(&canonical_root, &components) {
-            Some(path) => path,
-            None => continue,
-        };
-        let content = content_id(&components);
-        let id = model_id("directory", &canonical_root, &content);
-        let created = modified_seconds(&primary).unwrap_or_else(now);
-        output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
-            id,
-            content_id: content,
-            created,
-            ready_at: created,
-            source: ModelSource::Local {
-                declared_by: LocalDeclaration::Configuration,
-            },
-            location: ModelLocation::Directory {
-                source_id: source_id.to_owned(),
-                root: canonical_root.clone(),
-                total_bytes: components.iter().map(|item| item.size_bytes).sum(),
-                components,
-                integrity: Integrity::Unverified {
-                    reason: "configured_directory".to_owned(),
-                },
-            },
-            primary,
-            deletable: false,
-        })));
     }
     Ok(())
 }
@@ -1872,7 +1837,6 @@ mod tests {
                 .expect("absolute model and cache roots");
 
         assert!(config.hf_cache_dirs.is_empty());
-        assert!(config.model_sources.is_empty());
     }
 
     #[derive(Default)]
@@ -1962,18 +1926,26 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn create_hf_snapshot(root: &Path) -> (PathBuf, PathBuf) {
+        let cache = root.join("hf-cache");
+        let snapshot = cache
+            .join("models--test--model")
+            .join("snapshots")
+            .join("0123456789abcdef");
+        fs::create_dir_all(&snapshot).unwrap();
+        (cache, snapshot)
+    }
+
     #[tokio::test]
     async fn installed_package_listing_reports_discovered_package() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
-        let source = temporary.path().join("source");
-        fs::create_dir_all(&source).unwrap();
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
         write_minimal_gguf(&source.join("model.gguf"));
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
-        config.hf_cache_dirs.clear();
-        config.model_sources.push(source);
+        config.hf_cache_dirs.push(hf_cache);
         let manager = ModelManager::open_with_template_assessor(
             config,
             Some(Arc::new(CompleteTemplateAssessor::default())),
@@ -1984,21 +1956,24 @@ mod tests {
         let installed = manager.list_installed().await.unwrap();
 
         assert_eq!(installed.packages.len(), 1);
+        assert_eq!(
+            installed.packages[0].origin,
+            icn_contracts::models::ModelPackageInstallationOrigin::HuggingFaceCache
+        );
         let assessed = manager.list().await.unwrap();
         assert_eq!(assessed.len(), 1);
     }
 
     #[tokio::test]
-    async fn installed_package_reconciliation_refreshes_external_sources_after_startup() {
+    async fn installed_package_reconciliation_refreshes_hugging_face_cache_after_startup() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
-        let source = temporary.path().join("source");
-        fs::create_dir_all(&source).unwrap();
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
         write_minimal_gguf(&source.join("first.gguf"));
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
-        config.model_sources.push(source.clone());
+        config.hf_cache_dirs.push(hf_cache);
         let manager = ModelManager::open_with_template_assessor(
             config,
             Some(Arc::new(CompleteTemplateAssessor::default())),
@@ -2047,8 +2022,7 @@ mod tests {
     async fn template_failure_isolated_to_the_affected_installed_model() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
-        let source = temporary.path().join("source");
-        fs::create_dir_all(&source).unwrap();
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
         write_minimal_gguf(&source.join("working.gguf"));
         write_minimal_gguf(&source.join("broken.gguf"));
         fs::OpenOptions::new()
@@ -2060,8 +2034,7 @@ mod tests {
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
-        config.hf_cache_dirs.clear();
-        config.model_sources.push(source);
+        config.hf_cache_dirs.push(hf_cache);
         let manager = ModelManager::open_with_template_assessor(
             config,
             Some(Arc::new(CompleteTemplateAssessor {
@@ -2151,13 +2124,11 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
         let cache_root = temporary.path().join("cache");
-        let source = temporary.path().join("source");
-        fs::create_dir_all(&source).unwrap();
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
         write_minimal_gguf(&source.join("model.gguf"));
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
-        config.hf_cache_dirs.clear();
-        config.model_sources.push(source.clone());
+        config.hf_cache_dirs.push(hf_cache);
         let template = Arc::new(CompleteTemplateAssessor::default());
         let manager =
             ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
@@ -2208,14 +2179,12 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
         let cache_root = temporary.path().join("cache");
-        let source = temporary.path().join("source");
-        fs::create_dir_all(&source).unwrap();
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
         write_minimal_gguf(&source.join("first.gguf"));
         write_minimal_gguf(&source.join("second.gguf"));
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
-        config.hf_cache_dirs.clear();
-        config.model_sources.push(source);
+        config.hf_cache_dirs.push(hf_cache);
         let template = Arc::new(CompleteTemplateAssessor {
             delay: true,
             ..CompleteTemplateAssessor::default()

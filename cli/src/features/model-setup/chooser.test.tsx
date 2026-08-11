@@ -5,7 +5,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   DownloadAttemptIdSchema,
-  ModelOfferingTargetIdSchema,
+  ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ProviderModelIdSchema,
   RecommendationIdSchema,
@@ -13,8 +13,12 @@ import {
 import { beforeEach, expect, test, vi } from "vitest"
 import {
   makeCatalogCandidate,
+  makeDownload,
+  makeCatalogOnlyModel,
+  makeConfiguredModel,
   makeModel,
   makeRecommendation,
+  makeStandaloneBundle,
   makeView,
   GIB,
 } from "../local-inference/test-fixtures"
@@ -68,19 +72,14 @@ beforeEach(() => {
 })
 
 const chooserView = () => {
-  const remoteTargetId = ModelOfferingTargetIdSchema.make("target_remote")
   const remoteProviderModelId = ProviderModelIdSchema.make("configuration_remote")
-  const remoteModel = makeModel({
-    targetId: remoteTargetId,
-    displayName: "Remote Model",
-    download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * 1024 ** 3 },
-  })
   return makeView({
     ready: false,
-    models: [makeModel({ displayName: "Installed Model" }), remoteModel],
+    models: [makeModel({
+      presentation: { displayName: "Installed Model", description: "Test model" },
+    })],
     recommendations: [makeRecommendation({
       candidate: makeCatalogCandidate({
-        targetId: remoteTargetId,
         configurationId: ModelServingConfigurationIdSchema.make(remoteProviderModelId),
         displayName: "Remote Model",
         profile: { contextLength: 100_000 },
@@ -105,20 +104,17 @@ const chooserProps = (state: ReturnType<typeof chooserView>) => ({
 })
 
 const chooserViewWithInventory = (installedCount: number, downloadCount: number) => {
-  const installed = Array.from({ length: installedCount }, (_, index) => makeModel({
-    targetId: ModelOfferingTargetIdSchema.make(`target_installed_${index + 1}`),
-    displayName: `Installed ${index + 1}`,
-  }))
+  const installed = Array.from({ length: installedCount }, (_, index) => makeConfiguredModel(
+    ModelServingConfigurationIdSchema.make(`configuration_installed_${index + 1}`),
+    {
+      bundle: makeStandaloneBundle(`package_installed_${index + 1}`),
+      presentation: { displayName: `Installed ${index + 1}`, description: "Test model" },
+    },
+  ))
   const downloads = Array.from({ length: downloadCount }, (_, index) => {
     const number = index + 1
     const intents = ["balanced", "best_quality", "fastest", "lightweight"] as const
-    const targetId = ModelOfferingTargetIdSchema.make(`target_remote_${number}`)
     const providerModelId = ProviderModelIdSchema.make(`configuration_remote_${number}`)
-    const model = makeModel({
-      targetId,
-      displayName: `Remote ${number}`,
-      download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * 1024 ** 3 },
-    })
     const recommendation = makeRecommendation({
       id: RecommendationIdSchema.make(`recommendation_remote_${number}`),
       intent: intents[index] ?? "balanced",
@@ -126,16 +122,15 @@ const chooserViewWithInventory = (installedCount: number, downloadCount: number)
         ? "A deliberately long recommendation description that wraps across several lines without changing the chooser height when this model becomes selected."
         : "Balanced local inference.",
       candidate: makeCatalogCandidate({
-        targetId,
         configurationId: ModelServingConfigurationIdSchema.make(providerModelId),
         displayName: `Remote ${number}`,
       }),
     })
-    return { model, recommendation }
+    return { recommendation }
   })
   return makeView({
     ready: false,
-    models: [...installed, ...downloads.map(({ model }) => model)],
+    models: installed,
     recommendations: downloads.map(({ recommendation }) => recommendation),
   })
 }
@@ -199,16 +194,18 @@ test("loads a stored model without invoking download", async () => {
 })
 
 test("selects an assessed installed model before its offering is projected", async () => {
-  const targetId = ModelOfferingTargetIdSchema.make("target_installed_assessed")
+  const packageId = ModelPackageIdSchema.make("package_installed_assessed")
   const configurationId = ModelServingConfigurationIdSchema.make("configuration_installed_assessed")
   const state = makeView({
     ready: false,
-    models: [makeModel({ targetId, displayName: "Assessed Installed Model", offerings: [] })],
+    models: [makeCatalogOnlyModel({
+      bundle: makeStandaloneBundle(packageId),
+      presentation: { displayName: "Assessed Installed Model", description: "Test model" },
+    }, configurationId)],
     catalogCandidates: [makeCatalogCandidate({
-      targetId,
       configurationId,
       displayName: "Assessed Installed Model",
-      download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+      download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
       availability: { _tag: "Available" },
     })],
   })
@@ -228,7 +225,6 @@ test("selects an assessed installed model before its offering is projected", asy
     expect(view.captureCharFrame()).toMatch(/Assessed Installed Model\s+Load/)
     await act(async () => press("enter"))
     expect(onSelectConfiguration).toHaveBeenCalledWith({
-      targetId,
       configurationId,
       displayName: "Assessed Installed Model",
       reasoningEffort: "none",
@@ -361,7 +357,6 @@ test("replaces hardware progress with persistent left-aligned machine metadata",
 
 test("keeps the chooser unchanged until authoritative download state arrives", async () => {
   const candidate = makeCatalogCandidate({
-    targetId: ModelOfferingTargetIdSchema.make("target_remote"),
     configurationId: ModelServingConfigurationIdSchema.make("configuration_remote"),
     displayName: "Remote Model",
     download: {
@@ -404,7 +399,6 @@ test("keeps the chooser unchanged until authoritative download state arrives", a
     await act(async () => press("down"))
     await act(async () => press("enter"))
     expect(onSelectConfiguration).toHaveBeenCalledWith({
-      targetId: candidate.targetId,
       configurationId: candidate.configurationId,
       displayName: candidate.displayName,
       reasoningEffort: "none",
@@ -603,16 +597,40 @@ test("keeps four rows per section and scrolls only the installed-model window", 
 
 test("excludes unrelated failed downloads and unusable installed models", async () => {
   const base = chooserViewWithInventory(0, 4)
+  const unusableModel = makeModel({
+    bundle: makeStandaloneBundle("package_unusable"),
+    presentation: { displayName: "Unusable Installed Model", description: "Test model" },
+  })
   const state = {
     ...base,
     models: {
       ...base.models,
       models: [
         ...base.models.models,
-        makeModel({
-          targetId: ModelOfferingTargetIdSchema.make("target_failed"),
-          displayName: "Unrelated Failed Download",
-          download: {
+        {
+          ...unusableModel,
+          readiness: {
+            _tag: "Failed" as const,
+            failure: {
+              code: "assessment_failed",
+              message: "Assessment failed",
+              retryable: true,
+            },
+          },
+        },
+      ],
+      downloads: [
+        ...base.models.downloads,
+        makeDownload({
+          configuration: {
+            ...makeDownload().configuration,
+            bundle: makeStandaloneBundle("package_failed"),
+          },
+          presentation: {
+            displayName: "Unrelated Failed Download",
+            description: "Test model",
+          },
+          state: {
             _tag: "Failed" as const,
             attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
             completedBytes: 4 * GIB,
@@ -623,11 +641,6 @@ test("excludes unrelated failed downloads and unusable installed models", async 
               retryable: true,
             },
           },
-        }),
-        makeModel({
-          targetId: ModelOfferingTargetIdSchema.make("target_unusable"),
-          displayName: "Unusable Installed Model",
-          offerings: [],
         }),
       ],
     },
@@ -654,7 +667,6 @@ test("excludes unrelated failed downloads and unusable installed models", async 
     }
     await act(async () => press("enter"))
     expect(onSelectConfiguration).toHaveBeenCalledWith({
-      targetId: ModelOfferingTargetIdSchema.make("target_remote_4"),
       configurationId: ModelServingConfigurationIdSchema.make("configuration_remote_4"),
       displayName: "Remote 4",
       reasoningEffort: "none",

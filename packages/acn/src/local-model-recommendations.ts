@@ -16,11 +16,9 @@ import {
   ModelServingConfigurationSchema,
   LocalModelRecommendationProgressStepSchema,
   RecommendationSchema,
-  type FitsModelAssessment,
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
-  type ModelOfferingTarget,
-  type ModelOfferingTargetId,
+  type ServableModelBundle,
   type ModelFailure,
   type ModelServingConfiguration,
   type Recommendation,
@@ -28,10 +26,7 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { makeObservedState } from "./mirrored-state"
-import {
-  localModelAssessmentProfiles,
-  LocalModelAssessments,
-} from "./local-model-assessments"
+import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import {
@@ -95,21 +90,21 @@ export class LocalModelRecommendations extends Context.Tag(
   "LocalModelRecommendations"
 )<LocalModelRecommendations, LocalModelRecommendationsApi>() {}
 
-export const exactTargetTensorStorageBytes = (
+export const exactBundleTensorStorageBytes = (
   model: RecommendableModel
-): Option.Option<number> => exactTensorStorageBytes(model.target)
+): Option.Option<number> => exactTensorStorageBytes(model.configuration.bundle)
 
 const exactTensorStorageBytes = (
-  target: ModelOfferingTarget,
+  bundle: ServableModelBundle,
 ): Option.Option<number> => {
   const packages =
-    target._tag === "Package"
-      ? [target.package]
-      : [target.target, target.draft]
+    bundle._tag === "Standalone"
+      ? [bundle.package]
+      : [bundle.target, bundle.draft]
   const files = new Map(
     packages
       .flatMap(({ files }) => files)
-      // Primary/sharded weight tensors are required for every execution of the target. Other
+      // Primary/sharded weight tensors are required for every execution of the bundle. Other
       // package roles can be optional, so counting them could create a false rejection. Native
       // assessment accounts for every selected component precisely.
       .filter((file) => file.role === "weights")
@@ -125,10 +120,10 @@ const exactTensorStorageBytes = (
   return Option.some(total)
 }
 
-const targetPackages = (model: RecommendableModel) =>
-  model.target._tag === "Package"
-    ? [model.target.package]
-    : [model.target.target, model.target.draft]
+const bundlePackages = (model: RecommendableModel) =>
+  model.configuration.bundle._tag === "Standalone"
+    ? [model.configuration.bundle.package]
+    : [model.configuration.bundle.target, model.configuration.bundle.draft]
 
 const CatalogEntrySchema = Schema.Struct({
   candidate: LocalModelCatalogCandidateMetadataSchema,
@@ -143,16 +138,15 @@ const catalogProjection = (
     configurationId: candidate.assessment.configurationId,
     assessmentId: candidate.assessment.assessmentId,
     environmentId: candidate.assessment.environmentId,
-    targetId: candidate.model.targetId,
     displayName: candidate.model.displayName,
     description: candidate.model.description,
     license: candidate.model.license,
     profile: candidate.profile,
     downloadBytes: candidate.totalDownloadBytes,
-    quantization: targetPackages(candidate.model)
+    quantization: bundlePackages(candidate.model)
       .map(({ properties }) => properties.quantization)
       .join(" + "),
-    quantizationName: targetPackages(candidate.model)
+    quantizationName: bundlePackages(candidate.model)
       .map(({ properties }) => properties.quantizationName)
       .join(" + "),
     memory: candidate.assessment.memory,
@@ -163,62 +157,13 @@ const catalogProjection = (
     }),
     performance: candidate.assessment.performance,
     capabilities: candidate.model.capabilities,
-    sources: targetPackages(candidate.model).map((modelPackage) => ({
+    sources: bundlePackages(candidate.model).map((modelPackage) => ({
       source: modelPackage.source,
       files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
     })),
   },
-  configuration: {
-    id: candidate.assessment.configurationId,
-    target: candidate.model.target,
-    profile: candidate.profile,
-  },
+  configuration: candidate.model.configuration,
 })
-
-interface InstalledAssessmentTarget {
-  readonly targetId: ModelOfferingTargetId
-  readonly target: ModelOfferingTarget
-  readonly displayName: string
-  readonly capabilities: RecommendationCandidate["model"]["capabilities"]
-}
-
-const installedCatalogProjection = (
-  model: InstalledAssessmentTarget,
-  assessment: FitsModelAssessment,
-): CatalogEntry => {
-  const packages = model.target._tag === "Package"
-    ? [model.target.package]
-    : [model.target.target, model.target.draft]
-  return {
-    candidate: {
-      configurationId: assessment.configurationId,
-      assessmentId: assessment.assessmentId,
-      environmentId: assessment.environmentId,
-      targetId: model.targetId,
-      displayName: model.displayName,
-      description: "",
-      license: "Unknown",
-      profile: assessment.profile,
-      downloadBytes: packages.flatMap(({ files }) => files)
-        .reduce((total, file) => total + file.sizeBytes, 0),
-      quantization: packages.map(({ properties }) => properties.quantization).join(" + "),
-      quantizationName: packages.map(({ properties }) => properties.quantizationName).join(" + "),
-      memory: assessment.memory,
-      recommendationEvidence: Option.none(),
-      performance: assessment.performance,
-      capabilities: model.capabilities,
-      sources: packages.map((modelPackage) => ({
-        source: modelPackage.source,
-        files: modelPackage.files.map(({ path, sha256 }) => ({ path, sha256 })),
-      })),
-    },
-    configuration: {
-      id: assessment.configurationId,
-      target: model.target,
-      profile: assessment.profile,
-    },
-  }
-}
 
 const pendingProgress = (
   id: LocalModelRecommendationProgressStepId
@@ -247,14 +192,14 @@ const updateProgress = (
 export const makeLocalModelRecommendationsLive = (): Layer.Layer<
   LocalModelRecommendations,
   never,
-  IcnCatalog | IcnHardware | LocalModelAssessments | LocalModelPackages
+  IcnCatalog | IcnHardware | LocalModelAssessor | LocalModelPackages
 > =>
   Layer.scoped(
     LocalModelRecommendations,
     Effect.gen(function* () {
       const catalog = yield* IcnCatalog
       const hardware = yield* IcnHardware
-      const assessments = yield* LocalModelAssessments
+      const assessments = yield* LocalModelAssessor
       const packages = yield* LocalModelPackages
       const startupStartedAtMs = Date.now()
       const startupProgress = updateProgress(initialProgress(), "hardware", {
@@ -409,59 +354,14 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               catalogState.models,
               recommendableModelFromIcn
             )
-            const catalogTargetIds = new Set(catalogModels.map(({ targetId }) => targetId))
-            const explicitStandalonePackageIds = new Set(catalogModels.flatMap(({ target }) =>
-              target._tag === "Package" ? [target.package.id] : []))
-            const pairedPackageIds = new Set(catalogModels.flatMap(({ target }) =>
-              target._tag === "SpeculativeDecodingPair"
-                ? [target.target.id, target.draft.id]
-                : []))
-            const installedTargets = packageState.entries.flatMap(
-              (entry): readonly InstalledAssessmentTarget[] => {
-                if (
-                  entry.localState._tag !== "Installed"
-                  || entry.inspection._tag !== "Inspected"
-                  || Option.isNone(entry.targetId)
-                  || catalogTargetIds.has(entry.targetId.value)
-                  || (pairedPackageIds.has(entry.package.id)
-                    && !explicitStandalonePackageIds.has(entry.package.id))
-                ) return []
-                const target = { _tag: "Package" as const, package: entry.package }
-                const sourceName = entry.package.source._tag === "HuggingFace"
-                  ? entry.package.source.repository.split("/").at(-1)
-                    ?? entry.package.source.repository
-                  : entry.package.files[0]?.path.split("/").at(-1) ?? entry.package.id
-                return [{
-                  targetId: entry.targetId.value,
-                  target,
-                  displayName: sourceName,
-                  capabilities: entry.inspection.capabilities,
-                }]
-              },
-            )
-            const catalogAssessmentTargets = catalogModels.map((model) => ({
-              ...model,
-              profiles: localModelAssessmentProfiles(
-                model.target,
-                model.profile.contextLength,
-              ),
-            }))
-            const installedAssessmentTargets = installedTargets.map((model) => ({
-              ...model,
-              profiles: localModelAssessmentProfiles(model.target),
-            }))
-            const assessmentTargets = [
-              ...catalogAssessmentTargets,
-              ...installedAssessmentTargets,
-            ]
+            const assessmentConfigurations = catalogModels
             const inputState = yield* Schema.encode(
               Schema.parseJson(Schema.Unknown)
             )({
-              catalog: catalogAssessmentTargets.map((model) => ({
+              catalog: catalogModels.map((model) => ({
                 id: model.id,
-                targetId: model.targetId,
                 checkpointId: model.checkpointId,
-                assessmentProfiles: model.profiles,
+                configuration: model.configuration,
                 displayName: model.displayName,
                 description: model.description,
                 license: model.license,
@@ -472,16 +372,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 quantizationAware: model.quantizationAware,
                 qualityEvidence: model.qualityEvidence,
                 tensorStorageBytes: Option.getOrNull(
-                  exactTargetTensorStorageBytes(model)
-                ),
-              })),
-              installed: installedAssessmentTargets.map((model) => ({
-                targetId: model.targetId,
-                assessmentProfiles: model.profiles,
-                target: model.target,
-                capabilities: model.capabilities,
-                tensorStorageBytes: Option.getOrNull(
-                  exactTensorStorageBytes(model.target)
+                  exactBundleTensorStorageBytes(model)
                 ),
               })),
               hardware: hardwareSnapshot.topology_fingerprint,
@@ -515,8 +406,8 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   durationMs: 0,
                   cached: true,
                 },
-                completedItems: Option.some(assessmentTargets.length),
-                totalItems: Option.some(assessmentTargets.length),
+                completedItems: Option.some(assessmentConfigurations.length),
+                totalItems: Option.some(assessmentConfigurations.length),
                 estimatedRemainingMs: Option.none(),
               })
               progress = updateProgress(progress, "recommendations", {
@@ -544,79 +435,60 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               (total, domain) => total + domain.stable_capacity_bytes,
               0
             )
-            const assessableTargets = assessmentTargets.filter(({ target }) => {
-              const tensorStorageBytes = exactTensorStorageBytes(target)
+            const assessableConfigurations = assessmentConfigurations.filter(({ configuration }) => {
+              const tensorStorageBytes = exactTensorStorageBytes(configuration.bundle)
               return Option.isSome(tensorStorageBytes)
                 && tensorStorageBytes.value > aggregateStableCapacityBytes
                 ? false
                 : true
             })
-            const rejectedCount = assessmentTargets.length - assessableTargets.length
+            const rejectedCount = assessmentConfigurations.length - assessableConfigurations.length
             const assessmentStartedAt = Date.now()
             progress = yield* startStep(progress, "assessment", {
               completed: rejectedCount,
-              total: assessmentTargets.length,
+              total: assessmentConfigurations.length,
             })
             yield* publishProgress(progress)
-            const requests = assessableTargets.map(({ targetId, target, profiles }) => ({
-              targetId,
-              target,
-              profiles,
+            const coordinated = yield* assessments.state
+            const failedAssessment = assessableConfigurations.flatMap(({ configuration }) => {
+              const assessment = coordinated.get(configuration.id)?.assessment
+              return assessment?._tag === "Failed" ? [assessment.failure] : []
+            })[0]
+            if (failedAssessment !== undefined) {
+              return yield* new LocalModelMutationFailed(failedAssessment)
+            }
+            const completed = assessableConfigurations.filter(({ configuration }) => {
+              const assessment = coordinated.get(configuration.id)?.assessment
+              return assessment !== undefined
+                && assessment._tag !== "Assessing"
+            })
+            progress = updateProgress(progress, "assessment", {
+              completedItems: Option.some(rejectedCount + completed.length),
+              totalItems: Option.some(assessmentConfigurations.length),
+              estimatedRemainingMs: Option.none(),
+            })
+            yield* publishProgress(progress)
+            if (completed.length !== assessableConfigurations.length) return
+            const results = new Map(assessableConfigurations.flatMap(({ configuration }) => {
+              const assessment = coordinated.get(configuration.id)?.assessment
+              return assessment === undefined ? [] : [[configuration.id, assessment] as const]
             }))
-            const assessedResults = yield* assessments.assess(
-              requests,
-              (completed, total) =>
-                Effect.gen(function* () {
-                  const elapsedMs = Math.max(
-                    0,
-                    Date.now() - assessmentStartedAt
-                  )
-                  const estimatedRemainingMs =
-                    completed > 0
-                      ? Math.max(
-                          0,
-                          Math.round(
-                            (elapsedMs / completed) * (total - completed)
-                          )
-                        )
-                      : 0
-                  progress = updateProgress(progress, "assessment", {
-                    completedItems: Option.some(rejectedCount + completed),
-                    totalItems: Option.some(rejectedCount + total),
-                    estimatedRemainingMs:
-                      completed > 0
-                        ? Option.some(estimatedRemainingMs)
-                        : Option.none(),
-                  })
-                  yield* publishProgress(progress)
-                })
-            )
-            const results = new Map(
-              assessableTargets.map(({ targetId }, assessedIndex) => [
-                targetId,
-                assessedResults[assessedIndex],
-              ])
-            )
             progress = yield* completeStep(
               progress,
               "assessment",
               assessmentStartedAt,
               false,
-              { completed: assessmentTargets.length, total: assessmentTargets.length }
+              { completed: assessmentConfigurations.length, total: assessmentConfigurations.length }
             )
             const evaluated = catalogModels.flatMap(
               (model): readonly RecommendationCandidate[] => {
-                const result = results.get(model.targetId)
-                if (result?._tag !== "Assessed") return []
-                return result.assessments.flatMap(
-                  (assessment): readonly RecommendationCandidate[] => {
-                    if (assessment._tag !== "Fits") return []
-                    const profile = assessment.assessment.profile
-                    return [
-                      {
+                const result = results.get(model.configuration.id)
+                if (result?._tag !== "Fits") return []
+                const profile = result.assessment.profile
+                return [{
                         model,
                         profile,
-                        assessment: assessment.assessment,
+                        assessment: result.assessment,
                         artifactId: model.id,
                         checkpointId: model.checkpointId,
                         capability: {
@@ -626,12 +498,12 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                         fidelityRank: model.fidelityRank,
                         quantizationAware: model.quantizationAware,
                         estimatedLoadedBytes:
-                          assessment.assessment.memory.reduce(
+                          result.assessment.memory.reduce(
                             (total, domain) => total + domain.requiredBytes,
                             0
                           ),
                         stableCapacityBudgetBytes:
-                          assessment.assessment.memory.reduce(
+                          result.assessment.memory.reduce(
                             (total, domain) =>
                               total +
                               Math.max(
@@ -642,22 +514,19 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                             0
                           ),
                         totalDownloadBytes:
-                          model.target._tag === "Package"
-                            ? model.target.package.files.reduce(
+                          model.configuration.bundle._tag === "Standalone"
+                            ? model.configuration.bundle.package.files.reduce(
                                 (total, file) => total + file.sizeBytes,
                                 0
                               )
                             : [
-                                ...model.target.target.files,
-                                ...model.target.draft.files,
+                                ...model.configuration.bundle.target.files,
+                                ...model.configuration.bundle.draft.files,
                               ].reduce(
                                 (total, file) => total + file.sizeBytes,
                                 0
                               ),
-                      },
-                    ]
-                  }
-                )
+                      }]
               }
             )
             const selectionStartedAt = Date.now()
@@ -667,14 +536,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               evaluated,
               selected
             ).map(catalogProjection)
-            const installedCandidates = installedTargets.flatMap((model) => {
-              const result = results.get(model.targetId)
-              if (result?._tag !== "Assessed") return []
-              const assessment = result.assessments.find((item) => item._tag === "Fits")
-              return assessment === undefined
-                ? []
-                : [installedCatalogProjection(model, assessment.assessment)]
-            })
             progress = updateProgress(progress, "recommendations", {
               status: {
                 _tag: "Completed",
@@ -695,7 +556,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               {
                 _tag: "Ready",
                 recommendations: selected,
-                catalog: [...catalogCandidates, ...installedCandidates],
+                catalog: catalogCandidates,
                 progress,
               },
               equivalent
@@ -753,10 +614,12 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
         )
 
       yield* generate.pipe(Effect.forkScoped)
-      yield* Stream.merge(
-        Stream.merge(catalog.changes, hardware.assessmentChanges),
-        packages.changes
-      ).pipe(
+      yield* Stream.mergeAll([
+        catalog.changes.pipe(Stream.map(() => undefined)),
+        hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
+        packages.changes.pipe(Stream.map(() => undefined)),
+        assessments.changes.pipe(Stream.map(() => undefined)),
+      ], { concurrency: "unbounded" }).pipe(
         Stream.runForEach(() => generate),
         Effect.forkScoped
       )

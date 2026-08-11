@@ -12,13 +12,17 @@ import {
 import {
   buildModelsMenuEntries,
   huggingFaceRepositoryUrls,
+  localModelInstalledStatus,
+  localModelReadinessStatus,
   modelsMenuEntryIsSelected,
   modelsMenuSelectionAction,
+  providerDisabledStatus,
   resolveRootNavigationDirection,
   scrollCatalogCandidateIntoView,
 } from "./container"
 import {
   makeCatalogCandidate,
+  makeCatalogOnlyModel,
   makeModel,
   makeView,
   TEST_MODEL_ID,
@@ -57,6 +61,40 @@ describe("model menu root navigation", () => {
   test("leaves unrelated keys to the active view", () => {
     expect(resolveRootNavigationDirection(key("escape"))).toBeNull()
     expect(resolveRootNavigationDirection(key("up"))).toBeNull()
+  })
+})
+
+describe("installed model status", () => {
+  test("identifies models installed from the Hugging Face cache", () => {
+    expect(localModelInstalledStatus({
+      _tag: "Downloaded",
+      installedBytes: 1,
+      origins: ["HuggingFaceCache"],
+    })).toBe("Installed (HF)")
+  })
+
+  test("uses the standard installed label for Magnitude-managed models", () => {
+    expect(localModelInstalledStatus({
+      _tag: "Downloaded",
+      installedBytes: 1,
+      origins: ["Magnitude"],
+    })).toBe("Installed")
+  })
+
+  test("does not render native inspection diagnostics as model-list status", () => {
+    const model = {
+      ...makeModel(),
+      readiness: {
+        _tag: "Failed" as const,
+        failure: {
+          code: "template_inspection_failed",
+          message: "template inspection failed for /Users/example/.cache/model.gguf: native stderr",
+          retryable: false,
+        },
+      },
+    }
+
+    expect(localModelReadinessStatus(model)).toBe("Error")
   })
 })
 
@@ -121,9 +159,105 @@ describe("catalog repository links", () => {
 })
 
 describe("models menu entries", () => {
+  test("renders every disabled reason without a generic fallback", () => {
+    expect([
+      providerDisabledStatus("insufficient_resources"),
+      providerDisabledStatus("provider_unavailable"),
+      providerDisabledStatus("model_unavailable"),
+      providerDisabledStatus("installation_unavailable"),
+      providerDisabledStatus("incompatible_runtime"),
+      providerDisabledStatus("invalid_configuration"),
+    ]).toEqual([
+      "Insufficient resources",
+      "Provider unavailable",
+      "Model unavailable",
+      "Installation missing",
+      "Incompatible runtime",
+      "Invalid configuration",
+    ])
+  })
+
+  test("does not put an uninstalled catalog model in Models", () => {
+    expect(buildModelsMenuEntries([], [], [], [])).toEqual([])
+  })
+
+  test("keeps an installed model visible when its assessment does not fit", () => {
+    const fitting = makeModel()
+    if (fitting.readiness._tag !== "Assessed") throw new Error("fixture is not assessed")
+    const model = {
+      ...fitting,
+      readiness: {
+        ...fitting.readiness,
+        assessment: {
+          _tag: "DoesNotFit",
+          assessmentId: "assessment-test" as never,
+          environmentId: "environment-test" as never,
+          memory: [],
+          deficitBytes: 1,
+          limitingResource: "system_memory",
+        } as const,
+      },
+    }
+
+    expect(buildModelsMenuEntries([], [model], [], [])).toMatchObject([
+      { _tag: "LocalStatus", model },
+    ])
+  })
+
+  test("keeps an unavailable installed offering visible but not selectable", () => {
+    const available = makeModel()
+    if (available.readiness._tag !== "Assessed") throw new Error("fixture is not assessed")
+    const model = {
+      ...available,
+      readiness: {
+        ...available.readiness,
+        offering: Option.map(available.readiness.offering, (offering) => ({
+          ...offering,
+          availability: { _tag: "Disabled" as const, reason: "incompatible_runtime" as const },
+        })),
+      },
+    }
+    const choices = buildInstalledLocalModelChoices({
+      inventory: { _tag: "Ready" },
+      models: [model],
+      downloads: [],
+      recommendations: { _tag: "Loading", progress: [] },
+    })
+    const entries = buildModelsMenuEntries(choices, [model], [], [])
+
+    expect(entries).toMatchObject([{ _tag: "Local" }])
+    expect(modelsMenuSelectionAction(entries[0]!)).toEqual(Option.none())
+  })
+
+  test("keeps one stable local row while assessment completes", () => {
+    const fitting = makeModel()
+    const assessing = {
+      ...fitting,
+      readiness: { _tag: "Assessing" as const },
+    }
+    const fittingEntries = buildModelsMenuEntries(
+      buildInstalledLocalModelChoices({
+        inventory: { _tag: "Ready" },
+        models: [fitting],
+        downloads: [],
+        recommendations: { _tag: "Loading", progress: [] },
+      }),
+      [fitting],
+      [],
+      [],
+    )
+    const assessingEntries = buildModelsMenuEntries([], [assessing], [], [])
+
+    expect(assessingEntries).toHaveLength(1)
+    expect(fittingEntries).toHaveLength(1)
+    expect(assessingEntries[0]).toMatchObject({ _tag: "LocalStatus" })
+    expect(fittingEntries[0]).toMatchObject({ _tag: "Local" })
+    expect(assessingEntries[0]?.id).toBe(fittingEntries[0]?.id)
+  })
+
   test("joins custom provider metadata into its model entry", () => {
     const providerId = ProviderIdSchema.make("custom:openrouter")
-    const entries = buildModelsMenuEntries([], [{
+    const entries = buildModelsMenuEntries([], [], [{
       providerId,
       providerModelId: ProviderModelIdSchema.make("z-ai/glm-5.2"),
       modelFamilyId: Option.none(),
@@ -160,24 +294,25 @@ describe("models menu entries", () => {
     })
   })
 
-  test("represents an installed target once before and after offering creation", () => {
+  test("keeps an installed catalog entry visible while its provider offering appears", () => {
     const withoutOffering = makeView({
       ready: false,
-      models: [makeModel({ offerings: [] })],
+      models: [makeCatalogOnlyModel()],
       catalogCandidates: [makeCatalogCandidate({
-        download: { _tag: "Downloaded", installedBytes: 16 },
+        download: { _tag: "Downloaded", installedBytes: 16, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     })
     const withOffering = makeView({
       ready: false,
       catalogCandidates: [makeCatalogCandidate({
-        download: { _tag: "Downloaded", installedBytes: 16 },
+        download: { _tag: "Downloaded", installedBytes: 16, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     })
     const entriesFor = (view: ReturnType<typeof makeView>) => buildModelsMenuEntries(
-      buildInstalledLocalModelChoices(view.models, view.catalog, view.slots),
+      buildInstalledLocalModelChoices(view.models, view.slots),
+      [],
       ProviderModelCatalogLifecycle.match(view.catalog, {
         Loading: () => [],
         Ready: ({ models }) => models,
@@ -198,19 +333,15 @@ describe("models menu entries", () => {
     const after = entriesFor(withOffering)
     expect(before).toHaveLength(1)
     expect(after).toHaveLength(1)
-    expect(before[0]?.id).toBe(after[0]?.id)
-    expect(before[0]?._tag).toBe("Local")
+    expect(Option.getOrThrow(modelsMenuSelectionAction(before[0]!))).toMatchObject({
+      _tag: "InstallConfiguration",
+    })
     expect(after[0]?._tag).toBe("Local")
-    expect(modelsMenuEntryIsSelected(before[0]!, Option.none())).toBe(false)
     expect(modelsMenuEntryIsSelected(after[0]!, Option.none())).toBe(false)
     expect(modelsMenuEntryIsSelected(
       after[0]!,
       Option.some({ providerId: ProviderIdSchema.make("local"), providerModelId: TEST_MODEL_ID }),
     )).toBe(true)
-    expect(Option.getOrThrow(modelsMenuSelectionAction(before[0]!))).toMatchObject({
-      _tag: "CreateOffering",
-      configurationId: makeCatalogCandidate().configurationId,
-    })
     expect(Option.getOrThrow(modelsMenuSelectionAction(after[0]!))).toMatchObject({
       _tag: "AssignOffering",
       providerModel: { providerModelId: TEST_MODEL_ID },

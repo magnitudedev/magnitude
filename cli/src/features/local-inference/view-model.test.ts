@@ -3,7 +3,7 @@ import { Option } from "effect"
 import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
-  ModelOfferingTargetIdSchema,
+  ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ProviderModelIdSchema,
   RecommendationIdSchema,
@@ -22,14 +22,17 @@ import {
 import {
   GIB,
   makeCatalogCandidate,
+  makeCatalogOnlyModel,
   makeHardware,
   makeModel,
+  makeModelWithContext,
   makeRecommendation,
+  makeStandaloneBundle,
   makeView,
 } from "./test-fixtures"
 
 const selectionsFor = (view: ReturnType<typeof makeView>) =>
-  buildLocalInferenceSelections(view.models, view.catalog, view.slots)
+  buildLocalInferenceSelections(view.models, view.slots)
 
 describe("local inference onboarding presentation", () => {
   it("formats model artifacts in decimal gigabytes", () => {
@@ -65,13 +68,10 @@ describe("local inference onboarding presentation", () => {
 })
 
 describe("local inference selection view model", () => {
-  it("projects a newly downloaded target without creating a provider offering", () => {
+  it("projects a newly downloaded configuration without a provider offering", () => {
     const before = makeView({
       ready: false,
-      models: [makeModel({
-        offerings: [],
-        download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-      })],
+      models: [],
       catalogCandidates: [makeCatalogCandidate({
         download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
         availability: { _tag: "NotDownloaded" },
@@ -79,53 +79,53 @@ describe("local inference selection view model", () => {
     })
     const after = makeView({
       ready: false,
-      models: [makeModel({ offerings: [] })],
+      models: [makeCatalogOnlyModel()],
       catalogCandidates: [makeCatalogCandidate({
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     })
 
-    expect(buildInstalledLocalModelChoices(before.models, before.catalog, before.slots)).toEqual([])
-    const choices = buildInstalledLocalModelChoices(after.models, after.catalog, after.slots)
-    expect(choices).toHaveLength(1)
-    expect(choices[0]).toMatchObject({
-      id: `installed:${makeModel().targetId}`,
+    expect(buildInstalledLocalModelChoices(before.models, before.slots)).toEqual([])
+    const selections = selectionsFor(after)
+    expect(selections).toHaveLength(1)
+    expect(selections[0]).toMatchObject({
+      id: `installed:${makeCatalogCandidate().configurationId}`,
       configurationId: makeCatalogCandidate().configurationId,
+      kind: "stored",
     })
-    expect(Option.isNone(choices[0]!.providerModel)).toBe(true)
+    expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
   })
 
-  it("keeps one target-centered choice when its provider offering is created", () => {
+  it("enriches a catalog-only configuration with its provider offering", () => {
     const withoutOffering = makeView({
       ready: false,
-      models: [makeModel({ offerings: [] })],
+      models: [makeCatalogOnlyModel()],
       catalogCandidates: [makeCatalogCandidate({
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     })
     const withOffering = makeView({
       ready: false,
       catalogCandidates: [makeCatalogCandidate({
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     })
 
     const before = buildInstalledLocalModelChoices(
       withoutOffering.models,
-      withoutOffering.catalog,
       withoutOffering.slots,
     )
     const after = buildInstalledLocalModelChoices(
       withOffering.models,
-      withOffering.catalog,
       withOffering.slots,
     )
     expect(before).toHaveLength(1)
+    expect(Option.isNone(before[0]!.providerModel)).toBe(true)
     expect(after).toHaveLength(1)
-    expect(after[0]!.id).toBe(before[0]!.id)
+    expect(after[0]!.id).toBe(`installed:${makeCatalogCandidate().configurationId}`)
     expect(Option.map(after[0]!.providerModel, ({ providerModelId }) => providerModelId))
       .toEqual(Option.some(ProviderModelIdSchema.make("configuration_test")))
   })
@@ -379,15 +379,15 @@ describe("local inference selection view model", () => {
     expect(selectionsFor(makeView())[0]?.kind).toBe("running")
   })
 
-  it("shows an assessed installed target before it has a provider offering", () => {
+  it("shows an assessed installed bundle before it has a provider offering", () => {
     const configurationId = ModelServingConfigurationIdSchema.make("configuration_default")
     const selections = selectionsFor(makeView({
       ready: false,
-      models: [makeModel({ offerings: [] })],
+      models: [makeCatalogOnlyModel({}, configurationId)],
       catalogCandidates: [makeCatalogCandidate({
         configurationId,
         profile: { contextLength: 131_072 },
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     }))
@@ -399,34 +399,33 @@ describe("local inference selection view model", () => {
     expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
   })
 
-  it("keeps the preferred configuration when another offering exists", () => {
+  it("publishes one choice for an installed bundle", () => {
     const preferredConfigurationId = ModelServingConfigurationIdSchema.make("configuration_default")
     const selections = selectionsFor(makeView({
       ready: false,
       catalogCandidates: [makeCatalogCandidate({
         configurationId: preferredConfigurationId,
         profile: { contextLength: 100_000 },
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     }))
 
     expect(selections).toHaveLength(1)
     expect(selections[0]?.kind === "stored" && selections[0].configurationId)
-      .toBe(preferredConfigurationId)
-    expect(Option.isNone(selections[0]!.providerModelId)).toBe(true)
+      .toBe(ModelServingConfigurationIdSchema.make("configuration_test"))
   })
 
   it("keeps the selected offering when the preferred catalog configuration differs", () => {
     const view = makeView({
       catalogCandidates: [makeCatalogCandidate({
         configurationId: ModelServingConfigurationIdSchema.make("configuration_preferred"),
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     })
 
-    const [choice] = buildInstalledLocalModelChoices(view.models, view.catalog, view.slots)
+    const [choice] = buildInstalledLocalModelChoices(view.models, view.slots)
     expect(choice?.configurationId).toBe(ModelServingConfigurationIdSchema.make("configuration_test"))
     expect(choice?.running).toBe(true)
     expect(Option.map(choice!.providerModel, ({ providerModelId }) => providerModelId))
@@ -435,11 +434,11 @@ describe("local inference selection view model", () => {
 
   it("shows the configured context for a downloaded catalog model", () => {
     const selection = selectionsFor(makeView({
-      models: [makeModel({ maximumContextLength: 262_144 })],
+      models: [makeModelWithContext(100_000)],
       providerContextWindow: 100_000,
       catalogCandidates: [makeCatalogCandidate({
         profile: { contextLength: 100_000 },
-        download: { _tag: "Downloaded", installedBytes: 16 * GIB },
+        download: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
         availability: { _tag: "Available" },
       })],
     }))[0]
@@ -449,12 +448,9 @@ describe("local inference selection view model", () => {
     expect(selectionMetadata(selection!)).not.toContain("256K ctx")
   })
 
-  it("keeps recommendations actionable without duplicating target state", () => {
-    const model = makeModel({
-      download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-    })
+  it("keeps recommendations actionable without duplicating bundle state", () => {
     const selections = selectionsFor(makeView({
-      models: [model],
+      models: [],
       recommendations: [makeRecommendation()],
       ready: false,
     }))
@@ -468,11 +464,9 @@ describe("local inference selection view model", () => {
       intent: "balanced" | "best_quality" | "fastest" | "lightweight",
       index: number,
     ) => {
-      const targetId = ModelOfferingTargetIdSchema.make(`target_${index}`)
       return makeRecommendation({
         id: RecommendationIdSchema.make(`recommendation_${intent}`),
         candidate: makeCatalogCandidate({
-          targetId,
           configurationId: ModelServingConfigurationIdSchema.make(`configuration_${index}`),
         }),
         intent,
@@ -480,14 +474,9 @@ describe("local inference selection view model", () => {
       })
     }
     const intents = ["fastest", "lightweight", "best_quality", "balanced"] as const
-    const models = intents.map((intent, index) => makeModel({
-      targetId: ModelOfferingTargetIdSchema.make(`target_${index}`),
-      displayName: `${intent} model`,
-      download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-    }))
     const selections = selectionsFor(makeView({
       ready: false,
-      models,
+      models: [],
       recommendations: intents.map(recommendation),
     }))
     expect(selections.map(({ recommendation }) => recommendation._tag === "Recommended"
@@ -514,10 +503,7 @@ describe("local inference selection view model", () => {
       }),
     })
     const selection = selectionsFor(makeView({
-      models: [makeModel({
-        offerings: [],
-        download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 1 },
-      })],
+      models: [],
       recommendations: [recommendation],
     }))[0]!
     expect(selectionCapacityWarning(selection)).toBe("This configuration does not fit")

@@ -23,20 +23,19 @@ or runtime residency.
 
 ## Provider offerings
 
-ACN owns durable local provider offerings. Each offering contains:
+ACN owns durable retained model serving configurations. The local provider adapter projects each
+configuration as one offering containing a stable local provider model ID and that exact
+configuration. The offering is a projection rather than another persisted record.
 
-- a stable local provider model ID;
-- the stable model-offering-target ID presented to product clients;
-- one exact ICN-issued model serving configuration.
-
-Capabilities are not persisted on the offering. ACN resolves them from the recommendable catalog
-or the installed package inspection, which are the authoritative evidence for the target.
+Capabilities are not persisted as offering state. ACN resolves them from the recommendable catalog
+or installed package inspection. When neither source can establish capabilities, the retained
+configuration remains visible as disabled with conservative metadata rather than claiming support.
 
 Within the separate `local` provider namespace, the provider model ID is exactly the serving
 configuration ID. ACN never prefixes or hashes package or profile data to create another identity.
 
 An offering exists independently of current installation, assessment, slot selection, or residency.
-ACN's local-offering projection combines the durable offering with installed-package and assessment
+ACN's local-offering projection combines the durable configuration with installed-package and assessment
 observations to produce the provider model catalog entry. This is the only place that derives local
 provider availability. When ICN can assess the exact configuration, that catalog entry carries the
 complete per-domain memory accounting unchanged: capacity, required allocation, compatibility
@@ -45,11 +44,14 @@ system-domain load admission, and warning presentation from that one value. They
 parallel aggregate or capacity-label fields. Generic and cloud provider entries do not fabricate local
 memory accounting.
 
-Package notifications invalidate the local-offering projection, but download byte progress is not
-assessment input. Before reassessing, the projection rereads configured-package evidence and proceeds
-only when installation or inspection truth changed. Offering, catalog, and stable hardware-assessment
-changes remain assessment triggers. Clients therefore observe `Assessing` only for real assessment
-work, never as a side effect of transfer progress.
+Initial and invalidation-driven projection runs in one scoped background worker. Native assessment
+never gates ACN service readiness.
+
+The local-offering projection consumes the shared per-configuration assessment state; it never
+invokes native assessment. Package notifications may change offering availability, while the
+separate local-model assessor decides assessment admission from semantic assessment keys.
+Download progress may update product acquisition presentation but cannot transition an offering's
+configuration to `Assessing`.
 
 The aggregate provider catalog remains usable when aggregation completes with typed provider or
 catalog failures. Such a snapshot is `Degraded`, including when every successful source contributes
@@ -60,8 +62,12 @@ Catalog refresh is catalog-owned shared work. Equivalent callers join one refres
 targeted refreshes serialize. Every Effect `Exit` publishes a terminal Ready, Degraded, or
 Unavailable snapshot before releasing ownership, so caller loss cannot strand `Refreshing`.
 
-The target ID groups every serving configuration of the same standalone package or speculative
-pair into one product model. Provider model IDs continue to distinguish configurations.
+Product visibility and grouping belong to
+[Local-model product projection](../model-management/local-model-product-projection.md). The provider
+adapter contributes one offering facet for each retained configuration; it does not enumerate
+installed packages or decide whether a product row exists. Bundle identity is its tagged structure
+and ordered package identities; the retained configuration is the provider's complete operational
+authority. Provider model IDs continue to distinguish configurations.
 
 ## Selection and resolution
 
@@ -73,8 +79,8 @@ requested effort and otherwise selects the provider model's default. Stored sele
 normalized through the same operation when the catalog becomes available. The client and agent do
 not independently repair reasoning effort.
 
-The local provider resolver maps the selected provider model ID to the offering's exact
-configuration ID. Provider binding is cheap and has no runtime side effect.
+The local provider resolver maps the selected provider model ID directly to the exact retained
+configuration. Provider binding is cheap and has no runtime side effect.
 
 Existing recency-based slot substitution remains product behavior. It operates on stable provider
 model IDs and does not create, reassess, or rewrite offerings.
@@ -86,8 +92,8 @@ ICN owns one `ModelInstanceController` and currently permits at most one Ready l
 ACN's `ModelSlotController` is the product intent authority. A manual load and local request
 preparation use the same canonical slot and instance observation:
 
-1. resolve the selected offering;
-2. require all target packages to be installed;
+1. resolve the selected retained configuration through its provider offering;
+2. require all bundle packages to be installed;
 3. create a fresh `ModelInstanceId` and submit the exact configuration to ICN;
 4. bind the slot after native admission and observe that exact instance to Ready; and
 5. start chat with that exact instance ID and configuration.
@@ -152,16 +158,16 @@ Generic agent code consumes the optional capability without branching on the loc
 
 ## Speculative decoding
 
-A speculative target is explicit in the offering's configuration. ACN does not attach or remove a
-draft during provider resolution or chat.
+A speculative-decoding pair is explicit in the offering's configuration. ACN does not attach or
+remove a draft during provider resolution or chat.
 
 ICN resolves target and draft components through one native planning path. Assessment and loading
-use the same target identity and speculative-selection policy. Runtime evidence reports whether
+use the same exact bundle structure and speculative-selection policy. Runtime evidence reports whether
 drafting actually ran.
 
 ## Failure behavior
 
-- Missing offering: ACN rejects provider resolution.
+- Missing retained configuration: ACN rejects provider resolution.
 - Missing package: the provider catalog entry and slot are unavailable; chat does not trigger a
   download.
 - Configuration no longer fits or is incompatible: the provider catalog entry is disabled and load
@@ -171,9 +177,12 @@ drafting actually ran.
 
 ## Acceptance criteria
 
-- Every local provider call resolves through one durable offering.
+- Every local provider call resolves through one retained exact configuration and one read-only
+  provider projection.
 - Runtime load receives the stored ICN configuration unchanged.
 - Local availability is derived in one ACN projection.
+- Provider projection consumes assessment state and never admits assessment work.
+- Provider availability never determines local-model product visibility.
 - A completed aggregate catalog with provider failures is degraded even when it contains no models.
 - Every assessed local provider catalog entry exposes ICN's complete per-domain memory accounting
   for that exact serving configuration.

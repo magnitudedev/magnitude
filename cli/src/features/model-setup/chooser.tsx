@@ -115,7 +115,7 @@ const ModelRow = ({
         attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
         wrapMode="none"
       >
-        {selected ? "› " : "  "}{truncateToDisplayWidth(selection.model.displayName, nameWidth).padEnd(nameWidth)}
+        {selected ? "› " : "  "}{truncateToDisplayWidth(selection.displayName, nameWidth).padEnd(nameWidth)}
         {"  "}
         <span fg={selection.kind === "running"
           ? theme.success
@@ -301,7 +301,7 @@ export function OnboardingModelChooser({
 }): ReactNode {
   const theme = useTheme()
   const selections = useMemo(() =>
-    buildLocalInferenceSelections(models, catalog, slots).filter((selection) =>
+    buildLocalInferenceSelections(models, slots).filter((selection) =>
       selection.kind !== "recommendation"
         || selection.recommendation._tag === "Recommended"),
   [catalog, models, slots])
@@ -346,7 +346,7 @@ export function OnboardingModelChooser({
     if (selection.kind === "stored" && Option.isSome(selection.providerModelId)) {
       onLoad({
         providerModelId: selection.providerModelId.value,
-        displayName: selection.model.displayName,
+        displayName: selection.displayName,
         reasoningEffort: Option.getOrElse(
           selection.reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
@@ -356,9 +356,8 @@ export function OnboardingModelChooser({
     }
     if (selection.kind === "stored") {
       onSelectConfiguration({
-        targetId: selection.model.targetId,
         configurationId: selection.configurationId,
-        displayName: selection.model.displayName,
+        displayName: selection.displayName,
         reasoningEffort: Option.getOrElse(
           selection.reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
@@ -372,7 +371,6 @@ export function OnboardingModelChooser({
     ) {
       const candidate = selection.recommendation.value.candidate
       onSelectConfiguration({
-        targetId: candidate.targetId,
         configurationId: candidate.configurationId,
         displayName: candidate.displayName,
         reasoningEffort: Option.getOrElse(
@@ -481,7 +479,7 @@ export function OnboardingModelChooser({
           attributes={TextAttributes.BOLD}
           wrapMode="none"
         >
-          {truncateToDisplayWidth(selected.model.displayName, titleNameWidth)}
+          {truncateToDisplayWidth(selected.displayName, titleNameWidth)}
           {recommendationIntent && <span fg={theme.primary}>{`   ${recommendationIntent}`}</span>}
         </text>
       </DetailRow>

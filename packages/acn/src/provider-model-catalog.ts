@@ -22,7 +22,7 @@ import {
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
-import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
+import { LocalProviderOfferings } from "./local-provider-offerings"
 import { AcnActivityTracker } from "./activity-tracker"
 import { makeServiceOperationCoordinator } from "./service-operation-coordinator"
 
@@ -181,10 +181,10 @@ const sameRefreshTarget = (
 export const ProviderModelCatalogLive: Layer.Layer<
   ProviderModelCatalog,
   never,
-  ProviderClient | LocalProviderOfferingProjection | MirroredStateChanges | AcnActivityTracker
+  ProviderClient | LocalProviderOfferings | MirroredStateChanges | AcnActivityTracker
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
-  const localProjection = yield* LocalProviderOfferingProjection
+  const localOfferings = yield* LocalProviderOfferings
   const scope = yield* Scope.Scope
   const lock = yield* Effect.makeSemaphore(1)
   const refreshOperations = yield* makeServiceOperationCoordinator<
@@ -240,7 +240,7 @@ export const ProviderModelCatalogLive: Layer.Layer<
       }
     }
 
-    const localOfferingsResult = yield* Effect.either(localProjection.list)
+    const localOfferingsResult = yield* Effect.either(localOfferings.catalog)
     const localModels = Either.isRight(localOfferingsResult) ? localOfferingsResult.right : []
     modelsByProvider.set(LOCAL_PROVIDER_ID, localModels)
     if (Either.isLeft(localOfferingsResult)) {
@@ -364,7 +364,7 @@ export const ProviderModelCatalogLive: Layer.Layer<
   )
 
   yield* Effect.forkIn(
-    localProjection.changes.pipe(
+    localOfferings.catalogChanges.pipe(
       // A local offering change only reprojects cached catalog outcomes. It
       // must not force remote catalog refresh or hold background activity.
       Stream.runForEach(() => reconcileLocalProjection),

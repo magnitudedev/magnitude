@@ -5,8 +5,6 @@ import {
   Layer,
   Option,
   ParseResult,
-  Stream,
-  SubscriptionRef,
 } from "effect"
 import {
   FitsModelAssessmentSchema,
@@ -14,16 +12,13 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   LocalModelMutationFailed,
   MemoryAssessmentSchema,
-  ModelOfferingTargetIdSchema,
   ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
-  type LocalModelAssessmentLifecycle,
   type FitsModelAssessment,
   type AssessmentEnvironmentId,
   type LocalInferenceError,
   type ModelFailure,
-  type ModelOfferingTarget,
-  type ModelOfferingTargetId,
+  type ServableModelBundle,
   type ModelServingConfiguration,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
@@ -36,33 +31,33 @@ import { LocalModelPackages } from "./local-model-packages"
 import {
   servingProfileFromIcn,
   servingProfileToIcn,
-  targetToIcn,
+  bundleToIcnInput,
 } from "./local-model-icn-adapter"
 
 const REQUIRED_RESERVE_BYTES = 1536 * 1024 * 1024
 const ASSESSMENT_OPERATION_TIMEOUT_MS = 5 * 60 * 1_000
-const MINIMUM_CONTEXT_LENGTH = 4_096
+export const MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH = 4_096
 const DEFAULT_LOCAL_MODEL_CONTEXT_LENGTH = 100_000
 const PERFORMANCE_SAMPLE_CONTEXT_LENGTHS = [25_000, 50_000, 75_000] as const
 type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
-const targetMaximumContextLength = (
-  target: ModelOfferingTarget,
-): number => target._tag === "Package"
-    ? target.package.properties.maximumContextLength
+const bundleMaximumContextLength = (
+  bundle: ServableModelBundle,
+): number => bundle._tag === "Standalone"
+    ? bundle.package.properties.maximumContextLength
     : Math.min(
-        target.target.properties.maximumContextLength,
-        target.draft.properties.maximumContextLength,
+        bundle.target.properties.maximumContextLength,
+        bundle.draft.properties.maximumContextLength,
       )
 
 const assessmentProfile = (contextLength: number): AssessmentProfiles =>
-  contextLength >= MINIMUM_CONTEXT_LENGTH ? [{ contextLength }] : []
+  contextLength >= MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH ? [{ contextLength }] : []
 
 export const localModelAssessmentProfiles = (
-  target: ModelOfferingTarget,
+  bundle: ServableModelBundle,
   contextLength: number = DEFAULT_LOCAL_MODEL_CONTEXT_LENGTH,
 ): readonly ServingProfile[] => assessmentProfile(
-  Math.min(contextLength, targetMaximumContextLength(target)),
+  Math.min(contextLength, bundleMaximumContextLength(bundle)),
 )
 
 export const performanceSampleContextTokens = (
@@ -92,59 +87,17 @@ export type LocalModelAssessment =
     }
 
 export interface LocalModelAssessmentRequest {
-  readonly targetId: ModelOfferingTargetId
-  readonly target: ModelOfferingTarget
+  readonly bundle: ServableModelBundle
   readonly profiles: readonly ServingProfile[]
 }
 
 export type LocalModelAssessmentResult =
   | {
       readonly _tag: "Assessed"
-      readonly targetId: ModelOfferingTargetId
       readonly environmentId: AssessmentEnvironmentId
       readonly assessments: readonly LocalModelAssessment[]
     }
-  | { readonly _tag: "InvalidTarget"; readonly message: string }
-
-export const clearAssessmentLifecycle = (
-  current: ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle>,
-  targetIds: readonly ModelOfferingTargetId[],
-): ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle> => {
-  const next = new Map(current)
-  for (const targetId of targetIds) {
-    const state = next.get(targetId)
-    if (state?._tag === "Assessing") {
-      next.set(targetId, { _tag: "Unassessed" })
-    }
-  }
-  return next
-}
-
-export const completeAssessmentLifecycle = (
-  current: ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle>,
-  targetIds: readonly ModelOfferingTargetId[],
-  completed: readonly LocalModelAssessmentResult[],
-): ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle> => {
-  const next = new Map(current)
-  completed.forEach((result, index) => {
-    const targetId = targetIds[index]
-    const state = targetId === undefined ? undefined : next.get(targetId)
-    if (
-      targetId === undefined
-      || result._tag !== "Assessed"
-      || state?._tag !== "Assessing"
-    ) return
-    next.set(targetId, {
-      _tag: "Assessed",
-      environmentId: result.environmentId,
-      configurationIds: result.assessments.map((assessment) =>
-        assessment._tag === "Fits"
-          ? assessment.assessment.configurationId
-          : assessment.configurationId),
-    })
-  })
-  return next
-}
+  | { readonly _tag: "InvalidBundle"; readonly message: string }
 
 export const formatLocalModelAssessmentFailure = (error: unknown): string => {
   try {
@@ -244,12 +197,11 @@ export const localModelAssessmentResultFromIcn = (
   result: AssessModelResult,
   environmentId: AssessmentEnvironmentId,
 ): Effect.Effect<LocalModelAssessmentResult, ParseResult.ParseError> =>
-  result._tag === "InvalidTarget"
-    ? Effect.succeed({ _tag: "InvalidTarget", message: result.failure.message })
+  result._tag === "InvalidBundle"
+    ? Effect.succeed({ _tag: "InvalidBundle", message: result.failure.message })
     : Effect.gen(function* () {
         return {
           _tag: "Assessed" as const,
-          targetId: ModelOfferingTargetIdSchema.make(String(result.targetId)),
           environmentId,
           assessments: yield* Effect.all(result.profiles.map((assessment) =>
             assessmentFromIcn(assessment, environmentId))),
@@ -257,8 +209,6 @@ export const localModelAssessmentResultFromIcn = (
       })
 
 export interface LocalModelAssessmentsApi {
-  readonly state: Effect.Effect<ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle>>
-  readonly changes: Stream.Stream<ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle>>
   readonly assess: (
     requests: readonly LocalModelAssessmentRequest[],
     onProgress: (
@@ -280,23 +230,7 @@ export const LocalModelAssessmentsLive: Layer.Layer<
 > = Layer.effect(LocalModelAssessments, Effect.gen(function* () {
   const client = yield* IcnClient
   const packages = yield* LocalModelPackages
-  const lifecycle = yield* SubscriptionRef.make<
-    ReadonlyMap<ModelOfferingTargetId, LocalModelAssessmentLifecycle>
-  >(new Map())
   const operationLock = yield* Effect.makeSemaphore(1)
-
-  const setLifecycle = (
-    targetIds: readonly ModelOfferingTargetId[],
-    value: LocalModelAssessmentLifecycle,
-  ) => SubscriptionRef.update(lifecycle, (current) => {
-    const next = new Map(current)
-    for (const targetId of targetIds) next.set(targetId, value)
-    return next
-  })
-
-  const clearLifecycle = (targetIds: readonly ModelOfferingTargetId[]) =>
-    SubscriptionRef.update(lifecycle, (current) =>
-      clearAssessmentLifecycle(current, targetIds))
 
   const assess: LocalModelAssessmentsApi["assess"] = (
     requests,
@@ -305,17 +239,12 @@ export const LocalModelAssessmentsLive: Layer.Layer<
     const deadlineAtMs = Date.now() + ASSESSMENT_OPERATION_TIMEOUT_MS
     const operation = operationLock.withPermits(1)(Effect.gen(function* () {
       if (requests.length === 0) return []
-      const targetIds = requests.map(({ targetId }) => targetId)
-      yield* setLifecycle(targetIds, { _tag: "Assessing" })
-      const completeOwned = (completed: readonly LocalModelAssessmentResult[]) =>
-        SubscriptionRef.update(lifecycle, (current) =>
-          completeAssessmentLifecycle(current, targetIds, completed))
       const run = Effect.gen(function* () {
         const installedIds = yield* packages.installedPackageIds
         const nativeRequests = yield* Effect.forEach(
           requests,
-          ({ target, profiles }, index) => targetToIcn(target, installedIds).pipe(
-            Effect.map((nativeTarget) => ({ index, nativeTarget, profiles })),
+          ({ bundle, profiles }, index) => bundleToIcnInput(bundle, installedIds).pipe(
+            Effect.map((nativeBundle) => ({ index, nativeBundle, profiles })),
           ),
         )
         const batchSize = 8
@@ -328,9 +257,9 @@ export const LocalModelAssessmentsLive: Layer.Layer<
           const batch = nativeRequests.slice(offset, offset + batchSize)
           const response = yield* client.models.assessModels({
             payload: {
-              requests: batch.map(({ index, nativeTarget, profiles }) => ({
+              requests: batch.map(({ index, nativeBundle, profiles }) => ({
                 requestId: `assessment-${index}`,
-                target: nativeTarget,
+                bundle: nativeBundle,
                 profiles: profiles.map((profile) => ({
                   profile: servingProfileToIcn(profile),
                   performanceContextTokens: performanceSampleContextTokens(profile),
@@ -369,19 +298,11 @@ export const LocalModelAssessmentsLive: Layer.Layer<
               found.value.result,
               found.value.environmentId,
             ).pipe(Effect.orDie)
-            if (decoded._tag === "Assessed" && decoded.targetId !== targetIds[index]) {
-              return yield* Effect.dieMessage(
-                "ICN returned an assessment for a different model offering target",
-              )
-            }
             return decoded
           }),
         )
       })
-      return yield* run.pipe(
-        Effect.tap(completeOwned),
-        Effect.ensuring(clearLifecycle(targetIds)),
-      )
+      return yield* run
     }))
     return operation.pipe(
       Effect.timeoutFail({
@@ -399,9 +320,5 @@ export const LocalModelAssessmentsLive: Layer.Layer<
     )
   }
 
-  return LocalModelAssessments.of({
-    state: SubscriptionRef.get(lifecycle),
-    changes: lifecycle.changes,
-    assess,
-  })
+  return LocalModelAssessments.of({ assess })
 }))
