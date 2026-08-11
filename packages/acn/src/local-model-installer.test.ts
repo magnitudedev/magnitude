@@ -1,6 +1,7 @@
 import { Effect, Option, Ref, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
+  DownloadAttemptIdSchema,
   ModelServingConfigurationIdSchema,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
@@ -98,7 +99,12 @@ describe("LocalModelInstaller", () => {
         installedPackageIds: Effect.succeed(new Set()),
         admitBundle: (bundle) => Effect.sync(() => {
           admittedBundles.push(bundle)
-          return { _tag: "AlreadyInstalled" as const }
+          return admittedBundles.length === 1
+            ? {
+                _tag: "DownloadAdmitted" as const,
+                attemptIds: [DownloadAttemptIdSchema.make("attempt-a")],
+              }
+            : { _tag: "AlreadyInstalled" as const }
         }),
         cancelAttempts: () => Effect.void,
         acknowledgeFailures: () => Effect.void,
@@ -118,7 +124,12 @@ describe("LocalModelInstaller", () => {
       }
     }))
     expect(result.first.providerModelId).toBe("configuration-a")
+    expect(result.first).toMatchObject({
+      _tag: "DownloadAdmitted",
+      attemptIds: ["attempt-a"],
+    })
     expect(result.second.providerModelId).toBe("configuration-a")
+    expect(result.second._tag).toBe("AlreadyInstalled")
     expect(result.retained.map(({ id }) => id)).toEqual(["configuration-a"])
     expect(result.admittedBundles).toHaveLength(2)
   })

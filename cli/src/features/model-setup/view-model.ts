@@ -75,7 +75,7 @@ export const deriveOnboardingModelSetupView = ({
   if (submission === null) return { _tag: "Choosing" }
 
   const choice = submission.choice
-  const model = submission._tag === "ConfigureThenLoad"
+  const model = submission._tag === "InstallThenLoad"
     ? Option.getOrUndefined(findLocalModelByConfigurationId(
         models.models,
         submission.choice.configurationId,
@@ -88,7 +88,7 @@ export const deriveOnboardingModelSetupView = ({
   if (model?.acquisitionState._tag === "Downloading") {
     return { _tag: "Downloading", model }
   }
-  if (submission._tag === "ConfigureThenLoad"
+  if (submission._tag === "InstallThenLoad"
     && model?.acquisitionState._tag === "Installed"
     && submitting
     && Option.isNone(providerModelId)) {
@@ -118,7 +118,7 @@ export const deriveOnboardingModelSetupView = ({
   if (lifecycle?._tag === "Stopped") return { _tag: "Choosing" }
 
   if (!submitting) return { _tag: "Choosing" }
-  if (submission._tag === "ConfigureThenLoad"
+  if (submission._tag === "InstallThenLoad"
     && model !== undefined
     && model.acquisitionState._tag !== "Installed") {
     return { _tag: "Downloading", model }

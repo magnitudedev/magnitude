@@ -15,7 +15,6 @@ import {
   type DownloadAttempt,
   type DownloadAttemptId,
   type LocalInferenceError,
-  type ModelDownloadAdmission,
   type ModelPackage,
   type ModelPackageEntry,
   type ModelPackageId,
@@ -167,9 +166,9 @@ export interface LocalModelPackagesApi {
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
   readonly admitBundle: (
     bundle: ServableModelBundle,
-  ) => Effect.Effect<ModelDownloadAdmission, LocalInferenceError>
+  ) => Effect.Effect<BundleInstallationAdmission, LocalInferenceError>
   readonly cancelAttempts: (
-    attemptIds: Extract<ModelDownloadAdmission, { readonly _tag: "DownloadAdmitted" }>["attemptIds"],
+    attemptIds: Extract<BundleInstallationAdmission, { readonly _tag: "DownloadAdmitted" }>["attemptIds"],
   ) => Effect.Effect<void, LocalInferenceError>
   readonly acknowledgeFailures: (
     attemptIds: readonly DownloadAttemptId[],
@@ -179,6 +178,13 @@ export interface LocalModelPackagesApi {
     retainedPackageIds?: ReadonlySet<string>,
   ) => Effect.Effect<void, LocalInferenceError>
 }
+
+export type BundleInstallationAdmission =
+  | { readonly _tag: "AlreadyInstalled" }
+  | {
+      readonly _tag: "DownloadAdmitted"
+      readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
+    }
 
 export class LocalModelPackages extends Context.Tag("LocalModelPackages")<
   LocalModelPackages,
@@ -318,12 +324,12 @@ export const LocalModelPackagesLive: Layer.Layer<
       const attemptIds = response.attempts.map((attempt) => DownloadAttemptIdSchema.make(attempt.id))
       const [first, ...rest] = attemptIds
       if (first === undefined) {
-        return { _tag: "AlreadyInstalled" } satisfies ModelDownloadAdmission
+        return { _tag: "AlreadyInstalled" } satisfies BundleInstallationAdmission
       }
       return {
         _tag: "DownloadAdmitted",
         attemptIds: [first, ...rest],
-      } satisfies ModelDownloadAdmission
+      } satisfies BundleInstallationAdmission
     }).pipe(Effect.mapError((error) =>
       localModelPackageMutationFailure("start_model_download_failed", error))),
     cancelAttempts: (attemptIds) => Effect.gen(function* () {

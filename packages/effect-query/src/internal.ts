@@ -8,9 +8,9 @@ import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Stream from "effect/Stream"
 import {
-  type AnyMutationExecution,
-  type MutationExecution,
-  type MutationExecutionId,
+  type AnyMutationState,
+  type MutationState,
+  type MutationStateId,
   type MutationFilter,
   type QueryClientEvent,
   type QueryDefinition,
@@ -31,7 +31,10 @@ export interface ErasedQueryEntry {
   readonly keyHash: number
   readonly state: (registry: AtomRegistry.Registry) => QueryEntryState
   readonly failureCause: (registry: AtomRegistry.Registry) => Option.Option<Cause.Cause<unknown>>
-  readonly start: (registry: AtomRegistry.Registry) => void
+  readonly start: (
+    registry: AtomRegistry.Registry,
+    options?: { readonly cancelRefetch?: boolean }
+  ) => void
   readonly cancel: (registry: AtomRegistry.Registry) => void
   readonly invalidate: (registry: AtomRegistry.Registry) => void
   readonly remove: (registry: AtomRegistry.Registry) => void
@@ -54,7 +57,7 @@ export const queryEntry = <Data>(carrier: QueryEntryCarrier<Data>): QueryEntry<D
   carrier[QueryEntryTypeId]
 
 export interface MutationInvocation<Output, Error> {
-  readonly id: MutationExecutionId
+  readonly id: MutationStateId
   readonly await: Effect.Effect<Output, Error>
 }
 
@@ -79,7 +82,7 @@ export interface ClientCore {
   readonly entries: Set<ErasedQueryEntry>
   readonly definitions: Map<string, QueryDefinition>
   readonly removed: Set<ErasedQueryEntry>
-  readonly executions: Array<AnyMutationExecution>
+  readonly mutationStates: Array<AnyMutationState>
   readonly revision: Atom.Writable<number>
   readonly events: Stream.Stream<QueryClientEvent>
   readonly emit: (event: QueryClientEvent) => void
@@ -99,7 +102,7 @@ export const getClientCore = (registry: AtomRegistry.Registry): ClientCore => {
     entries: new Set(),
     definitions: new Map(),
     removed: new Set(),
-    executions: [],
+    mutationStates: [],
     revision,
     events: Stream.fromPubSub(pubsub),
     emit: (event) => {
@@ -160,36 +163,36 @@ export const queryMatches = (
   }) ?? true
 }
 
-export const mutationStatus = (execution: AnyMutationExecution): "pending" | "success" | "failure" =>
-  execution.result.waiting || execution.result._tag === "Initial"
+export const mutationStatus = (state: AnyMutationState): "pending" | "success" | "error" =>
+  state.result.waiting || state.result._tag === "Initial"
     ? "pending"
-    : execution.result._tag === "Success" ? "success" : "failure"
+    : state.result._tag === "Success" ? "success" : "error"
 
-export const mutationMatches = (execution: AnyMutationExecution, filter: MutationFilter | undefined): boolean => {
+export const mutationMatches = (state: AnyMutationState, filter: MutationFilter | undefined): boolean => {
   if (filter === undefined) return true
-  if (filter.mutation !== undefined && filter.mutation !== execution.mutation) return false
-  if (filter.scope !== undefined && !Option.contains(execution.scope, filter.scope)) return false
-  if (filter.status !== undefined && filter.status !== mutationStatus(execution)) return false
-  return filter.predicate?.(execution) ?? true
+  if (filter.mutation !== undefined && filter.mutation !== state.mutation) return false
+  if (filter.scope !== undefined && !Option.contains(state.scope, filter.scope)) return false
+  if (filter.status !== undefined && filter.status !== mutationStatus(state)) return false
+  return filter.predicate?.(state) ?? true
 }
 
-export const addExecution = <Input, Output, Error>(
+export const addMutationState = <Input, Output, Error>(
   core: ClientCore,
-  execution: MutationExecution<Input, Output, Error>
+  state: MutationState<Input, Output, Error>
 ): void => {
-  core.executions.push(execution)
+  core.mutationStates.push(state)
   core.touch()
 }
 
-export const settleExecution = <Output, Error>(
+export const settleMutationState = <Output, Error>(
   core: ClientCore,
-  id: MutationExecutionId,
+  id: MutationStateId,
   result: AtomResult.Result<Output, Error>
 ): void => {
-  const index = core.executions.findIndex((execution) => execution.id === id)
+  const index = core.mutationStates.findIndex((state) => state.id === id)
   if (index < 0) return
-  const previous = core.executions[index]
-  core.executions[index] = {
+  const previous = core.mutationStates[index]
+  core.mutationStates[index] = {
     ...previous,
     result,
     settledAt: result.waiting || result._tag === "Initial" ? Option.none() : Option.some(Date.now())
@@ -206,9 +209,9 @@ export const settleExecution = <Output, Error>(
 }
 
 export type {
-  AnyMutationExecution,
-  MutationExecution,
-  MutationExecutionId,
+  AnyMutationState,
+  MutationState,
+  MutationStateId,
   MutationFilter,
   QueryClientEvent,
   QueryDefinition,

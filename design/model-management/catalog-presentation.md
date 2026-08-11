@@ -32,12 +32,22 @@ configuration. Catalog-maintainer scoring data is not presented to users. Huggin
 repositories are presented as themed, underlined links that open in the user's browser and provide
 pointer-hover feedback.
 
+After a user requests installation, Catalog presents `Starting download…` for that exact
+configuration while the `InstallModel` mutation awaits ACN admission and synchronized query
+visibility. The action is unavailable for that configuration only; other configurations may be
+installed concurrently. Once the canonical local-model query publishes acquisition, its
+`Downloading` progress replaces command status. A typed admission rejection settles the scoped
+mutation state as a failure; it never escapes as an unhandled Promise rejection.
+Models and Catalog render installation rejection from that retained mutation state and selection
+rejection from the canonical `AssignSlot` mutation result. They do not copy either failure into
+presentation state or discard it in a fire-and-forget workflow.
+
 Initial observation renders loading. Refresh retains the prior successful rows. Catalog, slot,
 hardware, or recommendation observation failure may degrade affected metadata or actions but cannot
 erase successful local-model entries.
 
 Live allocation headroom may be sampled more frequently than model-list meaning changes. Models and
-Catalog consume read-only semantic selectors over the canonical local-model mirror. Byte-only
+Catalog consume read-only semantic selectors over the canonical Effect Query local-model snapshot. Byte-only
 headroom changes do not rebuild either list while its displayed headroom category is unchanged;
 category transitions, acquisition progress, assessment, recommendation, membership, and identity
 changes remain observable. Cursor, detail identity, ordering, and scroll position are presentation
@@ -83,6 +93,10 @@ failure may present an unavailable state.
 - Byte-only live-headroom polling cannot reset or redraw the complete Models or Catalog list.
 - Every list layout exposes details and preserves all existing catalog actions, even when compact
   help copy omits secondary shortcuts.
+- Download admission is correlated to the submitted configuration and cannot be mistaken for
+  another catalog row's acquisition state.
+- Installation pending and rejection presentation comes only from configuration-scoped Effect Query
+  mutation states; no singleton client installation atom exists.
 - Keyboard cursor movement keeps the focused candidate inside the visible scrollbox viewport.
 - Narrow detail views retain every fact by reflowing content vertically.
 - Table rows do not wrap, overlap, or render beyond their allocated width.

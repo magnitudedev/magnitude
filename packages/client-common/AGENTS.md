@@ -63,6 +63,20 @@ root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
 
 `AgentClient` is the standard RPC interface. Ordinary client code must not build a raw RPC client, manually run RPC Effects, or maintain a parallel request cache.
 
+### Effect Query adoption
+
+A subsystem may adopt `@magnitudedev/effect-query` without migrating unrelated domains. Its query
+and mutation definitions belong in one domain module in client-common and must bind to the existing
+`AgentClient` layer. Once adopted, that subsystem uses Effect Query as its only query cache and
+mutation-state authority; do not retain an AtomRpc query or writable pending/error atom for the
+same operation.
+
+Use semantic mutation scopes for resource-specific concurrency, typed mutation-state selectors for
+pending and rejection presentation, and mutation synchronization for promised query visibility.
+Long-running resource progress still comes from the authoritative query. Mirror-backed Effect Query
+definitions subscribe through the shared connection-wide invalidation watch; they must not open a
+second `WatchMirroredStates` stream.
+
 ### Queries
 
 - Read server state with `useAtomValue(client.query(...))`.

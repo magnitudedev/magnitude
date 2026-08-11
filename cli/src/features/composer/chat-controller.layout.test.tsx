@@ -14,6 +14,11 @@ import {
   type TaskDisplayRow,
 } from '@magnitudedev/sdk'
 import {
+  deriveModelDownloadNotificationState,
+  NotificationIdSchema,
+  NotificationStateSchema,
+} from '@magnitudedev/client-common'
+import {
   GIB,
   LOCAL_PROVIDER_ID,
   makeAcquiringModel,
@@ -378,11 +383,15 @@ test('shows active model downloads in the persistent footer and links to the cat
         bytesPerSecond: Option.none(),
     })],
   })
+  const notificationState = deriveModelDownloadNotificationState(
+    localInferenceState.models,
+  )
   const mediumHtml = render(
     <Composer
       {...makeProps()}
       chatColumnWidth={60}
       localModels={localInferenceState.models}
+      notificationState={notificationState}
       openCatalog={openCatalog}
     />,
   )
@@ -396,6 +405,7 @@ test('shows active model downloads in the persistent footer and links to the cat
       {...makeProps()}
       chatColumnWidth={45}
       localModels={localInferenceState.models}
+      notificationState={notificationState}
       openCatalog={openCatalog}
     />,
   )
@@ -409,6 +419,7 @@ test('shows active model downloads in the persistent footer and links to the cat
       <Composer
         {...makeProps()}
         localModels={localInferenceState.models}
+        notificationState={notificationState}
         openCatalog={openCatalog}
       />,
     )
@@ -445,6 +456,28 @@ test('shows active model downloads in the persistent footer and links to the cat
     (node) => node.type === 'text' && textOf(node) === '1 model downloading',
   )).toHaveLength(0)
   act(() => { view.unmount() })
+})
+
+test('uses compact notification copy when the footer stacks into two rows', () => {
+  const notificationState = NotificationStateSchema.make({
+    id: NotificationIdSchema.make('selected-local-model-low-memory'),
+    message: 'Low memory: close memory-intensive apps (need 2.4 GB) to load model',
+    compactMessage: Option.some('Low memory: Free 2.4 GB to load'),
+    priority: 'warning',
+    action: Option.none(),
+    createdAt: 0,
+  })
+
+  const html = render(
+    <Composer
+      {...makeProps()}
+      chatColumnWidth={45}
+      notificationState={notificationState}
+    />,
+  )
+
+  expect(html).toContain('! Low memory: Free 2.4 GB to load')
+  expect(html).not.toContain('close memory-intensive apps')
 })
 
 test('clicking effort opens the footer selector and clicking an option commits it', () => {

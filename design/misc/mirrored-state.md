@@ -64,6 +64,13 @@ Client-common owns one watch per client connection and all query invalidation. Q
 distinct by Get RPC tag, and clients retain each query's waiting, failure, and success Result
 independently. Screens may derive presentation from successful domain values; they do not combine
 domain Results into an aggregate authority, reconstruct state, or open their own operation streams.
+An initial snapshot failure is recorded by its query and does not terminate the invalidation
+subscription. A later watch event or reconnection retries the same canonical query.
+
+During scoped Effect Query adoption, that same connection-wide watch fans an invalidation out to
+both legacy AtomRpc queries and adopted Effect Query definitions. This is a temporary cache-boundary
+composition, not a second mirror subscription or a second state source. A domain has one canonical
+query cache at a time.
 
 ## Client retention and rendering
 

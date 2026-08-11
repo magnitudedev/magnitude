@@ -19,15 +19,24 @@ type AgentClientInstance = ReturnType<typeof useAgentClient>
 interface ResidentWatch {
   readonly atom: Atom.Atom<Result.Result<void, never>>
   readonly mountedMirrorIds: Set<string>
+  readonly subscribers: Map<string, Set<() => Effect.Effect<void>>>
 }
 
 const residentWatches = new WeakMap<object, ResidentWatch>()
 
 const runInvalidationWatch = <R>(
   mountedMirrorIds: ReadonlySet<string>,
+  subscribers: ReadonlyMap<string, ReadonlySet<() => Effect.Effect<void>>>,
   connect: Effect.Effect<Stream.Stream<WatchEvent, RpcClientError>, never, R>,
 ) => {
-  const invalidateMountedMirrors = () => Reactivity.invalidate([...mountedMirrorIds])
+  const notify = (ids: ReadonlyArray<string>) => Effect.gen(function* () {
+    yield* Reactivity.invalidate(ids)
+    yield* Effect.forEach(
+      ids.flatMap((id) => [...(subscribers.get(id) ?? [])]),
+      (subscriber) => subscriber(),
+      { discard: true },
+    )
+  })
   const reconnect = Schedule.exponential("100 millis").pipe(
     Schedule.modifyDelay((_, delay) => Duration.min(delay, Duration.seconds(5))),
     Schedule.jittered,
@@ -35,8 +44,8 @@ const runInvalidationWatch = <R>(
   const watch = Stream.unwrap(Effect.gen(function* () {
     const stream = yield* connect
     yield* Effect.logDebug("Mirrored state watch connected")
-    yield* invalidateMountedMirrors()
-    return stream.pipe(Stream.tap((event) => Reactivity.invalidate([event.id])))
+    yield* notify([...mountedMirrorIds])
+    return stream.pipe(Stream.tap((event) => notify([event.id])))
   }))
   return watch.pipe(
     Stream.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
@@ -52,7 +61,7 @@ const runInvalidationWatch = <R>(
   )
 }
 
-const getResidentWatch = (
+export const getMirroredStateInvalidationWatch = (
   client: AgentClientInstance,
   mirrorId: string,
 ): Atom.Atom<Result.Result<void, never>> => {
@@ -63,12 +72,30 @@ const getResidentWatch = (
   }
 
   const mountedMirrorIds = new Set([mirrorId])
+  const subscribers = new Map<string, Set<() => Effect.Effect<void>>>()
   const atom = client.runtime.atom(runInvalidationWatch(
     mountedMirrorIds,
+    subscribers,
     Effect.map(client, (rpc) => rpc("WatchMirroredStates", {})),
   ))
-  residentWatches.set(client, { atom, mountedMirrorIds })
+  residentWatches.set(client, { atom, mountedMirrorIds, subscribers })
   return atom
+}
+
+export const subscribeToMirroredStateInvalidation = (
+  client: AgentClientInstance,
+  mirrorId: string,
+  subscriber: () => Effect.Effect<void>,
+): (() => void) => {
+  getMirroredStateInvalidationWatch(client, mirrorId)
+  const resident = residentWatches.get(client)!
+  const current = resident.subscribers.get(mirrorId) ?? new Set()
+  current.add(subscriber)
+  resident.subscribers.set(mirrorId, current)
+  return () => {
+    current.delete(subscriber)
+    if (current.size === 0) resident.subscribers.delete(mirrorId)
+  }
 }
 
 /**
@@ -168,7 +195,7 @@ export function useMirroredStateAtom<
     [client, definition],
   )
   const watchAtom = useMemo(
-    () => getResidentWatch(client, definition.id),
+    () => getMirroredStateInvalidationWatch(client, definition.id),
     [client, definition.id],
   )
   useAtomMount(watchAtom)

@@ -53,7 +53,7 @@ describe("onboarding model setup projection", () => {
     const view = makeView({ models: [model], ready: false })
     const state = deriveOnboardingModelSetupView({
       active: true,
-      submission: { _tag: "ConfigureThenLoad", choice },
+      submission: { _tag: "InstallThenLoad", choice },
       providerModelId: Option.none(),
       submitting: true,
       models: view.models,
@@ -68,7 +68,7 @@ describe("onboarding model setup projection", () => {
     const view = makeView({ models: [model], ready: false })
     expect(deriveOnboardingModelSetupView({
       active: true,
-      submission: { _tag: "ConfigureThenLoad", choice },
+      submission: { _tag: "InstallThenLoad", choice },
       providerModelId: Option.none(),
       submitting: true,
       models: view.models,
@@ -81,7 +81,7 @@ describe("onboarding model setup projection", () => {
     }
     expect(deriveOnboardingModelSetupView({
       active: true,
-      submission: { _tag: "ConfigureThenLoad", choice },
+      submission: { _tag: "InstallThenLoad", choice },
       providerModelId: Option.none(),
       submitting: true,
       models: { ...view.models, models: [installed] },

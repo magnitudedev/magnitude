@@ -1,43 +1,52 @@
 import { useCallback, useMemo } from "react"
-import type { Equivalence } from "effect"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Effect, Option, type Equivalence } from "effect"
+import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Mutation, Query } from "@magnitudedev/effect-query"
 import {
   LocalInferenceHardwareMirror,
-  LocalModelsMirror,
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
+  ProviderIdSchema,
   type ModelInstanceId,
   type DownloadAttemptId,
   type LocalModelsState,
   type ModelServingConfigurationId,
-  type ProviderModelId,
   type ProviderModelIdentity,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { useMirroredState, useMirroredStateSelector } from "./use-mirrored-state"
+import { localModelAtoms } from "../local-models/atoms"
+import { useMirroredState } from "./use-mirrored-state"
 
 export const useLocalInferenceHardware = () =>
   Result.map(useMirroredState(LocalInferenceHardwareMirror), ({ state }) => state)
 export type LocalInferenceHardwareResult = ReturnType<typeof useLocalInferenceHardware>
 
-export const useLocalModels = () =>
-  Result.map(useMirroredState(LocalModelsMirror), ({ state }) => state)
+export const useLocalModelsResultAtom = () => {
+  const client = useAgentClient()
+  const atoms = useMemo(() => localModelAtoms(client), [client])
+  useAtomMount(atoms.mirrorInvalidationWatchAtom)
+  useAtomMount(atoms.invalidationBridgeAtom)
+  return atoms.localModelsResultAtom
+}
+
+export const useLocalModels = () => useAtomValue(useLocalModelsResultAtom())
 
 export const useLocalModelsSelector = <Selection,>(
   selector: (state: LocalModelsState) => Selection,
   equivalent: Equivalence.Equivalence<Selection>,
 ) => {
-  const snapshotSelector = useCallback(
-    ({ state }: { readonly state: LocalModelsState }) => selector(state),
-    [selector],
-  )
-  return useMirroredStateSelector(
-    LocalModelsMirror,
-    snapshotSelector,
+  const client = useAgentClient()
+  const atoms = useMemo(() => localModelAtoms(client), [client])
+  const selection = useMemo(() => Query.select(
+    atoms.localModelsQuery(undefined),
+    selector,
     equivalent,
-  )
+  ), [atoms, equivalent, selector])
+  useAtomMount(atoms.mirrorInvalidationWatchAtom)
+  useAtomMount(atoms.invalidationBridgeAtom)
+  return Result.value(useAtomValue(selection).result)
 }
 
 export const useModelSlots = () =>
@@ -61,53 +70,71 @@ export function usePreviewModelLoad(slotId: SlotId) {
 
 export function useLocalModelActions() {
   const client = useAgentClient()
-  const installAtom = useMemo(
-    () => client.mutation("InstallModel"),
-    [client],
-  )
-  const installResult = useAtomValue(installAtom)
-  const install = useAtomSet(
-    installAtom,
-    { mode: "promise" },
-  )
-  const cancel = useAtomSet(client.mutation("CancelModelDownload"))
-  const dismiss = useAtomSet(client.mutation("DismissModelDownloadFailure"))
-  const deleteModel = useAtomSet(client.mutation("DeleteLocalModel"))
+  const atoms = useMemo(() => localModelAtoms(client), [client])
+  const installationMutationStates = useAtomValue(atoms.installationMutationStatesAtom)
+  const install = useAtomSet(atoms.installMutation)
+  const cancel = useAtomSet(atoms.cancelDownloadMutation)
+  const dismiss = useAtomSet(atoms.dismissDownloadFailureMutation)
+  const deleteModel = useAtomSet(atoms.deleteLocalModelMutation)
+  const assignMutation = useMemo(() => client.mutation("AssignSlot"), [client])
+  const installAndAssignAtom = useMemo(() => Atom.fn<{
+    readonly configurationId: ModelServingConfigurationId
+    readonly slotId: SlotId
+    readonly reasoningEffort: SlotSelection["reasoningEffort"]
+  }>()(({ configurationId, slotId, reasoningEffort }, get) => Effect.gen(function* () {
+    const { providerModelId } = yield* Mutation.execute(atoms.installMutation, { configurationId })
+    yield* get.setResult(assignMutation, {
+      payload: {
+        slotId,
+        selection: {
+          providerId: ProviderIdSchema.make("local"),
+          providerModelId,
+          reasoningEffort,
+        },
+      },
+      reactivityKeys: [ModelSlotsMirror.id],
+    })
+  })), [assignMutation, atoms])
+  const installAndAssign = useAtomSet(installAndAssignAtom)
+  useAtomMount(atoms.mirrorInvalidationWatchAtom)
+  useAtomMount(atoms.invalidationBridgeAtom)
 
   return {
-    installResult,
-    install: useCallback((configurationId: ModelServingConfigurationId) => install({
-      payload: { configurationId },
-      reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
-    }), [install]),
-    cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => cancel({
-      payload: { attemptIds },
-      reactivityKeys: [LocalModelsMirror.id],
-    }), [cancel]),
-    dismissFailure: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => dismiss({
-      payload: { attemptIds },
-      reactivityKeys: [LocalModelsMirror.id],
-    }), [dismiss]),
-    delete: useCallback((configurationId: ModelServingConfigurationId) => deleteModel({
-      payload: { configurationId },
-      reactivityKeys: [
-        LocalModelsMirror.id,
-        ProviderModelCatalogMirror.id,
-        ModelSlotsMirror.id,
-      ],
-    }), [deleteModel]),
+    installationMutationStates,
+    install: useCallback((configurationId: ModelServingConfigurationId) => {
+      install({ configurationId })
+    }, [install]),
+    installAndAssign: useCallback((
+      configurationId: ModelServingConfigurationId,
+      slotId: SlotId,
+      reasoningEffort: SlotSelection["reasoningEffort"],
+    ) => {
+      installAndAssign({ configurationId, slotId, reasoningEffort })
+    }, [installAndAssign]),
+    cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => {
+      cancel({ attemptIds })
+    }, [cancel]),
+    dismissFailure: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => {
+      dismiss({ attemptIds })
+    }, [dismiss]),
+    delete: useCallback((configurationId: ModelServingConfigurationId) => {
+      deleteModel({ configurationId })
+    }, [deleteModel]),
   }
 }
 
 export function useModelSlotActions() {
   const client = useAgentClient()
-  const assign = useAtomSet(client.mutation("AssignSlot"))
+  const assignAtom = useMemo(() => client.mutation("AssignSlot"), [client])
+  const assignResult = useAtomValue(assignAtom)
+  const assign = useAtomSet(assignAtom)
   const clear = useAtomSet(client.mutation("ClearSlot"))
   const load = useAtomSet(client.mutation("LoadModel"))
   const stop = useAtomSet(client.mutation("StopModel"))
   const favorite = useAtomSet(client.mutation("SetModelFavorite"))
 
   return {
+    assignResult,
     assign: useCallback((slotId: SlotId, selection: SlotSelection) => assign({
       payload: { slotId, selection },
       reactivityKeys: [ModelSlotsMirror.id],

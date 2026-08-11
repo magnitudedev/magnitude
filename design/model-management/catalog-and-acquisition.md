@@ -140,13 +140,13 @@ quantization never transfers presentation between bundles. Every independently s
 package contributes a standalone product row even when no retained or catalog configuration
 references it.
 
-Product acquisition addresses the row's `ModelServingConfigurationId`. For an existing retained
+Product installation addresses the row's `ModelServingConfigurationId`. For an existing retained
 configuration ACN resolves that exact value directly; for first installation it resolves the exact
 catalog-published configuration. ACN durably retains it before the private package owner admits its
 bundle's required packages. The client-facing admission result carries the configuration-backed
 provider-model ID and reports that the bundle is already installed or carries the exact
 download-attempt identities needed for subsequent cancellation and observation. ICN
-package-download commands remain bundle/package operations private to acquisition.
+package-download commands remain bundle/package operations private to installation.
 
 Download state stores no assessment evidence and determines neither configuration, offering, nor
 slot identity. ACN may immediately merge an exact admission response into observation to reduce
@@ -200,7 +200,7 @@ exists for the bundle; ICN constructs and canonically identifies the configurati
 - Package identity is independent of paths, display names, and mutable upstream references.
 - Exact catalog bundle structure preserves curated presentation across installation and
   recommendation changes; fallback presentation cannot overwrite it.
-- Product acquisition and retained selection begin with serving-configuration identity; only the
+- Product installation and retained selection begin with serving-configuration identity; only the
   private package owner uses bundle/package structure, and provider projection represents the same
   configuration in the local provider namespace.
 - Catalog failure cannot hide retained configurations or installed packages.

@@ -340,7 +340,7 @@ function CliAppContent(
     void props.updateOnboarding(true);
   }, [props.updateOnboarding]);
   const loadOnboardingModel = onboardingSetup.load;
-  const configureOnboardingModel = onboardingSetup.configureThenLoad;
+  const installOnboardingModel = onboardingSetup.installThenLoad;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
@@ -402,7 +402,7 @@ function CliAppContent(
     });
     const retryConfiguration = (model: LocalModel) => {
       if (model.servingState._tag !== "Assessed") return;
-      configureOnboardingModel({
+      installOnboardingModel({
         configurationId: model.servingState.configuration.id,
         displayName: model.presentation.displayName,
         reasoningEffort: Option.getOrElse(
@@ -432,7 +432,7 @@ function CliAppContent(
                 onRetry: () => retryConfiguration(setupView.model),
               }}
               onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
+              onSelectConfiguration={installOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -452,7 +452,7 @@ function CliAppContent(
                 onRetry: () => retryConfiguration(setupView.model),
               }}
               onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
+              onSelectConfiguration={installOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -470,7 +470,7 @@ function CliAppContent(
                 model: setupView.model,
               }}
               onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
+              onSelectConfiguration={installOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -501,7 +501,7 @@ function CliAppContent(
                 onChooseAnother: cancelOnboardingModelSetup,
               }}
               onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
+              onSelectConfiguration={installOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />
@@ -520,7 +520,7 @@ function CliAppContent(
               }
               operation={null}
               onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
+              onSelectConfiguration={installOnboardingModel}
               onContinue={completeModelSetup}
               onSkip={completeModelSetup}
             />

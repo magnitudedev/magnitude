@@ -186,7 +186,7 @@ ModelPackage(s) -> ServableModelBundle + ServingProfile
                          +-------------------------+------------------+
                          |                                            |
                          v                                            v
-             LocalModelAssessor                           Install(configurationId)
+             LocalModelAssessor                          Install(configurationId)
                          |                                            |
                          v                                            v
                   assessment                               retained configuration

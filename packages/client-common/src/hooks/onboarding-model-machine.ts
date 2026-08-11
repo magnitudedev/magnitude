@@ -26,7 +26,7 @@ export interface OnboardingConfigurationChoice extends OnboardingModelChoiceBase
 
 export type OnboardingModelSubmission =
   | { readonly _tag: "Load"; readonly choice: OnboardingLoadModelChoice }
-  | { readonly _tag: "ConfigureThenLoad"; readonly choice: OnboardingConfigurationChoice }
+  | { readonly _tag: "InstallThenLoad"; readonly choice: OnboardingConfigurationChoice }
 
 type SubmissionProps = { readonly submission: OnboardingModelSubmission }
 type DownloadProps = SubmissionProps & {
@@ -40,7 +40,7 @@ type LoadProps = SubmissionProps & {
 }
 
 export class OnboardingIdle extends Data.TaggedClass("Idle")<{}> {}
-export class OnboardingAdmittingDownload extends Data.TaggedClass("AdmittingDownload")<
+export class OnboardingRequestingInstallation extends Data.TaggedClass("RequestingInstallation")<
   SubmissionProps & { readonly cancellationRequested: boolean }
 > {}
 export class OnboardingDownloadAdmitted extends Data.TaggedClass("DownloadAdmitted")<DownloadProps> {}
@@ -68,7 +68,7 @@ export class OnboardingCompleting extends Data.TaggedClass("Completing")<LoadPro
 export const OnboardingModelMachine = FSM.defineFSM(
   {
     Idle: OnboardingIdle,
-    AdmittingDownload: OnboardingAdmittingDownload,
+    RequestingInstallation: OnboardingRequestingInstallation,
     DownloadAdmitted: OnboardingDownloadAdmitted,
     RequestingDownloadCancellation: OnboardingRequestingDownloadCancellation,
     AwaitingDownloadCancellation: OnboardingAwaitingDownloadCancellation,
@@ -82,8 +82,8 @@ export const OnboardingModelMachine = FSM.defineFSM(
     Completing: OnboardingCompleting,
   },
   {
-    Idle: ["AdmittingDownload", "Assigning"],
-    AdmittingDownload: ["DownloadAdmitted", "Assigning", "Idle"],
+    Idle: ["RequestingInstallation", "Assigning"],
+    RequestingInstallation: ["DownloadAdmitted", "Assigning", "Idle"],
     DownloadAdmitted: ["RequestingDownloadCancellation", "Assigning", "Idle"],
     RequestingDownloadCancellation: ["AwaitingDownloadCancellation", "DownloadCancellationFailed"],
     AwaitingDownloadCancellation: ["Idle"],
@@ -110,7 +110,7 @@ export const resetOnboardingOperation = (
     case "LoadAdmitted":
     case "LoadStopFailed":
       return OnboardingModelMachine.transition(state, "Idle", {})
-    case "AdmittingDownload":
+    case "RequestingInstallation":
     case "RequestingDownloadCancellation":
     case "AwaitingDownloadCancellation":
     case "Assigning":
@@ -145,14 +145,14 @@ export const onboardingProviderModelId = (
     case "LoadStopFailed":
     case "Completing":
       return Option.some(state.providerModelId)
-    case "AdmittingDownload":
+    case "RequestingInstallation":
       return Option.none()
   }
 }
 
 export const onboardingCancellationPending = (state: OnboardingModelOperation): boolean => {
   switch (state._tag) {
-    case "AdmittingDownload":
+    case "RequestingInstallation":
     case "Assigning":
     case "AdmittingLoad":
       return state.cancellationRequested
@@ -174,7 +174,7 @@ export const onboardingCancellationPending = (state: OnboardingModelOperation): 
 export type OnboardingCancellationRequest =
   | { readonly _tag: "Noop"; readonly state: OnboardingModelOperation }
   | { readonly _tag: "Deferred"; readonly state:
-      OnboardingAdmittingDownload | OnboardingAssigning | OnboardingAdmittingLoad }
+      OnboardingRequestingInstallation | OnboardingAssigning | OnboardingAdmittingLoad }
   | { readonly _tag: "Download"; readonly state: OnboardingRequestingDownloadCancellation }
   | { readonly _tag: "Load"; readonly state: OnboardingRequestingLoadStop }
 
@@ -182,7 +182,7 @@ export const requestOnboardingCancellation = (
   state: OnboardingModelOperation,
 ): OnboardingCancellationRequest => {
   switch (state._tag) {
-    case "AdmittingDownload":
+    case "RequestingInstallation":
     case "Assigning":
     case "AdmittingLoad":
       return {
@@ -293,14 +293,14 @@ export const reduceLoadObservation = (
 }
 
 export const observeAdmittedDownload = <E, R>(
-  results: Stream.Stream<Result.Result<{ readonly state: LocalModelsState }, E>, never, R>,
+  results: Stream.Stream<Result.Result<LocalModelsState, E>, never, R>,
   configurationId: ModelServingConfigurationId,
   attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
   accept: (observation: DownloadObservation) => boolean = () => true,
 ): Effect.Effect<DownloadObservation, never, R> => results.pipe(
-  // AtomRpc invalidates before mutation acknowledgement. A waiting Success contains the old cache.
+  // Ignore a previous cached value while a synchronized refresh is in flight.
   Stream.filterMap((result) => Result.isSuccess(result) && !result.waiting
-    ? Option.some(result.value.state)
+    ? Option.some(result.value)
     : Option.none()),
   Stream.mapAccum(initialObservationCorrelation, (correlation, state) => {
     const [next, observation] = reduceDownloadObservation(

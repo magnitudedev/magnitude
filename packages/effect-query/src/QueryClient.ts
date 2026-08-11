@@ -21,7 +21,7 @@ import {
   type QueryFilter,
   type QueryMetadata
 } from "./internal.js"
-import type { AnyMutationExecution, MutationFilter } from "./Model.js"
+import type { AnyMutationState, MutationFilter } from "./Model.js"
 
 export type { QueryClientEvent, QueryFilter, QueryMetadata }
 
@@ -61,7 +61,7 @@ export interface Service {
   ) => Effect.Effect<void>
   readonly isFetching: (filter?: QueryFilter) => Atom.Atom<number>
   readonly isMutating: (filter?: MutationFilter) => Atom.Atom<number>
-  readonly mutationState: (filter?: MutationFilter) => Atom.Atom<ReadonlyArray<AnyMutationExecution>>
+  readonly mutationState: (filter?: MutationFilter) => Atom.Atom<ReadonlyArray<AnyMutationState>>
   readonly events: Stream.Stream<QueryClientEvent>
 }
 
@@ -134,14 +134,20 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
     }
     return [entry, existed]
   }
+  const fetchQuery = <Input, Data, Error, Requirements>(
+    query: QueryAtom<Input, Data, Error, Requirements>
+  ): Effect.Effect<Data, Error> => Effect.suspend(() => {
+    const [entry, existed] = materialize(query)
+    const state = entry.state(registry)
+    if (existed && state.fetchStatus !== "paused" && entry.hasData(registry) && !state.isStale) {
+      return Effect.succeed(Option.getOrThrow(entry.getData(registry)))
+    }
+    if ((existed || state.fetchStatus === "paused") && state.fetchStatus !== "fetching") entry.start(registry)
+    return awaitQuery(registry, query)
+  })
 
   return {
-    fetch: (query) => Effect.suspend(() => {
-      const [entry, existed] = materialize(query)
-      const status = entry.state(registry).fetchStatus
-      if ((existed || status === "paused") && status !== "fetching") entry.start(registry)
-      return awaitQuery(registry, query)
-    }),
+    fetch: fetchQuery,
     ensure: (query) => Effect.suspend(() => {
       const [entry] = materialize(query)
       if (entry.hasData(registry)) {
@@ -151,24 +157,19 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
       if (entry.state(registry).fetchStatus !== "fetching") entry.start(registry)
       return awaitQuery(registry, query)
     }),
-    prefetch: (query) => Effect.suspend(() => {
-      const [entry, existed] = materialize(query)
-      const status = entry.state(registry).fetchStatus
-      if ((existed || status === "paused") && status !== "fetching") entry.start(registry)
-      return Effect.ignore(awaitQuery(registry, query))
-    }),
+    prefetch: (query) => Effect.ignore(fetchQuery(query)),
     invalidate: (filter, options) => Effect.sync(() => {
       for (const entry of entries(filter)) {
         entry.invalidate(registry)
         core.emit({ _tag: "QueryInvalidated", name: entry.name, keyHash: entry.keyHash })
-        if (options?.refetch !== false) entry.start(registry)
+        if (options?.refetch !== false) entry.start(registry, { cancelRefetch: true })
       }
       core.touch()
     }),
     refetch: (filter) => Effect.gen(function*() {
       const failures: Array<QueryBatchFailure> = []
       for (const entry of entries(filter)) {
-        entry.start(registry)
+        entry.start(registry, { cancelRefetch: true })
         const state = yield* Effect.exit(awaitErased(registry, entry))
         if (state._tag === "Failure") failures.push({ name: entry.name, keyHash: entry.keyHash, cause: state.cause })
       }
@@ -201,13 +202,13 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
     }),
     isMutating: (filter) => Atom.readable((get) => {
       get(core.revision)
-      return core.executions.filter((execution) => mutationMatches(execution, filter)).filter((execution) =>
-        execution.result.waiting || execution.result._tag === "Initial"
+      return core.mutationStates.filter((state) => mutationMatches(state, filter)).filter((state) =>
+        state.result.waiting || state.result._tag === "Initial"
       ).length
     }),
     mutationState: (filter) => Atom.readable((get) => {
       get(core.revision)
-      return core.executions.filter((execution) => mutationMatches(execution, filter))
+      return core.mutationStates.filter((state) => mutationMatches(state, filter))
     }),
     events: core.events
   }
@@ -263,5 +264,5 @@ export const isMutating = (filter?: MutationFilter): Effect.Effect<Atom.Atom<num
 
 export const mutationState = (
   filter?: MutationFilter
-): Effect.Effect<Atom.Atom<ReadonlyArray<AnyMutationExecution>>, never, QueryClient> =>
+): Effect.Effect<Atom.Atom<ReadonlyArray<AnyMutationState>>, never, QueryClient> =>
   Effect.map(QueryClient, (client) => client.mutationState(filter))
