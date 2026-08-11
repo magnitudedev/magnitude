@@ -5,7 +5,7 @@ import {
   DownloadAttemptIdSchema,
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
-  ModelInstallationAdmissionSchema,
+  LocalModelInstallationAdmissionSchema,
   ModelInstanceIdSchema,
   ModelLoadAdmissionSchema,
   ModelLoadPlanSchema,
@@ -26,7 +26,7 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
 
 export const InstallModel = Rpc.make("InstallModel", {
   payload: Schema.Struct({ configurationId: ModelServingConfigurationIdSchema }),
-  success: ModelInstallationAdmissionSchema,
+  success: LocalModelInstallationAdmissionSchema,
   error: LocalInferenceError,
 })
 

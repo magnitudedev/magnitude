@@ -29,7 +29,7 @@ const replacementInstanceId = ModelInstanceIdSchema.make("instance_replacement")
 const providerModelId = ProviderModelIdSchema.make("model_test")
 const configurationId = ModelServingConfigurationIdSchema.make("configuration_test")
 const submission = {
-  _tag: "ConfigureThenLoad" as const,
+  _tag: "InstallThenLoad" as const,
   choice: {
     configurationId,
     displayName: "Test model",
@@ -115,7 +115,7 @@ const slotsState = (
 
 describe("OnboardingModelMachine", () => {
   it("represents cancellation request, acceptance, and failure as distinct transitions", () => {
-    const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "AdmittingDownload", {
+    const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "RequestingInstallation", {
       submission,
       cancellationRequested: false,
     })
@@ -166,14 +166,14 @@ describe("OnboardingModelMachine", () => {
   })
 
   it("retains pre-admission cancellation as intent and retries only from a failure state", () => {
-    const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "AdmittingDownload", {
+    const admitting = OnboardingModelMachine.transition(new OnboardingIdle(), "RequestingInstallation", {
       submission,
       cancellationRequested: false,
     })
     const deferred = requestOnboardingCancellation(admitting)
     expect(deferred).toMatchObject({
       _tag: "Deferred",
-      state: { _tag: "AdmittingDownload", cancellationRequested: true },
+      state: { _tag: "RequestingInstallation", cancellationRequested: true },
     })
 
     const admitted = OnboardingModelMachine.transition(admitting, "DownloadAdmitted", {
@@ -252,11 +252,11 @@ describe("admitted model observation", () => {
   })
 
   it("does not treat an invalidated query's stale successful value as post-admission truth", async () => {
-    const stale = Result.waiting(Result.success({
-      state: modelsState({ _tag: "Installed", installedBytes: 2, origins: ["Magnitude"] }),
-    }))
-    const active = Result.success({
-      state: modelsState({
+    const stale = Result.waiting(Result.success(
+      modelsState({ _tag: "Installed", installedBytes: 2, origins: ["Magnitude"] }),
+    ))
+    const active = Result.success(
+      modelsState({
         _tag: "Downloading",
         attemptIds: [admittedAttempt],
         stage: "downloading",
@@ -264,21 +264,21 @@ describe("admitted model observation", () => {
         totalBytes: 2,
         bytesPerSecond: Option.none(),
       }),
-    })
-    const failed = Result.success({
-      state: modelsState({
+    )
+    const failed = Result.success(
+      modelsState({
         _tag: "Failed",
         attemptIds: [admittedAttempt],
         completedBytes: 1,
         totalBytes: 2,
         failure: { code: "failed", message: "failed", retryable: true },
       }),
-    })
+    )
 
     const observation = await Effect.runPromise(observeAdmittedDownload(
       Stream.fromIterable([
         stale,
-        Result.failure<{ readonly state: LocalModelsState }, string>(
+        Result.failure<LocalModelsState, string>(
           Cause.fail("query unavailable"),
         ),
         active,

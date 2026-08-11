@@ -8,28 +8,28 @@ import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 import {
-  addExecution,
+  addMutationState,
   getClientCore,
   MutationInternalTypeId,
+  mutationMatches,
   mutationController,
-  settleExecution,
+  settleMutationState,
   type MutationController,
   type MutationControllerCarrier
 } from "./internal.js"
 import {
   MutationDefinitionTypeId,
-  MutationExecutionId,
+  MutationStateId,
   MutationScope,
-  type AnyMutationExecution,
+  type AnyMutationState,
   type MutationDefinition,
-  type MutationExecution,
+  type MutationState,
   type MutationFilter
 } from "./Model.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Mutation")
 
-export { MutationExecutionId, MutationScope }
-export type { AnyMutationExecution, MutationExecution, MutationFilter }
+export { MutationScope }
 
 export class MutationSynchronizationError<Output, SynchronizationError> extends Data.TaggedError(
   "MutationSynchronizationError"
@@ -66,6 +66,56 @@ export type Output<M> = M extends Mutation<infer _I, infer O, infer _CE, infer _
 export type CommandError<M> = M extends Mutation<infer _I, infer _O, infer E, infer _R, infer _SE> ? E : never
 export type Requirements<M> = M extends Mutation<infer _I, infer _O, infer _CE, infer R, infer _SE> ? R : never
 export type SynchronizationError<M> = M extends Mutation<infer _I, infer _O, infer _CE, infer _R, infer E> ? E : never
+export type Error<M> = M extends Mutation<infer _I, infer O, infer CE, infer _R, infer SE>
+  ? CE | MutationSynchronizationError<O, SE>
+  : never
+export type State<M> = M extends Mutation<infer I, infer O, infer CE, infer _R, infer SE>
+  ? MutationState<I, O, CE | MutationSynchronizationError<O, SE>>
+  : never
+
+export interface Filters<M extends AnyMutation = AnyMutation> {
+  readonly mutation?: M
+  readonly scope?: MutationScope
+  readonly status?: "pending" | "success" | "error"
+  readonly predicate?: (state: State<M>) => boolean
+}
+
+type AnyMutation = Mutation<any, any, any, any, any>
+
+const mutationFilter = <M extends AnyMutation>(
+  filters: Filters<M> | undefined,
+): MutationFilter | undefined => filters === undefined ? undefined : ({
+    mutation: filters.mutation,
+    scope: filters.scope,
+    status: filters.status,
+    predicate: filters.predicate as MutationFilter["predicate"],
+  })
+
+export interface StateOptions<M extends AnyMutation = AnyMutation, Selected = State<M>> {
+  readonly filters?: Filters<M>
+  readonly select?: (state: State<M>) => Selected
+}
+
+/** Reactive mutation-cache selection, equivalent to TanStack Query's useMutationState. */
+export const state = <M extends AnyMutation = AnyMutation, Selected = State<M>>(
+  options: StateOptions<M, Selected> = {},
+): Atom.Atom<ReadonlyArray<Selected>> => Atom.readable((get) => {
+  const core = getClientCore(get.registry)
+  get(core.revision)
+  const states = core.mutationStates.filter((state) =>
+    mutationMatches(state, mutationFilter(options.filters))) as unknown as ReadonlyArray<State<M>>
+  return options.select === undefined
+    ? states as unknown as ReadonlyArray<Selected>
+    : states.map(options.select)
+})
+
+/** Number of matching pending mutation states, equivalent to TanStack Query's useIsMutating. */
+export const isMutating = <M extends AnyMutation = AnyMutation>(
+  filters?: Filters<M>,
+): Atom.Atom<number> => state({
+  filters: { ...filters, status: "pending" },
+  select: () => 1,
+}).pipe(Atom.map((matches) => matches.length))
 
 export interface Options<Input, Output, CommandError, CommandRequirements, SynchronizationError, SynchronizationRequirements> {
   readonly effect: (input: Input) => Effect.Effect<Output, CommandError, CommandRequirements>
@@ -106,7 +156,7 @@ export interface Factory<Provided, RuntimeError> {
 }
 
 interface Invocation<Input, Output, Error> {
-  readonly id: MutationExecutionId
+  readonly id: MutationStateId
   readonly input: Input
   readonly registry: AtomRegistry.Registry
   readonly deferred: Deferred.Deferred<Output, Error>
@@ -115,7 +165,7 @@ interface Invocation<Input, Output, Error> {
   started: boolean
 }
 
-let nextExecutionId = 0
+let nextMutationStateId = 0
 
 const makeDefinition = <
   Provided,
@@ -155,26 +205,26 @@ const makeDefinition = <
     semaphoresByRegistry.set(registry, semaphores)
     return semaphores
   }
-  const activeByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationExecutionId, CurrentInvocation>>()
-  const activeFor = (registry: AtomRegistry.Registry): Map<MutationExecutionId, CurrentInvocation> => {
+  const activeByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationStateId, CurrentInvocation>>()
+  const activeFor = (registry: AtomRegistry.Registry): Map<MutationStateId, CurrentInvocation> => {
     const existing = activeByRegistry.get(registry)
     if (existing !== undefined) return existing
-    const active = new Map<MutationExecutionId, CurrentInvocation>()
+    const active = new Map<MutationStateId, CurrentInvocation>()
     activeByRegistry.set(registry, active)
     return active
   }
   const gcTime = Duration.toMillis(Duration.decode(options.gcTime ?? Duration.minutes(5)))
-  const completeExecution = (
+  const completeInvocation = (
     core: ReturnType<typeof getClientCore>,
     invocation: CurrentInvocation,
     result: AtomResult.Result<Output, PublicError>
   ) => {
     invocation.result = result
-    settleExecution(core, invocation.id, result)
+    settleMutationState(core, invocation.id, result)
     if (gcTime === Number.POSITIVE_INFINITY) return
     const timer = setTimeout(() => {
-      const index = core.executions.findIndex((execution) => execution.id === invocation.id)
-      if (index >= 0) core.executions.splice(index, 1)
+      const index = core.mutationStates.findIndex((state) => state.id === invocation.id)
+      if (index >= 0) core.mutationStates.splice(index, 1)
       if (core.registry.getNodes().has(core.revision)) core.touch()
     }, gcTime)
     timer.unref()
@@ -217,7 +267,7 @@ const makeDefinition = <
       Effect.onExit((exit) => Deferred.done(invocation.deferred, exit).pipe(
         Effect.zipRight(Effect.sync(() => {
           activeFor(invocation.registry).delete(invocation.id)
-          completeExecution(
+          completeInvocation(
             core,
             invocation,
             AtomResult.fromExit(exit)
@@ -238,7 +288,7 @@ const makeDefinition = <
         && result._tag === "Failure" && !result.waiting) {
         activeFor(get.registry).delete(invocation.id)
         Effect.runSync(Deferred.failCause(invocation.deferred, result.cause))
-        completeExecution(getClientCore(get.registry), invocation, result)
+        completeInvocation(getClientCore(get.registry), invocation, result)
       }
       return invocation === undefined
         ? result
@@ -259,8 +309,8 @@ const makeDefinition = <
       }
       const registry = ctx.get(registryAtom)
       const core = getClientCore(registry)
-      const id = MutationExecutionId(`${name}:${Date.now()}:${nextExecutionId++}`)
-      const execution: MutationExecution<Input, Output, PublicError> = {
+      const id = MutationStateId(`${name}:${Date.now()}:${nextMutationStateId++}`)
+      const state: MutationState<Input, Output, PublicError> = {
         id,
         mutation,
         input: value,
@@ -269,7 +319,7 @@ const makeDefinition = <
         submittedAt: Date.now(),
         settledAt: Option.none()
       }
-      addExecution(core, execution)
+      addMutationState(core, state)
       core.emit({ _tag: "MutationStarted", name, id })
       const invocation: CurrentInvocation = {
         id,
@@ -291,7 +341,7 @@ const makeDefinition = <
       registry.get(mutation)
       registry.set(mutation, input)
       const invocation = latest.get(registry)
-      if (invocation === undefined) throw new Error(`Mutation ${name} did not create an execution`)
+      if (invocation === undefined) throw new Error(`Mutation ${name} did not create invocation state`)
       return { id: invocation.id, await: Deferred.await(invocation.deferred) }
     }
   }

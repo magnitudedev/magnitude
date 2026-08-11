@@ -3,7 +3,7 @@ import {
   LocalModelMutationFailed,
   ModelServingConfigurationSchema,
   type LocalInferenceError,
-  type ModelInstallationAdmission,
+  type LocalModelInstallationAdmission,
   type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
@@ -28,7 +28,7 @@ const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 export interface LocalModelInstallerApi {
   readonly install: (
     configurationId: ModelServingConfigurationId,
-  ) => Effect.Effect<ModelInstallationAdmission, LocalInferenceError>
+  ) => Effect.Effect<LocalModelInstallationAdmission, LocalInferenceError>
 }
 
 export class LocalModelInstaller extends Context.Tag("LocalModelInstaller")<
@@ -44,7 +44,7 @@ export const makeLocalModelInstaller = (
 ): Effect.Effect<LocalModelInstallerApi> => Effect.gen(function* () {
   const installUnlocked = (
     configurationId: ModelServingConfigurationId,
-  ): Effect.Effect<ModelInstallationAdmission, LocalInferenceError> => Effect.gen(function* () {
+  ): Effect.Effect<LocalModelInstallationAdmission, LocalInferenceError> => Effect.gen(function* () {
       const retainedConfiguration = yield* retained.resolve(configurationId)
       const configuration = Option.isSome(retainedConfiguration)
         ? retainedConfiguration.value
@@ -105,10 +105,10 @@ export const makeLocalModelInstaller = (
           failure("retain_local_model_configuration_failed", error.message, true)),
       )
       const download = yield* packages.admitBundle(materialized.bundle)
-      return {
-        providerModelId: ProviderModelIdSchema.make(materialized.id),
-        download,
-      }
+      const providerModelId = ProviderModelIdSchema.make(materialized.id)
+      return download._tag === "AlreadyInstalled"
+        ? { _tag: "AlreadyInstalled", providerModelId }
+        : { _tag: "DownloadAdmitted", providerModelId, attemptIds: download.attemptIds }
     })
 
   const install = (configurationId: ModelServingConfigurationId) =>

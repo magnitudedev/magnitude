@@ -1,7 +1,9 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
+import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
 import {
   buildModelsMenuEntries,
+  catalogStatus,
   catalogLocalModels,
   localModelInstalledStatus,
   localModelReadinessStatus,
@@ -78,6 +80,24 @@ describe("unified models menu projection", () => {
     ]
 
     expect(catalogLocalModels(models)).toEqual([catalogFit])
+  })
+
+  it("shows download admission before mirrored acquisition begins", () => {
+    expect(catalogStatus(makeCatalogOnlyModel(), true)).toBe("Starting download…")
+  })
+
+  it("prefers authoritative download progress once it is visible", () => {
+    expect(catalogStatus({
+      ...makeCatalogOnlyModel(),
+      acquisitionState: {
+        _tag: "Downloading",
+        attemptIds: [DownloadAttemptIdSchema.make("attempt-a")],
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 4,
+        bytesPerSecond: Option.none(),
+      },
+    }, true)).toBe("Downloading 25%")
   })
 
   it("uses embedded local availability for selection and identity", () => {

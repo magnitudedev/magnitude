@@ -176,6 +176,12 @@ Client-common imports application contracts through the SDK. It does not redefin
 domain unions, calculate backend policy, or become a second application backend in the client
 process.
 
+For an Effect Query-adopted subsystem, client-common owns the canonical query definitions,
+mutation definitions, semantic mutation scopes, and the invalidation bridge from ACN mirror events.
+The bridge treats events only as notification and rereads the ACN snapshot. Effect Query mutation
+states describe exact client command invocations; they do not duplicate ACN installation or
+ICN download lifecycle state.
+
 Client-common must not:
 
 - define parallel memory-assessment, fit, guidance, or loadability shapes;

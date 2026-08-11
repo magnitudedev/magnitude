@@ -64,6 +64,149 @@ describe("Query", () => {
     registry.dispose()
   })
 
+  it("retains the complete query entry across observer-free remounts", async () => {
+    const registry = Registry.make()
+    const client = clientFor(registry)
+    const runtime = Atom.runtime(Layer.empty)
+    let calls = 0
+    const query = Query.bind(runtime).make("Remounted", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.sync(() => ++calls).pipe(Effect.delay("1 millis")),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = query(undefined)
+
+    const unmount = registry.mount(atom)
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    unmount()
+    await Effect.runPromise(Effect.sleep("1 millis"))
+
+    const remount = registry.mount(atom)
+    const state = registry.get(atom)
+    expect(AtomResult.value(state.result)).toEqual(Option.some(1))
+    expect(state.fetchStatus).toBe("idle")
+    expect(calls).toBe(1)
+    remount()
+    registry.dispose()
+  })
+
+  it("returns retained fresh data from fetch without executing again", async () => {
+    const registry = Registry.make()
+    const client = clientFor(registry)
+    const runtime = Atom.runtime(Layer.empty)
+    let calls = 0
+    const query = Query.bind(runtime).make("FreshFetch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.sync(() => ++calls),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = query(undefined)
+
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    expect(calls).toBe(1)
+    registry.dispose()
+  })
+
+  it("does not prefetch retained fresh data again", async () => {
+    const registry = Registry.make()
+    const client = clientFor(registry)
+    const runtime = Atom.runtime(Layer.empty)
+    let calls = 0
+    const query = Query.bind(runtime).make("FreshPrefetch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.sync(() => ++calls),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = query(undefined)
+
+    await Effect.runPromise(client.prefetch(atom))
+    await Effect.runPromise(client.prefetch(atom))
+    expect(calls).toBe(1)
+    registry.dispose()
+  })
+
+  it("does not execute again when switching between selector observers", async () => {
+    const registry = Registry.make()
+    const client = clientFor(registry)
+    const runtime = Atom.runtime(Layer.empty)
+    let calls = 0
+    const query = Query.bind(runtime).make("SelectorSwitch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.sync(() => ({ value: ++calls })).pipe(Effect.delay("1 millis")),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const source = query(undefined)
+    const modelsSelector = Query.select(source, (data) => `models:${data.value}`)
+
+    const unmountModels = registry.mount(modelsSelector)
+    expect(await Effect.runPromise(client.fetch(source))).toEqual({ value: 1 })
+    unmountModels()
+    const catalogSelector = Query.select(source, (data) => `catalog:${data.value}`)
+    const unmountCatalog = registry.mount(catalogSelector)
+
+    expect(AtomResult.value(registry.get(catalogSelector).result)).toEqual(Option.some("catalog:1"))
+    expect(calls).toBe(1)
+    unmountCatalog()
+    registry.dispose()
+  })
+
+  it("does not refetch fresh data when a fetch bridge unmounts and remounts", async () => {
+    const registry = Registry.make()
+    const runtime = Atom.runtime(QueryClient.layer)
+    let calls = 0
+    const query = Query.bind(runtime).make("BridgeRemount", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.sync(() => ++calls),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = query(undefined)
+    const bridge = Atom.setIdleTTL(runtime.atom(
+      Effect.flatMap(QueryClient.QueryClient, (client) => client.fetch(atom))
+    ), 0)
+
+    const firstUnmount = registry.mount(bridge)
+    await Effect.runPromise(Effect.sleep("1 millis"))
+    firstUnmount()
+    await Effect.runPromise(Effect.sleep("1 millis"))
+    const secondUnmount = registry.mount(bridge)
+    await Effect.runPromise(Effect.sleep("1 millis"))
+
+    expect(calls).toBe(1)
+    secondUnmount()
+    registry.dispose()
+  })
+
+  it("collects the complete query entry when gcTime expires", async () => {
+    const registry = Registry.make({ timeoutResolution: 1 })
+    const client = clientFor(registry)
+    const runtime = Atom.runtime(Layer.empty)
+    let calls = 0
+    const query = Query.bind(runtime).make("Expired", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.sync(() => ++calls),
+      staleTime: Duration.infinity,
+      gcTime: "50 millis"
+    })
+    const atom = query(undefined)
+
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    await Effect.runPromise(Effect.sleep("2 millis"))
+    const remount = registry.mount(atom)
+    expect(AtomResult.value(registry.get(atom).result)).toEqual(Option.some(1))
+    expect(calls).toBe(1)
+    remount()
+    await Effect.runPromise(Effect.sleep("75 millis"))
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(2)
+    expect(calls).toBe(2)
+    registry.dispose()
+  })
+
   it("uses equality, not hash identity, for canonical keys", () => {
     class CollidingKey implements Equal.Equal {
       constructor(readonly value: string) {}
@@ -80,8 +223,23 @@ describe("Query", () => {
       effect: Effect.succeed
     })
 
-    expect(query("a")).toBe(query("a"))
+    const firstA = query("a")
+    expect(firstA).toBe(query("a"))
+    expect(firstA.input).toBe("a")
     expect(query("a")).not.toBe(query("b"))
+  })
+
+  it("keeps canonical query identity while the returned atom is strongly reachable", () => {
+    const runtime = Atom.runtime(Layer.empty)
+    const query = Query.bind(runtime).make("StrongCanonicalIdentity", {
+      key: () => Data.tuple("singleton"),
+      effect: () => Effect.succeed(1)
+    })
+
+    const first = query(undefined)
+    Bun.gc(true)
+
+    expect(query(undefined)).toBe(first)
   })
 
   it("retains successful data during background refetch failure", async () => {
@@ -198,6 +356,35 @@ describe("Query", () => {
     registry.dispose()
   })
 
+  it("coalesces repeated invalidations while a replacement fetch is active", async () => {
+    const registry = Registry.make()
+    const client = clientFor(registry)
+    const runtime = Atom.runtime(Layer.empty)
+    const first = Effect.runSync(Deferred.make<number>())
+    const replacement = Effect.runSync(Deferred.make<number>())
+    let calls = 0
+    const query = Query.bind(runtime).make("CoalescedInvalidation", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Deferred.await(calls++ === 0 ? first : replacement),
+      staleTime: Duration.infinity
+    })
+    const atom = query(undefined)
+
+    const waiter = Effect.runFork(client.fetch(atom))
+    await Effect.runPromise(Effect.yieldNow())
+    await Effect.runPromise(Effect.all(
+      Array.from({ length: 25 }, () => client.invalidate(query.match())),
+      { concurrency: "unbounded" }
+    ))
+    await Effect.runPromise(Deferred.succeed(first, 1))
+    await Effect.runPromise(Deferred.succeed(replacement, 2))
+
+    expect(await Effect.runPromise(Fiber.join(waiter))).toBe(2)
+    expect(calls).toBe(2)
+    expect(AtomResult.value(registry.get(atom).result)).toEqual(Option.some(2))
+    registry.dispose()
+  })
+
   it("does not materialize an unobserved query when a notification invalidates its key", async () => {
     const registry = Registry.make()
     const client = clientFor(registry)
@@ -300,7 +487,7 @@ describe("Query", () => {
 })
 
 describe("Mutation", () => {
-  it("indexes executions and distinguishes synchronization failure", async () => {
+  it("indexes mutation states and distinguishes synchronization failure", async () => {
     const registry = Registry.make()
     const client = clientFor(registry)
     const runtime = Atom.runtime(Layer.empty)
@@ -323,10 +510,31 @@ describe("Mutation", () => {
       expect((failure as Mutation.MutationSynchronizationError<string, string>).output).toBe("ADA")
     }
 
-    const executionAtom = client.mutationState(mutation.match())
-    const executions = registry.get(executionAtom)
-    expect(executions).toHaveLength(1)
-    expect(executions[0].result._tag).toBe("Failure")
+    const mutationStatesAtom = client.mutationState(mutation.match())
+    const mutationStates = registry.get(mutationStatesAtom)
+    expect(mutationStates).toHaveLength(1)
+    expect(mutationStates[0].result._tag).toBe("Failure")
+    registry.dispose()
+  })
+
+  it("keeps mutation state pending until synchronization completes", async () => {
+    const registry = Registry.make()
+    const runtime = Atom.runtime(Layer.empty)
+    const synchronized = Effect.runSync(Deferred.make<void>())
+    const mutation = Mutation.bind(runtime).make("SynchronizedMutation", {
+      effect: (input: string) => Effect.succeed(input.toUpperCase()),
+      synchronize: () => Deferred.await(synchronized),
+    })
+    const mutatingState = Mutation.isMutating({ mutation })
+    const fiber = Effect.runFork(Mutation.execute(mutation, "ready").pipe(
+      Effect.provideService(Registry.AtomRegistry, registry),
+    ))
+    await Effect.runPromise(Effect.yieldNow())
+
+    expect(registry.get(mutatingState)).toBe(1)
+    Effect.runSync(Deferred.succeed(synchronized, undefined))
+    expect(await Effect.runPromise(Fiber.join(fiber))).toBe("READY")
+    expect(registry.get(mutatingState)).toBe(0)
     registry.dispose()
   })
 
@@ -390,7 +598,51 @@ describe("Mutation", () => {
     registry.dispose()
   })
 
-  it("interrupts active executions and resets only the public latest result", async () => {
+  it("selects typed mutation states by semantic scope and pending status", async () => {
+    const registry = Registry.make()
+    const runtime = Atom.runtime(Layer.empty)
+    const first = Effect.runSync(Deferred.make<string>())
+    const second = Effect.runSync(Deferred.make<string>())
+    const mutation = Mutation.bind(runtime).make("ScopedSelectors", {
+      effect: ({ id }: { readonly id: "first" | "second" }) =>
+        Deferred.await(id === "first" ? first : second),
+      scope: ({ id }) => Mutation.MutationScope(`item:${id}`),
+    })
+    const firstScope = Mutation.MutationScope("item:first")
+    const firstMutationStates = Mutation.state({
+      filters: { mutation, scope: firstScope },
+    })
+    const firstInputsState = Mutation.state({
+      filters: { mutation, scope: firstScope },
+      select: ({ input }) => input.id,
+    })
+    const firstMutatingState = Mutation.isMutating({ mutation, scope: firstScope })
+
+    const firstInput: Mutation.Input<typeof mutation> = { id: "first" }
+    const secondInput: Mutation.Input<typeof mutation> = { id: "second" }
+    const firstFiber = Effect.runFork(Mutation.execute(mutation, firstInput).pipe(
+      Effect.provideService(Registry.AtomRegistry, registry),
+    ))
+    const secondFiber = Effect.runFork(Mutation.execute(mutation, secondInput).pipe(
+      Effect.provideService(Registry.AtomRegistry, registry),
+    ))
+    await Effect.runPromise(Effect.yieldNow())
+
+    expect(registry.get(firstMutatingState)).toBe(1)
+    expect(registry.get(firstInputsState)).toEqual(["first"])
+    expect(registry.get(firstMutationStates).at(-1)?.input.id).toBe("first")
+
+    Effect.runSync(Deferred.succeed(first, "FIRST"))
+    await Effect.runPromise(Fiber.join(firstFiber))
+    expect(registry.get(firstMutatingState)).toBe(0)
+    expect(registry.get(Mutation.isMutating({ mutation }))).toBe(1)
+
+    Effect.runSync(Deferred.succeed(second, "SECOND"))
+    await Effect.runPromise(Fiber.join(secondFiber))
+    registry.dispose()
+  })
+
+  it("interrupts active invocations and resets only the public latest result", async () => {
     const registry = Registry.make()
     const runtime = Atom.runtime(Layer.empty)
     const pending = Effect.runSync(Deferred.make<string>())
@@ -414,7 +666,7 @@ describe("Mutation", () => {
     registry.dispose()
   })
 
-  it("retries commands and collects settled execution records", async () => {
+  it("retries commands and collects settled mutation states", async () => {
     const registry = Registry.make()
     const client = clientFor(registry)
     const runtime = Atom.runtime(Layer.empty)
@@ -455,6 +707,10 @@ describe("type propagation", () => {
     expectTypeOf<Mutation.Input<typeof mutation>>().toEqualTypeOf<number>()
     expectTypeOf<Mutation.Output<typeof mutation>>().toEqualTypeOf<string>()
     expectTypeOf<Mutation.SynchronizationError<typeof mutation>>().toEqualTypeOf<"sync-error">()
+    expectTypeOf<Mutation.State<typeof mutation>["input"]>().toEqualTypeOf<number>()
+    expectTypeOf<Mutation.State<typeof mutation>["result"]>().toEqualTypeOf<
+      AtomResult.Result<string, Mutation.MutationSynchronizationError<string, "sync-error">>
+    >()
   })
 
   it("discharges only requirements supplied by the bound runtime", () => {

@@ -1,9 +1,9 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Effect, Option, Schema, Stream } from "effect"
+import { Mutation } from "@magnitudedev/effect-query"
 import {
   LocalInferenceHardwareMirror,
-  LocalModelsMirror,
   ModelSlotsMirror,
   OnboardingMirror,
   PRIMARY_SLOT_ID,
@@ -12,7 +12,8 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { useMirroredStateAtom } from "./use-mirrored-state"
-import { useModelSlotActions } from "./use-local-inference-state"
+import { useLocalModelsResultAtom, useModelSlotActions } from "./use-local-inference-state"
+import { localModelAtoms } from "../local-models/atoms"
 import {
   OnboardingIdle,
   OnboardingModelMachine,
@@ -56,18 +57,17 @@ export class OnboardingModelCommandFailed extends Schema.TaggedError<
 export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
   const hardwareAtom = useMirroredStateAtom(LocalInferenceHardwareMirror)
-  const modelsAtom = useMirroredStateAtom(LocalModelsMirror)
+  const modelsAtom = useLocalModelsResultAtom()
   const slotsAtom = useMirroredStateAtom(ModelSlotsMirror)
   const slotActions = useModelSlotActions()
   const mutations = useMemo(() => ({
-    install: client.mutation("InstallModel"),
     assign: client.mutation("AssignSlot"),
     load: client.mutation("LoadModel"),
     complete: client.mutation("UpdateOnboardingState"),
-    cancel: client.mutation("CancelModelDownload"),
     clear: client.mutation("ClearSlot"),
     stop: client.mutation("StopModel"),
   }), [client])
+  const atoms = useMemo(() => localModelAtoms(client), [client])
   const operationAtom = useMemo(
     () => Atom.make<OnboardingModelOperation>(new OnboardingIdle()),
     [],
@@ -77,12 +77,12 @@ export const useOnboardingModelSetup = () => {
     () => Atom.fn<"Cancel">()((_, get) => {
       const initial = get(operationAtom)
       if ((initial._tag === "DownloadAdmitted" || initial._tag === "DownloadCancellationFailed")
-        && initial.submission._tag === "ConfigureThenLoad") {
+        && initial.submission._tag === "InstallThenLoad") {
         const currentModels = get(modelsAtom)
         const terminal = Result.isSuccess(currentModels) && !currentModels.waiting
           ? reduceDownloadObservation(
             initialObservationCorrelation,
-            currentModels.value.state,
+            currentModels.value,
             initial.configurationId,
             initial.attemptIds,
           )[1]
@@ -117,9 +117,8 @@ export const useOnboardingModelSetup = () => {
         case "Download": {
           const requesting = request.state
           return Effect.gen(function* () {
-            yield* get.setResult(mutations.cancel, {
-              payload: { attemptIds: requesting.attemptIds },
-              reactivityKeys: [LocalModelsMirror.id],
+            yield* Mutation.execute(atoms.cancelDownloadMutation, {
+              attemptIds: requesting.attemptIds,
             }).pipe(
               Effect.mapError((error) => new OnboardingModelCommandFailed({
                 command: "cancel",
@@ -145,7 +144,7 @@ export const useOnboardingModelSetup = () => {
               "AwaitingDownloadCancellation",
               {},
             ))
-            if (requesting.submission._tag !== "ConfigureThenLoad") {
+            if (requesting.submission._tag !== "InstallThenLoad") {
               return yield* Effect.die("Download cancellation requires a download submission")
             }
             yield* observeAdmittedDownload(
@@ -207,7 +206,7 @@ export const useOnboardingModelSetup = () => {
         }
       }
     }),
-    [modelsAtom, mutations, operationAtom, slotsAtom],
+    [atoms, modelsAtom, mutations, operationAtom, slotsAtom],
   )
 
   const workflowAtom = useMemo(
@@ -237,7 +236,7 @@ export const useOnboardingModelSetup = () => {
               providerModelId,
               cancellationRequested: false,
             })
-          : beforeAssignment._tag === "AdmittingDownload" || beforeAssignment._tag === "DownloadAdmitted"
+          : beforeAssignment._tag === "RequestingInstallation" || beforeAssignment._tag === "DownloadAdmitted"
             ? OnboardingModelMachine.transition(beforeAssignment, "Assigning", {
                 submission: command,
                 providerModelId,
@@ -347,24 +346,22 @@ export const useOnboardingModelSetup = () => {
         if (beforeAdmission._tag !== "Idle") {
           return yield* Effect.die(`Cannot admit a download from ${beforeAdmission._tag}`)
         }
-        const admitting = OnboardingModelMachine.transition(beforeAdmission, "AdmittingDownload", {
+        const admitting = OnboardingModelMachine.transition(beforeAdmission, "RequestingInstallation", {
           submission: command,
           cancellationRequested: false,
         })
         get.set(operationAtom, admitting)
-        const installation = yield* get.setResult(mutations.install, {
-          payload: { configurationId: command.choice.configurationId },
-          reactivityKeys: [LocalModelsMirror.id],
+        const installation = yield* Mutation.execute(atoms.installMutation, {
+          configurationId: command.choice.configurationId,
         }).pipe(
           Effect.mapError((error) => new OnboardingModelCommandFailed({
             command: "install",
             message: error.message,
           })),
         )
-        const acquisition = installation.download
-        if (acquisition._tag === "AlreadyInstalled") {
+        if (installation._tag === "AlreadyInstalled") {
           const current = get(operationAtom)
-          if (current._tag !== "AdmittingDownload") return { _tag: "Superseded" as const }
+          if (current._tag !== "RequestingInstallation") return { _tag: "Superseded" as const }
           if (current.cancellationRequested) {
             get.set(operationAtom, OnboardingModelMachine.transition(current, "Idle", {}))
             return { _tag: "Cancelled" as const }
@@ -372,12 +369,12 @@ export const useOnboardingModelSetup = () => {
           return yield* activate(installation.providerModelId)
         }
         const afterAdmission = get(operationAtom)
-        if (afterAdmission._tag !== "AdmittingDownload") return { _tag: "Superseded" as const }
+        if (afterAdmission._tag !== "RequestingInstallation") return { _tag: "Superseded" as const }
         const cancellationRequested = afterAdmission.cancellationRequested
         const admitted = OnboardingModelMachine.transition(afterAdmission, "DownloadAdmitted", {
           configurationId: command.choice.configurationId,
           providerModelId: installation.providerModelId,
-          attemptIds: acquisition.attemptIds,
+          attemptIds: installation.attemptIds,
         })
         get.set(operationAtom, admitted)
         if (cancellationRequested) {
@@ -387,14 +384,14 @@ export const useOnboardingModelSetup = () => {
         const downloadState = yield* observeAdmittedDownload(
           get.stream(modelsAtom),
           command.choice.configurationId,
-          acquisition.attemptIds,
+          installation.attemptIds,
         )
         const current = get(operationAtom)
         if (current._tag === "RequestingDownloadCancellation"
           || current._tag === "AwaitingDownloadCancellation"
           || current._tag === "DownloadCancellationFailed") return yield* awaitCancellation
         if (current._tag !== "DownloadAdmitted"
-          || !sameDownloadAttempts(current.attemptIds, acquisition.attemptIds)) {
+          || !sameDownloadAttempts(current.attemptIds, installation.attemptIds)) {
           return { _tag: "Superseded" as const }
         }
         if (downloadState !== "Downloaded") {
@@ -407,13 +404,13 @@ export const useOnboardingModelSetup = () => {
       }).pipe(
         Effect.tapError(() => Effect.sync(() => {
           const current = get(operationAtom)
-          if (current._tag === "AdmittingDownload") {
+          if (current._tag === "RequestingInstallation") {
             get.set(operationAtom, OnboardingModelMachine.transition(current, "Idle", {}))
           }
         })),
       )
     }),
-    [cancelAtom, modelsAtom, mutations, operationAtom, slotsAtom],
+    [atoms, cancelAtom, modelsAtom, mutations, operationAtom, slotsAtom],
   )
   const runWorkflow = useAtomSet(workflowAtom)
   const runCancel = useAtomSet(cancelAtom)
@@ -422,7 +419,7 @@ export const useOnboardingModelSetup = () => {
       const operation = get(operationAtom)
       return {
         hardware: Result.map(get(hardwareAtom), ({ state }) => state),
-        models: Result.map(get(modelsAtom), ({ state }) => state),
+        models: get(modelsAtom),
         slots: Result.map(get(slotsAtom), ({ state }) => state),
         workflowResult: get(workflowAtom),
         cancelResult: get(cancelAtom),
@@ -447,9 +444,9 @@ export const useOnboardingModelSetup = () => {
     runWorkflow({ _tag: "Load", choice })
   }, [runWorkflow, setup.workflowResult])
 
-  const configureThenLoad = useCallback((choice: OnboardingConfigurationChoice) => {
+  const installThenLoad = useCallback((choice: OnboardingConfigurationChoice) => {
     if (Result.isWaiting(setup.workflowResult)) return
-    runWorkflow({ _tag: "ConfigureThenLoad", choice })
+    runWorkflow({ _tag: "InstallThenLoad", choice })
   }, [runWorkflow, setup.workflowResult])
 
   const cancel = useCallback(() => {
@@ -460,7 +457,7 @@ export const useOnboardingModelSetup = () => {
     ...setup,
     slotActions,
     load,
-    configureThenLoad,
+    installThenLoad,
     cancel,
   }
 }

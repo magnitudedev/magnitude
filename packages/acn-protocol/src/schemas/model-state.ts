@@ -470,19 +470,16 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
 )
 export type LocalModelAcquisitionState = typeof LocalModelAcquisitionStateSchema.Type
 
-export const ModelDownloadAdmissionSchema = Schema.Union(
-  Schema.TaggedStruct("AlreadyInstalled", {}),
+export const LocalModelInstallationAdmissionSchema = Schema.Union(
+  Schema.TaggedStruct("AlreadyInstalled", {
+    providerModelId: ProviderModelIdSchema,
+  }),
   Schema.TaggedStruct("DownloadAdmitted", {
+    providerModelId: ProviderModelIdSchema,
     attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
   }),
 )
-export type ModelDownloadAdmission = typeof ModelDownloadAdmissionSchema.Type
-
-export const ModelInstallationAdmissionSchema = Schema.Struct({
-  providerModelId: ProviderModelIdSchema,
-  download: ModelDownloadAdmissionSchema,
-})
-export type ModelInstallationAdmission = typeof ModelInstallationAdmissionSchema.Type
+export type LocalModelInstallationAdmission = typeof LocalModelInstallationAdmissionSchema.Type
 
 export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "insufficient_resources",

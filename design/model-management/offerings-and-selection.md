@@ -56,12 +56,13 @@ unretained standalone packages are not provider offerings. Their visibility belo
 ## Selecting a catalog option
 
 A catalog configuration is visible before retention on its unified local-model row. Only a
-completed eligible assessed row permits installation; it introduces no identity beyond its exact
+completed eligible assessed row permits acquisition; it introduces no identity beyond its exact
 configuration. The client-owned
 selection pipeline is:
 
 ```text
-InstallModel(configurationId)                        -> providerModelId + exact attempt IDs
+InstallModel(configurationId)                         -> AlreadyInstalled(providerModelId)
+                                                     | DownloadAdmitted(providerModelId, exact attempt IDs)
   -> AssignSlot(slotId, providerModelId)
   -> LoadModel(slotId)                               [if residency is requested]
 ```
@@ -129,7 +130,7 @@ preference and recency changes affect the next menu entry.
 - At most one retained configuration and provider offering exist for one bundle.
 - Catalog configurations and unretained standalone packages remain visible according to the product projection
   without becoming provider offerings.
-- Installing a configuration retains it before assignment and acquisition admission returns.
+- Installing a configuration retains it before assignment and installation admission returns.
 - Catalog row identity is not persisted as user intent.
 - Assignment commits durable selection and published configuration atomically.
 - Selection matching always uses one concrete provider-qualified offering identity.

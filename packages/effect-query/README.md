@@ -3,6 +3,37 @@
 Effect-native query and mutation state built on Effect Atom. Definitions retain their exact input,
 data, expected-error, and service-requirement types.
 
+## Relationship to TanStack Query
+
+This package intentionally preserves [TanStack Query](https://tanstack.com/query/latest)'s
+established query and mutation concepts so that cache behavior and API responsibilities remain
+familiar. It expresses those concepts with Effect and Effect Atom rather than React hooks,
+Promises, or an untyped error channel. The goal is
+semantic parity, not a line-for-line port: exact Effect error and requirement types, atom identity,
+and Effect services remain native to this package.
+
+| TanStack Query concept | `effect-query` equivalent | Effect-native difference |
+| --- | --- | --- |
+| Query options (`queryKey`, `queryFn`) | `Query.make({ key, effect })` | The fetch operation is an `Effect`; its error and service requirements remain typed. |
+| `useQuery` | Observe the query atom with the relevant Effect Atom integration | The query itself is a framework-independent atom. |
+| `fetchQuery` | `QueryClient.fetch` | Returns fresh retained data, joins active work, or fetches missing/stale data; preserves the exact error type. |
+| `ensureQueryData` | `QueryClient.ensure` | Returns retained data immediately and revalidates stale data. |
+| `prefetchQuery` | `QueryClient.prefetch` | Failure remains in query state and is not returned in the Effect error channel. |
+| `invalidateQueries` | `QueryClient.invalidate` | Accepts typed definition/key filters and optionally refetches. |
+| `refetchQueries` | `QueryClient.refetch` | Heterogeneous failures are collected in `QueryBatchError`. |
+| `cancelQueries` | `QueryClient.cancel` | Cancellation is represented by Effect interruption. |
+| `removeQueries` | `QueryClient.remove` | Removes matching query entries from the atom-backed cache. |
+| `getQueryState` | `QueryClient.getState` | Returns `Option<Query.State<...>>` in an `Effect`. |
+| `setQueryData` | `QueryClient.setData` | The updater receives `Option<Data>`. |
+| Query cache retention (`gcTime`) | Query `gcTime` | Retains the complete canonical entry—data, status, invalidation, and in-flight coordination—after its last observer unmounts. |
+| Mutation options (`mutationFn`, `scope`) | `Mutation.make({ effect, scope })` | The command and optional synchronization operation are typed Effects. |
+| `mutate` / `mutateAsync` | Write the mutation atom / `Mutation.execute` | Atom writes support reactive use; `execute` composes directly in Effect workflows. |
+| Mutation key | Exact mutation-definition identity | The definition is the typed identity, avoiding a parallel string-key contract. |
+| `MutationState` | `Mutation.State<M>` | Preserves the exact mutation input, output, and error types. |
+| `useMutationState` | `Mutation.state({ filters, select })` | Returns a derived `Atom` containing matching mutation states. |
+| `useIsMutating` | `Mutation.isMutating(filters)` | Returns an `Atom<number>`. |
+| Mutation cache retention (`gcTime`) | Mutation `gcTime` | Each invocation's `Mutation.State` remains selectable until collection. |
+
 ## Queries
 
 Bind definitions to the Atom runtime that provides their Effect services, then define a canonical
@@ -49,6 +80,16 @@ const current = AtomResult.value(state.result)
 Equivalent keys return the same query atom and share cached data and in-flight work. Structured keys
 must be Effect `Data` or another value implementing Effect `Equal`; plain objects and arrays are
 rejected because they have reference identity.
+
+Like TanStack Query, observer lifetime and cache lifetime are distinct. Unmounting the final
+observer does not reset a query: its complete canonical entry remains available until `gcTime`
+expires. Remounting during that interval synchronously reads retained state. Concurrent fetches
+join the active fetch, while repeated invalidations during an active replacement fetch coalesce
+instead of starting parallel requests.
+
+The keyed family returns that canonical query atom directly. Consumers and the registry therefore
+hold the same object that the family weakly indexes; it must not index a temporary wrapper around
+the atom, because collecting that wrapper would split one query key into multiple entries.
 
 `QueryClient` also provides exact operations for cache control:
 
@@ -287,7 +328,26 @@ const renameProgram = Mutation.execute(renameUser, { id: "1", name: "Grace" }).p
 )
 ```
 
-Executions with the same scope are serialized. A synchronization failure is reported as
+Invocations with the same scope are serialized. A synchronization failure is reported as
 `MutationSynchronizationError<Output, SynchronizationError>`, retaining both the accepted command
 output and the exact visibility error. Reactive aggregate state is available through
 `QueryClient.isFetching`, `QueryClient.isMutating`, and `QueryClient.mutationState`.
+
+The atom equivalents of TanStack Query's `useMutationState` and `useIsMutating` preserve the
+mutation's input, output, and error types and support exact semantic scope selection:
+
+```ts
+const userScope = Mutation.MutationScope("user:1")
+const mutationStatesAtom = Mutation.state({
+  filters: { mutation: renameUser, scope: userScope },
+})
+const namesAtom = Mutation.state({
+  filters: { mutation: renameUser, status: "success" },
+  select: ({ input }) => input.name,
+})
+const isMutatingAtom = Mutation.isMutating({ mutation: renameUser, scope: userScope })
+```
+
+Derive the latest invocation state with `mutationStates.at(-1)` and a pending boolean with
+`isMutating > 0`; these are consumer views rather than cache APIs. Resource lifecycle continues to
+come from its query.

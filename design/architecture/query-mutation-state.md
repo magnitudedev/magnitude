@@ -144,6 +144,21 @@ A query defines:
 - composition; and
 - observational failure.
 
+Query cache lifetime is distinct from observer lifetime. A canonical query entry owns its retained
+result, fetch status, freshness/invalidation state, and in-flight coordination as one lifecycle.
+The canonical entry is the query object returned to consumers: keyed lookup must retain and return
+that same object, never an unretained wrapper whose collection can silently recreate the query.
+Unmounting the last observer schedules collection according to the entry's retention policy; it
+must not discard only part of the entry or recreate an empty observation on remount. While retained,
+equivalent reads reuse the same result and concurrent fetches join the same work. Invalidation is
+idempotent with respect to active replacement work: repeated notifications may advance freshness,
+but they do not fan out parallel snapshot reads.
+
+Fetch and prefetch obey freshness: they return or preserve a fresh retained result, join active
+work, and execute only for missing or stale state. Refetch is the explicit operation that forces
+new observational work. A mutation that changes query authority invalidates the affected query
+before fetching the synchronized snapshot.
+
 ```text
 mount / read / refetch / watch
               X
@@ -317,6 +332,27 @@ local interaction  -> presentation atom
 - Declarative derivation replaces synchronization effects.
 - Shared atoms choose disposable or keep-alive lifetime intentionally.
 - CLI, web, and desktop share state behavior through client-common.
+
+Effect Query is the client cache and command-state authority for a subsystem that adopts it.
+A subsystem defines each query and mutation once in client-common, bound to the shared
+`AgentClient` transport. Components consume those definitions; they do not wrap them in parallel
+request atoms or writable status state.
+
+Mutation states are retained per invocation and keyed by the mutation definition and, when
+concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports
+concurrent installations of different configurations while serializing duplicate commands for the
+same configuration. Pending and failure presentation is selected from those exact mutation states.
+It is never represented by a singleton `installingId`, `busy`, or error side channel.
+
+Mutation success includes synchronization with every canonical query whose visibility is promised
+by the command. A command that admits a download remains pending until a fresh local-model snapshot
+shows the post-command state. Mutation synchronization does not wait for the admitted download to
+finish; progress and completion remain authoritative query state.
+
+Adoption is vertical and explicit. A subsystem may use Effect Query while unrelated subsystems
+continue to use AtomRpc queries and mutations. Within an adopted subsystem, however, there is one
+canonical query cache and one mutation-state registry; mixing a second cache or command-state
+mechanism for the same data is prohibited.
 
 ### AgentClient and RPC
 

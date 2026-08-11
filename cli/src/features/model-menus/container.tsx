@@ -19,6 +19,8 @@ import {
   localModelConfigurationId,
   localModelProviderModelId,
   localModelCapabilities,
+  localModelInstallationIsPending,
+  latestLocalModelInstallationMutationState,
   selectedSlotModel,
   truncateToDisplayWidth,
   type NotificationState,
@@ -779,6 +781,9 @@ const ModelsMenu = memo(function ModelsMenu({
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
+  const latestInstallationMutationState = modelActions.installationMutationStates.at(-1)
+  const installationFailed = latestInstallationMutationState !== undefined
+    && Result.isFailure(latestInstallationMutationState.result)
 
   const statusFor = (entry: ModelsMenuEntry): string => {
     const selectedEntry = isSelected(entry)
@@ -827,17 +832,17 @@ const ModelsMenu = memo(function ModelsMenu({
       return
     }
     const createAction = action.value
-    if (Result.isWaiting(modelActions.installResult)) return
-    void modelActions.install(createAction.configurationId).then(
-      ({ providerModelId }) => slotActions.assign(PRIMARY_SLOT_ID, {
-        providerId: LOCAL_PROVIDER_ID,
-        providerModelId,
-        reasoningEffort: Option.getOrElse(
-          createAction.reasoningEffort,
-          () => ReasoningEffortSchema.make("none"),
-        ),
-      }),
-      () => undefined,
+    if (localModelInstallationIsPending(
+      modelActions.installationMutationStates,
+      createAction.configurationId,
+    )) return
+    modelActions.installAndAssign(
+      createAction.configurationId,
+      PRIMARY_SLOT_ID,
+      Option.getOrElse(
+        createAction.reasoningEffort,
+        () => ReasoningEffortSchema.make("none"),
+      ),
     )
   }, [config, modelActions, slotActions])
 
@@ -1104,11 +1109,11 @@ const ModelsMenu = memo(function ModelsMenu({
         {Result.isFailure(config.catalog) && (
           <text style={{ fg: theme.error }}>Unable to refresh the provider model catalog; showing the last usable state when available.</text>
         )}
-        {Result.isFailure(config.slotUpdate) && (
+        {Result.isFailure(slotActions.assignResult) && (
           <text style={{ fg: theme.error }}>Failed to update model selection.</text>
         )}
-        {Result.isFailure(modelActions.installResult) && (
-          <text style={{ fg: theme.error }}>Failed to configure the installed model.</text>
+        {installationFailed && (
+          <text style={{ fg: theme.error }}>Failed to install the local model.</text>
         )}
         {Result.isFailure(config.favoriteUpdate) && (
           <text style={{ fg: theme.error }}>Failed to update model favorite.</text>
@@ -1157,13 +1162,17 @@ export const huggingFaceRepositoryUrls = (
     : [],
 ))]
 
-const catalogStatus = (model: LocalModel): string => {
+export const catalogStatus = (
+  model: LocalModel,
+  installationStarting = false,
+): string => {
   const acquisitionState = model.acquisitionState
-  if (acquisitionState._tag === "NotInstalled"
-    || acquisitionState._tag === "Cancelled") return "Available"
   if (acquisitionState._tag === "Downloading") {
     return `Downloading ${Math.round(acquisitionState.completedBytes / Math.max(1, acquisitionState.totalBytes) * 100)}%`
   }
+  if (installationStarting) return "Starting download…"
+  if (acquisitionState._tag === "NotInstalled"
+    || acquisitionState._tag === "Cancelled") return "Available"
   if (acquisitionState._tag === "Failed") return "Download failed"
   if (model.servingState._tag === "Assessed"
     && model.servingState.availabilityState._tag === "Unavailable") {
@@ -1178,6 +1187,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   recommendation,
   focused,
   pendingDelete,
+  installationStarting,
   index,
   layout,
   rowId,
@@ -1189,6 +1199,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   readonly recommendation: Option.Option<LocalModelRecommendation>
   readonly focused: boolean
   readonly pendingDelete: boolean
+  readonly installationStarting: boolean
   readonly index: number
   readonly layout: CatalogLayout
   readonly rowId: string
@@ -1196,12 +1207,16 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   readonly onMouseOver: () => void
 }) {
   const theme = useTheme()
-  const status = pendingDelete ? "Delete [y/n]" : catalogStatus(model)
+  const status = pendingDelete
+    ? "Delete [y/n]"
+    : catalogStatus(model, installationStarting)
   const statusColor = pendingDelete
     ? theme.warning
     : model.acquisitionState._tag === "Failed"
       ? theme.error
-      : model.acquisitionState._tag === "Downloading" || model.acquisitionState._tag === "Installed"
+      : installationStarting
+        || model.acquisitionState._tag === "Downloading"
+        || model.acquisitionState._tag === "Installed"
         ? theme.primary
         : theme.muted
   const recommendationText = recommendationLabel(recommendation)
@@ -1362,7 +1377,25 @@ const CatalogMenu = memo(function CatalogMenu({
     configurationIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
   const detail = candidates.find((model) => configurationIdFor(model) === detailId) ?? null
+  const detailConfigurationId = detail === null ? undefined : configurationIdFor(detail)
   const detailMemoryBytes = detail === null ? undefined : memoryBytesFor(detail)
+  const installationStartingFor = (model: LocalModel): boolean => {
+    const configurationId = configurationIdFor(model)
+    return configurationId !== undefined && localModelInstallationIsPending(
+      modelActions.installationMutationStates,
+      configurationId,
+    )
+  }
+  const detailInstallationStarting = detail !== null
+    && installationStartingFor(detail)
+  const detailInstallationMutationState = detailConfigurationId === undefined
+    ? undefined
+    : latestLocalModelInstallationMutationState(
+      modelActions.installationMutationStates,
+      detailConfigurationId,
+    )
+  const detailInstallationFailed = detailInstallationMutationState !== undefined
+    && Result.isFailure(detailInstallationMutationState.result)
   const progress = Option.match(snapshot, {
     onNone: () => [],
     onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
@@ -1373,6 +1406,7 @@ const CatalogMenu = memo(function CatalogMenu({
     if (!detail) return [] as readonly ("primary" | "cancel" | "select")[]
     const actions: ("primary" | "cancel" | "select")[] = []
     if (detail.acquisitionState._tag === "Downloading") actions.push("cancel")
+    else if (detailInstallationStarting) return actions
     else if (detail.acquisitionState._tag === "Installed") {
       if (detail.servingState._tag === "Assessed"
         && (detail.servingState.availabilityState._tag === "Selectable"
@@ -1380,7 +1414,7 @@ const CatalogMenu = memo(function CatalogMenu({
     }
     else actions.push("primary")
     return actions
-  }, [detail])
+  }, [detail, detailInstallationStarting])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
 
@@ -1396,14 +1430,17 @@ const CatalogMenu = memo(function CatalogMenu({
     const configurationId = configurationIdFor(model)
     if (configurationId === undefined
       || model.acquisitionState._tag === "Downloading"
-      || model.acquisitionState._tag === "Installed") return
-    void modelActions.install(configurationId)
+      || model.acquisitionState._tag === "Installed"
+      || localModelInstallationIsPending(
+        modelActions.installationMutationStates,
+        configurationId,
+      )) return
+    modelActions.install(configurationId)
   }, [modelActions])
 
   const selectCandidate = useCallback((model: LocalModel) => {
     if (model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits"
-      || Result.isWaiting(modelActions.installResult)) return
+      || model.servingState.assessment._tag !== "Fits") return
     const configurationId = model.servingState.configuration.id
     const reasoningEffort = model.servingState.capabilities.reasoning.defaultEffort
     const providerModelId = localModelProviderModelId(model)
@@ -1419,9 +1456,10 @@ const CatalogMenu = memo(function CatalogMenu({
       void assign(providerModelId.value)
       return
     }
-    void modelActions.install(configurationId).then(
-      ({ providerModelId }) => assign(providerModelId),
-      () => undefined,
+    modelActions.installAndAssign(
+      configurationId,
+      PRIMARY_SLOT_ID,
+      Option.getOrElse(reasoningEffort, () => ReasoningEffortSchema.make("none")),
     )
   }, [modelActions, slotActions])
 
@@ -1574,12 +1612,15 @@ const CatalogMenu = memo(function CatalogMenu({
               </text>
             </>
           )}
-          <text style={{ fg: failed ? theme.error : downloading || downloaded ? theme.primary : theme.muted }}>
-            {catalogStatus(detail)}
+          <text style={{ fg: failed ? theme.error : detailInstallationStarting || downloading || downloaded ? theme.primary : theme.muted }}>
+            {catalogStatus(detail, detailInstallationStarting)}
           </text>
           {failed && <text style={{ fg: theme.error }}>{detail.acquisitionState.failure.message}</text>}
-          {Result.isFailure(modelActions.installResult) && (
+          {detailInstallationFailed && (
             <text style={{ fg: theme.error }}>Failed to install the local model.</text>
+          )}
+          {Result.isFailure(slotActions.assignResult) && (
+            <text style={{ fg: theme.error }}>Failed to update model selection.</text>
           )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             {detailActions.map((action, index) => (
@@ -1683,6 +1724,7 @@ const CatalogMenu = memo(function CatalogMenu({
               recommendation={recommendationFor(candidate)}
               focused={focused}
               pendingDelete={pendingDelete}
+              installationStarting={installationStartingFor(candidate)}
               index={index}
               layout={layout}
               rowId={catalogCandidateRowId(configurationId)}
