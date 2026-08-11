@@ -1,20 +1,27 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
+  LocalInferenceMemoryDomainIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   servableModelBundlePackageIds,
+  type LocalInferenceHardware,
+  type MemoryAssessment,
   type ModelServingConfiguration,
   type ServableModelBundle,
   type ModelPackageSource,
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
   availabilityFromProviderProjection,
+  projectLocalModelMemory,
   resolveBundlePresentation,
 } from "./local-models"
 import { resolveLocalModelConfigurations } from "./local-model-configuration-resolver"
+
+const GIB = 1024 ** 3
 
 const standaloneBundle = (
   source: ModelPackageSource,
@@ -202,6 +209,102 @@ describe("local model availability", () => {
       _tag: "Unavailable",
       failure: { code: "insufficient_resources" },
     })
+  })
+})
+
+describe("local model current memory headroom", () => {
+  const memoryDomainId = LocalInferenceMemoryDomainIdSchema.make("system")
+  const hardware: LocalInferenceHardware = {
+    platform: "MacOS",
+    architecture: "Arm64",
+    productName: Option.none(),
+    processor: Option.none(),
+    logicalCores: 8,
+    totalSystemMemoryBytes: 64 * GIB,
+    availableSystemMemoryBytes: 8 * GIB,
+    systemAllocationCapacityBytes: 64 * GIB,
+    systemAllocationHeadroomBytes: 8 * GIB,
+    abortReserveBytes: 4 * GIB,
+    accelerators: [],
+    memoryDomains: [{
+      memoryDomainId,
+      kind: "UnifiedMemory",
+      totalBytes: 64 * GIB,
+      stableCapacityBytes: 58 * GIB,
+      availableBytes: Option.some(8 * GIB),
+      sharesSystemMemory: true,
+    }],
+  }
+  const assessment: readonly MemoryAssessment[] = [{
+    memoryDomainId,
+    capacityBytes: 64 * GIB,
+    requiredBytes: 32 * GIB,
+    compatibilityReserveBytes: 6 * GIB,
+    remainingBytes: 26 * GIB,
+  }]
+  const instances = (
+    lifecycle: object,
+  ): Generated.ModelInstancesSnapshot => ({
+    revision: 1,
+    instances: [{
+      id: "instance-test",
+      configurationId: "configuration-test",
+      lifecycle,
+    }],
+  } as unknown as Generated.ModelInstancesSnapshot)
+
+  it("does not infer insufficient headroom while loading residency is indeterminate", () => {
+    const memory = projectLocalModelMemory(assessment, hardware, instances({
+      _tag: "Loading",
+      stage: "loading",
+      progress: Option.some(0.5),
+      plannedAllocation: Option.some({
+        contextWindowTokens: 100_000,
+        parallelSequences: 4,
+        physicalContextTokens: 400_000,
+        requiredSystemMemoryBytes: 40 * GIB,
+      }),
+    }))
+
+    expect(memory.currentHeadroomState).toEqual({ _tag: "NotObserved" })
+  })
+
+  it("does not infer insufficient headroom while a planned allocation is stopping", () => {
+    const memory = projectLocalModelMemory(assessment, hardware, instances({
+      _tag: "Stopping",
+      reason: "user_stop",
+      allocation: {
+        _tag: "Planned",
+        allocation: Option.some({
+          contextWindowTokens: 100_000,
+          parallelSequences: 4,
+          physicalContextTokens: 400_000,
+          requiredSystemMemoryBytes: 40 * GIB,
+        }),
+      },
+    }))
+
+    expect(memory.currentHeadroomState).toEqual({ _tag: "NotObserved" })
+  })
+
+  it("uses exact resident allocation when deciding current headroom", () => {
+    const memory = projectLocalModelMemory(assessment, hardware, instances({
+      _tag: "Ready",
+      allocation: {
+        contextWindowTokens: 100_000,
+        parallelSequences: 4,
+        physicalContextTokens: 400_000,
+        memoryDomains: [{
+          memoryDomainId,
+          modelBytes: 32 * GIB,
+          contextBytes: 8 * GIB,
+          computeBytes: 0,
+          auxiliaryBytes: 0,
+        }],
+      },
+    }))
+
+    expect(memory.currentHeadroomState._tag).toBe("Sufficient")
   })
 })
 

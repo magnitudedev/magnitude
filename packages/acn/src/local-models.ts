@@ -235,27 +235,29 @@ const allocationBytes = (allocation: Generated.ModelInstanceAllocation["memoryDo
 const residentSystemAllocationBytes = (
   instances: Generated.ModelInstancesSnapshot,
   systemDomains: ReadonlySet<string>,
-): number => {
+): Option.Option<number> => {
   const allocations = new Map<string, Generated.ModelInstanceAllocation>()
   for (const instance of instances.instances) {
-    if (instance.lifecycle._tag === "Ready") {
-      allocations.set(instance.id, instance.lifecycle.allocation)
-    } else if (instance.lifecycle._tag === "Stopping"
-      && instance.lifecycle.allocation._tag === "Resident") {
-      allocations.set(instance.id, instance.lifecycle.allocation.allocation)
+    const lifecycle = instance.lifecycle
+    if (lifecycle._tag === "Loading") return Option.none()
+    if (lifecycle._tag === "Stopping") {
+      if (lifecycle.allocation._tag === "Planned") return Option.none()
+      allocations.set(instance.id, lifecycle.allocation.allocation)
+    } else if (lifecycle._tag === "Ready") {
+      allocations.set(instance.id, lifecycle.allocation)
     }
   }
   if (allocations.size > 1) {
     throw new Error("local-model projection observed multiple resident model instances")
   }
   const allocation = allocations.values().next().value as Generated.ModelInstanceAllocation | undefined
-  return allocation?.memoryDomains.reduce((total, domain) =>
+  return Option.some(allocation?.memoryDomains.reduce((total, domain) =>
     systemDomains.has(domain.memoryDomainId)
       ? total + allocationBytes(domain)
-      : total, 0) ?? 0
+      : total, 0) ?? 0)
 }
 
-const projectMemory = (
+export const projectLocalModelMemory = (
   domains: readonly MemoryAssessment[],
   hardware: LocalInferenceHardware,
   instances: Generated.ModelInstancesSnapshot,
@@ -278,21 +280,31 @@ const projectMemory = (
     0,
     hardware.totalSystemMemoryBytes - requiredSystemMemoryBytes,
   )
+  const systemUseState = predictedHeadroomBytes < recommendedHeadroomBytes
+    ? { _tag: "High" as const, recommendedHeadroomBytes, predictedHeadroomBytes }
+    : { _tag: "WithinRecommendedHeadroom" as const, recommendedHeadroomBytes, predictedHeadroomBytes }
   if (systemEvidence.length === 0) {
     return {
       domains,
       totalRequiredBytes,
       requiredSystemMemoryBytes,
-      systemUseState: predictedHeadroomBytes < recommendedHeadroomBytes
-        ? { _tag: "High", recommendedHeadroomBytes, predictedHeadroomBytes }
-        : { _tag: "WithinRecommendedHeadroom", recommendedHeadroomBytes, predictedHeadroomBytes },
+      systemUseState,
       currentHeadroomState: { _tag: "NotObserved" },
     }
   }
   const residentBytes = residentSystemAllocationBytes(instances, systemDomains)
+  if (Option.isNone(residentBytes)) {
+    return {
+      domains,
+      totalRequiredBytes,
+      requiredSystemMemoryBytes,
+      systemUseState,
+      currentHeadroomState: { _tag: "NotObserved" },
+    }
+  }
   const allocationHeadroomBytes = Math.min(
     hardware.systemAllocationCapacityBytes,
-    hardware.systemAllocationHeadroomBytes + residentBytes,
+    hardware.systemAllocationHeadroomBytes + residentBytes.value,
   )
   const loadBoundaryBytes = requiredSystemMemoryBytes + hardware.abortReserveBytes
   const observation = {
@@ -305,9 +317,7 @@ const projectMemory = (
     domains,
     totalRequiredBytes,
     requiredSystemMemoryBytes,
-    systemUseState: predictedHeadroomBytes < recommendedHeadroomBytes
-      ? { _tag: "High", recommendedHeadroomBytes, predictedHeadroomBytes }
-      : { _tag: "WithinRecommendedHeadroom", recommendedHeadroomBytes, predictedHeadroomBytes },
+    systemUseState,
     currentHeadroomState: allocationHeadroomBytes > loadBoundaryBytes
       ? { _tag: "Sufficient", observation }
       : {
@@ -510,7 +520,7 @@ export const LocalModelsLive: Layer.Layer<
               assessmentId: coordinatedAssessment.assessment.assessmentId,
               environmentId: coordinatedAssessment.assessment.environmentId,
               profile: coordinatedAssessment.assessment.profile,
-              memory: projectMemory(
+              memory: projectLocalModelMemory(
                 coordinatedAssessment.assessment.memory,
                 hardwareState,
                 instanceState,

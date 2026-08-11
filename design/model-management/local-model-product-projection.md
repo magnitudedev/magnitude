@@ -107,7 +107,9 @@ from one row without a temporal join between mirrors.
 Stable assessment and recommendation identity depend only on their semantic evidence. Live memory
 availability updates only the nested advisory headroom result; it does not rerun or relabel stable
 assessment or recommendation. A later load remains authoritative and revalidates current safety in
-ICN.
+ICN. When an in-progress model-instance transition makes resident replacement credit indeterminate,
+the advisory current-headroom result is `NotObserved`; unknown residency never becomes evidence of
+insufficient headroom.
 
 Inventory reconciliation reuses inspection and assessment results when semantic keys are unchanged.
 Work is serialized, invalidations are coalesced, and completion rechecks its semantic key before
@@ -148,6 +150,8 @@ authorization.
 - Models contains only installed rows; Catalog contains only fitting `InCatalog` rows; onboarding
   contains only fitting installed or recommended rows.
 - Live availability changes do not invalidate stable assessment or recommendation evidence.
+- Indeterminate residency during an instance transition produces `NotObserved`, not a false
+  sufficient or insufficient result.
 - Advisory memory state never authorizes loading; ICN revalidates at the load boundary.
 - Download observation and cancellation correlate exact attempt identities from
   `acquisitionState`.
