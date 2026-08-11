@@ -328,13 +328,12 @@ const toRecommendation = (
   balanced: RecommendationCandidate,
 ): Recommendation => ({
   id: RecommendationIdSchema.make(`${candidate.assessment.configurationId}:${intent}`),
-  targetId: candidate.model.targetId,
   recommendableModelId: candidate.model.id,
   displayName: candidate.model.displayName,
   description: candidate.model.description,
   configuration: {
     id: candidate.assessment.configurationId,
-    target: candidate.model.target,
+    bundle: candidate.model.configuration.bundle,
     profile: candidate.profile,
   },
   assessment: candidate.assessment,

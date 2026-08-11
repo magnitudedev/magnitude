@@ -497,6 +497,57 @@
         }
       }
     },
+    "/v1/models/downloads/{attempt_id}/acknowledge-failure": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "acknowledgeModelDownloadFailure",
+        "parameters": [
+          {
+            "name": "attempt_id",
+            "in": "path",
+            "description": "Failed download attempt ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Acknowledged failed model download attempt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DownloadAttempt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Attempt has not failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Attempt not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models/downloads/{attempt_id}/cancel": {
       "post": {
         "tags": [
@@ -1118,15 +1169,15 @@
         "type": "object",
         "required": [
           "requestId",
-          "target",
+          "bundle",
           "profiles"
         ],
         "properties": {
           "requestId": {
             "$ref": "#/components/schemas/ModelAssessmentRequestId"
           },
-          "target": {
-            "$ref": "#/components/schemas/ModelTargetInput"
+          "bundle": {
+            "$ref": "#/components/schemas/ModelBundleInput"
           },
           "profiles": {
             "type": "array",
@@ -1143,16 +1194,12 @@
             "type": "object",
             "required": [
               "requestId",
-              "targetId",
               "profiles",
               "_tag"
             ],
             "properties": {
               "requestId": {
                 "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "targetId": {
-                "$ref": "#/components/schemas/ModelOfferingTargetId"
               },
               "profiles": {
                 "type": "array",
@@ -1185,7 +1232,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "InvalidTarget"
+                  "InvalidBundle"
                 ]
               }
             }
@@ -2069,6 +2116,7 @@
               "completedBytes",
               "totalBytes",
               "failure",
+              "acknowledged",
               "_tag"
             ],
             "properties": {
@@ -2090,6 +2138,9 @@
               },
               "failure": {
                 "$ref": "#/components/schemas/ModelFailure"
+              },
+              "acknowledged": {
+                "type": "boolean"
               },
               "_tag": {
                 "type": "string",
@@ -3197,20 +3248,20 @@
       "InstalledModelPackage": {
         "type": "object",
         "required": [
-          "targetId",
           "package",
           "path",
+          "origin",
           "inspection"
         ],
         "properties": {
-          "targetId": {
-            "$ref": "#/components/schemas/ModelOfferingTargetId"
-          },
           "package": {
             "$ref": "#/components/schemas/ModelPackage"
           },
           "path": {
             "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/ModelPackageInstallationOrigin"
           },
           "inspection": {
             "$ref": "#/components/schemas/ModelPackageInspection"
@@ -3221,16 +3272,27 @@
       "InstalledModelPackagesResponse": {
         "type": "object",
         "required": [
+          "revision",
+          "reconciliationComplete",
           "packages"
         ],
         "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
           "packages": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/InstalledModelPackage"
             }
           }
-        }
+        },
+        "additionalProperties": false
       },
       "JsonSchemaRequest": {
         "type": "object",
@@ -3527,6 +3589,50 @@
       },
       "ModelAssessmentRequestId": {
         "type": "string"
+      },
+      "ModelBundleInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "package",
+              "_tag"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Standalone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "target",
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "SpeculativeDecodingPair"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ModelCapabilities": {
         "type": "object",
@@ -4109,57 +4215,6 @@
           "verifying"
         ]
       },
-      "ModelOfferingTarget": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "package",
-              "_tag"
-            ],
-            "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Package"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "target",
-              "draft",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/SpeculativeDecodingPairId"
-              },
-              "target": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "SpeculativeDecodingPair"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelOfferingTargetId": {
-        "type": "string"
-      },
       "ModelPackage": {
         "type": "object",
         "required": [
@@ -4267,6 +4322,13 @@
               }
             }
           }
+        ]
+      },
+      "ModelPackageInstallationOrigin": {
+        "type": "string",
+        "enum": [
+          "Magnitude",
+          "HuggingFaceCache"
         ]
       },
       "ModelPackageOperand": {
@@ -4421,15 +4483,15 @@
         "type": "object",
         "required": [
           "id",
-          "target",
+          "bundle",
           "profile"
         ],
         "properties": {
           "id": {
             "$ref": "#/components/schemas/ModelServingConfigurationId"
           },
-          "target": {
-            "$ref": "#/components/schemas/ModelOfferingTarget"
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
           },
           "profile": {
             "$ref": "#/components/schemas/ServingProfile"
@@ -4473,50 +4535,6 @@
                 "type": "string",
                 "enum": [
                   "Resident"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelTargetInput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "package",
-              "_tag"
-            ],
-            "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Package"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "target",
-              "draft",
-              "_tag"
-            ],
-            "properties": {
-              "target": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "SpeculativeDecodingPair"
                 ]
               }
             }
@@ -4686,9 +4704,7 @@
         "required": [
           "id",
           "checkpointId",
-          "targetId",
-          "target",
-          "profile",
+          "configuration",
           "displayName",
           "description",
           "license",
@@ -4706,14 +4722,8 @@
           "checkpointId": {
             "type": "string"
           },
-          "targetId": {
-            "$ref": "#/components/schemas/ModelOfferingTargetId"
-          },
-          "target": {
-            "$ref": "#/components/schemas/ModelOfferingTarget"
-          },
-          "profile": {
-            "$ref": "#/components/schemas/ServingProfile"
+          "configuration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration"
           },
           "displayName": {
             "type": "string"
@@ -4858,6 +4868,50 @@
           }
         ]
       },
+      "ServableModelBundle": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "package",
+              "_tag"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Standalone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "target",
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "SpeculativeDecodingPair"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ServingProfile": {
         "type": "object",
         "required": [
@@ -4891,9 +4945,6 @@
           }
         },
         "additionalProperties": false
-      },
-      "SpeculativeDecodingPairId": {
-        "type": "string"
       },
       "SpeculativeMethod": {
         "oneOf": [
@@ -5008,24 +5059,20 @@
       "StartModelDownloadRequest": {
         "type": "object",
         "required": [
-          "target"
+          "bundle"
         ],
         "properties": {
-          "target": {
-            "$ref": "#/components/schemas/ModelOfferingTarget"
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
           }
         }
       },
       "StartModelDownloadResponse": {
         "type": "object",
         "required": [
-          "target_id",
           "attempts"
         ],
         "properties": {
-          "target_id": {
-            "$ref": "#/components/schemas/ModelOfferingTargetId"
-          },
           "attempts": {
             "type": "array",
             "items": {

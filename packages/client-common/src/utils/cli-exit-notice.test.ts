@@ -40,7 +40,7 @@ const state = (lifecycle: "Ready" | "Loading" | "Stopped", duplicate = false): M
       primary: local,
       secondary: duplicate ? { ...local, slotId: "secondary" } : { _tag: "Unassigned", slotId: "secondary" },
     },
-    recentModelIds: { primary: [], secondary: [] },
+    recentModels: { primary: [], secondary: [] },
     favoriteModels: [],
   } as unknown as ModelSlotsState
 }

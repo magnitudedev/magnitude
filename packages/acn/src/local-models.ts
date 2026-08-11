@@ -1,17 +1,19 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsMirror,
+  ModelServingConfigurationSchema,
+  ServableModelBundleSchema,
   type LocalModel,
-  type LocalInferenceError,
-  type LocalModelDownload,
+  type LocalModelCatalogDownloadState,
+  type LocalModelInstallation,
   type LocalModelCatalogCandidateAvailability,
   type LocalModelsState,
   type ModelFailure,
-  type ModelOfferingTarget,
-  type ModelOfferingTargetId,
+  type ModelServingConfiguration,
+  type ServableModelBundle,
   type ModelPackageEntry,
   type ProviderModelCatalogEntry,
-  modelOfferingTargetPackageIds,
+  servableModelBundlePackageIds,
 } from "@magnitudedev/acn-protocol"
 import type { ModelServingConfigurationId, ProviderModelId } from "@magnitudedev/sdk"
 import { IcnCatalog } from "@magnitudedev/icn"
@@ -20,60 +22,105 @@ import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import {
-  LocalProviderOfferingProjection,
   providerOfferingPackageEvidence,
   sameProviderOfferingPackageEvidence,
-} from "./local-provider-offering-projection"
-import { LocalModelAssessments } from "./local-model-assessments"
+} from "./local-provider-offerings"
+import { LocalModelAssessor } from "./local-model-assessor"
+import {
+  localModelAssessmentProfiles,
+  MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH,
+} from "./local-model-assessments"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
+import { RetainedModelConfigurations } from "./retained-model-configurations"
 
-interface TargetProjection {
-  readonly id: ModelOfferingTargetId
-  readonly target: ModelOfferingTarget
-}
-
-interface TargetPresentation {
+interface ModelPresentation {
   readonly displayName: string
   readonly description: string
 }
 
-const targetPackages = (target: ModelOfferingTarget) =>
-  target._tag === "Package" ? [target.package] : [target.target, target.draft]
+const bundlePackages = (bundle: ServableModelBundle) =>
+  bundle._tag === "Standalone" ? [bundle.package] : [bundle.target, bundle.draft]
+const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
+const bundleIdentity = (bundle: ServableModelBundle): string =>
+  bundle._tag === "Standalone"
+    ? `Standalone\0${bundle.package.id}`
+    : `SpeculativeDecodingPair\0${bundle.target.id}\0${bundle.draft.id}`
 
-const sourceName = (target: ModelOfferingTarget): string => {
-  const primary = target._tag === "Package" ? target.package : target.target
+export const decideLocalModelConfigurations = (input: {
+  readonly retained: readonly ModelServingConfiguration[]
+  readonly catalog: readonly ModelServingConfiguration[]
+  readonly assessed: readonly ModelServingConfiguration[]
+}): ReadonlyMap<string, ModelServingConfiguration> => {
+  const decided = new Map<string, ModelServingConfiguration>()
+  const authoredIds = new Set([
+    ...input.retained,
+    ...input.catalog,
+  ].map(({ id }) => id))
+  for (const configuration of input.assessed) {
+    if (!authoredIds.has(configuration.id)) {
+      decided.set(bundleIdentity(configuration.bundle), configuration)
+    }
+  }
+  for (const configuration of input.catalog) {
+    decided.set(bundleIdentity(configuration.bundle), configuration)
+  }
+  for (const configuration of input.retained) {
+    decided.set(bundleIdentity(configuration.bundle), configuration)
+  }
+  return decided
+}
+
+const sourceName = (bundle: ServableModelBundle): string => {
+  const primary = bundle._tag === "Standalone" ? bundle.package : bundle.target
   return primary.source._tag === "HuggingFace"
     ? primary.source.repository.split("/").at(-1) ?? primary.source.repository
     : primary.files[0]?.path.split("/").at(-1) ?? primary.id
 }
 
-export const resolveTargetPresentation = (
-  targetId: ModelOfferingTargetId,
-  target: ModelOfferingTarget,
-  curatedByTargetId: ReadonlyMap<ModelOfferingTargetId, TargetPresentation>,
-): TargetPresentation => curatedByTargetId.get(targetId) ?? {
-  displayName: sourceName(target),
+export const resolveBundlePresentation = (
+  bundle: ServableModelBundle,
+  curated: ModelPresentation | undefined,
+): ModelPresentation => curated ?? {
+  displayName: sourceName(bundle),
   description: "",
 }
 
-const aggregateDownload = (
-  target: ModelOfferingTarget,
+const installedBundle = (
+  bundle: ServableModelBundle,
   entries: ReadonlyMap<string, ModelPackageEntry>,
-): LocalModelDownload => {
-  const packages = targetPackages(target)
-  const totalBytes = packages.reduce(
-    (total, modelPackage) =>
-      total + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0),
-    0,
-  )
+): LocalModelInstallation | undefined => {
+  const packages = bundlePackages(bundle)
   const packageEntries = packages.map((modelPackage) => entries.get(modelPackage.id))
+  if (!packageEntries.every((entry) => entry?.localState._tag === "Installed")) {
+    return undefined
+  }
   const installedBytes = packages.reduce((total, modelPackage, index) =>
     total + (packageEntries[index]?.localState._tag === "Installed"
       ? modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0)
       : 0), 0)
-  if (packageEntries.every((entry) => entry?.localState._tag === "Installed")) {
-    return { _tag: "Downloaded", installedBytes }
+  const [origin, ...remainingOrigins] = [...new Set(packageEntries.flatMap((entry) =>
+    entry?.localState._tag === "Installed" ? [entry.localState.origin] : []))]
+  if (origin === undefined) {
+    throw new Error("Installed servable model bundle has no installation origin")
   }
+  return { installedBytes, origins: [origin, ...remainingOrigins] }
+}
+
+const aggregateDownload = (
+  bundle: ServableModelBundle,
+  entries: ReadonlyMap<string, ModelPackageEntry>,
+): LocalModelCatalogDownloadState => {
+  const packages = bundlePackages(bundle)
+  const packageEntries = packages.map((modelPackage) => entries.get(modelPackage.id))
+  const totalBytes = packages.reduce((total, modelPackage) =>
+    total + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0)
+  const installedBytes = packages.reduce((total, modelPackage, index) =>
+    total + (packageEntries[index]?.localState._tag === "Installed"
+      ? modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0)
+      : 0), 0)
+  const installation = installedBundle(bundle, entries)
+  if (installation !== undefined) return { _tag: "Downloaded", ...installation }
+
   const downloading = packageEntries.flatMap((entry) =>
     entry?.localState._tag === "Downloading" ? [entry.localState] : [])
   const completedBytes = installedBytes + downloading.reduce(
@@ -86,11 +133,10 @@ const aggregateDownload = (
       ? stages[0] ?? "queued"
       : stages.every((value) => value === "verifying" || value === "publishing")
         ? "verifying" as const
-      : stages.some((value) => value === "downloading")
-        ? "downloading" as const
-        : stages[0] ?? "queued"
-    const rates = downloading.flatMap(({ bytesPerSecond }) =>
-      Option.toArray(bytesPerSecond))
+        : stages.some((value) => value === "downloading")
+          ? "downloading" as const
+          : stages[0] ?? "queued"
+    const rates = downloading.flatMap(({ bytesPerSecond }) => Option.toArray(bytesPerSecond))
     return {
       _tag: "Downloading",
       attemptIds: downloading.map(({ attemptId }) => attemptId) as [
@@ -105,44 +151,35 @@ const aggregateDownload = (
         : Option.some(rates.reduce((total, rate) => total + rate, 0)),
     }
   }
+
   const failed = packageEntries.flatMap((entry) =>
     entry?.localState._tag === "DownloadFailed" ? [entry.localState] : [])[0]
-  const failedAttemptIds = packageEntries.flatMap((entry) =>
-    entry?.localState._tag === "DownloadFailed" ? [entry.localState.attemptId] : [])
-  const failedBytes = installedBytes + packages.reduce((total, modelPackage, index) => {
-    const entry = packageEntries[index]
-    if (!entry
-      || entry.localState._tag !== "DownloadFailed") return total
-    return total + entry.localState.completedBytes
-  }, 0)
-  return failed
+  if (failed !== undefined) {
+    const attemptIds = packageEntries.flatMap((entry) =>
+      entry?.localState._tag === "DownloadFailed" ? [entry.localState.attemptId] : [])
+    return {
+      _tag: "Failed",
+      attemptIds: attemptIds as [typeof attemptIds[number], ...Array<typeof attemptIds[number]>],
+      completedBytes: installedBytes + packageEntries.reduce((total, entry) =>
+        total + (entry?.localState._tag === "DownloadFailed" ? entry.localState.completedBytes : 0), 0),
+      totalBytes,
+      failure: failed.failure,
+    }
+  }
+
+  const cancelledAttemptIds = packageEntries.flatMap((entry) =>
+    entry?.localState._tag === "DownloadCancelled" ? [entry.localState.attemptId] : [])
+  return cancelledAttemptIds.length > 0
     ? {
-        _tag: "Failed",
-        attemptIds: failedAttemptIds as [
-          typeof failedAttemptIds[number],
-          ...Array<typeof failedAttemptIds[number]>,
+        _tag: "Cancelled",
+        attemptIds: cancelledAttemptIds as [
+          typeof cancelledAttemptIds[number],
+          ...Array<typeof cancelledAttemptIds[number]>,
         ],
-        completedBytes: failedBytes,
+        completedBytes,
         totalBytes,
-        failure: failed.failure,
       }
-    : (() => {
-        const cancelledAttemptIds = packageEntries.flatMap((entry) =>
-          entry?.localState._tag === "DownloadCancelled"
-            ? [entry.localState.attemptId]
-            : [])
-        return cancelledAttemptIds.length > 0
-          ? {
-              _tag: "Cancelled" as const,
-              attemptIds: cancelledAttemptIds as [
-                typeof cancelledAttemptIds[number],
-                ...Array<typeof cancelledAttemptIds[number]>,
-              ],
-              completedBytes,
-              totalBytes,
-            }
-          : { _tag: "NotDownloaded" as const, completedBytes, totalBytes }
-      })()
+    : { _tag: "NotDownloaded", completedBytes, totalBytes }
 }
 
 type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
@@ -178,25 +215,25 @@ export const availabilityFromProviderProjection = (
 }
 
 const aggregateAvailability = (
-  target: ModelOfferingTarget,
+  bundle: ServableModelBundle,
   entries: ReadonlyMap<string, ModelPackageEntry>,
   providerModelId: ProviderModelId | undefined,
   providerEntries: ReadonlyMap<ProviderModelId, ProviderModelCatalogEntry>,
   providerProjectionCurrent: boolean,
   providerProjectionFailure: Option.Option<ModelFailure>,
 ): LocalModelCatalogCandidateAvailability | undefined => {
-  const targetEntries = modelOfferingTargetPackageIds(target).map((packageId) => entries.get(packageId))
-  if (!targetEntries.every((entry) => entry?.localState._tag === "Installed")) {
+  const bundleEntries = servableModelBundlePackageIds(bundle).map((packageId) => entries.get(packageId))
+  if (!bundleEntries.every((entry) => entry?.localState._tag === "Installed")) {
     return { _tag: "NotDownloaded" }
   }
-  const failure = targetEntries.flatMap((entry): readonly ModelFailure[] => {
+  const failure = bundleEntries.flatMap((entry): readonly ModelFailure[] => {
     if (entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible") {
       return [entry.inspection.failure]
     }
     return []
   })[0]
   if (failure) return { _tag: "Unavailable", failure }
-  if (targetEntries.some((entry) => entry?.inspection._tag === "Pending")) {
+  if (bundleEntries.some((entry) => entry?.inspection._tag === "Pending")) {
     return undefined
   }
   return availabilityFromProviderProjection(
@@ -210,9 +247,6 @@ const aggregateAvailability = (
 export interface LocalModelsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
-  readonly resolveTarget: (
-    targetId: ModelOfferingTargetId,
-  ) => Effect.Effect<ModelOfferingTarget | undefined, LocalInferenceError>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
@@ -221,16 +255,19 @@ export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
   IcnCatalog | LocalModelPackages | LocalModelRecommendations
-    | LocalModelAssessments | LocalProviderOfferingProjection | LocalProviderOfferings | MirroredStateChanges
+    | LocalModelAssessor | LocalProviderOfferings | MirroredStateChanges
+    | RetainedModelConfigurations
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const packages = yield* LocalModelPackages
   const recommendations = yield* LocalModelRecommendations
-  const assessments = yield* LocalModelAssessments
+  const assessments = yield* LocalModelAssessor
   const offerings = yield* LocalProviderOfferings
-  const offeringProjection = yield* LocalProviderOfferingProjection
+  const retained = yield* RetainedModelConfigurations
   const mirror = yield* makeMirroredState(LocalModelsMirror, {
+    inventory: { _tag: "Initializing" },
     models: [],
+    downloads: [],
     recommendations: {
       _tag: "Loading",
       progress: [],
@@ -247,80 +284,13 @@ export const LocalModelsLive: Layer.Layer<
     )
     const recommendationState = (yield* recommendations.snapshot).state
     const assessmentState = yield* assessments.state
-    const recommendationEntries = recommendationState._tag === "Ready"
-      ? recommendationState.recommendations
-      : []
+    const retainedConfigurations = yield* retained.get
     const configured = yield* offerings.list
-    const projectedOfferings = yield* offeringProjection.state
+    const projectedOfferings = yield* offerings.state
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
     )
-    const explicitStandalonePackageIds = new Set([
-      ...catalogModels.flatMap(({ target }) =>
-        target._tag === "Package" ? [target.package.id] : []),
-      ...recommendationEntries.flatMap(({ configuration }) =>
-        configuration.target._tag === "Package"
-          ? [configuration.target.package.id]
-          : []),
-      ...configured.flatMap(({ configuration }) =>
-        configuration.target._tag === "Package"
-          ? [configuration.target.package.id]
-          : []),
-    ])
-    const speculativePackageIds = new Set([
-      ...catalogModels.flatMap(({ target }) =>
-        target._tag === "SpeculativeDecodingPair"
-          ? [target.target.id, target.draft.id]
-          : []),
-      ...recommendationEntries.flatMap(({ configuration }) =>
-        configuration.target._tag === "SpeculativeDecodingPair"
-          ? [configuration.target.target.id, configuration.target.draft.id]
-          : []),
-      ...configured.flatMap(({ configuration }) =>
-        configuration.target._tag === "SpeculativeDecodingPair"
-          ? [configuration.target.target.id, configuration.target.draft.id]
-          : []),
-    ])
-    const targets = new Map<ModelOfferingTargetId, TargetProjection>()
-    const curatedPresentationByTargetId = new Map<
-      ModelOfferingTargetId,
-      TargetPresentation
-    >()
-    for (const model of catalogModels) {
-      targets.set(model.targetId, {
-        id: model.targetId,
-        target: model.target,
-      })
-      curatedPresentationByTargetId.set(model.targetId, {
-        displayName: model.displayName,
-        description: model.description,
-      })
-    }
-    for (const entry of packageState.entries) {
-      if (Option.isNone(entry.targetId)) continue
-      if (speculativePackageIds.has(entry.package.id)
-        && !explicitStandalonePackageIds.has(entry.package.id)) continue
-      targets.set(entry.targetId.value, {
-        id: entry.targetId.value,
-        target: { _tag: "Package", package: entry.package },
-      })
-    }
-    for (const recommendation of recommendationEntries) {
-      targets.set(recommendation.targetId, {
-        id: recommendation.targetId,
-        target: recommendation.configuration.target,
-      })
-      curatedPresentationByTargetId.set(recommendation.targetId, {
-        displayName: recommendation.displayName,
-        description: recommendation.description,
-      })
-    }
-    for (const offering of configured) {
-      targets.set(offering.targetId, {
-        id: offering.targetId,
-        target: offering.configuration.target,
-      })
-    }
+    const sameBundle = Schema.equivalence(ServableModelBundleSchema)
     const providerIdByConfiguration = new Map<ModelServingConfigurationId, ProviderModelId>()
     for (const offering of configured) {
       providerIdByConfiguration.set(offering.configuration.id, offering.providerModelId)
@@ -344,51 +314,162 @@ export const LocalModelsLive: Layer.Layer<
       message: error.message,
       retryable: "retryable" in error ? error.retryable : true,
     }))
-    const models: LocalModel[] = [...targets.values()].map((projection): LocalModel => {
-      const modelPackages = targetPackages(projection.target)
-      const presentation = resolveTargetPresentation(
-        projection.id,
-        projection.target,
-        curatedPresentationByTargetId,
-      )
-      return {
-        targetId: projection.id,
-        offerings: configured
-          .filter(({ targetId }) => targetId === projection.id)
-          .map(({ configuration, providerModelId }) => ({
-            configurationId: configuration.id,
-            providerModelId,
-          })),
-        displayName: presentation.displayName,
-        description: presentation.description,
-        kind: projection.target._tag === "Package" ? "Standalone" : "SpeculativePair",
-        quantization: modelPackages.map(({ properties }) => properties.quantization).join(" + "),
-        maximumContextLength: Math.min(
-          ...modelPackages.map(({ properties }) => properties.maximumContextLength),
-        ),
-        downloadBytes: modelPackages.reduce((total, modelPackage) =>
-          total + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0),
-        download: aggregateDownload(projection.target, packageEntries),
-        assessment: assessmentState.get(projection.id) ?? { _tag: "Unassessed" },
+    const knownConfigurations = new Map<
+      ModelServingConfigurationId,
+      (typeof configured)[number]["configuration"]
+    >()
+    const addKnownConfiguration = (
+      configuration: (typeof configured)[number]["configuration"],
+    ) => {
+      const existing = knownConfigurations.get(configuration.id)
+      if (existing !== undefined && !sameConfiguration(existing, configuration)) {
+        throw new Error(`Configuration ${configuration.id} has conflicting values`)
       }
-    }).sort((left, right) => left.displayName.localeCompare(right.displayName))
+      knownConfigurations.set(configuration.id, configuration)
+    }
+    retainedConfigurations.forEach(addKnownConfiguration)
+    catalogModels.forEach(({ configuration }) => addKnownConfiguration(configuration))
+    assessmentState.forEach(({ configuration }) => addKnownConfiguration(configuration))
+
+    const groups = new Map<string, ServableModelBundle>()
+    const addBundle = (bundle: ServableModelBundle) => {
+      const identity = bundleIdentity(bundle)
+      const existing = groups.get(identity)
+      if (existing === undefined) {
+        groups.set(identity, bundle)
+      } else if (!sameBundle(existing, bundle)) {
+        throw new Error(`Servable model bundle ${identity} has conflicting package definitions`)
+      }
+    }
+    knownConfigurations.forEach((configuration) => {
+      if (installedBundle(configuration.bundle, packageEntries) !== undefined) {
+        addBundle(configuration.bundle)
+      }
+    })
+    for (const entry of packageState.entries) {
+      if (entry.localState._tag !== "Installed") continue
+      const independentlyServable = entry.package.files.some(({ role }) =>
+        role === "weights" || role === "draft")
+      if (independentlyServable) addBundle({ _tag: "Standalone", package: entry.package })
+    }
+    const configurationByBundle = decideLocalModelConfigurations({
+      retained: retainedConfigurations,
+      catalog: catalogModels.map(({ configuration }) => configuration),
+      assessed: [...assessmentState.values()].map(({ configuration }) => configuration),
+    })
+    const configuredById = new Map(configured.map((offering) => [
+      offering.configuration.id,
+      offering,
+    ]))
+    const downloads = [...knownConfigurations.values()].flatMap((configuration) => {
+      const download = aggregateDownload(configuration.bundle, packageEntries)
+      if (download._tag === "NotDownloaded") return []
+      const catalogModel = catalogModels.find((model) => model.configuration.id === configuration.id)
+      const configuredOffering = configuredById.get(configuration.id)
+      const primaryPackage = configuration.bundle._tag === "Standalone"
+        ? configuration.bundle.package
+        : configuration.bundle.target
+      const inspection = packageEntries.get(primaryPackage.id)?.inspection
+      const capabilities = Option.firstSomeOf([
+        Option.fromNullable(catalogModel).pipe(Option.map(({ capabilities }) => capabilities)),
+        Option.fromNullable(configuredOffering).pipe(
+          Option.map(({ capabilities }) => capabilities),
+        ),
+        inspection?._tag === "Inspected"
+          ? Option.some(inspection.capabilities)
+          : Option.none(),
+      ])
+      return [{
+        configuration,
+        presentation: resolveBundlePresentation(configuration.bundle, catalogModel && {
+          displayName: catalogModel.displayName,
+          description: catalogModel.description,
+        }),
+        capabilities,
+        state: download,
+      }]
+    })
+    const models: LocalModel[] = [...groups.values()].map((bundle): LocalModel => {
+      const curated = catalogModels.find((model) =>
+        bundleIdentity(model.configuration.bundle) === bundleIdentity(bundle))
+      const presentation = resolveBundlePresentation(bundle, curated && {
+        displayName: curated.displayName,
+        description: curated.description,
+      })
+      const primaryPackage = bundle._tag === "Standalone"
+        ? bundle.package
+        : bundle.target
+      const bundleEntries = bundlePackages(bundle).map((modelPackage) =>
+        packageEntries.get(modelPackage.id))
+      const installation = installedBundle(bundle, packageEntries)
+      if (installation === undefined) {
+        throw new Error(
+          `Installed servable model bundle ${bundleIdentity(bundle)} disappeared during projection`,
+        )
+      }
+      const inspectionFailure = bundleEntries.flatMap((entry) =>
+        entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible"
+          ? [entry.inspection.failure]
+          : [])[0]
+      const inspectedCapabilities = packageEntries.get(primaryPackage.id)?.inspection
+      const inspectionComplete = bundleEntries.every((entry) =>
+        entry?.inspection._tag === "Inspected")
+      const configuration = configurationByBundle.get(bundleIdentity(bundle))
+      const assessment = configuration === undefined
+        ? undefined
+        : assessmentState.get(configuration.id)?.assessment
+      const configuredOffering = configuration === undefined
+        ? undefined
+        : configuredById.get(configuration.id)
+      const projectedOffering = configuredOffering === undefined
+        ? undefined
+        : providerEntries.get(configuredOffering.providerModelId)
+      return {
+        bundle,
+        presentation,
+        installation,
+        readiness: inspectionFailure !== undefined
+          ? { _tag: "Failed", failure: inspectionFailure }
+          : !inspectionComplete || inspectedCapabilities?._tag !== "Inspected"
+            ? { _tag: "Assessing" }
+            : configuration !== undefined
+              && assessment !== undefined
+              && assessment._tag !== "Assessing"
+              ? {
+                  _tag: "Assessed",
+                  capabilities: curated?.capabilities ?? inspectedCapabilities.capabilities,
+                  configuration,
+                  offering: Option.fromNullable(projectedOffering),
+                  assessment,
+                }
+              : localModelAssessmentProfiles(bundle).length === 0
+                ? {
+                    _tag: "Failed",
+                    failure: {
+                      code: "unsupported_model_context_length",
+                      message: `Model context length is below the ${MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH.toLocaleString("en-US")}-token minimum`,
+                      retryable: false,
+                    },
+                  }
+                : { _tag: "Assessing" },
+      }
+    }).sort((left, right) =>
+      left.presentation.displayName.localeCompare(right.presentation.displayName))
     const catalogCandidates = recommendationState._tag === "Ready"
-      ? recommendationState.catalog.flatMap(({ candidate }) => {
-          const model = models.find(({ targetId }) => targetId === candidate.targetId)
-          const projection = targets.get(candidate.targetId)
-          const availability = projection === undefined ? undefined : aggregateAvailability(
-            projection.target,
+      ? recommendationState.catalog.flatMap(({ candidate, configuration }) => {
+          const availability = aggregateAvailability(
+            configuration.bundle,
             packageEntries,
             providerIdByConfiguration.get(candidate.configurationId),
             providerEntries,
             providerProjectionCurrent,
             providerProjectionFailure,
           )
-          return model === undefined || availability === undefined
+          return availability === undefined
             ? []
             : [{
                 ...candidate,
-                download: model.download,
+                download: aggregateDownload(configuration.bundle, packageEntries),
                 availability,
               }]
         })
@@ -428,7 +509,9 @@ export const LocalModelsLive: Layer.Layer<
             progress: recommendationState.progress,
           }
     yield* mirror.setIfChanged({
+      inventory: packageState.inventory,
       models,
+      downloads,
       recommendations: recommendationLifecycle,
     }, equivalent)
   })).pipe(Effect.catchAllCause((cause) =>
@@ -442,8 +525,9 @@ export const LocalModelsLive: Layer.Layer<
     catalog.changes,
     recommendations.changes,
     assessments.changes,
+    retained.changes,
     offerings.changes,
-    offeringProjection.changes,
+    offerings.catalogChanges,
   ], { concurrency: "unbounded" }).pipe(
     Stream.debounce("25 millis"),
     Stream.runForEach(() => project),
@@ -453,17 +537,5 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
-    resolveTarget: (targetId) => Effect.gen(function* () {
-      const recommendationState = (yield* recommendations.snapshot).state
-      const catalogEntry = recommendationState._tag === "Ready"
-        ? recommendationState.catalog.find(({ candidate }) => candidate.targetId === targetId)
-        : undefined
-      if (catalogEntry) return catalogEntry.configuration.target
-      const offering = (yield* offerings.list).find((candidate) => candidate.targetId === targetId)
-      if (offering) return offering.configuration.target
-      const entry = (yield* packages.snapshot).state.entries.find((candidate) =>
-        Option.exists(candidate.targetId, (candidateTargetId) => candidateTargetId === targetId))
-      return entry ? { _tag: "Package" as const, package: entry.package } : undefined
-    }),
   })
 }))

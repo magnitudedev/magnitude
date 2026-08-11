@@ -18,7 +18,7 @@ import {
 } from "@magnitudedev/agent"
 import {
   LocalModelMutationFailed,
-  modelOfferingTargetPackageIds,
+  servableModelBundlePackageIds,
   ModelInstanceIdSchema,
   ModelPreferenceMutationFailed,
   ModelSlotLifecycle,
@@ -57,18 +57,14 @@ import {
   IcnInstances,
 } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
-import {
-  selectedSlotSelection,
-  slotSelectionOption,
-  unassignedSlotSelection,
-} from "@magnitudedev/storage"
+import { MagnitudeStorage } from "@magnitudedev/storage"
 import {
   ReasoningEffortSchema,
   type ProviderId,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { ModelConfiguration } from "./model-configuration"
+import { ModelSelection } from "./model-selection"
 import { MirroredStateChanges } from "./mirrored-state"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
@@ -228,10 +224,11 @@ const modelFailure = (
 export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
-  ModelConfiguration | LocalModelPackages | LocalModelRecommendations | LocalProviderOfferings
+  ModelSelection | MagnitudeStorage | LocalModelPackages | LocalModelRecommendations | LocalProviderOfferings
     | ProviderModelCatalog | MirroredStateChanges | IcnClient | IcnInstances
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
-  const configuration = yield* ModelConfiguration
+  const modelSelection = yield* ModelSelection
+  const storage = yield* MagnitudeStorage
   const localPackages = yield* LocalModelPackages
   const recommendations = yield* LocalModelRecommendations
   const localOfferings = yield* LocalProviderOfferings
@@ -246,22 +243,23 @@ export const ModelSlotControllerLive: Layer.Layer<
     ReadonlyMap<ModelServingConfigurationId, ModelLoadCommand>
   >(new Map())
 
-  const initialConfiguration = yield* configuration.get
+  const initialSelection = yield* modelSelection.get
+  const configuredContextLimits = yield* storage.config.getContextLimitPolicy().pipe(Effect.orDie)
   const initialCatalog = (yield* catalog.snapshot).state
   const emptyState: ModelSlotsState = {
     slots: {
       primary: new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
       secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
     },
-    recentModelIds: initialConfiguration.localModelRecency,
-    favoriteModels: initialConfiguration.favoriteModels,
+    recentModels: initialSelection.recentModels,
+    favoriteModels: initialSelection.favorites,
   }
   const aggregate = yield* SubscriptionRef.make<ControllerAggregate>({
     snapshot: { revision: 0, state: emptyState },
     agentConfiguration: buildConfigStateFromSlots(
       catalogContents(initialCatalog).models,
       emptyState.slots,
-      initialConfiguration.contextLimits,
+      configuredContextLimits,
     ),
     loadTargets: {
       primary: Option.none(),
@@ -275,7 +273,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   const commit = (
     state: ModelSlotsState,
     catalogModels: readonly ProviderModelCatalogEntry[],
-    contextLimits: typeof initialConfiguration.contextLimits,
+    contextLimits: typeof configuredContextLimits,
     loadTargets: ControllerAggregate["loadTargets"],
     instanceBindings: ControllerAggregate["instanceBindings"],
   ) => Effect.gen(function* () {
@@ -388,7 +386,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   }
 
   const rebuild = stateLock.withPermits(1)(Effect.gen(function* () {
-    const configured = yield* configuration.get
+    const configured = yield* modelSelection.get
     const catalogState = (yield* catalog.snapshot).state
     const contents = catalogContents(catalogState)
     const packages = yield* localPackages.installedPackageIds
@@ -432,7 +430,7 @@ export const ModelSlotControllerLive: Layer.Layer<
           const offering = offerings.find((item) =>
             item.providerModelId === selected.providerModelId)
           const downloaded = offering !== undefined
-            && modelOfferingTargetPackageIds(offering.configuration.target)
+            && servableModelBundlePackageIds(offering.configuration.bundle)
               .every((packageId) => packages.has(packageId))
           const availability = localModelSlotAvailability(
             { _tag: "Available" },
@@ -470,11 +468,11 @@ export const ModelSlotControllerLive: Layer.Layer<
 
     const state: ModelSlotsState = {
       slots: {
-        primary: buildSlot(PRIMARY_SLOT_ID, slotSelectionOption(configured.slots.primary)),
-        secondary: buildSlot(SECONDARY_SLOT_ID, slotSelectionOption(configured.slots.secondary)),
+        primary: buildSlot(PRIMARY_SLOT_ID, configured.slots.primary),
+        secondary: buildSlot(SECONDARY_SLOT_ID, configured.slots.secondary),
       },
-      recentModelIds: configured.localModelRecency,
-      favoriteModels: configured.favoriteModels,
+      recentModels: configured.recentModels,
+      favoriteModels: configured.favorites,
     }
     const loadTargetFor = (
       selection: Option.Option<SlotSelection>,
@@ -489,8 +487,8 @@ export const ModelSlotControllerLive: Layer.Layer<
           )
         : Option.none())
     const loadTargets: ControllerAggregate["loadTargets"] = {
-      primary: loadTargetFor(slotSelectionOption(configured.slots.primary)),
-      secondary: loadTargetFor(slotSelectionOption(configured.slots.secondary)),
+      primary: loadTargetFor(configured.slots.primary),
+      secondary: loadTargetFor(configured.slots.secondary),
     }
     const nextBindingFor = (
       key: "primary" | "secondary",
@@ -504,7 +502,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     return yield* commit(
       state,
       contents.models,
-      configured.contextLimits,
+      configuredContextLimits,
       loadTargets,
       {
         primary: nextBindingFor("primary"),
@@ -514,7 +512,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   }))
 
   yield* rebuild
-  yield* Effect.forkIn(configuration.changes.pipe(
+  yield* Effect.forkIn(modelSelection.changes.pipe(
     Stream.runForEach(() => rebuild),
   ), scope)
   yield* Effect.forkIn(localPackages.changes.pipe(Stream.runForEach(() => rebuild)), scope)
@@ -989,10 +987,7 @@ export const ModelSlotControllerLive: Layer.Layer<
         if (Option.isNone(normalized) && previous._tag === "Unassigned") return previous
         if (Option.isSome(normalized) && previous._tag !== "Unassigned"
           && sameSelection(previous.selection, normalized.value)) return previous
-        yield* configuration.updateSlot(slotId, Option.match(normalized, {
-          onNone: unassignedSlotSelection,
-          onSome: selectedSlotSelection,
-        })).pipe(
+        yield* modelSelection.updateSlot(slotId, normalized).pipe(
           Effect.mapError((error) => new ModelSlotMutationFailed({
             slotId,
             code: "model_slot_persistence_failed",
@@ -1004,9 +999,9 @@ export const ModelSlotControllerLive: Layer.Layer<
         return previous
       }))
       if (previous._tag === "ConfiguredLocal" && Option.isSome(previous.instance)) {
-        const configured = (yield* configuration.get).slots
+        const configured = (yield* modelSelection.get).slots
         const stillSelected = [configured.primary, configured.secondary].some((candidate) =>
-          Option.exists(slotSelectionOption(candidate), (value) =>
+          Option.exists(candidate, (value) =>
             value.providerId === LOCAL_PROVIDER_ID
             && value.providerModelId === previous.selection.providerModelId))
         if (!stillSelected) {
@@ -1020,7 +1015,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     })
 
   const setModelFavorite: ModelSlotControllerApi["setModelFavorite"] = (model, favorite) =>
-    configuration.setFavorite(model, favorite).pipe(
+    modelSelection.setFavorite(model, favorite).pipe(
       Effect.mapError(() => new ModelPreferenceMutationFailed({
         message: "Failed to save model favorite",
       })),

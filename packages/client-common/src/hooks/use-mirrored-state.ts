@@ -117,6 +117,7 @@ export function useMirroredStateAtom<
     () =>
       client.query(definition.id, definition.getPayload, {
         reactivityKeys: [definition.id],
+        timeToLive: Infinity,
       }),
     [client, definition],
   )

@@ -75,14 +75,18 @@ import { SessionCommandsLive } from "./session-commands"
 import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
-import { makeModelConfigurationLayer } from "./model-configuration"
+import { ModelSelectionLive } from "./model-selection"
+import { RetainedModelConfigurationsLive } from "./retained-model-configurations"
+import { LocalModelConfigurationCoordinatorLive } from "./local-model-configuration-coordinator"
+import { ConfigurationRecoveryLive } from "./configuration-recovery"
 import { makeAcnIcn } from "./icn"
 import { LocalModelAssessmentsLive } from "./local-model-assessments"
+import { LocalModelAssessorLive } from "./local-model-assessor"
 import { LocalModelPackagesLive } from "./local-model-packages"
+import { LocalModelInstallerLive } from "./local-model-installer"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
-import { LocalProviderOfferingProjectionLive } from "./local-provider-offering-projection"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
@@ -374,13 +378,25 @@ const addLocalInferenceServices = <A, E, R>(
     ModelResidencyPolicyLive,
     withIcn,
   )
-  const withConfiguration = Layer.provideMerge(
-    makeModelConfigurationLayer(),
+  const withSelection = Layer.provideMerge(
+    ModelSelectionLive,
     withResidencyPolicy
+  )
+  const withConfigurationCoordinator = Layer.provideMerge(
+    LocalModelConfigurationCoordinatorLive,
+    withSelection,
+  )
+  const withConfiguration = Layer.provideMerge(
+    RetainedModelConfigurationsLive,
+    withConfigurationCoordinator,
+  )
+  const withConfigurationRecovery = Layer.provideMerge(
+    ConfigurationRecoveryLive,
+    withConfiguration,
   )
   const withCustomEndpoints = Layer.provideMerge(
     CustomEndpointsLive,
-    withConfiguration,
+    withConfigurationRecovery,
   )
   const withHardware = Layer.provideMerge(
     LocalInferenceHardwareLive,
@@ -391,17 +407,18 @@ const addLocalInferenceServices = <A, E, R>(
     LocalModelAssessmentsLive,
     withPackages
   )
+  const withAssessor = Layer.provideMerge(
+    LocalModelAssessorLive,
+    withAssessments,
+  )
+  const withInstaller = Layer.provideMerge(LocalModelInstallerLive, withAssessor)
   const withOfferings = Layer.provideMerge(
     LocalProviderOfferingsLive,
-    withAssessments
-  )
-  const withOfferingProjection = Layer.provideMerge(
-    LocalProviderOfferingProjectionLive,
-    withOfferings
+    withInstaller
   )
   const withRecommendations = Layer.provideMerge(
     makeLocalModelRecommendationsLive(),
-    withOfferingProjection
+    withOfferings
   )
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withRecommendations)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)

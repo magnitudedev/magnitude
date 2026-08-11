@@ -25,6 +25,11 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         searchHuggingFaceModels: makeHttpOperation(http, options, Operations.searchHuggingFaceModelsOperation),
       },
       models: {
+        acknowledgeModelDownloadFailure: makeHttpOperation(
+          http,
+          options,
+          Operations.acknowledgeModelDownloadFailureOperation,
+        ),
         assessModels: makeHttpOperation(http, options, Operations.assessModelsOperation),
         cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
         getModelDownload: makeHttpOperation(http, options, Operations.getModelDownloadOperation),

@@ -14,7 +14,7 @@ import {
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
 import { IcnProvider, createLocalProvider } from "@magnitudedev/icn/provider"
-import { ModelConfiguration } from "./model-configuration"
+import { ModelSelection } from "./model-selection"
 import { SlotIdSchema } from "@magnitudedev/acn-protocol"
 import { CustomEndpoints } from "./custom-endpoints"
 
@@ -118,13 +118,13 @@ export class ProviderClientRegistry extends Context.Tag("ProviderClientRegistry"
 export const ProviderClientRegistryLive: Layer.Layer<
   ProviderClientRegistry,
   never,
-  MagnitudeStorage | IcnProvider | ModelConfiguration | CustomEndpoints
+  MagnitudeStorage | IcnProvider | ModelSelection | CustomEndpoints
 > = Layer.effect(
   ProviderClientRegistry,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
     const local = createLocalProvider(yield* IcnProvider)
-    const modelConfiguration = yield* ModelConfiguration
+    const modelSelection = yield* ModelSelection
     const customEndpoints = yield* CustomEndpoints
     const entries = yield* Ref.make<ReadonlyMap<string, ProviderClientEntry>>(new Map())
     const lock = yield* Effect.makeSemaphore(1)
@@ -147,7 +147,7 @@ export const ProviderClientRegistryLive: Layer.Layer<
             key,
             requestStarted: attribution.requestStarted.pipe(Effect.zipRight(
               Schema.is(SlotIdSchema)(key)
-                ? modelConfiguration.recordUse(key, providerModelId).pipe(Effect.ignore)
+                ? modelSelection.recordUse(key, { providerId, providerModelId }).pipe(Effect.ignore)
                 : Effect.void,
             )),
           }

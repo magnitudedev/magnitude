@@ -5,7 +5,6 @@ import type {
   DownloadAttemptId,
   LocalModelsState,
   ModelInstanceId,
-  ModelOfferingTargetId,
   ModelServingConfigurationId,
   ModelSlotsState,
   ProviderModelId,
@@ -22,7 +21,6 @@ export interface OnboardingLoadModelChoice extends OnboardingModelChoiceBase {
 }
 
 export interface OnboardingConfigurationChoice extends OnboardingModelChoiceBase {
-  readonly targetId: ModelOfferingTargetId
   readonly configurationId: ModelServingConfigurationId
 }
 
@@ -32,7 +30,8 @@ export type OnboardingModelSubmission =
 
 type SubmissionProps = { readonly submission: OnboardingModelSubmission }
 type DownloadProps = SubmissionProps & {
-  readonly targetId: ModelOfferingTargetId
+  readonly configurationId: ModelServingConfigurationId
+  readonly providerModelId: ProviderModelId
   readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
 }
 type LoadProps = SubmissionProps & {
@@ -45,9 +44,6 @@ export class OnboardingAdmittingDownload extends Data.TaggedClass("AdmittingDown
   SubmissionProps & { readonly cancellationRequested: boolean }
 > {}
 export class OnboardingDownloadAdmitted extends Data.TaggedClass("DownloadAdmitted")<DownloadProps> {}
-export class OnboardingCreatingOffering extends Data.TaggedClass("CreatingOffering")<
-  SubmissionProps & { readonly cancellationRequested: boolean }
-> {}
 export class OnboardingRequestingDownloadCancellation extends Data.TaggedClass(
   "RequestingDownloadCancellation",
 )<DownloadProps> {}
@@ -74,7 +70,6 @@ export const OnboardingModelMachine = FSM.defineFSM(
     Idle: OnboardingIdle,
     AdmittingDownload: OnboardingAdmittingDownload,
     DownloadAdmitted: OnboardingDownloadAdmitted,
-    CreatingOffering: OnboardingCreatingOffering,
     RequestingDownloadCancellation: OnboardingRequestingDownloadCancellation,
     AwaitingDownloadCancellation: OnboardingAwaitingDownloadCancellation,
     DownloadCancellationFailed: OnboardingDownloadCancellationFailed,
@@ -88,9 +83,8 @@ export const OnboardingModelMachine = FSM.defineFSM(
   },
   {
     Idle: ["AdmittingDownload", "Assigning"],
-    AdmittingDownload: ["DownloadAdmitted", "CreatingOffering", "Idle"],
-    DownloadAdmitted: ["RequestingDownloadCancellation", "CreatingOffering", "Idle"],
-    CreatingOffering: ["Assigning", "Idle"],
+    AdmittingDownload: ["DownloadAdmitted", "Assigning", "Idle"],
+    DownloadAdmitted: ["RequestingDownloadCancellation", "Assigning", "Idle"],
     RequestingDownloadCancellation: ["AwaitingDownloadCancellation", "DownloadCancellationFailed"],
     AwaitingDownloadCancellation: ["Idle"],
     DownloadCancellationFailed: ["RequestingDownloadCancellation", "Idle"],
@@ -117,7 +111,6 @@ export const resetOnboardingOperation = (
     case "LoadStopFailed":
       return OnboardingModelMachine.transition(state, "Idle", {})
     case "AdmittingDownload":
-    case "CreatingOffering":
     case "RequestingDownloadCancellation":
     case "AwaitingDownloadCancellation":
     case "Assigning":
@@ -143,7 +136,6 @@ export const onboardingProviderModelId = (
     case "RequestingDownloadCancellation":
     case "AwaitingDownloadCancellation":
     case "DownloadCancellationFailed":
-    case "CreatingOffering":
       return Option.none()
     case "Assigning":
     case "AdmittingLoad":
@@ -161,7 +153,6 @@ export const onboardingProviderModelId = (
 export const onboardingCancellationPending = (state: OnboardingModelOperation): boolean => {
   switch (state._tag) {
     case "AdmittingDownload":
-    case "CreatingOffering":
     case "Assigning":
     case "AdmittingLoad":
       return state.cancellationRequested
@@ -183,8 +174,7 @@ export const onboardingCancellationPending = (state: OnboardingModelOperation): 
 export type OnboardingCancellationRequest =
   | { readonly _tag: "Noop"; readonly state: OnboardingModelOperation }
   | { readonly _tag: "Deferred"; readonly state:
-      OnboardingAdmittingDownload | OnboardingCreatingOffering
-        | OnboardingAssigning | OnboardingAdmittingLoad }
+      OnboardingAdmittingDownload | OnboardingAssigning | OnboardingAdmittingLoad }
   | { readonly _tag: "Download"; readonly state: OnboardingRequestingDownloadCancellation }
   | { readonly _tag: "Load"; readonly state: OnboardingRequestingLoadStop }
 
@@ -193,7 +183,6 @@ export const requestOnboardingCancellation = (
 ): OnboardingCancellationRequest => {
   switch (state._tag) {
     case "AdmittingDownload":
-    case "CreatingOffering":
     case "Assigning":
     case "AdmittingLoad":
       return {
@@ -235,29 +224,34 @@ export type DownloadObservation = "Downloaded" | "Failed" | "Cancelled" | "Super
 export const reduceDownloadObservation = (
   correlation: ObservationCorrelation,
   state: LocalModelsState,
-  targetId: ModelOfferingTargetId,
+  configurationId: ModelServingConfigurationId,
   attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
 ): readonly [ObservationCorrelation, Option.Option<DownloadObservation>] => {
-  const model = state.models.find((candidate) => candidate.targetId === targetId)
-  if (!model || model.download._tag === "NotDownloaded") {
-    return [correlation, Option.none()]
-  }
-  if (model.download._tag === "Downloaded") {
-    return [correlation, Option.some("Downloaded")]
-  }
-  const admitted = new Set<DownloadAttemptId>(attemptIds)
-  const exact = model.download.attemptIds.some((attemptId) => admitted.has(attemptId))
-  if (!exact) {
-    return correlation.exactIdentitySeen
-      ? [correlation, Option.some("Superseded")]
-      : [correlation, Option.none()]
-  }
-  const next = { exactIdentitySeen: true }
-  switch (model.download._tag) {
-    case "Downloading": return [next, Option.none()]
-    case "Failed": return [next, Option.some("Failed")]
-    case "Cancelled": return [next, Option.some("Cancelled")]
-  }
+  return Option.match(
+    Option.fromNullable(state.downloads.find(({ configuration }) =>
+      configuration.id === configurationId)),
+    {
+      onNone: () => [correlation, Option.none()],
+      onSome: ({ state: download }) => {
+        if (download._tag === "Downloaded") {
+          return [correlation, Option.some("Downloaded")]
+        }
+        const admitted = new Set<DownloadAttemptId>(attemptIds)
+        const exact = download.attemptIds.some((attemptId) => admitted.has(attemptId))
+        if (!exact) {
+          return correlation.exactIdentitySeen
+            ? [correlation, Option.some("Superseded")]
+            : [correlation, Option.none()]
+        }
+        const next = { exactIdentitySeen: true }
+        switch (download._tag) {
+          case "Downloading": return [next, Option.none()]
+          case "Failed": return [next, Option.some("Failed")]
+          case "Cancelled": return [next, Option.some("Cancelled")]
+        }
+      },
+    },
+  )
 }
 
 export type LoadObservation = "Ready" | "Failed" | "Stopped" | "Superseded"
@@ -295,7 +289,7 @@ export const reduceLoadObservation = (
 
 export const observeAdmittedDownload = <E, R>(
   results: Stream.Stream<Result.Result<{ readonly state: LocalModelsState }, E>, never, R>,
-  targetId: ModelOfferingTargetId,
+  configurationId: ModelServingConfigurationId,
   attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
   accept: (observation: DownloadObservation) => boolean = () => true,
 ): Effect.Effect<DownloadObservation, never, R> => results.pipe(
@@ -307,7 +301,7 @@ export const observeAdmittedDownload = <E, R>(
     const [next, observation] = reduceDownloadObservation(
       correlation,
       state,
-      targetId,
+      configurationId,
       attemptIds,
     )
     return [next, Option.filter(observation, accept)] as const

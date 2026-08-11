@@ -6,6 +6,8 @@ import {
   ReasoningEffortSchema,
 } from "@magnitudedev/ai/provider/model"
 import { FSM } from "@magnitudedev/utils"
+import { ModelPackageInstallationOrigin as ModelPackageInstallationOriginSchema } from "@magnitudedev/icn-protocol/schemas"
+export type { ModelPackageInstallationOrigin } from "@magnitudedev/icn-protocol/schemas"
 
 const { defineFSM } = FSM
 
@@ -51,7 +53,7 @@ export const ModelFailureSchema = Schema.Struct({
 export type ModelFailure = typeof ModelFailureSchema.Type
 
 // =============================================================================
-// Local model packages, targets, assessments, and offerings
+// Local model packages, bundles, assessments, and offerings
 // =============================================================================
 
 export const ModelFileIdSchema = NonEmptyString.pipe(Schema.brand("ModelFileId"))
@@ -75,14 +77,6 @@ export type ModelDownloadStage = typeof ModelDownloadStageSchema.Type
 
 export const ModelInstanceIdSchema = NonEmptyString.pipe(Schema.brand("ModelInstanceId"))
 export type ModelInstanceId = typeof ModelInstanceIdSchema.Type
-
-export const SpeculativeDecodingPairIdSchema =
-  NonEmptyString.pipe(Schema.brand("SpeculativeDecodingPairId"))
-export type SpeculativeDecodingPairId = typeof SpeculativeDecodingPairIdSchema.Type
-
-export const ModelOfferingTargetIdSchema =
-  NonEmptyString.pipe(Schema.brand("ModelOfferingTargetId"))
-export type ModelOfferingTargetId = typeof ModelOfferingTargetIdSchema.Type
 
 export const ModelServingConfigurationIdSchema =
   NonEmptyString.pipe(Schema.brand("ModelServingConfigurationId"))
@@ -267,13 +261,15 @@ export const ModelPackageLocalStateSchema = Schema.Union(
   Schema.TaggedStruct("DownloadCancelled", {
     attemptId: DownloadAttemptIdSchema,
   }),
-  Schema.TaggedStruct("Installed", { path: NonEmptyString }),
+  Schema.TaggedStruct("Installed", {
+    path: NonEmptyString,
+    origin: ModelPackageInstallationOriginSchema,
+  }),
 )
 export type ModelPackageLocalState = typeof ModelPackageLocalStateSchema.Type
 
 export const ModelPackageEntrySchema = Schema.Struct({
   package: ModelPackageSchema,
-  targetId: Schema.optionalWith(ModelOfferingTargetIdSchema, { as: "Option", exact: true }),
   localState: ModelPackageLocalStateSchema,
   inspection: ModelPackageInspectionSchema,
 })
@@ -302,6 +298,7 @@ export const DownloadAttemptSchema = Schema.Union(
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
     failure: ModelFailureSchema,
+    acknowledged: Schema.Boolean,
   }),
   Schema.TaggedStruct("Cancelled", {
     id: DownloadAttemptIdSchema,
@@ -310,28 +307,38 @@ export const DownloadAttemptSchema = Schema.Union(
 )
 export type DownloadAttempt = typeof DownloadAttemptSchema.Type
 
-export const PackageOfferingTargetSchema = Schema.TaggedStruct("Package", {
+export const StandaloneModelBundleSchema = Schema.TaggedStruct("Standalone", {
   package: ModelPackageSchema,
 })
 
 export const SpeculativeDecodingPairSchema = Schema.TaggedStruct("SpeculativeDecodingPair", {
-  id: SpeculativeDecodingPairIdSchema,
   target: ModelPackageSchema,
   draft: ModelPackageSchema,
 })
 
-export const ModelOfferingTargetSchema = Schema.Union(
-  PackageOfferingTargetSchema,
+export const ServableModelBundleSchema = Schema.Union(
+  StandaloneModelBundleSchema,
   SpeculativeDecodingPairSchema,
 )
-export type ModelOfferingTarget = typeof ModelOfferingTargetSchema.Type
+export type ServableModelBundle = typeof ServableModelBundleSchema.Type
 
-export const modelOfferingTargetPackageIds = (
-  target: ModelOfferingTarget,
+export const servableModelBundlePackageIds = (
+  bundle: ServableModelBundle,
 ): readonly ModelPackageId[] =>
-  target._tag === "Package"
-    ? [target.package.id]
-    : [target.target.id, target.draft.id]
+  bundle._tag === "Standalone"
+    ? [bundle.package.id]
+    : [bundle.target.id, bundle.draft.id]
+
+export const sameServableModelBundleIdentity = (
+  left: ServableModelBundle,
+  right: ServableModelBundle,
+): boolean => {
+  if (left._tag !== right._tag) return false
+  const leftPackageIds = servableModelBundlePackageIds(left)
+  const rightPackageIds = servableModelBundlePackageIds(right)
+  return leftPackageIds.length === rightPackageIds.length
+    && leftPackageIds.every((packageId, index) => rightPackageIds[index] === packageId)
+}
 
 export const ServingProfileSchema = Schema.Struct({
   contextLength: PositiveSafeInteger,
@@ -340,7 +347,7 @@ export type ServingProfile = typeof ServingProfileSchema.Type
 
 export const ModelServingConfigurationSchema = Schema.Struct({
   id: ModelServingConfigurationIdSchema,
-  target: ModelOfferingTargetSchema,
+  bundle: ServableModelBundleSchema,
   profile: ServingProfileSchema,
 })
 export type ModelServingConfiguration = typeof ModelServingConfigurationSchema.Type
@@ -351,9 +358,7 @@ export type RecommendableModelCapabilities = typeof RecommendableModelCapabiliti
 export const RecommendableModelSchema = Schema.Struct({
   id: RecommendableModelIdSchema,
   checkpointId: NonEmptyString,
-  targetId: ModelOfferingTargetIdSchema,
-  target: ModelOfferingTargetSchema,
-  profile: ServingProfileSchema,
+  configuration: ModelServingConfigurationSchema,
   displayName: NonEmptyString,
   description: Schema.String,
   license: NonEmptyString,
@@ -412,7 +417,6 @@ export type FitsModelAssessment = typeof FitsModelAssessmentSchema.Type
 
 export const RecommendationSchema = Schema.Struct({
   id: RecommendationIdSchema,
-  targetId: ModelOfferingTargetIdSchema,
   recommendableModelId: RecommendableModelIdSchema,
   displayName: NonEmptyString,
   description: Schema.String,
@@ -423,34 +427,50 @@ export const RecommendationSchema = Schema.Struct({
 })
 export type Recommendation = typeof RecommendationSchema.Type
 
-export const LocalModelDownloadSchema = Schema.Union(
-  Schema.TaggedStruct("NotDownloaded", {
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-  }),
-  Schema.TaggedStruct("Downloading", {
-    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
-    stage: ModelDownloadStageSchema,
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
-  }),
-  Schema.TaggedStruct("Failed", {
-    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-    failure: ModelFailureSchema,
-  }),
-  Schema.TaggedStruct("Cancelled", {
-    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-  }),
-  Schema.TaggedStruct("Downloaded", {
-    installedBytes: NonNegativeSafeInteger,
-  }),
+const LocalModelNotDownloadedSchema = Schema.TaggedStruct("NotDownloaded", {
+  completedBytes: NonNegativeSafeInteger,
+  totalBytes: NonNegativeSafeInteger,
+})
+const LocalModelDownloadingSchema = Schema.TaggedStruct("Downloading", {
+  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  stage: ModelDownloadStageSchema,
+  completedBytes: NonNegativeSafeInteger,
+  totalBytes: NonNegativeSafeInteger,
+  bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+})
+const LocalModelDownloadFailedSchema = Schema.TaggedStruct("Failed", {
+  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  completedBytes: NonNegativeSafeInteger,
+  totalBytes: NonNegativeSafeInteger,
+  failure: ModelFailureSchema,
+})
+const LocalModelDownloadCancelledSchema = Schema.TaggedStruct("Cancelled", {
+  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  completedBytes: NonNegativeSafeInteger,
+  totalBytes: NonNegativeSafeInteger,
+})
+const LocalModelDownloadedSchema = Schema.TaggedStruct("Downloaded", {
+  installedBytes: NonNegativeSafeInteger,
+  origins: Schema.NonEmptyArray(ModelPackageInstallationOriginSchema),
+})
+
+export const LocalModelCatalogDownloadStateSchema = Schema.Union(
+  LocalModelNotDownloadedSchema,
+  LocalModelDownloadingSchema,
+  LocalModelDownloadFailedSchema,
+  LocalModelDownloadCancelledSchema,
+  LocalModelDownloadedSchema,
 )
-export type LocalModelDownload = typeof LocalModelDownloadSchema.Type
+export type LocalModelCatalogDownloadState =
+  typeof LocalModelCatalogDownloadStateSchema.Type
+
+export const LocalModelDownloadStateSchema = Schema.Union(
+  LocalModelDownloadingSchema,
+  LocalModelDownloadFailedSchema,
+  LocalModelDownloadCancelledSchema,
+  LocalModelDownloadedSchema,
+)
+export type LocalModelDownloadState = typeof LocalModelDownloadStateSchema.Type
 
 export const ModelDownloadAdmissionSchema = Schema.Union(
   Schema.TaggedStruct("AlreadyInstalled", {}),
@@ -459,6 +479,12 @@ export const ModelDownloadAdmissionSchema = Schema.Union(
   }),
 )
 export type ModelDownloadAdmission = typeof ModelDownloadAdmissionSchema.Type
+
+export const ModelInstallationAdmissionSchema = Schema.Struct({
+  providerModelId: ProviderModelIdSchema,
+  download: ModelDownloadAdmissionSchema,
+})
+export type ModelInstallationAdmission = typeof ModelInstallationAdmissionSchema.Type
 
 export const LocalModelCatalogCandidateAvailabilitySchema = Schema.Union(
   Schema.TaggedStruct("NotDownloaded", {}),
@@ -470,35 +496,101 @@ export const LocalModelCatalogCandidateAvailabilitySchema = Schema.Union(
 export type LocalModelCatalogCandidateAvailability =
   typeof LocalModelCatalogCandidateAvailabilitySchema.Type
 
-export const LocalModelOfferingReferenceSchema = Schema.Struct({
-  configurationId: ModelServingConfigurationIdSchema,
-  providerModelId: ProviderModelIdSchema,
-})
-export type LocalModelOfferingReference = typeof LocalModelOfferingReferenceSchema.Type
+export const ProviderModelDisabledReasonSchema = Schema.Literal(
+  "insufficient_resources",
+  "provider_unavailable",
+  "model_unavailable",
+  "installation_unavailable",
+  "incompatible_runtime",
+  "invalid_configuration",
+)
+export type ProviderModelDisabledReason = typeof ProviderModelDisabledReasonSchema.Type
 
-export const LocalModelAssessmentLifecycleSchema = Schema.Union(
-  Schema.TaggedStruct("Unassessed", {}),
-  Schema.TaggedStruct("Assessing", {}),
-  Schema.TaggedStruct("Assessed", {
+export const ProviderModelCatalogEntrySchema = Schema.Struct({
+  providerId: ProviderIdSchema,
+  providerModelId: ProviderModelIdSchema,
+  modelFamilyId: Schema.optionalWith(ModelFamilyIdSchema, { as: "Option", exact: true }),
+  displayName: Schema.String,
+  supportedSlots: Schema.Array(SlotIdSchema),
+  contextWindow: PositiveSafeInteger,
+  maxOutputTokens: PositiveSafeInteger,
+  memory: Schema.optionalWith(Schema.Array(MemoryAssessmentSchema), { as: "Option", exact: true }),
+  capabilities: ModelCapabilitiesSchema,
+  availability: Schema.Union(
+    Schema.TaggedStruct("Available", {}),
+    Schema.TaggedStruct("Disabled", { reason: ProviderModelDisabledReasonSchema }),
+  ),
+  pricing: Schema.optionalWith(Schema.Struct({
+    input: FiniteNonNegative,
+    output: FiniteNonNegative,
+    cachedInput: Schema.optionalWith(FiniteNonNegative, { as: "Option", exact: true }),
+  }), { as: "Option", exact: true }),
+}).pipe(Schema.filter((model) => new Set(model.supportedSlots).size === model.supportedSlots.length,
+  { message: () => "supported model slots must be unique" }))
+export type ProviderModelCatalogEntry = typeof ProviderModelCatalogEntrySchema.Type
+
+export const LocalModelOfferingSchema = ProviderModelCatalogEntrySchema
+export type LocalModelOffering = typeof LocalModelOfferingSchema.Type
+
+export const LocalModelConfigurationAssessmentSchema = Schema.Union(
+  Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
+  Schema.TaggedStruct("Fits", {
+    assessment: FitsModelAssessmentSchema,
+  }),
+  Schema.TaggedStruct("DoesNotFit", {
+    assessmentId: ModelAssessmentIdSchema,
     environmentId: AssessmentEnvironmentIdSchema,
-    configurationIds: Schema.Array(ModelServingConfigurationIdSchema),
+    memory: Schema.Array(MemoryAssessmentSchema),
+    deficitBytes: NonNegativeSafeInteger,
+    limitingResource: NonEmptyString,
+  }),
+  Schema.TaggedStruct("Incompatible", {
+    environmentId: AssessmentEnvironmentIdSchema,
+    failure: ModelFailureSchema,
   }),
 )
-export type LocalModelAssessmentLifecycle = typeof LocalModelAssessmentLifecycleSchema.Type
+export type LocalModelConfigurationAssessment =
+  typeof LocalModelConfigurationAssessmentSchema.Type
+
+export const LocalModelInstallationSchema = Schema.Struct({
+  installedBytes: NonNegativeSafeInteger,
+  origins: Schema.NonEmptyArray(ModelPackageInstallationOriginSchema),
+})
+export type LocalModelInstallation = typeof LocalModelInstallationSchema.Type
+
+export const LocalModelReadinessSchema = Schema.Union(
+  Schema.TaggedStruct("Assessing", {}),
+  Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
+  Schema.TaggedStruct("Assessed", {
+    capabilities: ModelCapabilitiesSchema,
+    configuration: ModelServingConfigurationSchema,
+    offering: Schema.optionalWith(LocalModelOfferingSchema, { as: "Option", exact: true }),
+    assessment: LocalModelConfigurationAssessmentSchema,
+  }),
+)
+export type LocalModelReadiness = typeof LocalModelReadinessSchema.Type
 
 export const LocalModelSchema = Schema.Struct({
-  targetId: ModelOfferingTargetIdSchema,
-  offerings: Schema.Array(LocalModelOfferingReferenceSchema),
-  displayName: NonEmptyString,
-  description: Schema.String,
-  kind: Schema.Literal("Standalone", "SpeculativePair"),
-  quantization: NonEmptyString,
-  maximumContextLength: PositiveSafeInteger,
-  downloadBytes: NonNegativeSafeInteger,
-  download: LocalModelDownloadSchema,
-  assessment: LocalModelAssessmentLifecycleSchema,
+  bundle: ServableModelBundleSchema,
+  presentation: Schema.Struct({
+    displayName: NonEmptyString,
+    description: Schema.String,
+  }),
+  installation: LocalModelInstallationSchema,
+  readiness: LocalModelReadinessSchema,
 })
 export type LocalModel = typeof LocalModelSchema.Type
+
+export const LocalModelDownloadSchema = Schema.Struct({
+  configuration: ModelServingConfigurationSchema,
+  presentation: Schema.Struct({
+    displayName: NonEmptyString,
+    description: Schema.String,
+  }),
+  capabilities: Schema.optionalWith(ModelCapabilitiesSchema, { as: "Option", exact: true }),
+  state: LocalModelDownloadStateSchema,
+})
+export type LocalModelDownload = typeof LocalModelDownloadSchema.Type
 
 export const LocalModelCatalogRecommendationEvidenceSchema = Schema.Struct({
   intelligence: Schema.optionalWith(Schema.Struct({
@@ -515,7 +607,6 @@ const LocalModelCatalogCandidateMetadataFields = {
   configurationId: ModelServingConfigurationIdSchema,
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
-  targetId: ModelOfferingTargetIdSchema,
   displayName: NonEmptyString,
   description: Schema.String,
   license: NonEmptyString,
@@ -548,7 +639,7 @@ export type LocalModelCatalogCandidateMetadata =
 
 export const LocalModelCatalogCandidateSchema = Schema.Struct({
   ...LocalModelCatalogCandidateMetadataFields,
-  download: LocalModelDownloadSchema,
+  download: LocalModelCatalogDownloadStateSchema,
   availability: LocalModelCatalogCandidateAvailabilitySchema,
 }).pipe(Schema.filter((candidate) =>
   candidate.performance.at(-1)?.contextTokens === candidate.profile.contextLength,
@@ -622,12 +713,23 @@ export type LocalModelRecommendationsLifecycle =
   typeof LocalModelRecommendationsLifecycleSchema.Type
 
 export const LocalModelsStateSchema = Schema.Struct({
+  inventory: Schema.Union(
+    Schema.TaggedStruct("Initializing", {}),
+    Schema.TaggedStruct("Ready", {}),
+    Schema.TaggedStruct("Degraded", { failure: ModelFailureSchema }),
+  ),
   models: Schema.Array(LocalModelSchema),
+  downloads: Schema.Array(LocalModelDownloadSchema),
   recommendations: LocalModelRecommendationsLifecycleSchema,
 })
 export type LocalModelsState = typeof LocalModelsStateSchema.Type
 
 export const ModelPackagesStateSchema = Schema.Struct({
+  inventory: Schema.Union(
+    Schema.TaggedStruct("Initializing", {}),
+    Schema.TaggedStruct("Ready", {}),
+    Schema.TaggedStruct("Degraded", { failure: ModelFailureSchema }),
+  ),
   entries: Schema.Array(ModelPackageEntrySchema),
 })
 export type ModelPackagesState = typeof ModelPackagesStateSchema.Type
@@ -645,7 +747,6 @@ export type LocalModelDownloadsState = typeof LocalModelDownloadsStateSchema.Typ
 
 export const LocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
-  targetId: ModelOfferingTargetIdSchema,
   configuration: ModelServingConfigurationSchema,
   capabilities: ModelCapabilitiesSchema,
 })
@@ -673,39 +774,6 @@ export const ProviderCatalogEntrySchema = Schema.Struct({
   availability: ProviderAvailabilitySchema,
 })
 export type ProviderCatalogEntry = typeof ProviderCatalogEntrySchema.Type
-
-export const ProviderModelDisabledReasonSchema = Schema.Literal(
-  "insufficient_resources",
-  "provider_unavailable",
-  "model_unavailable",
-  "installation_unavailable",
-  "incompatible_runtime",
-  "invalid_configuration",
-)
-export type ProviderModelDisabledReason = typeof ProviderModelDisabledReasonSchema.Type
-
-export const ProviderModelCatalogEntrySchema = Schema.Struct({
-  providerId: ProviderIdSchema,
-  providerModelId: ProviderModelIdSchema,
-  modelFamilyId: Schema.optionalWith(ModelFamilyIdSchema, { as: "Option", exact: true }),
-  displayName: Schema.String,
-  supportedSlots: Schema.Array(SlotIdSchema),
-  contextWindow: PositiveSafeInteger,
-  maxOutputTokens: PositiveSafeInteger,
-  memory: Schema.optionalWith(Schema.Array(MemoryAssessmentSchema), { as: "Option", exact: true }),
-  capabilities: ModelCapabilitiesSchema,
-  availability: Schema.Union(
-    Schema.TaggedStruct("Available", {}),
-    Schema.TaggedStruct("Disabled", { reason: ProviderModelDisabledReasonSchema }),
-  ),
-  pricing: Schema.optionalWith(Schema.Struct({
-    input: FiniteNonNegative,
-    output: FiniteNonNegative,
-    cachedInput: Schema.optionalWith(FiniteNonNegative, { as: "Option", exact: true }),
-  }), { as: "Option", exact: true }),
-}).pipe(Schema.filter((model) => new Set(model.supportedSlots).size === model.supportedSlots.length,
-  { message: () => "supported model slots must be unique" }))
-export type ProviderModelCatalogEntry = typeof ProviderModelCatalogEntrySchema.Type
 
 export const ProviderModelIdentitySchema = Schema.Struct({
   providerId: ProviderIdSchema,
@@ -934,9 +1002,9 @@ export const ModelSlotsStateSchema = Schema.Struct({
     primary: ModelSlotSchema,
     secondary: ModelSlotSchema,
   }),
-  recentModelIds: Schema.Struct({
-    primary: Schema.Array(ProviderModelIdSchema),
-    secondary: Schema.Array(ProviderModelIdSchema),
+  recentModels: Schema.Struct({
+    primary: Schema.Array(ProviderModelIdentitySchema),
+    secondary: Schema.Array(ProviderModelIdentitySchema),
   }),
   favoriteModels: Schema.Array(ProviderModelIdentitySchema),
 }).pipe(

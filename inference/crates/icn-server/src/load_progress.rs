@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use icn_contracts::models::{
-    ModelFileRole, ModelOfferingTarget, ModelPackage, ModelServingConfiguration,
+    ModelFileRole, ModelPackage, ModelServingConfiguration, ServableModelBundle,
 };
 use icn_engine::{ModelLoadObserver, ModelLoadPhase};
 use icn_models::ModelCache;
@@ -417,9 +417,9 @@ fn retain_recent<T>(
 }
 
 fn packages(configuration: &ModelServingConfiguration) -> Vec<&ModelPackage> {
-    match &configuration.target {
-        ModelOfferingTarget::Package { package } => vec![package],
-        ModelOfferingTarget::SpeculativeDecodingPair { target, draft, .. } => {
+    match &configuration.bundle {
+        ServableModelBundle::Standalone { package } => vec![package],
+        ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => {
             vec![target, draft]
         }
     }
@@ -427,9 +427,9 @@ fn packages(configuration: &ModelServingConfiguration) -> Vec<&ModelPackage> {
 
 fn phase_work(configuration: &ModelServingConfiguration) -> BTreeMap<ModelLoadPhase, f64> {
     let mut result = BTreeMap::new();
-    let (target, draft) = match &configuration.target {
-        ModelOfferingTarget::Package { package } => (package, None),
-        ModelOfferingTarget::SpeculativeDecodingPair { target, draft, .. } => (target, Some(draft)),
+    let (target, draft) = match &configuration.bundle {
+        ServableModelBundle::Standalone { package } => (package, None),
+        ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => (target, Some(draft)),
     };
     let target_bytes = target
         .files

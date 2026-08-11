@@ -19,9 +19,8 @@ macro_rules! string_id {
 string_id!(ModelFileId);
 string_id!(ModelPackageId);
 string_id!(DownloadAttemptId);
-string_id!(SpeculativeDecodingPairId);
 string_id!(ModelAssessmentRequestId);
-string_id!(ModelOfferingTargetId);
+string_id!(ServableModelBundleKey);
 string_id!(ModelServingConfigurationId);
 string_id!(ModelAssessmentId);
 string_id!(AssessmentEnvironmentId);
@@ -275,19 +274,30 @@ pub enum ModelPackageInspection {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ModelPackageInstallationOrigin {
+    Magnitude,
+    HuggingFaceCache,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstalledModelPackage {
-    pub target_id: ModelOfferingTargetId,
     pub package: ModelPackage,
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub path: PathBuf,
+    pub origin: ModelPackageInstallationOrigin,
     pub inspection: ModelPackageInspection,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstalledModelPackagesResponse {
+    pub revision: u64,
+    pub reconciliation_complete: bool,
     pub packages: Vec<InstalledModelPackage>,
 }
 
@@ -302,12 +312,11 @@ pub struct RemoveInstalledModelPackageResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelOfferingTarget {
-    Package {
+pub enum ServableModelBundle {
+    Standalone {
         package: ModelPackage,
     },
     SpeculativeDecodingPair {
-        id: SpeculativeDecodingPairId,
         target: ModelPackage,
         draft: ModelPackage,
     },
@@ -325,7 +334,7 @@ pub struct ServingProfile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelServingConfiguration {
     pub id: ModelServingConfigurationId,
-    pub target: ModelOfferingTarget,
+    pub bundle: ServableModelBundle,
     pub profile: ServingProfile,
 }
 
@@ -355,9 +364,7 @@ pub struct ModelCapabilities {
 pub struct RecommendableModel {
     pub id: RecommendableModelId,
     pub checkpoint_id: String,
-    pub target_id: ModelOfferingTargetId,
-    pub target: ModelOfferingTarget,
-    pub profile: ServingProfile,
+    pub configuration: ModelServingConfiguration,
     pub display_name: String,
     pub description: String,
     pub license: String,
@@ -398,9 +405,9 @@ pub enum ModelPackageOperand {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelTargetInput {
+pub enum ModelBundleInput {
     #[serde(rename_all = "camelCase")]
-    Package { package: ModelPackageOperand },
+    Standalone { package: ModelPackageOperand },
     #[serde(rename_all = "camelCase")]
     SpeculativeDecodingPair {
         target: ModelPackageOperand,
@@ -428,7 +435,7 @@ pub struct ModelAssessmentProfile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssessModelRequest {
     pub request_id: ModelAssessmentRequestId,
-    pub target: ModelTargetInput,
+    pub bundle: ModelBundleInput,
     pub profiles: Vec<ModelAssessmentProfile>,
 }
 
@@ -533,11 +540,10 @@ pub enum AssessModelResult {
     #[serde(rename_all = "camelCase")]
     Assessed {
         request_id: ModelAssessmentRequestId,
-        target_id: ModelOfferingTargetId,
         profiles: Vec<ModelAssessment>,
     },
     #[serde(rename_all = "camelCase")]
-    InvalidTarget {
+    InvalidBundle {
         request_id: ModelAssessmentRequestId,
         failure: ModelFailure,
     },
@@ -554,7 +560,7 @@ pub struct AssessModelsResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadRequest {
-    pub target: ModelOfferingTarget,
+    pub bundle: ServableModelBundle,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -588,6 +594,9 @@ pub enum DownloadAttempt {
         completed_bytes: u64,
         total_bytes: u64,
         failure: ModelFailure,
+        #[serde(default)]
+        #[cfg_attr(feature = "openapi", schema(required = true))]
+        acknowledged: bool,
     },
     #[serde(rename_all = "camelCase")]
     Cancelled {
@@ -599,7 +608,6 @@ pub enum DownloadAttempt {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadResponse {
-    pub target_id: ModelOfferingTargetId,
     pub attempts: Vec<DownloadAttempt>,
 }
 
@@ -678,37 +686,37 @@ pub enum ModelLoadEvent {
 }
 
 #[derive(Clone)]
-pub struct ResolvedModelTarget {
-    pub target_id: ModelOfferingTargetId,
-    pub target: ModelOfferingTarget,
+pub struct ResolvedServableModelBundle {
+    pub bundle_key: ServableModelBundleKey,
+    pub bundle: ServableModelBundle,
     pub target_model: ResolvedModel,
     pub draft_model: Option<ResolvedModel>,
     resolution_guards: Vec<std::sync::Arc<dyn Send + Sync>>,
 }
 
-impl std::fmt::Debug for ResolvedModelTarget {
+impl std::fmt::Debug for ResolvedServableModelBundle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ResolvedModelTarget")
-            .field("target_id", &self.target_id)
-            .field("target", &self.target)
+            .debug_struct("ResolvedServableModelBundle")
+            .field("bundle_key", &self.bundle_key)
+            .field("bundle", &self.bundle)
             .field("target_model", &self.target_model)
             .field("draft_model", &self.draft_model)
             .finish_non_exhaustive()
     }
 }
 
-impl ResolvedModelTarget {
+impl ResolvedServableModelBundle {
     #[must_use]
     pub fn new(
-        target_id: ModelOfferingTargetId,
-        target: ModelOfferingTarget,
+        bundle_key: ServableModelBundleKey,
+        bundle: ServableModelBundle,
         target_model: ResolvedModel,
         draft_model: Option<ResolvedModel>,
     ) -> Self {
         Self {
-            target_id,
-            target,
+            bundle_key,
+            bundle,
             target_model,
             draft_model,
             resolution_guards: Vec::new(),
@@ -722,15 +730,15 @@ impl ResolvedModelTarget {
     }
 }
 
-/// Installed package and exact-target resolution boundary.
+/// Installed package and exact-bundle resolution boundary.
 pub trait InstalledModelPackages: Send + Sync + 'static {
     fn list_installed(
         &self,
     ) -> BoxFuture<'_, Result<InstalledModelPackagesResponse, InventoryError>>;
-    fn resolve_target(
+    fn resolve_bundle(
         &self,
-        target: ModelTargetInput,
-    ) -> BoxFuture<'_, Result<ResolvedModelTarget, InventoryError>>;
+        bundle: ModelBundleInput,
+    ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>>;
     fn remove_installed(
         &self,
         package_id: &ModelPackageId,
@@ -759,6 +767,10 @@ pub trait ModelDownloads: Send + Sync + 'static {
         id: &DownloadAttemptId,
     ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
     fn cancel(
+        &self,
+        id: &DownloadAttemptId,
+    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
+    fn acknowledge_failure(
         &self,
         id: &DownloadAttemptId,
     ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;

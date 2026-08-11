@@ -4,7 +4,8 @@ applies_to:
   - inference/crates/icn-models/**
   - inference/crates/icn-api/**
   - packages/icn/src/hardware/**
-  - packages/acn/src/local-model-assessments.ts
+  - packages/acn/src/local-model-assessment*.ts
+  - packages/acn/src/local-model-assessor.ts
   - packages/acn/src/local-model-recommendations.ts
   - packages/acn/src/local-model-recommendation-policy.ts
   - packages/acn/src/local-models.ts
@@ -28,61 +29,108 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 ## Pipeline
 
 ```text
-recommendable target
+catalog-published serving configuration
   -> exact tensor-storage rejection proof
-  -> catalog-owned profile, or 100K default for discovered installed targets
   -> cached or native ICN assessment with 25K, 50K, 75K, and full-context speed samples
   -> completed configuration candidates
   -> recommendation portfolio
 ```
 
 The rejection proof compares exact, content-deduplicated tensor storage with aggregate stable
-physical capacity. Uncertain targets proceed. File/download size is not rejection evidence.
+physical capacity. Uncertain bundles proceed. File/download size is not rejection evidence.
 
 ## Assessment service
 
-ACN exposes one assessment service accepting a batch of exact targets and profiles. It owns the
+ACN exposes one assessment executor accepting exact bundles and profiles. It owns the
 scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
-One catalog projection assesses release-catalog and discovered installed targets together;
-recommendation policy consumes the release-catalog candidates from that projection. Each
-release-catalog target uses its one reviewed catalog profile. A discovered installed target uses
-the 100K product default, bounded by the target maximum. A speculative pair is additionally bounded
-by the lower component maximum.
+One ACN local-model assessor owns demand for release-catalog configurations, retained
+configurations, and standard configurations derived only for inspected standalone bundles with no
+retained or catalog configuration.
+Recommendation, provider-offering, and local-model projections consume its state and
+never invoke assessment independently. Recommendation policy consumes only release-catalog
+candidates. Each release-catalog configuration uses its reviewed catalog profile. A retained
+configuration uses its exact persisted profile unchanged. An inspected standalone package uses the
+standard profile bounded by its package maximum only when no retained or catalog configuration
+exists for that bundle. Package installation origin does not affect this decision.
 
 ICN persists every completed exact profile result, including `DoesNotFit`, and performs
 single-flight native work. Repeated reads consume current results and do not trigger native
 assessment.
 
-Candidate and recommendation projection is a scoped background consumer. Constructing
-ACN services publishes their initial observable state without waiting for assessment; only the
-operation owner awaits its bounded request.
+The assessor is a scoped background owner. Constructing ACN services publishes initial
+observable state without waiting for assessment; only the admitted operation owner awaits its
+bounded native request.
+
+## Demand and invalidation
+
+The assessor reconciles current snapshots rather than treating notifications as semantic
+changes:
+
+```text
+source invalidation
+       |
+       v
+coalesce -> read snapshots -> compute semantic assessment keys
+                                      |
+                          +-----------+-----------+
+                          |                       |
+                       unchanged                changed
+                          |                       |
+                    retain result          assess exact key
+                                                  |
+                                      publish only while current
+```
+
+One semantic assessment key contains the complete serving configuration, resolved immutable
+assessment material, stable topology and capacity identity, native build and enabled backends,
+calibration identity, assessment method and policy, and requested performance-depth policy.
+
+Download bytes, transfer speed, attempt identity, package or inventory revision, catalog
+presentation, live free memory, provider state, slot state, runtime residency, and client activity
+are not assessment inputs. Revisions may require a reread; revision inequality never admits native
+assessment by itself.
+
+Reconciliation is serialized and invalidations are coalesced. It assesses only new or changed keys,
+preserves terminal results for unchanged keys, and removes state only when catalog, retained, and
+installed-package demand no longer includes the configuration. Completion rechecks the semantic key before publication;
+a result for a superseded key is discarded and reconciliation continues without overwriting newer
+state.
 
 ## Publication boundary
 
 A catalog candidate exists only for one completed `Fits` configuration. It contains its exact
-target, serving configuration, profile, assessment environment, memory, performance, capability,
+bundle, serving configuration, profile, assessment environment, memory, performance, capability,
 acquisition, and source evidence.
 
 Candidate performance is an ordered set of samples for the same configuration. Samples above the
 configured context are omitted, and the final sample is always the configured context.
 
-Recommendation evidence is present only when the target comes from the recommendable catalog.
-Discovered installed targets remain selectable catalog candidates without fabricated intelligence,
-fidelity, or quality values.
+Recommendation evidence is present only when the bundle comes from the recommendable catalog.
+Retained configurations outside the current catalog remain selectable provider offerings without
+fabricated intelligence, fidelity, or quality values when exact assessment and package evidence
+make them available.
 
 `DoesNotFit` and `Incompatible` are completed evidence but are not selectable candidates. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.
-Installed targets remain present independently of assessment and offering publication.
+Retained configurations remain durable independently of recommendation publication. Installed
+packages remain present in the [local-model product projection](./local-model-product-projection.md)
+independently of assessment and offering publication.
 
 ## Assessment lifecycle
 
-ACN exposes one shared assessment query. Its observable state is `Unassessed`, `Assessing`, or
-`Assessed`. `Assessing` is an empty marker scoped to the admitted Effect. Finalization clears or
-completes it on every exit path, and overlapping owners are serialized so stale completion is
-unrepresentable.
+ACN owns one shared per-configuration assessment coordinator. While admitted work for the current
+semantic key is running, its internal state is `Assessing`. Completion publishes `Failed`, `Fits`,
+`DoesNotFit`, or `Incompatible` for that key. Serialized reconciliation plus key validation makes
+stale completion unrepresentable. Unchanged configurations retain their terminal state while
+another configuration is assessed.
 
-An assessment endpoint defect fails the owning operation. ACN retains prior complete publication when
-available and never converts the defect into `DoesNotFit`, incompatibility, or an empty catalog.
+The product projection never publishes an absent assessment as a configuration result. An
+installed model without a terminal result for its decided configuration has model-level readiness
+`Assessing`; an assessed model contains exactly that configuration and its terminal result.
+
+An assessment-operation defect publishes `Failed` with its typed failure. It is not converted into
+`DoesNotFit` or `Incompatible`, and it cannot replace the local-model collection with an empty
+snapshot.
 
 ## Recommendation portfolio
 
@@ -129,11 +177,16 @@ Cached assessment never authorizes loading.
 
 ## Conformance
 
-- Every release-catalog target has one reviewed profile that does not exceed its exact target
-  maximum. Every discovered installed target has one 100K profile bounded by its exact target
-  maximum.
-- All missing profiles for one target are submitted together.
+- Every release-catalog choice publishes one reviewed configuration whose profile does not exceed
+  its exact bundle maximum. Retained configurations are assessed at their exact stored profiles.
+- Every inspected independently servable package without a retained or catalog configuration
+  receives one standard standalone assessment.
+- All missing profiles for one bundle are submitted together.
 - Equivalent concurrent misses perform one native assessment.
+- Download progress and semantically equivalent newer source revisions perform no assessment.
+- A changed semantic key reassesses only the affected configurations.
+- Provider-offering and local-model projection never invoke assessment.
+- Assessment completion cannot publish against a superseded semantic key.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
 - The recommendation eligibility floor uses full-context performance; ranking and relative
   comparisons use the bounded 50K sample.

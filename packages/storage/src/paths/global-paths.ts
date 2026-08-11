@@ -10,6 +10,10 @@ export interface GlobalStoragePaths {
   readonly authFile: string
   readonly localModelIndexFile: string
 
+  readonly stateRoot: string
+  readonly modelsFile: string
+  readonly onboardingFile: string
+
   readonly sessionsRoot: string
   readonly indexRoot: string
   readonly pendingMemoryExtractionRoot: string
@@ -52,6 +56,7 @@ export function defaultGlobalStorageRoot(): string {
 
 export function makeGlobalStoragePaths(root: string): GlobalStoragePaths {
   const sessionsRoot = join(root, 'sessions')
+  const stateRoot = join(root, 'state')
   const tracesRoot = join(root, 'traces')
   const logsRoot = join(root, 'logs')
   const skillsRoot = join(root, 'skills')
@@ -76,6 +81,10 @@ export function makeGlobalStoragePaths(root: string): GlobalStoragePaths {
     configFile: join(root, 'config.json'),
     authFile: join(root, 'auth.json'),
     localModelIndexFile: join(root, 'local-model-index.json'),
+
+    stateRoot,
+    modelsFile: join(stateRoot, 'models.json'),
+    onboardingFile: join(stateRoot, 'onboarding.json'),
 
     sessionsRoot,
     indexRoot,

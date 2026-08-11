@@ -11,7 +11,6 @@ export interface ModelMemoryConditions {
   readonly exceedsCapacity: boolean
   readonly belowWarningReserve: boolean
   readonly lacksCurrentHeadroom: boolean
-  readonly evidenceUnavailable: boolean
 }
 
 const lacksCurrentHeadroom = (
@@ -86,7 +85,6 @@ const assessedMemoryConditions = (
     lacksCurrentHeadroom: hardware !== undefined
       && systemRequiredBytes !== undefined
       && lacksCurrentHeadroom(systemRequiredBytes, hardware, residentAllocation, systemDomains),
-    evidenceUnavailable: hardware === undefined || systemRequiredBytes === undefined,
   }
 }
 
@@ -100,7 +98,6 @@ export const providerModelMemoryConditions = (
       exceedsCapacity: false,
       belowWarningReserve: false,
       lacksCurrentHeadroom: false,
-      evidenceUnavailable: true,
     }),
     onSome: (memory) => assessedMemoryConditions(memory, hardware, residentAllocation),
   })
@@ -116,30 +113,24 @@ export const modelMemoryStatusLabel = ({
   exceedsCapacity,
   lacksCurrentHeadroom,
   belowWarningReserve,
-  evidenceUnavailable,
 }: ModelMemoryConditions): string =>
-  evidenceUnavailable
-    ? "Unavailable"
-    : exceedsCapacity
-      ? "Too large"
-      : lacksCurrentHeadroom
-        ? "Free memory"
-        : belowWarningReserve
-          ? "Tight fit"
-          : ""
+  exceedsCapacity
+    ? "Too large"
+    : lacksCurrentHeadroom
+      ? "Free memory"
+      : belowWarningReserve
+        ? "Tight fit"
+        : ""
 
 export const modelMemoryStatusDetail = ({
   exceedsCapacity,
   lacksCurrentHeadroom,
   belowWarningReserve,
-  evidenceUnavailable,
 }: ModelMemoryConditions): string =>
-  evidenceUnavailable
-    ? "Memory information is unavailable"
-    : exceedsCapacity
-      ? "Requires more memory than this system has"
-      : lacksCurrentHeadroom
-        ? "Not enough memory available - close memory-intensive apps"
-        : belowWarningReserve
-          ? "High memory use"
-          : ""
+  exceedsCapacity
+    ? "Requires more memory than this system has"
+    : lacksCurrentHeadroom
+      ? "Not enough memory available - close memory-intensive apps"
+      : belowWarningReserve
+        ? "High memory use"
+        : ""

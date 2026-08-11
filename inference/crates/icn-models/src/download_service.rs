@@ -8,13 +8,12 @@ use futures_util::future::BoxFuture;
 use getrandom::fill;
 use icn_contracts::models::{
     DownloadAttempt, DownloadAttemptId, ModelDownloads, ModelDownloadsResponse, ModelFailure,
-    ModelOfferingTarget, ModelPackage, StartModelDownloadRequest, StartModelDownloadResponse,
+    ModelPackage, ServableModelBundle, StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{DownloadStage, InventoryError, ModelDownloadEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::inventory::ModelManager;
-use crate::package_service::offering_target_id;
 
 #[derive(Clone)]
 pub struct ManagedModelDownloads {
@@ -54,6 +53,7 @@ impl ManagedModelDownloads {
                         message: "download was interrupted when ICN stopped".to_owned(),
                         retryable: true,
                     },
+                    acknowledged: false,
                 };
             }
         }
@@ -142,6 +142,7 @@ impl ManagedModelDownloads {
                         message: error.message,
                         retryable: error.retryable,
                     },
+                    acknowledged: false,
                 },
             };
             let is_terminal = matches!(
@@ -170,6 +171,7 @@ impl ManagedModelDownloads {
                         message: "download ended before reporting a terminal result".to_owned(),
                         retryable: true,
                     },
+                    acknowledged: false,
                 },
             );
         }
@@ -237,22 +239,67 @@ fn load_records(path: &Path) -> BTreeMap<DownloadAttemptId, AttemptRecord> {
         .collect()
 }
 
-fn persist_records(path: &Path, records: &BTreeMap<DownloadAttemptId, AttemptRecord>) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
+fn persist_records_result(
+    path: &Path,
+    records: &BTreeMap<DownloadAttemptId, AttemptRecord>,
+) -> Result<(), InventoryError> {
+    let parent = path.parent().ok_or_else(|| {
+        InventoryError::Io("download attempt registry has no parent directory".to_owned())
+    })?;
+    fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
     let temporary = path.with_extension("json.tmp");
     let values = records.values().collect::<Vec<_>>();
-    if serde_json::to_vec(&values)
-        .ok()
-        .and_then(|bytes| fs::write(&temporary, bytes).ok())
-        .is_some()
-    {
-        let _ = fs::rename(temporary, path);
+    let bytes =
+        serde_json::to_vec(&values).map_err(|error| InventoryError::Internal(error.to_string()))?;
+    fs::write(&temporary, bytes).map_err(|error| InventoryError::Io(error.to_string()))?;
+    fs::rename(temporary, path).map_err(|error| InventoryError::Io(error.to_string()))?;
+    Ok(())
+}
+
+fn persist_records(path: &Path, records: &BTreeMap<DownloadAttemptId, AttemptRecord>) {
+    let _ = persist_records_result(path, records);
+}
+
+fn acknowledge_failed_record(
+    path: &Path,
+    records: &mut BTreeMap<DownloadAttemptId, AttemptRecord>,
+    id: &DownloadAttemptId,
+) -> Result<DownloadAttempt, InventoryError> {
+    let record = records
+        .get(id)
+        .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+    let DownloadAttempt::Failed {
+        id: attempt_id,
+        package_id,
+        completed_bytes,
+        total_bytes,
+        failure,
+        acknowledged,
+    } = &record.attempt
+    else {
+        return Err(InventoryError::InvalidRequest(format!(
+            "download attempt {} has not failed",
+            id.0
+        )));
+    };
+    if *acknowledged {
+        return Ok(record.attempt.clone());
     }
+    let acknowledged_attempt = DownloadAttempt::Failed {
+        id: attempt_id.clone(),
+        package_id: package_id.clone(),
+        completed_bytes: *completed_bytes,
+        total_bytes: *total_bytes,
+        failure: failure.clone(),
+        acknowledged: true,
+    };
+    let mut next = records.clone();
+    next.get_mut(id)
+        .expect("acknowledged download attempt must remain present")
+        .attempt = acknowledged_attempt.clone();
+    persist_records_result(path, &next)?;
+    *records = next;
+    Ok(acknowledged_attempt)
 }
 
 impl ModelDownloads for ManagedModelDownloads {
@@ -262,18 +309,12 @@ impl ModelDownloads for ManagedModelDownloads {
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>> {
         Box::pin(async move {
             let _start_guard = self.starts.lock().await;
-            let packages = match &request.target {
-                ModelOfferingTarget::Package { package } => vec![package.clone()],
-                ModelOfferingTarget::SpeculativeDecodingPair { target, draft, .. } => {
+            let packages = match &request.bundle {
+                ServableModelBundle::Standalone { package } => vec![package.clone()],
+                ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => {
                     vec![target.clone(), draft.clone()]
                 }
             };
-            let target_id = offering_target_id(
-                &packages
-                    .iter()
-                    .map(|package| &package.id)
-                    .collect::<Vec<_>>(),
-            );
             let active = {
                 let existing = self.records.read().map_err(|_| {
                     InventoryError::Internal("download registry lock poisoned".to_owned())
@@ -338,10 +379,7 @@ impl ModelDownloads for ManagedModelDownloads {
                 tokio::spawn(self.clone().consume(id, package, stream));
                 admitted.push(attempt);
             }
-            Ok(StartModelDownloadResponse {
-                target_id,
-                attempts: admitted,
-            })
+            Ok(StartModelDownloadResponse { attempts: admitted })
         })
     }
 
@@ -409,5 +447,186 @@ impl ModelDownloads for ManagedModelDownloads {
             self.update(&id, attempt.clone());
             Ok(attempt)
         })
+    }
+
+    fn acknowledge_failure(
+        &self,
+        id: &DownloadAttemptId,
+    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>> {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut records = self.records.write().map_err(|_| {
+                InventoryError::Internal("download registry lock poisoned".to_owned())
+            })?;
+            acknowledge_failed_record(&self.path, &mut records, &id)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use icn_contracts::models::{
+        ModelFile, ModelFileId, ModelFileRole, ModelPackageId, ModelPackageProperties,
+        ModelPackageSource,
+    };
+
+    fn package() -> ModelPackage {
+        ModelPackage {
+            id: ModelPackageId("package_test".to_owned()),
+            source: ModelPackageSource::HuggingFace {
+                repository: "owner/repository".to_owned(),
+                revision: "a".repeat(40),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId(format!("file_{}", "b".repeat(64))),
+                path: PathBuf::from("model.gguf"),
+                role: ModelFileRole::Weights,
+                size_bytes: 10,
+                tensor_storage_bytes: None,
+                sha256: "b".repeat(64),
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "Q4".to_owned(),
+                quantization_name: "4-bit".to_owned(),
+                architecture: "test".to_owned(),
+                maximum_context_length: 4096,
+            },
+        }
+    }
+
+    fn failed_attempt(id: &DownloadAttemptId) -> DownloadAttempt {
+        DownloadAttempt::Failed {
+            id: id.clone(),
+            package_id: ModelPackageId("package_test".to_owned()),
+            completed_bytes: 4,
+            total_bytes: 10,
+            failure: ModelFailure {
+                code: "network".to_owned(),
+                message: "network unavailable".to_owned(),
+                retryable: true,
+            },
+            acknowledged: false,
+        }
+    }
+
+    #[test]
+    fn acknowledgement_is_durable_and_idempotent() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("download-attempts.json");
+        let id = DownloadAttemptId("download_test".to_owned());
+        let mut records = BTreeMap::from([(
+            id.clone(),
+            AttemptRecord {
+                attempt: failed_attempt(&id),
+                package: package(),
+                sequence: 1,
+            },
+        )]);
+
+        let acknowledged =
+            acknowledge_failed_record(&path, &mut records, &id).expect("acknowledge failure");
+        assert!(matches!(
+            acknowledged,
+            DownloadAttempt::Failed {
+                acknowledged: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            acknowledge_failed_record(&path, &mut records, &id).expect("repeat acknowledgement"),
+            acknowledged
+        );
+        assert!(matches!(
+            load_records(&path).get(&id).map(|record| &record.attempt),
+            Some(DownloadAttempt::Failed {
+                acknowledged: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn acknowledgement_rejects_nonfailed_attempts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("download-attempts.json");
+        let id = DownloadAttemptId("download_test".to_owned());
+        let mut records = BTreeMap::from([(
+            id.clone(),
+            AttemptRecord {
+                attempt: DownloadAttempt::Pending {
+                    id: id.clone(),
+                    package_id: ModelPackageId("package_test".to_owned()),
+                },
+                package: package(),
+                sequence: 1,
+            },
+        )]);
+
+        assert!(matches!(
+            acknowledge_failed_record(&path, &mut records, &id),
+            Err(InventoryError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn acknowledgement_does_not_mutate_memory_when_persistence_fails() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let invalid_parent = directory.path().join("not-a-directory");
+        fs::write(&invalid_parent, b"file").expect("create parent file");
+        let path = invalid_parent.join("download-attempts.json");
+        let id = DownloadAttemptId("download_test".to_owned());
+        let mut records = BTreeMap::from([(
+            id.clone(),
+            AttemptRecord {
+                attempt: failed_attempt(&id),
+                package: package(),
+                sequence: 1,
+            },
+        )]);
+
+        assert!(matches!(
+            acknowledge_failed_record(&path, &mut records, &id),
+            Err(InventoryError::Io(_))
+        ));
+        assert!(matches!(
+            records.get(&id).map(|record| &record.attempt),
+            Some(DownloadAttempt::Failed {
+                acknowledged: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn failed_attempts_without_acknowledgement_decode_as_unacknowledged() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("download-attempts.json");
+        let id = DownloadAttemptId("download_test".to_owned());
+        let record = AttemptRecord {
+            attempt: failed_attempt(&id),
+            package: package(),
+            sequence: 1,
+        };
+        let mut encoded = serde_json::to_value([record]).expect("encode record");
+        encoded[0]["attempt"]
+            .as_object_mut()
+            .expect("attempt object")
+            .remove("acknowledged");
+        fs::write(
+            &path,
+            serde_json::to_vec(&encoded).expect("encode legacy record"),
+        )
+        .expect("write legacy record");
+
+        assert!(matches!(
+            load_records(&path).get(&id).map(|record| &record.attempt),
+            Some(DownloadAttempt::Failed {
+                acknowledged: false,
+                ..
+            })
+        ));
     }
 }

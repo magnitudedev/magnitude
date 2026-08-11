@@ -97,7 +97,7 @@ construction is installation-bound: the persistent service transfers its verifie
 authority to every installed worker, which registers and validates that exact runtime before
 initialization. Knowing the executable path is not native-runtime authority.
 The same MTP selector implementation and policy fingerprint are used in isolated assessment and
-resident loading. Target identity includes the selected component set and serving-configuration
+resident loading. Execution identity includes the selected component set and serving-configuration
 revision, and parity tests compare normalized fit evidence with loaded execution evidence.
 
 There are four bounded flows:

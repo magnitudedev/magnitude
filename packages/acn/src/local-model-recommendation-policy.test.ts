@@ -4,7 +4,6 @@ import {
   AssessmentEnvironmentIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelFileIdSchema,
-  ModelOfferingTargetIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
@@ -59,10 +58,11 @@ const candidate = (input: {
     model: {
       id: RecommendableModelIdSchema.make(artifactId),
       checkpointId,
-      targetId: ModelOfferingTargetIdSchema.make(`target_${input.id}`),
-      target: {
-        _tag: "Package",
-        package: {
+      configuration: {
+        id: configurationId,
+        bundle: {
+          _tag: "Standalone",
+          package: {
           id: packageId,
           source: {
             _tag: "HuggingFace",
@@ -85,9 +85,10 @@ const candidate = (input: {
             architecture: input.architecture ?? "dense",
             maximumContextLength: context,
           },
+          },
         },
+        profile,
       },
-      profile,
       displayName: input.id,
       description: "Test fixture",
       license: "test",

@@ -1,7 +1,7 @@
 import { Effect, Option, ParseResult, Schema } from "effect"
 import type {
   DownloadAttempt,
-  ModelOfferingTarget,
+  ServableModelBundle,
   ModelPackage,
   ModelPackageInspection,
   ModelServingConfiguration,
@@ -10,7 +10,7 @@ import type {
 } from "@magnitudedev/acn-protocol"
 import {
   DownloadAttemptSchema,
-  ModelOfferingTargetSchema,
+  ServableModelBundleSchema,
   ModelPackageInspectionSchema,
   ModelPackageSchema,
   RecommendableModelSchema,
@@ -18,11 +18,11 @@ import {
 } from "@magnitudedev/acn-protocol"
 import type {
   DownloadAttempt as NativeDownloadAttempt,
-  ModelOfferingTarget as NativeModelOfferingTarget,
+  ServableModelBundle as NativeServableModelBundle,
   ModelPackageInspection as NativeModelPackageInspection,
   ModelPackage as NativeModelPackage,
   ModelServingConfiguration as NativeModelServingConfiguration,
-  ModelTargetInput,
+  ModelBundleInput,
   RecommendableModel as NativeRecommendableModel,
   ServingProfile as NativeServingProfile,
 } from "@magnitudedev/icn-protocol/schemas"
@@ -37,19 +37,19 @@ const normalizeModelPackageFromIcn = (
   })),
 })
 
-const normalizeOfferingTargetFromIcn = (
-  target: NativeModelOfferingTarget,
-) => target._tag === "Package"
-  ? { ...target, package: normalizeModelPackageFromIcn(target.package) }
+const normalizeBundleFromIcn = (
+  bundle: NativeServableModelBundle,
+) => bundle._tag === "Standalone"
+  ? { ...bundle, package: normalizeModelPackageFromIcn(bundle.package) }
   : {
-      ...target,
-      target: normalizeModelPackageFromIcn(target.target),
-      draft: normalizeModelPackageFromIcn(target.draft),
+      ...bundle,
+      target: normalizeModelPackageFromIcn(bundle.target),
+      draft: normalizeModelPackageFromIcn(bundle.draft),
     }
 import {
-  ModelOfferingTarget as NativeModelOfferingTargetSchema,
+  ServableModelBundle as NativeServableModelBundleSchema,
   ModelPackage as NativeModelPackageSchema,
-  ModelTargetInput as NativeModelTargetInputSchema,
+  ModelBundleInput as NativeModelBundleInputSchema,
 } from "@magnitudedev/icn-protocol/schemas"
 
 export const modelPackageFromIcn = (
@@ -78,25 +78,25 @@ export const servingProfileToIcn = (profile: ServingProfile): NativeServingProfi
   contextLength: profile.contextLength,
 })
 
-export const offeringTargetFromIcn = (
-  target: NativeModelOfferingTarget,
-): Effect.Effect<ModelOfferingTarget, ParseResult.ParseError> =>
-  Schema.validate(ModelOfferingTargetSchema)(normalizeOfferingTargetFromIcn(target))
+export const servableModelBundleFromIcn = (
+  bundle: NativeServableModelBundle,
+): Effect.Effect<ServableModelBundle, ParseResult.ParseError> =>
+  Schema.validate(ServableModelBundleSchema)(normalizeBundleFromIcn(bundle))
 
-export const offeringTargetToIcn = (
-  target: ModelOfferingTarget,
-): Effect.Effect<NativeModelOfferingTarget, ParseResult.ParseError> =>
-  Schema.encode(ModelOfferingTargetSchema)(target).pipe(
-    Effect.flatMap(Schema.decodeUnknown(NativeModelOfferingTargetSchema)),
+export const servableModelBundleToIcn = (
+  bundle: ServableModelBundle,
+): Effect.Effect<NativeServableModelBundle, ParseResult.ParseError> =>
+  Schema.encode(ServableModelBundleSchema)(bundle).pipe(
+    Effect.flatMap(Schema.decodeUnknown(NativeServableModelBundleSchema)),
   )
 
 export const modelServingConfigurationToIcn = (
   configuration: ModelServingConfiguration,
 ): Effect.Effect<NativeModelServingConfiguration, ParseResult.ParseError> =>
-  offeringTargetToIcn(configuration.target).pipe(
-    Effect.map((target) => ({
+  servableModelBundleToIcn(configuration.bundle).pipe(
+    Effect.map((bundle) => ({
       id: configuration.id,
-      target,
+      bundle,
       profile: servingProfileToIcn(configuration.profile),
     })),
   )
@@ -106,7 +106,10 @@ export const recommendableModelFromIcn = (
 ): Effect.Effect<RecommendableModel, ParseResult.ParseError> =>
   Schema.validate(RecommendableModelSchema)({
     ...model,
-    target: normalizeOfferingTargetFromIcn(model.target),
+    configuration: {
+      ...model.configuration,
+      bundle: normalizeBundleFromIcn(model.configuration.bundle),
+    },
   })
 
 export const downloadAttemptFromIcn = (
@@ -119,10 +122,10 @@ export const downloadAttemptFromIcn = (
       }
     : attempt)
 
-export const targetToIcn = (
-  target: ModelOfferingTarget,
+export const bundleToIcnInput = (
+  bundle: ServableModelBundle,
   installedPackageIds: ReadonlySet<string>,
-): Effect.Effect<ModelTargetInput, ParseResult.ParseError> => {
+): Effect.Effect<ModelBundleInput, ParseResult.ParseError> => {
   const operand = (modelPackage: ModelPackage) =>
     installedPackageIds.has(modelPackage.id)
       ? Effect.succeed({ _tag: "Installed" as const, packageId: modelPackage.id })
@@ -130,13 +133,13 @@ export const targetToIcn = (
           Effect.map((encoded) => ({ _tag: "SourceBacked" as const, package: encoded })),
         )
   return Effect.gen(function* () {
-    const input = target._tag === "Package"
-      ? { _tag: "Package" as const, package: yield* operand(target.package) }
+    const input = bundle._tag === "Standalone"
+      ? { _tag: "Standalone" as const, package: yield* operand(bundle.package) }
       : {
           _tag: "SpeculativeDecodingPair" as const,
-          target: yield* operand(target.target),
-          draft: yield* operand(target.draft),
+          target: yield* operand(bundle.target),
+          draft: yield* operand(bundle.draft),
         }
-    return yield* Schema.decodeUnknown(NativeModelTargetInputSchema)(input)
+    return yield* Schema.decodeUnknown(NativeModelBundleInputSchema)(input)
   })
 }

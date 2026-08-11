@@ -35,8 +35,9 @@ const pack = (
 })
 
 const manifest = (artifacts: readonly ReleaseArtifact[]): ReleaseManifest => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   version: "1.0.0",
+  acnRevision: 0,
   tag: "@magnitudedev/cli@1.0.0",
   sourceCommit: "b".repeat(40),
   artifacts: artifacts as [ReleaseArtifact, ...ReleaseArtifact[]],

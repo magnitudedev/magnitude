@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use futures_util::future::BoxFuture;
 use icn_contracts::models::{
     InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessment,
-    ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
-    ModelOfferingTarget, ModelOfferingTargetId, ModelPackage, ModelPackageId,
-    ModelPackageInspection, ModelPackageOperand, ModelPackageProperties, ModelPackageSource,
-    ModelTargetInput, RemoveInstalledModelPackageResponse, ResolvedModelTarget,
-    SpeculativeDecodingPairId,
+    ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
+    ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageInstallationOrigin,
+    ModelPackageOperand, ModelPackageProperties, ModelPackageSource, ModelServingConfigurationId,
+    RemoveInstalledModelPackageResponse, ResolvedServableModelBundle, ServableModelBundle,
+    ServableModelBundleKey, ServingProfile,
 };
 use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, InventoryError, InventoryModel,
@@ -128,6 +128,16 @@ pub fn canonical_package_id(
         digest.update(b"\0");
     }
     ModelPackageId(format!("package_{:x}", digest.finalize()))
+}
+
+pub fn serving_configuration_id(
+    bundle_key: &ServableModelBundleKey,
+    profile: &ServingProfile,
+) -> ModelServingConfigurationId {
+    let mut digest = Sha256::new();
+    digest.update(bundle_key.0.as_bytes());
+    digest.update(profile.context_length.to_le_bytes());
+    ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
 }
 
 fn package_relationship(
@@ -311,26 +321,25 @@ fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
     }
 }
 
-pub fn offering_target_id(package_ids: &[&ModelPackageId]) -> ModelOfferingTargetId {
+pub fn servable_model_bundle_key(package_ids: &[&ModelPackageId]) -> ServableModelBundleKey {
     let mut digest = Sha256::new();
-    digest.update(b"magnitude-model-offering-target-v1\0");
+    digest.update(b"magnitude-servable-model-bundle-v1\0");
     for package_id in package_ids {
         digest.update(package_id.0.as_bytes());
         digest.update(b"\0");
     }
-    ModelOfferingTargetId(format!("target_{:x}", digest.finalize()))
+    ServableModelBundleKey(format!("bundle_{:x}", digest.finalize()))
 }
 
-fn speculative_pair_id(
-    target: &ModelPackageId,
-    draft: &ModelPackageId,
-) -> SpeculativeDecodingPairId {
-    let mut digest = Sha256::new();
-    digest.update(b"magnitude-speculative-decoding-pair-v1\0");
-    digest.update(target.0.as_bytes());
-    digest.update(b"\0");
-    digest.update(draft.0.as_bytes());
-    SpeculativeDecodingPairId(format!("pair_{:x}", digest.finalize()))
+pub fn servable_model_bundle_key_for_bundle(
+    bundle: &ServableModelBundle,
+) -> ServableModelBundleKey {
+    match bundle {
+        ServableModelBundle::Standalone { package } => servable_model_bundle_key(&[&package.id]),
+        ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => {
+            servable_model_bundle_key(&[&target.id, &draft.id])
+        }
+    }
 }
 
 impl ModelManager {
@@ -487,8 +496,18 @@ impl ModelManager {
             self.seed_package_digests_from_snapshot(&resolved)?;
             let package = self.package_from_resolved(&resolved)?;
             let installed = InstalledModelPackage {
-                target_id: offering_target_id(&[&package.id]),
                 path: installed_path(model, &resolved),
+                origin: match &model.location {
+                    ModelLocation::MagnitudeCache { .. } => {
+                        ModelPackageInstallationOrigin::Magnitude
+                    }
+                    ModelLocation::HuggingFaceCache { .. } => {
+                        ModelPackageInstallationOrigin::HuggingFaceCache
+                    }
+                    ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
+                        ModelPackageInstallationOrigin::Magnitude
+                    }
+                },
                 inspection: inspection_for(model),
                 package,
             };
@@ -685,44 +704,36 @@ impl InstalledModelPackages for ModelManager {
     fn list_installed(
         &self,
     ) -> BoxFuture<'_, Result<InstalledModelPackagesResponse, InventoryError>> {
-        Box::pin(async move {
-            self.installed_packages
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-                })
-                .map(|snapshot| snapshot.response())
-        })
+        Box::pin(async move { self.installed_packages_response() })
     }
 
-    fn resolve_target(
+    fn resolve_bundle(
         &self,
-        target: ModelTargetInput,
-    ) -> BoxFuture<'_, Result<ResolvedModelTarget, InventoryError>> {
+        bundle: ModelBundleInput,
+    ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>> {
         Box::pin(async move {
-            match target {
-                ModelTargetInput::Package { package } => {
+            match bundle {
+                ModelBundleInput::Standalone { package } => {
                     let resolved = self.resolve_package_operand(package).await?;
-                    let target_id = offering_target_id(&[&resolved.package.id]);
-                    let target = ModelOfferingTarget::Package {
+                    let bundle_key = servable_model_bundle_key(&[&resolved.package.id]);
+                    let bundle = ServableModelBundle::Standalone {
                         package: resolved.package,
                     };
                     let mut result =
-                        ResolvedModelTarget::new(target_id, target, resolved.model, None);
+                        ResolvedServableModelBundle::new(bundle_key, bundle, resolved.model, None);
                     if let Some(guard) = resolved.resolution_guard {
                         result = result.retain_resolution_guard(guard);
                     }
                     Ok(result)
                 }
-                ModelTargetInput::SpeculativeDecodingPair { target, draft } => {
+                ModelBundleInput::SpeculativeDecodingPair { target, draft } => {
                     let target = self.resolve_package_operand(target).await?;
                     let draft = self.resolve_package_operand(draft).await?;
-                    let pair_id = speculative_pair_id(&target.package.id, &draft.package.id);
-                    let target_id = offering_target_id(&[&target.package.id, &draft.package.id]);
-                    let mut result = ResolvedModelTarget::new(
-                        target_id,
-                        ModelOfferingTarget::SpeculativeDecodingPair {
-                            id: pair_id,
+                    let bundle_key =
+                        servable_model_bundle_key(&[&target.package.id, &draft.package.id]);
+                    let mut result = ResolvedServableModelBundle::new(
+                        bundle_key,
+                        ServableModelBundle::SpeculativeDecodingPair {
                             target: target.package,
                             draft: draft.package,
                         },

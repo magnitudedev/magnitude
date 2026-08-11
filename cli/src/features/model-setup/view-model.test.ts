@@ -11,8 +11,10 @@ import {
   TEST_CONFIGURATION_ID,
   TEST_MODEL_ID,
   TEST_REASONING_EFFORT,
-  TEST_TARGET_ID,
+  TEST_PACKAGE_ID,
   makeCatalogCandidate,
+  makeDownload,
+  makeCatalogOnlyModel,
   makeModel,
   makeView,
 } from "../local-inference/test-fixtures"
@@ -28,7 +30,6 @@ const choice = {
   reasoningEffort: TEST_REASONING_EFFORT,
 }
 const downloadChoice = {
-  targetId: TEST_TARGET_ID,
   configurationId: TEST_CONFIGURATION_ID,
   displayName: "Qwen Test",
   reasoningEffort: TEST_REASONING_EFFORT,
@@ -147,12 +148,12 @@ describe("deriveOnboardingModelSetupView", () => {
 
   it("does not represent configuration of an installed model as downloading", () => {
     const candidate = makeCatalogCandidate({
-      download: { _tag: "Downloaded", installedBytes: 16 },
+      download: { _tag: "Downloaded", installedBytes: 16, origins: ["Magnitude"] },
       availability: { _tag: "Available" },
     })
     const base = makeView({
       ready: false,
-      models: [makeModel({ offerings: [] })],
+      models: [makeCatalogOnlyModel()],
       catalogCandidates: [candidate],
     })
     const view = deriveOnboardingModelSetupView({
@@ -169,12 +170,12 @@ describe("deriveOnboardingModelSetupView", () => {
 
   it("represents offering creation for an installed model explicitly", () => {
     const candidate = makeCatalogCandidate({
-      download: { _tag: "Downloaded", installedBytes: 16 },
+      download: { _tag: "Downloaded", installedBytes: 16, origins: ["Magnitude"] },
       availability: { _tag: "Available" },
     })
     const base = makeView({
       ready: false,
-      models: [makeModel({ offerings: [] })],
+      models: [makeCatalogOnlyModel()],
       catalogCandidates: [candidate],
     })
     const view = deriveOnboardingModelSetupView({
@@ -200,7 +201,8 @@ describe("deriveOnboardingModelSetupView", () => {
       },
       availability: { _tag: "NotDownloaded" },
     })
-    const base = makeView({ models: [makeModel({ download: candidate.download })] })
+    if (candidate.download._tag !== "Failed") throw new Error("fixture download did not fail")
+    const base = makeView({ downloads: [makeDownload({ state: candidate.download })] })
     const view = deriveOnboardingModelSetupView({
       active: true,
       submission: {

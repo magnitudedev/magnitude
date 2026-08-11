@@ -12,6 +12,7 @@ import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
+  buildInstalledLocalModelChoices,
   deriveCurrentLocalModel,
   catalogCandidateMemoryConditions,
   modelMemoryStatusDetail,
@@ -19,6 +20,8 @@ import {
   modelSlotInstanceId,
   modelSlotResidentAllocation,
   getDisplayWidth,
+  findLocalOffering,
+  localModelCapabilities,
   requiredMemoryBytes,
   providerModelMemoryConditions,
   selectedSlotModel,
@@ -31,6 +34,7 @@ import {
   usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
+  type InstalledLocalModelChoice,
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
@@ -39,8 +43,11 @@ import {
   ReasoningEffortSchema,
   type LocalModel,
   type LocalModelCatalogCandidate,
+  type LocalModelCatalogDownloadState,
+  type LocalModelInstallation,
   type LocalModelRecommendation,
   type ProviderCatalogEntry,
+  type ProviderModelDisabledReason,
   type ProviderModelId,
   type ProviderModelCatalogEntry,
   type ReasoningEffort,
@@ -58,12 +65,12 @@ import {
 } from "../../state/cli-atoms"
 import { SingleLineInput } from "../composer/single-line-input"
 import {
-  buildInstalledLocalModelChoices,
   describeLocalHardware,
   formatBytes,
+  localModelMaximumContextLength,
+  localModelBundleKey,
   localInferenceProgressLines,
   performanceRangeSpeedLabel,
-  type InstalledLocalModelChoice,
 } from "../local-inference/view-model"
 import { deriveSettingsAuthInfo } from "../overlays/auth-display"
 import {
@@ -171,11 +178,59 @@ const providerKindLabel = (kind: ProviderCatalogEntry["kind"]): string => {
   }
 }
 
+export const providerDisabledStatus = (reason: ProviderModelDisabledReason): string => {
+  switch (reason) {
+    case "insufficient_resources": return "Insufficient resources"
+    case "provider_unavailable": return "Provider unavailable"
+    case "model_unavailable": return "Model unavailable"
+    case "installation_unavailable": return "Installation missing"
+    case "incompatible_runtime": return "Incompatible runtime"
+    case "invalid_configuration": return "Invalid configuration"
+    default: {
+      const unhandled: never = reason
+      return unhandled
+    }
+  }
+}
+
+const installedOriginStatus = (
+  origins: readonly ("Magnitude" | "HuggingFaceCache")[],
+): string => origins.every((origin) => origin === "HuggingFaceCache")
+  ? "Installed (HF)"
+  : "Installed"
+
+export const localModelInstalledStatus = (
+  download: LocalModelCatalogDownloadState,
+): string => download._tag === "Downloaded"
+  ? installedOriginStatus(download.origins)
+  : "Installed"
+
+const localModelInstallationStatus = (
+  installation: LocalModelInstallation,
+): string => installedOriginStatus(installation.origins)
+
+export const localModelReadinessStatus = (
+  model: LocalModel,
+): string => {
+  if (model.readiness._tag === "Assessing") return "Assessing"
+  if (model.readiness._tag === "Failed") return "Error"
+
+  const assessment = model.readiness.assessment
+  if (assessment._tag === "Incompatible" || assessment._tag === "Failed") return "Error"
+  if (assessment._tag === "DoesNotFit") return "Doesn’t fit"
+  return localModelInstallationStatus(model.installation)
+}
+
 export type ModelsMenuEntry =
   | {
       readonly _tag: "Local"
       readonly id: string
       readonly choice: InstalledLocalModelChoice
+    }
+  | {
+      readonly _tag: "LocalStatus"
+      readonly id: string
+      readonly model: LocalModel
     }
   | {
       readonly _tag: "Provider"
@@ -188,7 +243,9 @@ const modelsMenuProviderModel = (
   entry: ModelsMenuEntry,
 ): ProviderModelCatalogEntry | undefined => entry._tag === "Provider"
   ? entry.model
-  : Option.getOrUndefined(entry.choice.providerModel)
+  : entry._tag === "Local"
+    ? Option.getOrUndefined(entry.choice.providerModel)
+    : undefined
 
 const modelsMenuCandidate = (
   entry: ModelsMenuEntry,
@@ -197,12 +254,16 @@ const modelsMenuCandidate = (
   : undefined
 
 const modelsMenuDisplayName = (entry: ModelsMenuEntry): string => entry._tag === "Local"
-  ? entry.choice.model.displayName
-  : entry.model.displayName
+  ? entry.choice.model.presentation.displayName
+  : entry._tag === "LocalStatus"
+    ? entry.model.presentation.displayName
+    : entry.model.displayName
 
 const modelsMenuContextLength = (entry: ModelsMenuEntry): number => entry._tag === "Local"
   ? entry.choice.contextLength
-  : entry.model.contextWindow
+  : entry._tag === "Provider"
+    ? entry.model.contextWindow
+    : localModelMaximumContextLength(entry.model)
 
 const modelsMenuOfferingKey = (entry: ModelsMenuEntry): Option.Option<string> => {
   const providerModel = modelsMenuProviderModel(entry)
@@ -225,25 +286,48 @@ export const modelsMenuEntryIsSelected = (
 
 export const buildModelsMenuEntries = (
   choices: readonly InstalledLocalModelChoice[],
+  localModels: readonly LocalModel[],
   providerModels: readonly ProviderModelCatalogEntry[],
   providers: readonly ProviderCatalogEntry[],
-): readonly ModelsMenuEntry[] => [
-  ...choices.map((choice): ModelsMenuEntry => ({
-    _tag: "Local",
-    id: choice.id,
-    choice,
-  })),
-  ...providerModels.flatMap((model): readonly ModelsMenuEntry[] => {
-    if (model.providerId === LOCAL_PROVIDER_ID) return []
-    const provider = providers.find(({ providerId }) => providerId === model.providerId)
-    return provider === undefined ? [] : [{
-      _tag: "Provider",
-      id: providerModelKey(model),
-      model,
-      provider,
-    }]
-  }),
-]
+): readonly ModelsMenuEntry[] => {
+  const selectableBundleKeys = new Set(
+    choices.map(({ model }) => localModelBundleKey(model)),
+  )
+  return [
+    ...choices.map((choice, index): ModelsMenuEntry => {
+      const bundleKey = localModelBundleKey(choice.model)
+      const firstForBundle = choices.findIndex(({ model }) =>
+        localModelBundleKey(model) === bundleKey) === index
+      return {
+        _tag: "Local",
+        id: firstForBundle
+          ? `local:${bundleKey}:status`
+          : `local:${bundleKey}:${choice.configurationId}`,
+        choice,
+      }
+    }),
+    ...localModels.flatMap((model): readonly ModelsMenuEntry[] => {
+      const bundleKey = localModelBundleKey(model)
+      return selectableBundleKeys.has(bundleKey)
+        ? []
+        : [{
+            _tag: "LocalStatus",
+            id: `local:${bundleKey}:status`,
+            model,
+          }]
+    }),
+    ...providerModels.flatMap((model): readonly ModelsMenuEntry[] => {
+      if (model.providerId === LOCAL_PROVIDER_ID) return []
+      const provider = providers.find(({ providerId }) => providerId === model.providerId)
+      return provider === undefined ? [] : [{
+        _tag: "Provider",
+        id: providerModelKey(model),
+        model,
+        provider,
+      }]
+    }),
+  ]
+}
 
 export type ModelsMenuSelectionAction =
   | {
@@ -251,7 +335,7 @@ export type ModelsMenuSelectionAction =
       readonly providerModel: ProviderModelCatalogEntry
     }
   | {
-      readonly _tag: "CreateOffering"
+      readonly _tag: "InstallConfiguration"
       readonly configurationId: InstalledLocalModelChoice["configurationId"]
       readonly reasoningEffort: Option.Option<ReasoningEffort>
     }
@@ -267,10 +351,13 @@ export const modelsMenuSelectionAction = (
       : Option.none()
   }
   if (entry._tag === "Provider"
-    || !Option.exists(entry.choice.candidate, ({ availability }) =>
-      availability._tag === "Available")) return Option.none()
+    || entry._tag === "LocalStatus") return Option.none()
+  const candidate = modelsMenuCandidate(entry)
+  if (candidate !== undefined && candidate.availability._tag !== "Available") {
+    return Option.none()
+  }
   return Option.some({
-    _tag: "CreateOffering",
+    _tag: "InstallConfiguration",
     configurationId: entry.choice.configurationId,
     reasoningEffort: entry.choice.reasoningEffort,
   })
@@ -523,25 +610,33 @@ const ModelsMenu = memo(function ModelsMenu({
     ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
   )
   const selectedModel = Option.map(selected, ({ model }) => model)
-  const currentRecentModelIds = Option.match(slotsSnapshot, {
+  const currentRecentModelKeys = Option.match(slotsSnapshot, {
     onNone: () => [] as readonly string[],
-    onSome: ({ state }) => state.recentModelIds.primary,
+    onSome: ({ state }) => state.recentModels.primary.map(providerModelKey),
   })
   const currentFavoriteKeys = new Set(config.favoriteModels.map(providerModelKey))
   const [ordering] = useState(() => ({
     selectedModel,
-    recentModelIds: currentRecentModelIds,
+    recentModelKeys: currentRecentModelKeys,
     favoriteKeys: currentFavoriteKeys,
   }))
-  const installedChoices = Option.match(
-    Option.all({ models: localSnapshot, catalog: catalogSnapshot, slots: slotsSnapshot }),
-    {
-      onNone: () => [] as readonly InstalledLocalModelChoice[],
-      onSome: ({ models, catalog, slots }) =>
-        buildInstalledLocalModelChoices(models, catalog.state, slots.state),
-    },
+  const installedChoices = Option.match(localSnapshot, {
+    onNone: () => [] as readonly InstalledLocalModelChoice[],
+    onSome: (models) => buildInstalledLocalModelChoices(
+      models,
+      Option.getOrUndefined(Option.map(slotsSnapshot, ({ state }) => state)),
+    ),
+  })
+  const projectedLocalModels = Option.match(localSnapshot, {
+    onNone: () => [] as readonly LocalModel[],
+    onSome: ({ models }) => models,
+  })
+  const entries = buildModelsMenuEntries(
+    installedChoices,
+    projectedLocalModels,
+    catalog.models,
+    catalog.providers,
   )
-  const entries = buildModelsMenuEntries(installedChoices, catalog.models, catalog.providers)
   const isSelected = (entry: ModelsMenuEntry): boolean =>
     modelsMenuEntryIsSelected(entry, selectedModel)
   const isFavorite = (entry: ModelsMenuEntry): boolean =>
@@ -553,12 +648,7 @@ const ModelsMenu = memo(function ModelsMenu({
         && providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
         && (providerModel.availability._tag === "Available" || isSelected(entry))
     }
-    const candidate = modelsMenuCandidate(entry)
-    return isSelected(entry)
-      || providerModel?.availability._tag === "Available"
-      || (providerModel?.availability._tag === "Disabled"
-        && providerModel.availability.reason === "insufficient_resources")
-      || candidate?.availability._tag === "Available"
+    return true
   }
   const eligible = entries
     .filter(isEligible)
@@ -575,17 +665,17 @@ const ModelsMenu = memo(function ModelsMenu({
       const rightProviderModel = modelsMenuProviderModel(right)
       const leftRecency = leftProviderModel === undefined
         ? -1
-        : ordering.recentModelIds.indexOf(leftProviderModel.providerModelId)
+        : ordering.recentModelKeys.indexOf(providerModelKey(leftProviderModel))
       const rightRecency = rightProviderModel === undefined
         ? -1
-        : ordering.recentModelIds.indexOf(rightProviderModel.providerModelId)
+        : ordering.recentModelKeys.indexOf(providerModelKey(rightProviderModel))
       if (leftRecency !== rightRecency) {
         if (leftRecency < 0) return 1
         if (rightRecency < 0) return -1
         return leftRecency - rightRecency
       }
-      const leftLocal = left._tag === "Local"
-      const rightLocal = right._tag === "Local"
+      const leftLocal = left._tag !== "Provider"
+      const rightLocal = right._tag !== "Provider"
       if (leftLocal !== rightLocal) return leftLocal ? -1 : 1
       return modelsMenuDisplayName(left).localeCompare(modelsMenuDisplayName(right))
     })
@@ -594,33 +684,37 @@ const ModelsMenu = memo(function ModelsMenu({
   const cursorIndex = Math.max(0, eligible.findIndex(({ id }) => id === cursorId))
   const cursor = eligible[cursorIndex]
   const detail = eligible.find(({ id }) => id === detailId) ?? null
-  const localCatalogCandidates = Option.match(localSnapshot, {
-    onNone: () => [] as readonly LocalModelCatalogCandidate[],
-    onSome: (models) =>
-      models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
-  })
   const requirementFor = (entry: ModelsMenuEntry): string => {
     if (entry._tag === "Provider") {
       return providerKindLabel(entry.provider.kind)
     }
+    if (entry._tag === "LocalStatus") {
+      const assessment = entry.model.readiness._tag === "Assessed"
+        ? entry.model.readiness.assessment
+        : undefined
+      return assessment?._tag === "Fits"
+        ? formatBytes(requiredMemoryBytes(assessment.assessment.memory))
+        : assessment?._tag === "DoesNotFit"
+          ? formatBytes(requiredMemoryBytes(assessment.memory))
+          : "—"
+    }
     const providerModel = modelsMenuProviderModel(entry)
     const candidate = modelsMenuCandidate(entry)
+    const assessment = entry.choice.model.readiness._tag === "Assessed"
+      ? entry.choice.model.readiness.assessment
+      : undefined
+    const assessmentMemory = assessment?._tag === "Fits"
+      ? assessment.assessment.memory
+      : assessment?._tag === "DoesNotFit" ? assessment.memory : undefined
     return providerModel === undefined
-      ? candidate === undefined ? "—" : formatBytes(requiredMemoryBytes(candidate.memory))
+      ? candidate === undefined
+        ? assessmentMemory === undefined ? "—" : formatBytes(requiredMemoryBytes(assessmentMemory))
+        : formatBytes(requiredMemoryBytes(candidate.memory))
       : Option.match(providerModel.memory, {
           onNone: () => candidate === undefined ? "—" : formatBytes(requiredMemoryBytes(candidate.memory)),
           onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
         })
   }
-  const assessingRequirementFor = (model: LocalModel): string => {
-    const candidate = localCatalogCandidates.find(({ targetId }) => targetId === model.targetId)
-    return candidate ? formatBytes(requiredMemoryBytes(candidate.memory)) : "—"
-  }
-  const assessing = Option.match(localSnapshot, {
-    onNone: () => [] as readonly LocalModel[],
-    onSome: (models) => models.models.filter((model) =>
-      model.download._tag === "Downloaded" && model.assessment._tag === "Assessing"),
-  })
   const primarySlot = Option.match(slotsSnapshot, {
     onNone: () => null,
     onSome: ({ state }) => state.slots.primary,
@@ -639,10 +733,9 @@ const ModelsMenu = memo(function ModelsMenu({
             exceedsCapacity: false,
             belowWarningReserve: false,
             lacksCurrentHeadroom: false,
-            evidenceUnavailable: true,
           }
   }
-  const detailIsLocal = detail?._tag === "Local"
+  const detailIsLocal = detail !== null && detail._tag !== "Provider"
   const detailIsSelected = detail !== null && isSelected(detail)
   const detailCatalogCandidate = detail === null ? undefined : modelsMenuCandidate(detail)
   const detailActions = useMemo(() => {
@@ -669,6 +762,9 @@ const ModelsMenu = memo(function ModelsMenu({
 
   const statusFor = (entry: ModelsMenuEntry): string => {
     const selectedEntry = isSelected(entry)
+    if (entry._tag === "LocalStatus") {
+      return localModelReadinessStatus(entry.model)
+    }
     if (entry._tag === "Local") {
       const memoryConditions = memoryConditionsFor(entry)
       if (selectedEntry
@@ -679,11 +775,17 @@ const ModelsMenu = memo(function ModelsMenu({
       if (memoryLabel !== "") return memoryLabel
       const providerModel = modelsMenuProviderModel(entry)
       const candidate = modelsMenuCandidate(entry)
-      if (providerModel?.availability._tag === "Disabled"
-        || candidate?.availability._tag === "Unavailable") return "Unavailable"
+      if (providerModel?.availability._tag === "Disabled") {
+        return providerDisabledStatus(providerModel.availability.reason)
+      }
+      if (candidate?.availability._tag === "Unavailable") {
+        return candidate.availability.failure.message
+      }
     }
     if (selectedEntry) return "Selected"
-    return entry._tag === "Local" ? "Installed" : "Available"
+    return entry._tag === "Local"
+      ? localModelInstallationStatus(entry.choice.model.installation)
+      : "Available"
   }
 
   const choose = useCallback((entry: ModelsMenuEntry) => {
@@ -695,9 +797,9 @@ const ModelsMenu = memo(function ModelsMenu({
       return
     }
     const createAction = action.value
-    if (Result.isWaiting(modelActions.createOfferingResult)) return
-    void modelActions.createOffering(createAction.configurationId).then(
-      (providerModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
+    if (Result.isWaiting(modelActions.installResult)) return
+    void modelActions.install(createAction.configurationId).then(
+      ({ providerModelId }) => slotActions.assign(PRIMARY_SLOT_ID, {
         providerId: LOCAL_PROVIDER_ID,
         providerModelId,
         reasoningEffort: Option.getOrElse(
@@ -817,7 +919,13 @@ const ModelsMenu = memo(function ModelsMenu({
   if (detail) {
     const detailProviderModel = modelsMenuProviderModel(detail)
     const detailCandidate = modelsMenuCandidate(detail)
-    const detailCapabilities = detailProviderModel?.capabilities ?? detailCandidate?.capabilities
+    const detailCapabilities = detailProviderModel?.capabilities
+      ?? detailCandidate?.capabilities
+      ?? (detail._tag === "LocalStatus"
+        ? Option.getOrUndefined(localModelCapabilities(detail.model))
+        : detail._tag === "Local"
+          ? Option.getOrUndefined(localModelCapabilities(detail.choice.model))
+          : undefined)
     const detailFavorite = isFavorite(detail)
     const detailMemoryConditions = memoryConditionsFor(detail)
     const detailActionLabel = {
@@ -846,7 +954,7 @@ const ModelsMenu = memo(function ModelsMenu({
             {detailFavorite ? "★ " : ""}{modelsMenuDisplayName(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
-            {detailIsLocal ? "Local" : providerKindLabel(detail.provider.kind)} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
+            {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
           </text>
           {detailIsLocal && modelMemoryStatusDetail(detailMemoryConditions) !== "" && (
             <text style={{ fg: theme.warning }}>
@@ -881,7 +989,7 @@ const ModelsMenu = memo(function ModelsMenu({
       <MenuHeader
         title="Models"
         subtitle="Choose a model"
-        summary={`${eligible.filter(({ _tag }) => _tag === "Local").length} local`}
+        summary={`${eligible.filter(({ _tag }) => _tag !== "Provider").length} local`}
         hints={eligible.length === 0
           ? "↑↓ choose · Enter open · R refresh · Esc close"
           : "↑↓ choose · Enter select · F favorite · D details · R refresh · Esc close"}
@@ -905,23 +1013,6 @@ const ModelsMenu = memo(function ModelsMenu({
           <text style={{ fg: theme.muted, width: 9 }}>CONTEXT</text>
           <text style={{ fg: theme.muted, width: 23 }}>STATUS</text>
         </box>
-        {assessing.map((model, index) => (
-          <box
-            key={`assessing:${model.targetId}`}
-            style={{
-              flexDirection: "row",
-              width: "100%",
-              backgroundColor: index % 2 === 0 ? theme.menuBg : theme.menuAltBg,
-            }}
-          >
-            <text style={{ width: 2 }}> </text>
-            <text style={{ width: 2 }}> </text>
-            <text style={{ fg: theme.foreground, flexGrow: 1 }}>{model.displayName}</text>
-            <text style={{ fg: theme.muted, width: 14 }}>{assessingRequirementFor(model)}</text>
-            <text style={{ fg: theme.muted, width: 9 }}>{formatContextWindow(model.maximumContextLength)}</text>
-            <text style={{ fg: theme.primary, width: 23 }}>Assessing</text>
-          </box>
-        ))}
         {eligible.length === 0 ? (
           <box style={{ flexDirection: "column", paddingLeft: 2 }}>
             <text style={{ fg: theme.warning, marginLeft: 2 }}>No model is currently available.</text>
@@ -939,7 +1030,7 @@ const ModelsMenu = memo(function ModelsMenu({
           const focused = index === cursorIndex
           const active = isSelected(entry)
           const favorite = isFavorite(entry)
-          const rowIndex = assessing.length + index
+          const rowIndex = index
           return (
             <Button
               key={entry.id}
@@ -960,7 +1051,13 @@ const ModelsMenu = memo(function ModelsMenu({
               <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{modelsMenuDisplayName(entry)}</text>
               <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(entry)}</text>
               <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{formatContextWindow(modelsMenuContextLength(entry))}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 23 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{statusFor(entry)}</text>
+              <text
+                style={{ fg: active ? theme.menuBg : theme.muted, width: 23 }}
+                attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}
+                wrapMode="none"
+              >
+                {truncateToDisplayWidth(statusFor(entry), 23)}
+              </text>
             </Button>
           )
         })}
@@ -970,7 +1067,7 @@ const ModelsMenu = memo(function ModelsMenu({
         {Result.isFailure(config.slotUpdate) && (
           <text style={{ fg: theme.error }}>Failed to update model selection.</text>
         )}
-        {Result.isFailure(modelActions.createOfferingResult) && (
+        {Result.isFailure(modelActions.installResult) && (
           <text style={{ fg: theme.error }}>Failed to configure the installed model.</text>
         )}
         {Result.isFailure(config.favoriteUpdate) && (
@@ -1031,8 +1128,10 @@ const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
     return `Downloading ${Math.round(candidate.download.completedBytes / Math.max(1, candidate.download.totalBytes) * 100)}%`
   }
   if (candidate.download._tag === "Failed") return "Download failed"
-  if (candidate.availability._tag === "Unavailable") return "Unavailable"
-  return "Installed"
+  if (candidate.availability._tag === "Unavailable") {
+    return candidate.availability.failure.message
+  }
+  return localModelInstalledStatus(candidate.download)
 }
 
 const CatalogCandidateRow = memo(function CatalogCandidateRow({
@@ -1247,17 +1346,17 @@ const CatalogMenu = memo(function CatalogMenu({
   const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.download._tag === "Downloading"
       || candidate.download._tag === "Downloaded") return
-    void modelActions.download(candidate.targetId)
+    void modelActions.install(candidate.configurationId)
   }, [modelActions])
 
   const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
     if (candidate.availability._tag !== "Available"
-      || Result.isWaiting(modelActions.createOfferingResult)) return
-    const providerModelId = Option.flatMap(snapshot, ({ models }) => Option.fromNullable(
-      models.find(({ targetId }) => targetId === candidate.targetId)
-        ?.offerings.find(({ configurationId }) => configurationId === candidate.configurationId)
-        ?.providerModelId,
-    ))
+      || Result.isWaiting(modelActions.installResult)) return
+    const providerModelId = Option.map(
+      Option.flatMap(snapshot, ({ models }) =>
+        findLocalOffering(models, candidate.configurationId)),
+      ({ providerModelId }) => providerModelId,
+    )
     const assign = (id: ProviderModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
       providerModelId: id,
@@ -1270,8 +1369,8 @@ const CatalogMenu = memo(function CatalogMenu({
       void assign(providerModelId.value)
       return
     }
-    void modelActions.createOffering(candidate.configurationId).then(
-      assign,
+    void modelActions.install(candidate.configurationId).then(
+      ({ providerModelId }) => assign(providerModelId),
       () => undefined,
     )
   }, [modelActions, slotActions, snapshot])
@@ -1320,7 +1419,7 @@ const CatalogMenu = memo(function CatalogMenu({
         && !key.option
       if (confirmsDelete) {
         const candidate = candidates.find(({ configurationId }) => configurationId === pendingDeleteId)
-        if (candidate?.download._tag === "Downloaded") modelActions.delete(candidate.targetId)
+        if (candidate?.download._tag === "Downloaded") modelActions.delete(candidate.configurationId)
         setPendingDeleteId(null)
         key.preventDefault()
         return
@@ -1424,8 +1523,8 @@ const CatalogMenu = memo(function CatalogMenu({
             {catalogStatus(detail)}
           </text>
           {failed && <text style={{ fg: theme.error }}>{detail.download.failure.message}</text>}
-          {Result.isFailure(modelActions.createOfferingResult) && (
-            <text style={{ fg: theme.error }}>Failed to create the local model offering.</text>
+          {Result.isFailure(modelActions.installResult) && (
+            <text style={{ fg: theme.error }}>Failed to install the local model.</text>
           )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             {detailActions.map((action, index) => (
@@ -1704,7 +1803,7 @@ const HardwareMenu = memo(function HardwareMenu() {
                   instance.lifecycle._tag === "Stopping")
                   ? <text style={{ fg: theme.muted }}>Stopping model…</text>
                   : currentSlot.value.availability._tag === "Unavailable"
-                    ? <text style={{ fg: theme.muted }}>Unable to load model</text>
+                    ? <text style={{ fg: theme.muted }}>{currentSlot.value.availability.failure.message}</text>
                     : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
               onSome: (currentAction) => (
                 <MenuAction

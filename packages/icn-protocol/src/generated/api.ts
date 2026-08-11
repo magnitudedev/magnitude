@@ -6,6 +6,24 @@ import * as HttpApiSchema from "@effect/platform/HttpApiSchema"
 import * as S from "effect/Schema"
 import * as Schemas from "./schemas.js"
 
+export const acknowledgeModelDownloadFailure = HttpApiEndpoint.post(
+  "acknowledgeModelDownloadFailure",
+  "/v1/models/downloads/:attempt_id/acknowledge-failure",
+)
+  .setPath(S.Struct({ attempt_id: S.String }))
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+
 export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/v1/apply-template")
   .setPayload(
     S.suspend(
@@ -293,6 +311,7 @@ export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
   .add(searchHuggingFaceModels)
 
 export const ModelsGroup = HttpApiGroup.make("models")
+  .add(acknowledgeModelDownloadFailure)
   .add(assessModels)
   .add(cancelModelDownload)
   .add(getModelDownload)

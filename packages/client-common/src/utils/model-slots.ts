@@ -13,17 +13,19 @@ import {
   type ProviderModelCatalogState,
   type SlotId,
 } from "@magnitudedev/sdk"
-
 export const deriveSelectedLocalModelCandidate = (
   models: LocalModelsState,
   slots: ModelSlotsState,
 ): LocalModelCatalogCandidate | null => {
   const primary = slots.slots.primary
   if (primary._tag === "Unassigned" || models.recommendations._tag !== "Ready") return null
-  const configurationId = models.models
-    .flatMap((model) => model.offerings)
-    .find(({ providerModelId }) => providerModelId === primary.selection.providerModelId)
-    ?.configurationId
+  const configurationId = Option.getOrUndefined(Option.firstSomeOf(models.models.map((model) =>
+    model.readiness._tag === "Assessed" && Option.exists(
+      model.readiness.offering,
+      ({ providerModelId }) => providerModelId === primary.selection.providerModelId,
+    )
+      ? Option.some(model.readiness.configuration.id)
+      : Option.none())))
   if (configurationId === undefined) return null
   return models.recommendations.catalog.find((candidate) =>
     candidate.configurationId === configurationId)

@@ -101,7 +101,7 @@ export {
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
   OnboardingMirror,
-  ModelOfferingTargetIdSchema,
+  ModelPackageIdSchema,
   DownloadAttemptIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
@@ -113,7 +113,6 @@ export {
 
 export type {
   DownloadAttemptId,
-  ModelOfferingTargetId,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,

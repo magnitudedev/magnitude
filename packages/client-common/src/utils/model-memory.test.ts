@@ -5,7 +5,7 @@ import {
   type LocalInferenceHardware,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/sdk"
-import { providerModelMemoryConditions } from "./model-memory"
+import { modelMemoryStatusLabel, providerModelMemoryConditions } from "./model-memory"
 
 const systemMemoryDomainId = LocalInferenceMemoryDomainIdSchema.make("system")
 
@@ -80,13 +80,12 @@ describe("model memory presentation", () => {
     }, undefined, Option.none()).belowWarningReserve).toBe(true)
   })
 
-  it("marks current headroom evidence unavailable until hardware is known", () => {
-    expect(providerModelMemoryConditions(model, undefined, Option.none()).evidenceUnavailable).toBe(true)
-    expect(providerModelMemoryConditions(model, hardware, Option.none()).evidenceUnavailable).toBe(false)
-    expect(providerModelMemoryConditions({
-      ...model,
-      memory: Option.none(),
-    }, hardware, Option.none()).evidenceUnavailable).toBe(true)
+  it("does not invent a status when memory data is absent", () => {
+    expect(modelMemoryStatusLabel({
+      exceedsCapacity: false,
+      belowWarningReserve: false,
+      lacksCurrentHeadroom: false,
+    })).toBe("")
   })
 
   it("counts the current singleton residency as reclaimable before replacement", () => {

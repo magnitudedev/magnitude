@@ -1,7 +1,14 @@
 import { Option } from "effect"
 import {
-  ProviderModelCatalogLifecycle,
-  ProviderIdSchema,
+  buildInstalledLocalModelChoices,
+  type InstalledLocalModelChoice,
+} from "@magnitudedev/client-common"
+export {
+  buildInstalledLocalModelChoices,
+  findLocalOffering,
+  type InstalledLocalModelChoice,
+} from "@magnitudedev/client-common"
+import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
@@ -11,30 +18,17 @@ import {
   type ModelServingConfigurationId,
   type LocalModelRecommendationProgressStep,
   type ModelSlotsState,
-  type ProviderModelCatalogEntry,
-  type ProviderModelCatalogState,
   type ProviderModelId,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
 
-const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
-
 type LocalInferenceSelectionBase = {
   readonly id: string
-  readonly model: LocalModel
+  readonly displayName: string
+  readonly quantization: string
+  readonly downloadBytes: number
   readonly contextLength: number
   readonly providerModelId: Option.Option<ProviderModelId>
-  readonly reasoningEffort: Option.Option<ReasoningEffort>
-}
-
-export interface InstalledLocalModelChoice {
-  readonly id: string
-  readonly model: LocalModel
-  readonly configurationId: ModelServingConfigurationId
-  readonly candidate: Option.Option<LocalModelCatalogCandidate>
-  readonly providerModel: Option.Option<ProviderModelCatalogEntry>
-  readonly running: boolean
-  readonly contextLength: number
   readonly reasoningEffort: Option.Option<ReasoningEffort>
 }
 
@@ -76,87 +70,32 @@ const compareSelections = (
       ? recommendationIntentOrder[right.recommendation.value.intent]
       : 4)
     : 0)
-  || left.model.displayName.localeCompare(right.model.displayName)
+  || left.displayName.localeCompare(right.displayName)
 
-const providerCatalogModels = (
-  catalog: ProviderModelCatalogState,
-): readonly ProviderModelCatalogEntry[] => ProviderModelCatalogLifecycle.match(catalog, {
-  Loading: () => [],
-  Ready: ({ models }) => models,
-  Refreshing: ({ models }) => models,
-  Degraded: ({ models }) => models,
-  Unavailable: () => [],
-})
+export const localModelBundleKey = (model: LocalModel): string =>
+  model.bundle._tag === "Standalone"
+    ? `package:${model.bundle.package.id}`
+    : `speculative-pair:${model.bundle.target.id}:${model.bundle.draft.id}`
 
-export const buildInstalledLocalModelChoices = (
-  models: LocalModelsState,
-  catalog: ProviderModelCatalogState,
-  slots: ModelSlotsState,
-): readonly InstalledLocalModelChoice[] => {
-  const selectedProviderModelIds = new Set([slots.slots.primary, slots.slots.secondary].flatMap((slot) =>
-    slot._tag === "ConfiguredLocal" ? [slot.selection.providerModelId] : []))
-  const running = new Set([slots.slots.primary, slots.slots.secondary].flatMap((slot) =>
-    slot._tag === "ConfiguredLocal"
-      && Option.exists(slot.instance, (instance) => instance.lifecycle._tag === "Ready")
-      ? [slot.selection.providerModelId]
-      : []))
-  const catalogModels = providerCatalogModels(catalog)
-  const localProviderModels = new Map(catalogModels
-    .filter(({ providerId }) => providerId === LOCAL_PROVIDER_ID)
-    .map((model) => [model.providerModelId, model]))
-  const installedCandidates = models.recommendations._tag === "Ready"
-    ? models.recommendations.catalog.reduce((selected, candidate) => {
-        if (candidate.download._tag !== "Downloaded") return selected
-        const current = selected.get(candidate.targetId)
-        if (current === undefined
-          || (current.availability._tag !== "Available"
-            && candidate.availability._tag === "Available")) {
-          selected.set(candidate.targetId, candidate)
-        }
-        return selected
-      }, new Map<string, LocalModelCatalogCandidate>())
-    : new Map<string, LocalModelCatalogCandidate>()
+const modelPackages = (model: LocalModel) => model.bundle._tag === "Standalone"
+  ? [model.bundle.package]
+  : [model.bundle.target, model.bundle.draft]
 
-  return models.models.flatMap((model): readonly InstalledLocalModelChoice[] => {
-    if (model.download._tag !== "Downloaded") return []
-    const candidate = installedCandidates.get(model.targetId)
-    const offerings = model.offerings.flatMap((offering) => {
-      const providerModel = localProviderModels.get(offering.providerModelId)
-      return providerModel === undefined ? [] : [{ offering, providerModel }]
-    })
-    const selected = offerings.find(({ offering }) => selectedProviderModelIds.has(offering.providerModelId))
-      ?? offerings.find(({ offering }) => offering.configurationId === candidate?.configurationId)
-      ?? (candidate === undefined
-        ? offerings.find(({ providerModel }) => providerModel.availability._tag === "Available")
-          ?? offerings[0]
-        : undefined)
-    if (selected === undefined && candidate === undefined) return []
-    const configurationId = selected?.offering.configurationId ?? candidate!.configurationId
-    const providerModel = Option.fromNullable(selected?.providerModel)
-    const catalogCandidate = Option.fromNullable(candidate)
-    return [{
-      id: `installed:${model.targetId}`,
-      model,
-      configurationId,
-      candidate: catalogCandidate,
-      providerModel,
-      running: selected !== undefined && running.has(selected.offering.providerModelId),
-      contextLength: selected?.providerModel.contextWindow
-        ?? candidate?.profile.contextLength
-        ?? model.maximumContextLength,
-      reasoningEffort: selected?.providerModel.capabilities.reasoning.defaultEffort
-        ?? candidate?.capabilities.reasoning.defaultEffort
-        ?? Option.none(),
-    }]
-  })
-}
+export const localModelQuantization = (model: LocalModel): string =>
+  modelPackages(model)[0]?.properties.quantization ?? "Unknown"
+
+export const localModelMaximumContextLength = (model: LocalModel): number =>
+  Math.min(...modelPackages(model).map(({ properties }) => properties.maximumContextLength))
+
+export const localModelDownloadBytes = (model: LocalModel): number =>
+  modelPackages(model).reduce((total, modelPackage) => total
+    + modelPackage.files.reduce((packageTotal, file) => packageTotal + file.sizeBytes, 0), 0)
 
 export const buildLocalInferenceSelections = (
   models: LocalModelsState,
-  catalog: ProviderModelCatalogState,
   slots: ModelSlotsState,
 ): readonly LocalInferenceSelection[] => {
-  const installed = buildInstalledLocalModelChoices(models, catalog, slots)
+  const installed = buildInstalledLocalModelChoices(models, slots)
     .flatMap((choice): readonly LocalInferenceSelection[] => {
       const availableProviderModel = Option.filter(
         choice.providerModel,
@@ -166,11 +105,12 @@ export const buildLocalInferenceSelections = (
         choice.candidate,
         ({ availability }) => availability._tag === "Available",
       )
-      if (Option.isNone(availableProviderModel) && Option.isNone(availableCandidate)) return []
       return [{
         id: choice.id,
         kind: choice.running ? "running" : "stored",
-        model: choice.model,
+        displayName: choice.model.presentation.displayName,
+        quantization: localModelQuantization(choice.model),
+        downloadBytes: localModelDownloadBytes(choice.model),
         configurationId: choice.configurationId,
         recommendation: { _tag: "None" },
         providerModelId: Option.map(availableProviderModel, ({ providerModelId }) => providerModelId),
@@ -180,13 +120,13 @@ export const buildLocalInferenceSelections = (
     })
   const recommendations = models.recommendations._tag === "Ready"
     ? models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
-        const model = models.models.find(({ targetId }) =>
-          targetId === recommendation.candidate.targetId)
-        if (!model || model.download._tag === "Downloaded") return []
+        if (recommendation.candidate.download._tag === "Downloaded") return []
         return [{
           id: `recommendation:${recommendation.id}`,
           kind: "recommendation",
-          model,
+          displayName: recommendation.candidate.displayName,
+          quantization: recommendation.candidate.quantization,
+          downloadBytes: recommendation.candidate.downloadBytes,
           recommendation: { _tag: "Recommended", value: recommendation },
           contextLength: recommendation.candidate.profile.contextLength,
           providerModelId: Option.none(),
@@ -194,20 +134,30 @@ export const buildLocalInferenceSelections = (
         }]
       })
     : []
-  const representedModelIds = new Set(recommendations.map(({ model }) => model.targetId))
-  const transientDownloads = models.models
-    .filter((model) =>
-      (model.download._tag === "Downloading" || model.download._tag === "Failed")
-      && !representedModelIds.has(model.targetId))
-    .map((model): LocalInferenceSelection => ({
-      id: `download:${model.targetId}`,
+  const representedConfigurations = new Set(recommendations.flatMap(({ recommendation }) =>
+    recommendation._tag === "Recommended"
+      ? [recommendation.value.candidate.configurationId]
+      : []))
+  const transientDownloads = models.downloads.flatMap((download): readonly LocalInferenceSelection[] => {
+    if (download.state._tag !== "Downloading" && download.state._tag !== "Failed"
+      || representedConfigurations.has(download.configuration.id)) return []
+    return [{
+      id: `download:${download.configuration.id}`,
       kind: "recommendation",
-      model,
+      displayName: download.presentation.displayName,
+      quantization: download.configuration.bundle._tag === "Standalone"
+        ? download.configuration.bundle.package.properties.quantization
+        : download.configuration.bundle.target.properties.quantization,
+      downloadBytes: download.state.totalBytes,
       recommendation: { _tag: "None" },
-      contextLength: model.maximumContextLength,
-      providerModelId: Option.fromNullable(model.offerings[0]?.providerModelId),
-      reasoningEffort: Option.none(),
-    }))
+      contextLength: download.configuration.profile.contextLength,
+      providerModelId: Option.none(),
+      reasoningEffort: Option.flatMap(
+        download.capabilities,
+        ({ reasoning }) => reasoning.defaultEffort,
+      ),
+    }]
+  })
   return [...installed, ...recommendations, ...transientDownloads]
     .sort(compareSelections)
 }
@@ -461,10 +411,10 @@ export const describeLocalHardware = (
   }
 }
 
-export const selectionTitle = ({ model }: LocalInferenceSelection): string => model.displayName
+export const selectionTitle = ({ displayName }: LocalInferenceSelection): string => displayName
 
-export const selectionMetadata = ({ model, contextLength }: LocalInferenceSelection): string =>
-  `${model.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
+export const selectionMetadata = ({ quantization, downloadBytes, contextLength }: LocalInferenceSelection): string =>
+  `${quantization} · ${formatDownloadBytes(downloadBytes)} · ${formatContext(
     contextLength,
   )} ctx`
 

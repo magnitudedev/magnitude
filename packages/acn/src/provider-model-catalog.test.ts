@@ -12,7 +12,7 @@ import {
   type ProviderClientShape,
   type ProviderModel,
 } from "@magnitudedev/sdk"
-import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
+import { LocalProviderOfferings } from "./local-provider-offerings"
 import { MirroredStateChangesLive } from "./mirrored-state"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderClient } from "@magnitudedev/sdk"
@@ -95,8 +95,9 @@ describe("provider model catalog", () => {
       }
       const dependencies = Layer.mergeAll(
         Layer.succeed(ProviderClient, ProviderClient.of(client)),
-        Layer.succeed(LocalProviderOfferingProjection, LocalProviderOfferingProjection.of({
-          list: Effect.gen(function* () {
+        Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
+          list: Effect.succeed([]),
+          catalog: Effect.gen(function* () {
             const signal = yield* Ref.get(localReadSignal)
             if (Option.isSome(signal)) yield* Deferred.succeed(signal.value, undefined)
             return []
@@ -106,7 +107,9 @@ describe("provider model catalog", () => {
             entries: [],
             failure: Option.none(),
           }),
-          changes: Stream.fromPubSub(localChanges),
+          changes: Stream.never,
+          catalogChanges: Stream.fromPubSub(localChanges),
+          resolve: () => Effect.die("unused"),
         })),
         MirroredStateChangesLive,
         AcnActivityTrackerLive.pipe(

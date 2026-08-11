@@ -313,9 +313,8 @@ function CliAppContent(
     });
   const configurationMutationError = workflowError(
     onboardingSetup.workflowResult,
-    "createOffering",
-  )
-    ?? workflowError(onboardingSetup.workflowResult, "download");
+    "install",
+  );
   const loadMutationError = workflowError(onboardingSetup.workflowResult, "load");
   const assignmentMutationError = workflowError(onboardingSetup.workflowResult, "assign");
   const completionMutationError = workflowError(onboardingSetup.workflowResult, "complete");
@@ -416,7 +415,6 @@ function CliAppContent(
                 onCancel: cancelOnboardingModelSetup,
                 onRetry: () =>
                   configureOnboardingModel({
-                    targetId: setupView.candidate.targetId,
                     configurationId: setupView.candidate.configurationId,
                     displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(
@@ -446,7 +444,6 @@ function CliAppContent(
                 onChooseAnother: cancelOnboardingModelSetup,
                 onRetry: () =>
                   configureOnboardingModel({
-                    targetId: setupView.candidate.targetId,
                     configurationId: setupView.candidate.configurationId,
                     displayName: setupView.candidate.displayName,
                     reasoningEffort: Option.getOrElse(

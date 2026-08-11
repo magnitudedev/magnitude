@@ -44,8 +44,7 @@ export class OnboardingModelCommandFailed extends Schema.TaggedError<
   OnboardingModelCommandFailed
 >()("OnboardingModelCommandFailed", {
   command: Schema.Literal(
-    "createOffering",
-    "download",
+    "install",
     "assign",
     "load",
     "complete",
@@ -63,8 +62,7 @@ export const useOnboardingModelSetup = () => {
   const slotsAtom = useMirroredStateAtom(ModelSlotsMirror)
   const slotActions = useModelSlotActions()
   const mutations = useMemo(() => ({
-    createOffering: client.mutation("CreateLocalModelOffering"),
-    download: client.mutation("DownloadModel"),
+    install: client.mutation("InstallModel"),
     assign: client.mutation("AssignSlot"),
     load: client.mutation("LoadModel"),
     complete: client.mutation("UpdateOnboardingState"),
@@ -87,7 +85,7 @@ export const useOnboardingModelSetup = () => {
           ? reduceDownloadObservation(
             initialObservationCorrelation,
             currentModels.value.state,
-            initial.targetId,
+            initial.configurationId,
             initial.attemptIds,
           )[1]
           : Option.none()
@@ -154,7 +152,7 @@ export const useOnboardingModelSetup = () => {
             }
             yield* observeAdmittedDownload(
               get.stream(modelsAtom),
-              requesting.targetId,
+              requesting.configurationId,
               requesting.attemptIds,
               (observation) => observation !== "Superseded",
             )
@@ -241,7 +239,7 @@ export const useOnboardingModelSetup = () => {
               providerModelId,
               cancellationRequested: false,
             })
-          : beforeAssignment._tag === "CreatingOffering"
+          : beforeAssignment._tag === "AdmittingDownload" || beforeAssignment._tag === "DownloadAdmitted"
             ? OnboardingModelMachine.transition(beforeAssignment, "Assigning", {
                 submission: command,
                 providerModelId,
@@ -344,49 +342,6 @@ export const useOnboardingModelSetup = () => {
         })),
       )
 
-      const createOffering = (configurationId: OnboardingConfigurationChoice["configurationId"]) =>
-        get.setResult(mutations.createOffering, {
-          payload: { configurationId },
-          reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
-        }).pipe(
-          Effect.mapError((error) => new OnboardingModelCommandFailed({
-            command: "createOffering",
-            message: error.message,
-          })),
-        )
-
-      const createOfferingThenActivate = (
-        source: Extract<OnboardingModelOperation, {
-          readonly _tag: "AdmittingDownload" | "DownloadAdmitted"
-        }>,
-      ) => Effect.gen(function* () {
-        if (source.submission._tag !== "ConfigureThenLoad") {
-          return yield* Effect.die("Offering creation requires a configuration submission")
-        }
-        const creating = source._tag === "AdmittingDownload"
-          ? OnboardingModelMachine.transition(source, "CreatingOffering", {
-              submission: source.submission,
-              cancellationRequested: source.cancellationRequested,
-            })
-          : OnboardingModelMachine.transition(source, "CreatingOffering", {
-              submission: source.submission,
-              cancellationRequested: false,
-            })
-        get.set(operationAtom, creating)
-        if (creating.cancellationRequested) {
-          get.set(operationAtom, OnboardingModelMachine.transition(creating, "Idle", {}))
-          return { _tag: "Cancelled" as const }
-        }
-        const providerModelId = yield* createOffering(source.submission.choice.configurationId)
-        const current = get(operationAtom)
-        if (current._tag !== "CreatingOffering") return { _tag: "Superseded" as const }
-        if (current.cancellationRequested) {
-          get.set(operationAtom, OnboardingModelMachine.transition(current, "Idle", {}))
-          return { _tag: "Cancelled" as const }
-        }
-        return yield* activate(providerModelId)
-      })
-
       if (command._tag === "Load") return activate(command.choice.providerModelId)
 
       return Effect.gen(function* () {
@@ -399,25 +354,31 @@ export const useOnboardingModelSetup = () => {
           cancellationRequested: false,
         })
         get.set(operationAtom, admitting)
-        const acquisition = yield* get.setResult(mutations.download, {
-          payload: { targetId: command.choice.targetId },
-          reactivityKeys: [LocalModelsMirror.id],
+        const installation = yield* get.setResult(mutations.install, {
+          payload: { configurationId: command.choice.configurationId },
+          reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
         }).pipe(
           Effect.mapError((error) => new OnboardingModelCommandFailed({
-            command: "download",
+            command: "install",
             message: error.message,
           })),
         )
+        const acquisition = installation.download
         if (acquisition._tag === "AlreadyInstalled") {
           const current = get(operationAtom)
           if (current._tag !== "AdmittingDownload") return { _tag: "Superseded" as const }
-          return yield* createOfferingThenActivate(current)
+          if (current.cancellationRequested) {
+            get.set(operationAtom, OnboardingModelMachine.transition(current, "Idle", {}))
+            return { _tag: "Cancelled" as const }
+          }
+          return yield* activate(installation.providerModelId)
         }
         const afterAdmission = get(operationAtom)
         if (afterAdmission._tag !== "AdmittingDownload") return { _tag: "Superseded" as const }
         const cancellationRequested = afterAdmission.cancellationRequested
         const admitted = OnboardingModelMachine.transition(afterAdmission, "DownloadAdmitted", {
-          targetId: command.choice.targetId,
+          configurationId: command.choice.configurationId,
+          providerModelId: installation.providerModelId,
           attemptIds: acquisition.attemptIds,
         })
         get.set(operationAtom, admitted)
@@ -427,7 +388,7 @@ export const useOnboardingModelSetup = () => {
         }
         const downloadState = yield* observeAdmittedDownload(
           get.stream(modelsAtom),
-          command.choice.targetId,
+          command.choice.configurationId,
           acquisition.attemptIds,
         )
         const current = get(operationAtom)
@@ -444,11 +405,11 @@ export const useOnboardingModelSetup = () => {
           }
           return { _tag: downloadState }
         }
-        return yield* createOfferingThenActivate(current)
+        return yield* activate(installation.providerModelId)
       }).pipe(
         Effect.tapError(() => Effect.sync(() => {
           const current = get(operationAtom)
-          if (current._tag === "AdmittingDownload" || current._tag === "CreatingOffering") {
+          if (current._tag === "AdmittingDownload") {
             get.set(operationAtom, OnboardingModelMachine.transition(current, "Idle", {}))
           }
         })),

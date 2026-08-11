@@ -2,22 +2,24 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
   ModelFileIdSchema,
-  ModelOfferingTargetIdSchema,
   ModelPackageIdSchema,
-  type ModelOfferingTarget,
+  ModelServingConfigurationIdSchema,
+  type ModelServingConfiguration,
+  type ServableModelBundle,
   type ModelPackageSource,
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import {
   availabilityFromProviderProjection,
-  resolveTargetPresentation,
+  decideLocalModelConfigurations,
+  resolveBundlePresentation,
 } from "./local-models"
 
-const target = (
+const standaloneBundle = (
   source: ModelPackageSource,
   path = "model.gguf",
-): ModelOfferingTarget => ({
-  _tag: "Package",
+): ServableModelBundle => ({
+  _tag: "Standalone",
   package: {
     id: ModelPackageIdSchema.make("package-test"),
     source,
@@ -38,6 +40,41 @@ const target = (
       maximumContextLength: 50_000,
     },
   },
+})
+
+const configuration = (
+  id: string,
+  bundle: ServableModelBundle,
+  contextLength: number,
+): ModelServingConfiguration => ({
+  id: ModelServingConfigurationIdSchema.make(id),
+  bundle,
+  profile: { contextLength },
+})
+
+describe("local model configuration decision", () => {
+  it("constructs one decision per bundle with retained, catalog, derived precedence", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
+    const derived = configuration("configuration-derived", bundle, 50_000)
+    const catalog = configuration("configuration-catalog", bundle, 32_000)
+    const retained = configuration("configuration-retained", bundle, 24_000)
+
+    expect([...decideLocalModelConfigurations({
+      retained: [],
+      catalog: [],
+      assessed: [derived],
+    }).values()]).toEqual([derived])
+    expect([...decideLocalModelConfigurations({
+      retained: [],
+      catalog: [catalog],
+      assessed: [derived, catalog],
+    }).values()]).toEqual([catalog])
+    expect([...decideLocalModelConfigurations({
+      retained: [retained],
+      catalog: [catalog],
+      assessed: [derived, catalog, retained],
+    }).values()]).toEqual([retained])
+  })
 })
 
 describe("local model availability", () => {
@@ -101,22 +138,19 @@ describe("local model availability", () => {
 })
 
 describe("local model presentation", () => {
-  const curatedTargetId = ModelOfferingTargetIdSchema.make("target-curated")
-  const otherTargetId = ModelOfferingTargetIdSchema.make("target-other-quant")
-  const huggingFaceTarget = target({
+  const huggingFaceBundle = standaloneBundle({
     _tag: "HuggingFace",
     repository: "LiquidAI/LFM2.5-2.6B-GGUF",
     revision: "a".repeat(40),
   })
-  const curated = new Map([[curatedTargetId, {
+  const curated = {
     displayName: "Liquid LFM2.5 2.6B",
     description: "Curated model description.",
-  }]])
+  }
 
-  it("preserves curated metadata for an exact installed target", () => {
-    expect(resolveTargetPresentation(
-      curatedTargetId,
-      huggingFaceTarget,
+  it("preserves curated metadata for an exact installed bundle", () => {
+    expect(resolveBundlePresentation(
+      huggingFaceBundle,
       curated,
     )).toEqual({
       displayName: "Liquid LFM2.5 2.6B",
@@ -124,22 +158,20 @@ describe("local model presentation", () => {
     })
   })
 
-  it("does not transfer curated metadata to another target", () => {
-    expect(resolveTargetPresentation(
-      otherTargetId,
-      huggingFaceTarget,
-      curated,
+  it("does not transfer curated metadata to another bundle", () => {
+    expect(resolveBundlePresentation(
+      huggingFaceBundle,
+      undefined,
     )).toEqual({
       displayName: "LFM2.5-2.6B-GGUF",
       description: "",
     })
   })
 
-  it("derives an uncurated local target name from its file", () => {
-    expect(resolveTargetPresentation(
-      otherTargetId,
-      target({ _tag: "Local", path: "/models" }, "local-model.gguf"),
-      new Map(),
+  it("derives an uncurated local bundle name from its file", () => {
+    expect(resolveBundlePresentation(
+      standaloneBundle({ _tag: "Local", path: "/models" }, "local-model.gguf"),
+      undefined,
     )).toEqual({
       displayName: "local-model.gguf",
       description: "",

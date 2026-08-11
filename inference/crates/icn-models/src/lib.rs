@@ -26,7 +26,10 @@ pub use catalog::{
 };
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ModelManager};
-pub use package_service::{canonical_package_id, offering_target_id};
+pub use package_service::{
+    canonical_package_id, servable_model_bundle_key, servable_model_bundle_key_for_bundle,
+    serving_configuration_id,
+};
 pub use planner_stub::{
     PlannerStubComponent, PlannerStubContext, PlannerStubError, compact_planner_stub,
     planner_stub_context,

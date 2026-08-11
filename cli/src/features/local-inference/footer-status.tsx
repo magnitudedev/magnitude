@@ -14,8 +14,8 @@ export const deriveLocalModelDownloadSummary = (
   models: LocalModelsState | null,
 ): string | null => {
   if (models === null) return null
-  const count = models.models.filter(({ download }) =>
-    download._tag === "Downloading").length
+  const count = models.downloads.filter(({ state }) =>
+    state._tag === "Downloading").length
   return count === 0
     ? null
     : `${count} ${count === 1 ? "model" : "models"} downloading`
@@ -67,12 +67,14 @@ export const deriveLocalInferenceFooterView = (
     ? selectedSlot
     : undefined
   const activeModel = slot && models !== null
-    ? models.models.find((model) => model.offerings.some(({ providerModelId }) =>
-      providerModelId === slot.selection.providerModelId))
+    ? models.models.find((model) => model.readiness._tag === "Assessed"
+      && Option.exists(
+        model.readiness.offering,
+        ({ providerModelId }) => providerModelId === slot.selection.providerModelId,
+      ))
     : undefined
-  const downloadModel = models?.models.find((model) =>
-    model.download._tag === "Downloading" || model.download._tag === "Failed")
-  const model = activeModel ?? downloadModel
+  const download = models?.downloads.find(({ state }) =>
+    state._tag === "Downloading" || state._tag === "Failed")
   const lifecycle = slot?._tag === "ConfiguredLocal"
     ? Option.getOrNull(slot.instance)?.lifecycle
     : undefined
@@ -82,7 +84,10 @@ export const deriveLocalInferenceFooterView = (
       ? "loading" as const
       : "not_loaded" as const
   return {
-    modelName: selectedModelName ?? model?.displayName ?? null,
+    modelName: selectedModelName
+      ?? activeModel?.presentation.displayName
+      ?? download?.presentation.displayName
+      ?? null,
     residency,
     memoryLabel: residency === "loaded" && slot ? residentMemoryLabel(slot) : null,
   }
