@@ -785,7 +785,7 @@ fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
     }
     let rank = if format.contains("Q8") {
         80
-    } else if format.contains("Q6") {
+    } else if format.contains("Q6") || format.contains("NVFP4") {
         60
     } else if format.contains("Q5") {
         50
@@ -1333,6 +1333,14 @@ mod tests {
         assert_eq!(
             formats("nemotron-3-super-120b-a12b"),
             ["UD-Q4_K_XL", "MXFP4_MOE"]
+        );
+        assert_eq!(
+            formats("nemotron-3.5-lightning-30b-a3b"),
+            ["NVFP4", "Q4_K_M", "Q8_0"]
+        );
+        assert_eq!(
+            fidelity("nemotron-3.5-lightning-30b-a3b", "NVFP4"),
+            (60, false)
         );
         assert_eq!(formats("deepseek-v4-flash"), ["UD-Q4_K_XL", "UD-Q8_K_XL"]);
         assert_eq!(

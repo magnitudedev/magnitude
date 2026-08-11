@@ -260,6 +260,23 @@
       ]
     },
     {
+      "id": "nemotron-3.5-lightning-30b-a3b",
+      "displayName": "Nemotron 3.5 Lightning 30B-A3B",
+      "description": "Efficient hybrid MoE model for local reasoning, coding, and agentic workflows.",
+      "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+      "formats": ["NVFP4", "Q4_K_M", "Q8_0"],
+      "contextLength": 100000,
+      "license": "openmdw-1.1",
+      "qualityScore": 24.0,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "NVIDIA reports 24.58 for BF16 and 23.46 for the official NVFP4 checkpoint on Terminal-Bench 2.1; the catalog uses a curated family score of 24.0. The Q4_K_M and Q8_0 GGUF artifacts have not been measured independently.",
+        "NVFP4 is curated in the same fidelity tier as Q6 independently from hardware fit.",
+        "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+      ]
+    },
+    {
       "id": "deepseek-v4-flash",
       "displayName": "DeepSeek V4 Flash 284B-A13B",
       "description": "Frontier MoE model with a very large weight footprint and low active compute.",
