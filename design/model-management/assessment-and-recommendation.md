@@ -186,6 +186,10 @@ ACN selects at most one configuration for each intent:
 Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
 A recommendation annotates a local model; it does not copy model facts or create another identity.
 
+Curated fidelity is independent of runtime acceleration. NVFP4 occupies the same fidelity tier as
+Q6; exact hardware calibration and assessment determine whether either format is faster on the
+current execution environment.
+
 An assessed catalog configuration is eligible for recommendation only when its full-context expected generation
 speed is at least 5 tokens per second. Balanced speed utility uses 5 tokens per second as its zero
 point. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,

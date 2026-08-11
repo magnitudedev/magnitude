@@ -41,6 +41,10 @@ class:
 - sample count, duration, dispersion, and stability;
 - calibration-method identity.
 
+Calibration attempts every curated weight tensor family supported by the pinned runtime, including
+NVFP4, for both dense and routed operations. Unsupported backend/type/operation combinations are
+omitted rather than represented by fabricated measurements.
+
 It reads no model and produces no placement, memory, context, compatibility, or token-rate result.
 
 ### Startup contract
