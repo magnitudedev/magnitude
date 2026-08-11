@@ -166,12 +166,14 @@ an ephemeral response to the selection event.
 
 Onboarding keeps its recommendation and action labels unchanged in the model list. The selected
 model's right-hand detail pane preserves the recommendation explanation and independently presents
-stable fit and current loadability. When current headroom is insufficient, it shows model
-allocation, safety reserve, strict load requirement, current availability, and shortfall before a
-load is attempted. This live guidance is advisory: it neither changes recommendation rank nor
-authorizes loading. If authoritative admission still rejects the attempt, the same pane presents
-the structured low-memory facts and a retry action without exposing the raw diagnostic as primary
-copy.
+stable fit and current loadability. The metadata, explanation, and memory guidance are separated by
+one blank row each. When current headroom is insufficient, the compact memory block tells the user
+the published minimum additional availability to free before loading, explains that the model fits
+stable total capacity while current system use prevents loading, and suggests closing
+memory-intensive applications. This live guidance is advisory: it neither changes recommendation
+rank nor authorizes loading. If authoritative admission still rejects the attempt, the same pane
+presents the structured low-memory facts and a retry action without exposing the raw diagnostic as
+primary copy.
 
 While the selected local model is ready, the composer footer shows its correlated model-instance allocation
 after context: the sum of the server-published model, context, compute, and auxiliary allocations
