@@ -41,7 +41,7 @@ use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolP
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession};
+use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession, MtpVerificationResolution};
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
@@ -411,6 +411,7 @@ struct ActiveRequest<'model> {
     mtp_started: bool,
     mtp_draft: Vec<LlamaToken>,
     mtp_indices: Vec<i32>,
+    mtp_replaying: bool,
     draft_tokens: usize,
     accepted_draft_tokens: usize,
     draft_ms: f64,
@@ -1950,7 +1951,15 @@ fn decode_batch<'model>(
         }
     }
 
-    let mut draft_extra_tokens = 0_usize;
+    let mut draft_extra_tokens = active
+        .iter()
+        .filter(|request| {
+            request.sequence_id().is_some()
+                && request.outbound.is_empty()
+                && matches!(request.phase, RequestPhase::Decode { .. })
+        })
+        .map(|request| request.mtp_draft.len())
+        .sum::<usize>();
     if let Some(operations) = mtp.as_mut() {
         let mut drafted_sequences = Vec::new();
         let started = Instant::now();
@@ -1962,7 +1971,9 @@ fn decode_batch<'model>(
                     && matches!(request.phase, RequestPhase::Decode { .. })
             })
             .count();
-        let mut extra_budget = (context.n_batch() as usize).saturating_sub(decode_count);
+        let mut extra_budget = (context.n_batch() as usize)
+            .saturating_sub(decode_count)
+            .saturating_sub(draft_extra_tokens);
         for request in active.iter_mut().filter(|request| {
             request.mtp_started
                 && request.mtp_draft.is_empty()
@@ -1997,19 +2008,6 @@ fn decode_batch<'model>(
             for sequence_id in drafted_sequences {
                 let request = request_by_sequence(active, sequence_id)?;
                 request.mtp_draft = operations.take_draft(sequence_id).map_err(backend_error)?;
-                let RequestPhase::Decode { position, .. } = request.phase else {
-                    return Err(InferenceError::Backend(
-                        "MTP request left decode state while drafting".into(),
-                    ));
-                };
-                // MTP autoregressively advances its draft context while producing the
-                // proposal. The target verification batch will mirror the sampled token
-                // and accepted proposal back into that context, so discard the temporary
-                // speculative suffix first. This is the same transition performed by
-                // llama.cpp's server immediately after common_speculative_draft().
-                operations
-                    .remove_sequence_range(sequence_id, position, -1)
-                    .map_err(backend_error)?;
                 draft_extra_tokens = draft_extra_tokens.saturating_add(request.mtp_draft.len());
                 request.draft_tokens = request.draft_tokens.saturating_add(request.mtp_draft.len());
                 request.draft_ms += elapsed;
@@ -2154,6 +2152,8 @@ fn verify_mtp_batch<'model>(
                 "MTP verification request was not in decode state".into(),
             ));
         };
+        let sampler_checkpoint = request.sampler.snapshot().map_err(backend_error)?;
+        let proposed_drafts = request.mtp_draft.len();
         let accepted = request
             .sampler
             .sample_and_accept_n(context, &request.mtp_indices, &request.mtp_draft, false)
@@ -2164,27 +2164,40 @@ fn verify_mtp_batch<'model>(
             ));
         }
         let accepted_drafts = accepted.len() - 1;
-        operations
-            .accept(
-                sequence_id,
-                u16::try_from(accepted_drafts).map_err(backend_error)?,
-            )
+        let committed_tokens = request
+            .token_history
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_add(accepted_drafts))
+            .ok_or_else(|| InferenceError::Backend("MTP token history overflowed".into()))?;
+        let next_position = i32::try_from(committed_tokens).map_err(backend_error)?;
+        let resolution = operations
+            .resolve_verification(sequence_id, proposed_drafts, accepted_drafts, next_position)
             .map_err(backend_error)?;
+        if resolution == MtpVerificationResolution::Replay {
+            request
+                .sampler
+                .restore(&sampler_checkpoint)
+                .map_err(backend_error)?;
+            request.mtp_draft = accepted;
+            request.mtp_indices.clear();
+            request.mtp_replaying = true;
+            continue;
+        }
 
         request.token_history.push(pending);
         request
             .token_history
             .extend(accepted.iter().take(accepted_drafts).copied());
-        let next_position = i32::try_from(request.token_history.len()).map_err(backend_error)?;
-        operations
-            .remove_sequence_range(sequence_id, next_position, -1)
-            .map_err(backend_error)?;
+        let accepted_original_drafts =
+            accepted_drafts.saturating_sub(usize::from(request.mtp_replaying));
         request.accepted_draft_tokens = request
             .accepted_draft_tokens
-            .saturating_add(accepted_drafts);
+            .saturating_add(accepted_original_drafts);
         request.verification_ms += verification_ms;
         request.mtp_draft.clear();
         request.mtp_indices.clear();
+        request.mtp_replaying = false;
 
         let mut terminal = None;
         for token in accepted.iter().copied() {
@@ -3071,6 +3084,7 @@ impl<'model> ActiveRequest<'model> {
                 mtp_started: false,
                 mtp_draft: Vec::new(),
                 mtp_indices: Vec::new(),
+                mtp_replaying: false,
                 draft_tokens: 0,
                 accepted_draft_tokens: 0,
                 draft_ms: 0.0,
