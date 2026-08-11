@@ -189,44 +189,54 @@ const minimumBytesLabel = (bytes: number): string => {
   return `${(Math.ceil(gib * precision) / precision).toFixed(gib >= 10 ? 1 : 2)} GiB`
 }
 
-const memoryGuidanceRows = (memory: LocalModelMemory): number => {
-  const currentRows = memory.currentHeadroomState._tag === "Insufficient" ? 7 : 2
-  const stableRows = memory.systemUseState._tag === "High" ? 2 : 0
-  return currentRows + stableRows
-}
+const compactMemoryLabel = (bytes: number): string =>
+  `${Math.max(0.1, bytes / 1024 ** 3).toFixed(1)} GB`
+
+const memoryGuidanceRows = (memory: LocalModelMemory): number =>
+  memory.currentHeadroomState._tag === "Insufficient" ? 7 : 3
 
 const ModelMemoryGuidanceDetails = ({
   memory,
+  systemUsedBytes,
   width,
 }: {
   readonly memory: LocalModelMemory
+  readonly systemUsedBytes: number | null
   readonly width: number
 }): ReactNode => {
   const theme = useTheme()
   const current = memory.currentHeadroomState
+  if (current._tag === "Insufficient") {
+    return (
+      <box style={{ width, flexDirection: "column", flexShrink: 0 }}>
+        <text style={{ fg: theme.muted, width }} attributes={TextAttributes.BOLD}>MEMORY</text>
+        <text style={{ fg: theme.warning, width }} wrapMode="none">
+          {`! Low memory: Free ${compactMemoryLabel(current.minimumAdditionalAvailableBytes)} to load`}
+        </text>
+        <text style={{ fg: theme.muted, width }} wrapMode="word">
+          {systemUsedBytes === null
+            ? "This model fits on total memory but system memory is currently heavily used."
+            : `This model fits on total memory but system is currently using ${compactMemoryLabel(systemUsedBytes)}.`}
+        </text>
+        <text style={{ fg: theme.muted, width }} wrapMode="word">
+          Close other memory-intensive apps to run this model.
+        </text>
+      </box>
+    )
+  }
+  const guidance = memory.systemUseState._tag === "High"
+      ? {
+          color: theme.warning,
+          text: "! Tight fit: Limited memory remains for other apps",
+        }
+      : {
+          color: theme.muted,
+          text: `Model allocation ${formatBytes(memory.totalRequiredBytes)}`,
+        }
   return (
     <box style={{ width, flexDirection: "column", flexShrink: 0 }}>
       <text style={{ fg: theme.muted, width }} attributes={TextAttributes.BOLD}>MEMORY</text>
-      {current._tag === "Insufficient" ? (
-        <>
-          <text style={{ fg: theme.warning, width }}>! Not enough free memory right now</text>
-          <text style={{ fg: theme.muted, width }}>{`  Model allocation       ${formatBytes(memory.totalRequiredBytes)}`}</text>
-          <text style={{ fg: theme.muted, width }}>{`  System safety reserve ${formatBytes(current.observation.abortReserveBytes)}`}</text>
-          <text style={{ fg: theme.muted, width }}>{`  Needed to load         ${formatBytes(current.observation.loadBoundaryBytes)}`}</text>
-          <text style={{ fg: theme.muted, width }}>{`  Available now          ${formatBytes(current.observation.allocationHeadroomBytes)}`}</text>
-          <text style={{ fg: theme.warning, width }}>{`  Shortfall               ${minimumBytesLabel(current.minimumAdditionalAvailableBytes)}`}</text>
-        </>
-      ) : (
-        <text style={{ fg: theme.muted, width }}>
-          {`Model allocation ${formatBytes(memory.totalRequiredBytes)}`}
-        </text>
-      )}
-      {memory.systemUseState._tag === "High" && (
-        <>
-          <text style={{ fg: theme.warning, width }}>! Tight fit</text>
-          <text style={{ fg: theme.muted, width }}>  Leaves limited memory for other apps.</text>
-        </>
-      )}
+      <text style={{ fg: guidance.color, width }} wrapMode="none">{guidance.text}</text>
     </box>
   )
 }
@@ -391,6 +401,9 @@ export function OnboardingModelChooser({
     onNone: () => 0,
     onSome: memoryGuidanceRows,
   })
+  const systemUsedBytes = Result.isSuccess(hardware)
+    ? Math.max(0, hardware.value.totalSystemMemoryBytes - hardware.value.availableSystemMemoryBytes)
+    : null
   const contentHeight = Math.max(
     DETAIL_BASE_ROWS + selectedMemoryRows,
     localRows + sectionGap + downloadRows,
@@ -549,18 +562,16 @@ export function OnboardingModelChooser({
           {selectionMetadata(selected)}
         </text>
       </DetailRow>
-      <DetailRow width={detailWidth}>
-        {Option.isSome(selected.recommendation) && (
+      {Option.isSome(selected.recommendation) && (
+        <DetailRow width={detailWidth}>
           <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
             {performanceRangeSpeedLabel(selected.model)}
           </text>
-        )}
-      </DetailRow>
-      <box style={{ height: 1 }} />
+        </DetailRow>
+      )}
+      <box style={{ height: 1, flexShrink: 0 }} />
       <box style={{
         width: detailWidth,
-        height: DESCRIPTION_ROWS,
-        minHeight: DESCRIPTION_ROWS,
         maxHeight: DESCRIPTION_ROWS,
         flexShrink: 0,
         flexDirection: "column",
@@ -575,10 +586,14 @@ export function OnboardingModelChooser({
         </text>
       </box>
       {Option.isSome(selectedMemory) && (
-        <ModelMemoryGuidanceDetails
-          memory={selectedMemory.value}
-          width={detailWidth}
-        />
+        <>
+          <box style={{ height: 1, flexShrink: 0 }} />
+          <ModelMemoryGuidanceDetails
+            memory={selectedMemory.value}
+            systemUsedBytes={systemUsedBytes}
+            width={detailWidth}
+          />
+        </>
       )}
     </>
   ) : (
