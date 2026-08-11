@@ -89,7 +89,7 @@ describe("LocalModelAssessor", () => {
             state: {
               native_build: "native-build-test",
               topology_fingerprint: "topology-test",
-              system_memory: { total_bytes: 64, assess_reserve_bytes: 8 },
+              system_memory: { physical_capacity_bytes: 64, assess_reserve_bytes: 8 },
               enabled_backends: ["cpu"],
             },
           } as never),

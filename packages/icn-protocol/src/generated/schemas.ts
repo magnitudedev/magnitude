@@ -134,7 +134,6 @@ export type AssessModelResult = S.Schema.Type<typeof AssessModelResult>
 export type AssessModelResultEncoded = S.Schema.Encoded<typeof AssessModelResult>
 
 export const AssessModelsRequest = S.Struct({
-  capacityPolicy: S.suspend((): S.Schema<CapacityPolicy, CapacityPolicyEncoded> => CapacityPolicy),
   requests: S.Array(S.suspend((): S.Schema<AssessModelRequest, AssessModelRequestEncoded> => AssessModelRequest)),
 })
 export type AssessModelsRequest = S.Schema.Type<typeof AssessModelsRequest>
@@ -171,12 +170,6 @@ export const CacheTypeResponse = S.Union(
 )
 export type CacheTypeResponse = S.Schema.Type<typeof CacheTypeResponse>
 export type CacheTypeResponseEncoded = S.Schema.Encoded<typeof CacheTypeResponse>
-
-export const CapacityPolicy = S.Struct({
-  requiredReserveBytesPerMemoryDomain: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type CapacityPolicy = S.Schema.Type<typeof CapacityPolicy>
-export type CapacityPolicyEncoded = S.Schema.Encoded<typeof CapacityPolicy>
 
 export const CatalogDiagnostic = S.Struct({
   entryId: S.optionalWith(
@@ -773,10 +766,11 @@ export type HardwareSnapshotEncoded = S.Schema.Encoded<typeof HardwareSnapshot>
 
 export const HardwareSystemMemory = S.Struct({
   abort_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  allocation_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  allocation_headroom_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   assess_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  current_available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  warning_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physical_available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  physical_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type HardwareSystemMemory = S.Schema.Type<typeof HardwareSystemMemory>
 export type HardwareSystemMemoryEncoded = S.Schema.Encoded<typeof HardwareSystemMemory>
@@ -1025,7 +1019,6 @@ export const MemoryAssessment = S.Struct({
   memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   remainingBytes: S.Number.pipe(S.int()),
   requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  warningReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type MemoryAssessment = S.Schema.Type<typeof MemoryAssessment>
 export type MemoryAssessmentEncoded = S.Schema.Encoded<typeof MemoryAssessment>
@@ -1244,6 +1237,33 @@ export const ModelInstanceAllocation = S.Struct({
 export type ModelInstanceAllocation = S.Schema.Type<typeof ModelInstanceAllocation>
 export type ModelInstanceAllocationEncoded = S.Schema.Encoded<typeof ModelInstanceAllocation>
 
+export const ModelInstanceFailure = S.Union(
+  S.extend(
+    S.TaggedStruct("Operation", {
+      code: S.String,
+      message: S.String,
+      retryable: S.Boolean,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("LowMemory", {
+      allocationHeadroomBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      code: S.String,
+      loadBoundaryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      message: S.String,
+      minimumAdditionalAvailableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      requiredSystemMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      retryable: S.Boolean,
+      systemReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelInstanceFailure = S.Schema.Type<typeof ModelInstanceFailure>
+export type ModelInstanceFailureEncoded = S.Schema.Encoded<typeof ModelInstanceFailure>
+
 export const ModelInstanceId = S.String
 export type ModelInstanceId = S.Schema.Type<typeof ModelInstanceId>
 export type ModelInstanceIdEncoded = S.Schema.Encoded<typeof ModelInstanceId>
@@ -1285,7 +1305,7 @@ export const ModelInstanceLifecycle = S.Union(
   ),
   S.extend(
     S.TaggedStruct("Failed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      failure: S.suspend((): S.Schema<ModelInstanceFailure, ModelInstanceFailureEncoded> => ModelInstanceFailure),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1345,7 +1365,7 @@ export const ModelLoadEvent = S.Union(
   ),
   S.extend(
     S.TaggedStruct("Failed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      failure: S.suspend((): S.Schema<ModelInstanceFailure, ModelInstanceFailureEncoded> => ModelInstanceFailure),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),

@@ -1,40 +1,44 @@
-import { afterEach, describe, expect, test } from "vitest"
+import { describe, expect, test } from "vitest"
 import { Effect } from "effect"
-import {
-  clearEphemeralMessage,
-  getEphemeralMessageSnapshot,
-} from "@magnitudedev/client-common"
+import type { PushNotification } from "@magnitudedev/client-common"
 import { makeCliEffectLoggingLayer } from "./effect-logger"
 
-afterEach(() => clearEphemeralMessage())
-
-const runLog = (debug: boolean, effect: Effect.Effect<void>): Promise<void> =>
-  Effect.runPromise(effect.pipe(
-    Effect.provide(makeCliEffectLoggingLayer({ debug })),
+const runLog = async (
+  debug: boolean,
+  effect: Effect.Effect<void>,
+): Promise<readonly PushNotification[]> => {
+  const notifications: PushNotification[] = []
+  await Effect.runPromise(effect.pipe(
+    Effect.provide(makeCliEffectLoggingLayer({
+      debug,
+      publishNotification: (notification) => notifications.push(notification),
+    })),
   ))
+  return notifications
+}
 
 describe("CLI Effect logger", () => {
   test("surfaces errors as toasts", async () => {
-    await runLog(false, Effect.logError("RPC failed"))
+    const notifications = await runLog(false, Effect.logError("RPC failed"))
 
-    expect(getEphemeralMessageSnapshot()).toMatchObject({
-      text: "RPC failed",
-      tone: "error",
-    })
+    expect(notifications).toContainEqual(expect.objectContaining({
+      message: "RPC failed",
+      priority: "error",
+    }))
   })
 
   test("does not surface warnings normally", async () => {
-    await runLog(false, Effect.logWarning("retrying"))
+    const notifications = await runLog(false, Effect.logWarning("retrying"))
 
-    expect(getEphemeralMessageSnapshot()).toBeNull()
+    expect(notifications).toEqual([])
   })
 
   test("surfaces warnings in debug mode", async () => {
-    await runLog(true, Effect.logWarning("retrying"))
+    const notifications = await runLog(true, Effect.logWarning("retrying"))
 
-    expect(getEphemeralMessageSnapshot()).toMatchObject({
-      text: "retrying",
-      tone: "warning",
-    })
+    expect(notifications).toContainEqual(expect.objectContaining({
+      message: "retrying",
+      priority: "warning",
+    }))
   })
 })

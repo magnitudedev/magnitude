@@ -1,10 +1,8 @@
 import { Option } from "effect"
 import { expect, test } from "vitest"
 import {
-  DownloadAttemptIdSchema,
   ModelSlotConfiguredLocal,
   ModelInstanceIdSchema,
-  ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   SECONDARY_SLOT_ID,
@@ -12,20 +10,15 @@ import {
 import {
   GIB,
   LOCAL_PROVIDER_ID,
-  makeDownload,
   makeModel,
   makeView,
-  makeStandaloneBundle,
   TEST_CONFIGURATION_ID,
   TEST_MEMORY_DOMAIN_ID,
   TEST_MODEL_ID,
   TEST_REASONING_EFFORT,
 } from "./test-fixtures"
 
-const {
-  deriveLocalInferenceFooterView,
-  deriveLocalModelDownloadSummary,
-} = await import("./footer-status")
+const { deriveLocalInferenceFooterView } = await import("./footer-status")
 const instanceId = ModelInstanceIdSchema.make("test-instance")
 const selection = {
   providerId: LOCAL_PROVIDER_ID,
@@ -86,37 +79,6 @@ test("ready status exposes the model, residency, and complete resident allocatio
     residency: "loaded",
     memoryLabel: "16 GB mem",
   })
-})
-
-test("download summary is derived from active bundle downloads", () => {
-  const ready = makeView()
-  const downloading = makeDownload({
-    state: {
-      _tag: "Downloading" as const,
-      attemptIds: [DownloadAttemptIdSchema.make("download-1")] as const,
-      stage: "downloading" as const,
-      completedBytes: GIB,
-      totalBytes: 16 * GIB,
-      bytesPerSecond: Option.none(),
-    },
-  })
-  expect(deriveLocalModelDownloadSummary(null)).toBeNull()
-  expect(deriveLocalModelDownloadSummary(ready.models)).toBeNull()
-  expect(deriveLocalModelDownloadSummary({
-    ...ready.models,
-    downloads: [downloading],
-  })).toBe("1 model downloading")
-  expect(deriveLocalModelDownloadSummary({
-    ...ready.models,
-    downloads: [downloading, makeDownload({
-      configuration: {
-        ...downloading.configuration,
-        id: ModelServingConfigurationIdSchema.make("configuration-2"),
-        bundle: makeStandaloneBundle("package-2"),
-      },
-      state: downloading.state,
-    })],
-  })).toBe("2 models downloading")
 })
 
 test("slot residency remains visible when local-model inventory is unavailable", () => {

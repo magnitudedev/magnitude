@@ -68,13 +68,14 @@ run now. Cached assessment never authorizes a load.
 
 | Term | Meaning |
 |---|---|
-| **Recommendable model** | One curated configuration plus presentation, capabilities, license, and ranking evidence. |
+| **Recommendable model** | One curated configuration plus presentation, capabilities, license, and ranking data. |
 | **Recommendable model catalog** | Release-bound curated configurations eligible for assessment and recommendation. |
-| **Catalog candidate** | A product projection of one catalog configuration with completed assessment and current acquisition state. |
-| **Recommendation** | A policy-selected catalog candidate labeled with an intent and explanation. |
+| **Local model** | One client-facing product row for an exact servable bundle, with acquisition and serving state. |
+| **Recommendation** | A policy-owned intent and explanation annotating one local model. |
 
 Catalog membership contributes metadata and a configuration. It implies no installation, retained
-state, offering, selection, or residency. Candidate identity is the configuration identity.
+state, offering, selection, or residency. Internally, recommendation policy evaluates eligible
+assessed catalog configurations; these inputs are not a separate client-facing entity.
 
 ## Offering and runtime terms
 
@@ -109,7 +110,7 @@ packages follow the same rules:
 
 | Bundle case | Configuration used by the product | When it is stored in model state |
 |---|---|---|
-| Catalog bundle, not installed | Exact catalog configuration; no `LocalModel` exists | When installation is admitted |
+| Catalog bundle, not installed | Exact catalog configuration on an uninstalled `LocalModel` | When installation is admitted |
 | Installed bundle with a retained configuration | Exact retained configuration | Already stored |
 | Installed bundle matching the catalog, with no retained configuration | Exact catalog configuration | On selection/installation, or during the single bounded recovery epoch |
 | Installed non-catalog standalone bundle | ICN-issued configuration for ACN's standard profile decision after package inspection | Only when selected/installed |
@@ -134,29 +135,32 @@ state.
 LocalModel
   bundle: ServableModelBundle
   presentation
-  installation
-  readiness:
-    Assessing
+  downloadBytes
+  catalogMembershipState:
+    NotInCatalog
+    | InCatalog(catalogData)
+  acquisitionState: NotInstalled | Downloading | Failed | Cancelled | Installed
+  servingState:
+    Resolving
+    | Assessing(configuration)
     | Failed(failure)
     | Assessed(
         capabilities,
         configuration: ModelServingConfiguration,
-        offering?,
-        assessment: Fits | DoesNotFit | Incompatible | Failed
+        assessment: Fits | DoesNotFit | Incompatible,
+        availabilityState: Installable | Preparing | Selectable | Unavailable,
+        recommendations[]
       )
-
-LocalModelDownload
-  configuration: ModelServingConfiguration
-  presentation
-  capabilities?
-  state: Downloading | Failed | Cancelled | Downloaded
 ```
 
-Every independently servable installed package is represented as a `Standalone` bundle even when
-it has no catalog entry or retained configuration. Each installed bundle has one product
-configuration decision: retained first, otherwise exact catalog configuration, otherwise the
-ICN-issued configuration for ACN's standard profile decision. Catalog association enriches the same
-row with curated metadata; it does not decide whether the row exists.
+Every catalog bundle and every independently servable installed package is represented. Exact
+bundle identity coalesces catalog, installation, acquisition, assessment, recommendation, and
+provider-publication facts into the same row. Each bundle has one product configuration decision:
+retained first, otherwise exact catalog configuration, otherwise the ICN-issued configuration for
+ACN's standard profile decision. Catalog association enriches the row; it does not create another
+product entity. `catalogMembershipState` records that association explicitly because it cannot be
+derived from installation, fit, availability, or recommendation state. `InCatalog` carries the
+catalog's intelligence score and source, fidelity rank, and quality notes.
 
 ## Identity map
 
@@ -187,13 +191,10 @@ ModelPackage(s) -> ServableModelBundle + ServingProfile
                          v                                            v
                   assessment                               retained configuration
                          |                                            |
-                         +-> catalog candidate                         +-> provider offering
-                              +-> recommendation                       +-> slot -> instance
-
-installed packages ----------------+--> LocalModel[]
-inspection and assessment ---------+
-provider offerings ----------------+
-
-known configurations --------------+--> LocalModelDownload[]
-download state --------------------+
+                         +-> recommendation policy                    +-> provider offering
+                         |                                            +-> slot -> instance
+                         +------------------+
+                                            v
+catalog + installed packages + acquisition + assessment
+       + recommendations + provider offerings + memory --> LocalModel[]
 ```

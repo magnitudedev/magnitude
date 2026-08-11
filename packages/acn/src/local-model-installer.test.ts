@@ -166,6 +166,7 @@ describe("LocalModelInstaller", () => {
           assessmentId: "assessment-a" as never,
           environmentId: "environment-a" as never,
           memory: [],
+          totalRequiredBytes: 0,
           deficitBytes: 1,
           limitingResource: "system memory",
         }),

@@ -4582,9 +4582,10 @@ mod tests {
             cpu_model: Some("Apple".to_owned()),
             logical_cores: 8,
             system_memory: HardwareSystemMemory {
-                total_bytes: 64,
-                current_available_bytes: 20,
-                warning_reserve_bytes: 0,
+                physical_capacity_bytes: 64,
+                physical_available_bytes: 20,
+                allocation_capacity_bytes: 64,
+                allocation_headroom_bytes: 20,
                 assess_reserve_bytes: 0,
                 abort_reserve_bytes: 0,
             },

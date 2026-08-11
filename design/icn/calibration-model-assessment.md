@@ -230,10 +230,10 @@ configurations, and completion publishes only if that key remains current.
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
 - One assessor evaluates catalog-published and retained configurations plus ACN's standard profile
   decisions through the shared assessment service; ICN constructs every resulting exact
-  configuration, and recommendation policy consumes only recommendable catalog candidates.
+  configuration, and recommendation policy consumes only private eligible catalog inputs.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
 - Retained configurations remain visible while assessment is pending or fails.
-- Only completed `Fits` configurations become selectable catalog candidates or enabled provider
+- Only completed `Fits` configurations can become installable catalog rows or enabled provider
   offerings; assessment itself creates no durable configuration.
 - Downloading never performs hardware calibration.
 

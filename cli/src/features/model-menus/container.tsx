@@ -12,29 +12,24 @@ import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
-  buildInstalledLocalModelChoices,
   deriveCurrentLocalModel,
-  catalogCandidateMemoryConditions,
-  modelMemoryStatusDetail,
-  modelMemoryStatusLabel,
   modelSlotInstanceId,
   modelSlotResidentAllocation,
   getDisplayWidth,
-  findLocalOffering,
+  localModelConfigurationId,
+  localModelProviderModelId,
   localModelCapabilities,
-  requiredMemoryBytes,
-  providerModelMemoryConditions,
   selectedSlotModel,
   truncateToDisplayWidth,
+  type NotificationState,
   usePlatform,
   useLocalInferenceHardware,
   useLocalModelActions,
-  useLocalModels,
+  useLocalModelsSelector,
   useModelSlotActions,
   usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
-  type InstalledLocalModelChoice,
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
@@ -42,13 +37,11 @@ import {
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
   type LocalModel,
-  type LocalModelCatalogCandidate,
-  type LocalModelCatalogDownloadState,
-  type LocalModelInstallation,
   type LocalModelRecommendation,
   type ProviderCatalogEntry,
   type ProviderModelDisabledReason,
   type ProviderModelId,
+  type ModelServingConfigurationId,
   type ProviderModelCatalogEntry,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
@@ -80,6 +73,11 @@ import {
   formatCatalogModelLabel,
   type CatalogLayout,
 } from "./catalog-layout"
+import {
+  modelMenusLocalModelsStateEquivalent,
+  selectModelMenusLocalModelsState,
+} from "./state"
+import { NotificationArea } from "../notification-area/notification-area"
 
 // Cloud is disabled.
 const ROOTS = ["models", "catalog", "hardware"] as const
@@ -200,32 +198,31 @@ const installedOriginStatus = (
   : "Installed"
 
 export const localModelInstalledStatus = (
-  download: LocalModelCatalogDownloadState,
-): string => download._tag === "Downloaded"
-  ? installedOriginStatus(download.origins)
+  model: LocalModel,
+): string => model.acquisitionState._tag === "Installed"
+  ? installedOriginStatus(model.acquisitionState.origins)
   : "Installed"
-
-const localModelInstallationStatus = (
-  installation: LocalModelInstallation,
-): string => installedOriginStatus(installation.origins)
 
 export const localModelReadinessStatus = (
   model: LocalModel,
 ): string => {
-  if (model.readiness._tag === "Assessing") return "Assessing"
-  if (model.readiness._tag === "Failed") return "Error"
+  if (model.servingState._tag === "Resolving") return "Resolving"
+  if (model.servingState._tag === "Assessing") return "Assessing"
+  if (model.servingState._tag === "Failed") return "Error"
 
-  const assessment = model.readiness.assessment
-  if (assessment._tag === "Incompatible" || assessment._tag === "Failed") return "Error"
+  const assessment = model.servingState.assessment
+  if (assessment._tag === "Incompatible") return "Error"
   if (assessment._tag === "DoesNotFit") return "Doesn’t fit"
-  return localModelInstallationStatus(model.installation)
+  return model.acquisitionState._tag === "Installed"
+    ? localModelInstalledStatus(model)
+    : "Available"
 }
 
 export type ModelsMenuEntry =
   | {
       readonly _tag: "Local"
       readonly id: string
-      readonly choice: InstalledLocalModelChoice
+      readonly model: LocalModel
     }
   | {
       readonly _tag: "LocalStatus"
@@ -239,35 +236,59 @@ export type ModelsMenuEntry =
       readonly provider: ProviderCatalogEntry
     }
 
+export const modelsMenuStatusPresentation = (
+  status: string,
+): { readonly label: string; readonly tone: "muted" | "warning" } =>
+  status === "Low free memory"
+    ? { label: `! ${status}`, tone: "warning" }
+    : { label: status, tone: "muted" }
+
 const modelsMenuProviderModel = (
   entry: ModelsMenuEntry,
 ): ProviderModelCatalogEntry | undefined => entry._tag === "Provider"
   ? entry.model
-  : entry._tag === "Local"
-    ? Option.getOrUndefined(entry.choice.providerModel)
-    : undefined
-
-const modelsMenuCandidate = (
-  entry: ModelsMenuEntry,
-): LocalModelCatalogCandidate | undefined => entry._tag === "Local"
-  ? Option.getOrUndefined(entry.choice.candidate)
   : undefined
 
+const modelsMenuLocalModel = (entry: ModelsMenuEntry): LocalModel | undefined =>
+  entry._tag === "Local" ? entry.model
+    : entry._tag === "LocalStatus" ? entry.model : undefined
+
 const modelsMenuDisplayName = (entry: ModelsMenuEntry): string => entry._tag === "Local"
-  ? entry.choice.model.presentation.displayName
+  ? entry.model.presentation.displayName
   : entry._tag === "LocalStatus"
     ? entry.model.presentation.displayName
     : entry.model.displayName
 
 const modelsMenuContextLength = (entry: ModelsMenuEntry): number => entry._tag === "Local"
-  ? entry.choice.contextLength
+  ? entry.model.servingState._tag === "Assessed"
+    ? entry.model.servingState.configuration.profile.contextLength
+    : localModelMaximumContextLength(entry.model)
   : entry._tag === "Provider"
     ? entry.model.contextWindow
     : localModelMaximumContextLength(entry.model)
 
 const modelsMenuOfferingKey = (entry: ModelsMenuEntry): Option.Option<string> => {
   const providerModel = modelsMenuProviderModel(entry)
-  return Option.fromNullable(providerModel).pipe(Option.map(providerModelKey))
+  if (providerModel !== undefined) return Option.some(providerModelKey(providerModel))
+  const localModel = modelsMenuLocalModel(entry)
+  return localModel === undefined
+    ? Option.none()
+    : Option.map(localModelProviderModelId(localModel), (providerModelId) =>
+        `${LOCAL_PROVIDER_ID}:${providerModelId}`)
+}
+
+const modelsMenuProviderIdentity = (
+  entry: ModelsMenuEntry,
+): Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">> => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (providerModel !== undefined) return Option.some(providerModel)
+  const localModel = modelsMenuLocalModel(entry)
+  return localModel === undefined
+    ? Option.none()
+    : Option.map(localModelProviderModelId(localModel), (providerModelId) => ({
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId,
+      }))
 }
 
 const sameProviderModel = (
@@ -280,41 +301,32 @@ export const modelsMenuEntryIsSelected = (
   entry: ModelsMenuEntry,
   selectedModel: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
 ): boolean => Option.exists(
-  Option.fromNullable(modelsMenuProviderModel(entry)),
-  (model) => Option.exists(selectedModel, (selected) => sameProviderModel(model, selected)),
+  selectedModel,
+  (selected) => entry._tag === "Provider"
+    ? sameProviderModel(entry.model, selected)
+    : Option.exists(
+        Option.fromNullable(modelsMenuLocalModel(entry)),
+        (model) => Option.contains(localModelProviderModelId(model), selected.providerModelId)
+          && selected.providerId === LOCAL_PROVIDER_ID,
+      ),
 )
 
 export const buildModelsMenuEntries = (
-  choices: readonly InstalledLocalModelChoice[],
   localModels: readonly LocalModel[],
   providerModels: readonly ProviderModelCatalogEntry[],
   providers: readonly ProviderCatalogEntry[],
 ): readonly ModelsMenuEntry[] => {
-  const selectableBundleKeys = new Set(
-    choices.map(({ model }) => localModelBundleKey(model)),
-  )
   return [
-    ...choices.map((choice, index): ModelsMenuEntry => {
-      const bundleKey = localModelBundleKey(choice.model)
-      const firstForBundle = choices.findIndex(({ model }) =>
-        localModelBundleKey(model) === bundleKey) === index
-      return {
-        _tag: "Local",
-        id: firstForBundle
-          ? `local:${bundleKey}:status`
-          : `local:${bundleKey}:${choice.configurationId}`,
-        choice,
-      }
-    }),
     ...localModels.flatMap((model): readonly ModelsMenuEntry[] => {
+      if (model.acquisitionState._tag !== "Installed") return []
       const bundleKey = localModelBundleKey(model)
-      return selectableBundleKeys.has(bundleKey)
-        ? []
-        : [{
-            _tag: "LocalStatus",
-            id: `local:${bundleKey}:status`,
-            model,
-          }]
+      return [{
+        _tag: model.servingState._tag === "Assessed"
+          && model.servingState.assessment._tag === "Fits"
+          ? "Local" : "LocalStatus",
+        id: `local:${bundleKey}:status`,
+        model,
+      }]
     }),
     ...providerModels.flatMap((model): readonly ModelsMenuEntry[] => {
       if (model.providerId === LOCAL_PROVIDER_ID) return []
@@ -329,14 +341,26 @@ export const buildModelsMenuEntries = (
   ]
 }
 
+export const catalogLocalModels = (
+  models: readonly LocalModel[],
+): readonly LocalModel[] => models.filter((model) =>
+  model.catalogMembershipState._tag === "InCatalog"
+  && model.servingState._tag === "Assessed"
+  && model.servingState.assessment._tag === "Fits")
+
 export type ModelsMenuSelectionAction =
   | {
-      readonly _tag: "AssignOffering"
+      readonly _tag: "AssignProvider"
       readonly providerModel: ProviderModelCatalogEntry
     }
   | {
+      readonly _tag: "AssignLocal"
+      readonly providerModelId: ProviderModelId
+      readonly reasoningEffort: Option.Option<ReasoningEffort>
+    }
+  | {
       readonly _tag: "InstallConfiguration"
-      readonly configurationId: InstalledLocalModelChoice["configurationId"]
+      readonly configurationId: ModelServingConfigurationId
       readonly reasoningEffort: Option.Option<ReasoningEffort>
     }
 
@@ -347,26 +371,34 @@ export const modelsMenuSelectionAction = (
   if (providerModel !== undefined) {
     return providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
       && providerModel.availability._tag === "Available"
-      ? Option.some({ _tag: "AssignOffering", providerModel })
+      ? Option.some({ _tag: "AssignProvider", providerModel })
       : Option.none()
   }
   if (entry._tag === "Provider"
     || entry._tag === "LocalStatus") return Option.none()
-  const candidate = modelsMenuCandidate(entry)
-  if (candidate !== undefined && candidate.availability._tag !== "Available") {
-    return Option.none()
+  const { model } = entry
+  if (model.servingState._tag !== "Assessed"
+    || model.servingState.assessment._tag !== "Fits") return Option.none()
+  const reasoningEffort = model.servingState.capabilities.reasoning.defaultEffort
+  if (model.servingState.availabilityState._tag === "Selectable") {
+    return Option.some({
+      _tag: "AssignLocal",
+      providerModelId: model.servingState.availabilityState.providerModelId,
+      reasoningEffort,
+    })
   }
+  if (model.servingState.availabilityState._tag !== "Installable") return Option.none()
   return Option.some({
     _tag: "InstallConfiguration",
-    configurationId: entry.choice.configurationId,
-    reasoningEffort: entry.choice.reasoningEffort,
+    configurationId: model.servingState.configuration.id,
+    reasoningEffort,
   })
 }
 
-export function ModelMenusContainer({
-  downloadSummary,
+export const ModelMenusContainer = memo(function ModelMenusContainer({
+  notificationState,
 }: {
-  readonly downloadSummary: string | null
+  readonly notificationState: NotificationState | null
 }): ReactNode {
   const menu = useAtomValue(modelMenuStateAtom)
   const setMenu = useAtomSet(modelMenuStateAtom)
@@ -482,10 +514,14 @@ export function ModelMenusContainer({
             </Button>
           )
         })}
-        {downloadSummary && (
-          <Button onClick={() => openRoot("catalog")}>
-            <text style={{ fg: theme.primary }}>{downloadSummary}</text>
-          </Button>
+        {notificationState !== null && (
+          <NotificationArea
+            notificationState={notificationState}
+            theme={theme}
+            onAction={(action) => {
+              if (action === "openCatalog") openRoot("catalog")
+            }}
+          />
         )}
         <box style={{ flexGrow: 1 }} />
         <text style={{ fg: theme.muted }}>
@@ -494,7 +530,7 @@ export function ModelMenusContainer({
       </box>
     </box>
   )
-}
+})
 
 const MenuHeader = memo(function MenuHeader({
   title,
@@ -597,14 +633,15 @@ const ModelsMenu = memo(function ModelsMenu({
 }: ModelsMenuProps) {
   const theme = useTheme()
   const config = useModelConfig()
-  const localModels = useLocalModels()
+  const localSnapshot = useLocalModelsSelector(
+    selectModelMenusLocalModelsState,
+    modelMenusLocalModelsStateEquivalent,
+  )
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
-  const hardware = Option.getOrUndefined(Result.value(useLocalInferenceHardware()))
   const catalog = catalogContents(config)
   const catalogSnapshot = Result.value(config.catalog)
   const slotsSnapshot = Result.value(config.slots)
-  const localSnapshot = Result.value(localModels)
   const selected = Option.flatMap(
     Option.all({ catalog: catalogSnapshot, slots: slotsSnapshot }),
     ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
@@ -620,19 +657,11 @@ const ModelsMenu = memo(function ModelsMenu({
     recentModelKeys: currentRecentModelKeys,
     favoriteKeys: currentFavoriteKeys,
   }))
-  const installedChoices = Option.match(localSnapshot, {
-    onNone: () => [] as readonly InstalledLocalModelChoice[],
-    onSome: (models) => buildInstalledLocalModelChoices(
-      models,
-      Option.getOrUndefined(Option.map(slotsSnapshot, ({ state }) => state)),
-    ),
-  })
   const projectedLocalModels = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModel[],
     onSome: ({ models }) => models,
   })
   const entries = buildModelsMenuEntries(
-    installedChoices,
     projectedLocalModels,
     catalog.models,
     catalog.providers,
@@ -684,60 +713,51 @@ const ModelsMenu = memo(function ModelsMenu({
   const cursorIndex = Math.max(0, eligible.findIndex(({ id }) => id === cursorId))
   const cursor = eligible[cursorIndex]
   const detail = eligible.find(({ id }) => id === detailId) ?? null
+  const memoryFor = (entry: ModelsMenuEntry) => {
+    const model = modelsMenuLocalModel(entry)
+    return model?.servingState._tag === "Assessed"
+      && model.servingState.assessment._tag === "Fits"
+      ? Option.some(model.servingState.assessment.memory)
+      : Option.none()
+  }
   const requirementFor = (entry: ModelsMenuEntry): string => {
     if (entry._tag === "Provider") {
       return providerKindLabel(entry.provider.kind)
     }
     if (entry._tag === "LocalStatus") {
-      const assessment = entry.model.readiness._tag === "Assessed"
-        ? entry.model.readiness.assessment
+      const assessment = entry.model.servingState._tag === "Assessed"
+        ? entry.model.servingState.assessment
         : undefined
-      return assessment?._tag === "Fits"
-        ? formatBytes(requiredMemoryBytes(assessment.assessment.memory))
-        : assessment?._tag === "DoesNotFit"
-          ? formatBytes(requiredMemoryBytes(assessment.memory))
-          : "—"
+      if (assessment?._tag === "DoesNotFit") {
+        return formatBytes(assessment.totalRequiredBytes)
+      }
+      return Option.match(memoryFor(entry), {
+        onNone: () => "—",
+        onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+      })
     }
-    const providerModel = modelsMenuProviderModel(entry)
-    const candidate = modelsMenuCandidate(entry)
-    const assessment = entry.choice.model.readiness._tag === "Assessed"
-      ? entry.choice.model.readiness.assessment
+    const assessment = entry.model.servingState._tag === "Assessed"
+      ? entry.model.servingState.assessment
       : undefined
-    const assessmentMemory = assessment?._tag === "Fits"
-      ? assessment.assessment.memory
-      : assessment?._tag === "DoesNotFit" ? assessment.memory : undefined
-    return providerModel === undefined
-      ? candidate === undefined
-        ? assessmentMemory === undefined ? "—" : formatBytes(requiredMemoryBytes(assessmentMemory))
-        : formatBytes(requiredMemoryBytes(candidate.memory))
-      : Option.match(providerModel.memory, {
-          onNone: () => candidate === undefined ? "—" : formatBytes(requiredMemoryBytes(candidate.memory)),
-          onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
-        })
+    if (assessment?._tag === "DoesNotFit") {
+      return formatBytes(assessment.totalRequiredBytes)
+    }
+    return Option.match(memoryFor(entry), {
+      onNone: () => "—",
+      onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+    })
   }
   const primarySlot = Option.match(slotsSnapshot, {
     onNone: () => null,
     onSome: ({ state }) => state.slots.primary,
   })
-  const residentAllocation = primarySlot === null
-    ? Option.none()
-    : modelSlotResidentAllocation(primarySlot)
-  const memoryConditionsFor = (entry: ModelsMenuEntry) => {
-    const providerModel = modelsMenuProviderModel(entry)
-    const candidate = modelsMenuCandidate(entry)
-    return providerModel !== undefined
-      ? providerModelMemoryConditions(providerModel, hardware, residentAllocation)
-      : candidate !== undefined
-        ? catalogCandidateMemoryConditions(candidate, hardware, residentAllocation)
-        : {
-            exceedsCapacity: false,
-            belowWarningReserve: false,
-            lacksCurrentHeadroom: false,
-          }
-  }
   const detailIsLocal = detail !== null && detail._tag !== "Provider"
   const detailIsSelected = detail !== null && isSelected(detail)
-  const detailCatalogCandidate = detail === null ? undefined : modelsMenuCandidate(detail)
+  const detailCatalogModel = detail === null ? undefined : modelsMenuLocalModel(detail)
+  const detailCatalogConfigurationId = detailCatalogModel?.servingState._tag === "Assessed"
+    && detailCatalogModel.catalogMembershipState._tag === "InCatalog"
+    ? detailCatalogModel.servingState.configuration.id
+    : undefined
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
     const actions: ("select" | "load" | "stop" | "catalog")[] = []
@@ -753,9 +773,9 @@ const ModelsMenu = memo(function ModelsMenu({
       && primarySlot
       && primarySlot._tag === "ConfiguredLocal"
       && primarySlot.actions.includes("Stop")) actions.push("stop")
-    if (detailCatalogCandidate) actions.push("catalog")
+    if (detailCatalogConfigurationId) actions.push("catalog")
     return actions
-  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, primarySlot])
+  }, [detail, detailCatalogConfigurationId, detailIsLocal, detailIsSelected, primarySlot])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
@@ -766,34 +786,44 @@ const ModelsMenu = memo(function ModelsMenu({
       return localModelReadinessStatus(entry.model)
     }
     if (entry._tag === "Local") {
-      const memoryConditions = memoryConditionsFor(entry)
+      const memory = memoryFor(entry)
       if (selectedEntry
         && primarySlot?._tag === "ConfiguredLocal"
         && Option.isSome(primarySlot.instance)
-        && memoryConditions.lacksCurrentHeadroom) return "Selected"
-      const memoryLabel = modelMemoryStatusLabel(memoryConditions)
-      if (memoryLabel !== "") return memoryLabel
-      const providerModel = modelsMenuProviderModel(entry)
-      const candidate = modelsMenuCandidate(entry)
-      if (providerModel?.availability._tag === "Disabled") {
-        return providerDisabledStatus(providerModel.availability.reason)
-      }
-      if (candidate?.availability._tag === "Unavailable") {
-        return candidate.availability.failure.message
+        && Option.exists(memory, ({ currentHeadroomState }) =>
+          currentHeadroomState._tag === "Insufficient")) return "Selected"
+      if (Option.exists(memory, ({ currentHeadroomState }) =>
+        currentHeadroomState._tag === "Insufficient")) return "Low free memory"
+      if (Option.exists(memory, ({ systemUseState }) => systemUseState._tag === "High")) return "Tight fit"
+      const servingState = entry.model.servingState
+      if (servingState._tag === "Assessed"
+        && servingState.availabilityState._tag === "Unavailable") {
+        return servingState.availabilityState.failure.message
       }
     }
     if (selectedEntry) return "Selected"
     return entry._tag === "Local"
-      ? localModelInstallationStatus(entry.choice.model.installation)
+      ? localModelInstalledStatus(entry.model)
       : "Available"
   }
 
   const choose = useCallback((entry: ModelsMenuEntry) => {
     const action = modelsMenuSelectionAction(entry)
     if (Option.isNone(action)) return
-    if (action.value._tag === "AssignOffering") {
+    if (action.value._tag === "AssignProvider") {
       const { providerModel } = action.value
       config.updateSlotModel(PRIMARY_SLOT_ID, providerModel.providerId, providerModel.providerModelId)
+      return
+    }
+    if (action.value._tag === "AssignLocal") {
+      slotActions.assign(PRIMARY_SLOT_ID, {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: action.value.providerModelId,
+        reasoningEffort: Option.getOrElse(
+          action.value.reasoningEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      })
       return
     }
     const createAction = action.value
@@ -812,12 +842,13 @@ const ModelsMenu = memo(function ModelsMenu({
   }, [config, modelActions, slotActions])
 
   const toggleFavorite = useCallback((entry: ModelsMenuEntry) => {
-    const model = modelsMenuProviderModel(entry)
-    if (model === undefined) return
-    config.setModelFavorite({
-      providerId: model.providerId,
-      providerModelId: model.providerModelId,
-    }, !currentFavoriteKeys.has(providerModelKey(model)))
+    Option.match(modelsMenuProviderIdentity(entry), {
+      onNone: () => {},
+      onSome: (model) => config.setModelFavorite(
+        model,
+        !currentFavoriteKeys.has(providerModelKey(model)),
+      ),
+    })
   }, [config, currentFavoriteKeys])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
@@ -830,14 +861,14 @@ const ModelsMenu = memo(function ModelsMenu({
         onSome: slotActions.stop,
       })
     }
-    else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.configurationId)
-  }, [choose, detail, detailCatalogCandidate, openCatalogDetail, primarySlot, slotActions])
+    else if (detailCatalogConfigurationId) openCatalogDetail(detailCatalogConfigurationId)
+  }, [choose, detail, detailCatalogConfigurationId, openCatalogDetail, primarySlot, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (detail) {
       if (key.name === "f" && !key.ctrl && !key.meta && !key.option
-        && modelsMenuProviderModel(detail) !== undefined) {
+        && Option.isSome(modelsMenuProviderIdentity(detail))) {
         key.preventDefault()
         toggleFavorite(detail)
         return
@@ -897,7 +928,7 @@ const ModelsMenu = memo(function ModelsMenu({
       return
     }
     if (key.name === "f" && !key.ctrl && !key.meta && !key.option && cursor
-      && modelsMenuProviderModel(cursor) !== undefined) {
+      && Option.isSome(modelsMenuProviderIdentity(cursor))) {
       key.preventDefault()
       toggleFavorite(cursor)
       return
@@ -918,16 +949,15 @@ const ModelsMenu = memo(function ModelsMenu({
 
   if (detail) {
     const detailProviderModel = modelsMenuProviderModel(detail)
-    const detailCandidate = modelsMenuCandidate(detail)
+    const detailHasProviderIdentity = Option.isSome(modelsMenuProviderIdentity(detail))
     const detailCapabilities = detailProviderModel?.capabilities
-      ?? detailCandidate?.capabilities
       ?? (detail._tag === "LocalStatus"
         ? Option.getOrUndefined(localModelCapabilities(detail.model))
         : detail._tag === "Local"
-          ? Option.getOrUndefined(localModelCapabilities(detail.choice.model))
+          ? Option.getOrUndefined(localModelCapabilities(detail.model))
           : undefined)
     const detailFavorite = isFavorite(detail)
-    const detailMemoryConditions = memoryConditionsFor(detail)
+    const detailMemory = memoryFor(detail)
     const detailActionLabel = {
       select: "Use this model",
       load: "Load model",
@@ -944,10 +974,10 @@ const ModelsMenu = memo(function ModelsMenu({
             setRootSwitchingEnabled(true)
           }}
           hints={detailActions.length > 0
-            ? detailProviderModel === undefined
+            ? !detailHasProviderIdentity
               ? "↑↓ navigate · Enter choose · Esc back"
               : "↑↓ navigate · Enter choose · F favorite · Esc back"
-            : detailProviderModel === undefined ? "Esc back" : "F favorite · Esc back"}
+            : !detailHasProviderIdentity ? "Esc back" : "F favorite · Esc back"}
         />
         <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
           <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
@@ -956,9 +986,13 @@ const ModelsMenu = memo(function ModelsMenu({
           <text style={{ fg: theme.muted }}>
             {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
           </text>
-          {detailIsLocal && modelMemoryStatusDetail(detailMemoryConditions) !== "" && (
+          {detailIsLocal && Option.exists(detailMemory, ({ currentHeadroomState, systemUseState }) =>
+            currentHeadroomState._tag === "Insufficient" || systemUseState._tag === "High") && (
             <text style={{ fg: theme.warning }}>
-              {modelMemoryStatusDetail(detailMemoryConditions)}
+              {Option.exists(detailMemory, ({ currentHeadroomState }) =>
+                currentHeadroomState._tag === "Insufficient")
+                ? "Not enough free memory right now"
+                : "Uses more than the recommended share of system memory"}
             </text>
           )}
           {detailCapabilities && (
@@ -1031,6 +1065,7 @@ const ModelsMenu = memo(function ModelsMenu({
           const active = isSelected(entry)
           const favorite = isFavorite(entry)
           const rowIndex = index
+          const status = modelsMenuStatusPresentation(statusFor(entry))
           return (
             <Button
               key={entry.id}
@@ -1052,11 +1087,16 @@ const ModelsMenu = memo(function ModelsMenu({
               <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(entry)}</text>
               <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{formatContextWindow(modelsMenuContextLength(entry))}</text>
               <text
-                style={{ fg: active ? theme.menuBg : theme.muted, width: 23 }}
+                style={{
+                  fg: active
+                    ? theme.menuBg
+                    : status.tone === "warning" ? theme.warning : theme.muted,
+                  width: 23,
+                }}
                 attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}
                 wrapMode="none"
               >
-                {truncateToDisplayWidth(statusFor(entry), 23)}
+                {truncateToDisplayWidth(status.label, 23)}
               </text>
             </Button>
           )
@@ -1089,53 +1129,52 @@ const recommendationLabel = (recommendation: Option.Option<LocalModelRecommendat
     })[intent],
   })
 
-const intelligenceLabel = ({ recommendationEvidence }: LocalModelCatalogCandidate): string =>
-  Option.match(recommendationEvidence, {
-    onNone: () => "—",
-    onSome: ({ intelligence }) => Option.match(intelligence, {
-      onNone: () => "—",
-      onSome: ({ score }) => `${Math.round(score)}/100`,
-    }),
-  })
+const intelligenceLabel = (model: LocalModel): string =>
+  model.catalogMembershipState._tag === "InCatalog"
+    ? `${Math.round(model.catalogMembershipState.catalogData.intelligenceScore)}/100`
+    : "—"
 
-const qualityLabel = ({ recommendationEvidence }: LocalModelCatalogCandidate): string =>
-  Option.match(recommendationEvidence, {
-    onNone: () => "—",
-    onSome: ({ fidelityRank }) => fidelityRank >= 75
+const qualityLabel = (model: LocalModel): string =>
+  model.catalogMembershipState._tag !== "InCatalog" ? "—"
+    : model.catalogMembershipState.catalogData.fidelityRank >= 75
       ? "Near original"
-      : fidelityRank >= 55
+      : model.catalogMembershipState.catalogData.fidelityRank >= 55
         ? "Very high"
-        : fidelityRank >= 45 ? "High" : "Reduced",
-  })
+        : model.catalogMembershipState.catalogData.fidelityRank >= 45 ? "High" : "Reduced"
 
-const recommendationEvidenceLabel = (candidate: LocalModelCatalogCandidate): string =>
-  Option.isNone(candidate.recommendationEvidence)
-    ? "recommendation evidence unavailable"
-    : `intelligence ${intelligenceLabel(candidate)} · ${qualityLabel(candidate)}`
+const catalogDataLabel = (model: LocalModel): string =>
+  model.catalogMembershipState._tag !== "InCatalog"
+    ? "not in catalog"
+    : `intelligence ${intelligenceLabel(model)} · ${qualityLabel(model)}`
 
 export const huggingFaceRepositoryUrls = (
-  { sources }: LocalModelCatalogCandidate,
-): readonly string[] => [...new Set(sources.flatMap(({ source }) =>
+  model: LocalModel,
+): readonly string[] => [...new Set((model.bundle._tag === "Standalone"
+  ? [model.bundle.package]
+  : [model.bundle.target, model.bundle.draft]).flatMap(({ source }) =>
   source._tag === "HuggingFace"
     ? [`https://huggingface.co/${source.repository}`]
     : [],
 ))]
 
-const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
-  if (candidate.download._tag === "NotDownloaded"
-    || candidate.download._tag === "Cancelled") return "Available"
-  if (candidate.download._tag === "Downloading") {
-    return `Downloading ${Math.round(candidate.download.completedBytes / Math.max(1, candidate.download.totalBytes) * 100)}%`
+const catalogStatus = (model: LocalModel): string => {
+  const acquisitionState = model.acquisitionState
+  if (acquisitionState._tag === "NotInstalled"
+    || acquisitionState._tag === "Cancelled") return "Available"
+  if (acquisitionState._tag === "Downloading") {
+    return `Downloading ${Math.round(acquisitionState.completedBytes / Math.max(1, acquisitionState.totalBytes) * 100)}%`
   }
-  if (candidate.download._tag === "Failed") return "Download failed"
-  if (candidate.availability._tag === "Unavailable") {
-    return candidate.availability.failure.message
+  if (acquisitionState._tag === "Failed") return "Download failed"
+  if (model.servingState._tag === "Assessed"
+    && model.servingState.availabilityState._tag === "Unavailable") {
+    return model.servingState.availabilityState.failure.message
   }
-  return localModelInstalledStatus(candidate.download)
+  return localModelInstalledStatus(model)
 }
 
 const CatalogCandidateRow = memo(function CatalogCandidateRow({
-  candidate,
+  model,
+  memoryBytes,
   recommendation,
   focused,
   pendingDelete,
@@ -1145,7 +1184,8 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   onClick,
   onMouseOver,
 }: {
-  readonly candidate: LocalModelCatalogCandidate
+  readonly model: LocalModel
+  readonly memoryBytes: number | undefined
   readonly recommendation: Option.Option<LocalModelRecommendation>
   readonly focused: boolean
   readonly pendingDelete: boolean
@@ -1156,17 +1196,17 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   readonly onMouseOver: () => void
 }) {
   const theme = useTheme()
-  const status = pendingDelete ? "Delete [y/n]" : catalogStatus(candidate)
+  const status = pendingDelete ? "Delete [y/n]" : catalogStatus(model)
   const statusColor = pendingDelete
     ? theme.warning
-    : candidate.download._tag === "Failed"
+    : model.acquisitionState._tag === "Failed"
       ? theme.error
-      : candidate.download._tag === "Downloading" || candidate.download._tag === "Downloaded"
+      : model.acquisitionState._tag === "Downloading" || model.acquisitionState._tag === "Installed"
         ? theme.primary
         : theme.muted
   const recommendationText = recommendationLabel(recommendation)
-  const memoryText = formatBytes(requiredMemoryBytes(candidate.memory))
-  const speedText = performanceRangeSpeedLabel(candidate, "t/s")
+  const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
+  const speedText = performanceRangeSpeedLabel(model, "t/s")
   const backgroundColor = focused
     ? theme.surfaceHover
     : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
@@ -1181,8 +1221,8 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
       : 0
     const modelWidth = Math.max(1, layout.contentWidth - cursorWidth - primaryStatusWidth)
     const modelLabel = formatCatalogModelLabel(
-      candidate.displayName,
-      candidate.quantizationName,
+      model.presentation.displayName,
+      model.presentation.quantizationName,
       modelWidth,
     )
     const metadata = [recommendationText, memoryText, ...(layout.showSpeed ? [speedText] : [])]
@@ -1243,7 +1283,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         {focused ? "›" : " "}
       </text>
       <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
-        {formatCatalogModelLabel(candidate.displayName, candidate.quantizationName, layout.modelWidth)}
+        {formatCatalogModelLabel(model.presentation.displayName, model.presentation.quantizationName, layout.modelWidth)}
       </text>
       <text style={{ fg: theme.primary, width: layout.columns.recommendation }} wrapMode="none">
         {truncateToDisplayWidth(recommendationText, layout.columns.recommendation)}
@@ -1253,12 +1293,12 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
       </text>
       {layout.showIntelligence && (
         <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">
-          {truncateToDisplayWidth(intelligenceLabel(candidate), layout.columns.intelligence)}
+          {truncateToDisplayWidth(intelligenceLabel(model), layout.columns.intelligence)}
         </text>
       )}
       {layout.showQuality && (
         <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">
-          {truncateToDisplayWidth(qualityLabel(candidate), layout.columns.quality)}
+          {truncateToDisplayWidth(qualityLabel(model), layout.columns.quality)}
         </text>
       )}
       {layout.showSpeed && (
@@ -1283,52 +1323,60 @@ const CatalogMenu = memo(function CatalogMenu({
   const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const menuWidth = menuSize.width ?? 80
   const layout = deriveCatalogLayout(menuWidth)
-  const localModels = useLocalModels()
+  const snapshot = useLocalModelsSelector(
+    selectModelMenusLocalModelsState,
+    modelMenusLocalModelsStateEquivalent,
+  )
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
-  const snapshot = Result.value(localModels)
-  const catalogCandidates = Option.match(snapshot, {
-    onNone: () => [] as readonly LocalModelCatalogCandidate[],
-    onSome: (models) =>
-      models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
-  })
-  const recommendations = Option.match(snapshot, {
-    onNone: () => [] as readonly LocalModelRecommendation[],
-    onSome: (models) =>
-      models.recommendations._tag === "Ready" ? models.recommendations.entries : [],
+  const catalogModels = Option.match(snapshot, {
+    onNone: () => [] as readonly LocalModel[],
+    onSome: ({ models }) => catalogLocalModels(models),
   })
   const recommendationsReady = Option.exists(
     snapshot,
-    (models) => models.recommendations._tag === "Ready",
+    (models) => models.discoveryState._tag === "Ready",
   )
-  const recommendationFor = useCallback((candidate: LocalModelCatalogCandidate) =>
-    Option.fromNullable(recommendations.find((recommendation) =>
-      recommendation.candidate.configurationId === candidate.configurationId)), [recommendations])
-  const candidates = [...catalogCandidates].sort((left, right) => {
-    const leftInstalled = left.download._tag === "Downloaded"
-    const rightInstalled = right.download._tag === "Downloaded"
+  const recommendationFor = useCallback((model: LocalModel) =>
+    model.servingState._tag === "Assessed"
+      ? Option.fromNullable(model.servingState.recommendations[0])
+      : Option.none<LocalModelRecommendation>(), [])
+  const memoryBytesFor = (model: LocalModel): number | undefined =>
+    model.servingState._tag === "Assessed"
+      && model.servingState.assessment._tag === "Fits"
+      ? model.servingState.assessment.memory.totalRequiredBytes
+      : undefined
+  const candidates = [...catalogModels].sort((left, right) => {
+    const leftInstalled = left.acquisitionState._tag === "Installed"
+    const rightInstalled = right.acquisitionState._tag === "Installed"
     return leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1
   })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [hoveredRepositoryUrl, setHoveredRepositoryUrl] = useState<string | null>(null)
-  const cursorIndex = Math.max(0, candidates.findIndex(({ configurationId }) =>
-    configurationId === cursorId))
+  const configurationIdFor = (model: LocalModel) => Option.getOrUndefined(
+    localModelConfigurationId(model),
+  )
+  const cursorIndex = Math.max(0, candidates.findIndex((model) =>
+    configurationIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
-  const detail = candidates.find(({ configurationId }) => configurationId === detailId) ?? null
+  const detail = candidates.find((model) => configurationIdFor(model) === detailId) ?? null
+  const detailMemoryBytes = detail === null ? undefined : memoryBytesFor(detail)
   const progress = Option.match(snapshot, {
     onNone: () => [],
-    onSome: (models) => localInferenceProgressLines(models.recommendations.progress),
+    onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
   })
   const runningProgress = progress.find((line) => line.state === "running")
   const spinner = useSpinnerFrame(runningProgress !== undefined)
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("primary" | "cancel" | "select")[]
     const actions: ("primary" | "cancel" | "select")[] = []
-    if (detail.download._tag === "Downloading") actions.push("cancel")
-    else if (detail.download._tag === "Downloaded") {
-      if (detail.availability._tag === "Available") actions.push("select")
+    if (detail.acquisitionState._tag === "Downloading") actions.push("cancel")
+    else if (detail.acquisitionState._tag === "Installed") {
+      if (detail.servingState._tag === "Assessed"
+        && (detail.servingState.availabilityState._tag === "Selectable"
+          || detail.servingState.availabilityState._tag === "Installable")) actions.push("select")
     }
     else actions.push("primary")
     return actions
@@ -1337,31 +1385,33 @@ const CatalogMenu = memo(function CatalogMenu({
   const focusedDetailAction = detailActions[detailActionCursor.index]
 
   const moveCursorTo = useCallback((index: number) => {
-    const candidate = candidates[index]
-    if (!candidate) return
-    setCursorId(candidate.configurationId)
-    scrollCatalogCandidateIntoView(catalogScrollRef.current, candidate.configurationId)
+    const model = candidates[index]
+    const configurationId = model && configurationIdFor(model)
+    if (!model || configurationId === undefined) return
+    setCursorId(configurationId)
+    scrollCatalogCandidateIntoView(catalogScrollRef.current, configurationId)
   }, [candidates])
 
-  const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.download._tag === "Downloading"
-      || candidate.download._tag === "Downloaded") return
-    void modelActions.install(candidate.configurationId)
+  const primaryAction = useCallback((model: LocalModel) => {
+    const configurationId = configurationIdFor(model)
+    if (configurationId === undefined
+      || model.acquisitionState._tag === "Downloading"
+      || model.acquisitionState._tag === "Installed") return
+    void modelActions.install(configurationId)
   }, [modelActions])
 
-  const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.availability._tag !== "Available"
+  const selectCandidate = useCallback((model: LocalModel) => {
+    if (model.servingState._tag !== "Assessed"
+      || model.servingState.assessment._tag !== "Fits"
       || Result.isWaiting(modelActions.installResult)) return
-    const providerModelId = Option.map(
-      Option.flatMap(snapshot, ({ models }) =>
-        findLocalOffering(models, candidate.configurationId)),
-      ({ providerModelId }) => providerModelId,
-    )
+    const configurationId = model.servingState.configuration.id
+    const reasoningEffort = model.servingState.capabilities.reasoning.defaultEffort
+    const providerModelId = localModelProviderModelId(model)
     const assign = (id: ProviderModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
       providerModelId: id,
       reasoningEffort: Option.getOrElse(
-        candidate.capabilities.reasoning.defaultEffort,
+        reasoningEffort,
         () => ReasoningEffortSchema.make("none"),
       ),
     })
@@ -1369,11 +1419,11 @@ const CatalogMenu = memo(function CatalogMenu({
       void assign(providerModelId.value)
       return
     }
-    void modelActions.install(candidate.configurationId).then(
+    void modelActions.install(configurationId).then(
       ({ providerModelId }) => assign(providerModelId),
       () => undefined,
     )
-  }, [modelActions, slotActions, snapshot])
+  }, [modelActions, slotActions])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
@@ -1382,8 +1432,8 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "cancel") {
-      if (detail.download._tag === "Downloading") {
-        modelActions.cancel(detail.download.attemptIds)
+      if (detail.acquisitionState._tag === "Downloading") {
+        modelActions.cancel(detail.acquisitionState.attemptIds)
       }
       return
     }
@@ -1418,8 +1468,11 @@ const CatalogMenu = memo(function CatalogMenu({
         && !key.meta
         && !key.option
       if (confirmsDelete) {
-        const candidate = candidates.find(({ configurationId }) => configurationId === pendingDeleteId)
-        if (candidate?.download._tag === "Downloaded") modelActions.delete(candidate.configurationId)
+        const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
+        const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
+        if (model?.acquisitionState._tag === "Installed" && configurationId !== undefined) {
+          modelActions.delete(configurationId)
+        }
         setPendingDeleteId(null)
         key.preventDefault()
         return
@@ -1439,20 +1492,22 @@ const CatalogMenu = memo(function CatalogMenu({
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
       detailActionCursor.reset()
-      setDetailId(cursor.configurationId)
+      setDetailId(configurationIdFor(cursor) ?? null)
       setRootSwitchingEnabled(false)
     } else if (key.name === "d" && cursor) {
       key.preventDefault()
       primaryAction(cursor)
-    } else if (key.name === "s" && cursor && cursor.availability._tag === "Available") {
+    } else if (key.name === "s" && cursor && cursor.servingState._tag === "Assessed"
+      && (cursor.servingState.availabilityState._tag === "Selectable"
+        || cursor.servingState.availabilityState._tag === "Installable")) {
       key.preventDefault()
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
-      if (cursor.download._tag === "Downloading") {
-        modelActions.cancel(cursor.download.attemptIds)
+      if (cursor.acquisitionState._tag === "Downloading") {
+        modelActions.cancel(cursor.acquisitionState.attemptIds)
         key.preventDefault()
-      } else if (cursor.download._tag === "Downloaded") {
-        setPendingDeleteId(cursor.configurationId)
+      } else if (cursor.acquisitionState._tag === "Installed") {
+        setPendingDeleteId(configurationIdFor(cursor) ?? null)
         key.preventDefault()
       }
     }
@@ -1460,9 +1515,9 @@ const CatalogMenu = memo(function CatalogMenu({
 
   if (detail) {
     const recommendation = recommendationFor(detail)
-    const downloading = detail.download._tag === "Downloading"
-    const downloaded = detail.download._tag === "Downloaded"
-    const failed = detail.download._tag === "Failed"
+    const downloading = detail.acquisitionState._tag === "Downloading"
+    const downloaded = detail.acquisitionState._tag === "Installed"
+    const failed = detail.acquisitionState._tag === "Failed"
     const detailActionLabel = {
       primary: failed ? "Retry download" : "Download",
       cancel: "Cancel download",
@@ -1476,7 +1531,7 @@ const CatalogMenu = memo(function CatalogMenu({
       >
         <MenuHeader
           title="Catalog"
-          selection={detail.displayName}
+          selection={detail.presentation.displayName}
           onSectionClick={() => {
             setDetailId(null)
             setRootSwitchingEnabled(true)
@@ -1493,8 +1548,8 @@ const CatalogMenu = memo(function CatalogMenu({
           viewportOptions: { backgroundColor: theme.menuBg },
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.displayName}</text>
-          <text style={{ fg: theme.muted }} wrapMode="word">{detail.description}</text>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.presentation.displayName}</text>
+          <text style={{ fg: theme.muted }} wrapMode="word">{detail.presentation.description}</text>
           {Option.isSome(recommendation) && (
             <>
               <text style={{ fg: theme.primary }}>{recommendationLabel(recommendation)}</text>
@@ -1504,15 +1559,15 @@ const CatalogMenu = memo(function CatalogMenu({
           <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>Calibrated for this machine</text>
           {layout.compactHeader ? (
             <>
-              <text style={{ fg: theme.muted }} wrapMode="word">Memory: {formatBytes(requiredMemoryBytes(detail.memory))}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Quantization: {detail.quantization}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Evidence: {recommendationEvidenceLabel(detail)}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">Memory: {detailMemoryBytes === undefined ? "—" : formatBytes(detailMemoryBytes)}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">Quantization: {detail.presentation.quantization}</text>
+              <text style={{ fg: theme.muted }} wrapMode="word">Catalog: {catalogDataLabel(detail)}</text>
               <text style={{ fg: theme.muted }} wrapMode="word">Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}</text>
             </>
           ) : (
             <>
               <text style={{ fg: theme.muted }} wrapMode="word">
-                {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · {recommendationEvidenceLabel(detail)}
+                {detailMemoryBytes === undefined ? "—" : formatBytes(detailMemoryBytes)} memory · {detail.presentation.quantization} · {catalogDataLabel(detail)}
               </text>
               <text style={{ fg: theme.muted }} wrapMode="word">
                 {performanceRangeSpeedLabel(detail, "tokens/sec")}
@@ -1522,7 +1577,7 @@ const CatalogMenu = memo(function CatalogMenu({
           <text style={{ fg: failed ? theme.error : downloading || downloaded ? theme.primary : theme.muted }}>
             {catalogStatus(detail)}
           </text>
-          {failed && <text style={{ fg: theme.error }}>{detail.download.failure.message}</text>}
+          {failed && <text style={{ fg: theme.error }}>{detail.acquisitionState.failure.message}</text>}
           {Result.isFailure(modelActions.installResult) && (
             <text style={{ fg: theme.error }}>Failed to install the local model.</text>
           )}
@@ -1538,7 +1593,7 @@ const CatalogMenu = memo(function CatalogMenu({
               />
             ))}
           </box>
-          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {detail.license}</text>
+          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {Option.getOrElse(detail.presentation.license, () => "Unknown")}</text>
           {huggingFaceRepositoryUrls(detail).map((url) => (
             <box key={url} style={{ flexDirection: "row", alignSelf: "flex-start" }}>
               <text style={{ fg: theme.muted }}>Hugging Face: </text>
@@ -1616,27 +1671,30 @@ const CatalogMenu = memo(function CatalogMenu({
             No compatible recommended models are currently available.
           </text>
         ) : candidates.map((candidate, index) => {
+          const configurationId = configurationIdFor(candidate)
+          if (configurationId === undefined) return null
           const focused = index === cursorIndex
-          const pendingDelete = pendingDeleteId === candidate.configurationId
+          const pendingDelete = pendingDeleteId === configurationId
           return (
             <CatalogCandidateRow
-              key={candidate.configurationId}
-              candidate={candidate}
+              key={configurationId}
+              model={candidate}
+              memoryBytes={memoryBytesFor(candidate)}
               recommendation={recommendationFor(candidate)}
               focused={focused}
               pendingDelete={pendingDelete}
               index={index}
               layout={layout}
-              rowId={catalogCandidateRowId(candidate.configurationId)}
+              rowId={catalogCandidateRowId(configurationId)}
               onClick={() => {
                 setPendingDeleteId(null)
                 detailActionCursor.reset()
-                setDetailId(candidate.configurationId)
+                setDetailId(configurationId)
                 setRootSwitchingEnabled(false)
               }}
               onMouseOver={() => {
-                setCursorId(candidate.configurationId)
-                if (pendingDeleteId !== candidate.configurationId) setPendingDeleteId(null)
+                setCursorId(configurationId)
+                if (pendingDeleteId !== configurationId) setPendingDeleteId(null)
               }}
             />
           )

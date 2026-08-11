@@ -95,6 +95,39 @@ pub enum ModelStoppingAllocation {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelInstanceFailure {
+    Operation {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    LowMemory {
+        code: String,
+        message: String,
+        retryable: bool,
+        required_system_memory_bytes: u64,
+        allocation_headroom_bytes: u64,
+        system_reserve_bytes: u64,
+        load_boundary_bytes: u64,
+        minimum_additional_available_bytes: u64,
+        parallel_sequences: u32,
+    },
+}
+
+impl From<ModelFailure> for ModelInstanceFailure {
+    fn from(failure: ModelFailure) -> Self {
+        Self::Operation {
+            code: failure.code,
+            message: failure.message,
+            retryable: failure.retryable,
+        }
+    }
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum ModelInstanceLifecycle {
@@ -120,7 +153,7 @@ pub enum ModelInstanceLifecycle {
         reason: ModelReleaseReason,
     },
     Failed {
-        failure: ModelFailure,
+        failure: ModelInstanceFailure,
     },
 }
 
@@ -418,13 +451,6 @@ pub enum ModelBundleInput {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CapacityPolicy {
-    pub required_reserve_bytes_per_memory_domain: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelAssessmentProfile {
     pub profile: ServingProfile,
     pub performance_context_tokens: Vec<u32>,
@@ -444,7 +470,6 @@ pub struct AssessModelRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssessModelsRequest {
     pub requests: Vec<AssessModelRequest>,
-    pub capacity_policy: CapacityPolicy,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -455,7 +480,6 @@ pub struct MemoryAssessment {
     pub capacity_bytes: u64,
     pub required_bytes: u64,
     pub compatibility_reserve_bytes: u64,
-    pub warning_reserve_bytes: u64,
     pub remaining_bytes: i64,
 }
 
@@ -678,7 +702,7 @@ pub enum ModelLoadEvent {
         instance_id: ModelInstanceId,
     },
     Failed {
-        failure: ModelFailure,
+        failure: ModelInstanceFailure,
     },
 }
 

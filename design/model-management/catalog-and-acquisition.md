@@ -153,10 +153,11 @@ slot identity. ACN may immediately merge an exact admission response into observ
 presentation latency, while ICN attempt and inventory state remain authoritative for completion and
 physical presence.
 
-Every CLI download summary is a pure projection of `LocalModelsState.downloads`. Closing the Models
-menu leaves active download status visible in the persistent composer footer, and the client does
-not retain a second download counter or lifecycle. The composer footer and Models menu use the same
-download projection and remove it when that collection contains no active downloads.
+Every CLI download notification is a pure projection of
+`LocalModelsState.models[].acquisitionState`. Closing the Models menu leaves active download status
+visible in the persistent composer footer, and the client does not retain a second download counter
+or lifecycle. The composer footer and Models menu consume the same resolved notification and remove
+download activity when no row is actively downloading.
 
 ## Concurrency and recovery
 

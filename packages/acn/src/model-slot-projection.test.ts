@@ -43,6 +43,44 @@ describe("model slot projection", () => {
     })
   })
 
+  it("preserves structured low-memory failure facts", () => {
+    const projected = projectModelInstance({
+      id: "instance",
+      configurationId: "configuration",
+      lifecycle: {
+        _tag: "Failed",
+        failure: {
+          _tag: "LowMemory",
+          code: "low_memory",
+          message: "not enough memory",
+          retryable: true,
+          requiredSystemMemoryBytes: 24,
+          allocationHeadroomBytes: 20,
+          systemReserveBytes: 2,
+          loadBoundaryBytes: 26,
+          minimumAdditionalAvailableBytes: 7,
+          parallelSequences: 1,
+        },
+      },
+    } as Generated.ModelInstance)
+
+    expect(projected.lifecycle).toEqual({
+      _tag: "Failed",
+      failure: {
+        _tag: "LowMemory",
+        code: "low_memory",
+        message: "not enough memory",
+        retryable: true,
+        requiredSystemMemoryBytes: 24,
+        allocationHeadroomBytes: 20,
+        systemReserveBytes: 2,
+        loadBoundaryBytes: 26,
+        minimumAdditionalAvailableBytes: 7,
+        parallelSequences: 1,
+      },
+    })
+  })
+
   it("derives every physical action from canonical instance lifecycle", () => {
     const available = { _tag: "Available" as const }
     expect(modelSlotActions(available, Option.none())).toEqual(["Load"])

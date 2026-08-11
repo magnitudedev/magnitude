@@ -3320,9 +3320,10 @@ mod tests {
                     "cpu_model": "Test CPU",
                     "logical_cores": 8,
                     "system_memory": {
-                        "total_bytes": 1024,
-                        "current_available_bytes": 512,
-                        "warning_reserve_bytes": 256,
+                        "physical_capacity_bytes": 1024,
+                        "physical_available_bytes": 512,
+                        "allocation_capacity_bytes": 1024,
+                        "allocation_headroom_bytes": 512,
                         "assess_reserve_bytes": 128,
                         "abort_reserve_bytes": 64
                     },
@@ -3526,7 +3527,8 @@ mod tests {
                         message: "exact configuration loading is unavailable in the stub model controller"
                             .to_owned(),
                         retryable: false,
-                    },
+                    }
+                    .into(),
                 }
             }))
         }

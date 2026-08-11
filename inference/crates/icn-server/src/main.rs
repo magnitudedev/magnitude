@@ -19,11 +19,12 @@ use icn_contracts::models::{
     InstalledModelPackages as _, LoadModelReady, LoadModelRequest, MemoryAssessment,
     ModelAssessment, ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile,
     ModelAssessor, ModelBundleInput, ModelFailure as DomainModelFailure, ModelInstance,
-    ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadEvent, ModelLoadPlan, ModelLoadStage, ModelPackageId, ModelPackageOperand,
-    ModelReleaseReason, ModelServingConfiguration, ModelServingConfigurationId,
-    ModelStoppingAllocation, PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
-    RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
+    ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
+    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelLoadStage, ModelPackageId,
+    ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
+    ModelServingConfigurationId, ModelStoppingAllocation, PerformanceConfidence,
+    PerformanceEvidence, PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
+    ServableModelBundle as DomainServableModelBundle,
 };
 use icn_contracts::{
     CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
@@ -654,15 +655,14 @@ fn credit_replaced_instance_memory(
     mut sample: memory_supervisor::MemorySample,
     releasable_system_memory_bytes: u64,
 ) -> memory_supervisor::MemorySample {
-    sample.available_bytes = sample
-        .available_bytes
+    sample.physical_available_bytes = sample
+        .physical_available_bytes
         .saturating_add(releasable_system_memory_bytes)
-        .min(sample.total_bytes);
-    sample.available_commit_bytes = sample.available_commit_bytes.map(|available| {
-        available
-            .saturating_add(releasable_system_memory_bytes)
-            .min(sample.commit_limit_bytes.unwrap_or(u64::MAX))
-    });
+        .min(sample.physical_capacity_bytes);
+    sample.allocation_headroom_bytes = sample
+        .allocation_headroom_bytes
+        .saturating_add(releasable_system_memory_bytes)
+        .min(sample.allocation_capacity_bytes);
     sample
 }
 
@@ -735,6 +735,7 @@ fn native_assessor_services(
 }
 
 const MAX_ASSESSMENT_ORCHESTRATION_CONCURRENCY: usize = 12;
+const ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN: u64 = 1536 * 1024 * 1024;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -1330,10 +1331,20 @@ async fn discover_startup_hardware(
 ) -> Result<HardwareSnapshot, InventoryError> {
     let native_build = build_identity::native_build();
     spawn_blocking_traced(move || {
-        native_backend.discover_hardware(CapacityPolicy::default(), native_build, enabled_backends)
+        let snapshot = native_backend.discover_hardware(
+            CapacityPolicy::default(),
+            native_build,
+            enabled_backends,
+        );
+        let observation =
+            icn_hardware::observe_system_memory().map_err(InventoryError::Internal)?;
+        Ok(icn_hardware::with_system_memory_observation(
+            snapshot,
+            observation,
+        ))
     })
     .await
-    .map_err(|error| InventoryError::Internal(format!("hardware discovery task failed: {error}")))
+    .map_err(|error| InventoryError::Internal(format!("hardware discovery task failed: {error}")))?
 }
 
 async fn establish_hardware_calibration(
@@ -1808,17 +1819,15 @@ impl NativeModelAssessor {
         }
     }
 
-    async fn environment(
-        &self,
-        reserve_bytes: u64,
-    ) -> Result<AssessmentEnvironment, InventoryError> {
+    async fn environment(&self) -> Result<AssessmentEnvironment, InventoryError> {
         let snapshot = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
-        let thresholds = icn_hardware::system_memory_thresholds(snapshot.system_memory.total_bytes);
+        let thresholds =
+            icn_hardware::system_memory_thresholds(snapshot.system_memory.physical_capacity_bytes);
         let snapshot = icn_hardware::with_capacity_policy(
             snapshot,
             CapacityPolicy {
-                reserve_bytes_per_domain: reserve_bytes,
-                system_reserve_bytes: Some(reserve_bytes.max(thresholds.assess_reserve_bytes)),
+                reserve_bytes_per_domain: ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
+                system_reserve_bytes: Some(thresholds.assess_reserve_bytes),
             },
         );
         let topology =
@@ -1836,11 +1845,10 @@ impl NativeModelAssessor {
             &snapshot.native_build,
             &snapshot.enabled_backends,
             &snapshot.topology_fingerprint,
-            reserve_bytes,
-            reserve_bytes.max(thresholds.assess_reserve_bytes),
-            snapshot.system_memory.total_bytes,
+            ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
+            thresholds.assess_reserve_bytes,
+            snapshot.system_memory.physical_capacity_bytes,
             snapshot.system_memory.assess_reserve_bytes,
-            snapshot.system_memory.warning_reserve_bytes,
             hardware_calibration_identity,
         ))
         .map_err(|error| InventoryError::Internal(error.to_string()))?;
@@ -1871,7 +1879,6 @@ impl NativeModelAssessor {
         &self,
         bundle_key: &icn_contracts::models::ServableModelBundleKey,
         profiles: &[DomainModelAssessmentProfile],
-        reserve_bytes: u64,
         environment: &AssessmentEnvironment,
     ) -> Result<Vec<String>, InventoryError> {
         let calibration_identity = NativeResolvedModelAssessor::hardware_calibration_identity(
@@ -1893,7 +1900,6 @@ impl NativeModelAssessor {
                     &bundle_key.0,
                     defaults,
                     &profile.performance_context_tokens,
-                    reserve_bytes,
                 ))
                 .map_err(|error| InventoryError::Internal(error.to_string()))
             })
@@ -1904,11 +1910,10 @@ impl NativeModelAssessor {
         &self,
         bundle_key: &icn_contracts::models::ServableModelBundleKey,
         profiles: &[DomainModelAssessmentProfile],
-        reserve_bytes: u64,
         environment: &AssessmentEnvironment,
     ) -> Result<Option<Vec<ModelAssessment>>, InventoryError> {
         let evidence = self
-            .assessment_evidence(bundle_key, profiles, reserve_bytes, environment)
+            .assessment_evidence(bundle_key, profiles, environment)
             .await?;
         let results = evidence
             .iter()
@@ -1930,15 +1935,14 @@ impl NativeModelAssessor {
         &self,
         resolved: &icn_contracts::models::ResolvedServableModelBundle,
         profiles: &[DomainModelAssessmentProfile],
-        reserve_bytes: u64,
         environment: &AssessmentEnvironment,
         deadline_at_ms: u64,
     ) -> Result<Vec<ModelAssessment>, InventoryError> {
         let hardware = &environment.snapshot;
-        let thresholds = icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes);
-        let system_reserve_bytes = reserve_bytes.max(thresholds.assess_reserve_bytes);
+        let thresholds =
+            icn_hardware::system_memory_thresholds(hardware.system_memory.physical_capacity_bytes);
         let evidence = self
-            .assessment_evidence(&resolved.bundle_key, profiles, reserve_bytes, environment)
+            .assessment_evidence(&resolved.bundle_key, profiles, environment)
             .await?;
         // Serialize misses for one immutable target in one assessment environment. The waiter
         // rechecks every exact profile key after admission, so overlapping requests reuse results
@@ -2008,9 +2012,8 @@ impl NativeModelAssessor {
                     &resolved.bundle,
                     profiles[index].clone(),
                     &environment.id,
-                    reserve_bytes,
-                    system_reserve_bytes,
-                    thresholds.warning_reserve_bytes,
+                    ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
+                    thresholds.assess_reserve_bytes,
                     assessment,
                 )?;
                 models.write_model_assessment(&evidence[index], &assessment);
@@ -2041,7 +2044,6 @@ fn model_assessment(
     environment_id: &AssessmentEnvironmentId,
     reserve_bytes: u64,
     system_reserve_bytes: u64,
-    warning_reserve_bytes: u64,
     assessment: ModelExecutionAssessment,
 ) -> Result<ModelAssessment, InventoryError> {
     let DomainModelAssessmentProfile {
@@ -2097,11 +2099,6 @@ fn model_assessment(
                         };
                         MemoryAssessment {
                             compatibility_reserve_bytes: domain_reserve,
-                            warning_reserve_bytes: if domain.memory_domain.is_system() {
-                                warning_reserve_bytes
-                            } else {
-                                domain_reserve
-                            },
                             memory_domain_id: domain.memory_domain,
                             capacity_bytes: domain
                                 .usable_capacity_bytes
@@ -2132,11 +2129,6 @@ fn model_assessment(
                     };
                     MemoryAssessment {
                         compatibility_reserve_bytes: domain_reserve,
-                        warning_reserve_bytes: if domain.memory_domain.is_system() {
-                            warning_reserve_bytes
-                        } else {
-                            domain_reserve
-                        },
                         memory_domain_id: domain.memory_domain,
                         capacity_bytes: domain.usable_capacity_bytes.saturating_add(domain_reserve),
                         required_bytes: domain.required_bytes,
@@ -2287,10 +2279,7 @@ impl ModelAssessor for NativeModelAssessor {
             let deadline_at_ms = unix_time_millis()
                 .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
             tokio::time::timeout(remaining, async move {
-                let reserve_bytes = request
-                    .capacity_policy
-                    .required_reserve_bytes_per_memory_domain;
-                let environment = self.environment(reserve_bytes).await?;
+                let environment = self.environment().await?;
                 let release_catalog = Arc::clone(&self.release_catalog);
                 let evaluated = futures_util::stream::iter(
                     request.requests.into_iter().enumerate(),
@@ -2330,12 +2319,7 @@ impl ModelAssessor for NativeModelAssessor {
                             ));
                         }
                         let cached = self
-                            .cached_profiles(
-                                &bundle_key,
-                                &item.profiles,
-                                reserve_bytes,
-                                &environment,
-                            )
+                            .cached_profiles(&bundle_key, &item.profiles, &environment)
                             .await?;
                         let result = if let Some(profiles) = cached {
                             AssessModelResult::Assessed {
@@ -2371,7 +2355,6 @@ impl ModelAssessor for NativeModelAssessor {
                                         .assess_profiles(
                                             &resolved,
                                             &item.profiles,
-                                            reserve_bytes,
                                             &environment,
                                             deadline_at_ms,
                                         )
@@ -3163,7 +3146,12 @@ impl HardwareProvider for NativeResolvedModelAssessor {
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
-            Ok(snapshot)
+            let observation =
+                icn_hardware::observe_system_memory().map_err(InventoryError::Internal)?;
+            Ok(icn_hardware::with_system_memory_observation(
+                snapshot,
+                observation,
+            ))
         })
     }
 }
@@ -3228,18 +3216,112 @@ struct OwnedInferenceWorker {
 }
 
 #[derive(Clone)]
-struct ModelOperationFailure {
-    code: String,
-    message: String,
-    retryable: bool,
+enum ModelOperationFailure {
+    Operation {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    LowMemory {
+        message: String,
+        required_system_memory_bytes: u64,
+        allocation_headroom_bytes: u64,
+        system_reserve_bytes: u64,
+        load_boundary_bytes: u64,
+        minimum_additional_available_bytes: u64,
+        parallel_sequences: u32,
+    },
 }
 
 impl ModelOperationFailure {
     fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
-        Self {
+        Self::Operation {
             code: code.into(),
             message: message.into(),
             retryable,
+        }
+    }
+
+    fn low_memory(
+        sample: memory_supervisor::MemorySample,
+        required_system_memory_bytes: u64,
+        parallel_sequences: u32,
+    ) -> Self {
+        let system_reserve_bytes = sample.abort_reserve_bytes();
+        let load_boundary_bytes = required_system_memory_bytes.saturating_add(system_reserve_bytes);
+        let allocation_headroom_bytes = sample.allocation_headroom_bytes;
+        let minimum_additional_available_bytes = load_boundary_bytes
+            .saturating_sub(allocation_headroom_bytes)
+            .saturating_add(1);
+        let shortfall_unit = if minimum_additional_available_bytes == 1 {
+            "byte"
+        } else {
+            "bytes"
+        };
+        let message = format!(
+            "not enough memory available: model requires {required_system_memory_bytes} bytes plus {system_reserve_bytes} bytes reserved for the system; {allocation_headroom_bytes} bytes are available ({minimum_additional_available_bytes} {shortfall_unit} short)"
+        );
+        Self::LowMemory {
+            message,
+            required_system_memory_bytes,
+            allocation_headroom_bytes,
+            system_reserve_bytes,
+            load_boundary_bytes,
+            minimum_additional_available_bytes,
+            parallel_sequences,
+        }
+    }
+
+    fn code(&self) -> &str {
+        match self {
+            Self::Operation { code, .. } => code,
+            Self::LowMemory { .. } => LOW_MEMORY_FAILURE_CODE,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Operation { message, .. } | Self::LowMemory { message, .. } => message,
+        }
+    }
+
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Operation { retryable, .. } => *retryable,
+            Self::LowMemory { .. } => true,
+        }
+    }
+
+    fn into_instance_failure(self) -> ModelInstanceFailure {
+        match self {
+            Self::Operation {
+                code,
+                message,
+                retryable,
+            } => ModelInstanceFailure::Operation {
+                code,
+                message,
+                retryable,
+            },
+            Self::LowMemory {
+                message,
+                required_system_memory_bytes,
+                allocation_headroom_bytes,
+                system_reserve_bytes,
+                load_boundary_bytes,
+                minimum_additional_available_bytes,
+                parallel_sequences,
+            } => ModelInstanceFailure::LowMemory {
+                code: LOW_MEMORY_FAILURE_CODE.to_owned(),
+                message,
+                retryable: true,
+                required_system_memory_bytes,
+                allocation_headroom_bytes,
+                system_reserve_bytes,
+                load_boundary_bytes,
+                minimum_additional_available_bytes,
+                parallel_sequences,
+            },
         }
     }
 }
@@ -3393,7 +3475,7 @@ impl NativeModelInstanceController {
         &self,
         instance_id: &ModelInstanceId,
         configuration_id: &ModelServingConfigurationId,
-        failure: DomainModelFailure,
+        failure: ModelInstanceFailure,
     ) {
         self.instances
             .publish(ModelInstance {
@@ -3643,7 +3725,7 @@ impl NativeModelInstanceController {
             .await
             .map_err(ModelTransitionFailure::from)?;
         let assess_reserve =
-            icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes)
+            icn_hardware::system_memory_thresholds(hardware.system_memory.physical_capacity_bytes)
                 .assess_reserve_bytes;
         let resident = self.instances.ready_instance().await;
         let releasable_system_memory_bytes = resident
@@ -3785,7 +3867,7 @@ impl NativeModelInstanceController {
                     id: resident.instance_id,
                     configuration_id: resident.configuration_id,
                     lifecycle: ModelInstanceLifecycle::Failed {
-                        failure: DomainModelFailure {
+                        failure: ModelInstanceFailure::Operation {
                             code: code.to_owned(),
                             message: reason.to_owned(),
                             retryable: true,
@@ -3916,10 +3998,9 @@ impl NativeModelInstanceController {
                             });
                             controller.block_memory_admission();
                             tracing::warn!(
-                                memory.available_bytes = sample.available_bytes,
+                                memory.physical_available_bytes = sample.physical_available_bytes,
+                                memory.allocation_headroom_bytes = sample.allocation_headroom_bytes,
                                 memory.reserve_bytes = sample.abort_reserve_bytes(),
-                                memory.available_commit_bytes = ?sample.available_commit_bytes,
-                                memory.commit_limit_bytes = ?sample.commit_limit_bytes,
                                 memory.sample_age_ms = sample.captured_at.elapsed().as_millis(),
                                 worker.resident_bytes = ?worker_resident_bytes,
                                 worker.pid = worker.pid(),
@@ -4041,15 +4122,9 @@ impl NativeModelInstanceController {
                 .first()
                 .map(|(_, required)| *required)
                 .unwrap_or_default();
-            return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
-                LOW_MEMORY_FAILURE_CODE,
-                format!(
-                    "model requires at least {minimum_required} bytes of system memory at parallelism 1, but only {} bytes are available with a {} byte system reserve",
-                    sample.available_bytes,
-                    sample.abort_reserve_bytes()
-                ),
-                true,
-            )));
+            return Err(ModelTransitionFailure::new(
+                ModelOperationFailure::low_memory(sample, minimum_required, 1),
+            ));
         };
         Ok((selected.0, selected.1, hardware))
     }
@@ -4672,9 +4747,9 @@ impl ModelInstanceController for NativeModelInstanceController {
                 .select_load_allocation(resolved, &profile, &request.configuration.id)
                 .await
                 .map_err(|failure| InventoryError::ModelOperation {
-                    code: failure.event.code,
-                    message: failure.event.message,
-                    retryable: failure.event.retryable,
+                    code: failure.event.code().to_owned(),
+                    message: failure.event.message().to_owned(),
+                    retryable: failure.event.retryable(),
                 })?;
             let physical_context_tokens = plan
                 .context_size
@@ -4706,7 +4781,9 @@ impl ModelInstanceController for NativeModelInstanceController {
             {
                 Ok(admission) => admission,
                 Err(failure) => {
-                    let _ = events.send(ModelLoadEvent::Failed { failure });
+                    let _ = events.send(ModelLoadEvent::Failed {
+                        failure: failure.into(),
+                    });
                     return;
                 }
             };
@@ -4760,7 +4837,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                                 .await;
                             send_stopped();
                         } else {
-                            let failure = Self::load_failure(error);
+                            let failure = ModelInstanceFailure::from(Self::load_failure(error));
                             controller
                                 .publish_failed(&instance_id, &configuration_id, failure.clone())
                                 .await;
@@ -4792,7 +4869,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                     .await
                 {
                     Ok(allocation) => allocation,
-                    Err(failure) if failure.event.code == "model_instance_stopped" => {
+                    Err(failure) if failure.event.code() == "model_instance_stopped" => {
                         controller
                             .publish_stopped_loading(&instance_id, &configuration_id)
                             .await;
@@ -4800,11 +4877,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         return;
                     }
                     Err(failure) => {
-                        let failure = DomainModelFailure {
-                            code: failure.event.code.to_owned(),
-                            message: failure.event.message,
-                            retryable: failure.event.retryable,
-                        };
+                        let failure = failure.event.into_instance_failure();
                         controller
                             .publish_failed(&instance_id, &configuration_id, failure.clone())
                             .await;
@@ -4865,7 +4938,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         .publish_failed(
                             &instance_id,
                             &configuration_id,
-                            DomainModelFailure {
+                            ModelInstanceFailure::Operation {
                                 code: "model_instance_operation_panicked".to_owned(),
                                 message: "model instance operation panicked".to_owned(),
                                 retryable: true,
@@ -5416,9 +5489,9 @@ mod tests {
             retryable: false,
         });
 
-        assert_eq!(failure.event.code, "invalid_split_layout");
-        assert_eq!(failure.event.message, "the shard layout is invalid");
-        assert!(!failure.event.retryable);
+        assert_eq!(failure.event.code(), "invalid_split_layout");
+        assert_eq!(failure.event.message(), "the shard layout is invalid");
+        assert!(!failure.event.retryable());
     }
 
     #[test]
@@ -5456,9 +5529,10 @@ mod tests {
             cpu_model: Some("test-cpu".to_owned()),
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
-                total_bytes: 10,
-                current_available_bytes: 10,
-                warning_reserve_bytes: 0,
+                physical_capacity_bytes: 10,
+                physical_available_bytes: 10,
+                allocation_capacity_bytes: 10,
+                allocation_headroom_bytes: 10,
                 assess_reserve_bytes: 0,
                 abort_reserve_bytes: 0,
             },
@@ -5650,7 +5724,7 @@ mod tests {
             id: second_id,
             configuration_id: second_configuration,
             lifecycle: ModelInstanceLifecycle::Failed {
-                failure: DomainModelFailure {
+                failure: ModelInstanceFailure::Operation {
                     code: "test_failure".to_owned(),
                     message: "test failure".to_owned(),
                     retryable: false,
@@ -5753,10 +5827,10 @@ mod tests {
         let gib = 1024 * 1024 * 1024;
         let sample = memory_supervisor::MemorySample {
             captured_at: std::time::Instant::now(),
-            total_bytes: 16 * gib,
-            available_bytes: 7 * gib,
-            commit_limit_bytes: None,
-            available_commit_bytes: None,
+            physical_capacity_bytes: 16 * gib,
+            physical_available_bytes: 7 * gib,
+            allocation_capacity_bytes: 16 * gib,
+            allocation_headroom_bytes: 7 * gib,
         };
 
         assert_eq!(
@@ -5766,20 +5840,52 @@ mod tests {
     }
 
     #[test]
+    fn low_memory_failure_preserves_attempt_arithmetic() {
+        let gib = 1024 * 1024 * 1024;
+        let sample = memory_supervisor::MemorySample {
+            captured_at: std::time::Instant::now(),
+            physical_capacity_bytes: 16 * gib,
+            physical_available_bytes: 7 * gib,
+            allocation_capacity_bytes: 16 * gib,
+            allocation_headroom_bytes: 7 * gib,
+        };
+
+        assert_eq!(
+            ModelOperationFailure::low_memory(sample, 6 * gib, 1).into_instance_failure(),
+            ModelInstanceFailure::LowMemory {
+                code: LOW_MEMORY_FAILURE_CODE.to_owned(),
+                message: format!(
+                    "not enough memory available: model requires {} bytes plus {} bytes reserved for the system; {} bytes are available (1 byte short)",
+                    6 * gib,
+                    gib,
+                    7 * gib,
+                ),
+                retryable: true,
+                required_system_memory_bytes: 6 * gib,
+                allocation_headroom_bytes: 7 * gib,
+                system_reserve_bytes: gib,
+                load_boundary_bytes: 7 * gib,
+                minimum_additional_available_bytes: 1,
+                parallel_sequences: 1,
+            }
+        );
+    }
+
+    #[test]
     fn replacement_preview_credits_only_memory_the_current_residency_will_release() {
         let gib = 1024 * 1024 * 1024;
         let sample = memory_supervisor::MemorySample {
             captured_at: std::time::Instant::now(),
-            total_bytes: 16 * gib,
-            available_bytes: 3 * gib,
-            commit_limit_bytes: Some(20 * gib),
-            available_commit_bytes: Some(4 * gib),
+            physical_capacity_bytes: 16 * gib,
+            physical_available_bytes: 3 * gib,
+            allocation_capacity_bytes: 20 * gib,
+            allocation_headroom_bytes: 4 * gib,
         };
 
         assert_eq!(select_model_allocation(&[(1, 4 * gib)], sample), None);
         let credited = credit_replaced_instance_memory(sample, 3 * gib);
-        assert_eq!(credited.available_bytes, 6 * gib);
-        assert_eq!(credited.available_commit_bytes, Some(7 * gib));
+        assert_eq!(credited.physical_available_bytes, 6 * gib);
+        assert_eq!(credited.allocation_headroom_bytes, 7 * gib);
         assert_eq!(
             select_model_allocation(&[(1, 4 * gib)], credited),
             Some((1, 4 * gib))
@@ -6079,9 +6185,10 @@ mod tests {
             cpu_model: None,
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
-                total_bytes: 10,
-                current_available_bytes: 10,
-                warning_reserve_bytes: 0,
+                physical_capacity_bytes: 10,
+                physical_available_bytes: 10,
+                allocation_capacity_bytes: 10,
+                allocation_headroom_bytes: 10,
                 assess_reserve_bytes: 0,
                 abort_reserve_bytes: 0,
             },
@@ -6130,7 +6237,10 @@ mod tests {
         availability_only_change.captured_at = 2;
         availability_only_change
             .system_memory
-            .current_available_bytes = 0;
+            .physical_available_bytes = 0;
+        availability_only_change
+            .system_memory
+            .allocation_headroom_bytes = 0;
         assert_eq!(
             assessor
                 .capacity_assessment_cache_key(Some(&equivalent_preview), &snapshot)
@@ -6249,8 +6359,8 @@ mod tests {
         };
 
         for fixture in fixtures {
-            let store = tempfile::tempdir_in(inference_root.join("target"))
-                .expect("temporary model store");
+            let store =
+                tempfile::tempdir_in(inference_root.join("target")).expect("temporary model store");
             let mut config = InventoryConfig::with_roots(
                 store.path().join("inventory"),
                 store.path().join("cache"),

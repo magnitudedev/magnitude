@@ -1947,9 +1947,10 @@ mod tests {
                     cpu_model: None,
                     logical_cores: 1,
                     system_memory: icn_contracts::HardwareSystemMemory {
-                        total_bytes: 1,
-                        current_available_bytes: 1,
-                        warning_reserve_bytes: 0,
+                        physical_capacity_bytes: 1,
+                        physical_available_bytes: 1,
+                        allocation_capacity_bytes: 1,
+                        allocation_headroom_bytes: 1,
                         assess_reserve_bytes: 0,
                         abort_reserve_bytes: 0,
                     },

@@ -12,42 +12,33 @@ pub(crate) const RECOVERY_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MemorySample {
     pub(crate) captured_at: Instant,
-    pub(crate) total_bytes: u64,
-    pub(crate) available_bytes: u64,
-    pub(crate) commit_limit_bytes: Option<u64>,
-    pub(crate) available_commit_bytes: Option<u64>,
+    pub(crate) physical_capacity_bytes: u64,
+    pub(crate) physical_available_bytes: u64,
+    pub(crate) allocation_capacity_bytes: u64,
+    pub(crate) allocation_headroom_bytes: u64,
 }
 
 impl MemorySample {
     pub(crate) fn abort_reserve_bytes(self) -> u64 {
-        icn_hardware::system_memory_thresholds(self.total_bytes).abort_reserve_bytes
+        icn_hardware::system_memory_thresholds(self.physical_capacity_bytes).abort_reserve_bytes
     }
 
     pub(crate) fn permits_load(self, required_system_memory_bytes: u64) -> bool {
         let required = self
             .abort_reserve_bytes()
             .saturating_add(required_system_memory_bytes);
-        self.available_bytes > required
-            && self
-                .available_commit_bytes
-                .is_none_or(|available| available > required)
+        self.allocation_headroom_bytes > required
     }
 
     pub(crate) fn requires_eviction(self) -> bool {
-        self.available_bytes <= self.abort_reserve_bytes()
-            || self
-                .available_commit_bytes
-                .is_some_and(|available| available <= self.abort_reserve_bytes())
+        self.allocation_headroom_bytes <= self.abort_reserve_bytes()
     }
 
     pub(crate) fn recovered(self) -> bool {
         let required = self
             .abort_reserve_bytes()
             .saturating_add(RECOVERY_MARGIN_BYTES);
-        self.available_bytes > required
-            && self
-                .available_commit_bytes
-                .is_none_or(|available| available > required)
+        self.allocation_headroom_bytes > required
     }
 }
 
@@ -68,22 +59,18 @@ impl SystemMemoryObserver {
         let mut system = self
             .system
             .lock()
-            .map_err(|_| "system memory observer lock poisoned".to_owned())?;
+            .map_err(|_| "system memory observer lock is poisoned".to_owned())?;
         system.refresh_memory_specifics(MemoryRefreshKind::everything());
-        let total_bytes = system.total_memory();
-        let available_bytes = system.available_memory();
-        if total_bytes == 0 || available_bytes > total_bytes {
-            return Err(format!(
-                "invalid system memory observation: total={total_bytes}, available={available_bytes}"
-            ));
-        }
-        let (commit_limit_bytes, available_commit_bytes) = windows_commit()?;
+        let observation = icn_hardware::normalize_system_memory(
+            system.total_memory(),
+            system.available_memory(),
+        )?;
         Ok(MemorySample {
             captured_at: Instant::now(),
-            total_bytes,
-            available_bytes,
-            commit_limit_bytes,
-            available_commit_bytes,
+            physical_capacity_bytes: observation.physical_capacity_bytes,
+            physical_available_bytes: observation.physical_available_bytes,
+            allocation_capacity_bytes: observation.allocation_capacity_bytes,
+            allocation_headroom_bytes: observation.allocation_headroom_bytes,
         })
     }
 
@@ -99,34 +86,6 @@ impl SystemMemoryObserver {
     }
 }
 
-#[cfg(not(windows))]
-fn windows_commit() -> Result<(Option<u64>, Option<u64>), String> {
-    Ok((None, None))
-}
-
-#[cfg(windows)]
-fn windows_commit() -> Result<(Option<u64>, Option<u64>), String> {
-    use std::mem::{size_of, zeroed};
-    use windows_sys::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
-
-    // SAFETY: the structure is initialized to the documented size and passed for the duration of
-    // the call. GetPerformanceInfo writes no more than the supplied structure.
-    unsafe {
-        let mut performance: PERFORMANCE_INFORMATION = zeroed();
-        performance.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
-        if GetPerformanceInfo(&mut performance, performance.cb) == 0 {
-            return Err(format!(
-                "GetPerformanceInfo failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let page_size = performance.PageSize as u64;
-        let limit = (performance.CommitLimit as u64).saturating_mul(page_size);
-        let total = (performance.CommitTotal as u64).saturating_mul(page_size);
-        Ok((Some(limit), Some(limit.saturating_sub(total))))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,10 +93,10 @@ mod tests {
     fn sample(total_bytes: u64, available_bytes: u64) -> MemorySample {
         MemorySample {
             captured_at: Instant::now(),
-            total_bytes,
-            available_bytes,
-            commit_limit_bytes: None,
-            available_commit_bytes: None,
+            physical_capacity_bytes: total_bytes,
+            physical_available_bytes: available_bytes,
+            allocation_capacity_bytes: total_bytes,
+            allocation_headroom_bytes: available_bytes,
         }
     }
 
@@ -163,16 +122,27 @@ mod tests {
     }
 
     #[test]
-    fn windows_commit_headroom_is_an_independent_gate() {
+    fn normalized_allocation_headroom_is_the_admission_gate() {
         let gib = 1024 * 1024 * 1024;
         let mut observation = sample(16 * gib, 12 * gib);
-        observation.commit_limit_bytes = Some(20 * gib);
-        observation.available_commit_bytes = Some(gib);
+        observation.allocation_capacity_bytes = 20 * gib;
+        observation.allocation_headroom_bytes = gib;
         assert!(observation.requires_eviction());
         assert!(!observation.permits_load(gib));
         assert!(!observation.recovered());
 
-        observation.available_commit_bytes = Some(2 * gib);
+        observation.allocation_headroom_bytes = 2 * gib;
         assert!(observation.recovered());
+    }
+
+    #[test]
+    fn physical_availability_does_not_override_normalized_allocation_headroom() {
+        let gib = 1024 * 1024 * 1024;
+        let mut observation = sample(16 * gib, 12 * gib);
+        observation.allocation_headroom_bytes = 7 * gib;
+        assert!(!observation.permits_load(6 * gib));
+
+        observation.physical_available_bytes = 16 * gib;
+        assert!(!observation.permits_load(6 * gib));
     }
 }

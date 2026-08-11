@@ -1,6 +1,7 @@
 import type { DisplayMessage, DisplayTimeline, LocalModelsState, ModelSlotsState, ProviderId, RawImageAttachment, RawMentionOccurrence, ReasoningEffort, SlotId } from '@magnitudedev/sdk'
 import type { KeyEvent } from '@opentui/core'
 import type { ChatTheme } from '../../types/theme-system'
+import type { NotificationState } from '@magnitudedev/client-common'
 
 /**
  * Composer presentational props — individual and typed (spec §5.6: no prop
@@ -37,6 +38,7 @@ export type ComposerProps = {
   composerCanFocus: boolean
   widgetNavActive: boolean
   isWorkerView: boolean
+  notificationState: NotificationState | null
 
   // Autopilot (disabled)
   enableAutopilot: boolean

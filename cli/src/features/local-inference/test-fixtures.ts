@@ -17,15 +17,14 @@ import {
   RecommendationIdSchema,
   SECONDARY_SLOT_ID,
   type LocalInferenceHardware,
+  type LocalModel,
+  type LocalModelAcquisitionState,
+  type LocalModelRecommendation,
   type LocalModelsState,
   type ModelInstanceAllocation,
   type ModelSlotsState,
-  type LocalModel,
-  type LocalModelCatalogCandidate,
-  type LocalModelDownload,
-  type LocalModelRecommendation,
-  type ServableModelBundle,
   type ProviderModelCatalogState,
+  type ServableModelBundle,
 } from "@magnitudedev/sdk"
 
 export const GIB = 1024 ** 3
@@ -63,8 +62,8 @@ export const makeHardware = (
   logicalCores: 16,
   totalSystemMemoryBytes: 64 * GIB,
   availableSystemMemoryBytes: 12 * GIB,
-  warningReserveBytes: 13 * GIB,
-  assessReserveBytes: 7 * GIB,
+  systemAllocationCapacityBytes: 64 * GIB,
+  systemAllocationHeadroomBytes: 12 * GIB,
   abortReserveBytes: 4 * GIB,
   accelerators: [{
     acceleratorId: LocalInferenceAcceleratorIdSchema.make("gpu"),
@@ -83,51 +82,83 @@ export const makeHardware = (
   ...overrides,
 })
 
+const capabilities = {
+  vision: false,
+  tools: true,
+  structuredOutput: true,
+  reasoning: { supported: false as const, efforts: [], defaultEffort: Option.none() },
+}
+
+const performance = (contextLength: number) => [...new Set([
+  ...[25_000, 50_000, 75_000].filter((context) => context <= contextLength),
+  contextLength,
+])].sort((left, right) => left - right).map((contextTokens) => {
+  const estimatedTokensPerSecond = contextTokens === contextLength ? 24 : 28
+  return {
+    contextTokens,
+    lowerTokensPerSecond: estimatedTokensPerSecond - 4,
+    estimatedTokensPerSecond,
+    upperTokensPerSecond: estimatedTokensPerSecond + 4,
+    confidence: "moderate" as const,
+  }
+})
+
+export const makeRecommendation = (
+  overrides: Partial<LocalModelRecommendation> = {},
+): LocalModelRecommendation => ({
+  id: RecommendationIdSchema.make("recommendation_test"),
+  intent: "balanced",
+  explanation: "Balanced local inference.",
+  ...overrides,
+})
+
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
   const bundle = overrides.bundle ?? makeStandaloneBundle()
-  const capabilities = {
-    vision: false,
-    tools: true,
-    structuredOutput: true,
-    reasoning: { supported: false as const, efforts: [], defaultEffort: Option.none() },
-  }
+  const contextLength = 32_768
   return {
     bundle,
-    presentation: { displayName: "Qwen Test", description: "Test model" },
-    installation: { installedBytes: 16 * GIB, origins: ["Magnitude"] },
-    readiness: {
+    presentation: {
+      displayName: "Qwen Test",
+      description: "Test model",
+      license: Option.none(),
+      quantization: "Q4_K_M",
+      quantizationName: "4-bit",
+    },
+    downloadBytes: 16 * GIB,
+    catalogMembershipState: { _tag: "NotInCatalog" },
+    acquisitionState: {
+      _tag: "Installed",
+      installedBytes: 16 * GIB,
+      origins: ["Magnitude"],
+    },
+    servingState: {
       _tag: "Assessed",
       capabilities,
       configuration: {
         id: TEST_CONFIGURATION_ID,
         bundle,
-        profile: { contextLength: 32_768 },
+        profile: { contextLength },
       },
-      offering: Option.some({
-        providerId: LOCAL_PROVIDER_ID,
-        providerModelId: TEST_MODEL_ID,
-        modelFamilyId: Option.none(),
-        displayName: "Qwen Test",
-        supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
-        contextWindow: 32_768,
-        maxOutputTokens: 32_768,
-        memory: Option.none(),
-        capabilities,
-        availability: { _tag: "Available" },
-        pricing: Option.none(),
-      }),
       assessment: {
         _tag: "Fits",
-        assessment: {
-          _tag: "Fits",
-          profile: { contextLength: 32_768 },
-          configurationId: TEST_CONFIGURATION_ID,
-          assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
-          environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
-          memory: [],
-          performance: [],
+        profile: { contextLength },
+        assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
+        environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
+        memory: {
+          domains: [],
+          totalRequiredBytes: 0,
+          requiredSystemMemoryBytes: 0,
+          systemUseState: {
+            _tag: "WithinRecommendedHeadroom",
+            recommendedHeadroomBytes: 4 * GIB,
+            predictedHeadroomBytes: 48 * GIB,
+          },
+          currentHeadroomState: { _tag: "NotObserved" },
         },
+        performance: performance(contextLength),
       },
+      availabilityState: { _tag: "Selectable", providerModelId: TEST_MODEL_ID },
+      recommendations: [],
     },
     ...overrides,
   }
@@ -137,14 +168,57 @@ export const makeCatalogOnlyModel = (
   overrides: Partial<LocalModel> = {},
   configurationId = TEST_CONFIGURATION_ID,
 ): LocalModel => {
-  const model = makeModel(overrides)
-  if (model.readiness._tag !== "Assessed") return model
+  const model = makeModel()
+  if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
   return {
     ...model,
-    readiness: {
-      ...model.readiness,
-      configuration: { ...model.readiness.configuration, id: configurationId },
-      offering: Option.none(),
+    catalogMembershipState: {
+      _tag: "InCatalog",
+      catalogData: {
+        intelligenceScore: 75,
+        intelligenceScoreSource: "Test catalog score",
+        fidelityRank: 75,
+        qualityNotes: ["Test quantization notes"],
+      },
+    },
+    acquisitionState: { _tag: "NotInstalled", completedBytes: 0, totalBytes: model.downloadBytes },
+    servingState: {
+      ...model.servingState,
+      configuration: { ...model.servingState.configuration, id: configurationId },
+      availabilityState: { _tag: "Installable" },
+    },
+    presentation: { ...model.presentation, license: Option.some("Apache-2.0") },
+    ...overrides,
+  }
+}
+
+export const withDoesNotFitAssessment = (model: LocalModel): LocalModel => {
+  if (model.servingState._tag !== "Assessed"
+    || model.servingState.assessment._tag !== "Fits") {
+    throw new Error("DoesNotFit fixture requires a fitting assessed model")
+  }
+  return {
+    ...model,
+    servingState: {
+      ...model.servingState,
+      assessment: {
+        _tag: "DoesNotFit",
+        assessmentId: model.servingState.assessment.assessmentId,
+        environmentId: model.servingState.assessment.environmentId,
+        memoryDomains: [],
+        totalRequiredBytes: 10,
+        deficitBytes: 2,
+        limitingResource: "system memory",
+      },
+      availabilityState: {
+        _tag: "Unavailable",
+        providerModelId: Option.none(),
+        failure: {
+          code: "insufficient_resources",
+          message: "Does not fit",
+          retryable: false,
+        },
+      },
     },
   }
 }
@@ -153,19 +227,19 @@ export const makeConfiguredModel = (
   configurationId: ReturnType<typeof ModelServingConfigurationIdSchema.make>,
   overrides: Partial<LocalModel> = {},
 ): LocalModel => {
-  const model = makeModel(overrides)
-  if (model.readiness._tag !== "Assessed") return model
-  const configuredOffering = Option.map(model.readiness.offering, (offering) => ({
-    ...offering,
-    providerModelId: ProviderModelIdSchema.make(configurationId),
-  }))
+  const model = makeModel()
+  if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
   return {
     ...model,
-    readiness: {
-      ...model.readiness,
-      configuration: { ...model.readiness.configuration, id: configurationId },
-      offering: configuredOffering,
+    servingState: {
+      ...model.servingState,
+      configuration: { ...model.servingState.configuration, id: configurationId },
+      availabilityState: {
+        _tag: "Selectable",
+        providerModelId: ProviderModelIdSchema.make(configurationId),
+      },
     },
+    ...overrides,
   }
 }
 
@@ -173,124 +247,39 @@ export const makeModelWithContext = (
   contextLength: number,
   overrides: Partial<LocalModel> = {},
 ): LocalModel => {
-  const model = makeModel(overrides)
-  if (model.readiness._tag !== "Assessed") return model
-  const offering = Option.map(model.readiness.offering, (offering) => ({
-    ...offering,
-    contextWindow: contextLength,
-    maxOutputTokens: contextLength,
-  }))
+  const model = makeModel()
+  if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
   return {
     ...model,
-    readiness: {
-      ...model.readiness,
+    servingState: {
+      ...model.servingState,
       configuration: {
-        ...model.readiness.configuration,
+        ...model.servingState.configuration,
         profile: { contextLength },
       },
-      offering,
+      assessment: model.servingState.assessment._tag === "Fits"
+        ? {
+            ...model.servingState.assessment,
+            profile: { contextLength },
+            performance: performance(contextLength),
+          }
+        : model.servingState.assessment,
     },
-  }
-}
-
-export const makeCatalogCandidate = (
-  overrides: Partial<LocalModelCatalogCandidate> = {},
-): LocalModelCatalogCandidate => {
-  const profile = overrides.profile ?? { contextLength: 32_768 }
-  const performanceContexts = [...new Set([
-    ...[25_000, 50_000, 75_000].filter((context) =>
-      context <= profile.contextLength),
-    profile.contextLength,
-  ])].sort((left, right) => left - right)
-  const performance = overrides.performance ?? performanceContexts.map((contextTokens) => {
-    const estimatedTokensPerSecond = contextTokens === profile.contextLength ? 24 : 28
-    return {
-      contextTokens,
-      lowerTokensPerSecond: estimatedTokensPerSecond - 4,
-      estimatedTokensPerSecond,
-      upperTokensPerSecond: estimatedTokensPerSecond + 4,
-      confidence: "moderate" as const,
-    }
-  })
-  return {
-    configurationId: TEST_CONFIGURATION_ID,
-    assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
-    environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
-    displayName: "Qwen Test",
-    description: "Test model",
-    license: "Apache-2.0",
-    profile,
-    downloadBytes: 16 * GIB,
-    download: { _tag: "NotDownloaded", completedBytes: 0, totalBytes: 16 * GIB },
-    availability: { _tag: "NotDownloaded" },
-    quantization: "Q4_K_M",
-    quantizationName: "4-bit",
-    memory: [{
-      memoryDomainId: TEST_MEMORY_DOMAIN_ID,
-      capacityBytes: 22 * GIB,
-      requiredBytes: 18 * GIB,
-      compatibilityReserveBytes: 2 * GIB,
-      warningReserveBytes: 4 * GIB,
-      remainingBytes: 2 * GIB,
-    }],
-    recommendationEvidence: Option.some({
-      intelligence: Option.some({ score: 75, provenance: "Test evidence" }),
-      fidelityRank: 75,
-      qualityEvidence: ["Test quantization evidence"],
-    }),
-    performance,
-    capabilities: {
-      vision: false,
-      tools: true,
-      structuredOutput: true,
-      reasoning: {
-        supported: false,
-        efforts: [],
-        defaultEffort: Option.none(),
-      },
-    },
-    sources: [],
     ...overrides,
   }
 }
 
-export const makeRecommendation = (
-  overrides: Partial<LocalModelRecommendation> = {},
-): LocalModelRecommendation => ({
-  id: RecommendationIdSchema.make("recommendation_test"),
-  intent: "balanced",
-  explanation: "Balanced local inference.",
-  candidate: makeCatalogCandidate(),
-  ...overrides,
-})
+export const makeCatalogModel = (overrides: Partial<LocalModel> = {}): LocalModel =>
+  makeCatalogOnlyModel(overrides)
 
-export const makeDownload = (
-  overrides: Partial<LocalModelDownload> = {},
-): LocalModelDownload => {
-  const candidate = makeCatalogCandidate()
-  const bundle = makeStandaloneBundle()
-  return {
-    configuration: {
-      id: candidate.configurationId,
-      bundle,
-      profile: candidate.profile,
-    },
-    presentation: {
-      displayName: candidate.displayName,
-      description: candidate.description,
-    },
-    capabilities: Option.some(candidate.capabilities),
-    state: { _tag: "Downloaded", installedBytes: 16 * GIB, origins: ["Magnitude"] },
-    ...overrides,
-  }
-}
+export const makeAcquiringModel = (
+  acquisitionState: LocalModelAcquisitionState,
+  overrides: Partial<LocalModel> = {},
+): LocalModel => makeCatalogOnlyModel({ acquisitionState, ...overrides })
 
 export const makeView = (options: {
   readonly hardware?: LocalInferenceHardware
   readonly models?: readonly LocalModel[]
-  readonly recommendations?: readonly LocalModelRecommendation[]
-  readonly catalogCandidates?: readonly LocalModelCatalogCandidate[]
-  readonly downloads?: readonly LocalModelDownload[]
   readonly providerContextWindow?: number
   readonly allocation?: ModelInstanceAllocation
   readonly ready?: boolean
@@ -310,15 +299,9 @@ export const makeView = (options: {
   return {
     hardware: options.hardware ?? makeHardware(),
     models: {
-      inventory: { _tag: "Ready" },
+      inventoryState: { _tag: "Ready" },
       models,
-      downloads: options.downloads ?? [],
-      recommendations: {
-        _tag: "Ready",
-        entries: options.recommendations ?? [],
-        catalog: options.catalogCandidates ?? [],
-        progress: [],
-      },
+      discoveryState: { _tag: "Ready", progress: [] },
     },
     catalog: new ProviderModelCatalogReady({
       providers: [{
@@ -337,12 +320,7 @@ export const makeView = (options: {
         contextWindow: options.providerContextWindow ?? 32_768,
         maxOutputTokens: 4_096,
         memory: Option.none(),
-        capabilities: {
-          vision: false,
-          tools: true,
-          structuredOutput: true,
-          reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
-        },
+        capabilities,
         availability: { _tag: "Available" },
         pricing: Option.none(),
       }],

@@ -8,7 +8,6 @@ import {
   OnboardingMirror,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
-  ProviderModelCatalogMirror,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
@@ -58,7 +57,6 @@ export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
   const hardwareAtom = useMirroredStateAtom(LocalInferenceHardwareMirror)
   const modelsAtom = useMirroredStateAtom(LocalModelsMirror)
-  const catalogAtom = useMirroredStateAtom(ProviderModelCatalogMirror)
   const slotsAtom = useMirroredStateAtom(ModelSlotsMirror)
   const slotActions = useModelSlotActions()
   const mutations = useMemo(() => ({
@@ -356,7 +354,7 @@ export const useOnboardingModelSetup = () => {
         get.set(operationAtom, admitting)
         const installation = yield* get.setResult(mutations.install, {
           payload: { configurationId: command.choice.configurationId },
-          reactivityKeys: [LocalModelsMirror.id, ProviderModelCatalogMirror.id],
+          reactivityKeys: [LocalModelsMirror.id],
         }).pipe(
           Effect.mapError((error) => new OnboardingModelCommandFailed({
             command: "install",
@@ -425,7 +423,6 @@ export const useOnboardingModelSetup = () => {
       return {
         hardware: Result.map(get(hardwareAtom), ({ state }) => state),
         models: Result.map(get(modelsAtom), ({ state }) => state),
-        catalog: Result.map(get(catalogAtom), ({ state }) => state),
         slots: Result.map(get(slotsAtom), ({ state }) => state),
         workflowResult: get(workflowAtom),
         cancelResult: get(cancelAtom),
@@ -434,7 +431,14 @@ export const useOnboardingModelSetup = () => {
         cancelling: onboardingCancellationPending(operation),
       }
     }),
-    [cancelAtom, catalogAtom, hardwareAtom, modelsAtom, operationAtom, slotsAtom, workflowAtom],
+    [
+      cancelAtom,
+      hardwareAtom,
+      modelsAtom,
+      operationAtom,
+      slotsAtom,
+      workflowAtom,
+    ],
   )
   const setup = useAtomValue(setupAtom)
 

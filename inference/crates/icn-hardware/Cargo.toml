@@ -19,6 +19,9 @@ sha2.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus"] }
+
 [features]
 default = []
 cuda = ["llama-cpp-2/cuda"]

@@ -81,7 +81,19 @@ export const projectModelInstance = (
       case "Stopped":
         return { _tag: "Stopped" as const, reason: instance.lifecycle.reason }
       case "Failed":
-        return { _tag: "Failed" as const, failure: instance.lifecycle.failure }
+        return {
+          _tag: "Failed" as const,
+          failure: instance.lifecycle.failure._tag === "LowMemory"
+            ? {
+                ...instance.lifecycle.failure,
+                code: "low_memory" as const,
+              }
+            : {
+                code: instance.lifecycle.failure.code,
+                message: instance.lifecycle.failure.message,
+                retryable: instance.lifecycle.failure.retryable,
+              },
+        }
     }
   })(),
 })

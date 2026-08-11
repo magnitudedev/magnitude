@@ -22,7 +22,7 @@ slot selections. Terms follow [Model-management terminology](./terminology.md).
 ## Provider boundary
 
 Generic provider and agent code sees an ordinary `(ProviderId, ProviderModelId)` and bound model. It
-does not see packages, downloads, assessments, catalog candidates, native plans, or residency.
+does not see packages, downloads, assessments, recommendation-policy inputs, native plans, or residency.
 
 ACN owns one durable retained local configuration per bundle. The local provider adapter projects
 each one as:
@@ -47,7 +47,7 @@ durable while its packages are absent, downloading, being inspected, or temporar
 Its provider offering remains present, while its provider-catalog projection is enabled only when
 every required package is installed and its exact configuration has a current `Fits` assessment.
 
-Assessment publishes catalog candidates independently of retained configuration existence.
+Assessment publishes per-configuration results independently of retained configuration existence.
 Provider projection observes retained configurations and authoritative package and assessment state;
 it never materializes, defaults, substitutes, or rewrites configurations. Catalog-only choices and
 unretained standalone packages are not provider offerings. Their visibility belongs to
@@ -55,8 +55,9 @@ unretained standalone packages are not provider offerings. Their visibility belo
 
 ## Selecting a catalog option
 
-A catalog configuration is visible before retention. Only a completed eligible catalog candidate
-permits installation; it introduces no identity beyond its exact configuration. The client-owned
+A catalog configuration is visible before retention on its unified local-model row. Only a
+completed eligible assessed row permits installation; it introduces no identity beyond its exact
+configuration. The client-owned
 selection pipeline is:
 
 ```text

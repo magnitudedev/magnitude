@@ -12,9 +12,10 @@ pub(crate) fn system_memory_topology(capacity_bytes: u64) -> MemoryTopology {
         cpu_model: None,
         logical_cores: 1,
         system_memory: HardwareSystemMemory {
-            total_bytes: capacity_bytes,
-            current_available_bytes: capacity_bytes,
-            warning_reserve_bytes: 0,
+            physical_capacity_bytes: capacity_bytes,
+            physical_available_bytes: capacity_bytes,
+            allocation_capacity_bytes: capacity_bytes,
+            allocation_headroom_bytes: capacity_bytes,
             assess_reserve_bytes: 0,
             abort_reserve_bytes: 0,
         },

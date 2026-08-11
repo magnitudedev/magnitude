@@ -2,7 +2,6 @@ import { Option } from "effect"
 import {
   RecommendationIdSchema,
   type FitsModelAssessment,
-  type Recommendation,
   type RecommendableModel,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
@@ -32,6 +31,15 @@ export interface RecommendationCandidate {
   readonly estimatedLoadedBytes: number
   readonly stableCapacityBudgetBytes: number
   readonly totalDownloadBytes: number
+}
+
+export interface RecommendationSelection {
+  readonly id: ReturnType<typeof RecommendationIdSchema.make>
+  readonly configurationId: FitsModelAssessment["configurationId"]
+  readonly recommendableModelId: RecommendableModel["id"]
+  readonly displayName: string
+  readonly intent: "balanced" | "best_quality" | "fastest" | "lightweight"
+  readonly explanation: string
 }
 
 const fullContextGenerationFor = (candidate: RecommendationCandidate) =>
@@ -154,13 +162,13 @@ export const rankCatalogCandidates = (
 
 export const assembleRecommendationCatalogCandidates = (
   input: readonly RecommendationCandidate[],
-  recommendations: readonly Recommendation[],
+  recommendations: readonly RecommendationSelection[],
 ): readonly RecommendationCandidate[] => {
   const candidatesByConfiguration = new Map(
     input.map((candidate) => [candidate.assessment.configurationId, candidate]),
   )
   const selected = recommendations.flatMap((recommendation) => {
-    const candidate = candidatesByConfiguration.get(recommendation.configuration.id)
+    const candidate = candidatesByConfiguration.get(recommendation.configurationId)
     return candidate ? [candidate] : []
   })
   const selectedArtifactIds = new Set(
@@ -324,19 +332,13 @@ const describeLightweight = (
 
 const toRecommendation = (
   candidate: RecommendationCandidate,
-  intent: Recommendation["intent"],
+  intent: RecommendationSelection["intent"],
   balanced: RecommendationCandidate,
-): Recommendation => ({
+): RecommendationSelection => ({
   id: RecommendationIdSchema.make(`${candidate.assessment.configurationId}:${intent}`),
+  configurationId: candidate.assessment.configurationId,
   recommendableModelId: candidate.model.id,
   displayName: candidate.model.displayName,
-  description: candidate.model.description,
-  configuration: {
-    id: candidate.assessment.configurationId,
-    bundle: candidate.model.configuration.bundle,
-    profile: candidate.profile,
-  },
-  assessment: candidate.assessment,
   intent,
   explanation: intent === "balanced" ? describeBalanced(candidate)
     : intent === "best_quality" ? describeBestQuality(candidate, balanced)
@@ -352,7 +354,7 @@ const preferNewCheckpointWithin = (
 
 export const selectRecommendationPortfolio = (
   input: readonly RecommendationCandidate[],
-): readonly Recommendation[] => {
+): readonly RecommendationSelection[] => {
   const feasible = preferScoredCandidates(input.filter(usable))
   if (feasible.length === 0) return []
 
@@ -380,7 +382,7 @@ export const selectRecommendationPortfolio = (
 
   const selected: Array<{
     readonly candidate: RecommendationCandidate
-    readonly intent: Recommendation["intent"]
+    readonly intent: RecommendationSelection["intent"]
   }> = [{ candidate: balanced, intent: "balanced" }]
   const selectedConfigurations = new Set([balanced.assessment.configurationId])
   const usedCheckpointIds = new Set([balanced.checkpointId])

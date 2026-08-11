@@ -67,7 +67,6 @@ import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { ModelSelection } from "./model-selection"
 import { MirroredStateChanges } from "./mirrored-state"
 import { LocalModelPackages } from "./local-model-packages"
-import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import { modelServingConfigurationToIcn } from "./local-model-icn-adapter"
@@ -224,13 +223,12 @@ const modelFailure = (
 export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
-  ModelSelection | MagnitudeStorage | LocalModelPackages | LocalModelRecommendations | LocalProviderOfferings
+  ModelSelection | MagnitudeStorage | LocalModelPackages | LocalProviderOfferings
     | ProviderModelCatalog | MirroredStateChanges | IcnClient | IcnInstances
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
   const modelSelection = yield* ModelSelection
   const storage = yield* MagnitudeStorage
   const localPackages = yield* LocalModelPackages
-  const recommendations = yield* LocalModelRecommendations
   const localOfferings = yield* LocalProviderOfferings
   const catalog = yield* ProviderModelCatalog
   const mirroredChanges = yield* MirroredStateChanges

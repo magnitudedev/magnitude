@@ -16,8 +16,8 @@ visible even when inspection, assessment, or provider availability prevents exec
 shows that reason and becomes selectable only through an exact `Fits` configuration. Catalog-only,
 non-downloaded bundles never appear in Models.
 
-The Catalog page contains eligible assessed catalog candidates. A non-downloaded candidate that
-fits may be installed there. A catalog configuration that does not fit does not appear in either
+The Catalog page filters eligible assessed catalog rows from `LocalModelsState.models`. An
+uninstalled row that fits may be installed there. A catalog configuration that does not fit does not appear in either
 product list unless its bundle is already installed, in which case Models shows the installed row
 and its failure.
 
@@ -28,13 +28,20 @@ the same concrete provider-qualified offering identity as the selected slot.
 
 The catalog detail view owns the complete descriptive, recommendation, calibration,
 quantization-fidelity label, license, source repository, and actions for one eligible catalog
-configuration. Catalog-maintainer scoring evidence is not presented to users. Hugging Face
+configuration. Catalog-maintainer scoring data is not presented to users. Hugging Face
 repositories are presented as themed, underlined links that open in the user's browser and provide
 pointer-hover feedback.
 
 Initial observation renders loading. Refresh retains the prior successful rows. Catalog, slot,
 hardware, or recommendation observation failure may degrade affected metadata or actions but cannot
 erase successful local-model entries.
+
+Live allocation headroom may be sampled more frequently than model-list meaning changes. Models and
+Catalog consume read-only semantic selectors over the canonical local-model mirror. Byte-only
+headroom changes do not rebuild either list while its displayed headroom category is unchanged;
+category transitions, acquisition progress, assessment, recommendation, membership, and identity
+changes remain observable. Cursor, detail identity, ordering, and scroll position are presentation
+state and survive these source updates.
 
 ## Responsive information hierarchy
 
@@ -47,9 +54,9 @@ The list preserves information in this order:
 2. acquisition or availability status;
 3. recommendation and required memory;
 4. calibrated speed; and
-5. intelligence and quality evidence.
+5. intelligence and quality data.
 
-Wide layouts may show all evidence as columns. As space decreases, intelligence moves to the detail
+Wide layouts may show all data as columns. As space decreases, intelligence moves to the detail
 view first, followed by quality at the next narrower boundary. When a table can no longer preserve
 a useful model identity, each candidate becomes a fixed two-line row. At the narrowest supported
 widths speed also moves to the detail view.
@@ -65,14 +72,15 @@ failure may present an unavailable state.
 ## Conformance
 
 - Resizing chooses a pure presentation layout from the measured local width.
-- Local-model, catalog, and slot server state retain their distinct authorities and client
-  query/mutation paths.
+- Local-model product state and slot state retain their distinct authorities and client
+  query/mutation paths; catalog presentation is a filter over local-model rows.
 - Local-model rows preserve package, configuration, and assessment semantics at every width.
 - Installed-row visibility does not depend on provider availability, assessment completion, or
   slot-query success; Models-page membership does require the bundle to be downloaded.
-- Uninstalled catalog models and non-fitting catalog candidates do not appear in Models.
+- Uninstalled and non-fitting catalog rows do not appear in Models.
 - Only a concrete provider-qualified offering identity can render selected state.
 - Refresh and remount preserve the latest successful local-model rows.
+- Byte-only live-headroom polling cannot reset or redraw the complete Models or Catalog list.
 - Every list layout exposes details and preserves all existing catalog actions, even when compact
   help copy omits secondary shortcuts.
 - Keyboard cursor movement keeps the focused candidate inside the visible scrollbox viewport.

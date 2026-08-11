@@ -9,6 +9,7 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/utils/**
   - cli/src/features/local-inference/**
+  - cli/src/features/model-setup/**
 ---
 
 # Model instance lifecycle
@@ -122,6 +123,12 @@ Memory-pressure eviction uses the same physical memory domains and allocation ev
 assessment and load admission. It may stop an instance but does not clear the durable slot
 selection. Unexpected worker exit becomes typed instance failure and cannot be mistaken for a
 successful stop or provider incompatibility.
+
+A failed admission caused by insufficient memory carries structured attempt evidence through the
+instance lifecycle: required allocation, normalized allocation headroom, system reserve, strict
+load boundary, minimum additional availability, and parallel sequence count. The projection
+preserves this evidence so clients can explain and retry the exact failed attempt without parsing a
+human-readable message or learning which platform-specific mechanism limited the allocation.
 
 After restart, ACN restores retained configurations and slot selections, projects their current
 provider offerings, and does not reconstruct prior instance identity or residency. New demand

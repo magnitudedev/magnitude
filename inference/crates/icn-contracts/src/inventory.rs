@@ -654,9 +654,10 @@ pub struct HardwareDevice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareSystemMemory {
-    pub total_bytes: u64,
-    pub current_available_bytes: u64,
-    pub warning_reserve_bytes: u64,
+    pub physical_capacity_bytes: u64,
+    pub physical_available_bytes: u64,
+    pub allocation_capacity_bytes: u64,
+    pub allocation_headroom_bytes: u64,
     pub assess_reserve_bytes: u64,
     pub abort_reserve_bytes: u64,
 }

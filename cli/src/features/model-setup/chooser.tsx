@@ -5,17 +5,19 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   truncateToDisplayWidth,
+  localModelConfigurationId,
   type LocalInferenceHardwareResult,
   type OnboardingConfigurationChoice,
   type OnboardingLoadModelChoice,
 } from "@magnitudedev/client-common"
 import type {
-  LocalModelCatalogCandidate,
+  LocalModel,
+  LocalModelMemory,
   LocalModelRecommendationProgressStep,
   LocalModelsState,
   ModelSlotsState,
+  ModelInstanceFailure,
   ProviderModelId,
-  ProviderModelCatalogState,
 } from "@magnitudedev/sdk"
 import { ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -25,11 +27,14 @@ import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   buildLocalInferenceSelections,
   describeLocalHardwareSummary,
+  formatBytes,
   localInferenceProgressLines,
   performanceRangeSpeedLabel,
   selectedInferenceIndex,
-  selectionCapacityWarning,
+  selectionConfigurationId,
   selectionMetadata,
+  selectionProviderModelId,
+  selectionReasoningEffort,
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
 import { slate } from "../../utils/theme"
@@ -37,7 +42,7 @@ import { OnboardingModelDownloadDetails } from "./download-details"
 
 const SECTION_VIEWPORT_ROWS = 4
 const DESCRIPTION_ROWS = 5
-const DETAIL_FIXED_ROWS = 10
+const DETAIL_BASE_ROWS = 9
 const WIDE_LIST_WIDTH = 42
 
 const onboardingModelRowId = (selectionId: string): string =>
@@ -62,7 +67,7 @@ const intentLabel = (intent: "balanced" | "best_quality" | "fastest" | "lightwei
 const actionLabel = (selection: LocalInferenceSelection): string => {
   if (selection.kind === "running") return "Loaded"
   if (selection.kind === "recommendation") {
-    return selection.recommendation._tag === "Recommended"
+    return Option.isSome(selection.recommendation)
       ? intentLabel(selection.recommendation.value.intent)
       : "Download"
   }
@@ -71,12 +76,12 @@ const actionLabel = (selection: LocalInferenceSelection): string => {
 
 const onboardingSelection = (
   selection: LocalInferenceSelection,
-): ProviderModelId | null => Option.getOrNull(selection.providerModelId)
+): ProviderModelId | null => Option.getOrNull(selectionProviderModelId(selection))
 
 const matchesOnboardingSelection = (
   selection: LocalInferenceSelection,
   submitted: ProviderModelId,
-): boolean => Option.contains(selection.providerModelId, submitted)
+): boolean => Option.contains(selectionProviderModelId(selection), submitted)
 
 const ModelRow = ({
   selection,
@@ -98,7 +103,7 @@ const ModelRow = ({
   const theme = useTheme()
   const action = actionLabel(selection)
   const enabled = selection.kind !== "recommendation"
-    || selection.recommendation._tag === "Recommended"
+    || Option.isSome(selection.recommendation)
   const markerWidth = 2
   const gap = 2
   const nameWidth = Math.max(1, width - markerWidth - gap - action.length - 1)
@@ -115,7 +120,7 @@ const ModelRow = ({
         attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
         wrapMode="none"
       >
-        {selected ? "› " : "  "}{truncateToDisplayWidth(selection.displayName, nameWidth).padEnd(nameWidth)}
+        {selected ? "› " : "  "}{truncateToDisplayWidth(selection.model.presentation.displayName, nameWidth).padEnd(nameWidth)}
         {"  "}
         <span fg={selection.kind === "running"
           ? theme.success
@@ -177,6 +182,54 @@ const DetailRow = ({
     {children}
   </box>
 )
+
+const minimumBytesLabel = (bytes: number): string => {
+  const gib = bytes / 1024 ** 3
+  const precision = gib >= 10 ? 10 : 100
+  return `${(Math.ceil(gib * precision) / precision).toFixed(gib >= 10 ? 1 : 2)} GiB`
+}
+
+const memoryGuidanceRows = (memory: LocalModelMemory): number => {
+  const currentRows = memory.currentHeadroomState._tag === "Insufficient" ? 7 : 2
+  const stableRows = memory.systemUseState._tag === "High" ? 2 : 0
+  return currentRows + stableRows
+}
+
+const ModelMemoryGuidanceDetails = ({
+  memory,
+  width,
+}: {
+  readonly memory: LocalModelMemory
+  readonly width: number
+}): ReactNode => {
+  const theme = useTheme()
+  const current = memory.currentHeadroomState
+  return (
+    <box style={{ width, flexDirection: "column", flexShrink: 0 }}>
+      <text style={{ fg: theme.muted, width }} attributes={TextAttributes.BOLD}>MEMORY</text>
+      {current._tag === "Insufficient" ? (
+        <>
+          <text style={{ fg: theme.warning, width }}>! Not enough free memory right now</text>
+          <text style={{ fg: theme.muted, width }}>{`  Model allocation       ${formatBytes(memory.totalRequiredBytes)}`}</text>
+          <text style={{ fg: theme.muted, width }}>{`  System safety reserve ${formatBytes(current.observation.abortReserveBytes)}`}</text>
+          <text style={{ fg: theme.muted, width }}>{`  Needed to load         ${formatBytes(current.observation.loadBoundaryBytes)}`}</text>
+          <text style={{ fg: theme.muted, width }}>{`  Available now          ${formatBytes(current.observation.allocationHeadroomBytes)}`}</text>
+          <text style={{ fg: theme.warning, width }}>{`  Shortfall               ${minimumBytesLabel(current.minimumAdditionalAvailableBytes)}`}</text>
+        </>
+      ) : (
+        <text style={{ fg: theme.muted, width }}>
+          {`Model allocation ${formatBytes(memory.totalRequiredBytes)}`}
+        </text>
+      )}
+      {memory.systemUseState._tag === "High" && (
+        <>
+          <text style={{ fg: theme.warning, width }}>! Tight fit</text>
+          <text style={{ fg: theme.muted, width }}>  Leaves limited memory for other apps.</text>
+        </>
+      )}
+    </box>
+  )
+}
 
 const OnboardingHardwareContext = ({
   hardware,
@@ -248,7 +301,7 @@ const OnboardingSetupCard = ({
 export type OnboardingModelChooserOperation =
   | {
       readonly _tag: "Downloading"
-      readonly candidate: LocalModelCatalogCandidate
+      readonly model: LocalModel
       readonly cancelling: boolean
       readonly cancelError: string | null
       readonly onCancel: () => void
@@ -256,20 +309,20 @@ export type OnboardingModelChooserOperation =
     }
   | {
       readonly _tag: "DownloadFailed"
-      readonly candidate: LocalModelCatalogCandidate
+      readonly model: LocalModel
       readonly onChooseAnother: () => void
       readonly onRetry: () => void
     }
   | {
       readonly _tag: "Configuring"
-      readonly candidate: LocalModelCatalogCandidate
+      readonly model: LocalModel
     }
   | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly displayName: string
       readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
-      readonly failure: string | null
+      readonly failure: ModelInstanceFailure | null
       readonly onRetry: () => void
       readonly onChooseAnother: () => void
     }
@@ -277,7 +330,6 @@ export type OnboardingModelChooserOperation =
 export function OnboardingModelChooser({
   hardware,
   models,
-  catalog,
   slots,
   width,
   error,
@@ -289,7 +341,6 @@ export function OnboardingModelChooser({
 }: {
   readonly hardware: LocalInferenceHardwareResult
   readonly models: LocalModelsState
-  readonly catalog: ProviderModelCatalogState
   readonly slots: ModelSlotsState
   readonly width: number
   readonly error: string | null
@@ -303,29 +354,28 @@ export function OnboardingModelChooser({
   const selections = useMemo(() =>
     buildLocalInferenceSelections(models, slots).filter((selection) =>
       selection.kind !== "recommendation"
-        || selection.recommendation._tag === "Recommended"),
-  [catalog, models, slots])
+        || Option.isSome(selection.recommendation)),
+  [models, slots])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const localScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const downloadScrollRef = useRef<ScrollBoxRenderable | null>(null)
-  const selectionConfigurationId = (selection: LocalInferenceSelection) =>
-    selection.kind === "recommendation"
-      ? selection.recommendation._tag === "Recommended"
-        ? selection.recommendation.value.candidate.configurationId
-        : undefined
-      : selection.configurationId
   const activeSelectionId = operation === null
     ? Option.none<string>()
     : Option.fromNullable(selections.find((selection) =>
       operation._tag === "Downloading" || operation._tag === "DownloadFailed"
         || operation._tag === "Configuring"
-      ? selectionConfigurationId(selection) === operation.candidate.configurationId
-      : Option.contains(selection.providerModelId, operation.providerModelId))?.id)
+      ? Option.exists(localModelConfigurationId(operation.model), (configurationId) =>
+          Option.contains(selectionConfigurationId(selection), configurationId))
+      : Option.contains(selectionProviderModelId(selection), operation.providerModelId))?.id)
   const selectedIndex = selectedInferenceIndex(
     selections,
     Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
   )
   const selected = selections[selectedIndex]
+  const selectedMemory = selected?.model.servingState._tag === "Assessed"
+    && selected.model.servingState.assessment._tag === "Fits"
+    ? Option.some(selected.model.servingState.assessment.memory)
+    : Option.none<LocalModelMemory>()
   const locked = operation !== null
   const local = selections.filter(({ kind }) => kind === "running" || kind === "stored")
   const downloads = selections.filter(({ kind }) => kind === "recommendation")
@@ -336,30 +386,40 @@ export function OnboardingModelChooser({
   const localRows = local.length > 0 ? SECTION_VIEWPORT_ROWS + 1 : 0
   const downloadRows = downloads.length > 0 ? SECTION_VIEWPORT_ROWS + 1 : 0
   const sectionGap = local.length > 0 && downloads.length > 0 ? 1 : 0
-  const contentHeight = Math.max(DETAIL_FIXED_ROWS, localRows + sectionGap + downloadRows)
+  const selectedMemoryRows = Option.match(selectedMemory, {
+    onNone: () => 0,
+    onSome: memoryGuidanceRows,
+  })
+  const contentHeight = Math.max(
+    DETAIL_BASE_ROWS + selectedMemoryRows,
+    localRows + sectionGap + downloadRows,
+  )
   const detailContentHeight = Math.max(1, contentHeight - (wide ? 0 : 1))
   const choose = useCallback((selection: LocalInferenceSelection) => {
     if (selection.kind === "running") {
       onContinue()
       return
     }
-    if (selection.kind === "stored" && Option.isSome(selection.providerModelId)) {
+    const providerModelId = selectionProviderModelId(selection)
+    const configurationId = selectionConfigurationId(selection)
+    const reasoningEffort = selectionReasoningEffort(selection)
+    if (selection.kind === "stored" && Option.isSome(providerModelId)) {
       onLoad({
-        providerModelId: selection.providerModelId.value,
-        displayName: selection.displayName,
+        providerModelId: providerModelId.value,
+        displayName: selection.model.presentation.displayName,
         reasoningEffort: Option.getOrElse(
-          selection.reasoningEffort,
+          reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
         ),
       })
       return
     }
-    if (selection.kind === "stored") {
+    if (selection.kind === "stored" && Option.isSome(configurationId)) {
       onSelectConfiguration({
-        configurationId: selection.configurationId,
-        displayName: selection.displayName,
+        configurationId: configurationId.value,
+        displayName: selection.model.presentation.displayName,
         reasoningEffort: Option.getOrElse(
-          selection.reasoningEffort,
+          reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
         ),
       })
@@ -367,14 +427,14 @@ export function OnboardingModelChooser({
     }
     if (
       selection.kind === "recommendation"
-      && selection.recommendation._tag === "Recommended"
+      && Option.isSome(selection.recommendation)
     ) {
-      const candidate = selection.recommendation.value.candidate
+      if (Option.isNone(configurationId)) return
       onSelectConfiguration({
-        configurationId: candidate.configurationId,
-        displayName: candidate.displayName,
+        configurationId: configurationId.value,
+        displayName: selection.model.presentation.displayName,
         reasoningEffort: Option.getOrElse(
-          selection.reasoningEffort,
+          reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
         ),
       })
@@ -463,7 +523,7 @@ export function OnboardingModelChooser({
     </box>
   )
 
-  const recommendationIntent = selected?.recommendation._tag === "Recommended"
+  const recommendationIntent = selected && Option.isSome(selected.recommendation)
     ? intentLabel(selected.recommendation.value.intent)
     : null
   const titleNameWidth = Math.max(
@@ -479,7 +539,7 @@ export function OnboardingModelChooser({
           attributes={TextAttributes.BOLD}
           wrapMode="none"
         >
-          {truncateToDisplayWidth(selected.displayName, titleNameWidth)}
+          {truncateToDisplayWidth(selected.model.presentation.displayName, titleNameWidth)}
           {recommendationIntent && <span fg={theme.primary}>{`   ${recommendationIntent}`}</span>}
         </text>
       </DetailRow>
@@ -489,9 +549,9 @@ export function OnboardingModelChooser({
         </text>
       </DetailRow>
       <DetailRow width={detailWidth}>
-        {selected.recommendation._tag === "Recommended" && (
+        {Option.isSome(selected.recommendation) && (
           <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
-            {performanceRangeSpeedLabel(selected.recommendation.value.candidate)}
+            {performanceRangeSpeedLabel(selected.model)}
           </text>
         )}
       </DetailRow>
@@ -506,27 +566,26 @@ export function OnboardingModelChooser({
         overflow: "hidden",
       }}>
         <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="word">
-          {selected.recommendation._tag === "Recommended"
+          {Option.isSome(selected.recommendation)
             ? selected.recommendation.value.explanation
             : selected.kind === "running"
               ? "Loaded in memory and ready to use."
               : "Downloaded on this computer and ready to load."}
         </text>
       </box>
-      <DetailRow width={detailWidth}>
-        {selectionCapacityWarning(selected) && (
-          <text style={{ fg: theme.warning, width: detailWidth }} wrapMode="none">
-            {selectionCapacityWarning(selected)}
-          </text>
-        )}
-      </DetailRow>
+      {Option.isSome(selectedMemory) && (
+        <ModelMemoryGuidanceDetails
+          memory={selectedMemory.value}
+          width={detailWidth}
+        />
+      )}
     </>
   ) : (
     <text style={{ fg: theme.muted }}>{emptySelectionMessage}</text>
   )
   const detailsContent = operation?._tag === "Downloading" ? (
     <OnboardingModelDownloadDetails
-      candidate={operation.candidate}
+      model={operation.model}
       width={detailWidth}
       height={detailContentHeight}
       operation={{
@@ -539,7 +598,7 @@ export function OnboardingModelChooser({
     />
   ) : operation?._tag === "DownloadFailed" ? (
     <OnboardingModelDownloadDetails
-      candidate={operation.candidate}
+      model={operation.model}
       width={detailWidth}
       height={detailContentHeight}
       operation={{
@@ -592,7 +651,14 @@ export function OnboardingModelChooser({
             : operation.phase === "Loading"
               ? "Loading model into memory…"
               : "Finishing setup…"
-    : "↑/↓ choose · Enter select · Esc skip for now"
+    : Option.exists(
+        selectedMemory,
+        ({ currentHeadroomState }) => currentHeadroomState._tag === "Insufficient",
+      )
+      ? selected?.kind === "stored"
+        ? "Close memory-intensive apps, then Enter to retry · Esc choose another"
+        : "Close memory-intensive apps before loading · Enter select · Esc skip for now"
+      : "↑/↓ choose · Enter select · Esc skip for now"
 
   return (
     <OnboardingSetupCard
@@ -681,7 +747,7 @@ function OnboardingModelLoadingDetails({
   readonly width: number
   readonly height: number
   readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
-  readonly failed: string | null
+  readonly failed: ModelInstanceFailure | null
   readonly onRetry: () => void
   readonly onChooseAnother: () => void
 }): ReactNode {
@@ -715,9 +781,32 @@ function OnboardingModelLoadingDetails({
       <box style={{ height: 1 }} />
       {failed ? (
         <>
-          <box style={{ width, height: 5, flexShrink: 0, flexDirection: "column", overflow: "hidden" }}>
-            <text style={{ fg: theme.error, width }} wrapMode="word">{failed}</text>
-          </box>
+          {"_tag" in failed && failed._tag === "LowMemory" ? (
+            <box style={{ width, flexShrink: 0, flexDirection: "column" }}>
+              <text style={{ fg: theme.warning, width }} attributes={TextAttributes.BOLD}>
+                ! Not enough memory available
+              </text>
+              <box style={{ height: 1 }} />
+              <text style={{ fg: theme.foreground, width }} wrapMode="word">
+                {`Free at least ${minimumBytesLabel(failed.minimumAdditionalAvailableBytes)} and try again.`}
+              </text>
+              <text style={{ fg: theme.muted, width }} wrapMode="word">
+                Close memory-intensive applications or choose a smaller model.
+              </text>
+              <box style={{ height: 1 }} />
+              <text style={{ fg: theme.muted, width }}>
+                {`Needed at attempt    ${formatBytes(failed.loadBoundaryBytes)}`}
+              </text>
+              <text style={{ fg: theme.muted, width }}>
+                {`Available at attempt ${formatBytes(failed.allocationHeadroomBytes)}`}
+              </text>
+              <box style={{ height: 1 }} />
+            </box>
+          ) : (
+            <box style={{ width, height: 5, flexShrink: 0, flexDirection: "column", overflow: "hidden" }}>
+              <text style={{ fg: theme.error, width }} wrapMode="word">{failed.message}</text>
+            </box>
+          )}
           <box style={{ flexDirection: "row", gap: 2 }}>
             <Button onClick={onRetry} onMouseOver={() => setHovered("retry")} onMouseOut={() => setHovered(null)}>
               <text style={{ fg: hovered === "retry" ? theme.primary : theme.foreground }}>Retry loading</text>

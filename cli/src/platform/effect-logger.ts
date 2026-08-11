@@ -1,5 +1,6 @@
 import { Cause, Layer, Logger } from "effect"
-import { addEphemeralLogMessage } from "@magnitudedev/client-common"
+import { Option } from "effect"
+import type { PushNotification } from "@magnitudedev/client-common"
 import { TracingLayer } from "@magnitudedev/sdk"
 
 const stringifyMessagePart = (value: unknown): string => {
@@ -24,6 +25,7 @@ const formatToastMessage = (message: unknown, cause: Cause.Cause<unknown>): stri
 
 export interface MakeCliEffectLoggingLayerOptions {
   readonly debug: boolean
+  readonly publishNotification?: (notification: PushNotification) => void
 }
 
 /**
@@ -41,7 +43,12 @@ export const makeCliEffectLoggingLayer = (
         : null
 
     if (tone) {
-      addEphemeralLogMessage(formatToastMessage(message, cause), tone)
+      options.publishNotification?.({
+        message: formatToastMessage(message, cause),
+        priority: tone,
+        action: Option.none(),
+        dismissAfterMilliseconds: 5_000,
+      })
     }
   })
 
