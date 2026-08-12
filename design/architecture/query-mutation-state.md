@@ -129,6 +129,31 @@ removes the pending projection and reveals the unchanged query value. Success ke
 pending through synchronization so the refreshed authoritative value replaces the projection
 without exposing a stale intermediate value.
 
+Synchronization validates the mutation's exact acknowledgement contract in the refreshed query,
+not merely that a fetch completed. When a command returns an admitted occurrence or commits an
+exact selection, mutation success requires that same identity and postcondition to be visible.
+Dependent Effects may then consume the command output without a separate `seen` flag or timing
+assumption.
+
+### Client-side services
+
+A client-owned use case may span several backend domains without becoming an ACN operation. When
+that use case has meaningful in-memory state, concurrency, and cancellation, client-common owns one
+client-lifetime service. The service represents its state with keep-alive Effect Atoms, exposes a
+passive derived state atom and effectful command atoms, and composes already-materialized lower
+Effect Query mutations with `Mutation.execute`.
+
+Each command is one Effect program. Every step consumes the exact value returned by the preceding
+step; it never infers identity from mutation recency or an unrelated query fact. The public state
+atom joins only service-owned causal identities with canonical lower queries. It is observational,
+and it never copies lower lifecycle or progress into writable client state.
+
+Client-owned in-memory state is not put into Effect Query merely to make the API resemble a remote
+domain: that would create a redundant cache and mutation registry. This pattern introduces neither
+a workflow engine nor a second query runtime and requires no Effect Query extension. A concrete
+service is justified only by a real stateful client-owned use case. Ordinary one-shot composition
+remains an ordinary Effect.
+
 ## Queries
 
 Queries observe state or compose observations. They never request product change.

@@ -911,7 +911,9 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
     if (action === "select") choose(detail)
-    else if (action === "load") void slotActions.load(PRIMARY_SLOT_ID)
+    else if (action === "load" && primarySlot?._tag === "ConfiguredLocal") {
+      void slotActions.load(PRIMARY_SLOT_ID, primarySlot.selection)
+    }
     else if (action === "stop" && primarySlot) {
       Option.match(modelSlotInstanceId(primarySlot), {
         onNone: () => {},
@@ -1836,7 +1838,10 @@ const HardwareMenu = memo(function HardwareMenu() {
   const runAction = useCallback(() => {
     if (Option.isNone(action)) return
     if (action.value === "load") {
-      void slotActions.load(PRIMARY_SLOT_ID)
+      Option.match(currentSlot, {
+        onNone: () => {},
+        onSome: (slot) => slotActions.load(PRIMARY_SLOT_ID, slot.selection),
+      })
       return
     }
     Option.flatMap(currentSlot, modelSlotInstanceId).pipe(

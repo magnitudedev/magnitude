@@ -32,18 +32,18 @@ import {
   deriveLocalModelLoadActivity,
   notificationAreaStateAtom,
   deriveLocalModelPersistentNotificationStates,
-  formatLocalModelDisplayName,
   notificationStatesEquivalent,
   resolveActiveNotificationState,
   useLocalModelsSelector,
+  useModelSlots,
+  useModelSlotActions,
   useAcnLifecycle,
-  type OnboardingModelCommandFailed,
+  localModelConfigurationId,
+  formatLocalModelDisplayName,
+  type OnboardingModelSetupState,
 } from "@magnitudedev/client-common";
 import {
-  ReasoningEffortSchema,
   type LocalModelsState,
-  type LocalModel,
-  type ModelSlotsState,
   type SessionOptions,
   type AcnLifecycleState,
 } from "@magnitudedev/sdk";
@@ -89,9 +89,6 @@ import {
 import {
   OnboardingModelChooser,
   OnboardingModelPreparation,
-  deriveModelSetupActive,
-  deriveOnboardingModelSetupView,
-  onboardingModelSetupPlaceholder,
 } from "./features/model-setup";
 import { registerCliCommands } from "./commands/register";
 import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
@@ -99,6 +96,16 @@ import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
 registerCliCommands();
 
 export type { SessionStart };
+
+const modelSetupIsActive = ({
+  forceSetup,
+  onboardingRequired,
+  completionSucceeded,
+}: {
+  readonly forceSetup: boolean;
+  readonly onboardingRequired: boolean;
+  readonly completionSucceeded: boolean;
+}): boolean => onboardingRequired || (forceSetup && !completionSucceeded);
 
 export interface CliAppProps {
   sessionStart: SessionStart;
@@ -215,7 +222,7 @@ function OnboardingGate(
     ? !onboarding.state.value.completed
     : false;
   const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary);
-  const modelSetupActive = deriveModelSetupActive({
+  const modelSetupActive = modelSetupIsActive({
     forceSetup: props.forceSetup,
     onboardingRequired,
     completionSucceeded: Result.isSuccess(onboarding.updateResult),
@@ -237,7 +244,6 @@ function OnboardingGate(
       modelsConfigured={modelsConfigured}
       modelsReadyForInitialWork={modelsReadyForInitialWork}
       modelSetupActive={modelSetupActive}
-      updateOnboarding={onboarding.update}
       updateOnboardingResult={onboarding.updateResult}
     />
   );
@@ -248,7 +254,6 @@ function CliAppContent(
     readonly modelsConfigured: boolean;
     readonly modelsReadyForInitialWork: boolean;
     readonly modelSetupActive: boolean;
-    readonly updateOnboarding: ReturnType<typeof useOnboardingState>["update"];
     readonly updateOnboardingResult: ReturnType<
       typeof useOnboardingState
     >["updateResult"];
@@ -283,11 +288,8 @@ function CliAppContent(
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
   const notificationAreaState = useAtomValue(notificationAreaStateAtom);
   const onboardingSetup = useOnboardingModelSetup();
-  const modelSlotsState = Result.match(onboardingSetup.slots, {
-    onInitial: () => null,
-    onFailure: () => null,
-    onSuccess: ({ value }) => value,
-  });
+  const setupState = Option.getOrNull(Result.value(onboardingSetup.state));
+  const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
     === "ConfiguredLocal"
     ? modelSlotsState.slots.primary.selection.providerModelId
@@ -309,40 +311,41 @@ function CliAppContent(
     Option.getOrElse(persistentNotificationStates, () => []),
   );
   const { rootSlotId } = useSlotProfiles();
-  const localModelLoadActivity = Result.match(onboardingSetup.slots, {
+  const localModelLoadActivity = modelSlotsState === null
+    ? null
+    : deriveLocalModelLoadActivity(modelSlotsState, rootSlotId);
+  const describeError = (error: unknown): string => {
+    if (error instanceof Error && error.message.length > 0) return error.message;
+    if (typeof error === "object" && error !== null && "message" in error) {
+      return String(error.message);
+    }
+    return "The local model setup could not be completed.";
+  };
+  const setupError = setupState?._tag === "Failed"
+    ? (() => {
+        const failure = setupState.failure;
+        switch (failure._tag) {
+          case "OnboardingModelChoiceRejected":
+            return "That model is no longer available for setup.";
+          case "OnboardingModelResourceChanged":
+            return "The selected model changed before setup completed. Choose it again to retry.";
+          case "OnboardingModelSetupFailed":
+            return describeError(failure.cause);
+        }
+      })()
+    : null;
+  const cancelError = Result.matchWithError(onboardingSetup.cancelResult, {
     onInitial: () => null,
-    onFailure: () => null,
-    onSuccess: ({ value }) => deriveLocalModelLoadActivity(value, rootSlotId),
+    onError: describeError,
+    onDefect: (_, failure) => Cause.isInterruptedOnly(failure.cause)
+      ? null
+      : "The cancellation command failed unexpectedly.",
+    onSuccess: () => null,
   });
-  const workflowError = <A,>(
-    result: Result.Result<A, OnboardingModelCommandFailed>,
-    command: OnboardingModelCommandFailed["command"]
-  ): string | null =>
-    Result.matchWithError(result, {
-      onInitial: () => null,
-      onError: (failure) =>
-        failure.command === command ? failure.message : null,
-      onDefect: (_, failure) =>
-        Cause.isInterruptedOnly(failure.cause)
-          ? null
-          : "The local model setup command failed unexpectedly.",
-      onSuccess: () => null,
-    });
-  const configurationMutationError = workflowError(
-    onboardingSetup.workflowResult,
-    "install",
-  );
-  const loadMutationError = workflowError(onboardingSetup.workflowResult, "load");
-  const assignmentMutationError = workflowError(onboardingSetup.workflowResult, "assign");
-  const completionMutationError = workflowError(onboardingSetup.workflowResult, "complete");
-  const cancelDownloadError = workflowError(onboardingSetup.cancelResult, "cancel")
-    ?? workflowError(onboardingSetup.cancelResult, "clear");
-  const completeModelSetup = useCallback(() => {
-    void props.updateOnboarding(true);
-  }, [props.updateOnboarding]);
-  const loadOnboardingModel = onboardingSetup.load;
-  const installOnboardingModel = onboardingSetup.installThenLoad;
+  const setupOnboardingModel = onboardingSetup.setup;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
+  const skipOnboardingModelSetup = onboardingSetup.skip;
+  const slotActions = useModelSlotActions();
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
   const clientWorkingDirectory = process.cwd();
@@ -375,184 +378,92 @@ function CliAppContent(
         progress={progress}
         error={error}
         width={chatColumnWidth}
-        onSkip={completeModelSetup}
+        onSkip={skipOnboardingModelSetup}
       />
     ),
     placeholder: "Preparing local models…",
   });
-  const setupWithDomains = (
-    models: LocalModelsState,
-    slots: ModelSlotsState
-  ) => {
-    if (models.discoveryState._tag === "Loading") {
-      return setupPreparation(models.discoveryState.progress, null);
+  const setupWithState = (state: OnboardingModelSetupState) => {
+    if (state._tag === "Discovering") return setupPreparation(state.progress, null);
+    if (state._tag === "DiscoveryFailed") {
+      return setupPreparation(state.progress, state.failure.message);
     }
-    if (models.discoveryState._tag === "Failed") {
-      return setupPreparation(
-        models.discoveryState.progress,
-        models.discoveryState.failure.message
-      );
-    }
-    const setupView = deriveOnboardingModelSetupView({
-      operationState: onboardingSetup.operationState,
-      models,
-      slots,
+    const chooser = (
+      operation: Parameters<typeof OnboardingModelChooser>[0]["operation"],
+      placeholder: string,
+    ) => ({
+      surface: (
+        <OnboardingModelChooser
+          hardware={onboardingSetup.hardware}
+          options={state.options}
+          width={chatColumnWidth}
+          error={setupError ?? cancelError}
+          operation={operation}
+          onSelect={setupOnboardingModel}
+          onSkip={skipOnboardingModelSetup}
+        />
+      ),
+      placeholder,
     });
-    const retryConfiguration = (model: LocalModel) => {
-      if (model.servingState._tag !== "Assessed") return;
-      installOnboardingModel({
-        configurationId: model.servingState.configuration.id,
-        displayName: formatLocalModelDisplayName(model),
-        reasoningEffort: Option.getOrElse(
-          model.servingState.capabilities.reasoning.defaultEffort,
-          () => ReasoningEffortSchema.make("none")
+    switch (state._tag) {
+      case "Choosing": return chooser(null, "Select a model to start coding…");
+      case "Preparing":
+      case "Configuring": return chooser({
+        _tag: "Configuring",
+        model: state.model,
+      }, `Configuring ${formatLocalModelDisplayName(state.model)}…`);
+      case "Installing": return chooser({
+        _tag: "Downloading",
+        model: state.model,
+        starting: state.model.acquisitionState._tag === "NotInstalled",
+        cancelling: state.cancelling,
+        cancelError,
+        onCancel: cancelOnboardingModelSetup,
+        onRetry: () => setupOnboardingModel(
+          Option.getOrThrow(localModelConfigurationId(state.model)),
         ),
-      });
-    };
-    const surface = (() => {
-      switch (setupView._tag) {
-        case "Downloading":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              slots={slots}
-              width={chatColumnWidth}
-              error={configurationMutationError}
-              operation={{
-                _tag: "Downloading",
-                model: setupView.model,
-                starting: setupView.starting,
-                cancelling: setupView.cancelling,
-                cancelError: cancelDownloadError,
-                onCancel: cancelOnboardingModelSetup,
-                onRetry: () => retryConfiguration(setupView.model),
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={installOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "DownloadFailed":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              slots={slots}
-              width={chatColumnWidth}
-              error={null}
-              operation={{
-                _tag: "DownloadFailed",
-                model: setupView.model,
-                onChooseAnother: cancelOnboardingModelSetup,
-                onRetry: () => retryConfiguration(setupView.model),
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={installOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "Configuring":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              slots={slots}
-              width={chatColumnWidth}
-              error={configurationMutationError}
-              operation={{
-                _tag: "Configuring",
-                model: setupView.model,
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={installOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "Activating":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              slots={slots}
-              width={chatColumnWidth}
-              error={
-                setupView.phase === "Ready"
-                  ? completionMutationError
-                  : cancelDownloadError ?? assignmentMutationError ?? loadMutationError
-              }
-              operation={{
-                _tag: "Activating",
-                providerModelId: setupView.providerModelId,
-                displayName: setupView.displayName,
-                phase: setupView.phase,
-                failure: setupView.failure,
-                onRetry: () => loadOnboardingModel({
-                  providerModelId: setupView.providerModelId,
-                  displayName: setupView.displayName,
-                  reasoningEffort: setupView.reasoningEffort,
-                }),
-                onChooseAnother: cancelOnboardingModelSetup,
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={installOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "Choosing":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              slots={slots}
-              width={chatColumnWidth}
-              error={
-                configurationMutationError ??
-                assignmentMutationError ??
-                loadMutationError
-              }
-              operation={null}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={installOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-      }
-    })();
-    return {
-      surface,
-      placeholder: onboardingModelSetupPlaceholder(setupView),
-    };
+      }, `Downloading ${formatLocalModelDisplayName(state.model)}…`);
+      case "Loading": return chooser({
+        _tag: "Activating",
+        providerModelId: state.providerModelId,
+        displayName: formatLocalModelDisplayName(state.model),
+        phase: state.phase,
+        failure: state.failure,
+        onRetry: () => setupOnboardingModel(state.configurationId),
+        onChooseAnother: cancelOnboardingModelSetup,
+      }, state.phase === "Loading"
+        ? `Loading ${formatLocalModelDisplayName(state.model)}…`
+        : state.phase === "Stopping"
+          ? `Stopping ${formatLocalModelDisplayName(state.model)}…`
+          : state.phase === "Ready"
+            ? `Finishing setup for ${formatLocalModelDisplayName(state.model)}…`
+            : `Couldn’t load ${formatLocalModelDisplayName(state.model)}`);
+      case "Completing": return chooser({
+        _tag: "Activating",
+        providerModelId: state.providerModelId,
+        displayName: formatLocalModelDisplayName(state.model),
+        phase: "Ready",
+        failure: null,
+        onRetry: () => setupOnboardingModel(state.configurationId),
+        onChooseAnother: cancelOnboardingModelSetup,
+      }, `Finishing setup for ${formatLocalModelDisplayName(state.model)}…`);
+      case "Failed": return chooser(null, "Select a model to start coding…");
+    }
   };
   const setupPresentation = !props.modelSetupActive
     ? { surface: undefined, placeholder: null }
-    : Result.match(onboardingSetup.models, {
+    : Result.match(onboardingSetup.state, {
         onInitial: () => setupPreparation([], null),
         onFailure: () =>
           setupPreparation([], "Local model discovery is unavailable."),
-        onSuccess: ({ value: models }) =>
-          Result.match(onboardingSetup.slots, {
-            onInitial: () =>
-              setupPreparation(models.discoveryState.progress, null),
-            onFailure: () =>
-              setupPreparation(
-                models.discoveryState.progress,
-                "Model selection is unavailable."
-              ),
-            onSuccess: ({ value: slots }) => setupWithDomains(models, slots),
-          }),
+        onSuccess: ({ value }) => setupWithState(value),
       });
   const setupSurface = setupPresentation.surface;
   const modelSetupPlaceholder = setupPresentation.placeholder;
   const activityRail = (
     <ActivityRailContainer
       modelLoadActivity={localModelLoadActivity}
-      onStopModel={onboardingSetup.slotActions.stop}
+      onStopModel={slotActions.stop}
       width={chatColumnWidth}
       agentActivityEnabled={!props.modelSetupActive}
     />

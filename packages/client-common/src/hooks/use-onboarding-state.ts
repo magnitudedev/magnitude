@@ -1,27 +1,22 @@
 import { useCallback, useMemo } from "react"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import {
-  OnboardingMirror,
-} from "@magnitudedev/sdk"
+import { useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { useAgentClient } from "../state/agent-client-context"
-import { useMirroredState } from "./use-mirrored-state"
+import { onboardingAtoms } from "../onboarding/atoms"
 
 export function useOnboardingState() {
   const client = useAgentClient()
-  const updateAtom = useMemo(() => client.mutation("UpdateOnboardingState"), [client])
-  const state = Result.map(useMirroredState(OnboardingMirror), ({ state }) => state)
-  const updateResult = useAtomValue(updateAtom)
-  const updateMutation = useAtomSet(updateAtom, { mode: "promise" })
+  const atoms = useMemo(() => onboardingAtoms(client), [client])
+  const updateMutation = useAtomSet(atoms.updateMutation)
+  useAtomMount(atoms.mirrorInvalidationWatchAtom)
+  useAtomMount(atoms.invalidationBridgeAtom)
 
-  const update = useCallback((completed: boolean) =>
-    updateMutation({
-      payload: { completed },
-      reactivityKeys: [OnboardingMirror.id],
-    }), [updateMutation])
+  const update = useCallback((completed: boolean) => {
+    updateMutation({ completed })
+  }, [updateMutation])
 
   return {
-    state,
-    updateResult,
+    state: useAtomValue(atoms.resultAtom),
+    updateResult: useAtomValue(atoms.updateMutation),
     update,
   }
 }

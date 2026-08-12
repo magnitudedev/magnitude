@@ -121,6 +121,12 @@ Completed content is verified before atomic publication. Partial and resumable c
 reported as installed. Deleting or externally removing an installed package changes inventory
 independently of attempt history.
 
+Managed installation manifests retain exact package identity even when distinct packages share a
+primary weights path. Path identity may suppress duplicate discovery of the same external artifact;
+it never coalesces two managed manifests with different package structure. Publication makes the
+managed manifest and installed snapshot observable before the corresponding attempt becomes
+terminally completed.
+
 A managed transfer incrementally hashes successfully written bytes and checkpoints the
 serializable digest state with its exact committed offset. Resume truncates any uncommitted tail and
 continues without rereading the downloaded prefix. Missing or invalid checkpoint evidence discards
@@ -200,6 +206,9 @@ exists for the bundle; ICN constructs and canonically identifies the configurati
 - Runtime setup requires no network access to reconstruct the release catalog.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
+- A completed attempt awaiting installed-inventory convergence remains projected at full progress
+  in `publishing`; it cannot regress to `NotInstalled`.
+- Shared artifact paths never coalesce distinct managed package identities.
 - Failed-attempt acknowledgement survives restart and cannot hide a later retry's failure.
 - Package identity is independent of paths, display names, and mutable upstream references.
 - Exact catalog bundle structure preserves curated presentation across installation and

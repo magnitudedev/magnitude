@@ -4,19 +4,22 @@ import {
   localModelConfigurationId,
   localModelProviderModelId,
   formatLocalModelDisplayName,
+  localModelBundleKey,
+  localModelOptions,
+  type LocalModelOption,
 } from "@magnitudedev/client-common"
 export {
   installedLocalModels,
   findLocalModelByConfigurationId,
   localModelConfigurationId,
   localModelProviderModelId,
+  localModelBundleKey,
 } from "@magnitudedev/client-common"
 import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
   type LocalModelsState,
-  type LocalModelRecommendation,
   type LocalModelRecommendationProgressStep,
   type ModelAssessmentId,
   type ModelServingConfigurationId,
@@ -25,44 +28,7 @@ import {
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
 
-export type LocalInferenceSelection = {
-  readonly id: string
-  readonly kind: "running" | "stored" | "recommendation"
-  readonly model: LocalModel
-  readonly recommendation: Option.Option<LocalModelRecommendation>
-}
-
-const selectionKindOrder: Record<LocalInferenceSelection["kind"], number> = {
-  running: 0,
-  stored: 1,
-  recommendation: 2,
-}
-
-const recommendationIntentOrder = {
-  balanced: 0,
-  best_quality: 1,
-  fastest: 2,
-  lightweight: 3,
-} as const
-
-const compareSelections = (
-  left: LocalInferenceSelection,
-  right: LocalInferenceSelection,
-): number => selectionKindOrder[left.kind] - selectionKindOrder[right.kind]
-  || (left.kind === "recommendation" && right.kind === "recommendation"
-    ? (Option.isSome(left.recommendation)
-      ? recommendationIntentOrder[left.recommendation.value.intent]
-      : 4) - (Option.isSome(right.recommendation)
-      ? recommendationIntentOrder[right.recommendation.value.intent]
-      : 4)
-    : 0)
-  || formatLocalModelDisplayName(left.model).localeCompare(formatLocalModelDisplayName(right.model))
-  || left.id.localeCompare(right.id)
-
-export const localModelBundleKey = (model: LocalModel): string =>
-  model.bundle._tag === "Standalone"
-    ? `package:${model.bundle.package.id}`
-    : `speculative-pair:${model.bundle.target.id}:${model.bundle.draft.id}`
+export type LocalInferenceSelection = LocalModelOption
 
 const modelPackages = (model: LocalModel) => model.bundle._tag === "Standalone"
   ? [model.bundle.package]
@@ -80,51 +46,7 @@ export const localModelDownloadBytes = (model: LocalModel): number =>
 export const buildLocalInferenceSelections = (
   models: LocalModelsState,
   slots: ModelSlotsState,
-): readonly LocalInferenceSelection[] => {
-  const runningProviderModelIds = new Set([
-    slots.slots.primary,
-    slots.slots.secondary,
-  ].flatMap((slot) => slot._tag === "ConfiguredLocal"
-    && Option.exists(slot.instance, (instance) => instance.lifecycle._tag === "Ready")
-    ? [slot.selection.providerModelId]
-    : []))
-  const installed = installedLocalModels(models)
-    .map((model): LocalInferenceSelection => {
-      const running = Option.exists(
-        localModelProviderModelId(model),
-        (providerModelId) => runningProviderModelIds.has(providerModelId),
-      )
-      return {
-        id: `installed:${Option.getOrElse(localModelConfigurationId(model), () => localModelBundleKey(model))}`,
-        kind: running ? "running" : "stored",
-        model,
-        recommendation: Option.none(),
-      }
-    })
-  const representedBundles = new Set(installed.map(({ model }) => localModelBundleKey(model)))
-  const recommendations = models.models.flatMap((model): readonly LocalInferenceSelection[] => {
-    if (representedBundles.has(localModelBundleKey(model))
-      || model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits") return []
-    const recommendation = [...model.servingState.recommendations].sort((left, right) =>
-      recommendationIntentOrder[left.intent] - recommendationIntentOrder[right.intent])[0]
-    const acquisitionActive = model.acquisitionState._tag === "Downloading"
-      || model.acquisitionState._tag === "Failed"
-    if (recommendation === undefined && !acquisitionActive) return []
-        return [{
-      id: recommendation === undefined
-        ? `acquisition:${model.servingState.configuration.id}`
-        : `recommendation:${recommendation.id}`,
-          kind: "recommendation",
-      model,
-      recommendation: recommendation === undefined
-        ? Option.none()
-        : Option.some(recommendation),
-        }]
-  })
-  return [...installed, ...recommendations]
-    .sort(compareSelections)
-}
+): readonly LocalInferenceSelection[] => localModelOptions(models, slots)
 
 export const selectedInferenceIndex = (
   selections: readonly LocalInferenceSelection[],

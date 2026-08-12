@@ -11,6 +11,7 @@ import {
   ModelLoadPlanSchema,
   ModelServingConfigurationIdSchema,
   SlotIdSchema,
+  SlotSelectionSchema,
 } from "../schemas/model-state"
 import { defineMirroredState } from "./mirrored-state"
 
@@ -51,7 +52,7 @@ export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
 })
 
 export const LoadModel = Rpc.make("LoadModel", {
-  payload: Schema.Struct({ slotId: SlotIdSchema }),
+  payload: Schema.Struct({ slotId: SlotIdSchema, selection: SlotSelectionSchema }),
   success: ModelLoadAdmissionSchema,
   error: LocalInferenceError,
 })

@@ -120,6 +120,11 @@ Work is serialized, invalidations are coalesced, and completion rechecks its sem
 publication. Missing files update acquisition or membership; invalid installed artifacts remain
 visible with their exact failure.
 
+When an exact download attempt has completed but its installed-package observation has not yet
+converged, the row remains `Downloading` at full progress with stage `publishing`. Reconciliation
+may advance it to `Installed` or a terminal failure, but cannot reinterpret completion as
+`NotInstalled` or reset its progress.
+
 Discovery reports `Loading`, `Ready`, or `Failed` with progress. It describes portfolio production,
 not whether `models` is authoritative or empty. A successful empty model collection is distinct
 from discovery failure.

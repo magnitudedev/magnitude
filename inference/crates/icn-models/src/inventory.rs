@@ -509,13 +509,7 @@ impl ModelManager {
         } else {
             cache.remove(&model.id);
         }
-        let installed = self
-            .installed_packages
-            .read()
-            .map_err(|_| {
-                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-            })?
-            .clone();
+        let installed = self.build_installed_package_snapshot(&models)?;
         persist_inventory_index(&self.cache, &models, &cache, &installed);
         *self
             .models
@@ -526,6 +520,9 @@ impl ModelManager {
             .write()
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
             cache;
+        *self.installed_packages.write().map_err(|_| {
+            InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+        })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
         self.request_installed_model_reconciliation();
         Ok(model)
@@ -810,8 +807,9 @@ fn scan(
         }
     }
 
-    // Earlier sources have higher precedence. A canonical model path is projected once before
-    // any candidate is enriched.
+    // Earlier external sources have higher precedence for the same canonical path. Managed
+    // manifests retain their exact model identity even when two packages intentionally share a
+    // primary weights file (for example, a weights-only package and a weights-plus-MTP package).
     let mut seen_paths = BTreeSet::new();
     let mut models = BTreeMap::new();
     let mut observations = BTreeMap::new();
@@ -819,7 +817,20 @@ fn scan(
     for candidate in discovered {
         let path = candidate.primary_path().to_path_buf();
         let canonical = path.canonicalize().unwrap_or(path);
-        if seen_paths.insert(canonical) {
+        let path_is_distinct = match &candidate {
+            DiscoveryCandidate::Artifact(candidate) => {
+                if matches!(candidate.location, ModelLocation::MagnitudeCache { .. }) {
+                    // Managed manifests are distinct by model identity, but still claim their
+                    // canonical path so a later external-source scan cannot duplicate them.
+                    seen_paths.insert(canonical);
+                    true
+                } else {
+                    seen_paths.insert(canonical)
+                }
+            }
+            DiscoveryCandidate::Record { .. } => seen_paths.insert(canonical),
+        };
+        if path_is_distinct {
             match candidate {
                 DiscoveryCandidate::Artifact(candidate) => {
                     let observation_key = artifact_observation_key(
@@ -1936,6 +1947,90 @@ mod tests {
         (cache, snapshot)
     }
 
+    #[test]
+    fn managed_packages_keep_exact_identity_when_their_primary_path_is_shared() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let snapshot = store
+            .join("hub")
+            .join(hf_repo_dir("test/model"))
+            .join("snapshots")
+            .join("commit");
+        fs::create_dir_all(store.join("installations")).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        write_minimal_gguf(&snapshot.join("weights.gguf"));
+        write_minimal_gguf(&snapshot.join("mtp.gguf"));
+
+        let weights = ModelComponent {
+            path: PathBuf::from("weights.gguf"),
+            role: ComponentRole::Weights,
+            size_bytes: fs::metadata(snapshot.join("weights.gguf")).unwrap().len(),
+            content: ContentIdentity::Unknown,
+            shard_index: None,
+            relationship: None,
+        };
+        let mtp = ModelComponent {
+            path: PathBuf::from("mtp.gguf"),
+            role: ComponentRole::Mtp,
+            size_bytes: fs::metadata(snapshot.join("mtp.gguf")).unwrap().len(),
+            content: ContentIdentity::Unknown,
+            shard_index: None,
+            relationship: Some(icn_contracts::ComponentRelationship::MtpFor {
+                mtp: PathBuf::from("mtp.gguf"),
+                model: PathBuf::from("weights.gguf"),
+            }),
+        };
+        let manifest = |id: &str, content: &str, components: Vec<ModelComponent>| ManagedManifest {
+            version: MANIFEST_VERSION,
+            model_id: ModelId(id.to_owned()),
+            content_id: icn_contracts::ContentId(content.to_owned()),
+            repository: "test/model".to_owned(),
+            requested_revision: "commit".to_owned(),
+            commit: "commit".to_owned(),
+            components,
+            created_at: 1,
+            ready_at: 2,
+        };
+        fs::write(
+            store.join("installations/weights.json"),
+            serde_json::to_vec(&manifest(
+                "weights",
+                "weights-content",
+                vec![weights.clone()],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            store.join("installations/weights-mtp.json"),
+            serde_json::to_vec(&manifest(
+                "weights-mtp",
+                "weights-mtp-content",
+                vec![weights, mtp],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
+        let result = scan(
+            &config,
+            &cache,
+            Some(&CompleteTemplateAssessor::default()),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(result.models.len(), 2);
+        assert!(result.models.contains_key(&ModelId("weights".to_owned())));
+        assert!(
+            result
+                .models
+                .contains_key(&ModelId("weights-mtp".to_owned()))
+        );
+    }
+
     #[tokio::test]
     async fn installed_package_listing_reports_discovered_package() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1962,6 +2057,30 @@ mod tests {
         );
         let assessed = manager.list().await.unwrap();
         assert_eq!(assessed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_publication_updates_installed_snapshot_before_returning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let model_path = temporary.path().join("active.gguf");
+        write_minimal_gguf(&model_path);
+        let manager = ModelManager::open_with_template_assessor(
+            InventoryConfig::with_roots(
+                temporary.path().join("store"),
+                temporary.path().join("cache"),
+            )
+            .unwrap(),
+            Some(Arc::new(CompleteTemplateAssessor::default())),
+        )
+        .await
+        .unwrap();
+
+        manager
+            .register_active_model(&model_path, None)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.list_installed().await.unwrap().packages.len(), 1);
     }
 
     #[tokio::test]

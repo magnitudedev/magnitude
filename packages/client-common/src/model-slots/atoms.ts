@@ -17,6 +17,13 @@ import {
   subscribeToMirroredStateInvalidation,
 } from "../hooks/use-mirrored-state"
 
+export class ModelSlotSynchronizationFailed extends Data.TaggedError(
+  "ModelSlotSynchronizationFailed",
+)<{
+  readonly operation: "assign" | "load" | "stop"
+  readonly message: string
+}> {}
+
 export interface ModelSlotAssignmentInput {
   readonly slotId: SlotId
   readonly selection: SlotSelection
@@ -24,6 +31,10 @@ export interface ModelSlotAssignmentInput {
 
 export interface ModelSlotInput {
   readonly slotId: SlotId
+}
+
+export interface ModelSlotLoadInput extends ModelSlotInput {
+  readonly selection: SlotSelection
 }
 
 export interface ModelInstanceInput {
@@ -55,42 +66,96 @@ const synchronizeModelSlots = () => QueryClient.invalidate(
   modelSlotsQuery.match(),
 ).pipe(
   Effect.zipRight(QueryClient.fetch(modelSlotsQuery, undefined)),
-  Effect.asVoid,
 )
+
+export const sameSlotSelection = (left: SlotSelection, right: SlotSelection): boolean =>
+  left.providerId === right.providerId
+  && left.providerModelId === right.providerModelId
+  && left.reasoningEffort === right.reasoningEffort
+
+export const slotAssignmentIsVisible = (
+  state: ModelSlotsState,
+  slotId: SlotId,
+  selection: SlotSelection,
+): boolean => Option.exists(authoritativeSlotSelection(state, slotId), (current) =>
+  sameSlotSelection(current, selection))
+
+export const admittedInstanceIsVisible = (
+  state: ModelSlotsState,
+  slotId: SlotId,
+  instanceId: ModelInstanceId,
+): boolean => {
+  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
+  return slot._tag === "ConfiguredLocal"
+    && Option.exists(slot.instance, (instance) => instance.id === instanceId)
+}
 
 export const assignModelSlotMutation = Mutation.make("AssignSlot", {
   scope: ({ slotId }: ModelSlotAssignmentInput) => modelSlotMutationScope(slotId),
   effect: ({ slotId, selection }: ModelSlotAssignmentInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("AssignSlot", { slotId, selection })),
-  synchronize: synchronizeModelSlots,
+  synchronize: (_, { slotId, selection }) => synchronizeModelSlots().pipe(
+    Effect.filterOrFail(
+      (state) => slotAssignmentIsVisible(state.state, slotId, selection),
+      () => new ModelSlotSynchronizationFailed({
+        operation: "assign",
+        message: "The assigned model selection was absent from ModelSlots.",
+      }),
+    ),
+    Effect.asVoid,
+  ),
 })
 
 export const clearModelSlotMutation = Mutation.make("ClearSlot", {
   scope: ({ slotId }: ModelSlotInput) => modelSlotMutationScope(slotId),
   effect: ({ slotId }: ModelSlotInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("ClearSlot", { slotId })),
-  synchronize: synchronizeModelSlots,
+  synchronize: () => synchronizeModelSlots().pipe(Effect.asVoid),
 })
 
 export const loadModelMutation = Mutation.make("LoadModel", {
-  scope: ({ slotId }: ModelSlotInput) => modelSlotMutationScope(slotId),
-  effect: ({ slotId }: ModelSlotInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("LoadModel", { slotId })),
-  synchronize: synchronizeModelSlots,
+  scope: ({ slotId }: ModelSlotLoadInput) => modelSlotMutationScope(slotId),
+  effect: ({ slotId, selection }: ModelSlotLoadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("LoadModel", { slotId, selection })),
+  synchronize: ({ instanceId }, { slotId, selection }) => synchronizeModelSlots().pipe(
+    Effect.filterOrFail(
+      ({ state }) => slotAssignmentIsVisible(state, slotId, selection)
+        && admittedInstanceIsVisible(state, slotId, instanceId),
+      () => new ModelSlotSynchronizationFailed({
+        operation: "load",
+        message: "The admitted model instance was absent from ModelSlots.",
+      }),
+    ),
+    Effect.asVoid,
+  ),
 })
 
 export const stopModelMutation = Mutation.make("StopModel", {
   scope: ({ instanceId }: ModelInstanceInput) => modelInstanceMutationScope(instanceId),
   effect: ({ instanceId }: ModelInstanceInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("StopModel", { instanceId })),
-  synchronize: synchronizeModelSlots,
+  synchronize: (_, { instanceId }) => synchronizeModelSlots().pipe(
+    Effect.filterOrFail(
+      ({ state }) => [state.slots.primary, state.slots.secondary].every((slot) =>
+        slot._tag !== "ConfiguredLocal"
+        || Option.isNone(slot.instance)
+        || slot.instance.value.id !== instanceId
+        || slot.instance.value.lifecycle._tag === "Stopped"
+        || slot.instance.value.lifecycle._tag === "Failed"),
+      () => new ModelSlotSynchronizationFailed({
+        operation: "stop",
+        message: "The stopped model instance remained active in ModelSlots.",
+      }),
+    ),
+    Effect.asVoid,
+  ),
 })
 
 export const setModelFavoriteMutation = Mutation.make("SetModelFavorite", {
   scope: ({ model }: ModelFavoriteInput) => modelFavoriteMutationScope(model),
   effect: ({ model, favorite }: ModelFavoriteInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("SetModelFavorite", { model, favorite })),
-  synchronize: synchronizeModelSlots,
+  synchronize: () => synchronizeModelSlots().pipe(Effect.asVoid),
 })
 
 const makeAtoms = (client: AgentClientInstance) => {
