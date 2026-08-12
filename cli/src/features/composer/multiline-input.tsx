@@ -10,6 +10,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import { useAnimationStep } from '../../hooks/use-animation-time'
 
@@ -44,6 +45,7 @@ import { decodeNativePasteText } from './paste-events'
 import { logger } from '@magnitudedev/logger'
 import type {
   KeyEvent,
+  CliRenderer,
   LineInfo,
   MouseEvent,
   ScrollBoxRenderable,
@@ -102,6 +104,7 @@ function columnToCharOffsetInLine(
 }
 
 export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null): number[] {
+  const logicalLineStarts = computeLogicalLineStarts(text)
   if (
     !lineInfo ||
     !Array.isArray(lineInfo.lineSources) ||
@@ -109,11 +112,26 @@ export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null):
     lineInfo.lineSources.length === 0 ||
     lineInfo.lineStartCols.length === 0
   ) {
-    return computeLogicalLineStarts(text)
+    return logicalLineStarts
   }
 
-  const logicalLineStarts = computeLogicalLineStarts(text)
   const visualLineCount = Math.min(lineInfo.lineSources.length, lineInfo.lineStartCols.length)
+  const reportedSources = lineInfo.lineSources.slice(0, visualLineCount)
+  const lastLogicalLineIndex = logicalLineStarts.length - 1
+
+  // During a React commit, OpenTUI can briefly expose lineInfo for the previous
+  // text value. Never use it unless it covers exactly the current logical-line
+  // range; otherwise shrinking would render an empty composer at its old height.
+  if (
+    reportedSources.some(
+      (source) =>
+        !Number.isInteger(source) || source < 0 || source > lastLogicalLineIndex,
+    ) ||
+    reportedSources.at(-1) !== lastLogicalLineIndex
+  ) {
+    return logicalLineStarts
+  }
+
   const visualLineStarts: number[] = []
 
   for (let i = 0; i < visualLineCount; i++) {
@@ -143,6 +161,63 @@ export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null):
   }
 
   return visualLineStarts.length > 0 ? visualLineStarts : [0]
+}
+
+type TextLayoutStore = {
+  subscribe: (listener: () => void) => () => void
+  getSnapshot: () => number
+  setRenderable: (renderable: TextRenderable | null) => void
+}
+
+function lineInfoSignature(renderable: TextRenderable | null): string {
+  if (!renderable) return ''
+  const { lineSources, lineStartCols } = renderable.lineInfo
+  return `${lineSources.join(',')}|${lineStartCols.join(',')}`
+}
+
+function createTextLayoutStore(renderer: CliRenderer): TextLayoutStore {
+  const eventSource = renderer as Partial<Pick<CliRenderer, 'on' | 'off'>>
+  let renderable: TextRenderable | null = null
+  let revision = 0
+  let signature = ''
+  const listeners = new Set<() => void>()
+
+  const publish = () => {
+    revision += 1
+    for (const listener of listeners) listener()
+  }
+
+  const refresh = () => {
+    const nextSignature = lineInfoSignature(renderable)
+    if (signature === nextSignature) return
+    signature = nextSignature
+    publish()
+  }
+
+  return {
+    subscribe(listener) {
+      if (listeners.size === 0) eventSource.on?.('frame', refresh)
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+        if (listeners.size === 0) eventSource.off?.('frame', refresh)
+      }
+    },
+    getSnapshot: () => revision,
+    setRenderable(nextRenderable) {
+      if (renderable === nextRenderable) return
+
+      renderable?.off('line-info-change', refresh)
+      renderable = nextRenderable
+      renderable?.on('line-info-change', refresh)
+
+      if (!renderable) {
+        signature = ''
+        return
+      }
+      refresh()
+    },
+  }
 }
 
 function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
@@ -418,9 +493,25 @@ export const MultilineInput = forwardRef<
     },
     [cursorPosition],
   )
-
-
   const textRef = useRef<TextRenderable | null>(null)
+  const textLayoutStore = useMemo(() => createTextLayoutStore(renderer), [renderer])
+
+  // OpenTUI owns visual wrapping information. Subscribe to its layout signal so
+  // height and cursor scrolling are derived from the current lineInfo instead of
+  // waiting for an unrelated animation render.
+  useSyncExternalStore(
+    textLayoutStore.subscribe,
+    textLayoutStore.getSnapshot,
+    textLayoutStore.getSnapshot,
+  )
+
+  const setTextRenderable = useCallback(
+    (renderable: TextRenderable | null) => {
+      textRef.current = renderable
+      textLayoutStore.setRenderable(renderable)
+    },
+    [textLayoutStore],
+  )
 
   const lineInfo = safeRenderableAccess(
     textRef.current,
@@ -2018,7 +2109,7 @@ export const MultilineInput = forwardRef<
       }}
     >
       <text
-        ref={textRef}
+        ref={setTextRenderable}
         style={{ bg: 'transparent', fg: inputColor, wrapMode: 'word' }}
       >
         {isPlaceholder ? (
