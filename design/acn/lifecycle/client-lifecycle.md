@@ -75,7 +75,7 @@ Client bootstrap
 |   |
 |   +-- PreparingAcn                              "Preparing background server"
 |   |   |
-|   |   +-- read owner store                      normally immediate; facility retry <= 30s
+|   |   +-- read owner store                      normally immediate; SQLite contention <= 30s
 |   |   +-- inspect exact process                 normally immediate; facility retry <= 30s
 |   |   +-- classify owner/process tree           one coordination pass
 |   |   +-- probe owner health                    <= 2s per request
@@ -117,7 +117,7 @@ Client bootstrap
 |   `-- StartingMagnitude                         daemon startup <= 5m total
 |
 +-- FinalizingSelection                            no distinct display; previous phase remains
-|   +-- revalidate exact owner and process         normally immediate; facility retry <= 30s
+|   +-- revalidate exact owner and process         store errors terminal; process retry <= 30s
 |   +-- connect exact RPC endpoint                 transport-bounded
 |   `-- establish initial client lease             <= 5s per attempt; 250ms retry delay
 |

@@ -14,13 +14,13 @@ import {
   ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
+  sameAcnOwner,
   SqliteDriver,
-  COORDINATION_POLL_INTERVAL,
   TREE_KILL_WAIT,
   TREE_TERM_WAIT,
   waitForTreeAbsence,
   type AcnOwnerRecord,
-  type AcnProcessStoreError,
+  type AcnOwnerStoreError,
   type ExactProcess,
   type ExactProcessController as ExactProcessControllerService,
 } from "@magnitudedev/acn-protocol/coordination"
@@ -112,18 +112,13 @@ const CANDIDATE_ADMISSION_TIMEOUT = Duration.seconds(30)
 const CANDIDATE_PARENT_RELEASE_TIMEOUT = Duration.seconds(2)
 const CANDIDATE_EXIT_DIAGNOSTIC_TIMEOUT = Duration.seconds(2)
 const GRACEFUL_STOP_WAIT = Duration.seconds(5)
-const STORE_RETRY_INTERVAL = Duration.millis(25)
-const STORE_OPERATION_TIMEOUT = Duration.seconds(30)
+const MANAGER_RECONCILIATION_INTERVAL = Duration.seconds(1)
+const PROCESS_INSPECTION_RETRY_INTERVAL = Duration.seconds(1)
 const PROCESS_OPERATION_TIMEOUT = Duration.seconds(30)
 
 const monotonicMillis = Clock.currentTimeNanos.pipe(
   Effect.map((nanos) => Number(nanos / 1_000_000n)),
 )
-
-const sameOwner = (left: AcnOwnerRecord, right: AcnOwnerRecord): boolean =>
-  left.pid === right.pid &&
-  left.processStartIdentity === right.processStartIdentity &&
-  left.port === right.port
 
 const ownerNamesProcess = (owner: AcnOwnerRecord, process: ExactProcess): boolean =>
   owner.pid === process.pid && owner.processStartIdentity === process.processStartIdentity
@@ -136,31 +131,17 @@ const exactFrom = (owner: AcnOwnerRecord): ExactProcess => ({
   processStartIdentity: owner.processStartIdentity,
 })
 
-const storeFailure = (error: AcnProcessStoreError): AcnEnsuranceFailed =>
+const storeFailure = (error: AcnOwnerStoreError): AcnEnsuranceFailed =>
   new AcnEnsuranceFailed({
     reason: `${error._tag} during ${"operation" in error ? error.operation : "validation"} at ${error.path}${"message" in error ? `: ${error.message}` : ""}`,
   })
-
-const retryStore = <A>(
-  effect: Effect.Effect<A, AcnProcessStoreError>,
-): Effect.Effect<A, AcnEnsuranceFailed> => effect.pipe(
-  Effect.retry({
-    schedule: Schedule.spaced(STORE_RETRY_INTERVAL),
-    while: (error) => error._tag !== "AcnProcessStoreInvalid",
-  }),
-  Effect.timeoutFail({
-    duration: STORE_OPERATION_TIMEOUT,
-    onTimeout: () => new AcnEnsuranceFailed({ reason: "ACN coordination store remained unavailable" }),
-  }),
-  Effect.mapError((error) => error instanceof AcnEnsuranceFailed ? error : storeFailure(error)),
-)
 
 const inspectProcess = (
   processes: ExactProcessControllerService,
   pid: number,
 ): Effect.Effect<Option.Option<ExactProcess["processStartIdentity"]>, AcnEnsuranceFailed> =>
   processes.inspect(pid).pipe(
-    Effect.retry(Schedule.spaced(COORDINATION_POLL_INTERVAL)),
+    Effect.retry(Schedule.spaced(PROCESS_INSPECTION_RETRY_INTERVAL)),
     Effect.timeoutFail({
       duration: PROCESS_OPERATION_TIMEOUT,
       onTimeout: () => new AcnEnsuranceFailed({
@@ -210,6 +191,7 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.provideService(Path.Path, path),
   )
+  const readCurrentOwner = owners.current.pipe(Effect.mapError(storeFailure))
 
   const probeHealth = (
     owner: AcnOwnerRecord,
@@ -276,8 +258,8 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
   }
 
   const ownerStillCurrent = (owner: AcnOwnerRecord): Effect.Effect<boolean, AcnEnsuranceFailed> =>
-    retryStore(owners.current).pipe(
-      Effect.map(Option.exists((current) => sameOwner(current, owner))),
+    readCurrentOwner.pipe(
+      Effect.map(Option.exists((current) => sameAcnOwner(current, owner))),
     )
 
   const ownerStillSafeToSignal = (
@@ -338,8 +320,8 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
     Effect.gen(function* () {
       const { health, status } = observed
       if (status !== 200 || health.state._tag !== "Ready") return Option.none()
-      const confirmedOwner = yield* retryStore(owners.current)
-      if (!Option.exists(confirmedOwner, (current) => sameOwner(current, owner))) return Option.none()
+      const confirmedOwner = yield* readCurrentOwner
+      if (!Option.exists(confirmedOwner, (current) => sameAcnOwner(current, owner))) return Option.none()
       const identity = yield* inspectProcess(processes, owner.pid)
       if (!Option.contains(identity, owner.processStartIdentity)) return Option.none()
       return Option.some({
@@ -401,7 +383,7 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
 
       while (true) {
         const now = yield* monotonicMillis
-        const owner = yield* retryStore(owners.current)
+        const owner = yield* readCurrentOwner
 
         const state = yield* Option.match(owner, {
           onNone: () => classifyWithoutLiveOwner(now),
@@ -521,12 +503,14 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
                 now - observedHealthStateSince >= Duration.toMillis(grace.value)) {
                 yield* retireOwner(owner)
               } else {
-                yield* Effect.sleep(COORDINATION_POLL_INTERVAL)
+                yield* Effect.sleep(MANAGER_RECONCILIATION_INTERVAL)
               }
               return Option.none<ReadyInstance>()
             })),
           Match.tag("CandidatePending", () =>
-            Effect.sleep(COORDINATION_POLL_INTERVAL).pipe(Effect.as(Option.none<ReadyInstance>()))),
+            Effect.sleep(MANAGER_RECONCILIATION_INTERVAL).pipe(
+              Effect.as(Option.none<ReadyInstance>()),
+            )),
           Match.tag("CandidateExited", ({ candidate, code, stderr }) => Effect.fail(new AcnEnsuranceFailed({
             reason: candidate.admitted
               ? `Magnitude daemon ${candidate.process.pid} exited with code ${code} after admission before it became ready${stderr ? `:\n${stderr}` : ""}`
@@ -599,7 +583,7 @@ export const makeLocalAcnInstanceManagerWithProcessController = (
       )), { bufferSize: "unbounded" })
 
   const stop = Effect.gen(function* () {
-    const owner = yield* retryStore(owners.current)
+    const owner = yield* readCurrentOwner
     if (Option.isNone(owner)) return
     yield* retireOwner(owner.value).pipe(
       Effect.mapError((error) => new AcnAdministrationFailed({ reason: error.reason })),

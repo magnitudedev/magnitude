@@ -20,7 +20,6 @@ import {
   Option,
   Ref,
   Runtime,
-  Schedule,
   Schema,
   Scope,
 } from "effect"
@@ -40,7 +39,7 @@ import {
   ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
-  type AcnProcessStoreError,
+  type AcnOwnerStoreError,
   type AcnOwnerStore,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/coordination"
@@ -88,6 +87,7 @@ import { LocalModelInstallerLive } from "./local-model-installer"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
+import { installAcnOwnershipMonitor } from "./ownership-monitor"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
@@ -126,10 +126,10 @@ type ParentBindingState = "Pending" | "Admitted" | "Lost"
 const makeParentBinding = (
   enabled: boolean,
 ): Effect.Effect<{
-  readonly admit: <A>(
-    effect: Effect.Effect<A, AcnProcessStoreError>,
+  readonly admit: <A, E>(
+    effect: Effect.Effect<A, E>,
     admitted: (value: A) => boolean,
-  ) => Effect.Effect<A, AcnProcessStoreError | AcnBootstrapRejected>
+  ) => Effect.Effect<A, E | AcnBootstrapRejected>
 }, never, Scope.Scope> => Effect.gen(function* () {
   if (!enabled) return { admit: (effect) => effect }
   const state = yield* Ref.make<ParentBindingState>("Pending")
@@ -156,18 +156,30 @@ const makeParentBinding = (
     Effect.forkScoped,
   )
   return {
-    admit: (effect, isAdmitted) => lock.withPermits(1)(Effect.gen(function* () {
-      const lossObserved = Option.isSome(yield* Deferred.poll(lost))
-      if ((yield* Ref.get(state)) === "Lost" || lossObserved) {
-        yield* Ref.set(state, "Lost")
-        return yield* new AcnBootstrapRejected({
-          reason: "ACN spawning parent exited before admission",
-        })
-      }
-      const value = yield* effect
-      if (isAdmitted(value)) yield* Ref.set(state, "Admitted")
-      return value
-    }).pipe(Effect.uninterruptible)),
+    admit: (effect, isAdmitted) => lock.withPermits(1)(Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if ((yield* Ref.get(state)) === "Lost" || Option.isSome(yield* Deferred.poll(lost))) {
+          yield* Ref.set(state, "Lost")
+          return yield* new AcnBootstrapRejected({
+            reason: "ACN spawning parent exited before admission",
+          })
+        }
+        const value = yield* restore(Effect.raceFirst(
+          effect,
+          Deferred.await(lost).pipe(Effect.flatMap(() => Effect.fail(new AcnBootstrapRejected({
+            reason: "ACN spawning parent exited before admission",
+          })))),
+        ))
+        if (Option.isSome(yield* Deferred.poll(lost))) {
+          yield* Ref.set(state, "Lost")
+          return yield* new AcnBootstrapRejected({
+            reason: "ACN spawning parent exited before admission",
+          })
+        }
+        if (isAdmitted(value)) yield* Ref.set(state, "Admitted")
+        return value
+      }),
+    )),
   }
 })
 
@@ -502,21 +514,12 @@ const makeAcnInfrastructure = (
  * Runs one ACN process until its lifecycle enters Stopping. Scope
  * closure then stops HTTP, disposes sessions, and reaps the private ICN.
  */
-const retryCoordination = <A>(
-  effect: Effect.Effect<A, AcnProcessStoreError | AcnBootstrapRejected>,
+const rejectCoordinationFailure = <A>(
+  effect: Effect.Effect<A, AcnOwnerStoreError | AcnBootstrapRejected>,
 ): Effect.Effect<A, AcnBootstrapRejected> => effect.pipe(
-  Effect.retry({
-    schedule: Schedule.spaced(Duration.millis(25)),
-    while: (error) => error._tag !== "AcnBootstrapRejected"
-      && error._tag !== "AcnProcessStoreInvalid",
-  }),
-  Effect.timeoutFail({
-    duration: Duration.seconds(30),
-    onTimeout: () => new AcnBootstrapRejected({ reason: "ACN coordination timed out" }),
-  }),
   Effect.mapError((error) => error instanceof AcnBootstrapRejected
     ? error
-    : new AcnBootstrapRejected({ reason: `${error._tag}: ${"message" in error ? error.message : "busy"}` })),
+    : new AcnBootstrapRejected({ reason: `${error._tag}: ${error.message}` })),
 )
 
 const predecessorAbsent = (
@@ -583,19 +586,24 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     ))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
 
-    const expectedOwner = yield* retryCoordination(ownerStore.current)
+    const expectedOwner = yield* rejectCoordinationFailure(ownerStore.current)
     if (!(yield* predecessorAbsent(Option.map(expectedOwner, (owner) => ({
       pid: owner.pid,
       processStartIdentity: owner.processStartIdentity,
     }))))) return
+    const admittedOwner = { ...currentProcess, port: address.port }
     const admission = yield* parentBinding.admit(
       ownerStore.replaceOwner(
         expectedOwner,
-        { ...currentProcess, port: address.port },
+        admittedOwner,
       ),
       (result) => result._tag === "Replaced",
-    ).pipe(retryCoordination)
+    ).pipe(rejectCoordinationFailure)
     if (admission._tag !== "Replaced") return
+
+    yield* installAcnOwnershipMonitor(ownerStore, admittedOwner, lifecycle).pipe(
+      Effect.provideService(Scope.Scope, applicationScope),
+    )
 
     yield* Layer.buildWithScope(AcnProcessHandlersLive, applicationScope).pipe(
       Effect.provide(infrastructure),

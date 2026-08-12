@@ -3,10 +3,7 @@ import type { ExactProcessInspectionFailed } from "./errors"
 import type { ExactProcessController } from "./exact-process"
 import type { ExactProcess } from "./schemas"
 
-/**
- * Shared timing for owner observation and exact owner-tree retirement.
- */
-export const COORDINATION_POLL_INTERVAL = Duration.seconds(1)
+/** Shared timing for exact owner-tree retirement. */
 export const TREE_EXIT_POLL_INTERVAL = Duration.millis(50)
 export const TREE_TERM_WAIT = Duration.seconds(2)
 export const TREE_KILL_WAIT = Duration.seconds(2)
