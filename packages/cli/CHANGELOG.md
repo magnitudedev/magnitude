@@ -1,5 +1,15 @@
 # @magnitudedev/cli
 
+## 0.0.3
+
+### Patch Changes
+
+- [`a3df81f`](https://github.com/magnitudedev/magnitude/commit/a3df81f0b4098572dc595abdb620b620b019e3fb) Thanks [@anerli](https://github.com/anerli)! - fix: preserve prompt cache on interrupt
+
+- [`f368a70`](https://github.com/magnitudedev/magnitude/commit/f368a70dd879a185b85688a71e28294b83067600) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add support for Nvidia Nemotron 3.5 Lightning and NVFP4
+
+- [#28](https://github.com/magnitudedev/magnitude/pull/28) [`f9d692c`](https://github.com/magnitudedev/magnitude/commit/f9d692c5c0d431002a6158cfa63461771348517e) Thanks [@fabianhug](https://github.com/fabianhug)! - Exit with WSL guidance instead of failing to download artifacts when the launcher runs on native Windows.
+
 ## 0.0.2
 
 ### Patch Changes
