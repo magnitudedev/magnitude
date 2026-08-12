@@ -1003,11 +1003,11 @@ export const ModelSlotControllerLive: Layer.Layer<
             value.providerId === LOCAL_PROVIDER_ID
             && value.providerModelId === previous.selection.providerModelId))
         if (!stillSelected) {
-          yield* stopModel(previous.instance.value.id).pipe(
+          yield* Effect.forkIn(stopModel(previous.instance.value.id).pipe(
             Effect.catchAll((error) => Effect.logWarning("Follow-up local model stop failed").pipe(
               Effect.annotateLogs({ slotId, error: error.message }),
             )),
-          )
+          ), scope)
         }
       }
     })

@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from "react"
-import { Result, useAtomSet } from "@effect-atom/atom-react"
+import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   isRoleId,
@@ -16,6 +16,7 @@ import {
 import { useDisplayState } from "../state/display-state-store"
 import { useAgentClient } from "../state/agent-client-context"
 import { useMirroredState } from "./use-mirrored-state"
+import { useModelSlotsResultAtom } from "./use-local-inference-state"
 
 export interface SlotProfile {
   readonly slotId: SlotId
@@ -50,7 +51,7 @@ const catalogModels = (state: typeof ProviderModelCatalogMirror.stateSchema.Type
 
 export function useSlotProfiles() {
   const client = useAgentClient()
-  const slots = useMirroredState(ModelSlotsMirror)
+  const slots = useAtomValue(useModelSlotsResultAtom())
   const catalog = useMirroredState(ProviderModelCatalogMirror)
   const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
   const refresh = useAtomSet(refreshAtom)

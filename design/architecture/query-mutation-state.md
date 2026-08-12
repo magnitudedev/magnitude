@@ -122,6 +122,13 @@ mutation success  !=  operation success
 transport success !=  query visibility
 ```
 
+When submitted input completely determines an immediate user-facing value, presentation may
+project the latest pending mutation over the authoritative query result. This optimistic value is
+a derived view of command intent, not copied server state and not a query-cache write. Rejection
+removes the pending projection and reveals the unchanged query value. Success keeps the mutation
+pending through synchronization so the refreshed authoritative value replaces the projection
+without exposing a stale intermediate value.
+
 ## Queries
 
 Queries observe state or compose observations. They never request product change.
@@ -334,9 +341,11 @@ local interaction  -> presentation atom
 - CLI, web, and desktop share state behavior through client-common.
 
 Effect Query is the client cache and command-state authority for a subsystem that adopts it.
-A subsystem defines each query and mutation once in client-common, bound to the shared
-`AgentClient` transport. Components consume those definitions; they do not wrap them in parallel
-request atoms or writable status state.
+A subsystem defines each query and mutation once in client-common as static domain values whose
+Effects require the stable ACN RPC client service. One connection-scoped Effect Query client
+provides that service and materializes definitions into query and mutation atoms. Components
+consume those atoms; they do not construct runtimes or wrap them in parallel request atoms or
+writable status state.
 
 Mutation states are retained per invocation and keyed by the mutation definition and, when
 concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports
@@ -358,13 +367,20 @@ mechanism for the same data is prohibited.
 
 ```text
 component
-   +-- query definition ----> AgentClient ----> ACN query
-   +-- mutation definition -> AgentClient ----> ACN mutation
-                                      ^
-                                      +-- watch invalidates query
+   +-- static query definition ----> Effect Query client ----> ACN RPC service
+   +-- static mutation definition -> Effect Query client ----> ACN RPC service
+                                                ^
+                                                +-- watch invalidates query
 ```
 
-- One AgentClient owns transport recovery, query state, and mutation state.
+- The ACN RPC service owns typed transport access, not query or mutation state.
+- One Effect Query client per connection owns the Atom runtime, query cache, and mutation history.
+- Definitions are transport-using Effects but are independent of connection and runtime lifetime.
+- AtomRpc and Effect Query may serve different domains over the same transport during migration;
+  adopted domains do not use AtomRpc or the mirror cache as a second state authority.
+- The generic mirror abstraction is not implemented on top of Effect Query. Domains migrate
+  vertically and delete their mirror ownership once query, mutation, and invalidation semantics
+  have moved together.
 - Components do not own RPC clients, request caches, retries, or invalidation wiring.
 - Mutation receipts may await query visibility; they do not create another resource state.
 - Reconnection preserves client state and rereads authoritative ACN state.

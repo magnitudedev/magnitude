@@ -59,23 +59,31 @@ Every writable client atom MUST choose the correct lifetime:
 `useAtomInitialValues` only writes an initial value; it does not retain it. Never
 root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
 
-## AtomRpc Patterns
+## RPC state patterns
 
-`AgentClient` is the standard RPC interface. Ordinary client code must not build a raw RPC client, manually run RPC Effects, or maintain a parallel request cache.
+`AgentClient` owns the shared ACN transport. Ordinary client code must not build a raw RPC client or maintain a parallel request cache.
 
 ### Effect Query adoption
 
 A subsystem may adopt `@magnitudedev/effect-query` without migrating unrelated domains. Its query
-and mutation definitions belong in one domain module in client-common and must bind to the existing
-`AgentClient` layer. Once adopted, that subsystem uses Effect Query as its only query cache and
-mutation-state authority; do not retain an AtomRpc query or writable pending/error atom for the
-same operation.
+and mutation definitions belong as static values in one domain module in client-common. Definitions
+require `AcnRpcClientTag` as an ordinary Effect service; they never capture an `AgentClient`, Atom
+runtime, or React lifecycle. `createAgentClient` creates one connection-scoped Effect Query client,
+and domain modules materialize definitions through
+`client.effectQuery.query(...)` and `client.effectQuery.mutation(...)`. Do not construct domain-local
+query runtimes in feature code.
+
+Once adopted, that subsystem uses Effect Query as its only query cache and mutation-state authority;
+do not retain an AtomRpc query or writable pending/error atom for the same operation. `Query.make`
+and `Mutation.make` define domain behavior; the Effect Query client owns cache identity, mutation
+history, and the service runtime for one connection.
 
 Use semantic mutation scopes for resource-specific concurrency, typed mutation-state selectors for
 pending and rejection presentation, and mutation synchronization for promised query visibility.
-Long-running resource progress still comes from the authoritative query. Mirror-backed Effect Query
-definitions subscribe through the shared connection-wide invalidation watch; they must not open a
-second `WatchMirroredStates` stream.
+Long-running resource progress still comes from the authoritative query. Do not implement the
+generic mirror abstraction in terms of Effect Query or make one domain authoritative in both
+systems. Migration is vertical: move a domain's query, mutations, and invalidation ownership
+together, then remove its mirror ownership.
 
 ### Queries
 

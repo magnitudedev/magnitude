@@ -1,6 +1,12 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
+import {
+  DownloadAttemptIdSchema,
+  PRIMARY_SLOT_ID,
+  ProviderIdSchema,
+  ProviderModelIdSchema,
+  type ProviderModelCatalogEntry,
+} from "@magnitudedev/sdk"
 import {
   buildModelsMenuEntries,
   catalogStatus,
@@ -8,6 +14,8 @@ import {
   localModelInstalledStatus,
   localModelReadinessStatus,
   modelsMenuEntryIsSelected,
+  modelsMenuEntryIsEligible,
+  modelsMenuOrderingAtOpen,
   modelsMenuStatusPresentation,
   modelsMenuSelectionAction,
   providerDisabledStatus,
@@ -116,6 +124,68 @@ describe("unified models menu projection", () => {
       providerId: LOCAL_PROVIDER_ID,
       providerModelId: TEST_MODEL_ID,
     }))).toBe(true)
+  })
+
+  it("keeps eligibility tied to the selection captured when the menu opened", () => {
+    const local = makeModel()
+    if (local.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    const provider = {
+      providerId: ProviderIdSchema.make("test"),
+      displayName: "Test",
+      kind: "Hosted" as const,
+      authentication: "NotRequired" as const,
+      availability: { _tag: "Available" as const },
+    }
+    const unavailable = {
+      providerId: provider.providerId,
+      providerModelId: ProviderModelIdSchema.make("unavailable"),
+      modelFamilyId: Option.none(),
+      displayName: "Unavailable",
+      supportedSlots: [PRIMARY_SLOT_ID],
+      contextWindow: 1,
+      maxOutputTokens: 1,
+      memory: Option.none(),
+      capabilities: local.servingState.capabilities,
+      availability: { _tag: "Disabled" as const, reason: "model_unavailable" as const },
+      pricing: Option.none(),
+    } satisfies ProviderModelCatalogEntry
+    const entry = {
+      _tag: "Provider" as const,
+      id: "test:unavailable",
+      model: unavailable,
+      provider,
+    }
+
+    expect(modelsMenuEntryIsEligible(entry, Option.some(unavailable))).toBe(true)
+    expect(modelsMenuEntryIsEligible(entry, Option.none())).toBe(false)
+  })
+
+  it("waits for complete ordering inputs before capturing the selected model", () => {
+    const view = makeView()
+    const selected = Option.some({
+      providerId: LOCAL_PROVIDER_ID,
+      providerModelId: TEST_MODEL_ID,
+    })
+
+    expect(Option.isNone(modelsMenuOrderingAtOpen(
+      false,
+      true,
+      Option.some(view.slots),
+      selected,
+    ))).toBe(true)
+
+    const ordering = Option.getOrThrow(modelsMenuOrderingAtOpen(
+      true,
+      true,
+      Option.some(view.slots),
+      selected,
+    ))
+    expect(Option.getOrThrow(ordering.selectedModel).providerModelId).toBe(TEST_MODEL_ID)
+
+    expect(modelsMenuOrderingAtOpen(true, true, Option.none(), Option.none())).toMatchObject({
+      _tag: "Some",
+      value: { recentModelKeys: [], favoriteKeys: new Set() },
+    })
   })
 
   it("reports installation origin and stable assessment failures", () => {

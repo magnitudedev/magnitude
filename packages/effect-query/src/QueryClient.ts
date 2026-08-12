@@ -9,7 +9,7 @@ import * as FiberId from "effect/FiberId"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import type * as Stream from "effect/Stream"
-import type { QueryAtom, State as QueryState } from "./Query.js"
+import type { Query, QueryAtom, State as QueryState } from "./Query.js"
 import {
   type ErasedQueryEntry,
   getClientCore,
@@ -36,6 +36,10 @@ export class QueryBatchError extends Data.TaggedError("QueryBatchError")<{
 }> {}
 
 export interface Service {
+  readonly resolve: <Input, Data, Error, Requirements>(
+    query: Query<Input, Data, Error, Requirements>,
+    input: Input
+  ) => QueryAtom<Input, Data, Error, Requirements>
   readonly fetch: <Input, Data, Error, Requirements>(
     query: QueryAtom<Input, Data, Error, Requirements>
   ) => Effect.Effect<Data, Error>
@@ -119,10 +123,13 @@ const awaitErased = (
   return Effect.sync(() => unsubscribe?.())
 })
 
-const makeService = (registry: AtomRegistry.Registry): Service => {
+const makeService = (
+  registry: AtomRegistry.Registry,
+  resolve: Service["resolve"]
+): Service => {
   const core = getClientCore(registry)
   const entries = (filter?: QueryFilter) => [...core.entries].filter((entry) => queryMatches(registry, entry, filter))
-  const materialize = <Input, Data, Error, Requirements>(
+  const entryFor = <Input, Data, Error, Requirements>(
     query: QueryAtom<Input, Data, Error, Requirements>
   ): readonly [ReturnType<typeof queryEntry<Data>>, boolean] => {
     const entry = queryEntry(query)
@@ -137,7 +144,7 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
   const fetchQuery = <Input, Data, Error, Requirements>(
     query: QueryAtom<Input, Data, Error, Requirements>
   ): Effect.Effect<Data, Error> => Effect.suspend(() => {
-    const [entry, existed] = materialize(query)
+    const [entry, existed] = entryFor(query)
     const state = entry.state(registry)
     if (existed && state.fetchStatus !== "paused" && entry.hasData(registry) && !state.isStale) {
       return Effect.succeed(Option.getOrThrow(entry.getData(registry)))
@@ -147,9 +154,10 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
   })
 
   return {
+    resolve,
     fetch: fetchQuery,
     ensure: (query) => Effect.suspend(() => {
-      const [entry] = materialize(query)
+      const [entry] = entryFor(query)
       if (entry.hasData(registry)) {
         if (entry.state(registry).isStale && entry.state(registry).fetchStatus !== "fetching") entry.start(registry)
         return Effect.succeed(Option.getOrThrow(entry.getData(registry)))
@@ -190,7 +198,7 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
         : Option.none()
     }),
     setData: (query, update) => Effect.sync(() => {
-      const [entry] = materialize(query)
+      const [entry] = entryFor(query)
       entry.setData(registry, update)
       core.touch()
     }),
@@ -214,23 +222,29 @@ const makeService = (registry: AtomRegistry.Registry): Service => {
   }
 }
 
-export const layer: Layer.Layer<QueryClient, never, AtomRegistry.AtomRegistry> =
-  Layer.effect(QueryClient, Effect.map(AtomRegistry.AtomRegistry, makeService))
+/** Internal layer constructor used by a connection-scoped Client. */
+export const makeLayer = (
+  resolve: Service["resolve"]
+): Layer.Layer<QueryClient, never, AtomRegistry.AtomRegistry> =>
+  Layer.effect(QueryClient, Effect.map(AtomRegistry.AtomRegistry, (registry) => makeService(registry, resolve)))
 
 export const fetch = <Input, Data, Error, Requirements>(
-  query: QueryAtom<Input, Data, Error, Requirements>
+  query: Query<Input, Data, Error, Requirements>,
+  input: Input
 ): Effect.Effect<Data, Error, QueryClient> =>
-  Effect.flatMap(QueryClient, (client) => client.fetch(query))
+  Effect.flatMap(QueryClient, (client) => client.fetch(client.resolve(query, input)))
 
 export const ensure = <Input, Data, Error, Requirements>(
-  query: QueryAtom<Input, Data, Error, Requirements>
+  query: Query<Input, Data, Error, Requirements>,
+  input: Input
 ): Effect.Effect<Data, Error, QueryClient> =>
-  Effect.flatMap(QueryClient, (client) => client.ensure(query))
+  Effect.flatMap(QueryClient, (client) => client.ensure(client.resolve(query, input)))
 
 export const prefetch = <Input, Data, Error, Requirements>(
-  query: QueryAtom<Input, Data, Error, Requirements>
+  query: Query<Input, Data, Error, Requirements>,
+  input: Input
 ): Effect.Effect<void, never, QueryClient> =>
-  Effect.flatMap(QueryClient, (client) => client.prefetch(query))
+  Effect.flatMap(QueryClient, (client) => client.prefetch(client.resolve(query, input)))
 
 export const invalidate = (
   filter?: QueryFilter,
@@ -247,14 +261,17 @@ export const remove = (filter?: QueryFilter): Effect.Effect<void, never, QueryCl
   Effect.flatMap(QueryClient, (client) => client.remove(filter))
 
 export const getState = <Input, Data, Error, Requirements>(
-  query: QueryAtom<Input, Data, Error, Requirements>
+  query: Query<Input, Data, Error, Requirements>,
+  input: Input
 ): Effect.Effect<Option.Option<QueryState<Data, Error>>, never, QueryClient> =>
-  Effect.flatMap(QueryClient, (client) => client.getState(query))
+  Effect.flatMap(QueryClient, (client) => client.getState(client.resolve(query, input)))
 
 export const setData = <Input, Data, Error, Requirements>(
-  query: QueryAtom<Input, Data, Error, Requirements>,
+  query: Query<Input, Data, Error, Requirements>,
+  input: Input,
   update: (current: Option.Option<Data>) => Data
-): Effect.Effect<void, never, QueryClient> => Effect.flatMap(QueryClient, (client) => client.setData(query, update))
+): Effect.Effect<void, never, QueryClient> =>
+  Effect.flatMap(QueryClient, (client) => client.setData(client.resolve(query, input), update))
 
 export const isFetching = (filter?: QueryFilter): Effect.Effect<Atom.Atom<number>, never, QueryClient> =>
   Effect.map(QueryClient, (client) => client.isFetching(filter))

@@ -2,6 +2,7 @@ import { act, create, type ReactTestRenderer } from "react-test-renderer"
 import { Atom, RegistryContext } from "@effect-atom/atom-react"
 import * as Registry from "@effect-atom/atom/Registry"
 import { Context, Deferred, Effect, Layer, PubSub, Stream } from "effect"
+import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import { describe, expect, it } from "vitest"
 import {
   AgentClientProvider,
@@ -9,7 +10,7 @@ import {
   useLocalModelsSelector,
   type AgentClientInstance,
 } from "@magnitudedev/client-common"
-import type { LocalModelsState } from "@magnitudedev/sdk"
+import { AcnRpcClientTag, type AcnRpcClient, type LocalModelsState } from "@magnitudedev/sdk"
 import { makeView } from "../local-inference/test-fixtures"
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -45,11 +46,16 @@ const makeFakeAgentClient = (
   }
   const layer = Layer.succeed(FakeAgentClient, service)
   const runtime = Atom.runtime(layer)
+  const effectQuery = EffectQueryClient.make(Layer.succeed(
+    AcnRpcClientTag,
+    service as unknown as AcnRpcClient,
+  ))
   const mutation = () => Atom.fn(() => Effect.void)
   const tag = Object.assign(FakeAgentClient, {
     layer,
     runtime,
     mutation,
+    effectQuery,
   })
   return tag as unknown as AgentClientInstance
 }
