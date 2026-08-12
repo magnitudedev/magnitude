@@ -1,7 +1,7 @@
 import { memo, useState, useCallback, useRef, useMemo } from 'react'
 import { Atom, useAtomMount } from '@effect-atom/atom-react'
 import { Effect } from 'effect'
-import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import type { ActionId } from '../../types/ui-actions'
 import type { ContextUsageDisplay, DisplayTimeline } from '@magnitudedev/sdk'
@@ -55,7 +55,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
 
-  const scrollboxRef = useRef<any>(null)
+  const scrollboxRef = useRef<ScrollBoxRenderable | null>(null)
   const scrollboxWidth = useLocalWidth()
 
   useKeyboard(useCallback((key: KeyEvent) => {
