@@ -1,6 +1,7 @@
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
+import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Duration from "effect/Duration"
 import * as EffectData from "effect/Data"
 import * as Effect from "effect/Effect"
@@ -25,6 +26,7 @@ import {
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Query")
 const SetInputTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Query/setInput")
+const OptionsTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Query/options")
 
 export interface State<Data, Error> {
   readonly result: AtomResult.Result<Data, Error>
@@ -48,8 +50,7 @@ export interface Query<Input, Data, Error, Requirements> extends QueryDefinition
     readonly requirements: Requirements
   }
   readonly name: string
-  (input: Input): QueryAtom<Input, Data, Error, Requirements>
-  readonly atom: (input: Input) => QueryAtom<Input, Data, Error, Requirements>
+  readonly [OptionsTypeId]: unknown
   readonly match: {
     (): QueryFilter
     (input: Input): QueryFilter
@@ -86,15 +87,6 @@ export type Options<Input, Data, Error, Requirements> = CommonOptions<Input, Err
   readonly effect: (input: Input) => Effect.Effect<Data, Error, Requirements>
 }
 
-export interface Factory<Provided, RuntimeError> {
-  readonly make: {
-    <Input, Data, Error, Required extends Provided>(
-      name: string,
-      options: Options<Input, Data, Error, Required>
-    ): Query<Input, Data, Error | RuntimeError, Required>
-  }
-}
-
 interface Control<Data> {
   readonly invalidation: number
   readonly acceptedInvalidation: number
@@ -126,14 +118,37 @@ const normalizeInterrupted = <A, E>(result: AtomResult.Result<A, E>): AtomResult
   })
 }
 
-const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required extends Provided>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+export const make = <Input, Data, Error, Requirements>(
   name: string,
-  options: Options<Input, Data, Error, Required>
-): Query<Input, Data, Error | RuntimeError, Required> => {
+  options: Options<Input, Data, Error, Requirements>
+): Query<Input, Data, Error, Requirements> => {
+  let definition!: Query<Input, Data, Error, Requirements>
+  const keyFor = (input: Input): QueryKey => {
+    const key = options.key(input)
+    if ((typeof key === "object" && key !== null) && !Equal.isEqual(key)) {
+      throw new TypeError(`Query ${name} returned a structured key without Effect Equal semantics`)
+    }
+    return key
+  }
+  definition = {
+    [QueryDefinitionTypeId]: true,
+    [OptionsTypeId]: options,
+    name,
+    match: (input?: Input): QueryFilter => input === undefined
+      ? { definition }
+      : { definition, key: keyFor(input), exact: true }
+  }
+  return definition
+}
+
+export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Required extends Provided | Reactivity.Reactivity>(
+  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  definition: Query<Input, Data, Error, Required>
+): ((input: Input) => QueryAtom<Input, Data, Error | RuntimeError, Required>) => {
+  const { name } = definition
+  const options = definition[OptionsTypeId] as Options<Input, Data, Error, Required>
   const staleTime = Duration.toMillis(Duration.decode(options.staleTime ?? 0))
   const gcTime = options.gcTime ?? Duration.minutes(5)
-  let definition!: Query<Input, Data, Error | RuntimeError, Required>
   const keyFor = (input: Input): QueryKey => {
     const key = options.key(input)
     if ((typeof key === "object" && key !== null) && !Equal.isEqual(key)) {
@@ -336,29 +351,13 @@ const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required ext
     })
   })
 
-  const callable = (input: Input) => {
+  return (input: Input) => {
     const identity = keyFor(input)
     const atom = family(identity)
     atom[SetInputTypeId](input)
     return atom
   }
-  Object.defineProperty(callable, "name", { value: name, configurable: true })
-  definition = Object.assign(callable, {
-    [QueryDefinitionTypeId]: true as const,
-    atom: callable,
-    match: (input?: Input): QueryFilter => input === undefined
-      ? { definition }
-      : { definition, key: keyFor(input), exact: true }
-  })
-  return definition
 }
-
-export const bind = <Provided, RuntimeError>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>
-): Factory<Provided, RuntimeError> => ({
-  make: ((name: string, options: Options<unknown, unknown, unknown, Provided>) =>
-    makeDefinition(runtime, name, options)) as Factory<Provided, RuntimeError>["make"]
-})
 
 export const select = <Input, Data, Error, Requirements, Selected>(
   query: QueryAtom<Input, Data, Error, Requirements>,

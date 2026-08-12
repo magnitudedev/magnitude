@@ -8,7 +8,6 @@ import {
   ProviderModelCatalogMirror,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
-  type ModelSlotsState,
   type ProviderId,
   type ProviderModelIdentity,
   type ProviderModelId,
@@ -17,33 +16,28 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
+import { modelSlotAtoms, presentedSlotSelection } from "../model-slots/atoms"
 import { useMirroredState } from "./use-mirrored-state"
-
-const selectionAt = (state: ModelSlotsState, slotId: SlotId): Option.Option<SlotSelection> => {
-  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  return slot._tag === "Unassigned" ? Option.none() : Option.some(slot.selection)
-}
+import { useModelSlotsResultAtom } from "./use-local-inference-state"
 
 export function useModelConfig() {
   const client = useAgentClient()
   const catalog = useMirroredState(ProviderModelCatalogMirror)
-  const slots = useMirroredState(ModelSlotsMirror)
-  const assignAtom = useMemo(() => client.mutation("AssignSlot"), [client])
-  const clearAtom = useMemo(() => client.mutation("ClearSlot"), [client])
+  const slots = useAtomValue(useModelSlotsResultAtom())
+  const slotAtoms = useMemo(() => modelSlotAtoms(client), [client])
   const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
-  const favoriteAtom = useMemo(() => client.mutation("SetModelFavorite"), [client])
-  const slotUpdate = useAtomValue(assignAtom)
-  const slotClear = useAtomValue(clearAtom)
+  const slotUpdate = useAtomValue(slotAtoms.assignMutation)
+  const slotClear = useAtomValue(slotAtoms.clearMutation)
   const catalogRefresh = useAtomValue(refreshAtom)
-  const favoriteUpdate = useAtomValue(favoriteAtom)
-  const assign = useAtomSet(assignAtom)
-  const clear = useAtomSet(clearAtom)
+  const favoriteUpdate = useAtomValue(slotAtoms.favoriteMutation)
+  const assignmentMutationStates = useAtomValue(slotAtoms.assignmentMutationStatesAtom)
+  const assign = useAtomSet(slotAtoms.assignMutation)
+  const clear = useAtomSet(slotAtoms.clearMutation)
   const refresh = useAtomSet(refreshAtom)
-  const setFavoriteMutation = useAtomSet(favoriteAtom)
-
+  const setFavoriteMutation = useAtomSet(slotAtoms.favoriteMutation)
   const selections = Option.map(Result.value(slots), ({ state }) => ({
-    primary: selectionAt(state, PRIMARY_SLOT_ID),
-    secondary: selectionAt(state, SECONDARY_SLOT_ID),
+    primary: presentedSlotSelection(state, assignmentMutationStates, PRIMARY_SLOT_ID),
+    secondary: presentedSlotSelection(state, assignmentMutationStates, SECONDARY_SLOT_ID),
   }))
 
   const catalogModels = Option.flatMap(Result.value(catalog), ({ state }) =>
@@ -59,14 +53,8 @@ export function useModelConfig() {
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
   ): void => Option.match(selection, {
-    onNone: () => clear({
-      payload: { slotId },
-      reactivityKeys: [ModelSlotsMirror.id],
-    }),
-    onSome: (value) => assign({
-      payload: { slotId, selection: value },
-      reactivityKeys: [ModelSlotsMirror.id],
-    }),
+    onNone: () => clear({ slotId }),
+    onSome: (value) => assign({ slotId, selection: value }),
   }), [assign, clear])
 
   const selectionFor = useMemo(() => (
@@ -126,16 +114,15 @@ export function useModelConfig() {
   const setModelFavorite = useMemo(() => (
     model: ProviderModelIdentity,
     favorite: boolean,
-  ): void => setFavoriteMutation({
-    payload: { model, favorite },
-    reactivityKeys: [ModelSlotsMirror.id],
-  }), [setFavoriteMutation])
+  ): void => setFavoriteMutation({ model, favorite }), [setFavoriteMutation])
 
   return {
     catalog,
     slots,
     slotUpdate,
     slotClear,
+    selections,
+    assignmentMutationStates,
     catalogRefresh,
     favoriteUpdate,
     favoriteModels,

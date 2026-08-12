@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@effect-atom/atom": "^0.5.3",
+    "@effect/experimental": "^0.60.0",
     "effect": "^3.21.2"
   },
   "devDependencies": {

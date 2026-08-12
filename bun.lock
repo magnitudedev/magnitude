@@ -200,7 +200,7 @@
     },
     "packages/cli": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.1-alpha.41",
+      "version": "0.0.2",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
@@ -212,6 +212,7 @@
         "@effect-atom/atom-react": "^0.5.0",
         "@effect/platform": "^0.96.0",
         "@effect/rpc": "0.75.1",
+        "@magnitudedev/effect-query": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
         "@magnitudedev/utils": "workspace:*",
@@ -243,6 +244,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@effect-atom/atom": "^0.5.3",
+        "@effect/experimental": "^0.60.0",
         "effect": "^3.21.2",
       },
       "devDependencies": {

@@ -1,5 +1,12 @@
-export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, AcnClientTag } from "./protocol"
-export type { AcnClient } from "./protocol"
+export {
+  connect,
+  makeClientLayer,
+  protocolLayer,
+  protocolLayerWithRecovery,
+  AcnClientTag,
+  AcnRpcClientTag,
+} from "./protocol"
+export type { AcnClient, AcnRpcClient } from "./protocol"
 
 export {
   AcnInstanceManager,

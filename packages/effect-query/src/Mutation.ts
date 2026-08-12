@@ -1,6 +1,7 @@
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
+import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Data from "effect/Data"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
@@ -28,6 +29,7 @@ import {
 } from "./Model.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Mutation")
+const OptionsTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Mutation/options")
 
 export { MutationScope }
 
@@ -39,16 +41,7 @@ export class MutationSynchronizationError<Output, SynchronizationError> extends 
 }> {}
 
 export interface Mutation<Input, Output, CommandError, Requirements, SynchronizationError = never>
-  extends Atom.Writable<
-    AtomResult.Result<Output, CommandError | MutationSynchronizationError<Output, SynchronizationError>>,
-    Input | Atom.Reset | Atom.Interrupt
-  >,
-    MutationDefinition,
-    MutationControllerCarrier<
-      Input,
-      Output,
-      CommandError | MutationSynchronizationError<Output, SynchronizationError>
-    > {
+  extends MutationDefinition {
   readonly [TypeId]?: {
     readonly input: Input
     readonly output: Output
@@ -56,8 +49,22 @@ export interface Mutation<Input, Output, CommandError, Requirements, Synchroniza
     readonly requirements: Requirements
     readonly synchronizationError: SynchronizationError
   }
+  readonly [OptionsTypeId]: unknown
   readonly name: string
   readonly match: () => MutationFilter
+}
+
+export interface MutationAtom<Input, Output, CommandError, Requirements, SynchronizationError = never>
+  extends Atom.Writable<
+    AtomResult.Result<Output, CommandError | MutationSynchronizationError<Output, SynchronizationError>>,
+    Input | Atom.Reset | Atom.Interrupt
+  >,
+    MutationControllerCarrier<
+      Input,
+      Output,
+      CommandError | MutationSynchronizationError<Output, SynchronizationError>
+    > {
+  readonly definition: MutationDefinition
 }
 
 export type Any = MutationDefinition
@@ -71,7 +78,7 @@ export type Error<M> = M extends Mutation<infer _I, infer O, infer CE, infer _R,
   : never
 export type State<M> = M extends Mutation<infer I, infer O, infer CE, infer _R, infer SE>
   ? MutationState<I, O, CE | MutationSynchronizationError<O, SE>>
-  : never
+  : AnyMutationState
 
 export interface Filters<M extends AnyMutation = AnyMutation> {
   readonly mutation?: M
@@ -80,7 +87,7 @@ export interface Filters<M extends AnyMutation = AnyMutation> {
   readonly predicate?: (state: State<M>) => boolean
 }
 
-type AnyMutation = Mutation<any, any, any, any, any>
+type AnyMutation = MutationDefinition
 
 const mutationFilter = <M extends AnyMutation>(
   filters: Filters<M> | undefined,
@@ -128,33 +135,6 @@ export interface Options<Input, Output, CommandError, CommandRequirements, Synch
   readonly gcTime?: Duration.DurationInput
 }
 
-export interface Factory<Provided, RuntimeError> {
-  readonly make: <
-    Input,
-    Output,
-    CommandError,
-    CommandRequirements extends Provided,
-    SynchronizationError = never,
-    SynchronizationRequirements extends Provided = never
-  >(
-    name: string,
-    options: Options<
-      Input,
-      Output,
-      CommandError,
-      CommandRequirements,
-      SynchronizationError,
-      SynchronizationRequirements
-    >
-  ) => Mutation<
-    Input,
-    Output,
-    CommandError | RuntimeError,
-    CommandRequirements | SynchronizationRequirements,
-    SynchronizationError
-  >
-}
-
 interface Invocation<Input, Output, Error> {
   readonly id: MutationStateId
   readonly input: Input
@@ -167,17 +147,14 @@ interface Invocation<Input, Output, Error> {
 
 let nextMutationStateId = 0
 
-const makeDefinition = <
-  Provided,
-  RuntimeError,
+export const make = <
   Input,
   Output,
   CommandError,
-  CommandRequirements extends Provided,
-  SynchronizationError,
-  SynchronizationRequirements extends Provided
+  CommandRequirements,
+  SynchronizationError = never,
+  SynchronizationRequirements = never
 >(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
   name: string,
   options: Options<
     Input,
@@ -190,21 +167,62 @@ const makeDefinition = <
 ): Mutation<
   Input,
   Output,
-  CommandError | RuntimeError,
+  CommandError,
   CommandRequirements | SynchronizationRequirements,
   SynchronizationError
 > => {
+  let definition!: Mutation<
+    Input,
+    Output,
+    CommandError,
+    CommandRequirements | SynchronizationRequirements,
+    SynchronizationError
+  >
+  definition = {
+    [MutationDefinitionTypeId]: true,
+    [OptionsTypeId]: options,
+    name,
+    match: (): MutationFilter => ({ mutation: definition })
+  }
+  return definition
+}
+
+export const makeAtom = <
+  Provided,
+  RuntimeError,
+  Input,
+  Output,
+  CommandError,
+  Required extends Provided | Reactivity.Reactivity,
+  SynchronizationError,
+>(
+  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  definition: Mutation<
+    Input,
+    Output,
+    CommandError,
+    Required,
+    SynchronizationError
+  >
+): MutationAtom<
+  Input,
+  Output,
+  CommandError | RuntimeError,
+  Required,
+  SynchronizationError
+> => {
+  const { name } = definition
+  const options = definition[OptionsTypeId] as Options<
+    Input,
+    Output,
+    CommandError,
+    Required,
+    SynchronizationError,
+    Required
+  >
   type PublicError = CommandError | RuntimeError | MutationSynchronizationError<Output, SynchronizationError>
   type CurrentInvocation = Invocation<Input, Output, PublicError>
   const registryAtom = Atom.readable((get) => get.registry)
-  const semaphoresByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationScope, Effect.Semaphore>>()
-  const semaphoresFor = (registry: AtomRegistry.Registry): Map<MutationScope, Effect.Semaphore> => {
-    const existing = semaphoresByRegistry.get(registry)
-    if (existing !== undefined) return existing
-    const semaphores = new Map<MutationScope, Effect.Semaphore>()
-    semaphoresByRegistry.set(registry, semaphores)
-    return semaphores
-  }
   const activeByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationStateId, CurrentInvocation>>()
   const activeFor = (registry: AtomRegistry.Registry): Map<MutationStateId, CurrentInvocation> => {
     const existing = activeByRegistry.get(registry)
@@ -229,7 +247,7 @@ const makeDefinition = <
     }, gcTime)
     timer.unref()
   }
-  let mutation!: Mutation<Input, Output, CommandError | RuntimeError, CommandRequirements | SynchronizationRequirements, SynchronizationError>
+  let mutation!: MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
 
   const run = runtime.fn<CurrentInvocation>()((invocation) => {
     if (invocation.started) {
@@ -251,11 +269,10 @@ const makeDefinition = <
 
     const scope = options.scope?.(invocation.input)
     if (scope !== undefined) {
-      const semaphores = semaphoresFor(invocation.registry)
-      let semaphore = semaphores.get(scope)
+      let semaphore = core.mutationScopes.get(scope)
       if (semaphore === undefined) {
         semaphore = Effect.unsafeMakeSemaphore(1)
-        semaphores.set(scope, semaphore)
+        core.mutationScopes.set(scope, semaphore)
       }
       operation = semaphore.withPermits(1)(operation)
     }
@@ -312,7 +329,7 @@ const makeDefinition = <
       const id = MutationStateId(`${name}:${Date.now()}:${nextMutationStateId++}`)
       const state: MutationState<Input, Output, PublicError> = {
         id,
-        mutation,
+        mutation: definition,
         input: value,
         result: AtomResult.initial(true),
         scope: Option.fromNullable(options.scope?.(value)),
@@ -346,23 +363,14 @@ const makeDefinition = <
     }
   }
   mutation = Object.assign(writable, {
-    [MutationDefinitionTypeId]: true as const,
     [MutationInternalTypeId]: internal,
-    name,
-    match: (): MutationFilter => ({ mutation })
+    definition
   })
   return mutation
 }
 
-export const bind = <Provided, RuntimeError>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>
-): Factory<Provided, RuntimeError> => ({
-  make: ((name: string, options: Options<unknown, unknown, unknown, Provided, unknown, Provided>) =>
-    makeDefinition(runtime, name, options)) as Factory<Provided, RuntimeError>["make"]
-})
-
 export const execute = <Input, Output, CommandError, Requirements, SynchronizationError>(
-  mutation: Mutation<Input, Output, CommandError, Requirements, SynchronizationError>,
+  mutation: MutationAtom<Input, Output, CommandError, Requirements, SynchronizationError>,
   input: Input
 ): Effect.Effect<
   Output,
@@ -381,4 +389,7 @@ export const execute = <Input, Output, CommandError, Requirements, Synchronizati
 })
 
 export const isMutation = (value: unknown): value is Any =>
+  typeof value === "object" && value !== null && MutationDefinitionTypeId in value
+
+export const isMutationAtom = (value: unknown): value is MutationAtom<any, any, any, any, any> =>
   typeof value === "object" && value !== null && MutationInternalTypeId in value

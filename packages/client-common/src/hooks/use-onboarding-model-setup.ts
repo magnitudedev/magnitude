@@ -4,7 +4,6 @@ import { Effect, Option, Schema, Stream } from "effect"
 import { Mutation } from "@magnitudedev/effect-query"
 import {
   LocalInferenceHardwareMirror,
-  ModelSlotsMirror,
   OnboardingMirror,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
@@ -12,8 +11,9 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { useMirroredStateAtom } from "./use-mirrored-state"
-import { useLocalModelsResultAtom, useModelSlotActions } from "./use-local-inference-state"
+import { useLocalModelsResultAtom, useModelSlotActions, useModelSlotsResultAtom } from "./use-local-inference-state"
 import { localModelAtoms } from "../local-models/atoms"
+import { modelSlotAtoms } from "../model-slots/atoms"
 import {
   OnboardingIdle,
   OnboardingModelMachine,
@@ -56,16 +56,13 @@ export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
   const hardwareAtom = useMirroredStateAtom(LocalInferenceHardwareMirror)
   const modelsAtom = useLocalModelsResultAtom()
-  const slotsAtom = useMirroredStateAtom(ModelSlotsMirror)
+  const slotsAtom = useModelSlotsResultAtom()
   const slotActions = useModelSlotActions()
   const mutations = useMemo(() => ({
-    assign: client.mutation("AssignSlot"),
-    load: client.mutation("LoadModel"),
     complete: client.mutation("UpdateOnboardingState"),
-    clear: client.mutation("ClearSlot"),
-    stop: client.mutation("StopModel"),
   }), [client])
   const atoms = useMemo(() => localModelAtoms(client), [client])
+  const slotAtoms = useMemo(() => modelSlotAtoms(client), [client])
   const operationAtom = useMemo(
     () => Atom.make<OnboardingModelOperation>(new OnboardingIdle()),
     [],
@@ -161,9 +158,8 @@ export const useOnboardingModelSetup = () => {
         case "Load": {
           const requesting = request.state
           return Effect.gen(function* () {
-            yield* get.setResult(mutations.stop, {
-              payload: { instanceId: requesting.instanceId },
-              reactivityKeys: [ModelSlotsMirror.id],
+            yield* Mutation.execute(slotAtoms.stopMutation, {
+              instanceId: requesting.instanceId,
             }).pipe(
               Effect.mapError((error) => new OnboardingModelCommandFailed({
                 command: "cancel",
@@ -204,7 +200,7 @@ export const useOnboardingModelSetup = () => {
         }
       }
     }),
-    [atoms, modelsAtom, mutations, operationAtom, slotsAtom],
+    [atoms, modelsAtom, operationAtom, slotAtoms, slotsAtom],
   )
 
   const workflowAtom = useMemo(
@@ -242,16 +238,13 @@ export const useOnboardingModelSetup = () => {
               })
             : yield* Effect.die(`Cannot assign from onboarding state ${beforeAssignment._tag}`)
         get.set(operationAtom, assigning)
-        yield* get.setResult(mutations.assign, {
-          payload: {
-            slotId: PRIMARY_SLOT_ID,
-            selection: {
-              providerId: ProviderIdSchema.make("local"),
-              providerModelId,
-              reasoningEffort: command.choice.reasoningEffort,
-            },
+        yield* Mutation.execute(slotAtoms.assignMutation, {
+          slotId: PRIMARY_SLOT_ID,
+          selection: {
+            providerId: ProviderIdSchema.make("local"),
+            providerModelId,
+            reasoningEffort: command.choice.reasoningEffort,
           },
-          reactivityKeys: [ModelSlotsMirror.id],
         }).pipe(
           Effect.mapError((error) => new OnboardingModelCommandFailed({
             command: "assign",
@@ -261,9 +254,8 @@ export const useOnboardingModelSetup = () => {
         const afterAssignment = get(operationAtom)
         if (afterAssignment._tag !== "Assigning") return { _tag: "Superseded" as const }
         if (afterAssignment.cancellationRequested) {
-          yield* get.setResult(mutations.clear, {
-            payload: { slotId: PRIMARY_SLOT_ID },
-            reactivityKeys: [ModelSlotsMirror.id],
+          yield* Mutation.execute(slotAtoms.clearMutation, {
+            slotId: PRIMARY_SLOT_ID,
           }).pipe(
             Effect.mapError((error) => new OnboardingModelCommandFailed({
               command: "clear",
@@ -278,9 +270,8 @@ export const useOnboardingModelSetup = () => {
           cancellationRequested: false,
         })
         get.set(operationAtom, admitting)
-        const load = yield* get.setResult(mutations.load, {
-          payload: { slotId: PRIMARY_SLOT_ID },
-          reactivityKeys: [ModelSlotsMirror.id],
+        const load = yield* Mutation.execute(slotAtoms.loadMutation, {
+          slotId: PRIMARY_SLOT_ID,
         }).pipe(
           Effect.mapError((error) => new OnboardingModelCommandFailed({
             command: "load",
@@ -408,7 +399,7 @@ export const useOnboardingModelSetup = () => {
         })),
       )
     }),
-    [atoms, cancelAtom, modelsAtom, mutations, operationAtom, slotsAtom],
+    [atoms, cancelAtom, modelsAtom, mutations, operationAtom, slotAtoms, slotsAtom],
   )
   const runWorkflow = useAtomSet(workflowAtom)
   const runCancel = useAtomSet(cancelAtom)

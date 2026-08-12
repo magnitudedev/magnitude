@@ -125,6 +125,7 @@ const makeHarness = (options: {
   readonly installed?: boolean
   readonly projectedInstalled?: boolean
   readonly catalogAvailability?: ProviderModelCatalogEntry["availability"]
+  readonly blockStop?: boolean
 } = {}) => Effect.gen(function* () {
   const configuration = yield* SubscriptionRef.make({
     slots: {
@@ -164,6 +165,8 @@ const makeHarness = (options: {
   )
   const loadEntered = yield* Deferred.make<void>()
   const releaseLoad = yield* Deferred.make<void>()
+  const stopEntered = yield* Deferred.make<void>()
+  const releaseStop = yield* Deferred.make<void>()
 
   const client = {
     models: {
@@ -200,9 +203,12 @@ const makeHarness = (options: {
         return { status: 200, headers: {}, events: Stream.empty }
       }),
       stopModelInstance: ({ path }: { readonly path: { readonly instance_id: string } }) =>
-        Ref.update(stopCalls, (ids) => [...ids, path.instance_id]).pipe(
-          Effect.as({}),
-        ),
+        Effect.gen(function* () {
+          yield* Ref.update(stopCalls, (ids) => [...ids, path.instance_id])
+          yield* Deferred.succeed(stopEntered, undefined)
+          if (options.blockStop === true) yield* Deferred.await(releaseStop)
+          return {}
+        }),
     },
   } as unknown as IcnClientService
 
@@ -303,6 +309,8 @@ const makeHarness = (options: {
     catalogSnapshot,
     loadEntered,
     releaseLoad,
+    stopEntered,
+    releaseStop,
   }
 })
 
@@ -536,6 +544,28 @@ describe("ModelSlotController load admission", () => {
         const outcome = yield* Fiber.await(loading)
         expect(outcome._tag).toBe("Failure")
         expect(yield* Ref.get(harness.stopCalls)).toHaveLength(1)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("acknowledges a committed assignment before displaced-instance cleanup finishes", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({ blockStop: true })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        const loading = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* Deferred.await(harness.loadEntered)
+        yield* releaseLoadAsReady(harness)
+        yield* Fiber.join(loading)
+
+        const clearing = yield* controller.updateModelSlot(PRIMARY_SLOT_ID, Option.none()).pipe(Effect.fork)
+        yield* Deferred.await(harness.stopEntered)
+
+        expect(Option.isSome(yield* Fiber.poll(clearing))).toBe(true)
+        expect((yield* controller.snapshot).state.slots.primary._tag).toBe("Unassigned")
+
+        yield* Deferred.succeed(harness.releaseStop, undefined)
+        yield* Fiber.join(clearing)
       }).pipe(Effect.provide(harness.layer))
     })))
   })

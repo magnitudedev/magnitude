@@ -14,7 +14,7 @@ and Effect services remain native to this package.
 
 | TanStack Query concept | `effect-query` equivalent | Effect-native difference |
 | --- | --- | --- |
-| Query options (`queryKey`, `queryFn`) | `Query.make({ key, effect })` | The fetch operation is an `Effect`; its error and service requirements remain typed. |
+| Query options (`queryKey`, `queryFn`) | `Query.make(name, { key, effect })` | The fetch operation is an `Effect`; its error and service requirements remain typed. |
 | `useQuery` | Observe the query atom with the relevant Effect Atom integration | The query itself is a framework-independent atom. |
 | `fetchQuery` | `QueryClient.fetch` | Returns fresh retained data, joins active work, or fetches missing/stale data; preserves the exact error type. |
 | `ensureQueryData` | `QueryClient.ensure` | Returns retained data immediately and revalidates stale data. |
@@ -36,26 +36,24 @@ and Effect services remain native to this package.
 
 ## Queries
 
-Bind definitions to the Atom runtime that provides their Effect services, then define a canonical
-key and fetch Effect:
+Definitions are static domain values. Create them once, independently of any connection or Atom
+runtime. A `Client` materializes those definitions for one application connection and owns the
+shared query cache and mutation history:
 
 ```ts
-import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import { Query, QueryClient } from "@magnitudedev/effect-query"
+import { Client, Query, QueryClient } from "@magnitudedev/effect-query"
 
 class UserNotFound extends Data.TaggedError("UserNotFound")<{
   readonly id: string
 }> {}
 
-const AppQuery = Query.bind(Atom.runtime(Layer.empty))
-
-const userQuery = AppQuery.make("User", {
+const userQuery = Query.make("User", {
   key: ({ id }: { readonly id: string }) => Data.tuple(id),
   effect: ({ id }) => id === "missing"
     ? Effect.fail(new UserNotFound({ id }))
@@ -64,17 +62,13 @@ const userQuery = AppQuery.make("User", {
   gcTime: "5 minutes"
 })
 
+const client = Client.make(Layer.empty)
 const registry = AtomRegistry.make()
-const user = userQuery({ id: "1" })
-
-const program = QueryClient.fetch(user).pipe(
-  Effect.provide(QueryClient.layer),
-  Effect.provideService(AtomRegistry.AtomRegistry, registry)
-)
-
-const value = await Effect.runPromise(program)
+const user = client.query(userQuery, { id: "1" })
+const unmount = registry.mount(user)
 const state = registry.get(user)
 const current = AtomResult.value(state.result)
+unmount()
 ```
 
 Equivalent keys return the same query atom and share cached data and in-flight work. Structured keys
@@ -95,12 +89,12 @@ the atom, because collecting that wrapper would split one query key into multipl
 
 ```ts
 const cacheProgram = Effect.gen(function*() {
-  yield* QueryClient.ensure(user)                  // retained value, revalidate if stale
-  yield* QueryClient.prefetch(user)                // failure stays in query state
+  yield* QueryClient.ensure(userQuery, { id: "1" }) // retained value, revalidate if stale
+  yield* QueryClient.prefetch(userQuery, { id: "1" }) // failure stays in query state
   yield* QueryClient.invalidate(userQuery.match())
   yield* QueryClient.invalidate(userQuery.match({ id: "1" }), { refetch: false })
   yield* QueryClient.cancel({ stale: true })
-  yield* QueryClient.setData(user, (current) => Option.match(current, {
+  yield* QueryClient.setData(userQuery, { id: "1" }, (current) => Option.match(current, {
     onNone: () => ({ id: "1", name: "Grace" }),
     onSome: (value) => ({ ...value, name: "Grace" })
   }))
@@ -113,50 +107,53 @@ instead returns `QueryBatchError`, because matches may have unrelated error type
 
 ## RPC-backed definitions
 
-An Effect Atom RPC tag already owns the typed RPC client Layer and Atom runtime. Use that runtime to
-execute RPC Effects inside query definitions; do not call `Acn.query`, which would introduce a
-second cache:
+RPC is an Effect service required by static definitions. Provide that service once when creating
+the Effect Query client; no query-specific RPC adapter is needed:
 
 ```ts
-import * as AtomRpc from "@effect-atom/atom/AtomRpc"
 import { FetchHttpClient } from "@effect/platform"
-import { RpcClient, RpcSerialization } from "@effect/rpc"
+import { RpcClient, RpcClientError, RpcGroup, RpcSerialization } from "@effect/rpc"
+import { Context, Effect, Layer } from "effect"
+import { Client, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import { MagnitudeRpcs } from "./protocol.js"
 
-class AcnClient {}
+class AcnRpc extends Context.Tag("AcnRpc")<
+  AcnRpc,
+  RpcClient.RpcClient.Flat<RpcGroup.Rpcs<typeof MagnitudeRpcs>, RpcClientError.RpcClientError>
+>() {}
 
-const Acn = AtomRpc.Tag<AcnClient>()("AcnClient", {
-  group: MagnitudeRpcs,
-  protocol: RpcClient.layerProtocolHttp({ url: "http://127.0.0.1:3030/rpc" }).pipe(
+const AcnRpcLive = Layer.scoped(
+  AcnRpc,
+  RpcClient.make(MagnitudeRpcs, { flatten: true })
+).pipe(
+  Layer.provide(RpcClient.layerProtocolHttp({ url: "http://127.0.0.1:3030/rpc" }).pipe(
     Layer.provide(RpcSerialization.layerNdjson),
     Layer.provide(FetchHttpClient.layer)
-  )
-})
+  ))
+)
 
-const AcnQuery = Query.bind(Acn.runtime)
-
-const sessionQuery = AcnQuery.make("Session", {
+const sessionQuery = Query.make("Session", {
   key: ({ sessionId }: { readonly sessionId: string }) => Data.tuple(sessionId),
-  effect: (payload) => Effect.flatMap(Acn, (client) =>
+  effect: (payload) => Effect.flatMap(AcnRpc, (client) =>
     client("GetSession", payload))
 })
+
+const effectQuery = Client.make(AcnRpcLive)
+const sessionAtom = effectQuery.query(sessionQuery, { sessionId: "session-1" })
 ```
 
-Commands use the same client service. Include `QueryClient.layer` in the mutation runtime when the
-synchronization Effect updates cached queries:
+Commands use the same service. `Client.make` supplies `QueryClient` to synchronization Effects:
 
 ```ts
-const AcnMutation = Mutation.bind(Atom.runtime(
-  Layer.merge(Acn.layer, QueryClient.layer)
-))
-
-const deleteSession = AcnMutation.make("DeleteSession", {
+const deleteSession = Mutation.make("DeleteSession", {
   effect: (payload: { readonly sessionId: string }) =>
-    Effect.flatMap(Acn, (client) => client("DeleteSession", payload)),
+    Effect.flatMap(AcnRpc, (client) => client("DeleteSession", payload)),
   synchronize: (_output, payload) =>
     QueryClient.remove(sessionQuery.match(payload)),
   scope: ({ sessionId }) => Mutation.MutationScope(`session:${sessionId}`)
 })
+
+const deleteSessionAtom = effectQuery.mutation(deleteSession)
 ```
 
 Payload, success, domain-error, middleware-error, and RPC transport-error types are inferred from
@@ -181,20 +178,21 @@ const IcnHttp = AtomHttpApi.Tag<IcnHttpClient>()("IcnHttpClient", {
   baseUrl: "http://127.0.0.1:8080"
 })
 
-const IcnQuery = Query.bind(IcnHttp.runtime)
-
-const hardwareQuery = IcnQuery.make("Hardware", {
+const hardwareQuery = Query.make("Hardware", {
   key: () => Data.tuple("hardware"),
   effect: () => Effect.flatMap(IcnHttp, (client) =>
     client.system.getHardware({})),
   staleTime: "10 seconds"
 })
 
-const modelDownloadQuery = IcnQuery.make("ModelDownload", {
+const modelDownloadQuery = Query.make("ModelDownload", {
   key: ({ attemptId }: { readonly attemptId: string }) => Data.tuple(attemptId),
   effect: ({ attemptId }) => Effect.flatMap(IcnHttp, (client) =>
     client.models.getModelDownload({ path: { attempt_id: attemptId } }))
 })
+
+const icnQuery = Client.make(IcnHttp.layer)
+const hardwareAtom = icnQuery.query(hardwareQuery, undefined)
 ```
 
 Endpoint success, declared API errors, HTTP client failures, and Schema parse failures remain in the
@@ -217,7 +215,7 @@ snapshot data:
 import * as Stream from "effect/Stream"
 
 const synchronizeModels = Effect.gen(function*() {
-  const client = yield* Acn
+  const client = yield* AcnRpc
 
   yield* client("WatchModelChanges", {}).pipe(
     Stream.runForEach((change) =>
@@ -233,15 +231,19 @@ Mutation synchronization uses the same cache primitives. Fetch the exact query w
 must remain pending until the authoritative snapshot has been read:
 
 ```ts
-const renameModel = AcnMutation.make("RenameModel", {
+const renameModel = Mutation.make("RenameModel", {
   effect: (payload: {
     readonly modelId: string
     readonly name: string
-  }) => Effect.flatMap(Acn, (client) =>
+  }) => Effect.flatMap(AcnRpc, (client) =>
     client("RenameModel", payload)),
 
-  synchronize: (_receipt, payload) =>
-    QueryClient.fetch(modelQuery({ modelId: payload.modelId })).pipe(Effect.asVoid)
+  synchronize: (_receipt, payload) => QueryClient.invalidate(
+    modelQuery.match({ modelId: payload.modelId })
+  ).pipe(
+    Effect.zipRight(QueryClient.fetch(modelQuery, { modelId: payload.modelId })),
+    Effect.asVoid
+  )
 })
 ```
 
@@ -281,8 +283,8 @@ import {
 import { createRoot } from "react-dom/client"
 
 function Session({ sessionId }: { readonly sessionId: string }) {
-  const state = useAtomValue(sessionQuery({ sessionId }))
-  const remove = useAtomSet(deleteSession, { mode: "promise" })
+  const state = useAtomValue(effectQuery.query(sessionQuery, { sessionId }))
+  const remove = useAtomSet(effectQuery.mutation(deleteSession), { mode: "promise" })
 
   if (Result.isInitial(state.result)) return <p>Loading…</p>
   if (Result.isFailure(state.result)) return <p>Unable to load session.</p>
@@ -302,20 +304,20 @@ createRoot(document.getElementById("root")!).render(
 )
 ```
 
-`RegistryProvider` owns the registry used by observation, remote-client runtimes, and
-`QueryClient.layer`, so reads, commands, and synchronization operate on the same cache.
+`RegistryProvider` owns the registry used by observation, remote-client runtimes, and the
+connection-scoped Effect Query client, so reads, commands, and synchronization operate on the same
+cache.
 
 ## Mutations
 
-Mutation command and synchronization Effects retain separate error and requirement types. Bind a
-runtime containing `QueryClient` when synchronization updates query state:
+Mutation command and synchronization Effects retain separate error and requirement types. The
+connection-scoped client supplies both application services and the query client used during
+synchronization:
 
 ```ts
 import { Mutation } from "@magnitudedev/effect-query"
 
-const AppMutation = Mutation.bind(Atom.runtime(QueryClient.layer))
-
-const renameUser = AppMutation.make("RenameUser", {
+const renameUser = Mutation.make("RenameUser", {
   effect: ({ id, name }: { readonly id: string; readonly name: string }) =>
     Effect.succeed({ id, name }),
   synchronize: (_output, input) =>
@@ -323,7 +325,8 @@ const renameUser = AppMutation.make("RenameUser", {
   scope: ({ id }) => Mutation.MutationScope(`user:${id}`)
 })
 
-const renameProgram = Mutation.execute(renameUser, { id: "1", name: "Grace" }).pipe(
+const renameUserAtom = client.mutation(renameUser)
+const renameProgram = Mutation.execute(renameUserAtom, { id: "1", name: "Grace" }).pipe(
   Effect.provideService(AtomRegistry.AtomRegistry, registry)
 )
 ```
@@ -371,7 +374,7 @@ const pendingNamesAtom = Mutation.state({
 })
 
 function UserName() {
-  const user = useAtomValue(userQuery({ id: "1" }))
+  const user = useAtomValue(client.query(userQuery, { id: "1" }))
   const pendingNames = useAtomValue(pendingNamesAtom)
 
   if (!Result.isSuccess(user.result)) return <p>Loading…</p>

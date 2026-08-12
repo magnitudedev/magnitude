@@ -24,7 +24,10 @@ and its failure.
 An installed standalone row presents physical inventory and inspection status before assessment.
 When its exact configuration fits, the same row becomes selectable; incompatible and over-capacity
 results remain visible with their reason. Selection styling is applied only when the row contains
-the same concrete provider-qualified offering identity as the selected slot.
+the same concrete provider-qualified offering identity as the selected slot. While `AssignSlot` is
+pending, selection styling projects its latest slot-scoped submitted identity over the
+authoritative slot query. Rejection reveals the prior query value; successful query synchronization
+replaces the projection without an intermediate stale selection.
 
 The catalog detail view owns the complete descriptive, recommendation, calibration,
 quantization-fidelity label, license, source repository, and actions for one eligible catalog
@@ -51,7 +54,10 @@ Catalog consume read-only semantic selectors over the canonical Effect Query loc
 headroom changes do not rebuild either list while its displayed headroom category is unchanged;
 category transitions, acquisition progress, assessment, recommendation, membership, and identity
 changes remain observable. Cursor, detail identity, ordering, and scroll position are presentation
-state and survive these source updates.
+state and survive these source updates. A Models menu captures the complete ordering projection on
+entry, including the selected-model exception used for eligibility; assignment, recency, favorite,
+and favorite updates affect rendering but cannot reorder or remove a captured candidate during the
+open interaction. Independent source membership and availability changes remain observable.
 
 ## Responsive information hierarchy
 
@@ -97,6 +103,10 @@ failure may present an unavailable state.
   another catalog row's acquisition state.
 - Installation pending and rejection presentation comes only from configuration-scoped Effect Query
   mutation states; no singleton client installation atom exists.
+- Assignment pending and rejection presentation comes only from slot-scoped Effect Query mutation
+  states; pending input may change selection styling but never the authoritative slot query cache.
+- Selecting a model cannot reorder or remove candidates until the Models menu is closed and opened
+  again.
 - Keyboard cursor movement keeps the focused candidate inside the visible scrollbox viewport.
 - Narrow detail views retain every fact by reflowing content vertically.
 - Table rows do not wrap, overlap, or render beyond their allocated width.

@@ -1,7 +1,8 @@
 import { Atom, Result } from "@effect-atom/atom-react"
-import { Data, Effect, Layer } from "effect"
+import { Data, Effect } from "effect"
 import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import {
+  AcnRpcClientTag,
   LocalModelsMirror,
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
@@ -35,58 +36,65 @@ const localModelDownloadScope = (
   attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
 ): Mutation.MutationScope => Mutation.MutationScope([...attemptIds].sort().join("|"))
 
-const makeDefinitions = (client: AgentClientInstance) => {
-  const runtime = Atom.runtime(Layer.merge(client.layer, QueryClient.layer))
-  const query = Query.bind(runtime)
-  const mutation = Mutation.bind(runtime)
-  const localModelsQuery = query.make("LocalModels", {
-    key: (_: void) => Data.tuple("local-models"),
-    staleTime: Infinity,
-    gcTime: Infinity,
-    effect: () => Effect.flatMap(client, (rpc) =>
-      rpc("GetLocalModels", {}).pipe(Effect.map(({ state }) => state))),
-  })
-  const synchronizeLocalModels = () => QueryClient.invalidate(
-    localModelsQuery.match(),
-    { refetch: false },
-  ).pipe(
-    Effect.zipRight(QueryClient.fetch(localModelsQuery(undefined))),
-    Effect.asVoid,
-  )
+export const localModelsQuery = Query.make("LocalModels", {
+  key: (_: void) => Data.tuple("local-models"),
+  staleTime: Infinity,
+  gcTime: Infinity,
+  effect: () => Effect.flatMap(AcnRpcClientTag, (rpc) =>
+    rpc("GetLocalModels", {}).pipe(Effect.map(({ state }) => state))),
+})
 
-  const installMutation = mutation.make("InstallModel", {
-    scope: ({ configurationId }: LocalModelInstallationInput) =>
-      localModelInstallationScope(configurationId),
-    effect: ({ configurationId }: LocalModelInstallationInput) =>
-      Effect.flatMap(client, (rpc) => rpc("InstallModel", { configurationId })),
-    synchronize: () => synchronizeLocalModels().pipe(
-      Effect.zipRight(Reactivity.invalidate([ProviderModelCatalogMirror.id])),
-    ),
-  })
-  const cancelDownloadMutation = mutation.make("CancelModelDownload", {
-    scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
-    effect: ({ attemptIds }: LocalModelDownloadInput) =>
-      Effect.flatMap(client, (rpc) => rpc("CancelModelDownload", { attemptIds })),
-    synchronize: synchronizeLocalModels,
-  })
-  const dismissDownloadFailureMutation = mutation.make("DismissModelDownloadFailure", {
-    scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
-    effect: ({ attemptIds }: LocalModelDownloadInput) =>
-      Effect.flatMap(client, (rpc) => rpc("DismissModelDownloadFailure", { attemptIds })),
-    synchronize: synchronizeLocalModels,
-  })
-  const deleteLocalModelMutation = mutation.make("DeleteLocalModel", {
-    scope: ({ configurationId }: LocalModelDeletionInput) =>
-      localModelInstallationScope(configurationId),
-    effect: ({ configurationId }: LocalModelDeletionInput) =>
-      Effect.flatMap(client, (rpc) => rpc("DeleteLocalModel", { configurationId })),
-    synchronize: () => synchronizeLocalModels().pipe(
-      Effect.zipRight(Reactivity.invalidate([
-        ProviderModelCatalogMirror.id,
-        ModelSlotsMirror.id,
-      ])),
-    ),
-  })
+const synchronizeLocalModels = () => QueryClient.invalidate(
+  localModelsQuery.match(),
+).pipe(
+  Effect.zipRight(QueryClient.fetch(localModelsQuery, undefined)),
+  Effect.asVoid,
+)
+
+export const installLocalModelMutation = Mutation.make("InstallModel", {
+  scope: ({ configurationId }: LocalModelInstallationInput) =>
+    localModelInstallationScope(configurationId),
+  effect: ({ configurationId }: LocalModelInstallationInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("InstallModel", { configurationId })),
+  synchronize: () => synchronizeLocalModels().pipe(
+    Effect.zipRight(Reactivity.invalidate([ProviderModelCatalogMirror.id])),
+  ),
+})
+
+export const cancelModelDownloadMutation = Mutation.make("CancelModelDownload", {
+  scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
+  effect: ({ attemptIds }: LocalModelDownloadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { attemptIds })),
+  synchronize: synchronizeLocalModels,
+})
+
+export const dismissModelDownloadFailureMutation = Mutation.make("DismissModelDownloadFailure", {
+  scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
+  effect: ({ attemptIds }: LocalModelDownloadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { attemptIds })),
+  synchronize: synchronizeLocalModels,
+})
+
+export const deleteLocalModelMutation = Mutation.make("DeleteLocalModel", {
+  scope: ({ configurationId }: LocalModelDeletionInput) =>
+    localModelInstallationScope(configurationId),
+  effect: ({ configurationId }: LocalModelDeletionInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DeleteLocalModel", { configurationId })),
+  synchronize: () => synchronizeLocalModels().pipe(
+    Effect.zipRight(Reactivity.invalidate([
+      ProviderModelCatalogMirror.id,
+      ModelSlotsMirror.id,
+    ])),
+  ),
+})
+
+const makeAtoms = (client: AgentClientInstance) => {
+  const effectQuery = client.effectQuery
+  const localModelsQueryAtom = effectQuery.query(localModelsQuery, undefined)
+  const installMutation = effectQuery.mutation(installLocalModelMutation)
+  const cancelDownloadMutation = effectQuery.mutation(cancelModelDownloadMutation)
+  const dismissDownloadFailureMutation = effectQuery.mutation(dismissModelDownloadFailureMutation)
+  const deleteLocalModelMutationAtom = effectQuery.mutation(deleteLocalModelMutation)
 
   const invalidationBridgeEffect = Effect.gen(function* () {
     const queryClient = yield* QueryClient.QueryClient
@@ -98,31 +106,27 @@ const makeDefinitions = (client: AgentClientInstance) => {
       )),
       (unsubscribe) => Effect.sync(unsubscribe),
     )
-    yield* queryClient.prefetch(localModelsQuery(undefined))
+    yield* queryClient.prefetch(localModelsQueryAtom)
     return yield* Effect.never
-  })
-  const invalidationBridgeAtom = runtime.atom(invalidationBridgeEffect)
-  const mirrorInvalidationWatchAtom = getMirroredStateInvalidationWatch(client, LocalModelsMirror.id)
-  const localModelsResultAtom = Atom.make((get) => get(localModelsQuery(undefined)).result)
-  const installationMutationStatesAtom = Mutation.state({
-    filters: { mutation: installMutation },
   })
 
   return {
-    localModelsQuery,
-    localModelsResultAtom,
+    localModelsQueryAtom,
+    localModelsResultAtom: Atom.make((get) => get(localModelsQueryAtom).result),
     installMutation,
-    installationMutationStatesAtom,
+    installationMutationStatesAtom: Mutation.state({
+      filters: { mutation: installLocalModelMutation },
+    }),
     cancelDownloadMutation,
     dismissDownloadFailureMutation,
-    deleteLocalModelMutation,
-    invalidationBridgeAtom,
-    mirrorInvalidationWatchAtom,
+    deleteLocalModelMutation: deleteLocalModelMutationAtom,
+    invalidationBridgeAtom: effectQuery.runtime.atom(invalidationBridgeEffect),
+    mirrorInvalidationWatchAtom: getMirroredStateInvalidationWatch(client, LocalModelsMirror.id),
   }
 }
 
-export type LocalModelAtoms = ReturnType<typeof makeDefinitions>
-export type LocalModelInstallationMutationState = Mutation.State<LocalModelAtoms["installMutation"]>
+export type LocalModelAtoms = ReturnType<typeof makeAtoms>
+export type LocalModelInstallationMutationState = Mutation.State<typeof installLocalModelMutation>
 
 export const localModelInstallationIsPending = (
   mutationStates: ReadonlyArray<LocalModelInstallationMutationState>,
@@ -138,12 +142,10 @@ export const latestLocalModelInstallationMutationState = (
 
 const atomsByClient = new WeakMap<object, LocalModelAtoms>()
 
-export const localModelAtoms = (
-  client: AgentClientInstance,
-): LocalModelAtoms => {
+export const localModelAtoms = (client: AgentClientInstance): LocalModelAtoms => {
   const existing = atomsByClient.get(client)
   if (existing !== undefined) return existing
-  const atoms = makeDefinitions(client)
+  const atoms = makeAtoms(client)
   atomsByClient.set(client, atoms)
   return atoms
 }

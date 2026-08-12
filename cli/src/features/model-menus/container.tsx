@@ -21,7 +21,6 @@ import {
   localModelCapabilities,
   localModelInstallationIsPending,
   latestLocalModelInstallationMutationState,
-  selectedSlotModel,
   truncateToDisplayWidth,
   type NotificationState,
   usePlatform,
@@ -40,6 +39,7 @@ import {
   ReasoningEffortSchema,
   type LocalModel,
   type LocalModelRecommendation,
+  type ModelSlotsState,
   type ProviderCatalogEntry,
   type ProviderModelDisabledReason,
   type ProviderModelId,
@@ -102,6 +102,12 @@ interface ModelsMenuProps {
   readonly openRoot: (root: ModelMenuRoot) => void
   readonly openCatalogDetail: (providerModelId: string) => void
   readonly setRootSwitchingEnabled: (enabled: boolean) => void
+}
+
+interface ModelsMenuOrdering {
+  readonly selectedModel: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>
+  readonly recentModelKeys: readonly string[]
+  readonly favoriteKeys: ReadonlySet<string>
 }
 
 interface CatalogMenuProps {
@@ -312,6 +318,37 @@ export const modelsMenuEntryIsSelected = (
           && selected.providerId === LOCAL_PROVIDER_ID,
       ),
 )
+
+export const modelsMenuEntryIsEligible = (
+  entry: ModelsMenuEntry,
+  selectedAtOpen: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): boolean => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (entry._tag !== "Provider") return true
+  return providerModel !== undefined
+    && providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
+    && (providerModel.availability._tag === "Available"
+      || modelsMenuEntryIsSelected(entry, selectedAtOpen))
+}
+
+export const modelsMenuOrderingAtOpen = (
+  catalogReady: boolean,
+  slotsReady: boolean,
+  slots: Option.Option<ModelSlotsState>,
+  selected: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): Option.Option<ModelsMenuOrdering> => !catalogReady || !slotsReady
+  ? Option.none()
+  : Option.some({
+      selectedModel: selected,
+      recentModelKeys: Option.match(slots, {
+        onNone: () => [],
+        onSome: ({ recentModels }) => recentModels.primary.map(providerModelKey),
+      }),
+      favoriteKeys: new Set(Option.match(slots, {
+        onNone: () => [],
+        onSome: ({ favoriteModels }) => favoriteModels.map(providerModelKey),
+      })),
+    })
 
 export const buildModelsMenuEntries = (
   localModels: readonly LocalModel[],
@@ -628,13 +665,44 @@ const MenuAction = memo(function MenuAction({
   )
 })
 
-const ModelsMenu = memo(function ModelsMenu({
+const ModelsMenu = memo(function ModelsMenu(props: ModelsMenuProps) {
+  const theme = useTheme()
+  const config = useModelConfig()
+  const catalogReady = Result.match(config.catalog, {
+    onInitial: () => false,
+    onFailure: () => true,
+    onSuccess: ({ value: { state } }) => ProviderModelCatalogLifecycle.match(state, {
+      Loading: () => false,
+      Ready: () => true,
+      Refreshing: () => true,
+      Degraded: () => true,
+      Unavailable: () => true,
+    }),
+  })
+  const slotsReady = !Result.isInitial(config.slots)
+  const slots = Option.map(Result.value(config.slots), ({ state }) => state)
+  const selected = Option.flatMap(config.selections, ({ primary }) => primary)
+  const ordering = modelsMenuOrderingAtOpen(catalogReady, slotsReady, slots, selected)
+
+  return Option.match(ordering, {
+    onNone: () => <text style={{ fg: theme.muted }}>Loading models…</text>,
+    onSome: (initialOrdering) => (
+      <ReadyModelsMenu {...props} config={config} initialOrdering={initialOrdering} />
+    ),
+  })
+})
+
+const ReadyModelsMenu = memo(function ReadyModelsMenu({
   openRoot,
   openCatalogDetail,
   setRootSwitchingEnabled,
-}: ModelsMenuProps) {
+  config,
+  initialOrdering,
+}: ModelsMenuProps & {
+  readonly config: ReturnType<typeof useModelConfig>
+  readonly initialOrdering: ModelsMenuOrdering
+}) {
   const theme = useTheme()
-  const config = useModelConfig()
   const localSnapshot = useLocalModelsSelector(
     selectModelMenusLocalModelsState,
     modelMenusLocalModelsStateEquivalent,
@@ -642,23 +710,10 @@ const ModelsMenu = memo(function ModelsMenu({
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
   const catalog = catalogContents(config)
-  const catalogSnapshot = Result.value(config.catalog)
   const slotsSnapshot = Result.value(config.slots)
-  const selected = Option.flatMap(
-    Option.all({ catalog: catalogSnapshot, slots: slotsSnapshot }),
-    ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
-  )
-  const selectedModel = Option.map(selected, ({ model }) => model)
-  const currentRecentModelKeys = Option.match(slotsSnapshot, {
-    onNone: () => [] as readonly string[],
-    onSome: ({ state }) => state.recentModels.primary.map(providerModelKey),
-  })
+  const selectedModel = Option.flatMap(config.selections, ({ primary }) => primary)
   const currentFavoriteKeys = new Set(config.favoriteModels.map(providerModelKey))
-  const [ordering] = useState(() => ({
-    selectedModel,
-    recentModelKeys: currentRecentModelKeys,
-    favoriteKeys: currentFavoriteKeys,
-  }))
+  const [ordering] = useState(initialOrdering)
   const projectedLocalModels = Option.match(localSnapshot, {
     onNone: () => [] as readonly LocalModel[],
     onSome: ({ models }) => models,
@@ -673,13 +728,7 @@ const ModelsMenu = memo(function ModelsMenu({
   const isFavorite = (entry: ModelsMenuEntry): boolean =>
     Option.exists(modelsMenuOfferingKey(entry), (key) => currentFavoriteKeys.has(key))
   const isEligible = (entry: ModelsMenuEntry): boolean => {
-    const providerModel = modelsMenuProviderModel(entry)
-    if (entry._tag === "Provider") {
-      return providerModel !== undefined
-        && providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
-        && (providerModel.availability._tag === "Available" || isSelected(entry))
-    }
-    return true
+    return modelsMenuEntryIsEligible(entry, ordering.selectedModel)
   }
   const eligible = entries
     .filter(isEligible)

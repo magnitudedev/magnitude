@@ -11,6 +11,7 @@ import {
   type AnyMutationState,
   type MutationState,
   type MutationStateId,
+  type MutationScope,
   type MutationFilter,
   type QueryClientEvent,
   type QueryDefinition,
@@ -83,6 +84,7 @@ export interface ClientCore {
   readonly definitions: Map<string, QueryDefinition>
   readonly removed: Set<ErasedQueryEntry>
   readonly mutationStates: Array<AnyMutationState>
+  readonly mutationScopes: Map<MutationScope, Effect.Semaphore>
   readonly revision: Atom.Writable<number>
   readonly events: Stream.Stream<QueryClientEvent>
   readonly emit: (event: QueryClientEvent) => void
@@ -103,6 +105,7 @@ export const getClientCore = (registry: AtomRegistry.Registry): ClientCore => {
     definitions: new Map(),
     removed: new Set(),
     mutationStates: [],
+    mutationScopes: new Map(),
     revision,
     events: Stream.fromPubSub(pubsub),
     emit: (event) => {

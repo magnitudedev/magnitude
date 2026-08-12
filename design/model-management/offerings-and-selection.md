@@ -102,6 +102,12 @@ unavailability without discarding user intent. Authoritative deletion of an auth
 model is not temporary unavailability: it clears slots selecting that deleted identity without
 substituting another model.
 
+Assignment acknowledges after the durable selection and published configuration commit. When that
+commit displaces the final slot using a resident local instance, the model-slot owner starts exact
+instance replacement cleanup in its own service scope. That cleanup does not delay assignment
+acknowledgement and cannot change the committed selection; its lifecycle remains observable through
+the slot and instance authorities.
+
 ## Composite client workflows
 
 Onboarding may compose configuration installation, assignment, loading, completion, and

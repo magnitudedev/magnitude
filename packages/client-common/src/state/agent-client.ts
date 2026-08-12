@@ -1,39 +1,28 @@
-/**
- * AgentClient — AtomRpc tag for the MagnitudeRpcs group.
- * Spec §6.2.
- *
- * Uses the SDK's recovering protocol layer with a host-provided
- * daemon discovery and launch. The client runtime owns endpoint selection and recovery;
- * platform process access only queries or starts an ACN.
- */
-import { AtomRpc, Atom } from "@effect-atom/atom-react"
+/** Shared ACN transport with AtomRpc and Effect Query materializations. */
+import { Atom, AtomRpc } from "@effect-atom/atom-react"
 import { RpcClient } from "@effect/rpc"
-import type { Layer } from "effect"
-import { MagnitudeRpcs } from "@magnitudedev/sdk"
-
-/**
- * Placeholder class used as the type identifier for the AgentClient tag.
- */
-export class AgentClient {}
+import { Layer } from "effect"
+import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
+import { AcnRpcClientTag, MagnitudeRpcs } from "@magnitudedev/sdk"
 
 export type AgentClientInstance = ReturnType<typeof createAgentClient>
+export type AgentClient = AgentClientInstance
+
+class AcnAtomRpcClient {}
 
 /**
- * Create an AgentClient AtomRpc tag backed by a shared protocol layer.
- *
- * The protocol layer must be created once at startup (by the Platform) and
- * passed here. This ensures all RPC consumers — AtomRpc mutations, the
- * display controller, file-watch, session-statuses — share one client
- * lifecycle and recovery authority. Each typed RPC client still builds its
- * own single-consumer protocol receiver.
+ * Create one flat RPC service. AtomRpc and Effect Query share that service;
+ * each domain chooses one state system and never mixes both for the same data.
  */
 export function createAgentClient(
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
 ) {
-  const client = AtomRpc.Tag<AgentClient>()("AgentClient", {
+  const client = AtomRpc.Tag<AcnAtomRpcClient>()("AcnRpc", {
     group: MagnitudeRpcs,
     protocol: protocolLayer,
   })
   Atom.runtime.addGlobalLayer(client.layer)
-  return client
+  const rpcLayer = Layer.effect(AcnRpcClientTag, client).pipe(Layer.provide(client.layer))
+  const effectQuery = EffectQueryClient.make(rpcLayer)
+  return Object.assign(client, { effectQuery })
 }
