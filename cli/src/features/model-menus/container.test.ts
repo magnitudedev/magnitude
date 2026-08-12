@@ -141,6 +141,7 @@ describe("unified models menu projection", () => {
       providerModelId: ProviderModelIdSchema.make("unavailable"),
       modelFamilyId: Option.none(),
       displayName: "Unavailable",
+      variantLabel: Option.none(),
       supportedSlots: [PRIMARY_SLOT_ID],
       contextWindow: 1,
       maxOutputTokens: 1,

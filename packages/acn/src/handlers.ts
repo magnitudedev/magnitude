@@ -412,10 +412,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           deleteLocalModel(configurationId),
         ),
 
-      LoadModel: ({ slotId }) =>
+      LoadModel: ({ slotId, selection }) =>
         observeRpcDefects(
           "LoadModel",
-          modelSlots.admitModelLoad(slotId),
+          modelSlots.admitModelLoad(slotId, selection),
         ),
 
       PreviewModelLoad: ({ slotId }) =>

@@ -422,6 +422,27 @@ describe("ModelSlotController load admission", () => {
     })))
   })
 
+  it("rejects load admission when the slot no longer has the expected selection", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness()
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        const replacedSelection = {
+          ...selection,
+          reasoningEffort: ReasoningEffortSchema.make("high"),
+        }
+
+        const error = yield* Effect.flip(controller.admitModelLoad(
+          PRIMARY_SLOT_ID,
+          replacedSelection,
+        ))
+
+        expect(error._tag).toBe("ModelSlotMutationRejected")
+        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("acknowledges the exact published instance before it becomes Ready", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness()

@@ -73,7 +73,7 @@ const latestAttempt = (
   return Option.none()
 }
 
-type PackageAcquisition =
+export type PackageAcquisition =
   | { readonly _tag: "NotInstalled" }
   | { readonly _tag: "Downloading"; readonly attempt: Extract<DownloadAttempt, {
       readonly _tag: "Pending" | "Downloading"
@@ -82,6 +82,8 @@ type PackageAcquisition =
       readonly totalBytes: number; readonly failure: LocalModelMutationFailed
       readonly acknowledged: boolean }
   | { readonly _tag: "Cancelled"; readonly attemptId: DownloadAttemptId }
+  | { readonly _tag: "Publishing"; readonly attemptId: DownloadAttemptId
+      readonly totalBytes: number }
   | { readonly _tag: "Installed"; readonly path: string; readonly origin: ModelPackageInstallationOrigin }
 
 export const projectPackageAcquisition = (
@@ -103,6 +105,15 @@ export const projectPackageAcquisition = (
           : Option.none(),
       }
     }
+    case "Publishing":
+      return {
+        _tag: "Downloading",
+        attemptId: acquisition.attemptId,
+        stage: "publishing",
+        completedBytes: acquisition.totalBytes,
+        totalBytes: acquisition.totalBytes,
+        bytesPerSecond: Option.none(),
+      }
     case "Failed":
       return acquisition.acknowledged
         ? { _tag: "NotInstalled" }
@@ -127,7 +138,7 @@ export const projectPackageAcquisition = (
   }
 }
 
-const packageAcquisition = (
+export const packageAcquisition = (
   modelPackage: ModelPackage,
   installedPackages: ReadonlyMap<ModelPackageId, {
     readonly path: string
@@ -156,7 +167,11 @@ const packageAcquisition = (
       acknowledged: attempt.acknowledged,
     }
   }
-  return { _tag: "NotInstalled" }
+  return {
+    _tag: "Publishing",
+    attemptId: attempt.id,
+    totalBytes: modelPackage.files.reduce((total, file) => total + file.sizeBytes, 0),
+  }
 }
 
 export interface LocalModelPackagesApi {

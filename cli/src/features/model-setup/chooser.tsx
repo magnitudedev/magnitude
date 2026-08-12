@@ -7,26 +7,22 @@ import {
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
   localModelConfigurationId,
+  type LocalModelOption,
   type LocalInferenceHardwareResult,
-  type OnboardingConfigurationChoice,
-  type OnboardingLoadModelChoice,
 } from "@magnitudedev/client-common"
 import type {
   LocalModel,
   LocalModelMemory,
   LocalModelRecommendationProgressStep,
-  LocalModelsState,
-  ModelSlotsState,
   ModelInstanceFailure,
+  ModelServingConfigurationId,
   ProviderModelId,
 } from "@magnitudedev/sdk"
-import { ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { spinnerFrameAt, useSpinnerFrame } from "../../hooks/use-spinner-frame"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
-  buildLocalInferenceSelections,
   describeLocalHardwareSummary,
   formatBytes,
   localInferenceProgressLines,
@@ -35,7 +31,6 @@ import {
   selectionConfigurationId,
   selectionMetadata,
   selectionProviderModelId,
-  selectionReasoningEffort,
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
 import { slate } from "../../utils/theme"
@@ -326,12 +321,6 @@ export type OnboardingModelChooserOperation =
       readonly onRetry: () => void
     }
   | {
-      readonly _tag: "DownloadFailed"
-      readonly model: LocalModel
-      readonly onChooseAnother: () => void
-      readonly onRetry: () => void
-    }
-  | {
       readonly _tag: "Configuring"
       readonly model: LocalModel
     }
@@ -347,41 +336,34 @@ export type OnboardingModelChooserOperation =
 
 export function OnboardingModelChooser({
   hardware,
-  models,
-  slots,
+  options,
   width,
   error,
   operation,
-  onLoad,
-  onSelectConfiguration,
-  onContinue,
+  onSelect,
   onSkip,
 }: {
   readonly hardware: LocalInferenceHardwareResult
-  readonly models: LocalModelsState
-  readonly slots: ModelSlotsState
+  readonly options: readonly LocalModelOption[]
   readonly width: number
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
-  readonly onLoad: (choice: OnboardingLoadModelChoice) => void
-  readonly onSelectConfiguration: (choice: OnboardingConfigurationChoice) => void
-  readonly onContinue: () => void
+  readonly onSelect: (configurationId: ModelServingConfigurationId) => void
   readonly onSkip: () => void
 }): ReactNode {
   const theme = useTheme()
   const selections = useMemo(() =>
-    buildLocalInferenceSelections(models, slots).filter((selection) =>
+    options.filter((selection) =>
       selection.kind !== "recommendation"
         || Option.isSome(selection.recommendation)),
-  [models, slots])
+  [options])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const localScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const downloadScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const activeSelectionId = operation === null
     ? Option.none<string>()
     : Option.fromNullable(selections.find((selection) =>
-      operation._tag === "Downloading" || operation._tag === "DownloadFailed"
-        || operation._tag === "Configuring"
+      operation._tag === "Downloading" || operation._tag === "Configuring"
       ? Option.exists(localModelConfigurationId(operation.model), (configurationId) =>
           Option.contains(selectionConfigurationId(selection), configurationId))
       : Option.contains(selectionProviderModelId(selection), operation.providerModelId))?.id)
@@ -417,50 +399,9 @@ export function OnboardingModelChooser({
   )
   const detailContentHeight = Math.max(1, contentHeight - (wide ? 0 : 1))
   const choose = useCallback((selection: LocalInferenceSelection) => {
-    if (selection.kind === "running") {
-      onContinue()
-      return
-    }
-    const providerModelId = selectionProviderModelId(selection)
     const configurationId = selectionConfigurationId(selection)
-    const reasoningEffort = selectionReasoningEffort(selection)
-    if (selection.kind === "stored" && Option.isSome(providerModelId)) {
-      onLoad({
-        providerModelId: providerModelId.value,
-        displayName: formatLocalModelDisplayName(selection.model),
-        reasoningEffort: Option.getOrElse(
-          reasoningEffort,
-          () => ReasoningEffortSchema.make("none"),
-        ),
-      })
-      return
-    }
-    if (selection.kind === "stored" && Option.isSome(configurationId)) {
-      onSelectConfiguration({
-        configurationId: configurationId.value,
-        displayName: formatLocalModelDisplayName(selection.model),
-        reasoningEffort: Option.getOrElse(
-          reasoningEffort,
-          () => ReasoningEffortSchema.make("none"),
-        ),
-      })
-      return
-    }
-    if (
-      selection.kind === "recommendation"
-      && Option.isSome(selection.recommendation)
-    ) {
-      if (Option.isNone(configurationId)) return
-      onSelectConfiguration({
-        configurationId: configurationId.value,
-        displayName: formatLocalModelDisplayName(selection.model),
-        reasoningEffort: Option.getOrElse(
-          reasoningEffort,
-          () => ReasoningEffortSchema.make("none"),
-        ),
-      })
-    }
-  }, [onContinue, onLoad, onSelectConfiguration])
+    if (Option.isSome(configurationId)) onSelect(configurationId.value)
+  }, [onSelect])
 
   const moveSelectionTo = useCallback((index: number) => {
     const selection = selections[index]
@@ -620,17 +561,6 @@ export function OnboardingModelChooser({
         onRetry: operation.onRetry,
       }}
     />
-  ) : operation?._tag === "DownloadFailed" ? (
-    <OnboardingModelDownloadDetails
-      model={operation.model}
-      width={detailWidth}
-      height={detailContentHeight}
-      operation={{
-        _tag: "Failed",
-        onChooseAnother: operation.onChooseAnother,
-        onRetry: operation.onRetry,
-      }}
-    />
   ) : operation?._tag === "Activating" ? (
     <OnboardingModelLoadingDetails
       displayName={operation.displayName}
@@ -663,8 +593,6 @@ export function OnboardingModelChooser({
   )
   const interactionHint = operation?._tag === "Downloading"
       ? "Download in progress · Esc cancel"
-      : operation?._tag === "DownloadFailed"
-        ? "Download failed · Retry or choose another model"
       : operation?._tag === "Configuring"
         ? "Configuring model…"
       : operation?._tag === "Activating"

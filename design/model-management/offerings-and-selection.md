@@ -10,7 +10,12 @@ applies_to:
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
+  - packages/client-common/src/local-models/**
+  - packages/client-common/src/model-slots/**
+  - packages/client-common/src/onboarding/**
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts
+  - packages/client-common/src/hooks/use-local-inference-state.ts
+  - cli/src/features/model-setup/**
   - cli/src/features/model-menus/**
 ---
 
@@ -68,7 +73,7 @@ selection pipeline is:
 InstallModel(configurationId)                         -> AlreadyInstalled(providerModelId)
                                                      | DownloadAdmitted(providerModelId, exact attempt IDs)
   -> AssignSlot(slotId, providerModelId)
-  -> LoadModel(slotId)                               [if residency is requested]
+  -> LoadModel(slotId, exact selection)              [if residency is requested]
 ```
 
 Installation resolves a retained configuration first or a catalog configuration for first adoption,
@@ -76,7 +81,9 @@ durably retains it, and privately admits acquisition for its exact bundle. Retai
 configuration for the same bundle replaces the prior retained configuration; it does not create a
 second choice for the same installed model. Assignment stores the
 resulting provider identity as durable slot intent. Loading acts only on that slot and resolves the
-same retained configuration. `AssignSlot` also carries reasoning effort; the shorthand highlights
+same retained configuration. Load admission atomically verifies that the slot still contains the
+requested selection, so concurrent reassignment is rejected instead of loading its replacement.
+`AssignSlot` also carries reasoning effort; the shorthand highlights
 the identities that determine each stage.
 
 After installation, provider and slot operations use `(ProviderId, ProviderModelId)` and do not use
@@ -114,19 +121,36 @@ the slot and instance authorities.
 
 ## Composite client workflows
 
-Onboarding may compose configuration installation, assignment, loading, completion, and
-explicit cancellation as one client-owned workflow. Its transient state retains the submitted
-choice through each finite mutation and contains only the exact command identities required to
-bridge admitted work. It does not duplicate download, slot, or instance lifecycle.
-That canonical operation state is exposed directly to onboarding presentation. Clients do not
-decompose it into parallel phase fields or reconstruct it from mutation waiting and later resource
-snapshots. A requested installation can therefore render immediately while acquisition progress
-remains sourced from the exact local-model row.
+Onboarding model setup is owned by one client-side service in client-common. The service owns
+only its in-memory causal state: the explicit configuration choice and exact admission, provider,
+selection, and instance identities returned by its composed operations. It exposes one passive
+derived state atom and explicit start, cancel, and skip command atoms. Those commands execute in the
+connection's existing Effect runtime and compose the lower domains' Effect Query mutations.
 
-Interruption or restart never reconstructs onboarding intent from server observations. Confirmed
-cancellation invokes ordinary download-cancellation or slot-clear mutations. Successful load closes
-setup; an externally stopped load is terminal presentation rather than an invitation to replay the
-workflow.
+The start command follows exactly one of these paths:
+
+```text
+exact chosen instance already ready -> complete onboarding
+installed choice -> assign -> load -> await exact instance ready -> complete
+uninstalled choice -> install -> await exact installation -> assign -> load
+                   -> await exact instance ready -> complete
+```
+
+Mutation synchronization validates that each exact admission, selection, or instance is visible in
+the affected canonical query before dependent work begins. Background completion is observed by
+the same attempt or instance identity through `LocalModels` or `ModelSlots`. The service state joins
+those identities with canonical model and slot snapshots, so progress and lifecycle remain
+backend-owned and are never copied into service state.
+
+Opening or remounting onboarding only reads the service state. It cannot select or load a model.
+Only an explicit configuration-ID submission starts setup; current slot state and mutation history
+are never choice inputs. Component unmount does not interrupt active work. Process restart returns
+to passive choosing and does not reconstruct intent from surviving backend facts.
+
+Cancellation signals the one active continuation. After an admission it invokes the ordinary
+exact-attempt download cancel or exact-instance stop mutation and waits for that mutation's exact
+query synchronization. It never searches mutation history, targets a current-but-unowned slot
+instance, or clears durable slot selection.
 
 ## Favorites
 
@@ -149,4 +173,6 @@ preference and recency changes affect the next menu entry.
 - Assignment commits durable selection and published configuration atomically.
 - Selection matching always uses one concrete provider-qualified offering identity.
 - Selection, acquisition, assignment, and loading remain distinct mutations even when composed by a client.
+- Composite client interactions carry dependencies through function outputs; service state retains
+  only causal identity and never a parallel model lifecycle.
 - Generic provider code remains independent of local-model management concepts.

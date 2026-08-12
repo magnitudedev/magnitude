@@ -1,5 +1,5 @@
 import { Atom, Result } from "@effect-atom/atom-react"
-import { Data, Effect } from "effect"
+import { Data, Effect, Option } from "effect"
 import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
@@ -7,6 +7,8 @@ import {
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
   type DownloadAttemptId,
+  type LocalModelInstallationAdmission,
+  type LocalModelsState,
   type ModelServingConfigurationId,
 } from "@magnitudedev/sdk"
 import * as Reactivity from "@effect/experimental/Reactivity"
@@ -15,6 +17,11 @@ import {
   getMirroredStateInvalidationWatch,
   subscribeToMirroredStateInvalidation,
 } from "../hooks/use-mirrored-state"
+import { findLocalModelByConfigurationId, localModelProviderModelId } from "./projection"
+
+export class LocalModelSynchronizationFailed extends Data.TaggedError(
+  "LocalModelSynchronizationFailed",
+)<{ readonly operation: "install" | "cancel"; readonly message: string }> {}
 
 export interface LocalModelInstallationInput {
   readonly configurationId: ModelServingConfigurationId
@@ -48,7 +55,28 @@ const synchronizeLocalModels = () => QueryClient.invalidate(
   localModelsQuery.match(),
 ).pipe(
   Effect.zipRight(QueryClient.fetch(localModelsQuery, undefined)),
-  Effect.asVoid,
+)
+
+export const sameDownloadAttemptIds = (
+  left: readonly DownloadAttemptId[],
+  right: readonly DownloadAttemptId[],
+): boolean => left.length === right.length
+  && left.every((attemptId) => right.includes(attemptId))
+
+export const installationAdmissionIsVisible = (
+  state: LocalModelsState,
+  configurationId: ModelServingConfigurationId,
+  admission: LocalModelInstallationAdmission,
+): boolean => Option.exists(
+  findLocalModelByConfigurationId(state.models, configurationId),
+  (model) => {
+    if (!Option.contains(localModelProviderModelId(model), admission.providerModelId)) return false
+    if (model.acquisitionState._tag === "Installed") return true
+    if (admission._tag === "AlreadyInstalled") return false
+    const acquisition = model.acquisitionState
+    return acquisition._tag !== "NotInstalled"
+      && sameDownloadAttemptIds(acquisition.attemptIds, admission.attemptIds)
+  },
 )
 
 export const installLocalModelMutation = Mutation.make("InstallModel", {
@@ -56,7 +84,15 @@ export const installLocalModelMutation = Mutation.make("InstallModel", {
     localModelInstallationScope(configurationId),
   effect: ({ configurationId }: LocalModelInstallationInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("InstallModel", { configurationId })),
-  synchronize: () => synchronizeLocalModels().pipe(
+  synchronize: (admission, { configurationId }) => synchronizeLocalModels().pipe(
+    Effect.filterOrFail(
+      (state) => installationAdmissionIsVisible(state, configurationId, admission),
+      () => new LocalModelSynchronizationFailed({
+        operation: "install",
+        message: "The admitted local-model installation was absent from LocalModels.",
+      }),
+    ),
+    Effect.asVoid,
     Effect.zipRight(Reactivity.invalidate([ProviderModelCatalogMirror.id])),
   ),
 })
@@ -65,14 +101,30 @@ export const cancelModelDownloadMutation = Mutation.make("CancelModelDownload", 
   scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
   effect: ({ attemptIds }: LocalModelDownloadInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { attemptIds })),
-  synchronize: synchronizeLocalModels,
+  synchronize: (_, { attemptIds }) => synchronizeLocalModels().pipe(
+    Effect.filterOrFail(
+      (state) => state.models.every((model) => {
+        const acquisition = model.acquisitionState
+        return acquisition._tag === "NotInstalled"
+          || acquisition._tag === "Installed"
+          || !sameDownloadAttemptIds(acquisition.attemptIds, attemptIds)
+          || acquisition._tag === "Cancelled"
+          || acquisition._tag === "Failed"
+      }),
+      () => new LocalModelSynchronizationFailed({
+        operation: "cancel",
+        message: "The cancelled download attempts remained active in LocalModels.",
+      }),
+    ),
+    Effect.asVoid,
+  ),
 })
 
 export const dismissModelDownloadFailureMutation = Mutation.make("DismissModelDownloadFailure", {
   scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
   effect: ({ attemptIds }: LocalModelDownloadInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { attemptIds })),
-  synchronize: synchronizeLocalModels,
+  synchronize: () => synchronizeLocalModels().pipe(Effect.asVoid),
 })
 
 export const deleteLocalModelMutation = Mutation.make("DeleteLocalModel", {
@@ -81,6 +133,7 @@ export const deleteLocalModelMutation = Mutation.make("DeleteLocalModel", {
   effect: ({ configurationId }: LocalModelDeletionInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DeleteLocalModel", { configurationId })),
   synchronize: () => synchronizeLocalModels().pipe(
+    Effect.asVoid,
     Effect.zipRight(Reactivity.invalidate([
       ProviderModelCatalogMirror.id,
       ModelSlotsMirror.id,

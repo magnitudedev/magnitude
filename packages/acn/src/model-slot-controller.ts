@@ -102,6 +102,7 @@ export interface ModelSlotControllerApi {
   readonly loadModel: (slotId: SlotId) => Effect.Effect<ModelLoadResult, LocalInferenceError>
   readonly admitModelLoad: (
     slotId: SlotId,
+    expectedSelection?: SlotSelection,
   ) => Effect.Effect<ModelLoadAdmission, LocalInferenceError>
   readonly previewModelLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopModel: (instanceId: ModelInstanceId) => Effect.Effect<void, LocalInferenceError>
@@ -709,7 +710,10 @@ export const ModelSlotControllerLive: Layer.Layer<
     return result
   })
 
-  const admitModelLoad: ModelSlotControllerApi["admitModelLoad"] = (slotId) => Effect.gen(function* () {
+  const admitModelLoad: ModelSlotControllerApi["admitModelLoad"] = (
+    slotId,
+    expectedSelection,
+  ) => Effect.gen(function* () {
     yield* rebuild
     const candidateResult = yield* Deferred.make<ModelLoadResult, LocalInferenceError>()
     const candidateAdmission = yield* Deferred.make<void, LocalInferenceError>()
@@ -719,6 +723,9 @@ export const ModelSlotControllerLive: Layer.Layer<
       const slot = current.snapshot.state.slots[key]
       if (slot._tag !== "ConfiguredLocal") {
         return yield* reject(slotId, "The slot does not contain a local model")
+      }
+      if (expectedSelection !== undefined && !sameSelection(slot.selection, expectedSelection)) {
+        return yield* reject(slotId, "The selected local model changed before load admission")
       }
       const loadTarget = current.loadTargets[key]
       if (Option.isNone(loadTarget)

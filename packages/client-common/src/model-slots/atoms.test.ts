@@ -3,6 +3,9 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelSlotUnassigned,
+  ModelSlotConfiguredLocal,
+  ModelInstanceIdSchema,
+  ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -11,7 +14,9 @@ import {
   type ModelSlotsState,
 } from "@magnitudedev/sdk"
 import {
+  admittedInstanceIsVisible,
   presentedSlotSelection,
+  slotAssignmentIsVisible,
   type ModelSlotAssignmentMutationState,
 } from "./atoms"
 
@@ -55,5 +60,59 @@ describe("optimistic model-slot presentation", () => {
     )
 
     expect(Option.isNone(presented)).toBe(true)
+  })
+})
+
+describe("model-slot mutation synchronization", () => {
+  const selection = assignment("selected", true).input.selection
+  const configured: ModelSlotsState = {
+    ...authoritative,
+    slots: {
+      ...authoritative.slots,
+      primary: new ModelSlotConfiguredLocal({
+        slotId: PRIMARY_SLOT_ID,
+        selection,
+        descriptor: {
+          providerId: selection.providerId,
+          providerModelId: selection.providerModelId,
+          displayName: "Selected",
+          variantLabel: Option.none(),
+        },
+        availability: { _tag: "Available" },
+        instance: Option.some({
+          id: ModelInstanceIdSchema.make("instance"),
+          configurationId: ModelServingConfigurationIdSchema.make("configuration"),
+          lifecycle: {
+            _tag: "Loading",
+            stage: "queued",
+            progress: Option.none(),
+            plannedAllocation: Option.none(),
+          },
+        }),
+        actions: ["Stop"],
+      }),
+    },
+  }
+
+  it("requires the exact assigned selection", () => {
+    expect(slotAssignmentIsVisible(configured, PRIMARY_SLOT_ID, selection)).toBe(true)
+    expect(slotAssignmentIsVisible(
+      configured,
+      PRIMARY_SLOT_ID,
+      assignment("replacement", true).input.selection,
+    )).toBe(false)
+  })
+
+  it("requires the exact admitted instance", () => {
+    expect(admittedInstanceIsVisible(
+      configured,
+      PRIMARY_SLOT_ID,
+      ModelInstanceIdSchema.make("instance"),
+    )).toBe(true)
+    expect(admittedInstanceIsVisible(
+      configured,
+      PRIMARY_SLOT_ID,
+      ModelInstanceIdSchema.make("replacement"),
+    )).toBe(false)
   })
 })
