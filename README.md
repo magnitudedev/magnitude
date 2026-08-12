@@ -3,7 +3,7 @@
 <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a>
 <a href="https://discord.gg/EHt48pPWdC" target="_blank"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter" /></a>
 
-Open source agent built on local models, with its own inference engine. 100% private and offline. No token costs. No API keys. No rate limits.
+Your fully local, private agent. Runs models on your machine with its built-in inference engine. Works out of the box, on any hardware. 
 
 ![Magnitude running a local model](docs/maglocaldemo.gif)
 
