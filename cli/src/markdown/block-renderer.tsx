@@ -4,7 +4,6 @@ import {
   TextAttributes,
   type LineInfo,
   type MouseEvent as OTMouseEvent,
-  type TextBufferView,
   type TextRenderable,
 } from '@opentui/core'
 import { useRenderer } from '@opentui/react'
@@ -159,8 +158,7 @@ const SpanRenderer = memo(function SpanRenderer({
       (el) => {
         const localX = event.x - el.x
         const localY = event.y - el.y
-        const view = (el as unknown as Record<string, unknown>).textBufferView as TextBufferView
-        const info: LineInfo = view.lineInfo
+        const info: LineInfo = el.lineInfo
         if (localY < 0 || localY >= info.lineStartCols.length) return null
         const charIndex = info.lineStartCols[localY] + localX
         for (let i = 0; i < hitZones.length; i++) {

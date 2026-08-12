@@ -47,7 +47,6 @@ import type {
   LineInfo,
   MouseEvent,
   ScrollBoxRenderable,
-  TextBufferView,
   TextRenderable,
 } from '@opentui/core'
 
@@ -425,7 +424,7 @@ export const MultilineInput = forwardRef<
 
   const lineInfo = safeRenderableAccess(
     textRef.current,
-    (el) => ((el satisfies TextRenderable as any).textBufferView as TextBufferView).lineInfo,
+    (el) => el.lineInfo,
     {
       mountedRef,
       fallback: null,
@@ -548,11 +547,10 @@ export const MultilineInput = forwardRef<
     const selection = safeRenderableAccess(
       textRef.current,
       (el) => {
-        const textBufferView = (el as any)?.textBufferView
-        if (!textBufferView?.hasSelection?.() || !textBufferView?.getSelection) {
+        if (!el.hasSelection()) {
           return null
         }
-        return textBufferView.getSelection()
+        return el.getSelection()
       },
       {
         mountedRef,
@@ -572,8 +570,8 @@ export const MultilineInput = forwardRef<
   // Helper to clear the current selection
   const dismissSelection = useCallback(() => {
     safeRenderableCall(
-      renderer as any,
-      (r) => r.clearSelection?.(),
+      renderer,
+      (r) => r.clearSelection(),
       { mountedRef },
     )
   }, [renderer, mountedRef])
@@ -728,8 +726,8 @@ export const MultilineInput = forwardRef<
         const renderableData = safeRenderableAccess(
           scrollBoxRef.current,
           (scrollBox) => ({
-            viewportTop: Number((scrollBox as any).viewport?.y ?? 0),
-            viewportLeft: Number((scrollBox as any).viewport?.x ?? 0),
+            viewportTop: scrollBox.viewport.y,
+            viewportLeft: scrollBox.viewport.x,
             scrollPosition: scrollBox.verticalScrollBar?.scrollPosition ?? 0,
           }),
           {
@@ -1496,7 +1494,7 @@ export const MultilineInput = forwardRef<
       // Read lineInfo inside the callback to get current value (not stale from closure)
       const currentLineInfo = safeRenderableAccess(
         textRef.current,
-        (el) => ((el as any).textBufferView as TextBufferView)?.lineInfo,
+        (el) => el.lineInfo,
         {
           mountedRef,
           fallback: null,

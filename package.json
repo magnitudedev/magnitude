@@ -103,7 +103,6 @@
     "sqlite3"
   ],
   "patchedDependencies": {
-    "@opentui/core@0.1.88": "patches/@opentui%2Fcore@0.1.88.patch",
     "just-git@1.7.0": "patches/just-git@1.7.0.patch",
     "@changesets/assemble-release-plan@6.0.10": "patches/@changesets%2Fassemble-release-plan@6.0.10.patch"
   }
