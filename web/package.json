@@ -6,7 +6,8 @@
   "types": "src/index.tsx",
   "scripts": {
     "dev": "bun run scripts/dev-server.ts",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "bunx --bun vitest run src/components/composer-submit.test.ts"
   },
   "dependencies": {
     "@magnitudedev/sdk": "workspace:*",

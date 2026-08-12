@@ -496,7 +496,6 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
   const sidebarVisible = useAtomValue(sidebarVisibleAtom)
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
   const { startNewSession } = useSessionActions()
-  const sendRef = useRef<(text: string) => void>(() => {})
 
   const commandContext: CommandContext = useMemo(() => ({
     resetConversation: () => startNewSession(),
@@ -509,10 +508,6 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
       window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
     },
     enterBashMode: () => setBashMode(true),
-    activateSkill: (skillName: string, _skillPath: string | undefined, args: string) => {
-      const content = args.trim() ? `/${skillName} ${args.trim()}` : `/${skillName}`
-      sendRef.current(content)
-    },
     initProject: () => {
       showToast("info", "Project initialization is not available in the web app yet.")
     },
@@ -532,8 +527,6 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
   ])
 
   const composer = useComposerState(commandContext)
-  sendRef.current = (text: string) => composer.handleSend(text)
-
   const handleMentionConfirm = useCallback((item: { path: string }) => {
     setFilePath(item.path)
   }, [setFilePath])

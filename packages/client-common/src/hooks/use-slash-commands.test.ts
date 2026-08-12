@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
 import type { KeyEvent } from '../types/key-event'
+import { registerSkillCommands } from '../commands/slash-commands'
 import {
   getSlashCommandMenuAction,
   getSlashCommandSuggestions,
@@ -13,6 +14,10 @@ const key = (name: string): KeyEvent => ({
   shift: false,
 })
 
+afterEach(() => {
+  registerSkillCommands([])
+})
+
 describe('slash command menu', () => {
   test.each([
     ['return', '/ne', '/new'],
@@ -20,13 +25,30 @@ describe('slash command menu', () => {
   ])('%s executes the selected command', (keyName, input, commandText) => {
     const commands = getSlashCommandSuggestions(input)
     expect(getSlashCommandMenuAction(key(keyName), commands, 0)).toEqual({
-      _tag: 'Execute',
-      commandText,
+      _tag: 'Confirm',
+      confirmation: { _tag: 'ExecuteCommand', commandText },
+    })
+  })
+
+  test.each(['return', 'tab'])('%s populates the draft for a selected skill', (keyName) => {
+    registerSkillCommands([{
+      id: 'githits-code',
+      label: 'githits-code',
+      description: 'Inspect public source with GitHits',
+      source: 'skill',
+      skillPath: '/skills/githits-code/SKILL.md',
+    }])
+
+    const commands = getSlashCommandSuggestions('/githits')
+    expect(getSlashCommandMenuAction(key(keyName), commands, 0)).toEqual({
+      _tag: 'Confirm',
+      confirmation: { _tag: 'PopulateDraft', text: '/githits-code ' },
     })
   })
 
   test('input containing spaces closes the suggestion menu', () => {
     expect(getSlashCommandSuggestions('/new now')).toEqual([])
+    expect(getSlashCommandSuggestions('/githits-code ')).toEqual([])
     expect(getSlashCommandSuggestions('/new')[0]?.id).toBe('new')
   })
 

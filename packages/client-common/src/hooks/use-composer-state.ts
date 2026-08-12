@@ -72,7 +72,7 @@ export interface UseComposerStateResult {
   /** Run a bash command. The persisted event is the display source of truth. */
   handleRunBash: (command: string) => Promise<boolean>
   /** Handle a slash command string */
-  handleSlashCommand: (cmdText: string) => void
+  handleSlashCommand: (cmdText: string) => boolean
   /** Mention search client (null if runtime not ready) */
   mentionClient: MentionSearchClient | null
   /** Currently selected session ID */
@@ -331,7 +331,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   }, [selectedSessionId, runBashMutation, commandContext])
 
   const handleSlashCommand = useCallback((cmdText: string) => {
-    routeSlashCommand(cmdText, commandContext)
+    return routeSlashCommand(cmdText, commandContext)
   }, [commandContext])
 
   return {

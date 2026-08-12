@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
 
 describe('shouldHandleSlashCommand in task/main-chat context', () => {

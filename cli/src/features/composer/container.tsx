@@ -76,8 +76,8 @@ export function ComposerContainer({
     addEphemeralMessage(message, theme.error)
   }, [theme.error])
 
-  // Slash commands may trigger a send (skills, /init) — the hook that owns
-  // sending is constructed with this context, so route through a ref.
+  // /init triggers a send — the hook that owns sending is constructed with
+  // this context, so route through a ref.
   const sendRef = useRef<(text: string) => void>(() => {})
 
   const commandContext: CommandContext = useMemo(() => ({
@@ -88,10 +88,6 @@ export function ComposerContainer({
     exitApp: () => { process.kill(process.pid, 'SIGINT') },
     openRecentChats: () => setShowRecentChats(true),
     enterBashMode: () => setBashMode(true),
-    activateSkill: (skillName: string, _skillPath: string | undefined, args: string) => {
-      const content = args.trim() ? `/${skillName} ${args.trim()}` : `/${skillName}`
-      sendRef.current(content)
-    },
     initProject: () => { void sendRef.current(INIT_PROMPT) },
     openSettings: () => setMenu({ open: true, root: 'models' }),
     openModelMenu: (root) => setMenu({ open: true, root }),

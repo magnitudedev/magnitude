@@ -7,6 +7,7 @@
   "types": "src/index.ts",
   "scripts": {
     "prepare": "bun run src/prepare.ts",
+    "test": "bunx --bun vitest run src/resolve.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

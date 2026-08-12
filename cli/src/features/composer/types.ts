@@ -50,7 +50,7 @@ export type ComposerProps = {
     imageAttachments: RawImageAttachment[]
     mentions: RawMentionOccurrence[]
   }) => void
-  runSlashCommand: (commandText: string) => boolean | void
+  runSlashCommand: (commandText: string) => boolean
   executeBash: (command: string) => boolean | Promise<boolean>
   clearSystemBanners: () => void
   interruptFork: (forkId: string | null) => void

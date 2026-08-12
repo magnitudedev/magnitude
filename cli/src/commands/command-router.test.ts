@@ -1,8 +1,10 @@
-import { describe, expect, test, vi } from 'vitest'
-import { routeSlashCommand, type CommandContext } from '@magnitudedev/client-common'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import { registerSkillCommands, routeSlashCommand, type CommandContext } from '@magnitudedev/client-common'
 import { registerCliCommands } from './register'
 
 registerCliCommands()
+
+afterEach(() => registerSkillCommands([]))
 
 function createContext(overrides: Partial<CommandContext> = {}): CommandContext {
   return {
@@ -11,7 +13,6 @@ function createContext(overrides: Partial<CommandContext> = {}): CommandContext 
     exitApp: vi.fn(),
     openRecentChats: vi.fn(),
     enterBashMode: vi.fn(),
-    activateSkill: vi.fn(),
     initProject: vi.fn(),
     openSettings: vi.fn(),
     openUsage: vi.fn(),
@@ -27,7 +28,16 @@ describe('routeSlashCommand', () => {
   test('handles recognized commands', () => {
     const ctx = createContext()
     expect(routeSlashCommand('/new', ctx)).toBe(true)
-    expect(ctx.resetConversation).toHaveBeenCalledTimes(1)
+    expect(routeSlashCommand('/new ', ctx)).toBe(true)
+    expect(ctx.resetConversation).toHaveBeenCalledTimes(2)
+  })
+
+  test('does not execute argument-bearing built-in commands', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/new notes', ctx)).toBe(false)
+    expect(routeSlashCommand('/exit later', ctx)).toBe(false)
+    expect(ctx.resetConversation).not.toHaveBeenCalled()
+    expect(ctx.exitApp).not.toHaveBeenCalled()
   })
 
   test('opens each model menu directly', () => {
@@ -56,6 +66,16 @@ describe('routeSlashCommand', () => {
     const ctx = createContext()
     expect(routeSlashCommand('/definitely-not-a-command', ctx)).toBe(false)
     expect(ctx.showSystemMessage).not.toHaveBeenCalled()
+  })
+
+  test('skill-prefixed messages remain normal messages for explicit submission', () => {
+    registerSkillCommands([{
+      id: 'githits-code',
+      label: 'githits-code',
+      description: 'Inspect public repositories',
+      source: 'skill',
+    }])
+    expect(routeSlashCommand('/githits-code inspect owner/repo', createContext())).toBe(false)
   })
 
   test('slash-prefixed filesystem-like text is not handled', () => {

@@ -1,6 +1,7 @@
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { getTarget, getVersion, isWindows } from './platform'
 
 const BIN_DIR = join(homedir(), '.magnitude', 'bin')
@@ -27,10 +28,20 @@ async function versionMatches(): Promise<boolean> {
 }
 
 async function getRgPath(): Promise<string> {
+  // In an unbundled development runtime the binary is already a filesystem
+  // sibling. Bun's `type: "file"` import is a bundler primitive and attempting
+  // to evaluate it directly parses the executable as JavaScript.
+  const sourcePath = getDevelopmentRgPath(import.meta.url, isWindows())
+  if (await Bun.file(sourcePath).exists()) return sourcePath
+
   // Dynamic import so this is only resolved at runtime, not during
   // workspace builds or bundling that would try to parse the binary as JS.
   const { rgPath } = await import('./rg-embed')
   return rgPath
+}
+
+export function getDevelopmentRgPath(moduleUrl: string, windows: boolean): string {
+  return fileURLToPath(new URL(windows ? '../bin/rg.exe' : '../bin/rg', moduleUrl))
 }
 
 async function extractEmbedded(): Promise<string> {

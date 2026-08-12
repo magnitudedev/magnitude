@@ -20,13 +20,23 @@ interface SlashCommandsState {
 
 export type SlashCommandMenuAction =
   | { readonly _tag: 'Select'; readonly index: number }
-  | { readonly _tag: 'Execute'; readonly commandText: string }
+  | { readonly _tag: 'Confirm'; readonly confirmation: SlashCommandConfirmation }
   | { readonly _tag: 'Dismiss' }
 
+export type SlashCommandConfirmation =
+  | { readonly _tag: 'ExecuteCommand'; readonly commandText: string }
+  | { readonly _tag: 'PopulateDraft'; readonly text: string }
+
+export function confirmSlashCommand(command: SlashCommandDefinition): SlashCommandConfirmation {
+  return command.source === 'skill'
+    ? { _tag: 'PopulateDraft', text: `/${command.id} ` }
+    : { _tag: 'ExecuteCommand', commandText: `/${command.id}` }
+}
+
 export function getSlashCommandSuggestions(inputText: string): SlashCommandDefinition[] {
-  const trimmed = inputText.trim()
-  if (!trimmed.startsWith('/') || trimmed.includes(' ')) return []
-  return filterSlashCommands(trimmed.slice(1))
+  const input = inputText.trimStart()
+  if (!input.startsWith('/') || /\s/.test(input.slice(1))) return []
+  return filterSlashCommands(input.slice(1))
 }
 
 export function getSlashCommandMenuAction(
@@ -49,7 +59,7 @@ export function getSlashCommandMenuAction(
     !key.shift
   ) {
     const command = commands[selectedIndex]
-    return command ? { _tag: 'Execute', commandText: `/${command.id}` } : null
+    return command ? { _tag: 'Confirm', confirmation: confirmSlashCommand(command) } : null
   }
   if (key.name === 'escape') return { _tag: 'Dismiss' }
   return null
@@ -63,7 +73,7 @@ export function getSlashCommandMenuAction(
  */
 export function useSlashCommands(
   inputText: string,
-  onExecute: (commandText: string) => void,
+  onConfirm: (confirmation: SlashCommandConfirmation) => void,
 ): SlashCommandsState {
   const [selection, setSelection] = useState({ signature: '', index: 0 })
 
@@ -92,9 +102,9 @@ export function useSlashCommands(
     if (!action) return false
 
     if (action._tag === 'Select') setSelectedIndex(action.index)
-    if (action._tag === 'Execute') onExecute(action.commandText)
+    if (action._tag === 'Confirm') onConfirm(action.confirmation)
     return true
-  }, [isSlashMenuOpen, filteredCommands, selectedIndex, onExecute, setSelectedIndex])
+  }, [isSlashMenuOpen, filteredCommands, selectedIndex, onConfirm, setSelectedIndex])
 
   return {
     isSlashMenuOpen,

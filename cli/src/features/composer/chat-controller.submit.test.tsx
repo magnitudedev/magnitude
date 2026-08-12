@@ -1,56 +1,74 @@
-import { describe, expect, mock, test } from 'bun:test'
-import React, { type ReactNode } from 'react'
-import { act, create, type ReactTestRenderer } from 'react-test-renderer'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import React, { act, type ReactNode } from 'react'
+import { create, type ReactTestRenderer } from 'react-test-renderer'
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
+import { MultilineInput } from './multiline-input'
 import { chatThemes } from '../../utils/theme'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 
-let latestMultilineProps: {
-  onChange: (value: InputValue) => void
-  onSubmit: () => void
-} | null = null
+const mountedRenderers: ReactTestRenderer[] = []
 
-mock.module('../../hooks/use-file-mentions', () => ({
-  useFileMentions: () => ({
-    isOpen: false,
-    query: '',
-    items: [],
-    recentItems: [],
-    overflowCount: 0,
-    selectedIndex: 0,
-    confirmSelection: () => {},
-    setSelectedIndex: () => {},
-    handleKeyIntercept: () => false,
-  }),
-}))
+;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
+  .IS_REACT_ACT_ENVIRONMENT = true
 
-mock.module('../../hooks/use-slash-commands', () => ({
-  useSlashCommands: () => ({
-    isSlashMenuOpen: false,
-    filteredCommands: [],
-    selectedIndex: 0,
-    setSelectedIndex: () => {},
-    handleKeyIntercept: () => false,
-    getSelectedCommandText: () => null,
-  }),
-}))
+vi.mock('@opentui/react', async () => {
+  const actual = await vi.importActual<typeof import('@opentui/react')>('@opentui/react')
+  return {
+    ...actual,
+    useRenderer: () => ({ requestRender: () => {}, setMousePointer: () => {} }),
+  }
+})
 
-mock.module('./chat-surface-keyboard', () => ({ ChatSurfaceKeyboard: () => null }))
-mock.module('./mention-menu', () => ({ FileMentionMenu: () => null }))
-mock.module('./slash-menu', () => ({ SlashCommandMenu: () => null }))
-mock.module('./attachment-bar', () => ({ AttachmentsBar: () => null }))
-mock.module('./context-usage', () => ({ ContextUsage: () => null, contextUsageWidth: () => 0 }))
-mock.module('./residency-indicator', () => ({ ResidencyIndicator: () => null }))
-mock.module('../../components/button', () => ({ Button: ({ children }: { children?: ReactNode }) => <>{children}</> }))
-mock.module('./multiline-input', () => ({
-  INPUT_CURSOR_CHAR: '▍',
-  MultilineInput: (props: { onChange: (value: InputValue) => void; onSubmit: () => void }) => {
-    latestMultilineProps = { onChange: props.onChange, onSubmit: props.onSubmit }
-    return <text>[composer]</text>
-  },
-}))
+vi.mock('@magnitudedev/client-common', async () => {
+  const actual = await vi.importActual<typeof import('@magnitudedev/client-common')>('@magnitudedev/client-common')
+  return {
+    ...actual,
+    useFileMentions: () => ({
+      isOpen: false,
+      query: '',
+      items: [],
+      recentItems: [],
+      overflowCount: 0,
+      selectedIndex: 0,
+      confirmSelection: () => {},
+      setSelectedIndex: () => {},
+      handleKeyIntercept: () => false,
+    }),
+    useSlashCommands: () => ({
+      isSlashMenuOpen: false,
+      filteredCommands: [],
+      selectedIndex: 0,
+      setSelectedIndex: () => {},
+      handleKeyIntercept: () => false,
+      getSelectedCommandText: () => null,
+    }),
+    useAgentClient: () => ({
+      query: () => ({ pipe: () => {} }),
+      mutation: () => ({ pipe: () => {} }),
+      runtime: { pipe: () => {} },
+      pipe: () => {},
+    }),
+  }
+})
 
+vi.mock('@effect-atom/atom-react', async () => {
+  const actual = await vi.importActual<typeof import('@effect-atom/atom-react')>('@effect-atom/atom-react')
+  return {
+    ...actual,
+    useAtomValue: () => '',
+    useAtomSet: () => () => {},
+    useAtomMount: () => {},
+  }
+})
+
+vi.mock('./chat-surface-keyboard', () => ({ ChatSurfaceKeyboard: () => null }))
+vi.mock('./mention-menu', () => ({ FileMentionMenu: () => null }))
+vi.mock('./slash-menu', () => ({ SlashCommandMenu: () => null }))
+vi.mock('./attachment-bar', () => ({ AttachmentsBar: () => null }))
+vi.mock('./context-usage', () => ({ ContextUsage: () => null, contextUsageWidth: () => 0 }))
+vi.mock('./residency-indicator', () => ({ ResidencyIndicator: () => null }))
+vi.mock('../../components/button', () => ({ Button: ({ children }: { children?: ReactNode }) => <>{children}</> }))
 const { Composer } = await import('./composer')
 
 const EMPTY_INPUT: InputValue = {
@@ -94,22 +112,22 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       autopilotEnabled: false,
       autopilotGenerating: false,
       displayMode: 'default' as const,
-      submitUserMessage: mock(() => {}),
-      runSlashCommand: mock(() => false),
-      executeBash: mock((_command: string) => true),
-      clearSystemBanners: mock(() => {}),
-      interruptFork: mock(() => {}),
-      interruptAll: mock(() => {}),
-      openSettings: mock(() => {}),
-      openHardware: mock(() => {}),
-      openCatalog: mock(() => {}),
+      submitUserMessage: vi.fn(() => {}),
+      runSlashCommand: vi.fn(() => false),
+      executeBash: vi.fn((_command: string) => true),
+      clearSystemBanners: vi.fn(() => {}),
+      interruptFork: vi.fn(() => {}),
+      interruptAll: vi.fn(() => {}),
+      openSettings: vi.fn(() => {}),
+      openHardware: vi.fn(() => {}),
+      openCatalog: vi.fn(() => {}),
       thinkingOptions: [],
-      applyThinking: mock(() => {}),
-      handleWidgetKeyEvent: mock(() => false),
-      enterBashMode: mock(() => {}),
-      exitBashMode: mock(() => {}),
-      showToast: mock(() => {}),
-      toggleAutopilot: mock(() => {}),
+      applyThinking: vi.fn(() => {}),
+      handleWidgetKeyEvent: vi.fn(() => false),
+      enterBashMode: vi.fn(() => {}),
+      exitBashMode: vi.fn(() => {}),
+      showToast: vi.fn(() => {}),
+      toggleAutopilot: vi.fn(() => {}),
     displayMessages: [],
     selectedForkId: null,
     isBlockingOverlayActive: false,
@@ -119,65 +137,96 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
   }
 }
 
+function multilineProps() {
+  const renderer = mountedRenderers.at(-1)
+  if (!renderer) throw new Error('Composer not mounted')
+  return renderer.root.findByType(MultilineInput).props as {
+    readonly value: string
+    readonly onChange: (value: InputValue) => void
+    readonly onSubmit: () => void
+  }
+}
+
 function setComposerText(text: string) {
-  if (!latestMultilineProps) throw new Error('MultilineInput not mounted')
   const value: InputValue = {
     ...EMPTY_INPUT,
     text,
     cursorPosition: text.length,
   }
   act(() => {
-    latestMultilineProps!.onChange(value)
+    multilineProps().onChange(value)
   })
 }
 
 async function submitComposer() {
-  if (!latestMultilineProps) throw new Error('MultilineInput not mounted')
   await act(async () => {
-    latestMultilineProps!.onSubmit()
+    multilineProps().onSubmit()
     await Promise.resolve()
   })
 }
 
+async function mountComposer(props: ComposerProps) {
+  let renderer: ReactTestRenderer | null = null
+  await act(async () => {
+    renderer = create(<Composer {...props} /> as React.ReactElement)
+    await Promise.resolve()
+  })
+  mountedRenderers.push(renderer!)
+  multilineProps()
+}
+
+afterEach(async () => {
+  await act(async () => {
+    for (const renderer of mountedRenderers.splice(0)) renderer.unmount()
+    await Promise.resolve()
+  })
+  vi.clearAllMocks()
+})
+
 describe('ChatController submit slash behavior', () => {
-  test('typed unknown slash text sends as normal message and does not run slash command', async () => {
-    let renderer: ReactTestRenderer | null = null
+  test('typed unknown slash text is routed and then sent as a normal message', async () => {
     const props = makeProps()
-    act(() => {
-      renderer = create(<Composer {...props} /> as React.ReactElement)
-    })
+    await mountComposer(props)
 
     setComposerText('/foo')
     await submitComposer()
 
-    expect(props.runSlashCommand).not.toHaveBeenCalled()
+    expect(props.runSlashCommand).toHaveBeenCalledWith('/foo')
     expect(props.submitUserMessage).toHaveBeenCalledWith(expect.objectContaining({
       message: '/foo',
       visibleMessage: '/foo',
     }))
 
-    act(() => renderer?.unmount())
   })
 
-  test('slash-looking pasted text sends as normal message', async () => {
-    let renderer: ReactTestRenderer | null = null
-    const props = makeProps()
-    act(() => {
-      renderer = create(<Composer {...props} /> as React.ReactElement)
+  test('handled built-in slash text executes without sending', async () => {
+    const props = makeProps({
+      runSlashCommand: vi.fn((text: string) => text.trim() === '/new' || text.trim() === '/resume'),
     })
+    await mountComposer(props)
 
-    setComposerText('/new')
+    setComposerText('/new ')
     await submitComposer()
+    setComposerText('/resume ')
+    await submitComposer()
+
+    expect(props.runSlashCommand).toHaveBeenNthCalledWith(1, '/new ')
+    expect(props.runSlashCommand).toHaveBeenNthCalledWith(2, '/resume ')
+    expect(props.submitUserMessage).not.toHaveBeenCalled()
+    expect(multilineProps().value).toBe('')
+  })
+
+  test('unhandled slash-looking text remains a normal message', async () => {
+    const props = makeProps()
+    await mountComposer(props)
+
     setComposerText('/Users/me/a.png /Users/me/b.png')
     await submitComposer()
     setComposerText('/home/me/a.png')
     await submitComposer()
 
-    expect(props.runSlashCommand).not.toHaveBeenCalled()
-    expect(props.submitUserMessage).toHaveBeenCalledWith(expect.objectContaining({ message: '/new' }))
+    expect(props.runSlashCommand).toHaveBeenCalledTimes(2)
     expect(props.submitUserMessage).toHaveBeenCalledWith(expect.objectContaining({ message: '/Users/me/a.png /Users/me/b.png' }))
     expect(props.submitUserMessage).toHaveBeenCalledWith(expect.objectContaining({ message: '/home/me/a.png' }))
-
-    act(() => renderer?.unmount())
   })
 })

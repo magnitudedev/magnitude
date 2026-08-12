@@ -2,6 +2,17 @@
 
 You are working on Magnitude, an AI coding agent platform.
 
+<!-- githits -->
+GitHits is the default context source for public open-source packages and repositories. Load
+`githits-code` for source, documentation, examples, and API behavior. Load `githits-package` for
+package health, vulnerabilities, dependencies, changelogs, and upgrade reviews. GitHits does not
+inspect the local workspace, private repositories, or uncommitted code; use Magnitude's native
+repository tools for those sources. For an explicit public GitHub URL, the first repository
+discovery action after loading `githits-code` must invoke the GitHits CLI; do not use generic local
+or web discovery tools unless GitHits returns an actionable availability, authentication, or
+indexing failure.
+<!-- githits -->
+
 ## Package Layering
 
 ```

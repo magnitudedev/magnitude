@@ -20,6 +20,7 @@ import {
   mentionAttachmentFromSegment,
   mentionOccurrenceFromInputSegment,
   useSlashCommands,
+  type SlashCommandConfirmation,
   useFileMentions,
   type InputMentionSegment,
   type InputValue,
@@ -37,6 +38,7 @@ import {
   composerHistoryIndexAtom,
 } from "@magnitudedev/client-common"
 import type { MentionAttachment, RawMentionOccurrence } from "@magnitudedev/sdk"
+import { routeComposerSubmission } from "./composer-submit"
 
 export interface ComposerProps {
   /** Current role label (e.g. "Leader") */
@@ -52,7 +54,7 @@ export interface ComposerProps {
   /** Run a bash command (bash mode) */
   onRunBash?: (command: string) => Promise<boolean>
   /** Execute a slash command */
-  onSlashCommand?: (command: string) => void
+  onSlashCommand?: (command: string) => boolean
   /** Toggle bash mode */
   onToggleBashMode?: () => void
   /** File mention confirmation callback */
@@ -119,18 +121,34 @@ export function Composer({
   const messageHistory = useAtomValue(messageHistoryAtom)
   const setMessageHistory = useAtomSet(messageHistoryAtom)
 
-  // Slash commands
-  const slashState = useSlashCommands(text, (cmdText: string) => {
-    if (onSlashCommand) {
-      onSlashCommand(cmdText)
-    }
+  const [cursorPosition, setCursorPosition] = useState(0)
+
+  const clearHandledSlashCommand = useCallback(() => {
     setText("")
+    setAttachments([])
+    setCursorPosition(0)
+    setHistoryIndex(-1)
+    setSavedDraft({ text: "", mentions: [] })
     lastUserTextRef.current = ""
+  }, [setText, setAttachments, setHistoryIndex])
+
+  // Slash commands
+  const slashState = useSlashCommands(text, (confirmation: SlashCommandConfirmation) => {
+    if (confirmation._tag === 'PopulateDraft') {
+      setText(confirmation.text)
+      lastUserTextRef.current = confirmation.text
+      setCursorPosition(confirmation.text.length)
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus()
+        textareaRef.current?.setSelectionRange(confirmation.text.length, confirmation.text.length)
+      })
+      return
+    }
+
+    if (onSlashCommand?.(confirmation.commandText)) clearHandledSlashCommand()
   })
 
   // File mentions
-  const [cursorPosition, setCursorPosition] = useState(0)
-
   const mentionState = useFileMentions({
     inputText: text,
     cursorPosition,
@@ -186,7 +204,16 @@ export function Composer({
       return
     }
 
-    onSend(text, attachments.length > 0 ? attachments.map(mentionOccurrenceFromInputSegment) : undefined)
+    const outcome = routeComposerSubmission({
+      text,
+      trySlashCommand: onSlashCommand,
+      onHandledCommand: clearHandledSlashCommand,
+      onMessage: () => onSend(
+        text,
+        attachments.length > 0 ? attachments.map(mentionOccurrenceFromInputSegment) : undefined,
+      ),
+    })
+    if (outcome === 'command') return
     // Push to message history (most recent first, dedup consecutive)
     setMessageHistory((prev: string[]) =>
       prev[0] === trimmed ? prev : [trimmed, ...prev].slice(0, 100),
@@ -199,7 +226,7 @@ export function Composer({
     // Keep lastUserTextRef in sync so the restore-focus Effect doesn't
     // re-focus after submit clears text.
     lastUserTextRef.current = ""
-  }, [text, attachments, bashMode, onRunBash, onSend, setMessageHistory, setHistoryIndex, setText, setAttachments])
+  }, [text, attachments, bashMode, onRunBash, onSlashCommand, onSend, clearHandledSlashCommand, setMessageHistory, setHistoryIndex, setText, setAttachments])
 
   const canSend = text.trim().length > 0 || attachments.length > 0
 

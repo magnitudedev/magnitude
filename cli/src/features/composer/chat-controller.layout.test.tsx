@@ -341,7 +341,7 @@ test('shows resident memory three spaces after context and links it to hardware'
         modelSlots={localInferenceState.slots}
         selectedProviderId={LOCAL_PROVIDER_ID}
         openHardware={openHardware}
-      />,
+      /> as React.ReactElement,
     )
   })
   const textOf = (node: ReactTestInstance): string => node.children
@@ -411,7 +411,7 @@ test('shows active model downloads in the persistent footer and links to the cat
         {...makeProps()}
         localModels={localInferenceState.models}
         openCatalog={openCatalog}
-      />,
+      /> as React.ReactElement,
     )
   })
 
@@ -439,7 +439,7 @@ test('shows active model downloads in the persistent footer and links to the cat
         {...makeProps()}
         localModels={makeView().models}
         openCatalog={openCatalog}
-      />,
+      /> as React.ReactElement,
     )
   })
   expect(view.root.findAll(
@@ -479,7 +479,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
         selectedProviderId={LOCAL_PROVIDER_ID}
         thinkingOptions={thinkingOptions}
         applyThinking={(effort) => { applied.push(effort) }}
-      />,
+      /> as React.ReactElement,
     )
   })
 
@@ -551,7 +551,7 @@ test('disables footer settings controls while onboarding downloads a model', () 
         openSettings={openSettings}
         openHardware={openHardware}
         applyThinking={applyThinking}
-      />,
+      /> as React.ReactElement,
     )
   })
 
@@ -565,7 +565,7 @@ test('disables footer settings controls while onboarding downloads a model', () 
   ])
   for (const label of expectedColors.keys()) {
     const control = view.root.findAll((node) => textOf(node) === label)
-      .find((node) => node.type === 'box')
+      .find((node) => String(node.type) === 'box')
     expect(control).toBeDefined()
     act(() => {
       ;(control!.props.onMouseOver as () => void)()

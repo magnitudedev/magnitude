@@ -39,8 +39,6 @@ export interface CommandContext {
   openRecentChats: () => void
   /** Enter bash mode for running terminal commands */
   enterBashMode: () => void
-  /** Activate a skill by name and optional file path */
-  activateSkill: (skillName: string, skillPath: string | undefined, args: string) => void
   /** Run the /init flow: explore codebase and generate AGENTS.md */
   initProject: () => void
   /** Legacy settings entry point for clients without the model-menu surface. */
@@ -134,12 +132,16 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
   const parsed = parseSlashCommand(trimmed)
   if (!parsed) return false
 
-  // Check if this is a skill command
-  const cmd = getAvailableCommands().find(c => c.id === parsed.commandId)
-  if (cmd?.source === 'skill') {
-    ctx.activateSkill(cmd.id, cmd.skillPath, parsed.args)
-    return true
-  }
+  // Skills are ordinary agent messages. Menu selection only prepares the
+  // draft; the completed skill-prefixed message is sent by the composer.
+  if (getAvailableCommands().some((command) =>
+    command.id === parsed.commandId && command.source === 'skill'
+  )) return false
+
+  // No built-in command currently accepts arguments. Treat argument-bearing
+  // slash text as an ordinary message instead of triggering a destructive
+  // action from pasted or conversational text.
+  if (parsed.args.length > 0) return false
 
   switch (parsed.commandId) {
     case 'new':

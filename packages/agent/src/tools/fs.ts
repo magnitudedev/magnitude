@@ -10,7 +10,7 @@ import { WorkingDirectoryTag } from '../execution/working-directory'
 import { captureContextImageFromFile } from '../util/capture-context-image'
 import { ContextImageResultSchema } from '../content'
 import { expandScratchpadPath } from '@magnitudedev/scratchpad'
-import { Fs, resolveFsPath } from '../services/fs'
+import { Fs, FsSearchError, resolveFsPath } from '../services/fs'
 import { ToolErrorSchema } from './errors'
 
 // =============================================================================
@@ -377,7 +377,9 @@ export const grepTool = defineHarnessTool({
     })
 
     return yield* fs.search(searchParams).pipe(
-      Effect.mapError(() => fsError(`Search failed for ${pattern}`))
+      Effect.mapError((error) => fsError(
+        error instanceof FsSearchError ? error.message : `Search failed for ${pattern}`,
+      )),
     )
   }),
 })

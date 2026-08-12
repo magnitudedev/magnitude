@@ -19,7 +19,7 @@ import {
   deriveLocalModelDownloadSummary,
 } from '../local-inference/footer-status'
 import { useFileMentions, type MentionSearchClient } from '@magnitudedev/client-common'
-import { useSlashCommands } from '@magnitudedev/client-common'
+import { confirmSlashCommand, useSlashCommands, type SlashCommandConfirmation } from '@magnitudedev/client-common'
 import { readClipboardBitmap, readClipboardText } from '../../utils/clipboard'
 import { extractPastedPathCandidates, tryReadPastedImageFileCandidate, type ReadPastedImageFileParams } from '../../utils/pasted-image-path'
 import { autoScaleImageAttachmentIfNeeded } from '../../utils/image-scaling'
@@ -470,16 +470,27 @@ export function Composer(props: ComposerProps) {
     })
   }, [setComposerHasContent])
 
-  const executeSlashCommand = useCallback((commandText: string) => {
-    const handled = runSlashCommand(commandText)
-    if (handled) {
-      setInputValue(EMPTY_INPUT)
-      setComposerText('')
-      setComposerAttachments([])
-      setAttachments([])
-      setComposerHasContent(false)
+  const clearComposer = useCallback(() => {
+    setInputValue(EMPTY_INPUT)
+    setComposerText('')
+    setComposerAttachments([])
+    setAttachments([])
+    setComposerHasContent(false)
+    setComposerHistoryIndex(-1)
+    setSavedDraft('')
+  }, [setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
+
+  const confirmSlashSelection = useCallback((confirmation: SlashCommandConfirmation) => {
+    if (confirmation._tag === 'PopulateDraft') {
+      setComposerTextValue(confirmation.text)
+      multilineInputRef.current?.focus()
+      return
     }
-  }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent])
+
+    const handled = runSlashCommand(confirmation.commandText)
+    if (!handled) return
+    clearComposer()
+  }, [runSlashCommand, setComposerTextValue, clearComposer])
 
   const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }) => {
     setInputValue(prev => {
@@ -511,7 +522,7 @@ export function Composer(props: ComposerProps) {
     onConfirm: onSelectMention,
     onExpandDirectory: onExpandDirectoryMention,
   })
-  const slashCommands = useSlashCommands(inputValue.text, executeSlashCommand)
+  const slashCommands = useSlashCommands(inputValue.text, confirmSlashSelection)
 
   const handleInterrupt = useCallback(() => interruptFork(selectedForkId), [interruptFork, selectedForkId])
   const handleInterruptAll = useCallback(() => interruptAll(), [interruptAll])
@@ -605,17 +616,11 @@ export function Composer(props: ComposerProps) {
     return result.didInsert
   }, [addImageAttachment, addImageAttachmentFromFilePath])
 
-  const clearComposer = useCallback(() => {
-    setInputValue(EMPTY_INPUT)
-    setComposerText('')
-    setComposerAttachments([])
-    setAttachments([])
-    setComposerHasContent(false)
-    setComposerHistoryIndex(-1)
-    setSavedDraft('')
-  }, [setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
-
   const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionInputs: RawMentionOccurrence[] = []) => {
+    if (!bashMode && shouldHandleSlashCommandInTab(selectedForkId) && runSlashCommand(message)) {
+      clearComposer()
+      return
+    }
     if (modelSetupInProgress) return
     if (bashMode) {
       const trimmed = message.trim()
@@ -650,7 +655,7 @@ export function Composer(props: ComposerProps) {
     setComposerHistoryIndex(-1)
     setSavedDraft('')
     clearComposer()
-  }, [bashMode, modelSetupInProgress, modelsConfigured, submitUserMessage, executeBash, clearSystemBanners, showToast, attachments, clearComposer])
+  }, [bashMode, selectedForkId, runSlashCommand, modelSetupInProgress, modelsConfigured, submitUserMessage, executeBash, clearSystemBanners, showToast, attachments, clearComposer])
 
   const handleInputSubmit = useCallback(async () => {
     setComposerHistoryIndex(-1)
@@ -864,7 +869,7 @@ export function Composer(props: ComposerProps) {
               <SlashCommandMenu
                 commands={slashCommands.filteredCommands}
                 selectedIndex={slashCommands.selectedIndex}
-                onSelect={(cmd) => executeSlashCommand(`/${cmd.id}`)}
+                onSelect={(cmd) => confirmSlashSelection(confirmSlashCommand(cmd))}
                 onHoverIndex={slashCommands.setSelectedIndex}
               />
             )}
