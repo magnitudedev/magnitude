@@ -66,6 +66,7 @@ const localActivity = (lifecycle: {
     providerId: selection.providerId,
     providerModelId: selection.providerModelId,
     displayName: 'Local test',
+    variantLabel: Option.none(),
   },
   availability: { _tag: 'Available' },
   instance: Option.some({ id: instanceId, configurationId, lifecycle }),

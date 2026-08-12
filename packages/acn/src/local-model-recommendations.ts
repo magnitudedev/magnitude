@@ -323,6 +323,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 checkpointId: model.checkpointId,
                 configuration: model.configuration,
                 displayName: model.displayName,
+                variantLabel: model.variantLabel,
                 description: model.description,
                 license: model.license,
                 capabilities: model.capabilities,

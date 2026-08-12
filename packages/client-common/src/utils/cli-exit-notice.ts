@@ -4,6 +4,7 @@ import type {
   ModelSlotConfiguredLocal,
   ModelSlotsState,
 } from "@magnitudedev/sdk"
+import { formatModelDisplayName } from "./model-presentation"
 
 export const CLI_EXIT_OBSERVATION_FALLBACK =
   "Magnitude may still have background processes running.\n" +
@@ -31,7 +32,10 @@ export const deriveCliExitNotice = (observation: AcnClientCloseResult): Option.O
         const descriptions = [...byInstance.values()].map((slot) => {
           const instance = Option.getOrThrow(slot.instance)
           const activity = instance.lifecycle._tag === "Loading" ? "loading" : "running"
-          return `${slot.descriptor.displayName} (${activity})`
+          return `${formatModelDisplayName(
+            slot.descriptor.displayName,
+            slot.descriptor.variantLabel,
+          )} (${activity})`
         })
         const names = descriptions.length === 2
           ? descriptions.join(" and ")
@@ -49,7 +53,10 @@ export const deriveCliExitNotice = (observation: AcnClientCloseResult): Option.O
       const slot = byInstance.values().next().value!
       const instance = Option.getOrThrow(slot.instance)
       const activity = instance.lifecycle._tag === "Loading" ? "loading" : "running"
-      const name = slot.descriptor.displayName
+      const name = formatModelDisplayName(
+        slot.descriptor.displayName,
+        slot.descriptor.variantLabel,
+      )
       const firstSentence =
         connectedClientCount === 0
           ? activity === "loading"

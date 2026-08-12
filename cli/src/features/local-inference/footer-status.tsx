@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { modelSlotResidentAllocation } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, modelSlotResidentAllocation } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import type { LocalModelsState, ModelSlot, ModelSlotsState, ProviderId, SlotId } from "@magnitudedev/sdk"
 
@@ -72,8 +72,8 @@ export const deriveLocalInferenceFooterView = (
       : "not_loaded" as const
   return {
     modelName: selectedModelName
-      ?? activeModel?.presentation.displayName
-      ?? download?.presentation.displayName
+      ?? (activeModel ? formatLocalModelDisplayName(activeModel) : undefined)
+      ?? (download ? formatLocalModelDisplayName(download) : undefined)
       ?? null,
     residency,
     memoryLabel: residency === "loaded" && slot ? residentMemoryLabel(slot) : null,

@@ -27,6 +27,7 @@ const descriptor = {
   providerId: selection.providerId,
   providerModelId: selection.providerModelId,
   displayName: "Local model",
+  variantLabel: Option.none(),
 }
 const instanceId = ModelInstanceIdSchema.make("instance")
 const configurationId = ModelServingConfigurationIdSchema.make("configuration")

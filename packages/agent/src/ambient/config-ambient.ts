@@ -1,5 +1,6 @@
 import { Ambient } from '@magnitudedev/event-core'
 import { Effect, Schema } from 'effect'
+import { formatModelDisplayName } from '@magnitudedev/acn-protocol'
 
 import type { ModelSlotsState, ProviderModelCatalogEntry } from '@magnitudedev/sdk'
 import { type SlotId } from '@magnitudedev/roles'
@@ -128,7 +129,10 @@ export function buildConfigStateFromSlots(
         slotId,
         providerId: slot.selection.providerId,
         providerModelId: slot.selection.providerModelId,
-        modelDisplayName: selectedModel.displayName,
+        modelDisplayName: formatModelDisplayName(
+          selectedModel.displayName,
+          selectedModel.variantLabel,
+        ),
         profile: {
           contextWindow: selectedModel.contextWindow,
           maxOutputTokens: selectedModel.maxOutputTokens,

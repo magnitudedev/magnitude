@@ -16,6 +16,7 @@ const state = (lifecycle: "Ready" | "Loading" | "Stopped", duplicate = false): M
       providerId: "local",
       providerModelId: "local:test",
       displayName: "Qwen Test",
+      variantLabel: Option.none(),
     },
     availability: { _tag: "Available" },
     instance: Option.some({

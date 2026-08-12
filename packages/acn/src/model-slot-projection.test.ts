@@ -150,6 +150,7 @@ describe("model slot projection", () => {
       providerModelId: ProviderModelIdSchema.make("test-configuration"),
       modelFamilyId: Option.none(),
       displayName: "Local model",
+      variantLabel: Option.none(),
       supportedSlots: [SECONDARY_SLOT_ID],
       contextWindow: 4096,
       maxOutputTokens: 1024,

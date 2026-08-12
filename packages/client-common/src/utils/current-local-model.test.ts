@@ -20,6 +20,7 @@ const descriptor = {
   providerId: selection.providerId,
   providerModelId: selection.providerModelId,
   displayName: "Canonical local model",
+  variantLabel: Option.none(),
 }
 const allocation = {
   contextWindowTokens: 200_000,

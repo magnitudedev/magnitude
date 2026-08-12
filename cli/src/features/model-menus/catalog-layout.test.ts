@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest"
 import { getDisplayWidth } from "@magnitudedev/client-common"
+import { ModelVariantLabelSchema } from "@magnitudedev/sdk"
 import {
   catalogDetailHints,
   catalogListHints,
@@ -50,21 +51,25 @@ describe("catalog responsive layout", () => {
     }
   })
 
-  test("truncates the model name while preserving quantization when it fits", () => {
+  test("truncates the model name while preserving the variant label when it fits", () => {
     const label = formatCatalogModelLabel(
       "A Very Long Coding Model Name",
-      "Q4_K_M",
+      ModelVariantLabelSchema.make("Q4 QAT"),
       20,
     )
 
     expect(label).toContain("…")
-    expect(label.endsWith(" (Q4_K_M)")).toBe(true)
+    expect(label.endsWith(" (Q4 QAT)")).toBe(true)
     expect(getDisplayWidth(label)).toBeLessThanOrEqual(20)
   })
 
   test("never exceeds tiny display-width budgets", () => {
     for (const width of [1, 4, 8, 12]) {
-      const label = formatCatalogModelLabel("模型🚀 Coding Model", "Q4_K_M", width)
+      const label = formatCatalogModelLabel(
+        "模型🚀 Coding Model",
+        ModelVariantLabelSchema.make("NVFP4"),
+        width,
+      )
       expect(getDisplayWidth(label)).toBeLessThanOrEqual(width)
     }
   })

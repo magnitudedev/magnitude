@@ -2,6 +2,7 @@ import {
   getDisplayWidth,
   truncateToDisplayWidth,
 } from "@magnitudedev/client-common"
+import type { ModelVariantLabel } from "@magnitudedev/sdk"
 
 export type CatalogLayoutMode = "full" | "quality" | "compact" | "stacked" | "minimal"
 
@@ -131,11 +132,11 @@ export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
 
 export const formatCatalogModelLabel = (
   displayName: string,
-  quantizationName: string,
+  variantLabel: ModelVariantLabel,
   maxWidth: number,
 ): string => {
   const safeWidth = Math.max(1, Math.floor(maxWidth))
-  const suffix = ` (${quantizationName})`
+  const suffix = ` (${variantLabel})`
   const suffixWidth = getDisplayWidth(suffix)
   const fullLabel = `${displayName}${suffix}`
 

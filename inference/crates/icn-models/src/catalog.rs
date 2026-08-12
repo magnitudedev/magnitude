@@ -53,7 +53,7 @@ struct CatalogModel {
     display_name: String,
     description: String,
     repository: String,
-    formats: Vec<String>,
+    variants: Vec<CatalogVariant>,
     context_length: u32,
     #[serde(default)]
     companions: Vec<CatalogCompanion>,
@@ -61,6 +61,15 @@ struct CatalogModel {
     quality_score: f64,
     quality_score_provenance: String,
     quality_evidence: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogVariant {
+    format: String,
+    variant_label: String,
+    fidelity_rank: u32,
+    quantization_aware: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -133,8 +142,18 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
         ));
     }
     let mut ids = BTreeSet::new();
+    let mut presentations = BTreeSet::new();
     for model in &source.models {
-        let formats = model.formats.iter().collect::<BTreeSet<_>>();
+        let formats = model
+            .variants
+            .iter()
+            .map(|variant| variant.format.as_str())
+            .collect::<BTreeSet<_>>();
+        let variant_labels = model
+            .variants
+            .iter()
+            .map(|variant| variant.variant_label.as_str())
+            .collect::<BTreeSet<_>>();
         let companion_paths = model
             .companions
             .iter()
@@ -149,8 +168,18 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             || model.display_name.is_empty()
             || model.description.is_empty()
             || model.repository.is_empty()
-            || model.formats.is_empty()
-            || formats.len() != model.formats.len()
+            || model.variants.is_empty()
+            || formats.len() != model.variants.len()
+            || variant_labels.len() != model.variants.len()
+            || model.variants.iter().any(|variant| {
+                variant.format.is_empty()
+                    || variant.format.trim() != variant.format.as_str()
+                    || variant.variant_label.is_empty()
+                    || variant.variant_label.trim() != variant.variant_label.as_str()
+                    || variant.variant_label.contains('(')
+                    || variant.variant_label.contains(')')
+                    || variant.fidelity_rank == 0
+            })
             || model.context_length < MIN_CATALOG_CONTEXT_LENGTH
             || companion_paths.len() != model.companions.len()
             || companion_roles.len() != model.companions.len()
@@ -164,6 +193,9 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             || model.quality_score_provenance.is_empty()
             || model.quality_evidence.is_empty()
             || !ids.insert(model.id.as_str())
+            || model.variants.iter().any(|variant| {
+                !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
+            })
         {
             return Err(InventoryError::Integrity(format!(
                 "invalid or duplicate catalog declaration {}",
@@ -696,9 +728,9 @@ fn validate_resolved_catalog(
         .iter()
         .flat_map(|model| {
             model
-                .formats
+                .variants
                 .iter()
-                .map(|format| format!("{}:{format}", model.id))
+                .map(|variant| format!("{}:{}", model.id, variant.format))
         })
         .collect::<BTreeSet<_>>();
     if actual.len() != catalog.models.len()
@@ -774,42 +806,18 @@ fn package_source_matches(
     )
 }
 
-fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
-    if declaration_id.starts_with("gemma-4-") {
-        return (58, true);
-    }
-    if declaration_id == "nemotron-3-super-120b-a12b"
-        || declaration_id == "nemotron-3-ultra-550b-a55b"
-    {
-        return (58, true);
-    }
-    let rank = if format.contains("Q8") {
-        80
-    } else if format.contains("Q6") || format.contains("NVFP4") {
-        60
-    } else if format.contains("Q5") {
-        50
-    } else if format.contains("Q1") {
-        10
-    } else {
-        40
-    };
-    (rank, false)
-}
-
 fn recommendable_model(
     declaration: &CatalogModel,
-    format: &str,
+    variant: &CatalogVariant,
     package: ModelPackage,
     properties: &InventoryProperties,
 ) -> RecommendableModel {
-    let (fidelity_rank, quantization_aware) = fidelity(&declaration.id, format);
     let bundle_key = servable_model_bundle_key(&[&package.id]);
     let profile = ServingProfile {
         context_length: declaration.context_length,
     };
     RecommendableModel {
-        id: RecommendableModelId(format!("{}:{format}", declaration.id)),
+        id: RecommendableModelId(format!("{}:{}", declaration.id, variant.format)),
         checkpoint_id: declaration.id.clone(),
         configuration: ModelServingConfiguration {
             id: serving_configuration_id(&bundle_key, &profile),
@@ -817,13 +825,14 @@ fn recommendable_model(
             profile,
         },
         display_name: declaration.display_name.clone(),
+        variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
         license: declaration.license.clone(),
         capabilities: model_capabilities(properties),
         quality_score: declaration.quality_score,
         quality_score_provenance: declaration.quality_score_provenance.clone(),
-        fidelity_rank,
-        quantization_aware,
+        fidelity_rank: variant.fidelity_rank,
+        quantization_aware: variant.quantization_aware,
         quality_evidence: declaration.quality_evidence.clone(),
     }
 }
@@ -843,8 +852,8 @@ fn catalog_from_planner_inputs(
     }
     let mut models = Vec::new();
     for declaration in &source.models {
-        for format in &declaration.formats {
-            let model_id = RecommendableModelId(format!("{}:{format}", declaration.id));
+        for variant in &declaration.variants {
+            let model_id = RecommendableModelId(format!("{}:{}", declaration.id, variant.format));
             let input = by_model_id.get(&model_id).ok_or_else(|| {
                 InventoryError::Integrity(format!(
                     "planner bundle is missing catalog model {}",
@@ -853,7 +862,7 @@ fn catalog_from_planner_inputs(
             })?;
             let model = recommendable_model(
                 declaration,
-                format,
+                variant,
                 input.package.clone(),
                 &input.properties,
             );
@@ -890,7 +899,7 @@ impl ResolvingRecommendableCatalog {
     async fn resolve_model(
         &self,
         declaration: &CatalogModel,
-        format: &str,
+        variant: &CatalogVariant,
         snapshot: &HuggingFaceRepositorySnapshot,
     ) -> Result<
         (
@@ -901,7 +910,7 @@ impl ResolvingRecommendableCatalog {
         ),
         InventoryError,
     > {
-        let selector = format.to_ascii_lowercase();
+        let selector = variant.format.to_ascii_lowercase();
         let mut matches = snapshot
             .gguf_files
             .iter()
@@ -916,8 +925,9 @@ impl ResolvingRecommendableCatalog {
             .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(InventoryError::Integrity(format!(
-                "{} format {format} resolved to {} primary files",
+                "{} format {} resolved to {} primary files",
                 declaration.repository,
+                variant.format,
                 matches.len()
             )));
         }
@@ -953,7 +963,7 @@ impl ResolvingRecommendableCatalog {
         }
         let model = recommendable_model(
             declaration,
-            format,
+            variant,
             package.clone(),
             &prepared.model.model.properties,
         );
@@ -1181,10 +1191,10 @@ impl ResolvingRecommendableCatalog {
         let mut model_completed = 0;
         let resolved = stream::iter(source.models.into_iter().enumerate())
             .map(|(declaration_index, declaration)| async move {
-                let mut formats = Vec::with_capacity(declaration.formats.len());
-                for (format_index, format) in declaration.formats.iter().enumerate() {
+                let mut variants = Vec::with_capacity(declaration.variants.len());
+                for (variant_index, variant) in declaration.variants.iter().enumerate() {
                     let result = match resolved_snapshots.get(&declaration.repository) {
-                        Some(snapshot) => self.resolve_model(&declaration, format, snapshot).await,
+                        Some(snapshot) => self.resolve_model(&declaration, variant, snapshot).await,
                         None => Err(InventoryError::Io(
                             snapshot_failures
                                 .get(&declaration.repository)
@@ -1197,15 +1207,15 @@ impl ResolvingRecommendableCatalog {
                                 }),
                         )),
                     };
-                    formats.push((
+                    variants.push((
                         declaration_index,
-                        format_index,
+                        variant_index,
                         declaration.clone(),
-                        format.clone(),
+                        variant.clone(),
                         result,
                     ));
                 }
-                formats
+                variants
             })
             .buffer_unordered(6)
             .inspect(|_| {
@@ -1216,15 +1226,15 @@ impl ResolvingRecommendableCatalog {
             .collect::<Vec<_>>()
             .await;
         let mut resolved = resolved;
-        resolved.sort_by_key(|(declaration_index, format_index, ..)| {
-            (*declaration_index, *format_index)
+        resolved.sort_by_key(|(declaration_index, variant_index, ..)| {
+            (*declaration_index, *variant_index)
         });
         let mut models = Vec::new();
         let mut planner_inputs = BTreeMap::new();
         let mut source_headers = BTreeMap::new();
         let mut planner_stubs = BTreeMap::new();
         let mut diagnostics = Vec::new();
-        for (_, _, declaration, format, result) in resolved {
+        for (_, _, declaration, variant, result) in resolved {
             match result {
                 Ok((model, planner, model_headers, model_stubs)) => {
                     planner_inputs.insert(recommendable_model_bundle_key(&model), planner);
@@ -1250,7 +1260,10 @@ impl ResolvingRecommendableCatalog {
                     }
                 }
                 Err(error) => diagnostics.push(CatalogDiagnostic {
-                    entry_id: Some(RecommendableModelId(format!("{}:{format}", declaration.id))),
+                    entry_id: Some(RecommendableModelId(format!(
+                        "{}:{}",
+                        declaration.id, variant.format
+                    ))),
                     failure: ModelFailure {
                         code: "catalog_resolution_failed".to_owned(),
                         message: error.to_string(),
@@ -1308,15 +1321,21 @@ mod tests {
 
     #[test]
     fn workstation_catalog_uses_published_gguf_format_names() {
-        let formats = |id: &str| {
+        let variants = |id: &str| {
             catalog_source()
                 .expect("catalog source")
                 .models
                 .iter()
                 .find(|model| model.id == id)
                 .expect("catalog model")
-                .formats
+                .variants
                 .clone()
+        };
+        let formats = |id: &str| {
+            variants(id)
+                .into_iter()
+                .map(|variant| variant.format)
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             formats("laguna-s-2.1"),
@@ -1338,17 +1357,29 @@ mod tests {
             formats("nemotron-3.5-lightning-30b-a3b"),
             ["NVFP4", "Q4_K_M", "Q8_0"]
         );
-        assert_eq!(
-            fidelity("nemotron-3.5-lightning-30b-a3b", "NVFP4"),
-            (60, false)
-        );
+        let nvfp4 = variants("nemotron-3.5-lightning-30b-a3b")
+            .into_iter()
+            .find(|variant| variant.format == "NVFP4")
+            .expect("NVFP4 variant");
+        assert_eq!(nvfp4.variant_label, "NVFP4");
+        assert_eq!((nvfp4.fidelity_rank, nvfp4.quantization_aware), (60, false));
         assert_eq!(formats("deepseek-v4-flash"), ["UD-Q4_K_XL", "UD-Q8_K_XL"]);
         assert_eq!(
             formats("glm-5.2"),
             ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
         );
-        assert_eq!(fidelity("glm-5.2", "UD-Q4_K_XL"), (40, false));
-        assert_eq!(fidelity("glm-5.2", "UD-Q8_K_XL"), (80, false));
+        assert_eq!(
+            variants("glm-5.2")
+                .into_iter()
+                .map(|variant| (variant.variant_label, variant.fidelity_rank))
+                .collect::<Vec<_>>(),
+            [
+                ("Q4".to_owned(), 40),
+                ("Q5".to_owned(), 50),
+                ("Q6".to_owned(), 60),
+                ("Q8".to_owned(), 80)
+            ]
+        );
     }
 
     #[test]
@@ -1364,12 +1395,28 @@ mod tests {
         assert_eq!(model("qwen3.5-4b").context_length, 50_000);
         assert_eq!(model("gemma-4-e4b-it-qat").context_length, 50_000);
         assert_eq!(model("gemma-4-12b-it-qat").context_length, 100_000);
+        let [gemma] = model("gemma-4-12b-it-qat").variants.as_slice() else {
+            panic!("Gemma QAT model must declare one variant");
+        };
+        assert_eq!(gemma.variant_label, "Q4 QAT");
+        assert_eq!((gemma.fidelity_rank, gemma.quantization_aware), (58, true));
         assert_eq!(
-            model("lfm2.5-2.6b").formats,
+            model("lfm2.5-2.6b")
+                .variants
+                .iter()
+                .map(|variant| variant.format.as_str())
+                .collect::<Vec<_>>(),
             ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"]
         );
-        assert_eq!(model("bonsai-8b-q1").formats, ["Q1_0"]);
-        assert_eq!(fidelity("bonsai-8b-q1", "Q1_0"), (10, false));
+        let [bonsai] = model("bonsai-8b-q1").variants.as_slice() else {
+            panic!("bonsai must declare one variant");
+        };
+        assert_eq!(bonsai.format, "Q1_0");
+        assert_eq!(bonsai.variant_label, "Q1");
+        assert_eq!(
+            (bonsai.fidelity_rank, bonsai.quantization_aware),
+            (10, false)
+        );
     }
 
     #[test]

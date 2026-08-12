@@ -9,7 +9,6 @@ import {
   type LocalModelAssessment,
   type LocalModelAvailabilityState,
   type LocalModelMemory,
-  type LocalModelPresentation,
   type LocalModelRecommendation,
   type LocalModelsState,
   type MemoryAssessment,
@@ -40,43 +39,14 @@ import {
   LocalModelConfigurationResolver,
   localModelBundleIdentity as bundleIdentity,
 } from "./local-model-configuration-resolver"
+import { bundlePackages, resolveBundlePresentation } from "./local-model-presentation"
+export { resolveBundlePresentation } from "./local-model-presentation"
 
 const GIB = 1024 ** 3
-
-interface ModelPresentationInput {
-  readonly displayName: string
-  readonly description: string
-  readonly license?: string
-}
-
-const bundlePackages = (bundle: ServableModelBundle) =>
-  bundle._tag === "Standalone" ? [bundle.package] : [bundle.target, bundle.draft]
 
 const bundleDownloadBytes = (bundle: ServableModelBundle): number =>
   bundlePackages(bundle).reduce((total, modelPackage) => total
     + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0)
-
-const sourceName = (bundle: ServableModelBundle): string => {
-  const primary = bundle._tag === "Standalone" ? bundle.package : bundle.target
-  return primary.source._tag === "HuggingFace"
-    ? primary.source.repository.split("/").at(-1) ?? primary.source.repository
-    : primary.files[0]?.path.split("/").at(-1) ?? primary.id
-}
-
-export const resolveBundlePresentation = (
-  bundle: ServableModelBundle,
-  curated: ModelPresentationInput | undefined,
-): LocalModelPresentation => ({
-  displayName: curated?.displayName ?? sourceName(bundle),
-  description: curated?.description ?? "",
-  license: Option.fromNullable(curated?.license),
-  quantization: bundlePackages(bundle)
-    .map(({ properties }) => properties.quantization)
-    .join(" + "),
-  quantizationName: bundlePackages(bundle)
-    .map(({ properties }) => properties.quantizationName)
-    .join(" + "),
-})
 
 const installedBundle = (
   bundle: ServableModelBundle,
@@ -449,6 +419,7 @@ export const LocalModelsLive: Layer.Layer<
       const curated = catalogByBundle.get(identity)
       const presentation = resolveBundlePresentation(bundle, curated && {
         displayName: curated.displayName,
+        variantLabel: curated.variantLabel,
         description: curated.description,
         license: curated.license,
       })
@@ -478,6 +449,7 @@ export const LocalModelsLive: Layer.Layer<
               intelligenceScore: curated.qualityScore,
               intelligenceScoreSource: curated.qualityScoreProvenance,
               fidelityRank: curated.fidelityRank,
+              quantizationAware: curated.quantizationAware,
               qualityNotes: curated.qualityEvidence,
             },
           }
@@ -589,6 +561,8 @@ export const LocalModelsLive: Layer.Layer<
         : recommendationOrder.get(rightConfigurationId) ?? Number.MAX_SAFE_INTEGER
       return leftOrder - rightOrder
         || left.presentation.displayName.localeCompare(right.presentation.displayName)
+        || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
+        || bundleIdentity(left.bundle).localeCompare(bundleIdentity(right.bundle))
     })
 
     const discoveryState = recommendationState._tag === "Loading"

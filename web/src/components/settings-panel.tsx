@@ -8,7 +8,7 @@
 import { useState, useCallback, type ReactNode } from "react"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, visionPropertyLabel } from "@magnitudedev/client-common"
+import { formatModelDisplayName, formatTokensCompact, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, visionPropertyLabel } from "@magnitudedev/client-common"
 import { AlertTriangle } from "lucide-react"
 import type { CloudUsageResponse, UsagePeriod, SlotId, ProviderModelCatalogEntry } from "@magnitudedev/sdk"
 import { ProviderModelCatalogLifecycle } from "@magnitudedev/sdk"
@@ -734,7 +734,7 @@ function SlotCard({
                   value={String(index)}
                   disabled={model.availability._tag === "Disabled"}
                 >
-                  {model.displayName} — {formatContextWindowCompact(model.contextWindow)} ctx
+                  {formatModelDisplayName(model.displayName, model.variantLabel)} — {formatContextWindowCompact(model.contextWindow)} ctx
                   {Option.match(model.pricing, { onNone: () => "", onSome: (pricing) => ` — ${formatPricing(pricing)}` })}
                   {model.availability._tag === "Disabled" ? " — unavailable" : ""}
                 </option>

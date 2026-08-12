@@ -33,8 +33,10 @@ selection, and runtime residency remain separate facts.
 
 ## Release catalog
 
-The recommendable catalog is immutable release data. Human-reviewed declarations identify one exact
-default `ModelServingConfiguration`, required companion components, presentation, and recommendation
+The recommendable catalog is immutable release data. Human-reviewed declarations identify each
+artifact variant by its exact upstream format selector, short variant label, fidelity rank, and
+quantization-aware-training fact. Each variant publishes one exact default
+`ModelServingConfiguration`, required companion components, base presentation, and recommendation
 evidence. The configuration and its ICN-issued identity are
 published independently of hardware assessment. A separate lock maps each declaration to an
 immutable upstream revision. Advancing that lock is an explicit development operation.
@@ -189,6 +191,8 @@ exists for the bundle; ICN constructs and canonically identifies the configurati
 ## Conformance
 
 - Catalog membership implies only eligibility for assessment and recommendation.
+- Format, variant label, fidelity rank, and quantization-aware-training status are explicit reviewed
+  catalog facts; no downstream layer reconstructs one from another.
 - Every catalog bundle publishes the exact reviewed serving profile and required companion set used
   to construct its package.
 - Every catalog and standard serving configuration carries canonical identity constructed by ICN;

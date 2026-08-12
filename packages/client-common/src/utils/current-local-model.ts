@@ -4,6 +4,7 @@ import {
   type ModelSlot,
   type ModelSlotConfiguredLocal,
 } from "@magnitudedev/sdk"
+import { formatModelDisplayName } from "./model-presentation"
 
 export interface CurrentModelAllocation {
   readonly parallelSequences: number
@@ -54,7 +55,10 @@ export const deriveCurrentLocalModel = (
     if (slot._tag !== "ConfiguredLocal") return { _tag: "NoSelection" }
     const details: CurrentModelDetails = {
       slot,
-      displayName: slot.descriptor.displayName,
+      displayName: formatModelDisplayName(
+        slot.descriptor.displayName,
+        slot.descriptor.variantLabel,
+      ),
       contextWindow: Option.match(slot.instance, {
         onNone: Option.none,
         onSome: (instance) => {

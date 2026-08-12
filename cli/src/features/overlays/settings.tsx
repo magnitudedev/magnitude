@@ -7,7 +7,7 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 import { SingleLineInput } from '../composer/single-line-input'
 import type { AuthInfo } from './auth-display'
-import { deriveHardwareMemoryView, modelSlotResidentAllocation, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceHardware, useModelSlots, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
+import { deriveHardwareMemoryView, formatModelDisplayName, modelSlotResidentAllocation, reasoningEffortControl, reasoningPropertyLabel, selectedSlotModel, useLocalInferenceHardware, useModelSlots, visionPropertyLabel, type UseModelConfigResult } from '@magnitudedev/client-common'
 import { PRIMARY_SLOT_ID, ProviderModelCatalogLifecycle, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS, type ProviderCatalogFailure, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
 import { getInferenceSourceAction, INFERENCE_SOURCE_ACTIONS } from './inference-source-actions'
 import { getCatalogFailureNotice } from './catalog-failure-notice'
@@ -235,7 +235,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         kind: 'model' as const,
         id: m.providerModelId,
         providerId: m.providerId,
-        label: `${m.displayName} · ${formatContextWindow(m.contextWindow)} ctx${Option.match(m.pricing, { onNone: () => '', onSome: (pricing) => ` · ${formatPricing(pricing)}` })}${m.availability._tag === 'Disabled' ? ` · ${disabledReasonLabel(m.availability.reason)}` : ''}`,
+        label: `${formatModelDisplayName(m.displayName, m.variantLabel)} · ${formatContextWindow(m.contextWindow)} ctx${Option.match(m.pricing, { onNone: () => '', onSome: (pricing) => ` · ${formatPricing(pricing)}` })}${m.availability._tag === 'Disabled' ? ` · ${disabledReasonLabel(m.availability.reason)}` : ''}`,
         disabled: m.availability._tag === 'Disabled',
       }))
     }
@@ -612,7 +612,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           const label = SLOT_DISPLAY_NAMES[slotName]
           const description = SLOT_DESCRIPTIONS[slotName]
           const selected = selectedForSlot(slotId)
-          const modelLabel = Option.match(selected, { onNone: () => '—', onSome: ({ model }) => model.displayName })
+          const modelLabel = Option.match(selected, { onNone: () => '—', onSome: ({ model }) => formatModelDisplayName(model.displayName, model.variantLabel) })
           const thinkingLabel = Option.match(selected, {
             onNone: () => '—',
             onSome: ({ model, slot }) => {

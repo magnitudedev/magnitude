@@ -3,7 +3,7 @@ import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
 import type { LocalModel } from "@magnitudedev/sdk"
-import { truncateToDisplayWidth } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, truncateToDisplayWidth } from "@magnitudedev/client-common"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
 import { formatDownloadBytes } from "../local-inference/view-model"
@@ -71,8 +71,8 @@ export function OnboardingModelDownloadDetails({
   const percentageLabel = `${percentage}%`
   const barWidth = Math.max(8, contentWidth - percentageLabel.length - 2)
   const heading = failed
-    ? `Couldn’t download ${model.presentation.displayName} · ${model.presentation.quantization}`
-    : `Downloading ${model.presentation.displayName} · ${model.presentation.quantization}`
+    ? `Couldn’t download ${formatLocalModelDisplayName(model)} · ${model.presentation.quantization}`
+    : `Downloading ${formatLocalModelDisplayName(model)} · ${model.presentation.quantization}`
   const rate = downloading ? Option.getOrNull(download.bytesPerSecond) : null
   const detail = useMemo(() => {
     if (failed) return download.failure.message

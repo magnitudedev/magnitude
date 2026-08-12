@@ -35,6 +35,7 @@ const localSlot = (
     providerId: LOCAL_PROVIDER_ID,
     providerModelId: TEST_MODEL_ID,
     displayName: "Qwen Test",
+    variantLabel: Option.none(),
   },
   availability: { _tag: "Available" },
   instance,

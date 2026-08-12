@@ -5,6 +5,7 @@ import {
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
+  ModelVariantLabelSchema,
   servableModelBundlePackageIds,
   type LocalInferenceHardware,
   type MemoryAssessment,
@@ -316,6 +317,7 @@ describe("local model presentation", () => {
   })
   const curated = {
     displayName: "Liquid LFM2.5 2.6B",
+    variantLabel: ModelVariantLabelSchema.make("Q4"),
     description: "Curated model description.",
   }
 
@@ -325,10 +327,11 @@ describe("local model presentation", () => {
       curated,
     )).toEqual({
       displayName: "Liquid LFM2.5 2.6B",
+      variantLabel: "Q4",
       description: "Curated model description.",
       license: Option.none(),
       quantization: "Q4_K - Medium",
-      quantizationName: "4-bit",
+      precisionLabel: "4-bit",
     })
   })
 
@@ -338,10 +341,11 @@ describe("local model presentation", () => {
       undefined,
     )).toEqual({
       displayName: "LFM2.5-2.6B-GGUF",
+      variantLabel: "Q4_K - Medium",
       description: "",
       license: Option.none(),
       quantization: "Q4_K - Medium",
-      quantizationName: "4-bit",
+      precisionLabel: "4-bit",
     })
   })
 
@@ -351,10 +355,11 @@ describe("local model presentation", () => {
       undefined,
     )).toEqual({
       displayName: "local-model.gguf",
+      variantLabel: "Q4_K - Medium",
       description: "",
       license: Option.none(),
       quantization: "Q4_K - Medium",
-      quantizationName: "4-bit",
+      precisionLabel: "4-bit",
     })
   })
 })

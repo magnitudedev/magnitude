@@ -112,6 +112,8 @@ export {
   DownloadAttemptIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
+  ModelVariantLabelSchema,
+  formatModelDisplayName,
   RecommendationIdSchema,
   ModelAssessmentIdSchema,
   AssessmentEnvironmentIdSchema,

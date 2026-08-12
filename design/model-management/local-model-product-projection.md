@@ -1,13 +1,16 @@
 ---
 applies_to:
   - packages/acn/src/local-models.ts
+  - packages/acn/src/local-model-presentation.ts
   - packages/acn/src/local-model-assessor.ts
   - packages/acn/src/local-model-configuration-resolver.ts
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
+  - packages/agent/src/ambient/config-ambient.ts
   - packages/client-common/src/hooks/use-local-inference-state.ts
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts
   - packages/client-common/src/local-models/**
+  - packages/client-common/src/utils/model-presentation.ts
   - cli/src/features/local-inference/**
   - cli/src/features/model-*/**
 ---
@@ -44,7 +47,8 @@ temporarily unable to load. Those are facets of the same model, not different en
 Each `LocalModel` is identified by exact servable-bundle structure and contains:
 
 - the complete bundle;
-- presentation and download size;
+- presentation and download size; presentation keeps the base display name, short variant label,
+  user-facing precision label, and exact quantization independent;
 - one explicit `catalogMembershipState`;
 - one explicit `acquisitionState`;
 - one explicit `servingState`.
@@ -79,10 +83,10 @@ Exact bundle identity coalesces those sources into one row. Catalog removal cann
 installed bundle; package removal removes a non-catalog row but leaves a catalog row as uninstalled.
 
 `catalogMembershipState` is `NotInCatalog` or `InCatalog`. `InCatalog` carries the complete catalog
-data required by product presentation: intelligence score and source, fidelity rank, and quality
-notes. This membership is an explicit source fact because it is not derivable from acquisition,
-assessment, availability, or recommendation state. It does not create another model collection or
-identity.
+data required by product presentation: intelligence score and source, fidelity rank,
+quantization-aware-training status, and quality notes. This membership is an explicit source fact
+because it is not derivable from acquisition, assessment, availability, or recommendation state. It
+does not create another model collection or identity.
 
 Both `Magnitude` and `HuggingFaceCache` are installed origins and are equally runnable. Origin
 affects ownership-sensitive operations, not eligibility.
@@ -128,6 +132,12 @@ installed rows and preserves assessment or availability failures on those rows. 
 status reads `acquisitionState` from the same rows. All surfaces retain references to the canonical
 `LocalModel`; client wrappers may add interaction-only state but must not copy domain facts that
 need synchronization.
+
+Clients render a local product name as `base display name (variant label)`. Generic provider and
+slot projections carry the same optional structured label. The protocol's pure composition helper
+applies the same rule to agent attribution, menus, settings, status, and exit notices. Exact
+quantization and precision remain detail metadata. Consumers never parse names or infer a variant
+from fidelity rank.
 
 Recommendation labels and explanations remain visible independently of memory guidance. The
 selected row's detail pane presents stable system-use guidance and current load headroom on the

@@ -6,6 +6,7 @@ import {
   ModelSlotConfiguredLocal,
   ModelSlotConfiguredRemote,
   ModelSlotUnassigned,
+  ModelVariantLabelSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -58,6 +59,7 @@ describe('agent model configuration boundary', () => {
       providerModelId,
       modelFamilyId: Option.none(),
       displayName: 'Local model',
+      variantLabel: Option.some(ModelVariantLabelSchema.make('Q4 QAT')),
       supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
       contextWindow: 8_192,
       maxOutputTokens: 1_024,
@@ -79,7 +81,12 @@ describe('agent model configuration boundary', () => {
       primary: new ModelSlotConfiguredLocal({
         slotId: PRIMARY_SLOT_ID,
         selection: { providerId, providerModelId, reasoningEffort },
-        descriptor: { providerId, providerModelId, displayName: 'Local model' },
+        descriptor: {
+          providerId,
+          providerModelId,
+          displayName: 'Local model',
+          variantLabel: Option.some(ModelVariantLabelSchema.make('Q4 QAT')),
+        },
         availability: { _tag: 'Available' },
         instance,
         actions: [],
@@ -94,7 +101,11 @@ describe('agent model configuration boundary', () => {
 
     expect(state.bySlot.primary).toMatchObject({
       _tag: 'Ready',
-      config: { providerId, providerModelId },
+      config: {
+        providerId,
+        providerModelId,
+        modelDisplayName: 'Local model (Q4 QAT)',
+      },
     })
   })
 
@@ -107,6 +118,7 @@ describe('agent model configuration boundary', () => {
       providerModelId,
       modelFamilyId: Option.none(),
       displayName: 'GLM 5.2',
+      variantLabel: Option.none(),
       supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
       contextWindow: 1048576,
       maxOutputTokens: 128000,
@@ -129,7 +141,12 @@ describe('agent model configuration boundary', () => {
       primary: new ModelSlotConfiguredRemote({
         slotId: PRIMARY_SLOT_ID,
         selection,
-        descriptor: { providerId, providerModelId, displayName: 'GLM 5.2' },
+        descriptor: {
+          providerId,
+          providerModelId,
+          displayName: 'GLM 5.2',
+          variantLabel: Option.none(),
+        },
         availability: {
           _tag: 'Unavailable',
           failure: {
