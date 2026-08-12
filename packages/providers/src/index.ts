@@ -61,6 +61,11 @@ export {
   type ExaWebSearchInstance,
 } from "./exa/web-search"
 export {
+  createCrwWebSearch,
+  type CrwWebSearchConfig,
+  type CrwWebSearchInstance,
+} from "./crw/web-search"
+export {
   WebSearchProviderSchema,
   WebSearchNotConfigured,
   WebSearchRequestEncodingFailed,
@@ -69,6 +74,7 @@ export {
   WebSearchRejected,
   WebSearchResponseReadFailed,
   WebSearchInvalidResponse,
+  WebSearchStructuredOutputUnsupported,
   formatWebSearchError,
   type WebSearchProvider,
   type WebSearchError,

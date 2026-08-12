@@ -64,3 +64,12 @@ Magnitude can use [Exa](https://exa.ai) to search the web. Create an Exa API key
 export EXA_API_KEY="your-api-key"
 magnitude
 ```
+
+Magnitude can also use [fastCRW](https://github.com/us/crw), an open source search engine you can run yourself. A self-hosted instance needs no account and no key, so point Magnitude at its address:
+
+```sh
+export CRW_API_URL="http://localhost:3000"
+magnitude
+```
+
+To use the hosted fastCRW engine instead, set `CRW_API_KEY` and leave `CRW_API_URL` unset. If `EXA_API_KEY` is also set, Exa is used.

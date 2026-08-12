@@ -1,9 +1,12 @@
 import { Ambient } from '@magnitudedev/event-core'
 import { Effect, Schema } from 'effect'
+import { WebSearchProviderSchema } from '@magnitudedev/sdk'
 
 export const WebSearchAvailabilitySchema = Schema.Union(
   Schema.TaggedStruct('Available', {
-    source: Schema.Literal('magnitude', 'exa'),
+    // Derived, not restated: adding a search provider must not require editing
+    // this union in a second place.
+    source: WebSearchProviderSchema,
   }),
   Schema.TaggedStruct('Unavailable', {}),
 )
