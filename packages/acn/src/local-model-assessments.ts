@@ -98,6 +98,7 @@ export type LocalModelAssessmentResult =
       readonly assessments: readonly LocalModelAssessment[]
     }
   | { readonly _tag: "InvalidBundle"; readonly message: string }
+  | { readonly _tag: "Failed"; readonly failure: ModelFailure }
 
 export const formatLocalModelAssessmentFailure = (error: unknown): string => {
   try {
@@ -207,6 +208,8 @@ export const localModelAssessmentResultFromIcn = (
 ): Effect.Effect<LocalModelAssessmentResult, ParseResult.ParseError> =>
   result._tag === "InvalidBundle"
     ? Effect.succeed({ _tag: "InvalidBundle", message: result.failure.message })
+    : result._tag === "Failed"
+    ? Effect.succeed({ _tag: "Failed", failure: result.failure })
     : Effect.gen(function* () {
         return {
           _tag: "Assessed" as const,

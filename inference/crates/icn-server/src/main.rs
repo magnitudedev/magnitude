@@ -15,16 +15,16 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType,
 };
 use icn_contracts::models::{
-    AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
-    InstalledModelPackages as _, LoadModelReady, LoadModelRequest, MemoryAssessment,
-    ModelAssessment, ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile,
-    ModelAssessor, ModelBundleInput, ModelFailure as DomainModelFailure, ModelInstance,
-    ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelLoadStage, ModelPackageId,
-    ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
-    ModelServingConfigurationId, ModelStoppingAllocation, PerformanceConfidence,
-    PerformanceEvidence, PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
-    ServableModelBundle as DomainServableModelBundle,
+    AssessModelRequest, AssessModelResult, AssessModelsRequest, AssessModelsResponse,
+    AssessmentEnvironmentId, InstalledModelPackages as _, LoadModelReady, LoadModelRequest,
+    MemoryAssessment, ModelAssessment, ModelAssessmentId,
+    ModelAssessmentProfile as DomainModelAssessmentProfile, ModelAssessor, ModelBundleInput,
+    ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceFailure, ModelInstanceId,
+    ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadEvent,
+    ModelLoadPlan, ModelLoadStage, ModelPackageId, ModelPackageOperand, ModelReleaseReason,
+    ModelServingConfiguration, ModelServingConfigurationId, ModelStoppingAllocation,
+    PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
+    RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
 };
 use icn_contracts::{
     CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
@@ -1860,6 +1860,81 @@ impl NativeModelAssessor {
         })
     }
 
+    async fn assess_request(
+        &self,
+        item: AssessModelRequest,
+        environment: &AssessmentEnvironment,
+        release_catalog: Arc<ReleaseCatalog>,
+        deadline_at_ms: u64,
+    ) -> Result<AssessModelResult, InventoryError> {
+        let request_id = item.request_id;
+        let bundle_key = match bundle_input_key(&item.bundle) {
+            Ok(bundle_key) => bundle_key,
+            Err(message) => {
+                return Ok(AssessModelResult::InvalidBundle {
+                    request_id,
+                    failure: DomainModelFailure {
+                        code: "invalid_target".to_owned(),
+                        message,
+                        retryable: false,
+                    },
+                });
+            }
+        };
+        if let Err(message) = validate_model_assessment_profiles(&item.profiles) {
+            return Ok(AssessModelResult::InvalidBundle {
+                request_id,
+                failure: DomainModelFailure {
+                    code: "invalid_profiles".to_owned(),
+                    message,
+                    retryable: false,
+                },
+            });
+        }
+        let cached = self
+            .cached_profiles(&bundle_key, &item.profiles, environment)
+            .await?;
+        if let Some(profiles) = cached {
+            return Ok(AssessModelResult::Assessed {
+                request_id,
+                profiles,
+            });
+        }
+
+        let release_bundle_key = bundle_key.clone();
+        let release_bundle =
+            spawn_blocking_traced(move || release_catalog.resolve_bundle(&release_bundle_key))
+                .await
+                .map_err(|error| {
+                    InventoryError::Internal(format!(
+                        "release model preparation task failed for {}: {error}",
+                        bundle_key.0
+                    ))
+                })??;
+        let resolved = match release_bundle {
+            Some(resolved) => Ok(resolved),
+            None if bundle_uses_only_installed_packages(&item.bundle) => {
+                self.models.resolve_bundle(item.bundle).await
+            }
+            None => Err(InventoryError::InvalidRequest(format!(
+                "bundle {} is not installed or part of the release catalog",
+                bundle_key.0
+            ))),
+        };
+        match resolved {
+            Ok(resolved) => Ok(AssessModelResult::Assessed {
+                request_id,
+                profiles: self
+                    .assess_profiles(&resolved, &item.profiles, environment, deadline_at_ms)
+                    .await?,
+            }),
+            Err(error) => Ok(AssessModelResult::InvalidBundle {
+                request_id,
+                failure: assessment_bundle_failure(error)?,
+            }),
+        }
+    }
+
     fn resolved_for_planning(
         resolved: &icn_contracts::models::ResolvedServableModelBundle,
     ) -> ResolvedModel {
@@ -2269,6 +2344,42 @@ fn assessment_bundle_failure(error: InventoryError) -> Result<DomainModelFailure
     }
 }
 
+fn inventory_model_failure(error: InventoryError) -> DomainModelFailure {
+    let (code, retryable) = match &error {
+        InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
+        InventoryError::InvalidRequest(_) => ("invalid_request".to_owned(), false),
+        InventoryError::NotFound(_) => ("not_found".to_owned(), false),
+        InventoryError::NotReady(_) => ("not_ready".to_owned(), true),
+        InventoryError::Busy(_) => ("busy".to_owned(), true),
+        InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
+        InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
+        InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
+        InventoryError::Io(_) => ("io_failed".to_owned(), true),
+        InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
+        InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
+        InventoryError::ConcurrentMutation(_) => ("concurrent_mutation".to_owned(), true),
+        InventoryError::ModelOperation {
+            code, retryable, ..
+        } => (code.clone(), *retryable),
+        InventoryError::Internal(_) => ("internal".to_owned(), true),
+    };
+    DomainModelFailure {
+        code,
+        message: error.to_string(),
+        retryable,
+    }
+}
+
+fn failed_assessment_result(
+    request_id: icn_contracts::models::ModelAssessmentRequestId,
+    error: InventoryError,
+) -> AssessModelResult {
+    AssessModelResult::Failed {
+        request_id,
+        failure: inventory_model_failure(error),
+    }
+}
+
 impl ModelAssessor for NativeModelAssessor {
     fn assess(
         &self,
@@ -2281,98 +2392,32 @@ impl ModelAssessor for NativeModelAssessor {
             tokio::time::timeout(remaining, async move {
                 let environment = self.environment().await?;
                 let release_catalog = Arc::clone(&self.release_catalog);
-                let evaluated = futures_util::stream::iter(
-                    request.requests.into_iter().enumerate(),
-                )
-                .map(|(index, item)| {
-                    let environment = environment.clone();
-                    let release_catalog = Arc::clone(&release_catalog);
-                    async move {
-                        let request_id = item.request_id;
-                        let bundle_key = match bundle_input_key(&item.bundle) {
-                            Ok(bundle_key) => bundle_key,
-                            Err(message) => {
-                                return Ok::<_, InventoryError>((
-                                    index,
-                                    AssessModelResult::InvalidBundle {
-                                        request_id,
-                                        failure: DomainModelFailure {
-                                            code: "invalid_target".to_owned(),
-                                            message,
-                                            retryable: false,
-                                        },
-                                    },
-                                ));
+                let evaluated =
+                    futures_util::stream::iter(request.requests.into_iter().enumerate())
+                        .map(|(index, item)| {
+                            let environment = environment.clone();
+                            let release_catalog = Arc::clone(&release_catalog);
+                            let failed_request_id = item.request_id.clone();
+                            async move {
+                                self.assess_request(
+                                    item,
+                                    &environment,
+                                    release_catalog,
+                                    deadline_at_ms,
+                                )
+                                .await
                             }
-                        };
-                        if let Err(message) = validate_model_assessment_profiles(&item.profiles) {
-                            return Ok((
-                                index,
-                                AssessModelResult::InvalidBundle {
-                                    request_id,
-                                    failure: DomainModelFailure {
-                                        code: "invalid_profiles".to_owned(),
-                                        message,
-                                        retryable: false,
-                                    },
-                                },
-                            ));
-                        }
-                        let cached = self
-                            .cached_profiles(&bundle_key, &item.profiles, &environment)
-                            .await?;
-                        let result = if let Some(profiles) = cached {
-                            AssessModelResult::Assessed {
-                                request_id,
-                                profiles,
-                            }
-                        } else {
-                            let release_bundle_key = bundle_key.clone();
-                            let release_bundle = spawn_blocking_traced(move || {
-                                release_catalog.resolve_bundle(&release_bundle_key)
+                            .map(move |evaluated| {
+                                let result = evaluated.unwrap_or_else(|error| {
+                                    failed_assessment_result(failed_request_id, error)
+                                });
+                                (index, result)
                             })
-                            .await
-                            .map_err(|error| {
-                                InventoryError::Internal(format!(
-                                    "release model preparation task failed for {}: {error}",
-                                    bundle_key.0
-                                ))
-                            })??;
-                            let resolved = match release_bundle {
-                                Some(resolved) => Ok(resolved),
-                                None if bundle_uses_only_installed_packages(&item.bundle) => {
-                                    self.models.resolve_bundle(item.bundle).await
-                                }
-                                None => Err(InventoryError::InvalidRequest(format!(
-                                    "bundle {} is not installed or part of the release catalog",
-                                    bundle_key.0
-                                ))),
-                            };
-                            match resolved {
-                                Ok(resolved) => AssessModelResult::Assessed {
-                                    request_id,
-                                    profiles: self
-                                        .assess_profiles(
-                                            &resolved,
-                                            &item.profiles,
-                                            &environment,
-                                            deadline_at_ms,
-                                        )
-                                        .await?,
-                                },
-                                Err(error) => AssessModelResult::InvalidBundle {
-                                    request_id,
-                                    failure: assessment_bundle_failure(error)?,
-                                },
-                            }
-                        };
-                        Ok::<_, InventoryError>((index, result))
-                    }
-                })
-                .buffer_unordered(self.assessor.assessment_concurrency.concurrency())
-                .collect::<Vec<_>>()
-                .await;
-                let mut results = evaluated.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        })
+                        .buffer_unordered(self.assessor.assessment_concurrency.concurrency())
+                        .collect::<Vec<_>>()
+                        .await;
+                let mut results = evaluated;
                 results.sort_unstable_by_key(|(index, _)| *index);
                 Ok(AssessModelsResponse {
                     environment_id: environment.id,
@@ -3394,32 +3439,6 @@ impl From<InventoryError> for ModelTransitionFailure {
 
 impl NativeModelInstanceController {
     const DISCONNECTED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-    fn load_failure(error: InventoryError) -> DomainModelFailure {
-        let (code, retryable) = match &error {
-            InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
-            InventoryError::InvalidRequest(_) => ("invalid_request".to_owned(), false),
-            InventoryError::NotFound(_) => ("not_found".to_owned(), false),
-            InventoryError::NotReady(_) => ("not_ready".to_owned(), true),
-            InventoryError::Busy(_) => ("busy".to_owned(), true),
-            InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
-            InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
-            InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
-            InventoryError::Io(_) => ("io_failed".to_owned(), true),
-            InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
-            InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
-            InventoryError::ConcurrentMutation(_) => ("concurrent_mutation".to_owned(), true),
-            InventoryError::ModelOperation {
-                code, retryable, ..
-            } => (code.clone(), *retryable),
-            InventoryError::Internal(_) => ("internal".to_owned(), true),
-        };
-        DomainModelFailure {
-            code,
-            message: error.to_string(),
-            retryable,
-        }
-    }
 
     fn new(
         inventory: Arc<ModelManager>,
@@ -4837,7 +4856,8 @@ impl ModelInstanceController for NativeModelInstanceController {
                                 .await;
                             send_stopped();
                         } else {
-                            let failure = ModelInstanceFailure::from(Self::load_failure(error));
+                            let failure =
+                                ModelInstanceFailure::from(inventory_model_failure(error));
                             controller
                                 .publish_failed(&instance_id, &configuration_id, failure.clone())
                                 .await;
@@ -5510,13 +5530,29 @@ mod tests {
             message: "planning timed out".to_owned(),
             retryable: true,
         })
-        .expect_err("operational failure remains endpoint-wide");
+        .expect_err("operational failure remains distinct from invalid input");
         assert!(matches!(
-            operational,
+            &operational,
             InventoryError::ModelOperation {
                 retryable: true,
                 ..
             }
+        ));
+
+        let result = failed_assessment_result(
+            icn_contracts::models::ModelAssessmentRequestId("request-failed".to_owned()),
+            operational,
+        );
+        assert!(matches!(
+            result,
+            AssessModelResult::Failed {
+                request_id,
+                failure: DomainModelFailure {
+                    code,
+                    retryable: true,
+                    ..
+                },
+            } if request_id.0 == "request-failed" && code == "planning_deadline"
         ));
     }
 

@@ -1236,6 +1236,28 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "requestId",
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "requestId": {
+                "$ref": "#/components/schemas/ModelAssessmentRequestId"
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
           }
         ]
       },

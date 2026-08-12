@@ -156,6 +156,12 @@ const completedAssessment = (
       },
     } : undefined
   }
+  if (result._tag === "Failed") {
+    return request._tag === "Authored" ? {
+      configuration: request.configuration,
+      assessment: { _tag: "Failed", failure: result.failure },
+    } : undefined
+  }
   const resultForConfiguration = result.assessments.find(({ configuration }) =>
     request._tag === "Authored"
       ? configurationEquivalent(configuration, request.configuration)
