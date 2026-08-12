@@ -399,6 +399,7 @@ pub struct RecommendableModel {
     pub checkpoint_id: String,
     pub configuration: ModelServingConfiguration,
     pub display_name: String,
+    pub variant_label: String,
     pub description: String,
     pub license: String,
     pub capabilities: ModelCapabilities,

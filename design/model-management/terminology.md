@@ -69,6 +69,7 @@ run now. Cached assessment never authorizes a load.
 | Term | Meaning |
 |---|---|
 | **Recommendable model** | One curated configuration plus presentation, capabilities, license, and ranking data. |
+| **Model variant label** | A short, curated human-readable discriminator such as `Q4`, `Q4 QAT`, or `NVFP4`. It distinguishes product rows sharing a base model name without serving as identity or encoding exact artifact format. |
 | **Recommendable model catalog** | Release-bound curated configurations eligible for assessment and recommendation. |
 | **Local model** | One client-facing product row for an exact servable bundle, with acquisition and serving state. |
 | **Recommendation** | A policy-owned intent and explanation annotating one local model. |
@@ -173,8 +174,8 @@ catalog's intelligence score and source, fidelity rank, and quality notes.
 | `(ProviderId, ProviderModelId)` | One provider offering | Provider boundary |
 | `SlotId` | One product role assignment | ACN |
 
-Display names, paths, repositories, filenames, recommendation membership, cache keys, and array
-positions are never operational identity. For the local provider, the configuration ID is
+Display names, variant labels, paths, repositories, filenames, recommendation membership, cache
+keys, and array positions are never operational identity. For the local provider, the configuration ID is
 represented in the `ProviderModelId` namespace without making the brands interchangeable.
 
 ## Canonical relationship

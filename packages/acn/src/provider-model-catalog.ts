@@ -78,6 +78,7 @@ const toCatalogModel = (
     providerModelId: model.providerModelId,
     modelFamilyId: Option.fromNullable(model.modelFamilyId),
     displayName: model.displayName,
+    variantLabel: Option.none(),
     supportedSlots,
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxOutputTokens,

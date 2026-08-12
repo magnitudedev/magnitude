@@ -3,6 +3,7 @@ import {
   installedLocalModels,
   localModelConfigurationId,
   localModelProviderModelId,
+  formatLocalModelDisplayName,
 } from "@magnitudedev/client-common"
 export {
   installedLocalModels,
@@ -55,7 +56,8 @@ const compareSelections = (
       ? recommendationIntentOrder[right.recommendation.value.intent]
       : 4)
     : 0)
-  || left.model.presentation.displayName.localeCompare(right.model.presentation.displayName)
+  || formatLocalModelDisplayName(left.model).localeCompare(formatLocalModelDisplayName(right.model))
+  || left.id.localeCompare(right.id)
 
 export const localModelBundleKey = (model: LocalModel): string =>
   model.bundle._tag === "Standalone"
@@ -400,7 +402,7 @@ export const describeLocalHardware = (
 }
 
 export const selectionTitle = ({ model }: LocalInferenceSelection): string =>
-  model.presentation.displayName
+  formatLocalModelDisplayName(model)
 
 export const selectionMetadata = ({ model }: LocalInferenceSelection): string => {
   const configuration = model.servingState._tag === "Resolving"
@@ -412,7 +414,7 @@ export const selectionMetadata = ({ model }: LocalInferenceSelection): string =>
     onNone: () => localModelMaximumContextLength(model),
     onSome: ({ profile }) => profile.contextLength,
   })
-  return `${model.presentation.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
+  return `${model.presentation.precisionLabel} · ${model.presentation.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
     contextLength,
   )} ctx`
 }

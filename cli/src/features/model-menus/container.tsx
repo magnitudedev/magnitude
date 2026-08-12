@@ -13,6 +13,8 @@ import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
   deriveCurrentLocalModel,
+  formatLocalModelDisplayName,
+  formatModelDisplayName,
   modelSlotInstanceId,
   modelSlotResidentAllocation,
   getDisplayWidth,
@@ -262,10 +264,10 @@ const modelsMenuLocalModel = (entry: ModelsMenuEntry): LocalModel | undefined =>
     : entry._tag === "LocalStatus" ? entry.model : undefined
 
 const modelsMenuDisplayName = (entry: ModelsMenuEntry): string => entry._tag === "Local"
-  ? entry.model.presentation.displayName
+  ? formatLocalModelDisplayName(entry.model)
   : entry._tag === "LocalStatus"
-    ? entry.model.presentation.displayName
-    : entry.model.displayName
+    ? formatLocalModelDisplayName(entry.model)
+    : formatModelDisplayName(entry.model.displayName, entry.model.variantLabel)
 
 const modelsMenuContextLength = (entry: ModelsMenuEntry): number => entry._tag === "Local"
   ? entry.model.servingState._tag === "Assessed"
@@ -758,6 +760,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
       const rightLocal = right._tag !== "Provider"
       if (leftLocal !== rightLocal) return leftLocal ? -1 : 1
       return modelsMenuDisplayName(left).localeCompare(modelsMenuDisplayName(right))
+        || left.id.localeCompare(right.id)
     })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(null)
@@ -804,10 +807,10 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   })
   const detailIsLocal = detail !== null && detail._tag !== "Provider"
   const detailIsSelected = detail !== null && isSelected(detail)
-  const detailCatalogModel = detail === null ? undefined : modelsMenuLocalModel(detail)
-  const detailCatalogConfigurationId = detailCatalogModel?.servingState._tag === "Assessed"
-    && detailCatalogModel.catalogMembershipState._tag === "InCatalog"
-    ? detailCatalogModel.servingState.configuration.id
+  const detailLocalModel = detail === null ? undefined : modelsMenuLocalModel(detail)
+  const detailCatalogConfigurationId = detailLocalModel?.servingState._tag === "Assessed"
+    && detailLocalModel.catalogMembershipState._tag === "InCatalog"
+    ? detailLocalModel.servingState.configuration.id
     : undefined
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
@@ -1040,6 +1043,15 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
           <text style={{ fg: theme.muted }}>
             {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
           </text>
+          {detailLocalModel && (
+            <>
+              <text style={{ fg: theme.muted }}>Precision: {detailLocalModel.presentation.precisionLabel}</text>
+              <text style={{ fg: theme.muted }}>Quantization: {detailLocalModel.presentation.quantization}</text>
+              {detailLocalModel.catalogMembershipState._tag === "InCatalog" && detailLocalModel.catalogMembershipState.catalogData.quantizationAware && (
+                <text style={{ fg: theme.muted }}>Training: Quantization-aware</text>
+              )}
+            </>
+          )}
           {detailIsLocal && Option.exists(detailMemory, ({ currentHeadroomState, systemUseState }) =>
             currentHeadroomState._tag === "Insufficient" || systemUseState._tag === "High") && (
             <text style={{ fg: theme.warning }}>
@@ -1196,11 +1208,6 @@ const qualityLabel = (model: LocalModel): string =>
         ? "Very high"
         : model.catalogMembershipState.catalogData.fidelityRank >= 45 ? "High" : "Reduced"
 
-const catalogDataLabel = (model: LocalModel): string =>
-  model.catalogMembershipState._tag !== "InCatalog"
-    ? "not in catalog"
-    : `intelligence ${intelligenceLabel(model)} · ${qualityLabel(model)}`
-
 export const huggingFaceRepositoryUrls = (
   model: LocalModel,
 ): readonly string[] => [...new Set((model.bundle._tag === "Standalone"
@@ -1286,7 +1293,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
     const modelWidth = Math.max(1, layout.contentWidth - cursorWidth - primaryStatusWidth)
     const modelLabel = formatCatalogModelLabel(
       model.presentation.displayName,
-      model.presentation.quantizationName,
+      model.presentation.variantLabel,
       modelWidth,
     )
     const metadata = [recommendationText, memoryText, ...(layout.showSpeed ? [speedText] : [])]
@@ -1347,7 +1354,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         {focused ? "›" : " "}
       </text>
       <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
-        {formatCatalogModelLabel(model.presentation.displayName, model.presentation.quantizationName, layout.modelWidth)}
+        {formatCatalogModelLabel(model.presentation.displayName, model.presentation.variantLabel, layout.modelWidth)}
       </text>
       <text style={{ fg: theme.primary, width: layout.columns.recommendation }} wrapMode="none">
         {truncateToDisplayWidth(recommendationText, layout.columns.recommendation)}
@@ -1413,7 +1420,11 @@ const CatalogMenu = memo(function CatalogMenu({
   const candidates = [...catalogModels].sort((left, right) => {
     const leftInstalled = left.acquisitionState._tag === "Installed"
     const rightInstalled = right.acquisitionState._tag === "Installed"
-    return leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1
+    return (leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1)
+      || left.presentation.displayName.localeCompare(right.presentation.displayName)
+      || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
+      || Option.getOrElse(localModelConfigurationId(left), () => "")
+        .localeCompare(Option.getOrElse(localModelConfigurationId(right), () => ""))
   })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
@@ -1618,7 +1629,7 @@ const CatalogMenu = memo(function CatalogMenu({
       >
         <MenuHeader
           title="Catalog"
-          selection={detail.presentation.displayName}
+          selection={formatLocalModelDisplayName(detail)}
           onSectionClick={() => {
             setDetailId(null)
             setRootSwitchingEnabled(true)
@@ -1636,33 +1647,32 @@ const CatalogMenu = memo(function CatalogMenu({
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}>
           <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.presentation.displayName}</text>
-          <text style={{ fg: theme.muted }} wrapMode="word">{detail.presentation.description}</text>
+          <text style={{ fg: theme.muted }} wrapMode="word">
+            {detail.presentation.quantization}
+            {detail.catalogMembershipState._tag === "InCatalog" && detail.catalogMembershipState.catalogData.quantizationAware && " · QAT"}
+            {` · Fidelity: ${qualityLabel(detail)}`}
+          </text>
+          <text style={{ fg: theme.muted }} wrapMode="word">
+            Intelligence {intelligenceLabel(detail)}
+          </text>
+          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">{detail.presentation.description}</text>
           {Option.isSome(recommendation) && (
             <>
               <text style={{ fg: theme.primary }}>{recommendationLabel(recommendation)}</text>
               <text style={{ fg: theme.muted }} wrapMode="word">{recommendation.value.explanation}</text>
             </>
           )}
-          <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>Calibrated for this machine</text>
-          {layout.compactHeader ? (
-            <>
-              <text style={{ fg: theme.muted }} wrapMode="word">Memory: {detailMemoryBytes === undefined ? "—" : formatBytes(detailMemoryBytes)}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Quantization: {detail.presentation.quantization}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Catalog: {catalogDataLabel(detail)}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}</text>
-            </>
-          ) : (
-            <>
-              <text style={{ fg: theme.muted }} wrapMode="word">
-                {detailMemoryBytes === undefined ? "—" : formatBytes(detailMemoryBytes)} memory · {detail.presentation.quantization} · {catalogDataLabel(detail)}
-              </text>
-              <text style={{ fg: theme.muted }} wrapMode="word">
-                {performanceRangeSpeedLabel(detail, "tokens/sec")}
-              </text>
-            </>
-          )}
-          <text style={{ fg: failed ? theme.error : detailInstallationStarting || downloading || downloaded ? theme.primary : theme.muted }}>
-            {catalogStatus(detail, detailInstallationStarting)}
+          <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>On this computer</text>
+          <text style={{ fg: theme.muted }} wrapMode="word">
+            Memory: {detailMemoryBytes === undefined ? "—" : formatBytes(detailMemoryBytes)}
+          </text>
+          <text style={{ fg: theme.muted }} wrapMode="word">
+            Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}
+          </text>
+          <text style={{ fg: theme.muted }}>
+            Status: <span fg={failed ? theme.error : detailInstallationStarting || downloading || downloaded ? theme.primary : theme.muted}>
+              {catalogStatus(detail, detailInstallationStarting)}
+            </span>
           </text>
           {failed && <text style={{ fg: theme.error }}>{detail.acquisitionState.failure.message}</text>}
           {detailInstallationFailed && (
@@ -2254,7 +2264,7 @@ const CloudMenu = memo(function CloudMenu({
             <text style={{ fg: theme.muted }}>AVAILABLE MODELS</text>
             {cloudModels.map((model) => (
               <text key={providerModelKey(model)} style={{ fg: theme.foreground }}>
-                {model.displayName}<span style={{ fg: theme.muted }}> · {formatContextWindow(model.contextWindow)} context</span>
+                {formatModelDisplayName(model.displayName, model.variantLabel)}<span style={{ fg: theme.muted }}> · {formatContextWindow(model.contextWindow)} context</span>
               </text>
             ))}
           </box>

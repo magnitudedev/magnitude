@@ -1,6 +1,7 @@
 import { Option } from "effect"
 import {
   findLocalModelByConfigurationId,
+  formatLocalModelDisplayName,
   type OnboardingModelOperation,
   type OnboardingModelSubmission,
 } from "@magnitudedev/client-common"
@@ -232,9 +233,9 @@ export const deriveOnboardingModelSetupView = ({
 export const onboardingModelSetupPlaceholder = (view: OnboardingModelSetupView): string => {
   switch (view._tag) {
     case "Choosing": return "Select a model to start coding…"
-    case "Downloading": return `Downloading ${view.model.presentation.displayName}…`
-    case "DownloadFailed": return `Couldn’t download ${view.model.presentation.displayName}`
-    case "Configuring": return `Configuring ${view.model.presentation.displayName}…`
+    case "Downloading": return `Downloading ${formatLocalModelDisplayName(view.model)}…`
+    case "DownloadFailed": return `Couldn’t download ${formatLocalModelDisplayName(view.model)}`
+    case "Configuring": return `Configuring ${formatLocalModelDisplayName(view.model)}…`
     case "Activating":
       return view.phase === "Loading"
         ? `Loading ${view.displayName}…`

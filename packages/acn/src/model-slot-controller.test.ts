@@ -16,6 +16,7 @@ import {
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
+  ModelVariantLabelSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   ProviderModelCatalogReady,
@@ -98,6 +99,7 @@ const catalogModel: ProviderModelCatalogEntry = {
   providerModelId,
   modelFamilyId: Option.none(),
   displayName: "Test local model",
+  variantLabel: Option.some(ModelVariantLabelSchema.make("Q4")),
   supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
   contextWindow: 8_192,
   maxOutputTokens: 1_024,
@@ -364,6 +366,10 @@ describe("ModelSlotController load admission", () => {
         )
         expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
           _tag: "ConfiguredLocal",
+          descriptor: {
+            displayName: "Test local model",
+            variantLabel: Option.some(ModelVariantLabelSchema.make("Q4")),
+          },
           availability: { _tag: "Unavailable" },
         })
       }).pipe(Effect.provide(harness.layer))

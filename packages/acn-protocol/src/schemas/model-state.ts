@@ -98,6 +98,17 @@ export type ModelDownloadStage = typeof ModelDownloadStageSchema.Type
 export const ModelInstanceIdSchema = NonEmptyString.pipe(Schema.brand("ModelInstanceId"))
 export type ModelInstanceId = typeof ModelInstanceIdSchema.Type
 
+export const ModelVariantLabelSchema = NonEmptyString.pipe(Schema.brand("ModelVariantLabel"))
+export type ModelVariantLabel = typeof ModelVariantLabelSchema.Type
+
+export const formatModelDisplayName = (
+  displayName: string,
+  variantLabel: Option.Option<ModelVariantLabel>,
+): string => Option.match(variantLabel, {
+  onNone: () => displayName,
+  onSome: (label) => `${displayName} (${label})`,
+})
+
 export const ModelServingConfigurationIdSchema =
   NonEmptyString.pipe(Schema.brand("ModelServingConfigurationId"))
 export type ModelServingConfigurationId = typeof ModelServingConfigurationIdSchema.Type
@@ -380,6 +391,7 @@ export const RecommendableModelSchema = Schema.Struct({
   checkpointId: NonEmptyString,
   configuration: ModelServingConfigurationSchema,
   displayName: NonEmptyString,
+  variantLabel: ModelVariantLabelSchema,
   description: Schema.String,
   license: NonEmptyString,
   capabilities: RecommendableModelCapabilitiesSchema,
@@ -496,6 +508,7 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
   providerModelId: ProviderModelIdSchema,
   modelFamilyId: Schema.optionalWith(ModelFamilyIdSchema, { as: "Option", exact: true }),
   displayName: Schema.String,
+  variantLabel: Schema.optionalWith(ModelVariantLabelSchema, { as: "Option", exact: true }),
   supportedSlots: Schema.Array(SlotIdSchema),
   contextWindow: PositiveSafeInteger,
   maxOutputTokens: PositiveSafeInteger,
@@ -539,6 +552,7 @@ export const LocalModelCatalogDataSchema = Schema.Struct({
   intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   intelligenceScoreSource: NonEmptyString,
   fidelityRank: NonNegativeSafeInteger,
+  quantizationAware: Schema.Boolean,
   qualityNotes: Schema.Array(NonEmptyString),
 })
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
@@ -638,10 +652,11 @@ export type LocalModelAvailabilityState = typeof LocalModelAvailabilityStateSche
 
 export const LocalModelPresentationSchema = Schema.Struct({
   displayName: NonEmptyString,
+  variantLabel: ModelVariantLabelSchema,
   description: Schema.String,
   license: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   quantization: NonEmptyString,
-  quantizationName: NonEmptyString,
+  precisionLabel: NonEmptyString,
 })
 export type LocalModelPresentation = typeof LocalModelPresentationSchema.Type
 
@@ -878,6 +893,7 @@ export const ModelSlotDescriptorSchema = Schema.Struct({
   providerId: ProviderIdSchema,
   providerModelId: ProviderModelIdSchema,
   displayName: NonEmptyString,
+  variantLabel: Schema.optionalWith(ModelVariantLabelSchema, { as: "Option", exact: true }),
 })
 export type ModelSlotDescriptor = typeof ModelSlotDescriptorSchema.Type
 

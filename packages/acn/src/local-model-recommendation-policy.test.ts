@@ -7,6 +7,7 @@ import {
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
+  ModelVariantLabelSchema,
   RecommendableModelIdSchema,
 } from "@magnitudedev/acn-protocol"
 import {
@@ -90,6 +91,7 @@ const candidate = (input: {
         profile,
       },
       displayName: input.id,
+      variantLabel: ModelVariantLabelSchema.make(`Q${fidelity}`),
       description: "Test fixture",
       license: "test",
       capabilities: {

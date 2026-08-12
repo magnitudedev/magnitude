@@ -5,6 +5,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   truncateToDisplayWidth,
+  formatLocalModelDisplayName,
   localModelConfigurationId,
   type LocalInferenceHardwareResult,
   type OnboardingConfigurationChoice,
@@ -78,6 +79,12 @@ const onboardingSelection = (
   selection: LocalInferenceSelection,
 ): ProviderModelId | null => Option.getOrNull(selectionProviderModelId(selection))
 
+export const onboardingModelRowName = (
+  selection: LocalInferenceSelection,
+): string => selection.kind === "recommendation"
+  ? selection.model.presentation.displayName
+  : formatLocalModelDisplayName(selection.model)
+
 const matchesOnboardingSelection = (
   selection: LocalInferenceSelection,
   submitted: ProviderModelId,
@@ -120,7 +127,7 @@ const ModelRow = ({
         attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
         wrapMode="none"
       >
-        {selected ? "› " : "  "}{truncateToDisplayWidth(selection.model.presentation.displayName, nameWidth).padEnd(nameWidth)}
+        {selected ? "› " : "  "}{truncateToDisplayWidth(onboardingModelRowName(selection), nameWidth).padEnd(nameWidth)}
         {"  "}
         <span fg={selection.kind === "running"
           ? theme.success
@@ -420,7 +427,7 @@ export function OnboardingModelChooser({
     if (selection.kind === "stored" && Option.isSome(providerModelId)) {
       onLoad({
         providerModelId: providerModelId.value,
-        displayName: selection.model.presentation.displayName,
+        displayName: formatLocalModelDisplayName(selection.model),
         reasoningEffort: Option.getOrElse(
           reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
@@ -431,7 +438,7 @@ export function OnboardingModelChooser({
     if (selection.kind === "stored" && Option.isSome(configurationId)) {
       onSelectConfiguration({
         configurationId: configurationId.value,
-        displayName: selection.model.presentation.displayName,
+        displayName: formatLocalModelDisplayName(selection.model),
         reasoningEffort: Option.getOrElse(
           reasoningEffort,
           () => ReasoningEffortSchema.make("none"),
@@ -446,7 +453,7 @@ export function OnboardingModelChooser({
       if (Option.isNone(configurationId)) return
       onSelectConfiguration({
         configurationId: configurationId.value,
-        displayName: selection.model.presentation.displayName,
+        displayName: formatLocalModelDisplayName(selection.model),
         reasoningEffort: Option.getOrElse(
           reasoningEffort,
           () => ReasoningEffortSchema.make("none"),

@@ -39,6 +39,10 @@ For the local provider, ACN represents the ICN-issued serving-configuration iden
 addresses retained local state, while provider-model identity addresses its generic provider
 projection. Capabilities are resolved from current authoritative catalog or installed-package
 evidence and are not persisted as another offering record.
+Provider-catalog entries also carry an optional presentation-only variant label. Local offerings
+publish it from the shared ACN local-model presentation resolver; remote and custom offerings omit
+it unless their provider owns equivalent structured metadata. Slot descriptors copy this field so
+status surfaces never recover it from a display string.
 
 ## Offering availability
 

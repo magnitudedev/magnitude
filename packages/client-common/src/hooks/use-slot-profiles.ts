@@ -17,6 +17,7 @@ import { useDisplayState } from "../state/display-state-store"
 import { useAgentClient } from "../state/agent-client-context"
 import { useMirroredState } from "./use-mirrored-state"
 import { useModelSlotsResultAtom } from "./use-local-inference-state"
+import { formatModelDisplayName } from "../utils/model-presentation"
 
 export interface SlotProfile {
   readonly slotId: SlotId
@@ -72,7 +73,7 @@ export function useSlotProfiles() {
           slotId: slot.slotId,
           providerId: slot.selection.providerId,
           providerModelId: slot.selection.providerModelId,
-          modelDisplayName: model.displayName,
+          modelDisplayName: formatModelDisplayName(model.displayName, model.variantLabel),
           contextWindow: model.contextWindow,
           maxOutputTokens: model.maxOutputTokens,
           reasoningEffort: slot.selection.reasoningEffort,

@@ -32,6 +32,7 @@ import {
   deriveLocalModelLoadActivity,
   notificationAreaStateAtom,
   deriveLocalModelPersistentNotificationStates,
+  formatLocalModelDisplayName,
   notificationStatesEquivalent,
   resolveActiveNotificationState,
   useLocalModelsSelector,
@@ -401,7 +402,7 @@ function CliAppContent(
       if (model.servingState._tag !== "Assessed") return;
       installOnboardingModel({
         configurationId: model.servingState.configuration.id,
-        displayName: model.presentation.displayName,
+        displayName: formatLocalModelDisplayName(model),
         reasoningEffort: Option.getOrElse(
           model.servingState.capabilities.reasoning.defaultEffort,
           () => ReasoningEffortSchema.make("none")

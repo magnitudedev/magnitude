@@ -1,6 +1,11 @@
 ---
 applies_to:
   - cli/src/features/model-menus/**
+  - cli/src/features/model-setup/**
+  - cli/src/features/local-inference/**
+  - packages/client-common/src/utils/model-presentation.ts
+  - packages/client-common/src/hooks/use-slot-profiles.ts
+  - web/src/components/settings-panel.tsx
 ---
 
 # Catalog presentation
@@ -29,9 +34,15 @@ pending, selection styling projects its latest slot-scoped submitted identity ov
 authoritative slot query. Rejection reveals the prior query value; successful query synchronization
 replaces the projection without an intermediate stale selection.
 
-The catalog detail view owns the complete descriptive, recommendation, calibration,
-quantization-fidelity label, license, source repository, and actions for one eligible catalog
-configuration. Catalog-maintainer scoring data is not presented to users. Hugging Face
+The catalog detail view owns the complete descriptive, recommendation, model-quality,
+machine-assessment, exact quantization, quantization-aware-training status, license,
+source repository, and actions for one eligible catalog configuration. Its breadcrumb retains the
+parenthesized variant label so the selected catalog entry remains explicit. Its content title uses
+the base model name; exact quantization, concise QAT status when applicable, and fidelity appear on
+one line immediately below instead of repeating the variant in that title. Intelligence appears on
+its own line, followed by a visual break before the description. These model-intrinsic facts remain
+separate from machine-specific data. Memory, calibrated speed, and
+local installation status are grouped under `On this computer`. Hugging Face
 repositories are presented as themed, underlined links that open in the user's browser and provide
 pointer-hover feedback.
 
@@ -66,7 +77,7 @@ create or copy catalog, recommendation, download, offering, or slot state.
 
 The list preserves information in this order:
 
-1. entry identity, including quantization or component role;
+1. entry identity, including the curated variant label or component role;
 2. acquisition or availability status;
 3. recommendation and required memory;
 4. calibrated speed; and
@@ -79,6 +90,9 @@ widths speed also moves to the detail view.
 
 Entry identity and status never disappear. Text is display-width truncated or deliberately wrapped;
 layout-engine column compression must not create accidental multi-line table cells.
+The terminal's width-aware label formatter preserves the parenthesized variant suffix whenever the
+available width can contain it, truncating the base name first. Parentheses are presentation, not
+stored catalog data.
 
 An installed model from Magnitude's managed store is labeled `Installed`; one discovered in a
 Hugging Face cache is labeled `Installed (HF)`. Missing memory evidence is not model unavailability

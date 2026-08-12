@@ -1,13 +1,49 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
-import { makeAcquiringModel } from "../local-inference/test-fixtures"
 import {
+  makeAcquiringModel,
+  makeCatalogModel,
+  makeModel,
+  makeRecommendation,
+  makeView,
+} from "../local-inference/test-fixtures"
+import {
+  onboardingModelRowName,
   scrollOnboardingModelIntoView,
   type OnboardingModelChooserOperation,
 } from "./chooser"
+import { buildLocalInferenceSelections } from "../local-inference/view-model"
 
 describe("onboarding model chooser identity", () => {
+  it("keeps variants out of downloadable model names", () => {
+    const base = makeCatalogModel()
+    if (base.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    const model = {
+      ...base,
+      servingState: {
+        ...base.servingState,
+        recommendations: [makeRecommendation()],
+      },
+    }
+    const view = makeView({ models: [model], ready: false })
+    const [selection] = buildLocalInferenceSelections(view.models, view.slots)
+
+    expect(selection).toBeDefined()
+    if (!selection) return
+    expect(onboardingModelRowName(selection)).toBe(model.presentation.displayName)
+  })
+
+  it("keeps variants in installed model names", () => {
+    const model = makeModel()
+    const view = makeView({ models: [model] })
+    const [selection] = buildLocalInferenceSelections(view.models, view.slots)
+
+    expect(selection).toBeDefined()
+    if (!selection) return
+    expect(onboardingModelRowName(selection)).toBe("Qwen Test (Q4)")
+  })
+
   it("scrolls by presentation identity without copying model fields", () => {
     const calls: string[] = []
     scrollOnboardingModelIntoView({

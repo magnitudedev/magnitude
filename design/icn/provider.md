@@ -44,6 +44,9 @@ availability and derives application memory guidance from assessment, normalized
 resident allocation evidence on the same model row. Provider offerings do not carry application
 warning policy, parallel aggregate fields, or capacity labels. Generic and cloud provider entries
 do not fabricate local memory accounting.
+Provider catalog presentation keeps the base display name and optional variant label as separate
+fields. The local adapter derives both through the same ACN resolver used by the local-model product
+projection; generic provider and agent code treat the label as presentation only.
 
 Initial and invalidation-driven projection runs in one scoped background worker. Native assessment
 never gates ACN service readiness.

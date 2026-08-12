@@ -5,6 +5,7 @@ applies_to:
   - packages/icn-protocol/**
   - packages/acn/**
   - packages/acn-protocol/**
+  - packages/agent/src/ambient/config-ambient.ts
   - packages/sdk/**
   - packages/client-common/**
   - cli/**
@@ -42,6 +43,13 @@ because they were used to produce that contract.
 Each semantic decision has one owner. A higher layer may project an owned result into its own
 contract, but it must not independently recreate the decision or redefine the lower-layer domain
 shape.
+
+For model presentation, ICN publishes reviewed variant facts with each recommendable configuration.
+ACN owns the unified local presentation projection and carries the variant label independently from
+the base display name, exact quantization, and precision. The ACN protocol exports the canonical
+`Name (Variant)` composition over those structured fields so agent attribution and clients cannot
+diverge; client-common exposes it to clients. Individual clients own width-aware layout and
+truncation. No boundary parses a display string or infers a label from fidelity rank.
 
 ## ICN
 

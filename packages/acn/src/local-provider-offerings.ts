@@ -31,6 +31,7 @@ import { RetainedModelConfigurations } from "./retained-model-configurations"
 import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 import { makeObservedState } from "./mirrored-state"
+import { resolveBundlePresentation } from "./local-model-presentation"
 
 export type ProviderOfferingPackageEvidence = readonly {
   readonly providerModelId: LocalProviderOffering["providerModelId"]
@@ -230,17 +231,20 @@ export const LocalProviderOfferingsLive: Layer.Layer<
       const installed = installedBundles[index] ?? false
       const coordinated = assessmentState.get(offering.configuration.id)
       const assessment = inspectable[index] ? coordinated?.assessment : undefined
-      const primary = bundle._tag === "Standalone" ? bundle.package : bundle.target
-      const fallbackName = primary.source._tag === "HuggingFace"
-        ? primary.source.repository.split("/").at(-1) ?? primary.source.repository
-        : primary.files[0]?.path.split("/").at(-1) ?? primary.id
+      const curated = catalogModels.find((model) =>
+        sameBundle(model.configuration.bundle, bundle))
+      const presentation = resolveBundlePresentation(bundle, curated && {
+        displayName: curated.displayName,
+        variantLabel: curated.variantLabel,
+        description: curated.description,
+        license: curated.license,
+      })
       return {
         providerId: LOCAL_PROVIDER_ID,
         providerModelId: offering.providerModelId,
         modelFamilyId: Option.none(),
-        displayName: catalogModels.find((model) =>
-          sameBundle(model.configuration.bundle, bundle))?.displayName
-          ?? (bundle._tag === "Standalone" ? fallbackName : `${fallbackName} + speculative draft`),
+        displayName: presentation.displayName,
+        variantLabel: Option.some(presentation.variantLabel),
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
         contextWindow: profile.contextLength,
         maxOutputTokens: profile.contextLength,

@@ -4768,6 +4768,7 @@
           "checkpointId",
           "configuration",
           "displayName",
+          "variantLabel",
           "description",
           "license",
           "capabilities",
@@ -4788,6 +4789,9 @@
             "$ref": "#/components/schemas/ModelServingConfiguration"
           },
           "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
             "type": "string"
           },
           "description": {

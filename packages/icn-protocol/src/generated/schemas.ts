@@ -1616,6 +1616,7 @@ export const RecommendableModel = S.Struct({
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,
   quantizationAware: S.Boolean,
+  variantLabel: S.String,
 })
 export type RecommendableModel = S.Schema.Type<typeof RecommendableModel>
 export type RecommendableModelEncoded = S.Schema.Encoded<typeof RecommendableModel>

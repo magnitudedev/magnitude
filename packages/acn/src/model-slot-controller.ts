@@ -380,6 +380,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       providerId: selection.providerId,
       providerModelId: selection.providerModelId,
       displayName: model?.displayName || selection.providerModelId,
+      variantLabel: model?.variantLabel ?? Option.none(),
     }
   }
 
