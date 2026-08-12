@@ -19,3 +19,8 @@ export const AcnOwnerRecordSchema = Schema.Struct({
   port: PositiveSafeInteger.pipe(Schema.lessThanOrEqualTo(65_535)),
 })
 export type AcnOwnerRecord = typeof AcnOwnerRecordSchema.Type
+
+export const sameAcnOwner = (left: AcnOwnerRecord, right: AcnOwnerRecord): boolean =>
+  left.pid === right.pid &&
+  left.processStartIdentity === right.processStartIdentity &&
+  left.port === right.port

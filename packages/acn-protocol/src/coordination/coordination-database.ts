@@ -1,13 +1,14 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
-import { Effect, Option, Schema } from "effect"
+import { Clock, Duration, Effect, Option, Schema } from "effect"
 import {
   AcnProcessStoreBusy,
   AcnProcessStoreInvalid,
   AcnProcessStoreUnavailable,
+  type AcnOwnerStoreError,
   type AcnProcessStoreError,
 } from "./errors"
-import { AcnOwnerRecordSchema, type AcnOwnerRecord } from "./schemas"
+import { AcnOwnerRecordSchema, sameAcnOwner, type AcnOwnerRecord } from "./schemas"
 import {
   SqliteDriver,
   SqliteDriverBusy,
@@ -38,6 +39,10 @@ const Sql = {
   commit: "COMMIT",
   rollback: "ROLLBACK",
 } as const
+
+const OWNER_STORE_INITIAL_CONTENTION_RETRY_INTERVAL = Duration.millis(25)
+const OWNER_STORE_MAX_CONTENTION_RETRY_INTERVAL = Duration.seconds(1)
+const OWNER_STORE_CONTENTION_TIMEOUT = Duration.seconds(30)
 
 const OwnerRowSchema = Schema.Struct({
   pid: AcnOwnerRecordSchema.fields.pid,
@@ -81,10 +86,7 @@ const sameOwner = (
   right: Option.Option<AcnOwnerRecord>,
 ): boolean => Option.match(left, {
   onNone: () => Option.isNone(right),
-  onSome: (owner) => Option.exists(right, (other) =>
-    owner.pid === other.pid &&
-    owner.processStartIdentity === other.processStartIdentity &&
-    owner.port === other.port),
+  onSome: (owner) => Option.exists(right, (other) => sameAcnOwner(owner, other)),
 })
 
 export type ReplaceOwnerResult =
@@ -92,11 +94,11 @@ export type ReplaceOwnerResult =
   | { readonly _tag: "OwnerChanged"; readonly owner: Option.Option<AcnOwnerRecord> }
 
 export interface AcnCoordinationDatabase {
-  readonly currentOwner: Effect.Effect<Option.Option<AcnOwnerRecord>, AcnProcessStoreError>
+  readonly currentOwner: Effect.Effect<Option.Option<AcnOwnerRecord>, AcnOwnerStoreError>
   readonly replaceOwner: (
     expectedOwner: Option.Option<AcnOwnerRecord>,
     candidateOwner: AcnOwnerRecord,
-  ) => Effect.Effect<ReplaceOwnerResult, AcnProcessStoreError>
+  ) => Effect.Effect<ReplaceOwnerResult, AcnOwnerStoreError>
 }
 
 export const makeAcnCoordinationDatabase = (
@@ -111,6 +113,33 @@ export const makeAcnCoordinationDatabase = (
   const driver = yield* SqliteDriver
   const directory = paths.join(dataDirectory, "acn")
   const databasePath = paths.join(directory, "coordination.sqlite")
+
+  const resolveContention = <A>(
+    operation: string,
+    effect: Effect.Effect<A, AcnProcessStoreError>,
+  ): Effect.Effect<A, AcnOwnerStoreError> => Effect.gen(function* () {
+    const deadline = (yield* Clock.currentTimeMillis) +
+      Duration.toMillis(OWNER_STORE_CONTENTION_TIMEOUT)
+    let retryInterval = Duration.toMillis(OWNER_STORE_INITIAL_CONTENTION_RETRY_INTERVAL)
+    const maxRetryInterval = Duration.toMillis(OWNER_STORE_MAX_CONTENTION_RETRY_INTERVAL)
+
+    while (true) {
+      const result = yield* Effect.either(effect)
+      if (result._tag === "Right") return result.right
+      if (result.left._tag !== "AcnProcessStoreBusy") return yield* result.left
+
+      const remaining = deadline - (yield* Clock.currentTimeMillis)
+      if (remaining <= 0) {
+        return yield* new AcnProcessStoreUnavailable({
+          operation,
+          path: databasePath,
+          message: "SQLite contention did not resolve within the operation deadline",
+        })
+      }
+      yield* Effect.sleep(Duration.millis(Math.min(retryInterval, remaining)))
+      retryInterval = Math.min(retryInterval * 2, maxRetryInterval)
+    }
+  })
 
   const withConnection = <A>(
     operation: string,
@@ -158,36 +187,41 @@ export const makeAcnCoordinationDatabase = (
     })
 
   return {
-    currentOwner: withConnection("current-owner", (connection) =>
-      queryOwner(connection, "current-owner")),
+    currentOwner: resolveContention(
+      "current-owner",
+      withConnection("current-owner", (connection) => queryOwner(connection, "current-owner")),
+    ),
     replaceOwner: (expectedOwner, candidateOwner) =>
-      withConnection("replace-owner", (connection) => Effect.uninterruptibleMask(() =>
-        Effect.gen(function* () {
-          yield* connection.execute(Sql.beginImmediate).pipe(
-            Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
-          )
-          const transaction = Effect.gen(function* () {
-            const owner = yield* queryOwner(connection, "replace-owner")
-            if (!sameOwner(owner, expectedOwner)) {
-              yield* connection.execute(Sql.rollback).pipe(
-                Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
-              )
-              return { _tag: "OwnerChanged" as const, owner }
-            }
-            yield* connection.execute(Sql.replaceOwner, [
-              candidateOwner.pid,
-              candidateOwner.processStartIdentity,
-              candidateOwner.port,
-            ]).pipe(Effect.mapError((error) => storeError("replace-owner", databasePath, error)))
-            yield* connection.execute(Sql.commit).pipe(
+      resolveContention(
+        "replace-owner",
+        withConnection("replace-owner", (connection) => Effect.uninterruptibleMask(() =>
+          Effect.gen(function* () {
+            yield* connection.execute(Sql.beginImmediate).pipe(
               Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
             )
-            return { _tag: "Replaced" as const }
-          })
-          return yield* transaction.pipe(
-            Effect.onError(() => connection.execute(Sql.rollback).pipe(Effect.ignore)),
-          )
-        }),
-      )),
+            const transaction = Effect.gen(function* () {
+              const owner = yield* queryOwner(connection, "replace-owner")
+              if (!sameOwner(owner, expectedOwner)) {
+                yield* connection.execute(Sql.rollback).pipe(
+                  Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
+                )
+                return { _tag: "OwnerChanged" as const, owner }
+              }
+              yield* connection.execute(Sql.replaceOwner, [
+                candidateOwner.pid,
+                candidateOwner.processStartIdentity,
+                candidateOwner.port,
+              ]).pipe(Effect.mapError((error) => storeError("replace-owner", databasePath, error)))
+              yield* connection.execute(Sql.commit).pipe(
+                Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
+              )
+              return { _tag: "Replaced" as const }
+            })
+            return yield* transaction.pipe(
+              Effect.onError(() => connection.execute(Sql.rollback).pipe(Effect.ignore)),
+            )
+          }),
+        )),
+      ),
   }
 })
