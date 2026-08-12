@@ -111,9 +111,11 @@ Every requested profile produces one result:
 | `DoesNotFit` | Configuration identity, memory accounting, limiting resource, and deficit |
 | `Incompatible` | The artifact/runtime combination cannot execute |
 
-Malformed or unresolved input produces target-level `InvalidTarget`. Native crash, timeout,
-malformed output, impossible arithmetic, or missing output fails the endpoint. Operational failure
-is not a model result and creates no cache entry.
+Malformed or unresolved input produces target-level `InvalidTarget`. An operational failure while
+assessing one requested target produces `Failed` for that request ID; sibling results remain valid.
+`Failed` is not a compatibility or capacity result and creates no cache entry. A failure of shared
+batch setup, or a failure that prevents ICN from constructing a valid complete response envelope,
+fails the endpoint.
 
 ## Profiles
 

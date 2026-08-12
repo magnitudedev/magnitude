@@ -569,6 +569,11 @@ pub enum AssessModelResult {
         request_id: ModelAssessmentRequestId,
         failure: ModelFailure,
     },
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        request_id: ModelAssessmentRequestId,
+        failure: ModelFailure,
+    },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

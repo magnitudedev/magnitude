@@ -67,9 +67,13 @@ describe("LocalModelAssessor", () => {
         bundle: { _tag: "Standalone" as const, package: modelPackage },
         profile: { contextLength: 32_768 },
       }
+      const siblingConfiguration = {
+        ...configuration,
+        id: ModelServingConfigurationIdSchema.make("configuration-sibling"),
+      }
       const dependencies = Layer.mergeAll(
         Layer.succeed(RetainedModelConfigurations, RetainedModelConfigurations.of({
-          get: Effect.succeed([configuration]),
+          get: Effect.succeed([configuration, siblingConfiguration]),
           recoveryCompleted: Effect.succeed(true),
           changes: Stream.never,
           resolve: () => Effect.succeed(Option.some(configuration)),
@@ -111,10 +115,19 @@ describe("LocalModelAssessor", () => {
         Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({
           assess: (requests) => Effect.sync(() => {
             assessmentCalls += 1
-            return requests.map(() => ({
-              _tag: "InvalidBundle" as const,
-              message: "terminal test result",
-            }))
+            return requests.map((_, index) => index === 0
+              ? {
+                  _tag: "Failed" as const,
+                  failure: {
+                    code: "planning_worker_defect",
+                    message: "failed to create llama context",
+                    retryable: true,
+                  },
+                }
+              : {
+                  _tag: "InvalidBundle" as const,
+                  message: "terminal test result",
+                })
           }),
         })),
       )
@@ -125,9 +138,25 @@ describe("LocalModelAssessor", () => {
         yield* Effect.sleep("100 millis")
         expect(assessmentCalls).toBe(1)
         const initialState = yield* assessor.state
-        expect([...initialState.keys()]).toEqual([configuration.id])
+        expect([...initialState.keys()]).toEqual([configuration.id, siblingConfiguration.id])
         expect([...initialState.values()].every(({ assessment }) =>
           assessment._tag === "Failed")).toBe(true)
+        expect(initialState.get(configuration.id)?.assessment).toEqual({
+          _tag: "Failed",
+          failure: {
+            code: "planning_worker_defect",
+            message: "failed to create llama context",
+            retryable: true,
+          },
+        })
+        expect(initialState.get(siblingConfiguration.id)?.assessment).toEqual({
+          _tag: "Failed",
+          failure: {
+            code: "invalid_model_bundle",
+            message: "terminal test result",
+            retryable: false,
+          },
+        })
 
         yield* PubSub.publish(packageChanges, packageSnapshot)
         yield* PubSub.publish(packageChanges, packageSnapshot)

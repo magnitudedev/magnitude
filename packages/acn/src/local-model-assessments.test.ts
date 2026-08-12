@@ -126,6 +126,21 @@ describe("localModelAssessmentResultFromIcn", () => {
     profile: { contextLength },
   }) as unknown as NativeModelServingConfiguration
 
+  it("preserves a request-local operational failure", () => {
+    const failure = {
+      code: "planning_worker_defect",
+      message: "failed to create llama context",
+      retryable: true,
+    }
+    const result = Effect.runSync(localModelAssessmentResultFromIcn({
+      _tag: "Failed",
+      requestId: "assessment-failed",
+      failure,
+    }, environmentId))
+
+    expect(result).toEqual({ _tag: "Failed", failure })
+  })
+
   it("preserves terminal non-capacity assessment evidence", () => {
     const result = Effect.runSync(localModelAssessmentResultFromIcn({
       _tag: "Assessed",
