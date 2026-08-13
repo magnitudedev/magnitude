@@ -318,7 +318,6 @@ export type OnboardingModelChooserOperation =
       readonly cancelling: boolean
       readonly cancelError: string | null
       readonly onCancel: () => void
-      readonly onRetry: () => void
     }
   | {
       readonly _tag: "Configuring"
@@ -553,12 +552,10 @@ export function OnboardingModelChooser({
       width={detailWidth}
       height={detailContentHeight}
       operation={{
-        _tag: "Active",
         starting: operation.starting,
         cancelling: operation.cancelling,
         cancelError: operation.cancelError,
         onCancel: operation.onCancel,
-        onRetry: operation.onRetry,
       }}
     />
   ) : operation?._tag === "Activating" ? (

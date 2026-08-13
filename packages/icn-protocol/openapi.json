@@ -2141,7 +2141,7 @@
                 "minimum": 0
               },
               "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
+                "$ref": "#/components/schemas/DownloadFailure"
               },
               "acknowledged": {
                 "type": "boolean"
@@ -2180,6 +2180,124 @@
       },
       "DownloadAttemptId": {
         "type": "string"
+      },
+      "DownloadFailure": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Interrupted"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "requiredBytes",
+              "availableBytes",
+              "_tag"
+            ],
+            "properties": {
+              "requiredBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "availableBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "InsufficientDiskSpace"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "SourceUnavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NetworkUnavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LocalStorageFailure"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "CorruptDownload"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "message",
+              "_tag"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Internal"
+                ]
+              }
+            }
+          }
+        ]
       },
       "DownloadStage": {
         "type": "string",

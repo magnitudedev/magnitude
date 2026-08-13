@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use crate::{DownloadStage, InventoryError, ResolvedModel};
+use crate::{DownloadFailure, DownloadStage, InventoryError, ResolvedModel};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -620,7 +620,7 @@ pub enum DownloadAttempt {
         package_id: ModelPackageId,
         completed_bytes: u64,
         total_bytes: u64,
-        failure: ModelFailure,
+        failure: DownloadFailure,
         #[serde(default)]
         #[cfg_attr(feature = "openapi", schema(required = true))]
         acknowledged: bool,

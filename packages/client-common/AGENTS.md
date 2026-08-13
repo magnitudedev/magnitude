@@ -31,6 +31,10 @@ These follow directly from the principles above — declarative first, imperativ
 
 **3. `useAtomMount`** — Effect-scoped side effect with `Effect.addFinalizer`. The only sanctioned pattern when a side effect is inherent: no declarative mechanism exists, and no single user action is the sole trigger (state comes from server, timers, agent activity, or multiple sources).
 
+This decision applies to component-owned effects. A connection- or registry-lifetime resource owned
+by a client service is acquired by that service's `Layer.scoped`, as defined in
+`design/patterns/client-di.md`; React must not mount it to manufacture service lifetime.
+
 **Decision:** Can output be `f(inputs)` with platform sync? → Declarative. Is a user action the sole trigger? → Event-source. Otherwise → `useAtomMount`.
 
 **Prohibited:** `useEffect` with side effects, ref-diff (`prevRef !== value → doWork`), async IIFEs for server state, `useState` + `useEffect` sync, callback ref dep arrays for side effects.
@@ -85,6 +89,11 @@ generic mirror abstraction in terms of Effect Query or make one domain authorita
 systems. Migration is vertical: move a domain's query, mutations, and invalidation ownership
 together, then remove its mirror ownership.
 
+An Effect Query domain consumes ACN invalidation events in its own scoped Effect and invalidates
+only its own Query definitions through `QueryClient`. It never subscribes through the direct-mirror
+client implementation and never calls `Reactivity`. A direct-mirror domain invalidates only
+AtomRpc queries through `Reactivity` and never calls `QueryClient`.
+
 ### Queries
 
 - Read server state with `useAtomValue(client.query(...))`.
@@ -104,6 +113,8 @@ together, then remove its mirror ownership.
 ### Streams and invalidation
 
 - If a stream announces changes to state available from a query, treat the stream only as an invalidation channel. Consume it in an Effect owned by `useAtomMount`, call `Reactivity.invalidate(...)`, and continue rendering from the query atom.
+- The preceding `Reactivity` rule applies to direct-mirror/AtomRpc queries. Effect Query domains use
+  their domain-owned `QueryClient` invalidation Effect described above.
 - Do not copy stream events into React state when the same facts exist in a query snapshot.
 - Use `Effect.addFinalizer` or interruption-safe stream scope for cleanup. Interruption on unmount is normal; handle other failures through Effect's error channel.
 - A raw `RpcClient` is permitted only inside such an Effect-scoped bridge when AtomRpc's query/mutation abstraction cannot express the resident stream lifecycle. Keep that bridge in client-common when more than one client surface can use it.

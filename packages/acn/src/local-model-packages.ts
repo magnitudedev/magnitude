@@ -15,6 +15,7 @@ import {
   type DownloadAttempt,
   type DownloadAttemptId,
   type LocalInferenceError,
+  type ModelDownloadFailure,
   type ModelPackage,
   type ModelPackageEntry,
   type ModelPackageId,
@@ -79,7 +80,7 @@ export type PackageAcquisition =
       readonly _tag: "Pending" | "Downloading"
     }> }
   | { readonly _tag: "Failed"; readonly attemptId: DownloadAttemptId; readonly completedBytes: number
-      readonly totalBytes: number; readonly failure: LocalModelMutationFailed
+      readonly totalBytes: number; readonly failure: ModelDownloadFailure
       readonly acknowledged: boolean }
   | { readonly _tag: "Cancelled"; readonly attemptId: DownloadAttemptId }
   | { readonly _tag: "Publishing"; readonly attemptId: DownloadAttemptId
@@ -122,11 +123,7 @@ export const projectPackageAcquisition = (
             attemptId: acquisition.attemptId,
             completedBytes: acquisition.completedBytes,
             totalBytes: acquisition.totalBytes,
-            failure: {
-              code: acquisition.failure.code,
-              message: acquisition.failure.message,
-              retryable: acquisition.failure.retryable,
-            },
+            failure: acquisition.failure,
           }
     case "Cancelled":
       return {
@@ -163,7 +160,7 @@ export const packageAcquisition = (
       attemptId: attempt.id,
       completedBytes: attempt.completedBytes,
       totalBytes: attempt.totalBytes,
-      failure: new LocalModelMutationFailed(attempt.failure),
+      failure: attempt.failure,
       acknowledged: attempt.acknowledged,
     }
   }

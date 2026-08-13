@@ -75,6 +75,9 @@ it does not create a second model identity or mirror.
 client-ready result of joining acquisition and current local-provider publication. Clients do not
 look up the local model again in `ProviderModelCatalog`. Once a provider-model identity exists,
 preparing and unavailable states preserve it so durable slot selection still correlates the row.
+An installed configuration has its deterministic local provider-model identity even while the
+provider offering projection is catching up; that interval is `Preparing`, never `Installable`.
+`Selectable` means both physical installation and the exact current provider offering are visible.
 
 ## Membership and configuration
 
@@ -170,3 +173,5 @@ authorization.
 - Advisory memory state never authorizes loading; ICN revalidates at the load boundary.
 - Download observation and cancellation correlate exact attempt identities from
   `acquisitionState`.
+- An installed row cannot regress to `Installable`; provider-publication convergence is
+  `Preparing` and only `Selectable` authorizes assignment or loading.

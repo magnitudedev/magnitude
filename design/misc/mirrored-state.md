@@ -60,17 +60,16 @@ A backend may bind directly only when it owns the exact public schema and versio
 selection, including favorites and recency. Preference mutations durably commit before the mirror
 publishes the new snapshot.
 
-Client-common owns one watch per client connection and all query invalidation. Query atoms remain
-distinct by Get RPC tag, and clients retain each query's waiting, failure, and success Result
-independently. Screens may derive presentation from successful domain values; they do not combine
-domain Results into an aggregate authority, reconstruct state, or open their own operation streams.
-An initial snapshot failure is recorded by its query and does not terminate the invalidation
-subscription. A later watch event or reconnection retries the same canonical query.
+For direct-mirror domains, client-common owns one Reactivity watch per client connection. Query
+atoms remain distinct by Get RPC tag. Effect Query owns a separate connection-scoped watch; each
+Effect Query domain registers only its own `QueryClient` invalidation callback. The two mechanisms
+may consume the same ACN protocol stream but never share cache adapters or invalidation calls. A
+domain has one canonical client query cache at a time.
 
-During scoped Effect Query adoption, that same connection-wide watch fans an invalidation out to
-both legacy AtomRpc queries and adopted Effect Query definitions. This is a temporary cache-boundary
-composition, not a second mirror subscription or a second state source. A domain has one canonical
-query cache at a time.
+Clients retain each query's waiting, failure, and success Result independently. Screens may derive
+presentation from successful domain values; they do not combine domain Results into an aggregate
+authority or reconstruct state. An initial snapshot failure does not terminate the corresponding
+invalidation subscription. A later watch event or reconnection retries the same canonical query.
 
 ## Client retention and rendering
 
@@ -117,3 +116,5 @@ authoritative current snapshot.
 - One mirror's observation lifecycle cannot erase another mirror's successful value.
 - Selector atoms preserve one mirror authority while preventing unrelated source-field changes from
   invalidating a complete presentation surface.
+- Direct-mirror invalidation never writes to Effect Query, and Effect Query invalidation never calls
+  direct-mirror Reactivity.

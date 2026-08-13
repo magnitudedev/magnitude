@@ -260,8 +260,7 @@ pub enum ModelAvailability {
         completed_bytes: u64,
         total_bytes: u64,
         resumable: bool,
-        reason: Option<String>,
-        last_error: String,
+        failure: DownloadFailure,
         updated_at: u64,
     },
     Available {
@@ -1500,6 +1499,12 @@ pub enum ModelDownloadEvent {
         operation_id: String,
         model: Box<InventoryModel>,
     },
+    Cancelled {
+        operation_id: String,
+        model_id: Option<ModelId>,
+        completed_bytes: u64,
+        total_bytes: u64,
+    },
     Failed {
         operation_id: String,
         model_id: Option<ModelId>,
@@ -1518,12 +1523,25 @@ pub struct DownloadFileProgress {
     pub total_bytes: u64,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadFailure {
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum DownloadFailure {
+    Interrupted,
+    #[serde(rename_all = "camelCase")]
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    SourceUnavailable,
+    NetworkUnavailable,
+    LocalStorageFailure,
+    CorruptDownload,
+    #[serde(rename_all = "camelCase")]
+    Internal {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

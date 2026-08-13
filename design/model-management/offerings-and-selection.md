@@ -124,15 +124,15 @@ the slot and instance authorities.
 Onboarding model setup is owned by one client-side service in client-common. The service owns
 only its in-memory causal state: the explicit configuration choice and exact admission, provider,
 selection, and instance identities returned by its composed operations. It exposes one passive
-derived state atom and explicit start, cancel, and skip command atoms. Those commands execute in the
-connection's existing Effect runtime and compose the lower domains' Effect Query mutations.
+derived state atom and explicit start, cancel, and skip Effects. Those commands execute in the
+connection's existing Effect runtime and compose the lower domain services' semantic Effects.
 
 The start command follows exactly one of these paths:
 
 ```text
 exact chosen instance already ready -> complete onboarding
 installed choice -> assign -> load -> await exact instance ready -> complete
-uninstalled choice -> install -> await exact installation -> assign -> load
+uninstalled choice -> install -> await exact selectable installation -> assign -> load
                    -> await exact instance ready -> complete
 ```
 
@@ -141,6 +141,13 @@ the affected canonical query before dependent work begins. Background completion
 the same attempt or instance identity through `LocalModels` or `ModelSlots`. The service state joins
 those identities with canonical model and slot snapshots, so progress and lifecycle remain
 backend-owned and are never copied into service state.
+
+Download admission synchronization requires the chosen configuration to expose either the exact
+admitted attempt identities or installed acquisition. Provider publication is a later readiness
+condition: physical installation with `Preparing` availability remains a waiting state, and
+assignment begins only when that same configuration is `Selectable` with the provider-model
+identity returned by admission. Publication order therefore cannot become model replacement or a
+signal to restart setup.
 
 Opening or remounting onboarding only reads the service state. It cannot select or load a model.
 Only an explicit configuration-ID submission starts setup; current slot state and mutation history

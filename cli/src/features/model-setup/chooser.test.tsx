@@ -72,8 +72,7 @@ describe("onboarding model chooser identity", () => {
       cancelling: false,
       cancelError: null,
       onCancel: () => undefined,
-      onRetry: () => undefined,
     }
-    expect(operation.model).toBe(model)
+    expect(operation._tag === "Downloading" && operation.model).toBe(model)
   })
 })

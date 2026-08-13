@@ -25,7 +25,7 @@ import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
-import { LocalProviderOfferings } from "./local-provider-offerings"
+import { LocalProviderOfferings, localProviderModelId } from "./local-provider-offerings"
 import {
   providerOfferingPackageEvidence,
   sameProviderOfferingPackageEvidence,
@@ -301,6 +301,8 @@ export const projectLocalModelMemory = (
 export interface LocalModelsApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
+  /** Publishes a snapshot from the current lower-domain facts before returning. */
+  readonly refresh: Effect.Effect<void>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
@@ -515,6 +517,9 @@ export const LocalModelsLive: Layer.Layer<
                 failure: coordinatedAssessment.failure,
               }
         const providerModelId = providerIdByConfiguration.get(configuration.id)
+          ?? (acquisitionState._tag === "Installed"
+            ? localProviderModelId(configuration.id)
+            : undefined)
         const availabilityState = assessment._tag !== "Fits"
           ? unavailableAssessment(assessment, providerModelId)
           : acquisitionState._tag !== "Installed" || providerModelId === undefined
@@ -603,5 +608,6 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     snapshot: mirror.get,
     changes: mirror.changes,
+    refresh: project,
   })
 }))

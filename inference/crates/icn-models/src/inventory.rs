@@ -10,10 +10,10 @@ use icn_contracts::models::{
     InstalledModelPackage, InstalledModelPackagesResponse, ModelAssessment, ModelPackageId,
 };
 use icn_contracts::{
-    CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, Integrity,
-    InventoryError, InventoryModel, InventoryProperties, LocalDeclaration, ModelAvailability,
-    ModelComponent, ModelId, ModelLocation, ModelOperation, ModelSource, ReasoningCapability,
-    TemplateAssessor,
+    CapabilitySupport, ComponentRole, ContentIdentity, DownloadFailure, EffectiveTemplateInputs,
+    Integrity, InventoryError, InventoryModel, InventoryProperties, LocalDeclaration,
+    ModelAvailability, ModelComponent, ModelId, ModelLocation, ModelOperation, ModelSource,
+    ReasoningCapability, TemplateAssessor,
 };
 use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -1098,10 +1098,7 @@ fn scan_interrupted(
                 completed_bytes,
                 total_bytes,
                 resumable: true,
-                reason: None,
-                last_error: manifest
-                    .last_error
-                    .unwrap_or_else(|| "daemon_restarted".to_owned()),
+                failure: manifest.failure.unwrap_or(DownloadFailure::Interrupted),
                 updated_at: manifest.updated_at,
             },
             source: ModelSource::HuggingFace {

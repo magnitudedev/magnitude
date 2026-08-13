@@ -1,5 +1,5 @@
 import { useMemo } from "react"
-import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   ModelSlotsMirror,
@@ -16,29 +16,27 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { modelSlotAtoms, presentedSlotSelection } from "../model-slots/atoms"
+import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
 import { useMirroredState } from "./use-mirrored-state"
-import { useModelSlotsResultAtom } from "./use-local-inference-state"
 
 export function useModelConfig() {
   const client = useAgentClient()
   const catalog = useMirroredState(ProviderModelCatalogMirror)
-  const slots = useAtomValue(useModelSlotsResultAtom())
-  const slotAtoms = useMemo(() => modelSlotAtoms(client), [client])
-  const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
-  const slotUpdate = useAtomValue(slotAtoms.assignMutation)
-  const slotClear = useAtomValue(slotAtoms.clearMutation)
+  const slotService = useMemo(() => client.effectQuery.runtime.atom(ModelSlots), [client])
+  const slotState = useMemo(() => Atom.make((get) => Result.flatMap(
+    get(slotService),
+    (slots) => get(slots.state),
+  )), [slotService])
+  const slotSelections = useMemo(() => Atom.make((get) => Result.flatMap(
+    get(slotService),
+    (slots) => get(slots.selections),
+  )), [slotService])
+  const slotMutations = useModelSlotMutations()
+  const slots = useAtomValue(slotState)
+  const refreshAtom = useMemo(() => client.rpc.mutation("RefreshModelCatalog"), [client])
   const catalogRefresh = useAtomValue(refreshAtom)
-  const favoriteUpdate = useAtomValue(slotAtoms.favoriteMutation)
-  const assignmentMutationStates = useAtomValue(slotAtoms.assignmentMutationStatesAtom)
-  const assign = useAtomSet(slotAtoms.assignMutation)
-  const clear = useAtomSet(slotAtoms.clearMutation)
+  const selections = Result.value(useAtomValue(slotSelections))
   const refresh = useAtomSet(refreshAtom)
-  const setFavoriteMutation = useAtomSet(slotAtoms.favoriteMutation)
-  const selections = Option.map(Result.value(slots), ({ state }) => ({
-    primary: presentedSlotSelection(state, assignmentMutationStates, PRIMARY_SLOT_ID),
-    secondary: presentedSlotSelection(state, assignmentMutationStates, SECONDARY_SLOT_ID),
-  }))
 
   const catalogModels = Option.flatMap(Result.value(catalog), ({ state }) =>
     ProviderModelCatalogLifecycle.match(state, {
@@ -53,9 +51,9 @@ export function useModelConfig() {
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
   ): void => Option.match(selection, {
-    onNone: () => clear({ slotId }),
-    onSome: (value) => assign({ slotId, selection: value }),
-  }), [assign, clear])
+    onNone: () => slotMutations.clear(slotId),
+    onSome: (value) => slotMutations.assign(slotId, value),
+  }), [slotMutations.assign, slotMutations.clear])
 
   const selectionFor = useMemo(() => (
     slotId: SlotId,
@@ -114,17 +112,16 @@ export function useModelConfig() {
   const setModelFavorite = useMemo(() => (
     model: ProviderModelIdentity,
     favorite: boolean,
-  ): void => setFavoriteMutation({ model, favorite }), [setFavoriteMutation])
+  ): void => slotMutations.setFavorite(model, favorite), [slotMutations.setFavorite])
 
   return {
     catalog,
     slots,
-    slotUpdate,
-    slotClear,
+    slotUpdate: slotMutations.assignResult,
+    slotClear: slotMutations.clearResult,
     selections,
-    assignmentMutationStates,
     catalogRefresh,
-    favoriteUpdate,
+    favoriteUpdate: slotMutations.favoriteResult,
     favoriteModels,
     setModelFavorite,
     updateSlotModel,

@@ -16,6 +16,8 @@ export { makeRemoteAcnInstanceManager } from "./acn-jit/remote-acn-instance-mana
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
+export { AcnRpcClientTag } from "./protocol"
+export type { AcnRpcClient } from "./protocol"
 export type {
   AcnClientCloseReport,
   AcnClientCloseResult,
@@ -59,6 +61,7 @@ export {
   PercentageSchema,
   ModelCapabilitiesSchema,
   ModelFailureSchema,
+  ModelDownloadFailureSchema,
   ProviderModelCatalogStateSchema,
   ProviderCatalogEntrySchema,
   ProviderModelCatalogEntrySchema,

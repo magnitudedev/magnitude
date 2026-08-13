@@ -8,7 +8,7 @@
  * boxes and the startup header slot.
  */
 import { useCallback, type ReactNode } from "react";
-import { Cause, Option } from "effect";
+import { Cause, Option, Schema } from "effect";
 import {
   useAtomValue,
   useAtomSet,
@@ -43,6 +43,7 @@ import {
   type OnboardingModelSetupState,
 } from "@magnitudedev/client-common";
 import {
+  ModelDownloadFailureSchema,
   type LocalModelsState,
   type SessionOptions,
   type AcnLifecycleState,
@@ -90,6 +91,7 @@ import {
   OnboardingModelChooser,
   OnboardingModelPreparation,
 } from "./features/model-setup";
+import { modelDownloadFailureMessage } from "./features/local-inference/view-model";
 import { registerCliCommands } from "./commands/register";
 import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
 
@@ -324,13 +326,17 @@ function CliAppContent(
   const setupError = setupState?._tag === "Failed"
     ? (() => {
         const failure = setupState.failure;
+        if (Schema.is(ModelDownloadFailureSchema)(failure)) {
+          return modelDownloadFailureMessage(failure);
+        }
+        if (!("_tag" in failure)) return describeError(failure);
         switch (failure._tag) {
           case "OnboardingModelChoiceRejected":
             return "That model is no longer available for setup.";
           case "OnboardingModelResourceChanged":
             return "The selected model changed before setup completed. Choose it again to retry.";
-          case "OnboardingModelSetupFailed":
-            return describeError(failure.cause);
+          default:
+            return describeError(failure);
         }
       })()
     : null;
@@ -419,9 +425,6 @@ function CliAppContent(
         cancelling: state.cancelling,
         cancelError,
         onCancel: cancelOnboardingModelSetup,
-        onRetry: () => setupOnboardingModel(
-          Option.getOrThrow(localModelConfigurationId(state.model)),
-        ),
       }, `Downloading ${formatLocalModelDisplayName(state.model)}…`);
       case "Loading": return chooser({
         _tag: "Activating",

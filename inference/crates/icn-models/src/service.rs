@@ -920,7 +920,7 @@ mod tests {
             stage: "downloading".to_owned(),
             started_at: 1,
             updated_at: 1,
-            last_error: None,
+            failure: None,
         };
         let tombstone = root.path().join("trash/operation-mdl_test.1.json");
         fs::write(

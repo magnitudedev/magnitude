@@ -1,103 +1,14 @@
 import { useMemo } from "react"
-import { Cause, Duration, Effect, Equivalence, Option, Schedule, Schema, Stream } from "effect"
-import { Atom, Result, useAtomMount, useAtomValue } from "@effect-atom/atom-react"
-import * as Reactivity from "@effect/experimental/Reactivity"
+import { Equivalence, Option, Schema } from "effect"
+import { Atom, Result, useAtomValue } from "@effect-atom/atom-react"
 import type * as Rpc from "@effect/rpc/Rpc"
 import type * as RpcGroup from "@effect/rpc/RpcGroup"
 import type { RpcClientError } from "@effect/rpc/RpcClientError"
-import type {
-  MagnitudeRpcs,
-  MirroredStateInvalidation,
-} from "@magnitudedev/sdk"
+import type { MagnitudeRpcs } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
 type MagnitudeRpc = RpcGroup.Rpcs<typeof MagnitudeRpcs>
-type WatchEvent = MirroredStateInvalidation
 type RpcPayload<Tag extends Rpc.Tag<MagnitudeRpc>> = Rpc.PayloadConstructor<Rpc.ExtractTag<MagnitudeRpc, Tag>>
-type AgentClientInstance = ReturnType<typeof useAgentClient>
-
-interface ResidentWatch {
-  readonly atom: Atom.Atom<Result.Result<void, never>>
-  readonly mountedMirrorIds: Set<string>
-  readonly subscribers: Map<string, Set<() => Effect.Effect<void>>>
-}
-
-const residentWatches = new WeakMap<object, ResidentWatch>()
-
-const runInvalidationWatch = <R>(
-  mountedMirrorIds: ReadonlySet<string>,
-  subscribers: ReadonlyMap<string, ReadonlySet<() => Effect.Effect<void>>>,
-  connect: Effect.Effect<Stream.Stream<WatchEvent, RpcClientError>, never, R>,
-) => {
-  const notify = (ids: ReadonlyArray<string>) => Effect.gen(function* () {
-    yield* Reactivity.invalidate(ids)
-    yield* Effect.forEach(
-      ids.flatMap((id) => [...(subscribers.get(id) ?? [])]),
-      (subscriber) => subscriber(),
-      { discard: true },
-    )
-  })
-  const reconnect = Schedule.exponential("100 millis").pipe(
-    Schedule.modifyDelay((_, delay) => Duration.min(delay, Duration.seconds(5))),
-    Schedule.jittered,
-  )
-  const watch = Stream.unwrap(Effect.gen(function* () {
-    const stream = yield* connect
-    yield* Effect.logDebug("Mirrored state watch connected")
-    yield* notify([...mountedMirrorIds])
-    return stream.pipe(Stream.tap((event) => notify([event.id])))
-  }))
-  return watch.pipe(
-    Stream.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
-      ? Effect.void
-      : Effect.logWarning("Mirrored state watch disconnected; retrying").pipe(
-        Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 1_000) }),
-      )),
-    Stream.retry(reconnect),
-    Stream.runDrain,
-    Effect.catchAllCause((cause) => Cause.isInterruptedOnly(cause)
-      ? Effect.void
-      : Effect.logError(Cause.pretty(cause))),
-  )
-}
-
-export const getMirroredStateInvalidationWatch = (
-  client: AgentClientInstance,
-  mirrorId: string,
-): Atom.Atom<Result.Result<void, never>> => {
-  const existing = residentWatches.get(client)
-  if (existing) {
-    existing.mountedMirrorIds.add(mirrorId)
-    return existing.atom
-  }
-
-  const mountedMirrorIds = new Set([mirrorId])
-  const subscribers = new Map<string, Set<() => Effect.Effect<void>>>()
-  const atom = client.runtime.atom(runInvalidationWatch(
-    mountedMirrorIds,
-    subscribers,
-    Effect.map(client, (rpc) => rpc("WatchMirroredStates", {})),
-  ))
-  residentWatches.set(client, { atom, mountedMirrorIds, subscribers })
-  return atom
-}
-
-export const subscribeToMirroredStateInvalidation = (
-  client: AgentClientInstance,
-  mirrorId: string,
-  subscriber: () => Effect.Effect<void>,
-): (() => void) => {
-  getMirroredStateInvalidationWatch(client, mirrorId)
-  const resident = residentWatches.get(client)!
-  const current = resident.subscribers.get(mirrorId) ?? new Set()
-  current.add(subscriber)
-  resident.subscribers.set(mirrorId, current)
-  return () => {
-    current.delete(subscriber)
-    if (current.size === 0) resident.subscribers.delete(mirrorId)
-  }
-}
-
 /**
  * Mirrors one protocol-defined backend state into a query atom. The definition's
  * RPC tag is also its invalidation identity, so no parallel client configuration exists.
@@ -167,9 +78,8 @@ export function useMirroredStateSelector<
 }
 
 /**
- * Returns the query atom for one mirrored domain and keeps the shared
- * invalidation watch resident. Consumers must preserve each domain's Result;
- * successful values may be composed purely at the rendering boundary.
+ * Returns the query atom for one directly mirrored domain. The connection
+ * runtime owns invalidation; observing this atom only observes the snapshot.
  */
 export function useMirroredStateAtom<
   const Id extends Rpc.Tag<MagnitudeRpc>,
@@ -188,16 +98,11 @@ export function useMirroredStateAtom<
   const client = useAgentClient()
   const queryAtom = useMemo(
     () =>
-      client.query(definition.id, definition.getPayload, {
+      client.rpc.query(definition.id, definition.getPayload, {
         reactivityKeys: [definition.id],
         timeToLive: Infinity,
       }),
     [client, definition],
   )
-  const watchAtom = useMemo(
-    () => getMirroredStateInvalidationWatch(client, definition.id),
-    [client, definition.id],
-  )
-  useAtomMount(watchAtom)
   return queryAtom
 }

@@ -26,7 +26,7 @@ export function useUsageState(): UseUsageStateResult {
   const [period, setPeriod] = useState<UsagePeriod>("24h")
 
   const usageAtom = useMemo(
-    () => client.query("GetCloudUsage", { period }),
+    () => client.rpc.query("GetCloudUsage", { period }),
     [client, period],
   )
   const result = useAtomValue(usageAtom)

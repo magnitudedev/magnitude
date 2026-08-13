@@ -1,3 +1,4 @@
+import { createElement } from "react"
 import { act, create, type ReactTestRenderer } from "react-test-renderer"
 import { Atom, RegistryContext } from "@effect-atom/atom-react"
 import * as Registry from "@effect-atom/atom/Registry"
@@ -9,11 +10,17 @@ import {
   useLocalModelActions,
   useLocalModelsSelector,
   type AgentClientInstance,
-} from "@magnitudedev/client-common"
+} from "../index"
 import { AcnRpcClientTag, type AcnRpcClient, type LocalModelsState } from "@magnitudedev/sdk"
-import { makeView } from "../local-inference/test-fixtures"
+import { clientServicesLayer, type ClientServices } from "../state/client-services"
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
+const localModelsState: LocalModelsState = {
+  inventoryState: { _tag: "Ready" },
+  models: [],
+  discoveryState: { _tag: "Ready", progress: [] },
+}
+
+;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true
 
 interface FakeRpcClient {
@@ -36,7 +43,7 @@ const makeFakeAgentClient = (
   const service: FakeRpcClient = (tag) => {
     if (tag === "GetLocalModels") {
       onGetLocalModels()
-      return options?.getLocalModels?.() ?? Effect.succeed({ state: makeView().models })
+      return options?.getLocalModels?.() ?? Effect.succeed({ state: localModelsState })
     }
     if (tag === "WatchMirroredStates") {
       onWatchMirroredStates()
@@ -46,10 +53,10 @@ const makeFakeAgentClient = (
   }
   const layer = Layer.succeed(FakeAgentClient, service)
   const runtime = Atom.runtime(layer)
-  const effectQuery = EffectQueryClient.make(Layer.succeed(
-    AcnRpcClientTag,
-    service as unknown as AcnRpcClient,
-  ))
+  const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
+    Layer.succeed(AcnRpcClientTag, service as unknown as AcnRpcClient),
+    (client) => clientServicesLayer(client),
+  )
   const mutation = () => Atom.fn(() => Effect.void)
   const tag = Object.assign(FakeAgentClient, {
     layer,
@@ -57,7 +64,7 @@ const makeFakeAgentClient = (
     mutation,
     effectQuery,
   })
-  return tag as unknown as AgentClientInstance
+  return { rpc: tag, effectQuery } as unknown as AgentClientInstance
 }
 
 const selectModels = (state: LocalModelsState) => state.models
@@ -76,7 +83,20 @@ const CatalogProbe = () => {
 }
 
 const Harness = ({ root }: { readonly root: "models" | "catalog" }) =>
-  root === "models" ? <ModelsProbe /> : <CatalogProbe />
+  createElement(root === "models" ? ModelsProbe : CatalogProbe)
+
+const renderHarness = (
+  registry: Registry.Registry,
+  client: AgentClientInstance,
+  root: "models" | "catalog",
+) => createElement(
+  RegistryContext.Provider,
+  { value: registry },
+  createElement(
+    AgentClientProvider,
+    { tag: client, children: createElement(Harness, { root }) },
+  ),
+)
 
 describe("local model query lifecycle", () => {
   it("does not refetch GetLocalModels when switching menu consumers", async () => {
@@ -87,39 +107,21 @@ describe("local model query lifecycle", () => {
     let renderer!: ReactTestRenderer
 
     await act(async () => {
-      renderer = create(
-        <RegistryContext.Provider value={registry}>
-          <AgentClientProvider tag={client}>
-            <Harness root="models" />
-          </AgentClientProvider>
-        </RegistryContext.Provider>,
-      )
+      renderer = create(renderHarness(registry, client, "models"))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(watches).toBe(1)
     expect(calls).toBe(1)
 
     await act(async () => {
-      renderer.update(
-        <RegistryContext.Provider value={registry}>
-          <AgentClientProvider tag={client}>
-            <Harness root="catalog" />
-          </AgentClientProvider>
-        </RegistryContext.Provider>,
-      )
+      renderer.update(renderHarness(registry, client, "catalog"))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(watches).toBe(1)
     expect(calls).toBe(1)
 
     await act(async () => {
-      renderer.update(
-        <RegistryContext.Provider value={registry}>
-          <AgentClientProvider tag={client}>
-            <Harness root="models" />
-          </AgentClientProvider>
-        </RegistryContext.Provider>,
-      )
+      renderer.update(renderHarness(registry, client, "models"))
       await Effect.runPromise(Effect.sleep("10 millis"))
       renderer.unmount()
     })
@@ -140,9 +142,9 @@ describe("local model query lifecycle", () => {
       () => calls++,
       () => watches++,
       {
-        getLocalModels: () => calls <= 2
+        getLocalModels: () => calls === 1
           ? Effect.fail("temporarily unavailable")
-          : Effect.succeed({ state: makeView().models }),
+          : Effect.succeed({ state: localModelsState }),
         watchMirroredStates: () => Stream.unwrap(Deferred.await(watchConnected).pipe(
           Effect.as(Stream.fromPubSub(invalidations)),
         )),
@@ -152,17 +154,11 @@ describe("local model query lifecycle", () => {
     let renderer!: ReactTestRenderer
 
     await act(async () => {
-      renderer = create(
-        <RegistryContext.Provider value={registry}>
-          <AgentClientProvider tag={client}>
-            <ModelsProbe />
-          </AgentClientProvider>
-        </RegistryContext.Provider>,
-      )
+      renderer = create(renderHarness(registry, client, "models"))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(watches).toBe(1)
-    expect(calls).toBe(2)
+    expect(calls).toBe(1)
 
     await act(async () => {
       await Effect.runPromise(Deferred.succeed(watchConnected, undefined))
@@ -173,8 +169,18 @@ describe("local model query lifecycle", () => {
     await act(async () => {
       await Effect.runPromise(PubSub.publish(invalidations, {
         _tag: "changed",
-        id: "GetLocalModels",
+        id: "GetModelSlots",
         revision: 1,
+      } as const))
+      await Effect.runPromise(Effect.sleep("10 millis"))
+    })
+    expect(calls).toBe(callsBeforeInvalidation)
+
+    await act(async () => {
+      await Effect.runPromise(PubSub.publish(invalidations, {
+        _tag: "changed",
+        id: "GetLocalModels",
+        revision: 2,
       } as const))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })

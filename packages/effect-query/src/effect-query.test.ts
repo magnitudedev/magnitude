@@ -28,6 +28,43 @@ const clientFor = (registry: Registry.Registry): QueryClient.Service => Effect.r
   )
 )
 
+describe("Client", () => {
+  it("acquires additional services once and releases them with the Atom registry", async () => {
+    interface AdditionalService {
+      readonly value: string
+    }
+    const AdditionalService = Context.GenericTag<AdditionalService>("test/AdditionalService")
+    let acquisitions = 0
+    let releases = 0
+    const client = Client.make<never, never, AdditionalService>(
+      Layer.empty,
+      () => Layer.scoped(AdditionalService, Effect.acquireRelease(
+        Effect.sync(() => {
+          acquisitions += 1
+          return { value: "available" }
+        }),
+        () => Effect.sync(() => {
+          releases += 1
+        }),
+      )),
+    )
+    const registry = Registry.make()
+    const service = client.runtime.atom(AdditionalService)
+
+    const unmount = registry.mount(service)
+    await Effect.runPromise(Effect.sleep("1 millis"))
+    expect(AtomResult.value(registry.get(service))).toEqual(Option.some({ value: "available" }))
+    expect(acquisitions).toBe(1)
+
+    unmount()
+    await Effect.runPromise(Effect.sleep("1 millis"))
+    expect(releases).toBe(0)
+
+    registry.dispose()
+    expect(releases).toBe(1)
+  })
+})
+
 describe("Query", () => {
   it("runs definition-based cache operations through its connection client", async () => {
     const registry = Registry.make()

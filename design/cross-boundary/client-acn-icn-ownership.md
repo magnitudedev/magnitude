@@ -185,10 +185,14 @@ domain unions, calculate backend policy, or become a second application backend 
 process.
 
 For an Effect Query-adopted subsystem, client-common owns the canonical query definitions,
-mutation definitions, semantic mutation scopes, and the invalidation bridge from ACN mirror events.
-The bridge treats events only as notification and rereads the ACN snapshot. Effect Query mutation
-states describe exact client command invocations; they do not duplicate ACN installation or
-ICN download lifecycle state.
+mutation definitions, semantic mutation scopes, and the invalidation Effect consuming ACN mirror
+events. The events are notification only; the Query rereads the ACN snapshot. Effect Query mutation
+states describe exact client command invocations and do not duplicate ACN installation or ICN
+download lifecycle state.
+
+Effect Query and direct-mirror domains are independent vertical client-state implementations. An
+Effect Query domain consumes ACN notifications directly into `QueryClient`; it does not subscribe
+through, invalidate, or otherwise compensate for the direct-mirror Reactivity implementation.
 
 Client-common must not:
 

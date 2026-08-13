@@ -15,6 +15,7 @@ import {
   SECONDARY_SLOT_ID,
   ProviderModelCatalogEntrySchema,
   type ProviderModelCatalogEntry,
+  type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
 import {
   ProviderModelIdSchema,
@@ -32,6 +33,10 @@ import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 import { makeObservedState } from "./mirrored-state"
 import { resolveBundlePresentation } from "./local-model-presentation"
+
+export const localProviderModelId = (
+  configurationId: ModelServingConfigurationId,
+): ProviderModelId => ProviderModelIdSchema.make(configurationId)
 
 export type ProviderOfferingPackageEvidence = readonly {
   readonly providerModelId: LocalProviderOffering["providerModelId"]
@@ -167,7 +172,7 @@ export const LocalProviderOfferingsLive: Layer.Layer<
     configurations: readonly ModelServingConfiguration[],
     sources: Effect.Effect.Success<typeof capabilitySources>,
   ): readonly LocalProviderOffering[] => configurations.map((configuration) => ({
-    providerModelId: ProviderModelIdSchema.make(configuration.id),
+    providerModelId: localProviderModelId(configuration.id),
     configuration,
     capabilities: capabilitySet(
       configuration.bundle,

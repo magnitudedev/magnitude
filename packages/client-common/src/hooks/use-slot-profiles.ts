@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from "react"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   isRoleId,
@@ -15,8 +15,8 @@ import {
 } from "@magnitudedev/sdk"
 import { useDisplayState } from "../state/display-state-store"
 import { useAgentClient } from "../state/agent-client-context"
+import { ModelSlots } from "../model-slots/service"
 import { useMirroredState } from "./use-mirrored-state"
-import { useModelSlotsResultAtom } from "./use-local-inference-state"
 import { formatModelDisplayName } from "../utils/model-presentation"
 
 export interface SlotProfile {
@@ -52,9 +52,14 @@ const catalogModels = (state: typeof ProviderModelCatalogMirror.stateSchema.Type
 
 export function useSlotProfiles() {
   const client = useAgentClient()
-  const slots = useAtomValue(useModelSlotsResultAtom())
+  const slotService = useMemo(() => client.effectQuery.runtime.atom(ModelSlots), [client])
+  const slotState = useMemo(() => Atom.make((get) => Result.flatMap(
+    get(slotService),
+    (service) => get(service.state),
+  )), [slotService])
+  const slots = useAtomValue(slotState)
   const catalog = useMirroredState(ProviderModelCatalogMirror)
-  const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
+  const refreshAtom = useMemo(() => client.rpc.mutation("RefreshModelCatalog"), [client])
   const refresh = useAtomSet(refreshAtom)
   const retry = useCallback(() => refresh({
     payload: { providerId: Option.none() },

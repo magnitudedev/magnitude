@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use icn_contracts::{
-    ComponentRelationship, ComponentRole, ContentId, ContentIdentity, ModelComponent, ModelId,
+    ComponentRelationship, ComponentRole, ContentId, ContentIdentity, DownloadFailure,
+    ModelComponent, ModelId,
 };
 use serde::{Deserialize, Serialize};
 
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,7 +51,7 @@ pub struct OperationManifest {
     pub stage: String,
     pub started_at: u64,
     pub updated_at: u64,
-    pub last_error: Option<String>,
+    pub failure: Option<DownloadFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
