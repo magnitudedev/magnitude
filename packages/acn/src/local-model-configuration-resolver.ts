@@ -4,6 +4,7 @@ import {
   ModelServingConfigurationSchema,
   servableModelBundlePackageIds,
   type LocalInferenceError,
+  type ModelPackage,
   type ModelServingConfiguration,
   type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
@@ -47,8 +48,21 @@ export const localModelBundleIdentity = (
 ): LocalModelBundleIdentity => LocalModelBundleIdentitySchema.make(
   bundle._tag === "Standalone"
     ? `Standalone\0${bundle.package.id}`
-    : `SpeculativeDecodingPair\0${bundle.target.id}\0${bundle.draft.id}`,
+    : bundle.draftSource._tag === "Embedded"
+      ? `SpeculativeDecoding\0${bundle.target.id}\0Embedded\0${JSON.stringify(bundle.method)}`
+      : `SpeculativeDecoding\0${bundle.target.id}\0Separate\0${bundle.draftSource.draft.id}\0${JSON.stringify(bundle.method)}`,
 )
+
+export const configuredModelPackageIds = (
+  configurations: Iterable<ModelServingConfiguration>,
+): ReadonlySet<string> => new Set([...configurations].flatMap(({ bundle }) =>
+  servableModelBundlePackageIds(bundle)))
+
+export const isStandalonePackageCandidate = (
+  modelPackage: ModelPackage,
+  configuredPackageIds: ReadonlySet<string>,
+): boolean => !configuredPackageIds.has(modelPackage.id)
+  && modelPackage.files.some(({ role }) => role === "weights")
 
 const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 

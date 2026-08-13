@@ -62,16 +62,18 @@ Decode-first service protects latency; rotating prompt starts prevent monopoliza
 Batch construction stages all request effects:
 
 ```text
-BatchCommit { prompt advances, MTP indices, logits }
+BatchCommit { prompt advances, speculative indices, logits }
                          |
-          target decode + linked MTP succeed
+       target decode + linked speculative processing succeed
                          |
                          v
                  mutate request state
 ```
 
-Failure drops the commit, so staged prompt work cannot become reusable. Multimodal and MTP
-preparation share this state machine; MTP target and draft state remain natively linked.
+Failure drops the commit, so staged prompt work cannot become reusable. Multimodal and speculative
+preparation share this state machine; target and draft state remain natively linked. Each successful
+multimodal token or embedding decode is processed speculatively before a later decode may depend on
+it.
 
 ## Terminal handling
 

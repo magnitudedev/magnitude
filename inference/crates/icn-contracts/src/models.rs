@@ -18,7 +18,7 @@ macro_rules! string_id {
 
 string_id!(ModelFileId);
 string_id!(ModelPackageId);
-string_id!(DownloadAttemptId);
+string_id!(ModelDownloadId);
 string_id!(ModelAssessmentRequestId);
 string_id!(ServableModelBundleKey);
 string_id!(ModelServingConfigurationId);
@@ -194,18 +194,15 @@ pub enum ModelFileRole {
 
 /// Native algorithm used by a speculative decoding stage.
 ///
-/// Method and artifact packaging are intentionally independent: MTP may be embedded in the target
-/// or supplied by a companion, while model-backed draft methods use companion artifacts.
+/// Method and artifact packaging are intentionally independent. The enclosing speculative bundle
+/// declares whether the selected method is embedded in the target or supplied by a companion.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum SpeculativeMethod {
     Mtp,
-    DraftSimple,
-    DraftEagle3,
-    DraftDFlash,
-    Ngram { method: String },
-    UnknownNative { method: String, evidence: String },
+    DFlash,
+    DSpark,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -349,10 +346,20 @@ pub enum ServableModelBundle {
     Standalone {
         package: ModelPackage,
     },
-    SpeculativeDecodingPair {
+    #[serde(rename_all = "camelCase")]
+    SpeculativeDecoding {
         target: ModelPackage,
-        draft: ModelPackage,
+        draft_source: SpeculativeDraftSource,
+        method: SpeculativeMethod,
     },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum SpeculativeDraftSource {
+    Embedded,
+    Separate { draft: ModelPackage },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -443,10 +450,19 @@ pub enum ModelBundleInput {
     #[serde(rename_all = "camelCase")]
     Standalone { package: ModelPackageOperand },
     #[serde(rename_all = "camelCase")]
-    SpeculativeDecodingPair {
+    SpeculativeDecoding {
         target: ModelPackageOperand,
-        draft: ModelPackageOperand,
+        draft_source: SpeculativeDraftSourceInput,
+        method: SpeculativeMethod,
     },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum SpeculativeDraftSourceInput {
+    Embedded,
+    Separate { draft: ModelPackageOperand },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -593,55 +609,56 @@ pub struct StartModelDownloadRequest {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum DownloadAttempt {
+pub enum ModelDownloadState {
     #[serde(rename_all = "camelCase")]
     Pending {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
+        completed_bytes: u64,
+        total_bytes: u64,
     },
     #[serde(rename_all = "camelCase")]
     Downloading {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
         stage: DownloadStage,
         completed_bytes: u64,
         total_bytes: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes_per_second: Option<u64>,
     },
-    #[serde(rename_all = "camelCase")]
-    Completed {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
-    },
+    Completed,
     #[serde(rename_all = "camelCase")]
     Failed {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
         completed_bytes: u64,
         total_bytes: u64,
         failure: ModelFailure,
-        #[serde(default)]
-        #[cfg_attr(feature = "openapi", schema(required = true))]
         acknowledged: bool,
     },
     #[serde(rename_all = "camelCase")]
     Cancelled {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
+        completed_bytes: u64,
+        total_bytes: u64,
     },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelDownload {
+    pub id: ModelDownloadId,
+    pub bundle: ServableModelBundle,
+    pub state: ModelDownloadState,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadResponse {
-    pub attempts: Vec<DownloadAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub download: Option<ModelDownload>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDownloadsResponse {
-    pub attempts: Vec<DownloadAttempt>,
+    pub downloads: Vec<ModelDownload>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -788,17 +805,10 @@ pub trait ModelDownloads: Send + Sync + 'static {
         &self,
         request: StartModelDownloadRequest,
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>>;
-    fn list_attempts(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>>;
-    fn get_attempt(
-        &self,
-        id: &DownloadAttemptId,
-    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
-    fn cancel(
-        &self,
-        id: &DownloadAttemptId,
-    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
+    fn list(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>>;
+    fn cancel(&self, id: &ModelDownloadId) -> BoxFuture<'_, Result<ModelDownload, InventoryError>>;
     fn acknowledge_failure(
         &self,
-        id: &DownloadAttemptId,
-    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
+        id: &ModelDownloadId,
+    ) -> BoxFuture<'_, Result<ModelDownload, InventoryError>>;
 }

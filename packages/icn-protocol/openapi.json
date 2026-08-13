@@ -396,7 +396,7 @@
         "operationId": "listModelDownloads",
         "responses": {
           "200": {
-            "description": "Retained model download attempts",
+            "description": "Retained model downloads and internal package attempts",
             "content": {
               "application/json": {
                 "schema": {
@@ -406,7 +406,7 @@
             }
           },
           "500": {
-            "description": "Download attempts unavailable",
+            "description": "Model downloads unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -434,7 +434,7 @@
         },
         "responses": {
           "200": {
-            "description": "Authoritative download attempt",
+            "description": "Authoritative model-download admission",
             "content": {
               "application/json": {
                 "schema": {
@@ -456,48 +456,7 @@
         }
       }
     },
-    "/v1/models/downloads/{attempt_id}": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getModelDownload",
-        "parameters": [
-          {
-            "name": "attempt_id",
-            "in": "path",
-            "description": "Download attempt ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Authoritative model download attempt",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DownloadAttempt"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Attempt not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/downloads/{attempt_id}/acknowledge-failure": {
+    "/v1/models/downloads/{download_id}/acknowledge-failure": {
       "post": {
         "tags": [
           "models"
@@ -505,9 +464,9 @@
         "operationId": "acknowledgeModelDownloadFailure",
         "parameters": [
           {
-            "name": "attempt_id",
+            "name": "download_id",
             "in": "path",
-            "description": "Failed download attempt ID",
+            "description": "Failed model download ID",
             "required": true,
             "schema": {
               "type": "string"
@@ -516,17 +475,17 @@
         ],
         "responses": {
           "200": {
-            "description": "Acknowledged failed model download attempt",
+            "description": "Acknowledged failed model download",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DownloadAttempt"
+                  "$ref": "#/components/schemas/ModelDownload"
                 }
               }
             }
           },
           "400": {
-            "description": "Attempt has not failed",
+            "description": "Model download has not failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -536,7 +495,7 @@
             }
           },
           "404": {
-            "description": "Attempt not found",
+            "description": "Model download not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -548,7 +507,7 @@
         }
       }
     },
-    "/v1/models/downloads/{attempt_id}/cancel": {
+    "/v1/models/downloads/{download_id}/cancel": {
       "post": {
         "tags": [
           "models"
@@ -556,9 +515,9 @@
         "operationId": "cancelModelDownload",
         "parameters": [
           {
-            "name": "attempt_id",
+            "name": "download_id",
             "in": "path",
-            "description": "Download attempt ID",
+            "description": "Model download ID",
             "required": true,
             "schema": {
               "type": "string"
@@ -567,17 +526,17 @@
         ],
         "responses": {
           "200": {
-            "description": "Cancelled or terminal model download attempt",
+            "description": "Cancelled or terminal model download",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DownloadAttempt"
+                  "$ref": "#/components/schemas/ModelDownload"
                 }
               }
             }
           },
           "404": {
-            "description": "Attempt not found",
+            "description": "Model download not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -2020,167 +1979,6 @@
         },
         "additionalProperties": false
       },
-      "DownloadAttempt": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "packageId",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Pending"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "packageId",
-              "stage",
-              "completedBytes",
-              "totalBytes",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "stage": {
-                "$ref": "#/components/schemas/DownloadStage"
-              },
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "bytesPerSecond": {
-                "type": [
-                  "integer",
-                  "null"
-                ],
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Downloading"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "packageId",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Completed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "packageId",
-              "completedBytes",
-              "totalBytes",
-              "failure",
-              "acknowledged",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "acknowledged": {
-                "type": "boolean"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "packageId",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Cancelled"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "DownloadAttemptId": {
-        "type": "string"
-      },
       "DownloadStage": {
         "type": "string",
         "enum": [
@@ -3606,20 +3404,24 @@
             "type": "object",
             "required": [
               "target",
-              "draft",
+              "draftSource",
+              "method",
               "_tag"
             ],
             "properties": {
               "target": {
                 "$ref": "#/components/schemas/ModelPackageOperand"
               },
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
+              "draftSource": {
+                "$ref": "#/components/schemas/SpeculativeDraftSourceInput"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "SpeculativeDecodingPair"
+                  "SpeculativeDecoding"
                 ]
               }
             }
@@ -3650,16 +3452,181 @@
         },
         "additionalProperties": false
       },
+      "ModelDownload": {
+        "type": "object",
+        "required": [
+          "id",
+          "bundle",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelDownloadId"
+          },
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ModelDownloadState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelDownloadId": {
+        "type": "string"
+      },
+      "ModelDownloadState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stage",
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "stage": {
+                "$ref": "#/components/schemas/DownloadStage"
+              },
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "bytesPerSecond": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Downloading"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "failure",
+              "acknowledged",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "acknowledged": {
+                "type": "boolean"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Cancelled"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelDownloadsResponse": {
         "type": "object",
         "required": [
-          "attempts"
+          "downloads"
         ],
         "properties": {
-          "attempts": {
+          "downloads": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/DownloadAttempt"
+              "$ref": "#/components/schemas/ModelDownload"
             }
           }
         }
@@ -4980,20 +4947,24 @@
             "type": "object",
             "required": [
               "target",
-              "draft",
+              "draftSource",
+              "method",
               "_tag"
             ],
             "properties": {
               "target": {
                 "$ref": "#/components/schemas/ModelPackage"
               },
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackage"
+              "draftSource": {
+                "$ref": "#/components/schemas/SpeculativeDraftSource"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "SpeculativeDecodingPair"
+                  "SpeculativeDecoding"
                 ]
               }
             }
@@ -5034,6 +5005,78 @@
         },
         "additionalProperties": false
       },
+      "SpeculativeDraftSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Separate"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "SpeculativeDraftSourceInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Separate"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "SpeculativeMethod": {
         "oneOf": [
           {
@@ -5059,7 +5102,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "DraftSimple"
+                  "DFlash"
                 ]
               }
             }
@@ -5073,67 +5116,13 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "DraftEagle3"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DraftDFlash"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "method",
-              "_tag"
-            ],
-            "properties": {
-              "method": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Ngram"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "method",
-              "evidence",
-              "_tag"
-            ],
-            "properties": {
-              "method": {
-                "type": "string"
-              },
-              "evidence": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "UnknownNative"
+                  "DSpark"
                 ]
               }
             }
           }
         ],
-        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent: MTP may be embedded in the target\nor supplied by a companion, while model-backed draft methods use companion artifacts."
+        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a companion."
       },
       "SplitModeResponse": {
         "type": "string",
@@ -5157,15 +5146,9 @@
       },
       "StartModelDownloadResponse": {
         "type": "object",
-        "required": [
-          "attempts"
-        ],
         "properties": {
-          "attempts": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DownloadAttempt"
-            }
+          "download": {
+            "$ref": "#/components/schemas/ModelDownload"
           }
         }
       },

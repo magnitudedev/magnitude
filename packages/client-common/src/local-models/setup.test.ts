@@ -5,7 +5,7 @@ import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
   AssessmentEnvironmentIdSchema,
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   ModelAssessmentIdSchema,
   ModelInstanceIdSchema,
   ModelPackageIdSchema,
@@ -25,12 +25,13 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import type { AgentClientInstance } from "../state/agent-client"
+import { installationAdmissionIsVisible } from "./atoms"
 import { onboardingModelSetupService } from "./setup"
 
 const configurationId = ModelServingConfigurationIdSchema.make("setup-configuration")
 const providerModelId = ProviderModelIdSchema.make("setup-model")
 const instanceId = ModelInstanceIdSchema.make("setup-instance")
-const attemptId = DownloadAttemptIdSchema.make("setup-attempt")
+const downloadId = ModelDownloadIdSchema.make("setup-download")
 const reasoningEffort = ReasoningEffortSchema.make("none")
 const localProviderId = ProviderIdSchema.make("local")
 const allocation = {
@@ -177,7 +178,7 @@ const makeHarness = (options: HarnessOptions) => {
       ...model,
       acquisitionState: {
         _tag: "Downloading",
-        attemptIds: [attemptId],
+        downloadId,
         stage: "downloading",
         completedBytes: 0,
         totalBytes: 1,
@@ -218,7 +219,7 @@ const makeHarness = (options: HarnessOptions) => {
                 ...uninstalled,
                 acquisitionState: {
                   _tag: "Downloading" as const,
-                  attemptIds: [attemptId],
+                  downloadId,
                   stage: "downloading" as const,
                   completedBytes: 0,
                   totalBytes: 1,
@@ -235,7 +236,7 @@ const makeHarness = (options: HarnessOptions) => {
         return Effect.succeed({
           _tag: "DownloadAdmitted",
           providerModelId,
-          attemptIds: [attemptId],
+          downloadId,
         })
       }
       case "AssignSlot": {
@@ -268,14 +269,14 @@ const makeHarness = (options: HarnessOptions) => {
         slots = configuredSlots("Stopped", payload.instanceId)
         return Effect.succeed({})
       case "CancelModelDownload":
-        cancelledAttempts.push(payload.attemptIds)
+        cancelledAttempts.push(payload.downloadId)
         models = {
           ...models,
           models: [{
             ...model,
             acquisitionState: {
               _tag: "Cancelled",
-              attemptIds: [attemptId],
+              downloadId,
               completedBytes: 0,
               totalBytes: 1,
             },
@@ -328,6 +329,63 @@ const waitForCall = (calls: readonly string[], name: string): Effect.Effect<void
   calls.includes(name)
     ? Effect.void
     : Effect.sleep("1 millis").pipe(Effect.zipRight(Effect.suspend(() => waitForCall(calls, name))))
+
+describe("local-model installation admission correlation", () => {
+  it("accepts the stable bundle download identity while package progress changes", () => {
+    const downloading = makeModel(false)
+    const state: LocalModelsState = {
+      inventoryState: { _tag: "Ready" },
+      discoveryState: { _tag: "Ready", progress: [] },
+      models: [{
+        ...downloading,
+        acquisitionState: {
+          _tag: "Downloading",
+          downloadId,
+          stage: "downloading",
+          completedBytes: 1,
+          totalBytes: 2,
+          bytesPerSecond: Option.none(),
+        },
+        servingState: downloading.servingState._tag === "Assessed"
+          ? {
+              ...downloading.servingState,
+              availabilityState: { _tag: "Preparing", providerModelId },
+            }
+          : downloading.servingState,
+      }],
+    }
+
+    expect(installationAdmissionIsVisible(state, configurationId, {
+      _tag: "DownloadAdmitted",
+      providerModelId,
+      downloadId,
+    })).toBe(true)
+  })
+
+  it("rejects a different bundle download occurrence", () => {
+    const downloading = makeModel(false)
+    const state: LocalModelsState = {
+      inventoryState: { _tag: "Ready" },
+      discoveryState: { _tag: "Ready", progress: [] },
+      models: [{
+        ...downloading,
+        acquisitionState: {
+          _tag: "Downloading",
+          downloadId: ModelDownloadIdSchema.make("replacement-download"),
+          stage: "downloading",
+          completedBytes: 1,
+          totalBytes: 2,
+          bytesPerSecond: Option.none(),
+        },
+      }],
+    }
+    expect(installationAdmissionIsVisible(state, configurationId, {
+      _tag: "DownloadAdmitted",
+      providerModelId,
+      downloadId,
+    })).toBe(false)
+  })
+})
 
 describe("OnboardingModelSetupService", () => {
   it("is observational and passive across state remounts", async () => {
@@ -472,7 +530,7 @@ describe("OnboardingModelSetupService", () => {
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
     await Effect.runPromise(Fiber.join(start))
-    expect(harness.cancelledAttempts).toEqual([[attemptId]])
+    expect(harness.cancelledAttempts).toEqual([downloadId])
     expect(harness.calls).not.toContain("AssignSlot")
     expect(harness.calls).not.toContain("LoadModel")
     harness.registry.dispose()

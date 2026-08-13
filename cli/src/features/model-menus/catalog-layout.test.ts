@@ -42,6 +42,7 @@ describe("catalog responsive layout", () => {
         + layout.modelWidth
         + columns.recommendation
         + columns.memory
+        + columns.speculative
         + columns.intelligence
         + columns.quality
         + columns.speed

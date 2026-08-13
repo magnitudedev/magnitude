@@ -20,6 +20,10 @@ import {
   type LocalModelAssessmentResult,
 } from "./local-model-assessments"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
+import {
+  configuredModelPackageIds,
+  isStandalonePackageCandidate,
+} from "./local-model-configuration-resolver"
 import { LocalModelPackages } from "./local-model-packages"
 import { makeObservedState } from "./mirrored-state"
 import { RetainedModelConfigurations } from "./retained-model-configurations"
@@ -124,7 +128,7 @@ const standardDemandKey = (
   profile: ServingProfile,
 ): AssessmentDemandKey => bundle._tag === "Standalone"
   ? `Standard\0Standalone\0${bundle.package.id}\0${profile.contextLength}`
-  : `Standard\0SpeculativeDecodingPair\0${bundle.target.id}\0${bundle.draft.id}\0${profile.contextLength}`
+  : `Standard\0${bundleDemandKey(bundle)}\0${profile.contextLength}`
 
 const authoredDemandKey = (
   configuration: ModelServingConfiguration,
@@ -133,7 +137,9 @@ const authoredDemandKey = (
 const bundleDemandKey = (bundle: ServableModelBundle): string =>
   bundle._tag === "Standalone"
     ? `Standalone\0${bundle.package.id}`
-    : `SpeculativeDecodingPair\0${bundle.target.id}\0${bundle.draft.id}`
+    : bundle.draftSource._tag === "Embedded"
+      ? `SpeculativeDecoding\0${bundle.target.id}\0Embedded\0${JSON.stringify(bundle.method)}`
+      : `SpeculativeDecoding\0${bundle.target.id}\0Separate\0${bundle.draftSource.draft.id}\0${JSON.stringify(bundle.method)}`
 
 const sameBundle = Schema.equivalence(ServableModelBundleSchema)
 const sameProfile = Schema.equivalence(ServingProfileSchema)
@@ -249,10 +255,11 @@ export const LocalModelAssessorLive: Layer.Layer<
     for (const configuration of retainedConfigurations) {
       authoredConfigurations.set(configuration.id, configuration)
     }
-    const configuredBundles = new Set([
+    const configuredConfigurations = [
       ...catalogConfigurations,
       ...retainedConfigurations,
-    ].map(({ bundle }) => bundleDemandKey(bundle)))
+    ]
+    const configuredPackages = configuredModelPackageIds(configuredConfigurations)
 
     const hardwareEvidence = {
       nativeBuild: hardwareState.native_build,
@@ -288,8 +295,8 @@ export const LocalModelAssessorLive: Layer.Layer<
     }
     for (const entry of packageState.entries) {
       if (entry.localState._tag !== "Installed" || entry.inspection._tag !== "Inspected") continue
+      if (!isStandalonePackageCandidate(entry.package, configuredPackages)) continue
       const bundle: ServableModelBundle = { _tag: "Standalone", package: entry.package }
-      if (configuredBundles.has(bundleDemandKey(bundle))) continue
       for (const profile of localModelAssessmentProfiles(bundle)) {
         const packageEvidence = [{
           packageId: entry.package.id,

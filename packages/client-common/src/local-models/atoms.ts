@@ -6,7 +6,7 @@ import {
   LocalModelsMirror,
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
-  type DownloadAttemptId,
+  type ModelDownloadId,
   type LocalModelInstallationAdmission,
   type LocalModelsState,
   type ModelServingConfigurationId,
@@ -28,7 +28,7 @@ export interface LocalModelInstallationInput {
 }
 
 export interface LocalModelDownloadInput {
-  readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
+  readonly downloadId: ModelDownloadId
 }
 
 export interface LocalModelDeletionInput {
@@ -40,8 +40,8 @@ export const localModelInstallationScope = (
 ): Mutation.MutationScope => Mutation.MutationScope(configurationId)
 
 const localModelDownloadScope = (
-  attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
-): Mutation.MutationScope => Mutation.MutationScope([...attemptIds].sort().join("|"))
+  downloadId: ModelDownloadId,
+): Mutation.MutationScope => Mutation.MutationScope(downloadId)
 
 export const localModelsQuery = Query.make("LocalModels", {
   key: (_: void) => Data.tuple("local-models"),
@@ -57,12 +57,6 @@ const synchronizeLocalModels = () => QueryClient.invalidate(
   Effect.zipRight(QueryClient.fetch(localModelsQuery, undefined)),
 )
 
-export const sameDownloadAttemptIds = (
-  left: readonly DownloadAttemptId[],
-  right: readonly DownloadAttemptId[],
-): boolean => left.length === right.length
-  && left.every((attemptId) => right.includes(attemptId))
-
 export const installationAdmissionIsVisible = (
   state: LocalModelsState,
   configurationId: ModelServingConfigurationId,
@@ -75,7 +69,7 @@ export const installationAdmissionIsVisible = (
     if (admission._tag === "AlreadyInstalled") return false
     const acquisition = model.acquisitionState
     return acquisition._tag !== "NotInstalled"
-      && sameDownloadAttemptIds(acquisition.attemptIds, admission.attemptIds)
+      && acquisition.downloadId === admission.downloadId
   },
 )
 
@@ -98,16 +92,16 @@ export const installLocalModelMutation = Mutation.make("InstallModel", {
 })
 
 export const cancelModelDownloadMutation = Mutation.make("CancelModelDownload", {
-  scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
-  effect: ({ attemptIds }: LocalModelDownloadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { attemptIds })),
-  synchronize: (_, { attemptIds }) => synchronizeLocalModels().pipe(
+  scope: ({ downloadId }: LocalModelDownloadInput) => localModelDownloadScope(downloadId),
+  effect: ({ downloadId }: LocalModelDownloadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { downloadId })),
+  synchronize: (_, { downloadId }) => synchronizeLocalModels().pipe(
     Effect.filterOrFail(
       (state) => state.models.every((model) => {
         const acquisition = model.acquisitionState
         return acquisition._tag === "NotInstalled"
           || acquisition._tag === "Installed"
-          || !sameDownloadAttemptIds(acquisition.attemptIds, attemptIds)
+          || acquisition.downloadId !== downloadId
           || acquisition._tag === "Cancelled"
           || acquisition._tag === "Failed"
       }),
@@ -121,9 +115,9 @@ export const cancelModelDownloadMutation = Mutation.make("CancelModelDownload", 
 })
 
 export const dismissModelDownloadFailureMutation = Mutation.make("DismissModelDownloadFailure", {
-  scope: ({ attemptIds }: LocalModelDownloadInput) => localModelDownloadScope(attemptIds),
-  effect: ({ attemptIds }: LocalModelDownloadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { attemptIds })),
+  scope: ({ downloadId }: LocalModelDownloadInput) => localModelDownloadScope(downloadId),
+  effect: ({ downloadId }: LocalModelDownloadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { downloadId })),
   synchronize: () => synchronizeLocalModels().pipe(Effect.asVoid),
 })
 

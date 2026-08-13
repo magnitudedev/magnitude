@@ -185,7 +185,7 @@ Per-request context length belongs to an explicit model serving configuration su
 assessment and load. ACN persists that exact configuration as retained model state and projects its
 provider offering; ICN owns its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,
 or process-launch field. Native sequence capacity, physical context allocation, batching, GPU
-placement, KV policy, projector, draft, and MTP selection are ICN-owned plan resolution. This
+placement, KV policy, projector, and speculative-decoding selection are ICN-owned plan resolution. This
 separation lets one ICN live for one ACN lifetime while models and configurations change
 independently.
 

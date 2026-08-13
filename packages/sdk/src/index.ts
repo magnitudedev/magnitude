@@ -107,9 +107,10 @@ export {
   ModelSlotsMirror,
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
+  servableModelBundlePackages,
   OnboardingMirror,
   ModelPackageIdSchema,
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelVariantLabelSchema,
@@ -121,7 +122,7 @@ export {
 } from "@magnitudedev/acn-protocol"
 
 export type {
-  DownloadAttemptId,
+  ModelDownloadId,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,

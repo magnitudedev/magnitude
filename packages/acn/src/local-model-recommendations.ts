@@ -13,6 +13,7 @@ import {
   LocalModelMutationFailed,
   ModelFailureSchema,
   LocalModelRecommendationProgressStepSchema,
+  servableModelBundlePackages,
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
   type ServableModelBundle,
@@ -91,10 +92,7 @@ export const exactBundleTensorStorageBytes = (
 const exactTensorStorageBytes = (
   bundle: ServableModelBundle,
 ): Option.Option<number> => {
-  const packages =
-    bundle._tag === "Standalone"
-      ? [bundle.package]
-      : [bundle.target, bundle.draft]
+  const packages = servableModelBundlePackages(bundle)
   const files = new Map(
     packages
       .flatMap(({ files }) => files)
@@ -474,19 +472,12 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                               ),
                             0
                           ),
-                        totalDownloadBytes:
-                          model.configuration.bundle._tag === "Standalone"
-                            ? model.configuration.bundle.package.files.reduce(
-                                (total, file) => total + file.sizeBytes,
-                                0
-                              )
-                            : [
-                                ...model.configuration.bundle.target.files,
-                                ...model.configuration.bundle.draft.files,
-                              ].reduce(
-                                (total, file) => total + file.sizeBytes,
-                                0
-                              ),
+                        totalDownloadBytes: servableModelBundlePackages(
+                          model.configuration.bundle
+                        ).flatMap(({ files }) => files).reduce(
+                          (total, file) => total + file.sizeBytes,
+                          0
+                        ),
                       }]
               }
             )

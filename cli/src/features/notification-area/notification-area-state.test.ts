@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest"
 import { Option } from "effect"
-import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
+import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   deriveModelDownloadNotificationState,
   deriveSelectedModelLowMemoryNotificationState,
@@ -12,7 +12,7 @@ describe("notification area model projections", () => {
     const view = makeView({
       models: [makeAcquiringModel({
         _tag: "Downloading",
-        attemptIds: [DownloadAttemptIdSchema.make("download-1")],
+        downloadId: ModelDownloadIdSchema.make("download-1"),
         stage: "downloading",
         completedBytes: 1,
         totalBytes: 2,

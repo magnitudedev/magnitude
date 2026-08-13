@@ -57,8 +57,13 @@ Every property whose value is a state machine is suffixed `State`. State is repr
 unions, not by combinations of nullable fields or absence.
 
 `acquisitionState` is exactly one of `NotInstalled`, `Downloading`, `Failed`, `Cancelled`, or
-`Installed`. Active and terminal download-attempt identities and progress live here. There is no
+`Installed`. Active and terminal model-download identity and progress live here. There is no
 parallel public download collection.
+
+For every admitted single- or multi-package bundle, `Downloading.downloadId`, `Failed.downloadId`,
+and `Cancelled.downloadId` identify the same durable ICN `ModelDownload` occurrence. Package
+components may complete independently, but their internal attempt membership never changes the
+identity exposed to ACN or clients.
 
 `servingState` is exactly one of `Resolving`, `Assessing`, `Failed`, or `Assessed`. An assessed row
 contains the decided configuration, capabilities, assessment, `availabilityState`, and zero or
@@ -81,6 +86,10 @@ preparing and unavailable states preserve it so durable slot selection still cor
 A row exists for every release-catalog bundle and every independently servable installed bundle.
 Exact bundle identity coalesces those sources into one row. Catalog removal cannot hide an
 installed bundle; package removal removes a non-catalog row but leaves a catalog row as uninstalled.
+Packages that are members of a catalog or retained bundle do not create additional standalone rows;
+the bundle is the product identity. In particular, a separately packaged speculative draft appears
+through its speculative bundle, not as an ordinary model beside that bundle. A package containing
+only draft-role payload is not evidence of standalone servability.
 
 `catalogMembershipState` is `NotInCatalog` or `InCatalog`. `InCatalog` carries the complete catalog
 data required by product presentation: intelligence score and source, fidelity rank,
@@ -120,10 +129,11 @@ Work is serialized, invalidations are coalesced, and completion rechecks its sem
 publication. Missing files update acquisition or membership; invalid installed artifacts remain
 visible with their exact failure.
 
-When an exact download attempt has completed but its installed-package observation has not yet
-converged, the row remains `Downloading` at full progress with stage `publishing`. Reconciliation
-may advance it to `Installed` or a terminal failure, but cannot reinterpret completion as
-`NotInstalled` or reset its progress.
+When ACN first observes an exact model download complete, it refreshes installed-package inventory
+before projecting the terminal occurrence. ICN publishes inventory before package completion, so
+the refreshed join becomes `Installed`. If the package is currently absent, including after later
+deletion or external removal, historical completion does not prove presence and the row is
+`NotInstalled`.
 
 Discovery reports `Loading`, `Ready`, or `Failed` with progress. It describes portfolio production,
 not whether `models` is authoritative or empty. A successful empty model collection is distinct
@@ -168,5 +178,5 @@ authorization.
 - Indeterminate residency during an instance transition produces `NotObserved`, not a false
   sufficient or insufficient result.
 - Advisory memory state never authorizes loading; ICN revalidates at the load boundary.
-- Download observation and cancellation correlate exact attempt identities from
+- Download observation and cancellation correlate the exact model-download identity from
   `acquisitionState`.

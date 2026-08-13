@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -11,6 +11,7 @@ import {
   buildModelsMenuEntries,
   catalogStatus,
   catalogLocalModels,
+  huggingFaceRepositoryUrls,
   localModelInstalledStatus,
   localModelReadinessStatus,
   modelsMenuEntryIsSelected,
@@ -25,6 +26,7 @@ import {
   LOCAL_PROVIDER_ID,
   makeModel,
   makeCatalogOnlyModel,
+  makeStandaloneBundle,
   makeView,
   TEST_MODEL_ID,
   withDoesNotFitAssessment,
@@ -99,13 +101,63 @@ describe("unified models menu projection", () => {
       ...makeCatalogOnlyModel(),
       acquisitionState: {
         _tag: "Downloading",
-        attemptIds: [DownloadAttemptIdSchema.make("attempt-a")],
+        downloadId: ModelDownloadIdSchema.make("download-a"),
         stage: "downloading",
         completedBytes: 1,
         totalBytes: 4,
         bytesPerSecond: Option.none(),
       },
     }, true)).toBe("Downloading 25%")
+  })
+
+  it("lists target and separate-draft repositories without treating the draft source as a package", () => {
+    const target = makeStandaloneBundle("package_target")
+    const draft = makeStandaloneBundle("package_draft")
+    if (target._tag !== "Standalone" || draft._tag !== "Standalone") {
+      throw new Error("test bundles must contain standalone packages")
+    }
+    const model = makeCatalogOnlyModel({
+      bundle: {
+        _tag: "SpeculativeDecoding",
+        target: {
+          ...target.package,
+          source: { _tag: "HuggingFace", repository: "publisher/target", revision: "a".repeat(40) },
+        },
+        draftSource: {
+          _tag: "Separate",
+          draft: {
+            ...draft.package,
+            source: { _tag: "HuggingFace", repository: "publisher/draft", revision: "b".repeat(40) },
+          },
+        },
+        method: { _tag: "DSpark" },
+      },
+    })
+
+    expect(huggingFaceRepositoryUrls(model)).toEqual([
+      "https://huggingface.co/publisher/target",
+      "https://huggingface.co/publisher/draft",
+    ])
+  })
+
+  it("lists only the target repository for embedded speculative decoding", () => {
+    const target = makeStandaloneBundle("package_target")
+    if (target._tag !== "Standalone") throw new Error("test bundle must contain a package")
+    const model = makeCatalogOnlyModel({
+      bundle: {
+        _tag: "SpeculativeDecoding",
+        target: {
+          ...target.package,
+          source: { _tag: "HuggingFace", repository: "publisher/target", revision: "a".repeat(40) },
+        },
+        draftSource: { _tag: "Embedded" },
+        method: { _tag: "Mtp" },
+      },
+    })
+
+    expect(huggingFaceRepositoryUrls(model)).toEqual([
+      "https://huggingface.co/publisher/target",
+    ])
   })
 
   it("uses embedded local availability for selection and identity", () => {

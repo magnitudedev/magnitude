@@ -35,26 +35,26 @@ pub struct ExecutionIntent {
     /// Optional multimodal projector loaded into the same model executor.
     pub projector: Option<ProjectorConfig>,
     /// Requested speculative-decoding configuration selected through native preflight.
-    pub mtp: MtpConfig,
+    pub speculative: SpeculativeDecodingConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum MtpConfig {
+pub enum SpeculativeDecodingConfig {
     Disabled {
         reason: String,
     },
     Enabled {
-        source: MtpSource,
+        source: SpeculativeDraftSource,
+        method: SpeculativeMethodConfig,
         n_max: u32,
         n_min: u32,
-        p_min: f32,
         cache_type_k: CacheType,
         cache_type_v: CacheType,
     },
 }
 
-impl Default for MtpConfig {
+impl Default for SpeculativeDecodingConfig {
     fn default() -> Self {
         Self::Disabled {
             reason: "not_supported".to_owned(),
@@ -64,23 +64,49 @@ impl Default for MtpConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum MtpSource {
-    /// Prediction layers are executable from the target GGUF itself.
-    Bundled,
-    /// Prediction layers are executable from a distinct GGUF linked to the target context.
+pub enum SpeculativeDraftSource {
+    /// The selected method's prediction capability is executable from the target GGUF itself.
+    Embedded,
+    /// The selected method's prediction capability is executable from a distinct GGUF linked to
+    /// the target context.
     Separate { model_path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum MtpRuntimeProperties {
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum SpeculativeMethodConfig {
+    Mtp { min_draft_probability: f32 },
+    DFlash { min_sample_probability: f32 },
+    DSpark { acceptance_threshold: f32 },
+}
+
+impl SpeculativeMethodConfig {
+    #[must_use]
+    pub fn threshold(&self) -> f32 {
+        match self {
+            Self::Mtp {
+                min_draft_probability,
+            } => *min_draft_probability,
+            Self::DFlash {
+                min_sample_probability,
+            } => *min_sample_probability,
+            Self::DSpark {
+                acceptance_threshold,
+            } => *acceptance_threshold,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum SpeculativeDecodingRuntimeProperties {
     Disabled {
         reason: String,
     },
     Enabled {
-        source: MtpSource,
+        source: SpeculativeDraftSource,
+        method: SpeculativeMethodConfig,
         n_max: u32,
         n_min: u32,
-        p_min: f32,
     },
 }
 
@@ -628,7 +654,7 @@ pub struct ModelProperties {
     pub capabilities: TemplateCapabilities,
     pub reasoning: ReasoningProfile,
     pub modalities: ModelModalities,
-    pub mtp: MtpRuntimeProperties,
+    pub speculative: SpeculativeDecodingRuntimeProperties,
     pub execution: ExecutionConfigReport,
     pub template_fingerprint: String,
 }
@@ -777,5 +803,25 @@ mod execution_config_tests {
         assert_eq!(encoded["data_base64"], "AAEC/w==");
         let decoded: ImageInput = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, image);
+    }
+
+    #[test]
+    fn speculative_methods_round_trip_with_method_specific_thresholds() {
+        let methods = [
+            SpeculativeMethodConfig::Mtp {
+                min_draft_probability: 0.1,
+            },
+            SpeculativeMethodConfig::DFlash {
+                min_sample_probability: 0.2,
+            },
+            SpeculativeMethodConfig::DSpark {
+                acceptance_threshold: 0.3,
+            },
+        ];
+        for method in methods {
+            let encoded = serde_json::to_value(&method).unwrap();
+            let decoded: SpeculativeMethodConfig = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, method);
+        }
     }
 }

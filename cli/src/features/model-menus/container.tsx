@@ -39,6 +39,7 @@ import {
   ProviderIdSchema,
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
+  servableModelBundlePackages,
   type LocalModel,
   type LocalModelRecommendation,
   type ModelSlotsState,
@@ -1212,9 +1213,7 @@ const qualityLabel = (model: LocalModel): string =>
 
 export const huggingFaceRepositoryUrls = (
   model: LocalModel,
-): readonly string[] => [...new Set((model.bundle._tag === "Standalone"
-  ? [model.bundle.package]
-  : [model.bundle.target, model.bundle.draft]).flatMap(({ source }) =>
+): readonly string[] => [...new Set(servableModelBundlePackages(model.bundle).flatMap(({ source }) =>
   source._tag === "HuggingFace"
     ? [`https://huggingface.co/${source.repository}`]
     : [],
@@ -1280,6 +1279,9 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   const recommendationText = recommendationLabel(recommendation)
   const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
+  const speculativeText = model.bundle._tag === "Standalone"
+    ? "—"
+    : model.bundle.method._tag === "Mtp" ? "MTP" : model.bundle.method._tag
   const backgroundColor = focused
     ? theme.surfaceHover
     : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
@@ -1298,7 +1300,12 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
       model.presentation.variantLabel,
       modelWidth,
     )
-    const metadata = [recommendationText, memoryText, ...(layout.showSpeed ? [speedText] : [])]
+    const metadata = [
+      recommendationText,
+      memoryText,
+      ...(model.bundle._tag === "SpeculativeDecoding" ? [speculativeText] : []),
+      ...(layout.showSpeed ? [speedText] : []),
+    ]
       .filter((value) => value !== "")
       .join(" · ")
     const metadataWidth = Math.max(1, layout.contentWidth - cursorWidth - secondaryStatusWidth)
@@ -1363,6 +1370,9 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
       </text>
       <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">
         {truncateToDisplayWidth(memoryText, layout.columns.memory)}
+      </text>
+      <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">
+        {truncateToDisplayWidth(speculativeText, layout.columns.speculative)}
       </text>
       {layout.showIntelligence && (
         <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">
@@ -1533,7 +1543,7 @@ const CatalogMenu = memo(function CatalogMenu({
     }
     if (action === "cancel") {
       if (detail.acquisitionState._tag === "Downloading") {
-        modelActions.cancel(detail.acquisitionState.attemptIds)
+        modelActions.cancel(detail.acquisitionState.downloadId)
       }
       return
     }
@@ -1604,7 +1614,7 @@ const CatalogMenu = memo(function CatalogMenu({
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
       if (cursor.acquisitionState._tag === "Downloading") {
-        modelActions.cancel(cursor.acquisitionState.attemptIds)
+        modelActions.cancel(cursor.acquisitionState.downloadId)
         key.preventDefault()
       } else if (cursor.acquisitionState._tag === "Installed") {
         setPendingDeleteId(configurationIdFor(cursor) ?? null)
@@ -1751,6 +1761,7 @@ const CatalogMenu = memo(function CatalogMenu({
             <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
             <text style={{ fg: theme.muted, width: layout.columns.recommendation }} wrapMode="none">RECOMMENDATION</text>
             <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>
+            <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">SPECULATIVE</text>
             {layout.showIntelligence && (
               <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">INTELLIGENCE</text>
             )}

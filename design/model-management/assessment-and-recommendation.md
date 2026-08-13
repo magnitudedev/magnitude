@@ -124,7 +124,7 @@ One semantic assessment key contains the complete serving configuration, resolve
 assessment material, stable topology and capacity identity, native build and enabled backends,
 calibration identity, assessment method and policy, and requested performance-depth policy.
 
-Download bytes, transfer speed, attempt identity, package or inventory revision, catalog
+Download bytes, transfer speed, model-download or package-attempt identity, package or inventory revision, catalog
 presentation, live free memory, provider state, slot state, runtime residency, and client activity
 are not assessment inputs. Revisions may require a reread; revision inequality never admits native
 assessment by itself.
@@ -230,6 +230,8 @@ Cached assessment never authorizes loading.
   its exact bundle maximum. Retained configurations are assessed at their exact stored profiles.
 - For every inspected independently servable package without a retained or catalog configuration,
   ACN makes one standard profile decision and ICN constructs and assesses its exact configuration.
+- A package already participating in a retained or catalog bundle is assessed only through that
+  bundle. Separate speculative companions are never submitted again as standalone targets.
 - All missing profiles for one bundle are submitted together.
 - Equivalent concurrent misses perform one native assessment.
 - Download progress and semantically equivalent newer source revisions perform no assessment.
