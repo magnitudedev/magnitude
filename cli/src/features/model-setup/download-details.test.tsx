@@ -3,7 +3,7 @@ import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
-import { DownloadAttemptIdSchema, ModelVariantLabelSchema } from "@magnitudedev/sdk"
+import { ModelDownloadIdSchema, ModelVariantLabelSchema } from "@magnitudedev/sdk"
 import { makeAcquiringModel, GIB } from "../local-inference/test-fixtures"
 
 const keyboard = vi.hoisted(() => ({
@@ -32,7 +32,7 @@ const onRetry = vi.fn()
 const model = makeAcquiringModel(
   {
     _tag: "Downloading",
-    attemptIds: [DownloadAttemptIdSchema.make("download_qwen")],
+    downloadId: ModelDownloadIdSchema.make("download_qwen"),
     stage: "downloading",
     completedBytes: 19 * GIB,
     totalBytes: 30 * GIB,
@@ -172,7 +172,7 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
 test("shows failed-download actions in the details pane", async () => {
   const failedModel = makeAcquiringModel({
       _tag: "Failed",
-      attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
+      downloadId: ModelDownloadIdSchema.make("download_failed"),
       completedBytes: 19 * GIB,
       totalBytes: 30 * GIB,
       failure: {

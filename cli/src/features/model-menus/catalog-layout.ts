@@ -9,6 +9,7 @@ export type CatalogLayoutMode = "full" | "quality" | "compact" | "stacked" | "mi
 export interface CatalogColumnWidths {
   readonly recommendation: number
   readonly memory: number
+  readonly speculative: number
   readonly intelligence: number
   readonly quality: number
   readonly speed: number
@@ -31,21 +32,23 @@ const HORIZONTAL_PADDING = 4
 const CURSOR_WIDTH = 2
 
 const FULL_COLUMNS: CatalogColumnWidths = {
-  recommendation: 15,
-  memory: 10,
-  intelligence: 13,
-  quality: 13,
-  speed: 12,
-  status: 17,
+  recommendation: 14,
+  memory: 9,
+  speculative: 12,
+  intelligence: 12,
+  quality: 10,
+  speed: 10,
+  status: 15,
 }
 
 const COMPACT_COLUMNS: CatalogColumnWidths = {
-  recommendation: 15,
-  memory: 10,
+  recommendation: 12,
+  memory: 9,
+  speculative: 12,
   intelligence: 0,
   quality: 0,
-  speed: 12,
-  status: 17,
+  speed: 10,
+  status: 14,
 }
 
 const QUALITY_COLUMNS: CatalogColumnWidths = {
@@ -56,6 +59,7 @@ const QUALITY_COLUMNS: CatalogColumnWidths = {
 const EMPTY_COLUMNS: CatalogColumnWidths = {
   recommendation: 0,
   memory: 0,
+  speculative: 0,
   intelligence: 0,
   quality: 0,
   speed: 0,
@@ -65,6 +69,7 @@ const EMPTY_COLUMNS: CatalogColumnWidths = {
 const columnTotal = (columns: CatalogColumnWidths): number =>
   columns.recommendation
   + columns.memory
+  + columns.speculative
   + columns.intelligence
   + columns.quality
   + columns.speed

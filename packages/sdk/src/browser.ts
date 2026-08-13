@@ -82,7 +82,7 @@ export {
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
   OnboardingMirror,
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelVariantLabelSchema,
@@ -102,7 +102,7 @@ export {
 } from "@magnitudedev/ai/provider/model"
 
 export type {
-  DownloadAttemptId,
+  ModelDownloadId,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,

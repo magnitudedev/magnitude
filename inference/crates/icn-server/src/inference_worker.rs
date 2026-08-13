@@ -7,9 +7,9 @@ use std::thread;
 
 use icn_contracts::{
     ChatRequest, ChatTemplateRequest, CompletionBackend, Generation, InferenceError,
-    InferenceStreamEvent, ModelProperties, PreparedChatInfo,
+    InferenceStreamEvent, ModelProperties, PreparedChatInfo, SpeculativeDecodingConfig,
 };
-use icn_engine::{ModelLoadObserver, ModelLoadPhase, MtpCandidateSelection, NativeBackend};
+use icn_engine::{ModelLoadObserver, ModelLoadPhase, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +39,7 @@ enum HostMessage {
     Load {
         model_id: String,
         plan: icn_contracts::ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: SpeculativeDecodingConfig,
         hardware: icn_contracts::HardwareSnapshot,
         trace: crate::telemetry::TraceCarrier,
     },
@@ -594,13 +594,13 @@ impl InferenceWorker {
         &self,
         model_id: String,
         plan: icn_contracts::ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: SpeculativeDecodingConfig,
         hardware: icn_contracts::HardwareSnapshot,
     ) -> Result<(), InferenceError> {
         self.client.inner.send(HostMessage::Load {
             model_id,
             plan,
-            mtp_selection,
+            speculative,
             hardware,
             trace: crate::telemetry::inject_current_trace(),
         })
@@ -876,7 +876,7 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
     let HostMessage::Load {
         model_id,
         plan,
-        mtp_selection,
+        speculative,
         hardware,
         trace,
     } = load.message
@@ -887,7 +887,7 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
     let load_span = tracing::info_span!("icn.worker.load", model.id = %model_id);
     crate::telemetry::set_parent_from_carrier(&load_span, &trace);
     let _load_entered = load_span.enter();
-    let prepared = match native.prepare_load(model_id.clone(), plan, mtp_selection, hardware) {
+    let prepared = match native.prepare_load(model_id.clone(), plan, speculative, hardware) {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = responses.send(WorkerMessage::LoadFailed {

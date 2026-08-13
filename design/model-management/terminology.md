@@ -23,9 +23,10 @@ language, not an identity-bearing domain type.
 |---|---|
 | **Model file** | One immutable content-identified file with a role such as weights, shard, projector, draft, or MTP. |
 | **Model package** | One immutable set of exact files, roles, relationships, inspected properties, and one source. |
-| **Servable model bundle** | The complete artifact structure that can be served: one standalone package or an ordered speculative-decoding pair. |
+| **Servable model bundle** | The complete artifact structure that can be served: one standalone package or one method-identified speculative-decoding bundle whose draft capability is embedded or separately packaged. |
 | **Serving profile** | Provider intent for serving a bundle, currently its context length. |
 | **Model serving configuration** | One exact servable bundle plus one serving profile, constructed and canonically identified by ICN. |
+| **Model download** | One admitted acquisition occurrence for an exact servable bundle. It has one stable identity while ICN coordinates any required package work. |
 | **Download attempt** | One admitted attempt to install one exact package. |
 
 The bundle is structural data, not an independently identified entity:
@@ -35,19 +36,24 @@ ServableModelBundle
   +-- Standalone
   |     package: ModelPackage
   |
-  +-- SpeculativeDecodingPair
+  +-- SpeculativeDecoding
         target: ModelPackage
-        draft: ModelPackage
+        method: MTP | DFlash | DSpark
+        draftSource:
+          Embedded
+          | Separate(draft: ModelPackage)
 ```
 
-`target` is the established speculative-decoding term for the primary model in a pair. It is not
-the name or identity of the enclosing bundle.
+`target` is the established speculative-decoding term for the primary model. `Embedded` means the
+target package itself contains the selected method's executable speculative capability.
+`Separate` means execution also requires the identified draft package and its native context.
+Neither form is a special case outside the bundle abstraction.
 
-Two bundles are the same when their tag and ordered package identities are the same. Components may
-derive private canonical keys for maps and caches, but those keys are not configuration identity.
-ICN alone derives canonical serving-configuration identity from the exact ordered bundle and
-profile. Private bundle keys are not serialized product data and never cross the protocol as bundle
-identity.
+Two bundles are the same when their tag, target identity, speculative method, draft-source variant,
+and any separate draft identity are the same. Components may derive private canonical keys for maps
+and caches, but those keys are not configuration identity. ICN alone derives canonical
+serving-configuration identity from the exact bundle and profile. Private bundle keys are not
+serialized product data and never cross the protocol as bundle identity.
 
 ## Assessment terms
 
@@ -115,7 +121,7 @@ packages follow the same rules:
 | Installed bundle with a retained configuration | Exact retained configuration | Already stored |
 | Installed bundle matching the catalog, with no retained configuration | Exact catalog configuration | On selection/installation, or during the single bounded recovery epoch |
 | Installed non-catalog standalone bundle | ICN-issued configuration for ACN's standard profile decision after package inspection | Only when selected/installed |
-| Speculative-decoding bundle | Exact retained configuration, otherwise exact catalog configuration | On selection/installation, or bounded recovery |
+| Speculative-decoding bundle, embedded or separate | Exact retained configuration, otherwise exact catalog configuration | On selection/installation, or bounded recovery |
 
 ACN makes a standard profile decision only for an installed, inspected standalone bundle having
 neither a retained nor catalog configuration. ICN constructs the corresponding configuration; ACN
@@ -168,6 +174,7 @@ catalog's intelligence score and source, fidelity rank, and quality notes.
 | Identity | Identifies | Owner |
 |---|---|---|
 | `ModelPackageId` | One immutable package | ICN |
+| `ModelDownloadId` | One exact-bundle acquisition occurrence | ICN |
 | `DownloadAttemptId` | One package-install attempt | ICN |
 | `ModelServingConfigurationId` | One bundle/profile combination, canonically constructed and validated with its configuration | ICN |
 | `ModelInstanceId` | One physical loaded occurrence | ICN |

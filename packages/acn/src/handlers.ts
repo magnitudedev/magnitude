@@ -394,16 +394,16 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           localModelInstaller.install(configurationId),
         ),
 
-      CancelModelDownload: ({ attemptIds }) =>
+      CancelModelDownload: ({ downloadId }) =>
         observeRpcDefects(
           "CancelModelDownload",
-          localModelPackages.cancelAttempts(attemptIds).pipe(Effect.as({})),
+          localModelPackages.cancelDownload(downloadId).pipe(Effect.as({})),
         ),
 
-      DismissModelDownloadFailure: ({ attemptIds }) =>
+      DismissModelDownloadFailure: ({ downloadId }) =>
         observeRpcDefects(
           "DismissModelDownloadFailure",
-          localModelPackages.acknowledgeFailures(attemptIds).pipe(Effect.as({})),
+          localModelPackages.acknowledgeFailure(downloadId).pipe(Effect.as({})),
         ),
 
       DeleteLocalModel: ({ configurationId }) =>

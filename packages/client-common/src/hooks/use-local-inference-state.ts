@@ -7,7 +7,7 @@ import {
   ModelSlotsMirror,
   ProviderModelCatalogMirror,
   type ModelInstanceId,
-  type DownloadAttemptId,
+  type ModelDownloadId,
   type LocalModelsState,
   type ModelServingConfigurationId,
   type ProviderModelIdentity,
@@ -105,11 +105,11 @@ export function useLocalModelActions() {
     ) => {
       installAndAssign({ configurationId, slotId, reasoningEffort })
     }, [installAndAssign]),
-    cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => {
-      cancel({ attemptIds })
+    cancel: useCallback((downloadId: ModelDownloadId) => {
+      cancel({ downloadId })
     }, [cancel]),
-    dismissFailure: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => {
-      dismiss({ attemptIds })
+    dismissFailure: useCallback((downloadId: ModelDownloadId) => {
+      dismiss({ downloadId })
     }, [dismiss]),
     delete: useCallback((configurationId: ModelServingConfigurationId) => {
       deleteModel({ configurationId })

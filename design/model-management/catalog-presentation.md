@@ -75,13 +75,20 @@ open interaction. Independent source membership and availability changes remain 
 The client derives presentation solely from its measured local content width. Width changes do not
 create or copy catalog, recommendation, download, offering, or slot state.
 
+The target quantization and speculative-decoding method are distinct presentation facts. The model
+label shows only the target package quantization; it never appends the draft/speculator package
+quantization. Table layouts show `MTP`, `DFlash`, or `DSpark` in a dedicated `SPECULATIVE` column,
+and show an em dash for standalone bundles. Stacked layouts retain the method in their metadata
+line when speculative decoding is configured.
+
 The list preserves information in this order:
 
 1. entry identity, including the curated variant label or component role;
 2. acquisition or availability status;
-3. recommendation and required memory;
-4. calibrated speed; and
-5. intelligence and quality data.
+3. speculative-decoding method;
+4. recommendation and required memory;
+5. calibrated speed; and
+6. intelligence and quality data.
 
 Wide layouts may show all data as columns. As space decreases, intelligence moves to the detail
 view first, followed by quality at the next narrower boundary. When a table can no longer preserve

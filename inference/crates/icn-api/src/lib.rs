@@ -21,13 +21,14 @@ use icn_contracts::bootstrap_protocol::{
     VulkanEligibility,
 };
 use icn_contracts::models::{
-    AssessModelsRequest, AssessModelsResponse, DownloadAttempt, DownloadAttemptId,
-    InstalledModelPackages, InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor,
-    ModelDownloads, ModelDownloadsResponse, ModelInstance, ModelInstanceAllocation,
-    ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadEvent, ModelLoadPlan, ModelPackageId, ModelServingConfigurationId,
-    PreviewModelLoadRequest, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    RemoveInstalledModelPackageResponse, StartModelDownloadRequest, StartModelDownloadResponse,
+    AssessModelsRequest, AssessModelsResponse, InstalledModelPackages,
+    InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor, ModelDownload,
+    ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance,
+    ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
+    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelPackageId,
+    ModelServingConfigurationId, PreviewModelLoadRequest, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, RemoveInstalledModelPackageResponse,
+    StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
@@ -281,15 +282,11 @@ pub fn app(state: AppState) -> Router {
             post(stop_model_instance),
         )
         .route(
-            "/v1/models/downloads/{attempt_id}",
-            get(model_download_attempt),
-        )
-        .route(
-            "/v1/models/downloads/{attempt_id}/cancel",
+            "/v1/models/downloads/{download_id}/cancel",
             post(cancel_model_download),
         )
         .route(
-            "/v1/models/downloads/{attempt_id}/acknowledge-failure",
+            "/v1/models/downloads/{download_id}/acknowledge-failure",
             post(acknowledge_model_download_failure),
         )
         .route(
@@ -1523,7 +1520,7 @@ async fn assess_models(
 #[utoipa::path(post, path = "/v1/models/downloads", operation_id = "startModelDownload", tag = "models",
     request_body(content = StartModelDownloadRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Authoritative download attempt", body = StartModelDownloadResponse),
+        (status = 200, description = "Authoritative model-download admission", body = StartModelDownloadResponse),
         (status = 500, description = "Download could not start", body = ErrorResponse)
     )
 )]
@@ -1545,8 +1542,8 @@ async fn start_model_download(
 
 #[utoipa::path(get, path = "/v1/models/downloads", operation_id = "listModelDownloads", tag = "models",
     responses(
-        (status = 200, description = "Retained model download attempts", body = ModelDownloadsResponse),
-        (status = 500, description = "Download attempts unavailable", body = ErrorResponse)
+        (status = 200, description = "Retained model downloads and internal package attempts", body = ModelDownloadsResponse),
+        (status = 500, description = "Model downloads unavailable", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(name = "icn.models.downloads.list", skip_all, err(Debug))]
@@ -1558,64 +1555,41 @@ async fn model_downloads(
         .as_ref()
         .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
     downloads
-        .list_attempts()
+        .list()
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models/downloads/{attempt_id}", operation_id = "getModelDownload", tag = "models",
-    params(("attempt_id" = String, Path, description = "Download attempt ID")),
+#[utoipa::path(post, path = "/v1/models/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
+    params(("download_id" = String, Path, description = "Model download ID")),
     responses(
-        (status = 200, description = "Authoritative model download attempt", body = DownloadAttempt),
-        (status = 404, description = "Attempt not found", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.downloads.get", skip_all, err(Debug))]
-async fn model_download_attempt(
-    State(state): State<AppState>,
-    Path(attempt_id): Path<String>,
-) -> Result<Json<DownloadAttempt>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .get_attempt(&DownloadAttemptId(attempt_id))
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(post, path = "/v1/models/downloads/{attempt_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
-    params(("attempt_id" = String, Path, description = "Download attempt ID")),
-    responses(
-        (status = 200, description = "Cancelled or terminal model download attempt", body = DownloadAttempt),
-        (status = 404, description = "Attempt not found", body = ErrorResponse)
+        (status = 200, description = "Cancelled or terminal model download", body = ModelDownload),
+        (status = 404, description = "Model download not found", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(name = "icn.models.downloads.cancel", skip_all, err(Debug))]
 async fn cancel_model_download(
     State(state): State<AppState>,
-    Path(attempt_id): Path<String>,
-) -> Result<Json<DownloadAttempt>, ApiError> {
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
     let downloads = state
         .model_downloads
         .as_ref()
         .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
     downloads
-        .cancel(&DownloadAttemptId(attempt_id))
+        .cancel(&ModelDownloadId(download_id))
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/downloads/{attempt_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
-    params(("attempt_id" = String, Path, description = "Failed download attempt ID")),
+#[utoipa::path(post, path = "/v1/models/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
+    params(("download_id" = String, Path, description = "Failed model download ID")),
     responses(
-        (status = 200, description = "Acknowledged failed model download attempt", body = DownloadAttempt),
-        (status = 400, description = "Attempt has not failed", body = ErrorResponse),
-        (status = 404, description = "Attempt not found", body = ErrorResponse)
+        (status = 200, description = "Acknowledged failed model download", body = ModelDownload),
+        (status = 400, description = "Model download has not failed", body = ErrorResponse),
+        (status = 404, description = "Model download not found", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(
@@ -1625,14 +1599,14 @@ async fn cancel_model_download(
 )]
 async fn acknowledge_model_download_failure(
     State(state): State<AppState>,
-    Path(attempt_id): Path<String>,
-) -> Result<Json<DownloadAttempt>, ApiError> {
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
     let downloads = state
         .model_downloads
         .as_ref()
         .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
     downloads
-        .acknowledge_failure(&DownloadAttemptId(attempt_id))
+        .acknowledge_failure(&ModelDownloadId(download_id))
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -2768,7 +2742,6 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         assess_models,
         start_model_download,
         model_downloads,
-        model_download_attempt,
         cancel_model_download,
         acknowledge_model_download_failure,
         preview_model_load,
@@ -2797,7 +2770,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         StartModelDownloadRequest,
         StartModelDownloadResponse,
         ModelDownloadsResponse,
-        DownloadAttempt,
+        ModelDownload,
         LoadModelRequest,
         PreviewModelLoadRequest,
         ModelLoadPlan,
@@ -3169,7 +3142,7 @@ impl CompletionBackend for FakeBackend {
                 template_fingerprint: "fake-fingerprint".into(),
             },
             modalities: ModelModalities::default(),
-            mtp: icn_contracts::MtpRuntimeProperties::Disabled {
+            speculative: icn_contracts::SpeculativeDecodingRuntimeProperties::Disabled {
                 reason: "fake_backend".into(),
             },
             execution: ExecutionConfigReport {

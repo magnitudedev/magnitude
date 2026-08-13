@@ -174,7 +174,7 @@ fn configuration_inspect(input: &Map<String, Value>) -> Result<Value, ProbeError
         prefill_quantum: input.context.batch_tokens,
         execution,
         projector: None,
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     };
     let (_, _, params, _, _) = icn_hardware::native_parameters_for_intent(&config)
         .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?
@@ -920,7 +920,7 @@ fn llama_batched_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
         prefill_quantum: input.batch_tokens,
         execution,
         projector: None,
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     };
     if !config.model_path.is_file() {
         return Err(ProbeError::invalid(
@@ -1248,7 +1248,7 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         prefill_quantum: input.batch_tokens,
         execution,
         projector: None,
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     };
 
     if !config.model_path.is_file() {

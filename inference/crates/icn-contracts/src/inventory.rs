@@ -855,7 +855,7 @@ pub enum MemoryLocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryChargeOwner {
     Target,
-    Mtp,
+    SpeculativeDraft,
     Projector,
     ResidentRuntime,
 }
@@ -1792,7 +1792,7 @@ mod tests {
             .unwrap();
         accountant
             .record(MemoryCharge::new(
-                MemoryChargeOwner::Mtp,
+                MemoryChargeOwner::SpeculativeDraft,
                 MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
                     "Metal",
                     Some("metal-0"),

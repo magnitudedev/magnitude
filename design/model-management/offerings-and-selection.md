@@ -71,7 +71,7 @@ selection pipeline is:
 
 ```text
 InstallModel(configurationId)                         -> AlreadyInstalled(providerModelId)
-                                                     | DownloadAdmitted(providerModelId, exact attempt IDs)
+                                                     | DownloadAdmitted(providerModelId, ModelDownloadId)
   -> AssignSlot(slotId, providerModelId)
   -> LoadModel(slotId, exact selection)              [if residency is requested]
 ```
@@ -138,9 +138,13 @@ uninstalled choice -> install -> await exact installation -> assign -> load
 
 Mutation synchronization validates that each exact admission, selection, or instance is visible in
 the affected canonical query before dependent work begins. Background completion is observed by
-the same attempt or instance identity through `LocalModels` or `ModelSlots`. The service state joins
+the same model-download or instance identity through `LocalModels` or `ModelSlots`. The service state joins
 those identities with canonical model and slot snapshots, so progress and lifecycle remain
 backend-owned and are never copied into service state.
+
+For an admitted multi-package download, package components may complete independently before the
+first synchronized snapshot. The aggregate model row continues to expose the one `ModelDownloadId`
+returned by admission; synchronization never depends on internal package-attempt membership.
 
 Opening or remounting onboarding only reads the service state. It cannot select or load a model.
 Only an explicit configuration-ID submission starts setup; current slot state and mutation history
@@ -148,7 +152,7 @@ are never choice inputs. Component unmount does not interrupt active work. Proce
 to passive choosing and does not reconstruct intent from surviving backend facts.
 
 Cancellation signals the one active continuation. After an admission it invokes the ordinary
-exact-attempt download cancel or exact-instance stop mutation and waits for that mutation's exact
+exact-model-download cancel or exact-instance stop mutation and waits for that mutation's exact
 query synchronization. It never searches mutation history, targets a current-but-unowned slot
 instance, or clears durable slot selection.
 

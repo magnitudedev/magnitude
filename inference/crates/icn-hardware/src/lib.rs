@@ -28,8 +28,8 @@ use icn_contracts::{
     HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
     HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory,
     MemoryAccountant, MemoryAccounting, MemoryAccountingError, MemoryBreakdown, MemoryCharge,
-    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelExecutionAssessment, MtpConfig,
-    MtpSource, NativeDeviceIdentity, NativeDeviceLocator,
+    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelExecutionAssessment,
+    NativeDeviceIdentity, NativeDeviceLocator, SpeculativeDecodingConfig, SpeculativeDraftSource,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
@@ -246,6 +246,8 @@ pub enum PlanningContextType {
     Target,
     /// Multi-token-prediction draft context.
     Mtp,
+    /// DFlash or DSpark draft context using the ordinary decoder graph type.
+    SpeculativeDraft,
 }
 
 impl Default for PlanningOptions {
@@ -786,8 +788,8 @@ pub struct AssessedExecutionPlan {
     pub plan: ExecutionIntent,
     pub assessment: HardwareAssessment,
     pub text_report: FitReport,
-    /// No-allocation report for the MTP context and optional companion model.
-    pub mtp_report: Option<FitReport>,
+    /// No-allocation report for the speculative context and optional companion model.
+    pub speculative_report: Option<FitReport>,
     #[cfg(feature = "mtmd")]
     pub projector_memory: Vec<llama_cpp_2::mtmd::MtmdDeviceMemoryEstimate>,
 }
@@ -797,7 +799,7 @@ pub struct AssessedExecutionPlan {
 pub struct BackendLoadPlan {
     pub assessed: AssessedExecutionPlan,
     pub native: NativeParameterPlan,
-    pub native_mtp: Option<NativeParameterPlan>,
+    pub native_speculative: Option<NativeParameterPlan>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -869,9 +871,9 @@ pub fn plan_load_with_backend(
         }
         (None, _) => return Err(AssessmentError::MissingMeasurements),
     };
-    let native_mtp = match requested.mtp {
-        MtpConfig::Disabled { .. } => None,
-        MtpConfig::Enabled { .. } => Some(
+    let native_speculative = match requested.speculative {
+        SpeculativeDecodingConfig::Disabled { .. } => None,
+        SpeculativeDecodingConfig::Enabled { .. } => Some(
             resolve_native_plan(
                 backend,
                 &planning_request(&assessed.plan, true)?,
@@ -884,7 +886,7 @@ pub fn plan_load_with_backend(
     Ok(BackendLoadPlan {
         assessed,
         native,
-        native_mtp,
+        native_speculative,
     })
 }
 
@@ -907,22 +909,24 @@ fn plan_and_assess(
                         .to_owned(),
                 },
                 text_report,
-                mtp_report: None,
+                speculative_report: None,
                 #[cfg(feature = "mtmd")]
                 projector_memory: Vec::new(),
             },
             None,
         ));
     }
-    let mut mtp_report = estimate_mtp_report(backend, requested)?;
+    let mut speculative_report = estimate_speculative_report(backend, requested)?;
     let projector_memory = projector_memory(requested)?;
 
     let preferred = capacity_summary(
         topology,
         &text_report.devices,
         Measurement::Initial,
-        mtp_report.as_ref().map(|report| report.devices.as_slice()),
-        mtp_includes_model(requested),
+        speculative_report
+            .as_ref()
+            .map(|report| report.devices.as_slice()),
+        speculative_includes_model(requested),
         &projector_memory,
     )?;
     if preferred.fits {
@@ -933,7 +937,7 @@ fn plan_and_assess(
                 assessment: fits_assessment(&plan, &preferred, HardwareRecommendation::Recommended),
                 plan,
                 text_report,
-                mtp_report,
+                speculative_report,
                 #[cfg(feature = "mtmd")]
                 projector_memory,
             },
@@ -946,13 +950,15 @@ fn plan_and_assess(
     let fallback = fallback_plan
         .as_ref()
         .map(|plan| {
-            mtp_report = estimate_mtp_report(backend, plan)?;
+            speculative_report = estimate_speculative_report(backend, plan)?;
             capacity_summary(
                 topology,
                 &text_report.devices,
                 Measurement::Selected,
-                mtp_report.as_ref().map(|report| report.devices.as_slice()),
-                mtp_includes_model(plan),
+                speculative_report
+                    .as_ref()
+                    .map(|report| report.devices.as_slice()),
+                speculative_includes_model(plan),
                 &projector_memory,
             )
         })
@@ -965,7 +971,7 @@ fn plan_and_assess(
                 assessment: fits_assessment(&plan, &summary, HardwareRecommendation::Constrained),
                 plan,
                 text_report,
-                mtp_report,
+                speculative_report,
                 #[cfg(feature = "mtmd")]
                 projector_memory,
             },
@@ -991,7 +997,7 @@ fn plan_and_assess(
             plan: requested.clone(),
             assessment,
             text_report,
-            mtp_report,
+            speculative_report,
             #[cfg(feature = "mtmd")]
             projector_memory,
         },
@@ -1001,34 +1007,41 @@ fn plan_and_assess(
 
 fn planning_request(
     plan: &ExecutionIntent,
-    mtp_context: bool,
+    speculative_context: bool,
 ) -> Result<PlanningRequest, AssessmentError> {
     let (model, cache_type_k, cache_type_v, context_type, recurrent_snapshots, maximum_outputs) =
-        if mtp_context {
-            let MtpConfig::Enabled {
+        if speculative_context {
+            let SpeculativeDecodingConfig::Enabled {
                 source,
+                method,
                 cache_type_k,
                 cache_type_v,
                 ..
-            } = &plan.mtp
+            } = &plan.speculative
             else {
                 return Err(AssessmentError::MissingMeasurements);
             };
             let model = match source {
-                MtpSource::Bundled => plan.model_path.clone(),
-                MtpSource::Separate { model_path } => model_path.clone(),
+                SpeculativeDraftSource::Embedded => plan.model_path.clone(),
+                SpeculativeDraftSource::Separate { model_path } => model_path.clone(),
             };
             (
                 model,
                 *cache_type_k,
                 *cache_type_v,
-                PlanningContextType::Mtp,
+                match method {
+                    icn_contracts::SpeculativeMethodConfig::Mtp { .. } => PlanningContextType::Mtp,
+                    icn_contracts::SpeculativeMethodConfig::DFlash { .. }
+                    | icn_contracts::SpeculativeMethodConfig::DSpark { .. } => {
+                        PlanningContextType::SpeculativeDraft
+                    }
+                },
                 0,
                 NonZeroU32::new(plan.max_sequences),
             )
         } else {
-            let (snapshots, outputs) = match plan.mtp {
-                MtpConfig::Enabled { n_max, .. } => (
+            let (snapshots, outputs) = match plan.speculative {
+                SpeculativeDecodingConfig::Enabled { n_max, .. } => (
                     n_max,
                     NonZeroU32::new(
                         plan.max_sequences
@@ -1036,7 +1049,7 @@ fn planning_request(
                             .min(plan.batch_size),
                     ),
                 ),
-                MtpConfig::Disabled { .. } => (0, None),
+                SpeculativeDecodingConfig::Disabled { .. } => (0, None),
             };
             (
                 plan.model_path.clone(),
@@ -1061,14 +1074,21 @@ fn planning_request(
             tensor_split: plan.execution.tensor_split.clone(),
             use_mmap: plan.execution.use_mmap,
             use_mlock: plan.execution.use_mlock,
-            load_mtp: mtp_context
-                || matches!(
-                    plan.mtp,
-                    MtpConfig::Enabled {
-                        source: MtpSource::Bundled,
+            load_mtp: matches!(
+                plan.speculative,
+                SpeculativeDecodingConfig::Enabled {
+                    source: SpeculativeDraftSource::Embedded,
+                    method: icn_contracts::SpeculativeMethodConfig::Mtp { .. },
+                    ..
+                }
+            ) || (speculative_context
+                && matches!(
+                    plan.speculative,
+                    SpeculativeDecodingConfig::Enabled {
+                        method: icn_contracts::SpeculativeMethodConfig::Mtp { .. },
                         ..
                     }
-                ),
+                )),
             cache_type_k,
             cache_type_v,
             flash_attention: plan.execution.flash_attention,
@@ -1085,13 +1105,13 @@ fn planning_request(
     })
 }
 
-fn estimate_mtp_report(
+fn estimate_speculative_report(
     backend: &LlamaBackend,
     plan: &ExecutionIntent,
 ) -> Result<Option<FitReport>, AssessmentError> {
-    match plan.mtp {
-        MtpConfig::Disabled { .. } => Ok(None),
-        MtpConfig::Enabled { .. } => Ok(Some(assess_linked_model_with_backend(
+    match plan.speculative {
+        SpeculativeDecodingConfig::Disabled { .. } => Ok(None),
+        SpeculativeDecodingConfig::Enabled { .. } => Ok(Some(assess_linked_model_with_backend(
             backend,
             &planning_request(plan, true)?,
             &planning_request(plan, false)?,
@@ -1099,11 +1119,11 @@ fn estimate_mtp_report(
     }
 }
 
-fn mtp_includes_model(plan: &ExecutionIntent) -> bool {
+fn speculative_includes_model(plan: &ExecutionIntent) -> bool {
     matches!(
-        plan.mtp,
-        MtpConfig::Enabled {
-            source: MtpSource::Separate { .. },
+        plan.speculative,
+        SpeculativeDecodingConfig::Enabled {
+            source: SpeculativeDraftSource::Separate { .. },
             ..
         }
     )
@@ -2291,8 +2311,8 @@ fn capacity_summary(
     topology: &MemoryTopology,
     devices: &[FitDeviceEstimate],
     measurement: Measurement,
-    mtp_devices: Option<&[FitDeviceEstimate]>,
-    mtp_includes_model: bool,
+    speculative_devices: Option<&[FitDeviceEstimate]>,
+    speculative_includes_model: bool,
     projectors: &[ProjectorMemory],
 ) -> Result<CapacitySummary, AssessmentError> {
     #[cfg(not(feature = "mtmd"))]
@@ -2315,17 +2335,17 @@ fn capacity_summary(
             ))
             .map_err(accounting_error)?;
     }
-    if let Some(mtp_devices) = mtp_devices {
-        for device in mtp_devices {
+    if let Some(speculative_devices) = speculative_devices {
+        for device in speculative_devices {
             let Some(estimate) = device.initial else {
                 continue;
             };
             accountant
                 .record(native_memory_charge(
-                    MemoryChargeOwner::Mtp,
+                    MemoryChargeOwner::SpeculativeDraft,
                     device,
                     estimate,
-                    mtp_includes_model,
+                    speculative_includes_model,
                 ))
                 .map_err(accounting_error)?;
         }
@@ -2400,7 +2420,7 @@ pub fn assess_model_with_backend(
     Ok(resolve_native_plan(backend, request, None, false)?.report)
 }
 
-/// Estimate an MTP model/context linked to the exact target execution context.
+/// Estimate a speculative model/context linked to the exact target execution context.
 pub fn assess_linked_model_with_backend(
     backend: &LlamaBackend,
     request: &PlanningRequest,
@@ -2418,10 +2438,11 @@ pub struct NativeParameterPlan {
     threads_batch: NonZeroU32,
 }
 
-/// Exact native parameter objects used only for MTP capability preflight. Construction lives
+/// Exact native parameter objects used only for speculative capability preflight. Construction lives
 /// beside ordinary load planning so speculative discovery cannot drift from runtime defaults.
-pub struct MtpPreflightParameters {
-    pub model_params: std::pin::Pin<Box<LlamaModelParams>>,
+pub struct SpeculativePreflightParameters {
+    pub target_model_params: std::pin::Pin<Box<LlamaModelParams>>,
+    pub draft_model_params: std::pin::Pin<Box<LlamaModelParams>>,
     pub target_context: LlamaContextParams,
     pub draft_context: LlamaContextParams,
 }
@@ -2451,23 +2472,20 @@ impl NativeParameterPlan {
     }
 }
 
-pub fn mtp_preflight_parameters(
+pub fn speculative_preflight_parameters(
     intent: &ExecutionIntent,
-    recurrent_snapshots: u32,
-) -> Result<MtpPreflightParameters, AssessmentError> {
-    let mut preflight = intent.clone();
-    preflight.mtp = MtpConfig::Enabled {
-        source: MtpSource::Bundled,
-        n_max: recurrent_snapshots,
-        n_min: 0,
-        p_min: 0.0,
-        cache_type_k: CacheType::F16,
-        cache_type_v: CacheType::F16,
-    };
-    let target = native_parameter_plan(&planning_request(&preflight, false)?)?;
-    let draft = native_parameter_plan(&planning_request(&preflight, true)?)?;
-    Ok(MtpPreflightParameters {
-        model_params: target.model_params,
+) -> Result<SpeculativePreflightParameters, AssessmentError> {
+    if !matches!(
+        intent.speculative,
+        SpeculativeDecodingConfig::Enabled { .. }
+    ) {
+        return Err(AssessmentError::MissingMeasurements);
+    }
+    let target = native_parameter_plan(&planning_request(intent, false)?)?;
+    let draft = native_parameter_plan(&planning_request(intent, true)?)?;
+    Ok(SpeculativePreflightParameters {
+        target_model_params: target.model_params,
+        draft_model_params: draft.model_params,
         target_context: target.context_params,
         draft_context: draft.context_params,
     })
@@ -2592,6 +2610,7 @@ fn native_context_params(options: &PlanningOptions) -> LlamaContextParams {
         .with_context_type(match options.context_type {
             PlanningContextType::Target => LlamaContextType::Default,
             PlanningContextType::Mtp => LlamaContextType::Mtp,
+            PlanningContextType::SpeculativeDraft => LlamaContextType::Default,
         })
         .with_n_rs_seq(options.recurrent_snapshots)
         .with_n_outputs_max(options.maximum_outputs)
@@ -4010,7 +4029,7 @@ mod tests {
         assert!(matches!(
             error,
             AssessmentError::TopologyMismatch {
-                owner: MemoryChargeOwner::Mtp,
+                owner: MemoryChargeOwner::SpeculativeDraft,
                 backend: Some(ref backend),
                 physical_id: Some(ref physical_id),
                 native_index: 1,

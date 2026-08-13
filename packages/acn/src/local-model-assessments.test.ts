@@ -48,23 +48,43 @@ describe("localModelAssessmentProfiles", () => {
 
   it("uses the lower package limit for speculative decoding", () => {
     const target = {
-      _tag: "SpeculativeDecodingPair",
+      _tag: "SpeculativeDecoding",
       target: { properties: { maximumContextLength: 131_072 } },
-      draft: { properties: { maximumContextLength: 32_768 } },
+      draftSource: {
+        _tag: "Separate",
+        draft: { properties: { maximumContextLength: 32_768 } },
+      },
+      method: { _tag: "DFlash" },
     } as unknown as ServableModelBundle
     expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 32_768 },
     ])
   })
 
-  it("caps a speculative pair when both package limits exceed 100K", () => {
+  it("caps separately paired speculative packages when both limits exceed 100K", () => {
     const target = {
-      _tag: "SpeculativeDecodingPair",
+      _tag: "SpeculativeDecoding",
       target: { properties: { maximumContextLength: 262_144 } },
-      draft: { properties: { maximumContextLength: 131_072 } },
+      draftSource: {
+        _tag: "Separate",
+        draft: { properties: { maximumContextLength: 131_072 } },
+      },
+      method: { _tag: "DSpark" },
     } as unknown as ServableModelBundle
     expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 100_000 },
+    ])
+  })
+
+  it("uses only the target package limit for embedded speculative decoding", () => {
+    const target = {
+      _tag: "SpeculativeDecoding",
+      target: { properties: { maximumContextLength: 80_000 } },
+      draftSource: { _tag: "Embedded" },
+      method: { _tag: "Mtp" },
+    } as unknown as ServableModelBundle
+    expect(localModelAssessmentProfiles(target)).toEqual([
+      { contextLength: 80_000 },
     ])
   })
 

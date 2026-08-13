@@ -26,13 +26,12 @@ import {
   type ModelSlotsState,
   type ProviderModelId,
   type ReasoningEffort,
+  servableModelBundlePackages,
 } from "@magnitudedev/sdk"
 
 export type LocalInferenceSelection = LocalModelOption
 
-const modelPackages = (model: LocalModel) => model.bundle._tag === "Standalone"
-  ? [model.bundle.package]
-  : [model.bundle.target, model.bundle.draft]
+const modelPackages = (model: LocalModel) => servableModelBundlePackages(model.bundle)
 
 export const localModelQuantization = (model: LocalModel): string =>
   model.presentation.quantization

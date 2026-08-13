@@ -17,7 +17,7 @@ import {
 import type { AgentClientInstance } from "../state/agent-client"
 import { onboardingAtoms } from "../onboarding/atoms"
 import { modelSlotAtoms, sameSlotSelection } from "../model-slots/atoms"
-import { localModelAtoms, sameDownloadAttemptIds } from "./atoms"
+import { localModelAtoms } from "./atoms"
 import {
   findLocalModelByConfigurationId,
   localModelProviderModelId,
@@ -208,7 +208,7 @@ const makeService = (client: AgentClientInstance) => {
           }
           if (admission._tag === "AlreadyInstalled"
             || acquisition._tag === "NotInstalled"
-            || !sameDownloadAttemptIds(acquisition.attemptIds, admission.attemptIds)) {
+            || acquisition.downloadId !== admission.downloadId) {
             return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
               configurationId: prepared.configurationId,
               resource: "installation",
@@ -238,7 +238,7 @@ const makeService = (client: AgentClientInstance) => {
               : Effect.void
             const cancel = admission._tag === "DownloadAdmitted"
               ? Mutation.execute(localModels.cancelDownloadMutation, {
-                  attemptIds: admission.attemptIds,
+                  downloadId: admission.downloadId,
                 }).pipe(
                   Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "cancel", cause })),
                   Effect.tapError((failure) => setExecution({

@@ -484,61 +484,6 @@ export const DefaultGenerationSettings = S.Struct({
 export type DefaultGenerationSettings = S.Schema.Type<typeof DefaultGenerationSettings>
 export type DefaultGenerationSettingsEncoded = S.Schema.Encoded<typeof DefaultGenerationSettings>
 
-export const DownloadAttempt = S.Union(
-  S.extend(
-    S.TaggedStruct("Pending", {
-      id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
-      packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Downloading", {
-      bytesPerSecond: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-        exact: true,
-        as: "Option",
-      }),
-      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
-      packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
-      stage: S.suspend((): S.Schema<DownloadStage, DownloadStageEncoded> => DownloadStage),
-      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Completed", {
-      id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
-      packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Failed", {
-      acknowledged: S.Boolean,
-      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
-      packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
-      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Cancelled", {
-      id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
-      packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type DownloadAttempt = S.Schema.Type<typeof DownloadAttempt>
-export type DownloadAttemptEncoded = S.Schema.Encoded<typeof DownloadAttempt>
-
-export const DownloadAttemptId = S.String
-export type DownloadAttemptId = S.Schema.Type<typeof DownloadAttemptId>
-export type DownloadAttemptIdEncoded = S.Schema.Encoded<typeof DownloadAttemptId>
-
 export const DownloadStage = S.Union(
   S.Literal("queued"),
   S.Literal("resolving"),
@@ -1124,8 +1069,11 @@ export const ModelBundleInput = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("SpeculativeDecodingPair", {
-      draft: S.suspend((): S.Schema<ModelPackageOperand, ModelPackageOperandEncoded> => ModelPackageOperand),
+    S.TaggedStruct("SpeculativeDecoding", {
+      draftSource: S.suspend(
+        (): S.Schema<SpeculativeDraftSourceInput, SpeculativeDraftSourceInputEncoded> => SpeculativeDraftSourceInput,
+      ),
+      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
       target: S.suspend((): S.Schema<ModelPackageOperand, ModelPackageOperandEncoded> => ModelPackageOperand),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1145,14 +1093,67 @@ export const ModelCapabilities = S.Struct({
 export type ModelCapabilities = S.Schema.Type<typeof ModelCapabilities>
 export type ModelCapabilitiesEncoded = S.Schema.Encoded<typeof ModelCapabilities>
 
+export const ModelDownload = S.Struct({
+  bundle: S.suspend((): S.Schema<ServableModelBundle, ServableModelBundleEncoded> => ServableModelBundle),
+  id: S.suspend((): S.Schema<ModelDownloadId, ModelDownloadIdEncoded> => ModelDownloadId),
+  state: S.suspend((): S.Schema<ModelDownloadState, ModelDownloadStateEncoded> => ModelDownloadState),
+})
+export type ModelDownload = S.Schema.Type<typeof ModelDownload>
+export type ModelDownloadEncoded = S.Schema.Encoded<typeof ModelDownload>
+
+export const ModelDownloadId = S.String
+export type ModelDownloadId = S.Schema.Type<typeof ModelDownloadId>
+export type ModelDownloadIdEncoded = S.Schema.Encoded<typeof ModelDownloadId>
+
 export const ModelDownloadsResponse = S.extend(
   S.Struct({
-    attempts: S.Array(S.suspend((): S.Schema<DownloadAttempt, DownloadAttemptEncoded> => DownloadAttempt)),
+    downloads: S.Array(S.suspend((): S.Schema<ModelDownload, ModelDownloadEncoded> => ModelDownload)),
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
 export type ModelDownloadsResponse = S.Schema.Type<typeof ModelDownloadsResponse>
 export type ModelDownloadsResponseEncoded = S.Schema.Encoded<typeof ModelDownloadsResponse>
+
+export const ModelDownloadState = S.Union(
+  S.extend(
+    S.TaggedStruct("Pending", {
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Downloading", {
+      bytesPerSecond: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+        exact: true,
+        as: "Option",
+      }),
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      stage: S.suspend((): S.Schema<DownloadStage, DownloadStageEncoded> => DownloadStage),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("Completed", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      acknowledged: S.Boolean,
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Cancelled", {
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelDownloadState = S.Schema.Type<typeof ModelDownloadState>
+export type ModelDownloadStateEncoded = S.Schema.Encoded<typeof ModelDownloadState>
 
 export const ModelFailure = S.Struct({
   code: S.String,
@@ -1693,8 +1694,11 @@ export const ServableModelBundle = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("SpeculativeDecodingPair", {
-      draft: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
+    S.TaggedStruct("SpeculativeDecoding", {
+      draftSource: S.suspend(
+        (): S.Schema<SpeculativeDraftSource, SpeculativeDraftSourceEncoded> => SpeculativeDraftSource,
+      ),
+      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
       target: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1716,24 +1720,34 @@ export const SetModelResidencyPolicyRequest = S.Struct({
 export type SetModelResidencyPolicyRequest = S.Schema.Type<typeof SetModelResidencyPolicyRequest>
 export type SetModelResidencyPolicyRequestEncoded = S.Schema.Encoded<typeof SetModelResidencyPolicyRequest>
 
+export const SpeculativeDraftSource = S.Union(
+  S.extend(S.TaggedStruct("Embedded", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Separate", {
+      draft: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type SpeculativeDraftSource = S.Schema.Type<typeof SpeculativeDraftSource>
+export type SpeculativeDraftSourceEncoded = S.Schema.Encoded<typeof SpeculativeDraftSource>
+
+export const SpeculativeDraftSourceInput = S.Union(
+  S.extend(S.TaggedStruct("Embedded", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Separate", {
+      draft: S.suspend((): S.Schema<ModelPackageOperand, ModelPackageOperandEncoded> => ModelPackageOperand),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type SpeculativeDraftSourceInput = S.Schema.Type<typeof SpeculativeDraftSourceInput>
+export type SpeculativeDraftSourceInputEncoded = S.Schema.Encoded<typeof SpeculativeDraftSourceInput>
+
 export const SpeculativeMethod = S.Union(
   S.extend(S.TaggedStruct("Mtp", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(S.TaggedStruct("DraftSimple", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(S.TaggedStruct("DraftEagle3", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(S.TaggedStruct("DraftDFlash", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(
-    S.TaggedStruct("Ngram", {
-      method: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("UnknownNative", {
-      evidence: S.String,
-      method: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
+  S.extend(S.TaggedStruct("DFlash", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("DSpark", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type SpeculativeMethod = S.Schema.Type<typeof SpeculativeMethod>
 export type SpeculativeMethodEncoded = S.Schema.Encoded<typeof SpeculativeMethod>
@@ -1753,7 +1767,10 @@ export type StartModelDownloadRequestEncoded = S.Schema.Encoded<typeof StartMode
 
 export const StartModelDownloadResponse = S.extend(
   S.Struct({
-    attempts: S.Array(S.suspend((): S.Schema<DownloadAttempt, DownloadAttemptEncoded> => DownloadAttempt)),
+    download: S.optionalWith(
+      S.suspend((): S.Schema<ModelDownload, ModelDownloadEncoded> => ModelDownload),
+      { exact: true, as: "Option" },
+    ),
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
