@@ -5,7 +5,7 @@ import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
   LocalModelsMirror,
-  type DownloadAttemptId,
+  type ModelDownloadId,
   type LocalModelInstallationAdmission,
   type LocalModelsState,
   type ModelServingConfigurationId,
@@ -24,7 +24,7 @@ interface InstallationInput {
 }
 
 interface DownloadInput {
-  readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
+  readonly downloadId: ModelDownloadId
 }
 
 interface DeletionInput {
@@ -36,8 +36,8 @@ const installationScope = (
 ): Mutation.MutationScope => Mutation.MutationScope(configurationId)
 
 const downloadScope = (
-  attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]],
-): Mutation.MutationScope => Mutation.MutationScope([...attemptIds].sort().join("|"))
+  downloadId: ModelDownloadId,
+): Mutation.MutationScope => Mutation.MutationScope(downloadId)
 
 const localModelsQuery = Query.make("LocalModels", {
   key: (_: void) => Data.tuple(LocalModelsMirror.id),
@@ -51,12 +51,6 @@ const synchronizeLocalModels = () => QueryClient.invalidate(localModelsQuery.mat
   Effect.zipRight(QueryClient.fetch(localModelsQuery, undefined)),
 )
 
-export const sameDownloadAttemptIds = (
-  left: readonly DownloadAttemptId[],
-  right: readonly DownloadAttemptId[],
-): boolean => left.length === right.length
-  && left.every((attemptId) => right.includes(attemptId))
-
 export const installationAdmissionIsVisible = (
   state: LocalModelsState,
   configurationId: ModelServingConfigurationId,
@@ -68,7 +62,7 @@ export const installationAdmissionIsVisible = (
     if (acquisition._tag === "Installed") return true
     if (admission._tag === "AlreadyInstalled") return false
     return acquisition._tag !== "NotInstalled"
-      && sameDownloadAttemptIds(acquisition.attemptIds, admission.attemptIds)
+      && acquisition.downloadId === admission.downloadId
   },
 )
 
@@ -89,22 +83,22 @@ const installMutation = Mutation.make("InstallModel", {
 })
 
 const cancelDownloadMutation = Mutation.make("CancelModelDownload", {
-  scope: ({ attemptIds }: DownloadInput) => downloadScope(attemptIds),
-  effect: ({ attemptIds }: DownloadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { attemptIds })),
-  synchronize: (_, { attemptIds }) => synchronizeLocalModels().pipe(
+  scope: ({ downloadId }: DownloadInput) => downloadScope(downloadId),
+  effect: ({ downloadId }: DownloadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { downloadId })),
+  synchronize: (_, { downloadId }) => synchronizeLocalModels().pipe(
     Effect.filterOrFail(
       (state) => state.models.every((model) => {
         const acquisition = model.acquisitionState
         return acquisition._tag === "NotInstalled"
           || acquisition._tag === "Installed"
-          || !sameDownloadAttemptIds(acquisition.attemptIds, attemptIds)
+          || acquisition.downloadId !== downloadId
           || acquisition._tag === "Cancelled"
           || acquisition._tag === "Failed"
       }),
       () => new LocalModelSynchronizationFailed({
         operation: "cancel",
-        message: "The cancelled download attempts remained active in LocalModels.",
+        message: "The cancelled model download remained active in LocalModels.",
       }),
     ),
     Effect.asVoid,
@@ -112,9 +106,9 @@ const cancelDownloadMutation = Mutation.make("CancelModelDownload", {
 })
 
 const dismissDownloadFailureMutation = Mutation.make("DismissModelDownloadFailure", {
-  scope: ({ attemptIds }: DownloadInput) => downloadScope(attemptIds),
-  effect: ({ attemptIds }: DownloadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { attemptIds })),
+  scope: ({ downloadId }: DownloadInput) => downloadScope(downloadId),
+  effect: ({ downloadId }: DownloadInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { downloadId })),
   synchronize: () => synchronizeLocalModels().pipe(Effect.asVoid),
 })
 
@@ -163,12 +157,12 @@ const makeLocalModels = Effect.gen(function* () {
       Mutation.execute(install, { configurationId }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),
       ),
-    cancelDownload: (attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) =>
-      Mutation.execute(cancelDownload, { attemptIds }).pipe(
+    cancelDownload: (downloadId: ModelDownloadId) =>
+      Mutation.execute(cancelDownload, { downloadId }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),
       ),
-    dismissDownloadFailure: (attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) =>
-      Mutation.execute(dismissDownloadFailure, { attemptIds }).pipe(
+    dismissDownloadFailure: (downloadId: ModelDownloadId) =>
+      Mutation.execute(dismissDownloadFailure, { downloadId }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),
       ),
     delete: (configurationId: ModelServingConfigurationId) =>
@@ -197,12 +191,12 @@ export function useLocalModelMutations() {
   ), [client])
   const downloadAction = useMemo(() => client.effectQuery.runtime.fn<{
     readonly operation: "cancel" | "dismiss"
-    readonly attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]
-  }>()(({ operation, attemptIds }) => Effect.flatMap(
+    readonly downloadId: ModelDownloadId
+  }>()(({ operation, downloadId }) => Effect.flatMap(
     LocalModels,
     (models) => operation === "cancel"
-      ? models.cancelDownload(attemptIds)
-      : models.dismissDownloadFailure(attemptIds),
+      ? models.cancelDownload(downloadId)
+      : models.dismissDownloadFailure(downloadId),
   )), [client])
   const deleteAction = useMemo(() => client.effectQuery.runtime.fn<ModelServingConfigurationId>()(
     (configurationId) => Effect.flatMap(LocalModels, (models) => models.delete(configurationId)),
@@ -226,11 +220,11 @@ export function useLocalModelMutations() {
     install: useCallback((configurationId: ModelServingConfigurationId) => {
       install(configurationId)
     }, [install]),
-    cancel: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => {
-      download({ operation: "cancel", attemptIds })
+    cancel: useCallback((downloadId: ModelDownloadId) => {
+      download({ operation: "cancel", downloadId })
     }, [download]),
-    dismissFailure: useCallback((attemptIds: readonly [DownloadAttemptId, ...DownloadAttemptId[]]) => {
-      download({ operation: "dismiss", attemptIds })
+    dismissFailure: useCallback((downloadId: ModelDownloadId) => {
+      download({ operation: "dismiss", downloadId })
     }, [download]),
     delete: useCallback((configurationId: ModelServingConfigurationId) => {
       deleteModel(configurationId)

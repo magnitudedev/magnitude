@@ -24,7 +24,7 @@ download behavior. Terms follow [Model-management terminology](./terminology.md)
 ## Ownership
 
 ICN owns the recommendable catalog, exact packages and sources, the managed model store, installed
-inventory, package inspection, and download attempts. ACN observes these independent authorities
+inventory, model-download occurrences, and their internal package attempts. ACN observes these independent authorities
 and produces product projections. Clients initiate mutations through ACN and do not infer command
 authorization or completion from cached projections.
 
@@ -37,16 +37,20 @@ The recommendable catalog is immutable release data. Human-reviewed declarations
 artifact variant by its exact upstream format selector, short variant label, fidelity rank, and
 quantization-aware-training fact. Each variant publishes one exact default
 `ModelServingConfiguration`, required companion components, base presentation, and recommendation
-evidence. The configuration and its ICN-issued identity are
-published independently of hardware assessment. A separate lock maps each declaration to an
-immutable upstream revision. Advancing that lock is an explicit development operation.
+evidence. A declaration may identify a separately packaged speculative draft from another upstream
+repository. Every distinct package source is locked independently, and the same immutable draft
+package may be referenced by multiple target-variant bundles without duplicating its installation.
+The configuration and its ICN-issued identity are published independently of hardware assessment.
+Advancing the source lock is an explicit development operation.
 
 Catalog generation resolves only locked revisions through production package construction,
 inspection, template analysis, and native planning. It emits a self-contained planner-input bundle
-and proves that compact planner inputs yield the same native assessments as their source metadata
-at each declaration's catalog profile. A declared profile above the exact artifact maximum, a
-missing or differently typed companion, an unresolved entry, incomplete coverage, integrity
-mismatch, or assessment mismatch fails generation or ICN readiness.
+for every target and separately packaged draft and proves that compact planner inputs yield the
+same native assessments as their source metadata at each declaration's catalog profile. Repeated
+references to one immutable package reuse one package identity and one content payload. A declared
+profile above the exact bundle maximum, a missing or differently typed companion or draft, an
+unresolved entry, incomplete coverage, integrity mismatch, or assessment mismatch fails generation
+or ICN readiness.
 
 Runtime catalog use performs no upstream discovery and does not follow mutable revisions. Adding a
 model, format, or upstream revision requires a new reviewed release catalog.
@@ -97,19 +101,25 @@ represented and assessed as a standalone bundle without catalog membership.
 
 Discovery prefers authoritative GGUF role evidence. Exact filename tokens may propose a
 relationship only when authoritative evidence is unavailable; file size never determines role.
-`DraftFor(target, method)` and `MtpFor(target)` remain distinct relationships.
+`DraftFor(target, method)` and `MtpFor(target)` remain distinct artifact relationships. A servable
+speculative-decoding bundle carries its method and embedded-versus-separate draft source directly;
+callers never infer that execution contract by searching package relationships.
 
 ## Downloads
 
-A download command carries an exact servable bundle and is idempotent over its required packages.
-ICN atomically admits missing package work as new attempts or joins already admitted equivalent
-work. The caller waits for the exact admitted attempt identities; it does not wait for a later
-inventory-wide refresh.
+A download command carries an exact servable bundle. If every required package is installed, ICN
+returns `AlreadyInstalled` without manufacturing a download occurrence. Otherwise ICN creates one
+durable `ModelDownload` with a stable `ModelDownloadId`, atomically admits missing package work as
+new attempts or joins already admitted equivalent work, and returns that occurrence. The caller
+waits for the exact model-download identity; it does not wait for a later inventory-wide refresh.
 
-Each attempt publishes bounded progress and exactly one terminal outcome. Caller interruption after
-admission detaches that waiter but does not abandon shared work. Cancellation is an explicit domain
-command. A retry creates a new attempt. Historical success never proves current presence, and
-historical failure never becomes permanent package state.
+The model download aggregates bounded progress and exactly one terminal outcome across the bundle.
+Package attempts are ICN execution details: each installs one package, and equivalent concurrent
+model downloads may share one active package attempt. Caller interruption after admission detaches
+that waiter but does not abandon shared work. Cancelling a model download is an explicit command;
+shared package work is cancelled only when no other live model download depends on it. A retry
+creates a new model-download identity and any required new package attempts. Historical success
+never proves current presence, and historical failure never becomes permanent package state.
 
 Download failures whose facts support recovery or presentation are structured domain outcomes.
 Insufficient disk space carries the required and currently available byte counts from ICN through
@@ -121,11 +131,11 @@ and corrupt downloaded content. Cancellation is a separate terminal outcome, not
 Everything else is an internal failure representing a violated invariant or implementation defect.
 There is no catch-all error code: clients render the variant and never infer behavior from prose.
 
-ICN also owns durable acknowledgement of an exact failed attempt. Acknowledgement is an idempotent
-mutation accepted only for that terminal failure and committed with the retained attempt before
-success is returned. It does not erase or alter the failure outcome. A retry has a new attempt
-identity and begins unacknowledged. ACN retains no parallel acknowledgement or dismissal state; it
-projects an acknowledged failure as no longer requiring presentation.
+ICN also owns durable acknowledgement of an exact failed model download. Acknowledgement is an
+idempotent mutation accepted only for that terminal occurrence and committed before success is
+returned. It does not erase or alter the failure outcome. A retry has a new model-download identity
+and begins unacknowledged. ACN retains no parallel acknowledgement or dismissal state; it projects
+an acknowledged failure as no longer requiring presentation.
 
 Completed content is verified before atomic publication. Partial and resumable content is not
 reported as installed. Deleting or externally removing an installed package changes inventory
@@ -147,7 +157,7 @@ atomic move.
 
 The complete join and visibility contract belongs to
 [Local-model product projection](./local-model-product-projection.md). Catalog and acquisition
-contribute exact catalog configurations, installed-package observations, and download-attempt state;
+contribute exact catalog configurations, installed-package observations, and model-download state;
 they do not decide whether another domain's entity is visible.
 
 Exact bundle structure also joins presentation metadata. A bundle present in the recommendable
@@ -162,13 +172,13 @@ Product installation addresses the row's `ModelServingConfigurationId`. For an e
 configuration ACN resolves that exact value directly; for first installation it resolves the exact
 catalog-published configuration. ACN durably retains it before the private package owner admits its
 bundle's required packages. The client-facing admission result carries the configuration-backed
-provider-model ID and reports that the bundle is already installed or carries the exact
-download-attempt identities needed for subsequent cancellation and observation. ICN
+provider-model ID and reports that the bundle is already installed or carries the exact stable
+`ModelDownloadId` needed for subsequent cancellation and observation. ICN
 package-download commands remain bundle/package operations private to installation.
 
 Download state stores no assessment evidence and determines neither configuration, offering, nor
 slot identity. ACN may immediately merge an exact admission response into observation to reduce
-presentation latency, while ICN attempt and inventory state remain authoritative for completion and
+presentation latency, while ICN model-download and inventory state remain authoritative for completion and
 physical presence.
 
 Every CLI download notification is a pure projection of
@@ -215,13 +225,15 @@ exists for the bundle; ICN constructs and canonically identifies the configurati
   ACN never recreates that identity.
 - Runtime setup requires no network access to reconstruct the release catalog.
 - Installed inventory reports presence and inspection, never inferred model assessment.
-- Download admission and completion depend on exact attempt state, not reconciliation timing.
 - Insufficient-disk failures preserve required and available byte counts through every serialized
   and projected download state; diagnostic text is never their data contract.
-- A completed attempt awaiting installed-inventory convergence remains projected at full progress
-  in `publishing`; it cannot regress to `NotInstalled`.
+- Download admission, observation, cancellation, and failure acknowledgement correlate one exact
+  `ModelDownloadId`; package-attempt membership is not a client-facing identity.
+- On first observing a completed model download, ACN refreshes installed inventory before
+  projection. A currently absent package is therefore `NotInstalled`; historical completion never
+  proves current presence.
 - Shared artifact paths never coalesce distinct managed package identities.
-- Failed-attempt acknowledgement survives restart and cannot hide a later retry's failure.
+- Failed model-download acknowledgement survives restart and cannot hide a later retry's failure.
 - Package identity is independent of paths, display names, and mutable upstream references.
 - Exact catalog bundle structure preserves curated presentation across installation and
   recommendation changes; fallback presentation cannot overwrite it.

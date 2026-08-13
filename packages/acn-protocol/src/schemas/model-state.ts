@@ -96,8 +96,8 @@ export type ModelFileId = typeof ModelFileIdSchema.Type
 export const ModelPackageIdSchema = NonEmptyString.pipe(Schema.brand("ModelPackageId"))
 export type ModelPackageId = typeof ModelPackageIdSchema.Type
 
-export const DownloadAttemptIdSchema = NonEmptyString.pipe(Schema.brand("DownloadAttemptId"))
-export type DownloadAttemptId = typeof DownloadAttemptIdSchema.Type
+export const ModelDownloadIdSchema = NonEmptyString.pipe(Schema.brand("ModelDownloadId"))
+export type ModelDownloadId = typeof ModelDownloadIdSchema.Type
 
 export const ModelDownloadStageSchema = Schema.Literal(
   "queued",
@@ -206,16 +206,8 @@ export type ModelPackageSource = typeof ModelPackageSourceSchema.Type
 
 export const SpeculativeMethodSchema = Schema.Union(
   Schema.TaggedStruct("Mtp", {}),
-  Schema.TaggedStruct("DraftSimple", {}),
-  Schema.TaggedStruct("DraftEagle3", {}),
-  Schema.TaggedStruct("DraftDFlash", {}),
-  Schema.TaggedStruct("Ngram", {
-    method: NonEmptyString,
-  }),
-  Schema.TaggedStruct("UnknownNative", {
-    method: NonEmptyString,
-    evidence: NonEmptyString,
-  }),
+  Schema.TaggedStruct("DFlash", {}),
+  Schema.TaggedStruct("DSpark", {}),
 )
 export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
 
@@ -290,22 +282,6 @@ export type ModelPackageInspection = typeof ModelPackageInspectionSchema.Type
 
 export const ModelPackageLocalStateSchema = Schema.Union(
   Schema.TaggedStruct("NotInstalled", {}),
-  Schema.TaggedStruct("Downloading", {
-    attemptId: DownloadAttemptIdSchema,
-    stage: ModelDownloadStageSchema,
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
-  }),
-  Schema.TaggedStruct("DownloadFailed", {
-    attemptId: DownloadAttemptIdSchema,
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-    failure: ModelDownloadFailureSchema,
-  }),
-  Schema.TaggedStruct("DownloadCancelled", {
-    attemptId: DownloadAttemptIdSchema,
-  }),
   Schema.TaggedStruct("Installed", {
     path: NonEmptyString,
     origin: ModelPackageInstallationOriginSchema,
@@ -320,65 +296,83 @@ export const ModelPackageEntrySchema = Schema.Struct({
 })
 export type ModelPackageEntry = typeof ModelPackageEntrySchema.Type
 
-export const DownloadAttemptSchema = Schema.Union(
+export const StandaloneModelBundleSchema = Schema.TaggedStruct("Standalone", {
+  package: ModelPackageSchema,
+})
+
+export const SpeculativeDraftSourceSchema = Schema.Union(
+  Schema.TaggedStruct("Embedded", {}),
+  Schema.TaggedStruct("Separate", {
+    draft: ModelPackageSchema,
+  }),
+)
+export type SpeculativeDraftSource = typeof SpeculativeDraftSourceSchema.Type
+
+export const SpeculativeDecodingModelBundleSchema = Schema.TaggedStruct("SpeculativeDecoding", {
+  target: ModelPackageSchema,
+  draftSource: SpeculativeDraftSourceSchema,
+  method: SpeculativeMethodSchema,
+})
+
+export const ServableModelBundleSchema = Schema.Union(
+  StandaloneModelBundleSchema,
+  SpeculativeDecodingModelBundleSchema,
+)
+export type ServableModelBundle = typeof ServableModelBundleSchema.Type
+
+export const ModelBundleDownloadStateSchema = Schema.Union(
   Schema.TaggedStruct("Pending", {
-    id: DownloadAttemptIdSchema,
-    packageId: ModelPackageIdSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
   }),
   Schema.TaggedStruct("Downloading", {
-    id: DownloadAttemptIdSchema,
-    packageId: ModelPackageIdSchema,
     stage: ModelDownloadStageSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
     bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   }),
-  Schema.TaggedStruct("Completed", {
-    id: DownloadAttemptIdSchema,
-    packageId: ModelPackageIdSchema,
-  }),
+  Schema.TaggedStruct("Completed", {}),
   Schema.TaggedStruct("Failed", {
-    id: DownloadAttemptIdSchema,
-    packageId: ModelPackageIdSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
     failure: ModelDownloadFailureSchema,
     acknowledged: Schema.Boolean,
   }),
   Schema.TaggedStruct("Cancelled", {
-    id: DownloadAttemptIdSchema,
-    packageId: ModelPackageIdSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
   }),
 )
-export type DownloadAttempt = typeof DownloadAttemptSchema.Type
+export type ModelBundleDownloadState = typeof ModelBundleDownloadStateSchema.Type
 
-export const StandaloneModelBundleSchema = Schema.TaggedStruct("Standalone", {
-  package: ModelPackageSchema,
+export const ModelBundleDownloadSchema = Schema.Struct({
+  id: ModelDownloadIdSchema,
+  bundle: ServableModelBundleSchema,
+  state: ModelBundleDownloadStateSchema,
 })
+export type ModelBundleDownload = typeof ModelBundleDownloadSchema.Type
 
-export const SpeculativeDecodingPairSchema = Schema.TaggedStruct("SpeculativeDecodingPair", {
-  target: ModelPackageSchema,
-  draft: ModelPackageSchema,
-})
-
-export const ServableModelBundleSchema = Schema.Union(
-  StandaloneModelBundleSchema,
-  SpeculativeDecodingPairSchema,
-)
-export type ServableModelBundle = typeof ServableModelBundleSchema.Type
+export const servableModelBundlePackages = (
+  bundle: ServableModelBundle,
+): readonly ModelPackage[] => bundle._tag === "Standalone"
+  ? [bundle.package]
+  : bundle.draftSource._tag === "Embedded"
+    ? [bundle.target]
+    : [bundle.target, bundle.draftSource.draft]
 
 export const servableModelBundlePackageIds = (
   bundle: ServableModelBundle,
-): readonly ModelPackageId[] =>
-  bundle._tag === "Standalone"
-    ? [bundle.package.id]
-    : [bundle.target.id, bundle.draft.id]
+): readonly ModelPackageId[] => servableModelBundlePackages(bundle).map(({ id }) => id)
 
 export const sameServableModelBundleIdentity = (
   left: ServableModelBundle,
   right: ServableModelBundle,
 ): boolean => {
   if (left._tag !== right._tag) return false
+  if (left._tag === "SpeculativeDecoding" && right._tag === "SpeculativeDecoding") {
+    if (left.draftSource._tag !== right.draftSource._tag) return false
+    if (!Schema.equivalence(SpeculativeMethodSchema)(left.method, right.method)) return false
+  }
   const leftPackageIds = servableModelBundlePackageIds(left)
   const rightPackageIds = servableModelBundlePackageIds(right)
   return leftPackageIds.length === rightPackageIds.length
@@ -465,20 +459,20 @@ const LocalModelNotInstalledSchema = Schema.TaggedStruct("NotInstalled", {
   totalBytes: NonNegativeSafeInteger,
 })
 const LocalModelDownloadingSchema = Schema.TaggedStruct("Downloading", {
-  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  downloadId: ModelDownloadIdSchema,
   stage: ModelDownloadStageSchema,
   completedBytes: NonNegativeSafeInteger,
   totalBytes: NonNegativeSafeInteger,
   bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
 })
 const LocalModelDownloadFailedSchema = Schema.TaggedStruct("Failed", {
-  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  downloadId: ModelDownloadIdSchema,
   completedBytes: NonNegativeSafeInteger,
   totalBytes: NonNegativeSafeInteger,
   failure: ModelDownloadFailureSchema,
 })
 const LocalModelDownloadCancelledSchema = Schema.TaggedStruct("Cancelled", {
-  attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+  downloadId: ModelDownloadIdSchema,
   completedBytes: NonNegativeSafeInteger,
   totalBytes: NonNegativeSafeInteger,
 })
@@ -502,7 +496,7 @@ export const LocalModelInstallationAdmissionSchema = Schema.Union(
   }),
   Schema.TaggedStruct("DownloadAdmitted", {
     providerModelId: ProviderModelIdSchema,
-    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
+    downloadId: ModelDownloadIdSchema,
   }),
 )
 export type LocalModelInstallationAdmission = typeof LocalModelInstallationAdmissionSchema.Type
@@ -782,6 +776,7 @@ export const ModelPackagesStateSchema = Schema.Struct({
     Schema.TaggedStruct("Degraded", { failure: ModelFailureSchema }),
   ),
   entries: Schema.Array(ModelPackageEntrySchema),
+  downloads: Schema.Array(ModelBundleDownloadSchema),
 })
 export type ModelPackagesState = typeof ModelPackagesStateSchema.Type
 

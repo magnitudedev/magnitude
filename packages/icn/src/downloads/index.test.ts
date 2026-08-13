@@ -1,32 +1,32 @@
 import { Effect, Layer, Ref } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnClient, type IcnClientService } from "../client.js"
-import type { DownloadAttempt } from "@magnitudedev/icn-protocol/schemas"
+import type { ModelDownload } from "@magnitudedev/icn-protocol/schemas"
 import { IcnDownloads, makeIcnDownloads } from "./index.js"
 
-const pending: DownloadAttempt = {
-  _tag: "Pending",
+const pending: ModelDownload = {
   id: "download-test",
-  packageId: "package-test",
+  bundle: {} as never,
+  state: { _tag: "Pending", completedBytes: 0, totalBytes: 1 },
 }
 
 describe("ICN downloads", () => {
-  it("publishes an admitted attempt immediately without listing downloads again", async () => {
+  it("publishes an admitted model download immediately without listing again", async () => {
     const reads = await Effect.runPromise(Ref.make(0))
     const client = {
       models: {
         listModelDownloads: () => Ref.updateAndGet(reads, (count) => count + 1).pipe(
-          Effect.as({ attempts: [] }),
+          Effect.as({ downloads: [] }),
         ),
       },
     } as unknown as IcnClientService
 
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const downloads = yield* IcnDownloads
-      yield* downloads.observeAttempt(pending)
-      yield* downloads.observeAttempt({
+      yield* downloads.observeDownload(pending)
+      yield* downloads.observeDownload({
         ...pending,
-        _tag: "Completed",
+        state: { _tag: "Completed" },
       })
       return {
         reads: yield* Ref.get(reads),
@@ -48,9 +48,9 @@ describe("ICN downloads", () => {
       snapshot: {
         revision: 2,
         state: {
-          attempts: [{
+          downloads: [{
             ...pending,
-            _tag: "Completed",
+            state: { _tag: "Completed" },
           }],
         },
       },

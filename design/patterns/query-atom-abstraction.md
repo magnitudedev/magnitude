@@ -205,9 +205,9 @@ resource discovered later, or timing.
 choose exact configuration
           |
           v
-install(configurationId) -> admission(providerModelId, attemptIds)
+install(configurationId) -> admission(providerModelId, modelDownloadId)
           |                              |
-          | await exact attempt          +---- cancellation addresses exact attemptIds
+          | await exact download         +---- cancellation addresses exact modelDownloadId
           v
 assign(exact providerModelId) -> exact selection
           |

@@ -8,11 +8,11 @@ import * as Schemas from "./schemas.js"
 
 export const acknowledgeModelDownloadFailure = HttpApiEndpoint.post(
   "acknowledgeModelDownloadFailure",
-  "/v1/models/downloads/:attempt_id/acknowledge-failure",
+  "/v1/models/downloads/:download_id/acknowledge-failure",
 )
-  .setPath(S.Struct({ attempt_id: S.String }))
+  .setPath(S.Struct({ download_id: S.String }))
   .addSuccess(
-    S.suspend((): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt),
+    S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
     { status: 200 },
   )
   .addError(
@@ -69,11 +69,11 @@ export const assessModels = HttpApiEndpoint.post("assessModels", "/v1/models/ass
 
 export const cancelModelDownload = HttpApiEndpoint.post(
   "cancelModelDownload",
-  "/v1/models/downloads/:attempt_id/cancel",
+  "/v1/models/downloads/:download_id/cancel",
 )
-  .setPath(S.Struct({ attempt_id: S.String }))
+  .setPath(S.Struct({ download_id: S.String }))
   .addSuccess(
-    S.suspend((): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt),
+    S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
     { status: 200 },
   )
   .addError(
@@ -89,17 +89,6 @@ export const getHardware = HttpApiEndpoint.get("getHardware", "/v1/hardware")
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
-  )
-
-export const getModelDownload = HttpApiEndpoint.get("getModelDownload", "/v1/models/downloads/:attempt_id")
-  .setPath(S.Struct({ attempt_id: S.String }))
-  .addSuccess(
-    S.suspend((): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 404 },
   )
 
 export const getModelInstances = HttpApiEndpoint.get("getModelInstances", "/v1/models/instances")
@@ -314,7 +303,6 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(acknowledgeModelDownloadFailure)
   .add(assessModels)
   .add(cancelModelDownload)
-  .add(getModelDownload)
   .add(getModelInstances)
   .add(getModelProperties)
   .add(getRecommendableModelCatalog)

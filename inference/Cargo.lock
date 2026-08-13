@@ -1446,8 +1446,8 @@ dependencies = [
  "getrandom 0.4.3",
  "icn-contracts",
  "icn-hardware",
- "icn-mtp",
  "icn-reasoning",
+ "icn-speculative",
  "libc",
  "llama-cpp-2",
  "serde",
@@ -1497,16 +1497,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "icn-mtp"
-version = "0.1.0"
-dependencies = [
- "icn-contracts",
- "icn-hardware",
- "llama-cpp-2",
- "thiserror",
 ]
 
 [[package]]
@@ -1568,8 +1558,8 @@ dependencies = [
  "icn-engine",
  "icn-hardware",
  "icn-models",
- "icn-mtp",
  "icn-reasoning",
+ "icn-speculative",
  "libc",
  "libloading",
  "llama-cpp-2",
@@ -1589,6 +1579,16 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "icn-speculative"
+version = "0.1.0"
+dependencies = [
+ "icn-contracts",
+ "icn-hardware",
+ "llama-cpp-2",
+ "thiserror",
 ]
 
 [[package]]

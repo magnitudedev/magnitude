@@ -8,7 +8,7 @@ import type { ChatTheme } from '../../types/theme-system'
 import { violet } from '../../utils/theme'
 import type { ComposerProps } from './types'
 import {
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   PRIMARY_SLOT_ID,
   ReasoningEffortSchema,
   type TaskDisplayRow,
@@ -100,10 +100,12 @@ vi.mock('@magnitudedev/client-common', async () => {
       handleKeyIntercept: () => false,
     }),
     useAgentClient: () => ({
-      query: () => ({ pipe: () => {} }),
-      mutation: () => ({ pipe: () => {} }),
-      runtime: { pipe: () => {} },
-      pipe: () => {},
+      rpc: {
+        query: () => ({ pipe: () => {} }),
+        mutation: () => ({ pipe: () => {} }),
+        runtime: { pipe: () => {} },
+        pipe: () => {},
+      },
     }),
   }
 })
@@ -376,7 +378,7 @@ test('shows active model downloads in the persistent footer and links to the cat
   const localInferenceState = makeView({
     models: [makeAcquiringModel({
         _tag: 'Downloading',
-        attemptIds: [DownloadAttemptIdSchema.make('download-1')],
+        downloadId: ModelDownloadIdSchema.make('download-1'),
         stage: 'downloading',
         completedBytes: GIB,
         totalBytes: 16 * GIB,

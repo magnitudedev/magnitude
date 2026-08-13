@@ -49,7 +49,8 @@ ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `Mod
 `LocalInferenceHardware`, and `Onboarding`. `LocalModels` groups by servable-bundle identity and
 publishes acquisition, serving, recommendation, provider availability, and advisory memory facets
 on the same row. Every catalog bundle and independently servable installed package contributes the
-same `LocalModel` shape. Raw package, download-attempt, recommendation-policy, provider-offering,
+same `LocalModel` shape. Raw package and package-attempt state, model-download records,
+recommendation-policy, provider-offering,
 and memory-observation working state remain private ACN observations. Private ICN types, native
 paths, and native field names do not cross the protocol boundary. The complete local-model
 projection is defined by

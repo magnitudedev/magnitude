@@ -25,22 +25,25 @@ use icn_contracts::models::{
     ModelServingConfiguration, ModelServingConfigurationId, ModelStoppingAllocation,
     PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
     RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
+    SpeculativeDraftSource as ModelSpeculativeDraftSource, SpeculativeDraftSourceInput,
+    SpeculativeMethod,
 };
 use icn_contracts::{
-    CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
+    CacheType, CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
     HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
     ModelExecutionAssessment, ModelPreviewProfile, ResolvedModel, ResolvedModelAssessor,
-    TemplateAssessment, TemplateAssessor,
+    SpeculativeDecodingConfig, SpeculativeDraftSource, SpeculativeMethodConfig, TemplateAssessment,
+    TemplateAssessor,
 };
 use icn_engine::{
-    ModelLoadObserver, ModelPlanDefaults, MtpCandidateSelection, NativeBackend, execution_intent,
-    model_plan_defaults,
+    ModelLoadObserver, ModelPlanDefaults, NativeBackend, execution_intent, model_plan_defaults,
 };
 use icn_hardware::CapacityPolicy;
 use icn_models::{
     InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ReleaseCatalog,
     ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog,
     servable_model_bundle_key, serving_configuration_id, serving_configuration_identity_is_valid,
+    speculative_servable_model_bundle_key,
 };
 use llama_cpp_2::model::params::fit::{
     FitCalibration as NativeHardwareCalibration,
@@ -743,7 +746,7 @@ struct PlanningWorkerRequest {
     hardware: HardwareSnapshot,
     primary: PathBuf,
     projector: Option<PathBuf>,
-    mtp: Vec<PathBuf>,
+    speculative: SpeculativeDecodingConfig,
     defaults: Vec<ModelPlanDefaults>,
     performance_context_tokens: Vec<Vec<u32>>,
     operation: PlanningOperation,
@@ -1597,6 +1600,7 @@ impl NativeResolvedModelAssessor {
     async fn run_resolved_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         estimate_performance: bool,
         hardware: HardwareSnapshot,
@@ -1620,12 +1624,6 @@ impl NativeResolvedModelAssessor {
             .iter()
             .find(|component| component.role == ComponentRole::Projector)
             .map(|component| component.path.clone());
-        let mtp: Vec<PathBuf> = resolved
-            .components
-            .iter()
-            .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
-            .map(|component| component.path.clone())
-            .collect();
         let defaults = if profiles.is_empty() {
             vec![self.effective_defaults(None)]
         } else {
@@ -1655,7 +1653,7 @@ impl NativeResolvedModelAssessor {
             hardware,
             primary,
             projector,
-            mtp,
+            speculative,
             defaults,
             performance_context_tokens,
             operation: if estimate_performance {
@@ -1699,7 +1697,14 @@ impl NativeResolvedModelAssessor {
         hardware: HardwareSnapshot,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         match self
-            .run_resolved_plans_with_hardware(resolved, profiles, false, hardware, None)
+            .run_resolved_plans_with_hardware(
+                resolved,
+                SpeculativeDecodingConfig::default(),
+                profiles,
+                false,
+                hardware,
+                None,
+            )
             .await?
         {
             PlanningWorkerResponse::Capacity { assessments } => Ok(assessments),
@@ -1716,7 +1721,14 @@ impl NativeResolvedModelAssessor {
         hardware: HardwareSnapshot,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         match self
-            .run_resolved_plans_with_hardware(resolved, profiles, true, hardware, None)
+            .run_resolved_plans_with_hardware(
+                resolved,
+                SpeculativeDecodingConfig::default(),
+                profiles,
+                true,
+                hardware,
+                None,
+            )
             .await?
         {
             PlanningWorkerResponse::Execution { assessments, .. } => Ok(assessments),
@@ -1729,6 +1741,7 @@ impl NativeResolvedModelAssessor {
     async fn assess_resolved_execution_plans_with_hardware_deadline(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         hardware: HardwareSnapshot,
         deadline_at_ms: u64,
@@ -1736,6 +1749,7 @@ impl NativeResolvedModelAssessor {
         match self
             .run_resolved_plans_with_hardware(
                 resolved,
+                speculative,
                 profiles,
                 true,
                 hardware,
@@ -1950,6 +1964,75 @@ impl NativeModelAssessor {
         target
     }
 
+    fn speculative_config_for_resolved(
+        resolved: &icn_contracts::models::ResolvedServableModelBundle,
+    ) -> Result<SpeculativeDecodingConfig, InventoryError> {
+        let DomainServableModelBundle::SpeculativeDecoding {
+            draft_source,
+            method,
+            ..
+        } = &resolved.bundle
+        else {
+            return Ok(SpeculativeDecodingConfig::Disabled {
+                reason: "standalone_bundle".to_owned(),
+            });
+        };
+        let method = match method {
+            SpeculativeMethod::Mtp => SpeculativeMethodConfig::Mtp {
+                min_draft_probability: 0.0,
+            },
+            SpeculativeMethod::DFlash => SpeculativeMethodConfig::DFlash {
+                min_sample_probability: 0.0,
+            },
+            SpeculativeMethod::DSpark => SpeculativeMethodConfig::DSpark {
+                acceptance_threshold: 0.0,
+            },
+        };
+        let source = match draft_source {
+            ModelSpeculativeDraftSource::Embedded => {
+                if resolved.draft_model.is_some() {
+                    return Err(InventoryError::InvalidRequest(
+                        "embedded speculative bundle unexpectedly resolved a separate draft"
+                            .to_owned(),
+                    ));
+                }
+                SpeculativeDraftSource::Embedded
+            }
+            ModelSpeculativeDraftSource::Separate { .. } => {
+                let draft = resolved.draft_model.as_ref().ok_or_else(|| {
+                    InventoryError::NotReady(
+                        "separate speculative bundle did not resolve its draft package".to_owned(),
+                    )
+                })?;
+                let model_path = draft
+                    .components
+                    .iter()
+                    .filter(|component| {
+                        matches!(
+                            component.role,
+                            ComponentRole::Weights | ComponentRole::Shard
+                        )
+                    })
+                    .min_by_key(|component| component.shard_index.unwrap_or(0))
+                    .map(|component| component.path.clone())
+                    .ok_or_else(|| {
+                        InventoryError::NotReady(
+                            "separate speculative package has no runnable weights".to_owned(),
+                        )
+                    })?;
+                SpeculativeDraftSource::Separate { model_path }
+            }
+        };
+        Ok(SpeculativeDecodingConfig::Enabled {
+            source,
+            method,
+            n_max: 3,
+            n_min: 0,
+            cache_type_k: CacheType::F16,
+            cache_type_v: CacheType::F16,
+        })
+    }
+
     async fn assessment_evidence(
         &self,
         bundle_key: &icn_contracts::models::ServableModelBundleKey,
@@ -2071,6 +2154,7 @@ impl NativeModelAssessor {
             let assessed = assessor
                 .assess_resolved_execution_plans_with_hardware_deadline(
                     Self::resolved_for_planning(&resolved),
+                    Self::speculative_config_for_resolved(&resolved)?,
                     native_profiles,
                     environment.snapshot.clone(),
                     deadline_at_ms,
@@ -2276,12 +2360,18 @@ fn bundle_input_key(
         ModelBundleInput::Standalone { package } => {
             Ok(servable_model_bundle_key(&[package_operand_id(package)?]))
         }
-        ModelBundleInput::SpeculativeDecodingPair { target, draft } => {
-            Ok(servable_model_bundle_key(&[
-                package_operand_id(target)?,
-                package_operand_id(draft)?,
-            ]))
-        }
+        ModelBundleInput::SpeculativeDecoding {
+            target,
+            draft_source,
+            method,
+        } => Ok(speculative_servable_model_bundle_key(
+            package_operand_id(target)?,
+            match draft_source {
+                SpeculativeDraftSourceInput::Embedded => None,
+                SpeculativeDraftSourceInput::Separate { draft } => Some(package_operand_id(draft)?),
+            },
+            method,
+        )),
     }
 }
 
@@ -2315,9 +2405,18 @@ fn bundle_uses_only_installed_packages(bundle: &ModelBundleInput) -> bool {
         ModelBundleInput::Standalone { package } => {
             matches!(package, ModelPackageOperand::Installed { .. })
         }
-        ModelBundleInput::SpeculativeDecodingPair { target, draft } => {
+        ModelBundleInput::SpeculativeDecoding {
+            target,
+            draft_source,
+            ..
+        } => {
             matches!(target, ModelPackageOperand::Installed { .. })
-                && matches!(draft, ModelPackageOperand::Installed { .. })
+                && match draft_source {
+                    SpeculativeDraftSourceInput::Embedded => true,
+                    SpeculativeDraftSourceInput::Separate { draft } => {
+                        matches!(draft, ModelPackageOperand::Installed { .. })
+                    }
+                }
         }
     }
 }
@@ -2449,7 +2548,7 @@ fn assess_planning_request_with_backend(
         hardware,
         primary,
         projector,
-        mtp,
+        speculative,
         defaults,
         performance_context_tokens,
         operation,
@@ -2472,13 +2571,13 @@ fn assess_planning_request_with_backend(
                     if !matches!(base, HardwareAssessment::Fits { .. }) {
                         return Ok(base);
                     }
-                    plan.mtp = icn_mtp::select_mtp_with_backend(
-                        backend,
-                        plan,
-                        icn_mtp::CandidatePolicy::Automatic(&mtp),
-                    )
-                    .context("failed to select a native MTP configuration")?;
-                    if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
+                    plan.speculative = speculative.clone();
+                    plan.speculative = icn_speculative::preflight_with_backend(backend, plan)
+                        .context("failed to preflight the speculative bundle")?;
+                    if matches!(
+                        plan.speculative,
+                        icn_contracts::SpeculativeDecodingConfig::Disabled { .. }
+                    ) {
                         return Ok(base);
                     }
                     Ok(icn_hardware::assess_with_backend(backend, &topology, plan)?.assessment)
@@ -2509,13 +2608,13 @@ fn assess_planning_request_with_backend(
                 return Ok(base);
             };
             debug_assert!(matches!(base_hardware, HardwareAssessment::Fits { .. }));
-            plan.mtp = icn_mtp::select_mtp_with_backend(
-                backend,
-                plan,
-                icn_mtp::CandidatePolicy::Automatic(&mtp),
-            )
-            .context("failed to select a native MTP configuration")?;
-            if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
+            plan.speculative = speculative.clone();
+            plan.speculative = icn_speculative::preflight_with_backend(backend, plan)
+                .context("failed to preflight the speculative bundle")?;
+            if matches!(
+                plan.speculative,
+                icn_contracts::SpeculativeDecodingConfig::Disabled { .. }
+            ) {
                 return Ok(ModelExecutionAssessment::Executable {
                     hardware: base_hardware,
                     performance,
@@ -2523,8 +2622,8 @@ fn assess_planning_request_with_backend(
             }
             let hardware = icn_hardware::assess_with_backend(backend, &topology, plan)?.assessment;
             if matches!(hardware, HardwareAssessment::Fits { .. }) {
-                // Phase 1 intentionally estimates baseline target-model decode. MTP changes
-                // memory but is not credited with an unmeasured speculative-decoding speedup.
+                // Phase 1 intentionally estimates baseline target-model decode. Speculation
+                // changes memory but is not credited with an unmeasured speedup.
                 Ok(ModelExecutionAssessment::Executable {
                     hardware,
                     performance,
@@ -3656,7 +3755,7 @@ impl NativeModelInstanceController {
         (
             ResolvedModel,
             ExecutionIntent,
-            MtpCandidateSelection,
+            SpeculativeDecodingConfig,
             Vec<ModelPackageId>,
         ),
         InventoryError,
@@ -3676,19 +3775,39 @@ impl NativeModelInstanceController {
                 },
                 vec![package.id.clone()],
             ),
-            DomainServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => (
-                ModelBundleInput::SpeculativeDecodingPair {
+            DomainServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method,
+            } => (
+                ModelBundleInput::SpeculativeDecoding {
                     target: ModelPackageOperand::Installed {
                         package_id: target.id.clone(),
                     },
-                    draft: ModelPackageOperand::Installed {
-                        package_id: draft.id.clone(),
+                    draft_source: match draft_source {
+                        ModelSpeculativeDraftSource::Embedded => {
+                            SpeculativeDraftSourceInput::Embedded
+                        }
+                        ModelSpeculativeDraftSource::Separate { draft } => {
+                            SpeculativeDraftSourceInput::Separate {
+                                draft: ModelPackageOperand::Installed {
+                                    package_id: draft.id.clone(),
+                                },
+                            }
+                        }
                     },
+                    method: method.clone(),
                 },
-                vec![target.id.clone(), draft.id.clone()],
+                match draft_source {
+                    ModelSpeculativeDraftSource::Embedded => vec![target.id.clone()],
+                    ModelSpeculativeDraftSource::Separate { draft } => {
+                        vec![target.id.clone(), draft.id.clone()]
+                    }
+                },
             ),
         };
         let resolved = self.inventory.resolve_bundle(target).await?;
+        let speculative = NativeModelAssessor::speculative_config_for_resolved(&resolved)?;
         let mut model = resolved.target_model;
         if let Some(draft) = resolved.draft_model {
             model
@@ -3715,22 +3834,11 @@ impl NativeModelInstanceController {
             .iter()
             .find(|component| component.role == ComponentRole::Projector)
             .map(|component| component.path.clone());
-        let mtp = model
-            .components
-            .iter()
-            .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
-            .map(|component| component.path.clone())
-            .collect();
         let defaults = self.profile_defaults(&ModelExecutionProfile {
             context_length: configuration.profile.context_length,
         })?;
         let plan = execution_intent(primary, projector, &defaults);
-        Ok((
-            model,
-            plan,
-            MtpCandidateSelection::Automatic(mtp),
-            package_ids,
-        ))
+        Ok((model, plan, speculative, package_ids))
     }
 
     async fn assess_load_candidates(
@@ -4158,7 +4266,7 @@ impl NativeModelInstanceController {
         configuration: ModelServingConfiguration,
         resolved: ResolvedModel,
         mut plan: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: SpeculativeDecodingConfig,
         package_ids: Vec<ModelPackageId>,
         events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
         instance_id: ModelInstanceId,
@@ -4280,7 +4388,7 @@ impl NativeModelInstanceController {
             .install_worker(&instance_id, worker.clone())
             .await;
         self.supervise_worker(instance_id.clone(), worker.clone());
-        if let Err(error) = worker.start_load(model_id.clone(), plan, mtp_selection, hardware) {
+        if let Err(error) = worker.start_load(model_id.clone(), plan, speculative, hardware) {
             self.cleanup_owned_worker_under_mutation(
                 model_mutation,
                 &instance_id,
@@ -4844,7 +4952,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         None,
                     )
                     .await;
-                let (resolved, plan, mtp_selection, package_ids) = match controller
+                let (resolved, plan, speculative, package_ids) = match controller
                     .resolved_configuration_load(&configuration)
                     .await
                 {
@@ -4879,7 +4987,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         configuration,
                         resolved,
                         plan,
-                        mtp_selection,
+                        speculative,
                         package_ids,
                         events.clone(),
                         instance_id.clone(),

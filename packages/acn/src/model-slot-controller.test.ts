@@ -11,7 +11,7 @@ import {
   SubscriptionRef,
 } from "effect"
 import {
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   LocalModelMutationFailed,
   ModelFileIdSchema,
   ModelPackageIdSchema,
@@ -236,7 +236,7 @@ const makeHarness = (options: {
       initialized: Effect.succeed(true),
       snapshot: Effect.succeed({
         revision: 0,
-        state: { inventory: { _tag: "Ready" }, entries: [] },
+        state: { inventory: { _tag: "Ready" }, entries: [], downloads: [] },
       }),
       changes: Stream.empty,
       installedPackageIds: Effect.succeed(
@@ -244,10 +244,10 @@ const makeHarness = (options: {
       ),
       admitBundle: () => Effect.succeed({
         _tag: "DownloadAdmitted",
-        attemptIds: [DownloadAttemptIdSchema.make("test-download")],
+        downloadId: ModelDownloadIdSchema.make("test-download"),
       }),
-      cancelAttempts: () => Effect.void,
-      acknowledgeFailures: () => Effect.void,
+      cancelDownload: () => Effect.void,
+      acknowledgeFailure: () => Effect.void,
       removeBundlePackages: () => Effect.void,
     })),
     Layer.succeed(LocalModelRecommendations, LocalModelRecommendations.of({
