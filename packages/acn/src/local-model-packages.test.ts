@@ -38,11 +38,9 @@ describe("localModelPackageMutationFailure", () => {
 })
 
 describe("projectPackageAcquisition", () => {
-  const failure = new LocalModelMutationFailed({
-    code: "network",
-    message: "network unavailable",
-    retryable: true,
-  })
+  const failure = {
+    _tag: "NetworkUnavailable" as const,
+  }
   const failed = {
     _tag: "Failed" as const,
     attemptId: DownloadAttemptIdSchema.make("download-test"),
@@ -70,9 +68,7 @@ describe("projectPackageAcquisition", () => {
       completedBytes: 4,
       totalBytes: 10,
       failure: {
-        code: "network",
-        message: "network unavailable",
-        retryable: true,
+        _tag: "NetworkUnavailable",
       },
     })
   })

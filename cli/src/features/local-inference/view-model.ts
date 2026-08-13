@@ -19,6 +19,7 @@ import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
+  type ModelDownloadFailure,
   type LocalModelsState,
   type LocalModelRecommendationProgressStep,
   type ModelAssessmentId,
@@ -90,6 +91,24 @@ export const formatDownloadBytes = (bytes: number): string => {
   return gigabytes >= 1
     ? `${gigabytes.toFixed(gigabytes >= 10 ? 1 : 2)} GB`
     : `${(bytes / 1_000_000).toFixed(0)} MB`
+}
+
+export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): string => {
+  switch (failure._tag) {
+    case "Interrupted": return "The download was interrupted. Try again to continue."
+    case "InsufficientDiskSpace":
+      return `Not enough disk space. Free at least ${formatDownloadBytes(
+        Math.max(0, failure.requiredBytes - failure.availableBytes),
+      )} and try again.`
+    case "SourceUnavailable": return "This model is not available from its source."
+    case "NetworkUnavailable":
+      return "Couldn’t reach the model source. Check your connection and try again."
+    case "CorruptDownload":
+      return "The downloaded file couldn’t be verified. Try the download again."
+    case "LocalStorageFailure":
+      return "Magnitude couldn’t write the model to disk. Check disk access and try again."
+    case "Internal": return "Magnitude couldn’t complete the download. Try again."
+  }
 }
 
 export const formatContext = (tokens: number): string => tokens < 1_000

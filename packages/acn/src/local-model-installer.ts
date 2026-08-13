@@ -6,8 +6,8 @@ import {
   type LocalModelInstallationAdmission,
   type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { LocalModelPackages, type LocalModelPackagesApi } from "./local-model-packages"
+import { localProviderModelId } from "./local-provider-offerings"
 import {
   RetainedModelConfigurations,
   type RetainedModelConfigurationsApi,
@@ -105,7 +105,7 @@ export const makeLocalModelInstaller = (
           failure("retain_local_model_configuration_failed", error.message, true)),
       )
       const download = yield* packages.admitBundle(materialized.bundle)
-      const providerModelId = ProviderModelIdSchema.make(materialized.id)
+      const providerModelId = localProviderModelId(materialized.id)
       return download._tag === "AlreadyInstalled"
         ? { _tag: "AlreadyInstalled", providerModelId }
         : { _tag: "DownloadAdmitted", providerModelId, attemptIds: download.attemptIds }

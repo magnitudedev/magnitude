@@ -7,10 +7,10 @@ use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use getrandom::fill;
 use icn_contracts::models::{
-    DownloadAttempt, DownloadAttemptId, ModelDownloads, ModelDownloadsResponse, ModelFailure,
-    ModelPackage, ServableModelBundle, StartModelDownloadRequest, StartModelDownloadResponse,
+    DownloadAttempt, DownloadAttemptId, ModelDownloads, ModelDownloadsResponse, ModelPackage,
+    ServableModelBundle, StartModelDownloadRequest, StartModelDownloadResponse,
 };
-use icn_contracts::{DownloadStage, InventoryError, ModelDownloadEvent};
+use icn_contracts::{DownloadFailure, DownloadStage, InventoryError, ModelDownloadEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::inventory::ModelManager;
@@ -48,11 +48,7 @@ impl ManagedModelDownloads {
                     package_id,
                     completed_bytes,
                     total_bytes,
-                    failure: ModelFailure {
-                        code: "interrupted".to_owned(),
-                        message: "download was interrupted when ICN stopped".to_owned(),
-                        retryable: true,
-                    },
+                    failure: DownloadFailure::Interrupted,
                     acknowledged: false,
                 };
             }
@@ -121,12 +117,10 @@ impl ManagedModelDownloads {
                     id: id.clone(),
                     package_id: package.id.clone(),
                 },
-                ModelDownloadEvent::Failed { error, .. } if error.code == "cancelled" => {
-                    DownloadAttempt::Cancelled {
-                        id: id.clone(),
-                        package_id: package.id.clone(),
-                    }
-                }
+                ModelDownloadEvent::Cancelled { .. } => DownloadAttempt::Cancelled {
+                    id: id.clone(),
+                    package_id: package.id.clone(),
+                },
                 ModelDownloadEvent::Failed {
                     error,
                     completed_bytes,
@@ -137,11 +131,7 @@ impl ManagedModelDownloads {
                     package_id: package.id.clone(),
                     completed_bytes,
                     total_bytes,
-                    failure: ModelFailure {
-                        code: error.code,
-                        message: error.message,
-                        retryable: error.retryable,
-                    },
+                    failure: error,
                     acknowledged: false,
                 },
             };
@@ -166,11 +156,7 @@ impl ManagedModelDownloads {
                     package_id: package.id,
                     completed_bytes,
                     total_bytes,
-                    failure: ModelFailure {
-                        code: "stream_ended".to_owned(),
-                        message: "download ended before reporting a terminal result".to_owned(),
-                        retryable: true,
-                    },
+                    failure: DownloadFailure::Interrupted,
                     acknowledged: false,
                 },
             );
@@ -503,11 +489,7 @@ mod tests {
             package_id: ModelPackageId("package_test".to_owned()),
             completed_bytes: 4,
             total_bytes: 10,
-            failure: ModelFailure {
-                code: "network".to_owned(),
-                message: "network unavailable".to_owned(),
-                retryable: true,
-            },
+            failure: DownloadFailure::NetworkUnavailable,
             acknowledged: false,
         }
     }

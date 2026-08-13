@@ -221,9 +221,9 @@ export function Composer(props: ComposerProps) {
   } = props
 
   const atomClient = useAgentClient()
-  const resolvePathMutation = useAtomSet(atomClient.mutation('ResolvePath'), { mode: 'promise' })
-  const readFileMutation = useAtomSet(atomClient.mutation('ReadFile'), { mode: 'promise' })
-  const searchMentionsMutation = useAtomSet(atomClient.mutation('SearchMentions'), { mode: 'promise' })
+  const resolvePathMutation = useAtomSet(atomClient.rpc.mutation('ResolvePath'), { mode: 'promise' })
+  const readFileMutation = useAtomSet(atomClient.rpc.mutation('ReadFile'), { mode: 'promise' })
+  const searchMentionsMutation = useAtomSet(atomClient.rpc.mutation('SearchMentions'), { mode: 'promise' })
 
   const composerText = useAtomValueClientCommon(composerTextAtom)
   const setComposerText = useAtomSet(composerTextAtom)

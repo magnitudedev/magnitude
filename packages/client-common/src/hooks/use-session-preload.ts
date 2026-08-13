@@ -14,10 +14,10 @@ export function useSessionPreload(enabled = true): void {
   const selectedSessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const sessionCreateOptions = useAtomValue(sessionCreateOptionsAtom)
-  const runtimeResult = useAtomValue(client.runtime)
+  const runtimeResult = useAtomValue(client.rpc.runtime)
   const runtimeReady = Result.isSuccess(runtimeResult)
-  const preloadMutationAtom = useMemo(() => client.mutation("PreloadSession"), [client])
-  const releaseMutationAtom = useMemo(() => client.mutation("ReleaseSessionPreload"), [client])
+  const preloadMutationAtom = useMemo(() => client.rpc.mutation("PreloadSession"), [client])
+  const releaseMutationAtom = useMemo(() => client.rpc.mutation("ReleaseSessionPreload"), [client])
   const preloadSession = useAtomSet(preloadMutationAtom, { mode: "promise" })
   const releaseSessionPreload = useAtomSet(releaseMutationAtom, { mode: "promise" })
 

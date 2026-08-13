@@ -1,5 +1,7 @@
 import * as Atom from "@effect-atom/atom/Atom"
+import * as AtomRegistry from "@effect-atom/atom/Registry"
 import type * as Reactivity from "@effect/experimental/Reactivity"
+import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Mutation from "./Mutation.js"
 import * as Query from "./Query.js"
@@ -16,14 +18,20 @@ export interface Client<Provided, RuntimeError> {
   ) => Mutation.MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
 }
 
-export const make = <Provided, RuntimeError>(
-  services: Layer.Layer<Provided, RuntimeError, never>
-): Client<Provided, RuntimeError> => {
-  let runtime!: Client<Provided, RuntimeError>["runtime"]
+export const make = <Provided, RuntimeError, Additional = never, AdditionalError = never>(
+  services: Layer.Layer<Provided, RuntimeError, never>,
+  additional?: (client: Client<Provided | Additional, RuntimeError | AdditionalError>) =>
+    Layer.Layer<
+      Additional,
+      AdditionalError,
+      Provided | QueryClient.QueryClient | AtomRegistry.AtomRegistry | Reactivity.Reactivity
+    >,
+): Client<Provided | Additional, RuntimeError | AdditionalError> => {
+  let runtime!: Client<Provided | Additional, RuntimeError | AdditionalError>["runtime"]
   const queryFamilies = new WeakMap<Query.Query<any, any, any, any>, (input: any) => Query.QueryAtom<any, any, any, any>>()
   const mutations = new WeakMap<Mutation.Mutation<any, any, any, any, any>, Mutation.MutationAtom<any, any, any, any, any>>()
 
-  const query: Client<Provided, RuntimeError>["query"] = (definition, input) => {
+  const query: Client<Provided | Additional, RuntimeError | AdditionalError>["query"] = (definition, input) => {
     let family = queryFamilies.get(definition)
     if (family === undefined) {
       family = Query.makeAtomFamily(runtime, definition as never)
@@ -32,13 +40,10 @@ export const make = <Provided, RuntimeError>(
     return family(input)
   }
 
-  runtime = Atom.runtime(Layer.mergeAll(
-    services,
-    QueryClient.makeLayer(query as QueryClient.Service["resolve"])
-  ))
-
-  return {
-    runtime,
+  const client = {
+    get runtime() {
+      return runtime
+    },
     query,
     mutation: (definition) => {
       let atom = mutations.get(definition)
@@ -48,5 +53,21 @@ export const make = <Provided, RuntimeError>(
       }
       return atom
     }
-  } as Client<Provided, RuntimeError>
+  } as Client<Provided | Additional, RuntimeError | AdditionalError>
+
+  const infrastructure = Layer.mergeAll(
+    services,
+    QueryClient.makeLayer(query as QueryClient.Service["resolve"]),
+  )
+  const layer = (additional === undefined
+    ? infrastructure
+    : additional(client).pipe(Layer.provideMerge(infrastructure))) as Layer.Layer<
+      Provided | QueryClient.QueryClient | Additional,
+      RuntimeError | AdditionalError,
+      AtomRegistry.AtomRegistry | Reactivity.Reactivity
+    >
+  const runtimeFactory = Atom.context({ memoMap: Effect.runSync(Layer.makeMemoMap) })
+  runtime = Atom.keepAlive(runtimeFactory(layer))
+
+  return client
 }

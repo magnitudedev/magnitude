@@ -139,9 +139,8 @@ assumption.
 
 A client-owned use case may span several backend domains without becoming an ACN operation. When
 that use case has meaningful in-memory state, concurrency, and cancellation, client-common owns one
-client-lifetime service. The service represents its state with keep-alive Effect Atoms, exposes a
-passive derived state atom and effectful command atoms, and composes already-materialized lower
-Effect Query mutations with `Mutation.execute`.
+client-lifetime service. The service represents its owned state with keep-alive Effect Atoms,
+exposes passive derived state and Effect operations, and composes semantic lower client services.
 
 Each command is one Effect program. Every step consumes the exact value returned by the preceding
 step; it never infers identity from mutation recency or an unrelated query fact. The public state
@@ -150,9 +149,16 @@ and it never copies lower lifecycle or progress into writable client state.
 
 Client-owned in-memory state is not put into Effect Query merely to make the API resemble a remote
 domain: that would create a redundant cache and mutation registry. This pattern introduces neither
-a workflow engine nor a second query runtime and requires no Effect Query extension. A concrete
-service is justified only by a real stateful client-owned use case. Ordinary one-shot composition
-remains an ordinary Effect.
+a workflow engine nor a second query runtime. The Effect Query client composition root may host
+ordinary service Layers, but Query and Mutation semantics gain no workflow or composition
+primitive. A concrete service is justified only by a real stateful client-owned use case. Ordinary
+one-shot composition remains an ordinary Effect.
+
+The materialization boundary and responsibilities of lower ACN-backed services, composed services,
+hooks, and UI are defined by
+[Client query and mutation abstraction](../patterns/query-atom-abstraction.md). Their identity,
+dependency graph, and renderer lifetime are defined by
+[Client dependency injection](../patterns/client-di.md).
 
 ## Queries
 
@@ -380,8 +386,10 @@ It is never represented by a singleton `installingId`, `busy`, or error side cha
 
 Mutation success includes synchronization with every canonical query whose visibility is promised
 by the command. A command that admits a download remains pending until a fresh local-model snapshot
-shows the post-command state. Mutation synchronization does not wait for the admitted download to
-finish; progress and completion remain authoritative query state.
+shows that exact configuration with either the admitted attempt identities or installed
+acquisition. Mutation synchronization does not wait for the admitted download or later provider
+publication to finish; progress, physical completion, and serving readiness remain authoritative
+query state consumed by the dependent Effect.
 
 Adoption is vertical and explicit. A subsystem may use Effect Query while unrelated subsystems
 continue to use AtomRpc queries and mutations. Within an adopted subsystem, however, there is one

@@ -21,8 +21,6 @@ import {
   localModelConfigurationId,
   localModelProviderModelId,
   localModelCapabilities,
-  localModelInstallationIsPending,
-  latestLocalModelInstallationMutationState,
   truncateToDisplayWidth,
   type NotificationState,
   usePlatform,
@@ -64,6 +62,7 @@ import { SingleLineInput } from "../composer/single-line-input"
 import {
   describeLocalHardware,
   formatBytes,
+  modelDownloadFailureMessage,
   localModelMaximumContextLength,
   localModelBundleKey,
   localInferenceProgressLines,
@@ -833,9 +832,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
-  const latestInstallationMutationState = modelActions.installationMutationStates.at(-1)
-  const installationFailed = latestInstallationMutationState !== undefined
-    && Result.isFailure(latestInstallationMutationState.result)
+  const installationFailed = modelActions.latestInstallationFailed
 
   const statusFor = (entry: ModelsMenuEntry): string => {
     const selectedEntry = isSelected(entry)
@@ -884,10 +881,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
       return
     }
     const createAction = action.value
-    if (localModelInstallationIsPending(
-      modelActions.installationMutationStates,
-      createAction.configurationId,
-    )) return
+    if (modelActions.isInstalling(createAction.configurationId)) return
     modelActions.installAndAssign(
       createAction.configurationId,
       PRIMARY_SLOT_ID,
@@ -1443,21 +1437,12 @@ const CatalogMenu = memo(function CatalogMenu({
   const detailMemoryBytes = detail === null ? undefined : memoryBytesFor(detail)
   const installationStartingFor = (model: LocalModel): boolean => {
     const configurationId = configurationIdFor(model)
-    return configurationId !== undefined && localModelInstallationIsPending(
-      modelActions.installationMutationStates,
-      configurationId,
-    )
+    return configurationId !== undefined && modelActions.isInstalling(configurationId)
   }
   const detailInstallationStarting = detail !== null
     && installationStartingFor(detail)
-  const detailInstallationMutationState = detailConfigurationId === undefined
-    ? undefined
-    : latestLocalModelInstallationMutationState(
-      modelActions.installationMutationStates,
-      detailConfigurationId,
-    )
-  const detailInstallationFailed = detailInstallationMutationState !== undefined
-    && Result.isFailure(detailInstallationMutationState.result)
+  const detailInstallationFailed = detailConfigurationId !== undefined
+    && modelActions.installationFailed(detailConfigurationId)
   const progress = Option.match(snapshot, {
     onNone: () => [],
     onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
@@ -1493,10 +1478,7 @@ const CatalogMenu = memo(function CatalogMenu({
     if (configurationId === undefined
       || model.acquisitionState._tag === "Downloading"
       || model.acquisitionState._tag === "Installed"
-      || localModelInstallationIsPending(
-        modelActions.installationMutationStates,
-        configurationId,
-      )) return
+      || modelActions.isInstalling(configurationId)) return
     modelActions.install(configurationId)
   }, [modelActions])
 
@@ -1676,7 +1658,11 @@ const CatalogMenu = memo(function CatalogMenu({
               {catalogStatus(detail, detailInstallationStarting)}
             </span>
           </text>
-          {failed && <text style={{ fg: theme.error }}>{detail.acquisitionState.failure.message}</text>}
+          {failed && (
+            <text style={{ fg: theme.error }}>
+              {modelDownloadFailureMessage(detail.acquisitionState.failure)}
+            </text>
+          )}
           {detailInstallationFailed && (
             <text style={{ fg: theme.error }}>Failed to install the local model.</text>
           )}

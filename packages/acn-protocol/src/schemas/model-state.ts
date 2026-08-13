@@ -52,6 +52,20 @@ export const ModelFailureSchema = Schema.Struct({
 })
 export type ModelFailure = typeof ModelFailureSchema.Type
 
+export const ModelDownloadFailureSchema = Schema.Union(
+  Schema.TaggedStruct("Interrupted", {}),
+  Schema.TaggedStruct("InsufficientDiskSpace", {
+    requiredBytes: NonNegativeSafeInteger,
+    availableBytes: NonNegativeSafeInteger,
+  }),
+  Schema.TaggedStruct("SourceUnavailable", {}),
+  Schema.TaggedStruct("NetworkUnavailable", {}),
+  Schema.TaggedStruct("LocalStorageFailure", {}),
+  Schema.TaggedStruct("CorruptDownload", {}),
+  Schema.TaggedStruct("Internal", { message: Schema.String }),
+)
+export type ModelDownloadFailure = typeof ModelDownloadFailureSchema.Type
+
 export const LowMemoryModelInstanceFailureSchema = Schema.TaggedStruct("LowMemory", {
   code: Schema.Literal("low_memory"),
   message: Schema.String,
@@ -287,7 +301,7 @@ export const ModelPackageLocalStateSchema = Schema.Union(
     attemptId: DownloadAttemptIdSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
-    failure: ModelFailureSchema,
+    failure: ModelDownloadFailureSchema,
   }),
   Schema.TaggedStruct("DownloadCancelled", {
     attemptId: DownloadAttemptIdSchema,
@@ -328,7 +342,7 @@ export const DownloadAttemptSchema = Schema.Union(
     packageId: ModelPackageIdSchema,
     completedBytes: NonNegativeSafeInteger,
     totalBytes: NonNegativeSafeInteger,
-    failure: ModelFailureSchema,
+    failure: ModelDownloadFailureSchema,
     acknowledged: Schema.Boolean,
   }),
   Schema.TaggedStruct("Cancelled", {
@@ -461,7 +475,7 @@ const LocalModelDownloadFailedSchema = Schema.TaggedStruct("Failed", {
   attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
   completedBytes: NonNegativeSafeInteger,
   totalBytes: NonNegativeSafeInteger,
-  failure: ModelFailureSchema,
+  failure: ModelDownloadFailureSchema,
 })
 const LocalModelDownloadCancelledSchema = Schema.TaggedStruct("Cancelled", {
   attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),

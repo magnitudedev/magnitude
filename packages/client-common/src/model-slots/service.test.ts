@@ -1,4 +1,3 @@
-import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
@@ -17,8 +16,7 @@ import {
   admittedInstanceIsVisible,
   presentedSlotSelection,
   slotAssignmentIsVisible,
-  type ModelSlotAssignmentMutationState,
-} from "./atoms"
+} from "./service"
 
 const authoritative: ModelSlotsState = {
   slots: {
@@ -29,19 +27,17 @@ const authoritative: ModelSlotsState = {
   favoriteModels: [],
 }
 
-const assignment = (providerModelId: string, waiting: boolean) => ({
-  input: {
-    slotId: PRIMARY_SLOT_ID,
-    selection: {
-      providerId: ProviderIdSchema.make("test"),
-      providerModelId: ProviderModelIdSchema.make(providerModelId),
-      reasoningEffort: ReasoningEffortSchema.make("none"),
-    },
+const assignment = (providerModelId: string, pending: boolean) => ({
+  slotId: PRIMARY_SLOT_ID,
+  selection: {
+    providerId: ProviderIdSchema.make("test"),
+    providerModelId: ProviderModelIdSchema.make(providerModelId),
+    reasoningEffort: ReasoningEffortSchema.make("none"),
   },
-  result: Result.initial(waiting),
-}) as ModelSlotAssignmentMutationState
+  pending,
+})
 
-describe("optimistic model-slot presentation", () => {
+describe("model-slot service presentation", () => {
   it("projects the latest pending assignment over authoritative state", () => {
     const presented = presentedSlotSelection(
       authoritative,
@@ -64,7 +60,7 @@ describe("optimistic model-slot presentation", () => {
 })
 
 describe("model-slot mutation synchronization", () => {
-  const selection = assignment("selected", true).input.selection
+  const selection = assignment("selected", true).selection
   const configured: ModelSlotsState = {
     ...authoritative,
     slots: {
@@ -99,7 +95,7 @@ describe("model-slot mutation synchronization", () => {
     expect(slotAssignmentIsVisible(
       configured,
       PRIMARY_SLOT_ID,
-      assignment("replacement", true).input.selection,
+      assignment("replacement", true).selection,
     )).toBe(false)
   })
 

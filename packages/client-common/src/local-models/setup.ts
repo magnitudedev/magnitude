@@ -1,6 +1,5 @@
-import { Atom, Result } from "@effect-atom/atom-react"
-import { Deferred, Effect, Exit, Option, Stream } from "effect"
-import { Mutation } from "@magnitudedev/effect-query"
+import { Atom, Registry, Result } from "@effect-atom/atom-react"
+import { Context, Deferred, Effect, Exit, Layer, Option, Stream } from "effect"
 import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
@@ -14,10 +13,9 @@ import {
   type ReasoningEffort,
   type SlotSelection,
 } from "@magnitudedev/sdk"
-import type { AgentClientInstance } from "../state/agent-client"
-import { onboardingAtoms } from "../onboarding/atoms"
-import { modelSlotAtoms, sameSlotSelection } from "../model-slots/atoms"
-import { localModelAtoms, sameDownloadAttemptIds } from "./atoms"
+import { OnboardingPersistence } from "../onboarding/persistence"
+import { ModelSlots, sameSlotSelection } from "../model-slots/service"
+import { LocalModels, sameDownloadAttemptIds } from "./service"
 import {
   findLocalModelByConfigurationId,
   localModelProviderModelId,
@@ -27,7 +25,6 @@ import {
   OnboardingModelResourceChanged,
   OnboardingModelSetupAlreadyActive,
   OnboardingModelSetupCancellationUnavailable,
-  OnboardingModelSetupFailed,
   OnboardingModelSetupNotActive,
   projectOnboardingModelSetup,
   type OnboardingModelSetupExecution,
@@ -86,12 +83,6 @@ const resolveChoice = (
     return Effect.fail(new OnboardingModelChoiceRejected({ configurationId, reason: "ineligible" }))
   }
   const providerModelId = localModelProviderModelId(model.value)
-  if (model.value.acquisitionState._tag === "Installed" && Option.isNone(providerModelId)) {
-    return Effect.fail(new OnboardingModelChoiceRejected({
-      configurationId,
-      reason: "missing_provider_identity",
-    }))
-  }
   const primary = slots.slots.primary
   const reasoningEffort = primary._tag !== "Unassigned"
       && Option.contains(providerModelId, primary.selection.providerModelId)
@@ -102,7 +93,11 @@ const resolveChoice = (
       )
   const prepared = { configurationId, reasoningEffort }
   const installed = model.value.acquisitionState._tag === "Installed"
-    ? Option.map(providerModelId, (id) => ({ ...prepared, providerModelId: id }))
+      && serving.availabilityState._tag === "Selectable"
+    ? Option.some({
+        ...prepared,
+        providerModelId: serving.availabilityState.providerModelId,
+      })
     : Option.none()
   const ready = Option.flatMap(installed, (exact) => {
     const selection: SlotSelection = {
@@ -138,24 +133,18 @@ const terminalFact = <Value>(
   })),
 )
 
-const makeService = (client: AgentClientInstance) => {
-  const localModels = localModelAtoms(client)
-  const slots = modelSlotAtoms(client)
-  const onboarding = onboardingAtoms(client)
+const makeOnboardingModelSetup = Effect.gen(function* () {
+  const localModels = yield* LocalModels
+  const slots = yield* ModelSlots
+  const onboarding = yield* OnboardingPersistence
+  const registry = yield* Registry.AtomRegistry
   const execution = Atom.keepAlive(Atom.make<OnboardingModelSetupExecution>({ _tag: "Choosing" }))
   const active = Atom.keepAlive(Atom.make<Option.Option<ActiveInvocation>>(Option.none()))
-  const sources = Atom.make((get) => {
-    get.mount(localModels.mirrorInvalidationWatchAtom)
-    get.mount(localModels.invalidationBridgeAtom)
-    get.mount(slots.mirrorInvalidationWatchAtom)
-    get.mount(slots.invalidationBridgeAtom)
-  })
 
   const state = Atom.make((get) => {
-    get.mount(sources)
     return Result.map(Result.all({
-      models: get(localModels.localModelsQueryAtom).result,
-      slots: get(slots.modelSlotsQueryAtom).result,
+      models: get(localModels.state),
+      slots: get(slots.state),
     }), ({ models, slots: response }) => projectOnboardingModelSetup(
       get(execution),
       models,
@@ -163,31 +152,24 @@ const makeService = (client: AgentClientInstance) => {
     ))
   })
 
-  const start = Atom.keepAlive(client.effectQuery.runtime.fn<ModelServingConfigurationId>()(
-    (configurationId, get) => Effect.gen(function* () {
-      get.mount(sources)
+  const start = (configurationId: ModelServingConfigurationId) => Effect.gen(function* () {
       const cancellation = yield* Deferred.make<void>()
       const done = yield* Deferred.make<void, OnboardingModelSetupFailure>()
       const invocation = { cancellation, done }
       const claimed = yield* Effect.sync(() => {
-        if (Option.isSome(get.registry.get(active))) return false
-        get.registry.set(active, Option.some(invocation))
+        if (Option.isSome(registry.get(active))) return false
+        registry.set(active, Option.some(invocation))
         return true
       })
       if (!claimed) return yield* new OnboardingModelSetupAlreadyActive()
 
       const setExecution = (next: OnboardingModelSetupExecution) => Effect.sync(() => {
-        get.registry.set(execution, next)
-      })
-      const observeFailure = (cause: unknown) => new OnboardingModelSetupFailed({
-        phase: "observe",
-        cause,
+        registry.set(execution, next)
       })
       const awaitInstalled = (
         prepared: PreparedModel,
         admission: LocalModelInstallationAdmission,
-      ) => terminalFact(get.streamResult(localModels.localModelsResultAtom).pipe(
-        Stream.mapError(observeFailure),
+      ) => terminalFact(Registry.toStreamResult(registry, localModels.state).pipe(
         Stream.map((current): TerminalFact<InstalledModel> => {
           const model = findLocalModelByConfigurationId(current.models, prepared.configurationId)
           if (Option.isNone(model)) {
@@ -198,13 +180,29 @@ const makeService = (client: AgentClientInstance) => {
           }
           const acquisition = model.value.acquisitionState
           if (acquisition._tag === "Installed") {
-            const providerModelId = localModelProviderModelId(model.value)
-            return Option.exists(providerModelId, (id) => id === admission.providerModelId)
-              ? { _tag: "Ready", value: { ...prepared, providerModelId: admission.providerModelId } }
-              : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+            const serving = model.value.servingState
+            if (serving._tag !== "Assessed") return { _tag: "Waiting" }
+            const availability = serving.availabilityState
+            if (availability._tag === "Installable") return { _tag: "Waiting" }
+            const providerModelId = availability._tag === "Unavailable"
+              ? Option.getOrUndefined(availability.providerModelId)
+              : availability.providerModelId
+            if (providerModelId !== admission.providerModelId) {
+              return providerModelId === undefined
+                ? { _tag: "Waiting" }
+                : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
                   configurationId: prepared.configurationId,
                   resource: "installation",
                 }) }
+            }
+            if (availability._tag === "Preparing") return { _tag: "Waiting" }
+            if (availability._tag === "Unavailable") {
+              return { _tag: "Failed", failure: availability.failure }
+            }
+            return {
+              _tag: "Ready",
+              value: { ...prepared, providerModelId: admission.providerModelId },
+            }
           }
           if (admission._tag === "AlreadyInstalled"
             || acquisition._tag === "NotInstalled"
@@ -215,19 +213,19 @@ const makeService = (client: AgentClientInstance) => {
             }) }
           }
           if (acquisition._tag === "Downloading") return { _tag: "Waiting" }
-          return { _tag: "Failed", failure: new OnboardingModelSetupFailed({
-            phase: "install",
-            cause: acquisition._tag === "Failed" ? acquisition.failure : acquisition,
-          }) }
+          return acquisition._tag === "Failed"
+            ? { _tag: "Failed", failure: acquisition.failure }
+            : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+                configurationId: prepared.configurationId,
+                resource: "installation",
+              }) }
         }),
       ))
       const ensureInstalled = (resolved: ResolvedChoice) => Option.match(resolved.installed, {
         onSome: Effect.succeed,
-        onNone: () => Effect.uninterruptibleMask((restore) => Mutation.execute(
-          localModels.installMutation,
-          { configurationId: resolved.prepared.configurationId },
+        onNone: () => Effect.uninterruptibleMask((restore) => localModels.install(
+          resolved.prepared.configurationId,
         ).pipe(
-          Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "install", cause })),
           Effect.flatMap((admission) => {
             const publish = admission._tag === "DownloadAdmitted"
               ? setExecution({
@@ -237,10 +235,7 @@ const makeService = (client: AgentClientInstance) => {
                 })
               : Effect.void
             const cancel = admission._tag === "DownloadAdmitted"
-              ? Mutation.execute(localModels.cancelDownloadMutation, {
-                  attemptIds: admission.attemptIds,
-                }).pipe(
-                  Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "cancel", cause })),
+              ? localModels.cancelDownload(admission.attemptIds).pipe(
                   Effect.tapError((failure) => setExecution({
                     _tag: "Failed",
                     configurationId: resolved.prepared.configurationId,
@@ -267,17 +262,12 @@ const makeService = (client: AgentClientInstance) => {
           configurationId: installed.configurationId,
           cancelling: false,
         }).pipe(
-          Effect.zipRight(Effect.uninterruptible(Mutation.execute(slots.assignMutation, {
-            slotId: PRIMARY_SLOT_ID,
-            selection,
-          }))),
-          Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "assign", cause })),
+          Effect.zipRight(Effect.uninterruptible(slots.assign(PRIMARY_SLOT_ID, selection))),
           Effect.as({ ...installed, selection }),
         )
       }
       const awaitReady = (loading: LoadingModel) => terminalFact(
-        get.streamResult(slots.modelSlotsResultAtom).pipe(
-          Stream.mapError(observeFailure),
+        Registry.toStreamResult(registry, slots.state).pipe(
           Stream.map(({ state: current }): TerminalFact<LoadingModel> => {
             const slot = current.slots.primary
             if (slot._tag !== "ConfiguredLocal"
@@ -300,24 +290,17 @@ const makeService = (client: AgentClientInstance) => {
               case "Loading":
               case "Stopping": return { _tag: "Waiting" }
               case "Ready": return { _tag: "Ready", value: loading }
-              case "Failed": return { _tag: "Failed", failure: new OnboardingModelSetupFailed({
-                phase: "load",
-                cause: instance.value.lifecycle.failure,
-              }) }
-              case "Stopped": return { _tag: "Failed", failure: new OnboardingModelSetupFailed({
-                phase: "load",
-                cause: instance.value.lifecycle,
+              case "Failed": return { _tag: "Failed", failure: instance.value.lifecycle.failure }
+              case "Stopped": return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+                configurationId: loading.configurationId,
+                resource: "instance",
               }) }
             }
           }),
         ),
       )
       const load = (assigned: AssignedModel) => Effect.uninterruptibleMask((restore) =>
-        Mutation.execute(slots.loadMutation, {
-          slotId: PRIMARY_SLOT_ID,
-          selection: assigned.selection,
-        }).pipe(
-          Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "load", cause })),
+        slots.load(PRIMARY_SLOT_ID, assigned.selection).pipe(
           Effect.map(({ instanceId }) => ({ ...assigned, instanceId })),
           Effect.tap((loading) => setExecution({
             _tag: "Loading",
@@ -326,10 +309,7 @@ const makeService = (client: AgentClientInstance) => {
             cancelling: false,
           })),
           Effect.flatMap((loading) => restore(awaitReady(loading)).pipe(
-            Effect.onInterrupt(() => Mutation.execute(slots.stopMutation, {
-              instanceId: loading.instanceId,
-            }).pipe(
-              Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "cancel", cause })),
+            Effect.onInterrupt(() => slots.stop(loading.instanceId).pipe(
               Effect.tapError((failure) => setExecution({
                 _tag: "Failed",
                 configurationId: loading.configurationId,
@@ -343,20 +323,12 @@ const makeService = (client: AgentClientInstance) => {
         _tag: "Completing",
         configurationId: ready.configurationId,
       }).pipe(
-        Effect.zipRight(Effect.uninterruptible(Mutation.execute(
-          onboarding.updateMutation,
-          { completed: true },
-        ))),
-        Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "complete", cause })),
+        Effect.zipRight(Effect.uninterruptible(onboarding.setCompleted(true))),
       )
       const run = Effect.gen(function* () {
         yield* setExecution({ _tag: "Preparing", configurationId, cancelling: false })
-        const models = yield* get.result(localModels.localModelsResultAtom).pipe(
-          Effect.mapError(observeFailure),
-        )
-        const slotResponse = yield* get.result(slots.modelSlotsResultAtom).pipe(
-          Effect.mapError(observeFailure),
-        )
+        const models = yield* Registry.getResult(registry, localModels.state)
+        const slotResponse = yield* Registry.getResult(registry, slots.state)
         const resolved = yield* resolveChoice(configurationId, models, slotResponse.state)
         if (Option.isSome(resolved.ready)) return yield* complete(resolved.ready.value)
         const installed = yield* ensureInstalled(resolved)
@@ -377,40 +349,36 @@ const makeService = (client: AgentClientInstance) => {
         Effect.onInterrupt(() => setExecution({ _tag: "Choosing" })),
         Effect.onExit((exit) => Deferred.done(done, Exit.asVoid(exit)).pipe(
           Effect.zipRight(Effect.sync(() => {
-            if (Option.exists(get.registry.get(active), (current) => current === invocation)) {
-              get.registry.set(active, Option.none())
+            if (Option.exists(registry.get(active), (current) => current === invocation)) {
+              registry.set(active, Option.none())
             }
           })),
         )),
       )
       if (outcome === "Cancelled") yield* setExecution({ _tag: "Choosing" })
-    }),
-    { concurrent: true },
-  ))
+    })
 
-  const cancel = Atom.keepAlive(client.effectQuery.runtime.fn<void>()((_, get) => Effect.gen(function* () {
-    const invocation = get.registry.get(active)
+  const cancel = Effect.gen(function* () {
+    const invocation = registry.get(active)
     if (Option.isNone(invocation)) return yield* new OnboardingModelSetupNotActive()
-    const current = get.registry.get(execution)
+    const current = registry.get(execution)
     if (current._tag === "Completing") {
       return yield* new OnboardingModelSetupCancellationUnavailable()
     }
     if (current._tag !== "Choosing" && current._tag !== "Failed") {
-      get.registry.set(execution, { ...current, cancelling: true })
+      registry.set(execution, { ...current, cancelling: true })
     }
     yield* Deferred.succeed(invocation.value.cancellation, undefined)
     yield* Deferred.await(invocation.value.done)
-  }), { concurrent: true }))
+  })
 
-  const skip = Atom.keepAlive(client.effectQuery.runtime.fn<void>()((_, get) => Effect.gen(function* () {
-    if (Option.isSome(get.registry.get(active))) {
+  const skip = Effect.gen(function* () {
+    if (Option.isSome(registry.get(active))) {
       return yield* new OnboardingModelSetupAlreadyActive()
     }
-    yield* Mutation.execute(onboarding.updateMutation, { completed: true }).pipe(
-      Effect.mapError((cause) => new OnboardingModelSetupFailed({ phase: "complete", cause })),
-    )
-    get.registry.set(execution, { _tag: "Choosing" })
-  }), { concurrent: true }))
+    yield* onboarding.setCompleted(true)
+    registry.set(execution, { _tag: "Choosing" })
+  })
 
   return {
     state,
@@ -418,18 +386,15 @@ const makeService = (client: AgentClientInstance) => {
     cancel,
     skip,
   }
-}
+})
 
-export type OnboardingModelSetupService = ReturnType<typeof makeService>
+export interface OnboardingModelSetup extends Effect.Effect.Success<typeof makeOnboardingModelSetup> {}
 
-const servicesByClient = new WeakMap<object, OnboardingModelSetupService>()
+export const OnboardingModelSetup = Context.GenericTag<OnboardingModelSetup>(
+  "client/OnboardingModelSetup",
+)
 
-export const onboardingModelSetupService = (
-  client: AgentClientInstance,
-): OnboardingModelSetupService => {
-  const existing = servicesByClient.get(client)
-  if (existing !== undefined) return existing
-  const service = makeService(client)
-  servicesByClient.set(client, service)
-  return service
-}
+export const OnboardingModelSetupLive = Layer.effect(
+  OnboardingModelSetup,
+  makeOnboardingModelSetup,
+)

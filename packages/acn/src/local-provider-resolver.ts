@@ -3,8 +3,7 @@ import {
   IcnProviderModelResolver,
   type IcnProviderModelResolution,
 } from "@magnitudedev/icn/provider"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { LocalProviderOfferings } from "./local-provider-offerings"
+import { LocalProviderOfferings, localProviderModelId } from "./local-provider-offerings"
 
 export const LocalProviderResolverLive: Layer.Layer<
   IcnProviderModelResolver,
@@ -15,7 +14,7 @@ export const LocalProviderResolverLive: Layer.Layer<
   return IcnProviderModelResolver.of({
     resolve: (providerModelId) => offerings.resolve(providerModelId).pipe(
       Effect.map((offering): Option.Option<IcnProviderModelResolution> => Option.some({
-        runtimeModelId: ProviderModelIdSchema.make(offering.configuration.id),
+        runtimeModelId: localProviderModelId(offering.configuration.id),
       })),
       Effect.catchAll(() => Effect.succeed(Option.none())),
     ),

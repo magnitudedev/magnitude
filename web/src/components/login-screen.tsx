@@ -22,7 +22,7 @@ export function LoginScreen(): ReactNode {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const updateProviderAuth = useAtomSet(client.mutation("UpdateProviderAuth"), { mode: "promise" })
+  const updateProviderAuth = useAtomSet(client.rpc.mutation("UpdateProviderAuth"), { mode: "promise" })
 
   const handleConnect = useCallback(async () => {
     const trimmed = inputKey.trim()

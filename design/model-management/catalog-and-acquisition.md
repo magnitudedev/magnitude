@@ -111,6 +111,16 @@ admission detaches that waiter but does not abandon shared work. Cancellation is
 command. A retry creates a new attempt. Historical success never proves current presence, and
 historical failure never becomes permanent package state.
 
+Download failures whose facts support recovery or presentation are structured domain outcomes.
+Insufficient disk space carries the required and currently available byte counts from ICN through
+ACN's package and product projections. Interrupted-operation manifests and reconstructed inventory
+retain the same typed failure rather than reducing it to a string. No higher layer parses
+diagnostic prose or reconstructs the storage check. Expected failures distinguish insufficient
+disk space, interruption, unavailable source content, unavailable network, local storage failure,
+and corrupt downloaded content. Cancellation is a separate terminal outcome, not a failure.
+Everything else is an internal failure representing a violated invariant or implementation defect.
+There is no catch-all error code: clients render the variant and never infer behavior from prose.
+
 ICN also owns durable acknowledgement of an exact failed attempt. Acknowledgement is an idempotent
 mutation accepted only for that terminal failure and committed with the retained attempt before
 success is returned. It does not erase or alter the failure outcome. A retry has a new attempt
@@ -206,6 +216,8 @@ exists for the bundle; ICN constructs and canonically identifies the configurati
 - Runtime setup requires no network access to reconstruct the release catalog.
 - Installed inventory reports presence and inspection, never inferred model assessment.
 - Download admission and completion depend on exact attempt state, not reconciliation timing.
+- Insufficient-disk failures preserve required and available byte counts through every serialized
+  and projected download state; diagnostic text is never their data contract.
 - A completed attempt awaiting installed-inventory convergence remains projected at full progress
   in `publishing`; it cannot regress to `NotInstalled`.
 - Shared artifact paths never coalesce distinct managed package identities.

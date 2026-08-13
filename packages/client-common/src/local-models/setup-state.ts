@@ -1,6 +1,7 @@
 import { Data, Option } from "effect"
 import type {
   LocalModel,
+  ModelDownloadFailure,
   LocalModelRecommendationProgressStep,
   LocalModelsState,
   ModelInstanceFailure,
@@ -10,7 +11,14 @@ import type {
   ModelSlotsState,
   ProviderModelId,
 } from "@magnitudedev/sdk"
+import type { OnboardingPersistenceError } from "../onboarding/persistence"
+import type {
+  ModelSlotsAssignError,
+  ModelSlotsLoadError,
+  ModelSlotsStopError,
+} from "../model-slots/service"
 import { localModelOptions, type LocalModelOption } from "./options"
+import type { LocalModelsCancelError, LocalModelsInstallError } from "./service"
 import {
   findLocalModelByConfigurationId,
   localModelProviderModelId,
@@ -42,17 +50,17 @@ export class OnboardingModelResourceChanged extends Data.TaggedError(
   readonly resource: "installation" | "instance"
 }> {}
 
-export class OnboardingModelSetupFailed extends Data.TaggedError(
-  "OnboardingModelSetupFailed",
-)<{
-  readonly phase: "observe" | "install" | "assign" | "load" | "complete" | "cancel"
-  readonly cause: unknown
-}> {}
-
 export type OnboardingModelSetupFailure =
   | OnboardingModelChoiceRejected
   | OnboardingModelResourceChanged
-  | OnboardingModelSetupFailed
+  | ModelDownloadFailure
+  | ModelInstanceFailure
+  | LocalModelsInstallError
+  | LocalModelsCancelError
+  | ModelSlotsAssignError
+  | ModelSlotsLoadError
+  | ModelSlotsStopError
+  | OnboardingPersistenceError
 
 type WithOptions<State> = State & { readonly options: readonly LocalModelOption[] }
 

@@ -186,7 +186,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   const client = useAgentClient()
   const settings = useSettingsState()
   const authSource = useAtomValue(authSourceAtom)
-  const runtimeResult = useAtomValue(client.runtime)
+  const runtimeResult = useAtomValue(client.rpc.runtime)
   const [period, setPeriod] = useState<UsagePeriod>('7d')
 
   const tz = useMemo(getLocalTimeZone, [])
@@ -195,7 +195,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
 
   const usageAtom = useMemo(
     () => isVisible && runtimeReady && cloudConfigured
-      ? client.query('GetCloudUsage', { period, days: DAILY_DAYS, tz })
+      ? client.rpc.query('GetCloudUsage', { period, days: DAILY_DAYS, tz })
       : Atom.make<Result.Result<CloudUsageResponse, never>>(() => Result.initial()),
     [client, cloudConfigured, isVisible, period, runtimeReady, tz],
   )

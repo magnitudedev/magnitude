@@ -20,12 +20,15 @@ import {
   SECONDARY_SLOT_ID,
   type AcnRpcClient,
   type LocalModel,
+  type ModelDownloadFailure,
   type LocalModelsState,
   type ModelSlotsState,
   type SlotSelection,
 } from "@magnitudedev/sdk"
-import type { AgentClientInstance } from "../state/agent-client"
-import { onboardingModelSetupService } from "./setup"
+import { clientServicesLayer, type ClientServices } from "../state/client-services"
+import { localModelProviderModelId } from "./projection"
+import { installationAdmissionIsVisible } from "./service"
+import { OnboardingModelSetup } from "./setup"
 
 const configurationId = ModelServingConfigurationIdSchema.make("setup-configuration")
 const providerModelId = ProviderModelIdSchema.make("setup-model")
@@ -158,6 +161,56 @@ const configuredSlots = (
   },
 })
 
+describe("installationAdmissionIsVisible", () => {
+  it("accepts the exact admitted attempts before a provider identity exists", () => {
+    const uninstalled = makeModel(false)
+    const downloading: LocalModel = {
+      ...uninstalled,
+      acquisitionState: {
+        _tag: "Downloading",
+        attemptIds: [attemptId],
+        stage: "downloading",
+        completedBytes: 0,
+        totalBytes: 1,
+        bytesPerSecond: Option.none(),
+      },
+    }
+    const state: LocalModelsState = {
+      inventoryState: { _tag: "Ready" },
+      models: [downloading],
+      discoveryState: { _tag: "Ready", progress: [] },
+    }
+
+    expect(installationAdmissionIsVisible(state, configurationId, {
+      _tag: "DownloadAdmitted",
+      providerModelId,
+      attemptIds: [attemptId],
+    })).toBe(true)
+    expect(Option.isNone(localModelProviderModelId(downloading))).toBe(true)
+  })
+
+  it("accepts the exact installed configuration while provider publication is pending", () => {
+    const installed = makeModel(true)
+    const publishing = installed.servingState._tag === "Assessed" ? {
+      ...installed,
+      servingState: {
+        ...installed.servingState,
+        availabilityState: { _tag: "Preparing" as const, providerModelId },
+      },
+    } : installed
+
+    expect(installationAdmissionIsVisible({
+      inventoryState: { _tag: "Ready" },
+      models: [publishing],
+      discoveryState: { _tag: "Ready", progress: [] },
+    }, configurationId, {
+      _tag: "DownloadAdmitted",
+      providerModelId,
+      attemptIds: [attemptId],
+    })).toBe(true)
+  })
+})
+
 interface HarnessOptions {
   readonly installed: boolean
   readonly initiallyDownloading?: boolean
@@ -168,6 +221,7 @@ interface HarnessOptions {
   readonly replaceLoadInstance?: boolean
   readonly keepCompleting?: boolean
   readonly replaceSelectionBeforeLoad?: boolean
+  readonly downloadFailure?: ModelDownloadFailure
 }
 
 const makeHarness = (options: HarnessOptions) => {
@@ -185,7 +239,7 @@ const makeHarness = (options: HarnessOptions) => {
       },
       servingState: {
         ...model.servingState,
-        availabilityState: { _tag: "Preparing", providerModelId },
+        availabilityState: { _tag: "Installable" },
       },
     }
   }
@@ -211,7 +265,21 @@ const makeHarness = (options: HarnessOptions) => {
         state: { completed: onboardingCompleted },
       })
       case "InstallModel": {
-        model = options.keepDownloading
+        model = options.downloadFailure !== undefined
+          ? (() => {
+              const uninstalled = makeModel(false)
+              return {
+                ...uninstalled,
+                acquisitionState: {
+                  _tag: "Failed" as const,
+                  attemptIds: [attemptId],
+                  completedBytes: 0,
+                  totalBytes: 1,
+                  failure: options.downloadFailure,
+                },
+              }
+            })()
+          : options.keepDownloading
           ? (() => {
               const uninstalled = makeModel(false)
               return uninstalled.servingState._tag === "Assessed" ? {
@@ -226,7 +294,7 @@ const makeHarness = (options: HarnessOptions) => {
                 },
                 servingState: {
                   ...uninstalled.servingState,
-                  availabilityState: { _tag: "Preparing" as const, providerModelId },
+                  availabilityState: { _tag: "Installable" as const },
                 },
               } : uninstalled
             })()
@@ -289,13 +357,30 @@ const makeHarness = (options: HarnessOptions) => {
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
   })) as unknown as AcnRpcClient
-  const effectQuery = EffectQueryClient.make(Layer.succeed(AcnRpcClientTag, rpc))
-  const client = Object.assign(Effect.succeed(rpc), {
-    effectQuery,
-    runtime: effectQuery.runtime,
-  }) as unknown as AgentClientInstance
+  const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
+    Layer.succeed(AcnRpcClientTag, rpc),
+    (client) => clientServicesLayer(client),
+  )
   const registry = Registry.make()
-  const service = onboardingModelSetupService(client)
+  const serviceReference = effectQuery.runtime.atom(OnboardingModelSetup)
+  const service = {
+    state: Atom.make((get) => Result.flatMap(
+      get(serviceReference),
+      (setup) => get(setup.state),
+    )),
+    start: Atom.keepAlive(effectQuery.runtime.fn<typeof configurationId>()(
+      (input) => Effect.flatMap(OnboardingModelSetup, (setup) => setup.start(input)),
+      { concurrent: true },
+    )),
+    cancel: Atom.keepAlive(effectQuery.runtime.fn(
+      () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.cancel),
+      { concurrent: true },
+    )),
+    skip: Atom.keepAlive(effectQuery.runtime.fn(
+      () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.skip),
+      { concurrent: true },
+    )),
+  }
   return {
     calls,
     registry,
@@ -419,6 +504,30 @@ describe("OnboardingModelSetupService", () => {
       "LoadModel",
       "UpdateOnboardingState",
     ])
+    harness.registry.dispose()
+  })
+
+  it("preserves a structured download failure as the terminal setup failure", async () => {
+    const failure: ModelDownloadFailure = {
+      _tag: "InsufficientDiskSpace",
+      requiredBytes: 40,
+      availableBytes: 30,
+    }
+    const harness = makeHarness({ installed: false, downloadFailure: failure })
+    const exit = await Effect.runPromiseExit(execute(
+      harness.registry,
+      harness.service.start,
+      configurationId,
+    ))
+
+    expect(exit._tag).toBe("Failure")
+    const state = Option.getOrThrow(Result.value(harness.registry.get(harness.service.state)))
+    expect(state).toMatchObject({
+      _tag: "Failed",
+      failure,
+    })
+    expect(harness.calls).not.toContain("AssignSlot")
+    expect(harness.calls).not.toContain("LoadModel")
     harness.registry.dispose()
   })
 

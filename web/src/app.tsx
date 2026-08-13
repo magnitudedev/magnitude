@@ -150,7 +150,7 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
 
   const trimmedSearchQuery = searchQuery.trim()
   const firstPageAtom = useMemo(
-    () => client.query("ListSessions", {
+    () => client.rpc.query("ListSessions", {
       cwd: cwdFilter ? Option.some(cwdFilter) : Option.none(),
       query: trimmedSearchQuery ? Option.some(trimmedSearchQuery) : Option.none(),
       cursor: Option.none(),
@@ -159,7 +159,7 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
     [client, cwdFilter, trimmedSearchQuery],
   )
   const firstPageResult = useAtomValue(firstPageAtom)
-  const listSessionsMutation = useAtomSet(client.mutation("ListSessions"), { mode: "promise" })
+  const listSessionsMutation = useAtomSet(client.rpc.mutation("ListSessions"), { mode: "promise" })
 
   useEffect(() => {
     sessionPageGenerationRef.current += 1
@@ -247,7 +247,7 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
   useAtomMount(focusSearchAtom)
 
   const cwdOptionsResult = useAtomValue(
-    client.query("ListSessionCwds", {}, { reactivityKeys: ["sessions"] }),
+    client.rpc.query("ListSessionCwds", {}, { reactivityKeys: ["sessions"] }),
   )
   const cwdOptions = Result.match(cwdOptionsResult, {
     onInitial: () => [] as string[],
@@ -320,7 +320,7 @@ function FileViewerPanelContainer(): ReactNode {
   // P1: reactivityKeys: ["files"] so the query refreshes when files change.
   const readFileAtom = useMemo(
     () => filePath && selectedCwd
-      ? client.query("ReadFile", {
+      ? client.rpc.query("ReadFile", {
           cwd: selectedCwd,
           path: filePath,
           format: isImageFile ? "base64" : "text",
@@ -570,7 +570,7 @@ function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nul
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
   const selectedSessionAtom = useMemo(
     () => selectedSessionId
-      ? client.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
+      ? client.rpc.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
       : Atom.make(() => null),
     [client, selectedSessionId],
   )
@@ -625,7 +625,7 @@ function ChatTitleBar(): ReactNode {
   const displaySession = useDisplayState((state) => state.session)
   const selectedSessionAtom = useMemo(
     () => selectedSessionId
-      ? client.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
+      ? client.rpc.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
       : Atom.make(() => null),
     [client, selectedSessionId],
   )
@@ -651,7 +651,7 @@ function ChatTitleBar(): ReactNode {
 function useInterruptAllListener(): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptMutation = useAtomSet(client.mutation("Interrupt"))
+  const interruptMutation = useAtomSet(client.rpc.mutation("Interrupt"))
 
   const interruptAtom = useMemo(
     () =>

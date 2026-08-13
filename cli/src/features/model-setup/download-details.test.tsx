@@ -28,7 +28,6 @@ vi.mock("../../hooks/use-theme", () => ({
 const { OnboardingModelDownloadDetails } = await import("./download-details")
 
 const onCancel = vi.fn()
-const onRetry = vi.fn()
 const model = makeAcquiringModel(
   {
     _tag: "Downloading",
@@ -52,7 +51,6 @@ const model = makeAcquiringModel(
 
 beforeEach(() => {
   onCancel.mockClear()
-  onRetry.mockClear()
 })
 
 const press = (name: string) => keyboard.handler?.(new KeyEvent({
@@ -75,9 +73,10 @@ test("shows compact download details with progress, rate, and ETA", async () => 
       width={56}
       height={11}
       operation={{
-        _tag: "Failed",
-        onChooseAnother: onCancel,
-        onRetry,
+        starting: false,
+        cancelling: false,
+        cancelError: null,
+        onCancel,
       }}
     />,
     { width: 100, height: 24 },
@@ -107,12 +106,10 @@ test("shows zero-percent download details while admission is starting", async ()
       width={56}
       height={11}
       operation={{
-        _tag: "Active",
         starting: true,
         cancelling: false,
         cancelError: null,
         onCancel,
-        onRetry,
       }}
     />,
     { width: 100, height: 24 },
@@ -136,12 +133,10 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
       width={56}
       height={11}
       operation={{
-        _tag: "Active",
         starting: false,
         cancelling: false,
         cancelError: null,
         onCancel,
-        onRetry,
       }}
     />,
     { width: 100, height: 24 },
@@ -164,46 +159,6 @@ test("requires confirmation before cancelling and supports keyboard choice", asy
     await act(async () => press("escape"))
     await act(async () => press("return"))
     expect(onCancel).toHaveBeenCalledTimes(1)
-  } finally {
-    await act(async () => view.renderer.destroy())
-  }
-})
-
-test("shows failed-download actions in the details pane", async () => {
-  const failedModel = makeAcquiringModel({
-      _tag: "Failed",
-      attemptIds: [DownloadAttemptIdSchema.make("download_failed")],
-      completedBytes: 19 * GIB,
-      totalBytes: 30 * GIB,
-      failure: {
-        code: "transport_failed",
-        message: "Download failed",
-        retryable: true,
-      },
-  })
-  const view = await testRender(
-    <OnboardingModelDownloadDetails
-      model={failedModel}
-      width={56}
-      height={11}
-      operation={{
-        _tag: "Active",
-        starting: false,
-        cancelling: false,
-        cancelError: null,
-        onCancel,
-        onRetry,
-      }}
-    />,
-    { width: 100, height: 24 },
-  )
-  try {
-    await act(view.renderOnce)
-    const frame = view.captureCharFrame()
-    expect(frame).toContain("Couldn’t download Qwen Test")
-    expect(frame).toContain("Download failed")
-    expect(frame).not.toContain("63%")
-    expect(frame).toMatch(/Retry\s+Choose another model/)
   } finally {
     await act(async () => view.renderer.destroy())
   }

@@ -85,6 +85,7 @@ export {
   PercentageSchema,
   ModelCapabilitiesSchema,
   ModelFailureSchema,
+  ModelDownloadFailureSchema,
   ProviderModelCatalogStateSchema,
   ProviderCatalogEntrySchema,
   ProviderModelCatalogEntrySchema,

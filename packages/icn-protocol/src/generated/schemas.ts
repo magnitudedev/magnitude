@@ -517,7 +517,7 @@ export const DownloadAttempt = S.Union(
     S.TaggedStruct("Failed", {
       acknowledged: S.Boolean,
       completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      failure: S.suspend((): S.Schema<DownloadFailure, DownloadFailureEncoded> => DownloadFailure),
       id: S.suspend((): S.Schema<DownloadAttemptId, DownloadAttemptIdEncoded> => DownloadAttemptId),
       packageId: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
       totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -538,6 +538,29 @@ export type DownloadAttemptEncoded = S.Schema.Encoded<typeof DownloadAttempt>
 export const DownloadAttemptId = S.String
 export type DownloadAttemptId = S.Schema.Type<typeof DownloadAttemptId>
 export type DownloadAttemptIdEncoded = S.Schema.Encoded<typeof DownloadAttemptId>
+
+export const DownloadFailure = S.Union(
+  S.extend(S.TaggedStruct("Interrupted", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("InsufficientDiskSpace", {
+      availableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("SourceUnavailable", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("NetworkUnavailable", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("LocalStorageFailure", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("CorruptDownload", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Internal", {
+      message: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type DownloadFailure = S.Schema.Type<typeof DownloadFailure>
+export type DownloadFailureEncoded = S.Schema.Encoded<typeof DownloadFailure>
 
 export const DownloadStage = S.Union(
   S.Literal("queued"),

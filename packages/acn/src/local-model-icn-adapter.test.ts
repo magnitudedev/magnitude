@@ -59,13 +59,40 @@ describe("local model ICN adapter", () => {
       packageId: "package_test",
       completedBytes: 4_000,
       totalBytes: 10_000,
-      failure: { code: "network", message: "offline", retryable: true },
+      failure: {
+        _tag: "NetworkUnavailable",
+      },
       acknowledged: true,
     })
 
     await expect(Effect.runPromise(downloadAttemptFromIcn(attempt))).resolves.toMatchObject({
       _tag: "Failed",
       acknowledged: true,
+    })
+  })
+
+  it("preserves insufficient-disk facts without parsing diagnostic text", async () => {
+    const attempt = Schema.decodeUnknownSync(NativeDownloadAttemptSchema)({
+      _tag: "Failed",
+      id: "download_disk_full",
+      packageId: "package_test",
+      completedBytes: 0,
+      totalBytes: 35_000_000_000,
+      failure: {
+        _tag: "InsufficientDiskSpace",
+        requiredBytes: 37_923_968_128,
+        availableBytes: 33_440_665_600,
+      },
+      acknowledged: false,
+    })
+
+    await expect(Effect.runPromise(downloadAttemptFromIcn(attempt))).resolves.toMatchObject({
+      _tag: "Failed",
+      failure: {
+        _tag: "InsufficientDiskSpace",
+        requiredBytes: 37_923_968_128,
+        availableBytes: 33_440_665_600,
+      },
     })
   })
 

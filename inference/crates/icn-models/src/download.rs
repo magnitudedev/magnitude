@@ -49,7 +49,7 @@ impl DownloadOperation {
     fn ensure_active(&self) -> Result<(), DownloadError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(DownloadError {
-                code: "cancelled",
+                kind: DownloadErrorKind::Cancelled,
                 message: "download was cancelled".to_owned(),
                 retryable: true,
                 resumable: true,
@@ -164,13 +164,13 @@ impl DownloadIntegrity {
 
     fn update(&mut self, bytes: &[u8]) -> Result<(), DownloadError> {
         let count = u64::try_from(bytes.len()).map_err(|_| DownloadError {
-            code: "size_overflow",
+            kind: DownloadErrorKind::Integrity,
             message: "download chunk size overflows u64".to_owned(),
             retryable: false,
             resumable: false,
         })?;
         self.bytes = self.bytes.checked_add(count).ok_or_else(|| DownloadError {
-            code: "size_overflow",
+            kind: DownloadErrorKind::Integrity,
             message: "download byte count overflows u64".to_owned(),
             retryable: false,
             resumable: false,
@@ -204,7 +204,7 @@ impl DownloadIntegrity {
     fn verify(&self, component: &ModelComponent) -> Result<(), DownloadError> {
         if self.bytes != component.size_bytes {
             return Err(DownloadError {
-                code: "size_mismatch",
+                kind: DownloadErrorKind::Integrity,
                 message: format!("unexpected size for {}", component.path.display()),
                 retryable: true,
                 resumable: true,
@@ -223,7 +223,7 @@ impl DownloadIntegrity {
             .collect::<String>();
         if &actual != expected {
             return Err(DownloadError {
-                code: "integrity_failed",
+                kind: DownloadErrorKind::Integrity,
                 message: format!("SHA-256 mismatch for {}", component.path.display()),
                 retryable: false,
                 resumable: false,
@@ -233,13 +233,65 @@ impl DownloadIntegrity {
     }
 }
 
+#[derive(Debug)]
+enum DownloadErrorKind {
+    Cancelled,
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    SourceUnavailable,
+    SourceAccessDenied,
+    MissingSource,
+    Network,
+    Integrity,
+    FileSystem,
+    InvalidRequest,
+    Internal,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 struct DownloadError {
-    code: &'static str,
+    kind: DownloadErrorKind,
     message: String,
     retryable: bool,
     resumable: bool,
+}
+
+impl DownloadError {
+    fn resumable(&self) -> bool {
+        self.resumable
+    }
+
+    fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    fn to_failure(&self) -> Option<DownloadFailure> {
+        Some(match &self.kind {
+            DownloadErrorKind::Cancelled => return None,
+            DownloadErrorKind::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes,
+            } => DownloadFailure::InsufficientDiskSpace {
+                required_bytes: *required_bytes,
+                available_bytes: *available_bytes,
+            },
+            DownloadErrorKind::SourceUnavailable
+            | DownloadErrorKind::SourceAccessDenied
+            | DownloadErrorKind::MissingSource => DownloadFailure::SourceUnavailable,
+            DownloadErrorKind::Network => DownloadFailure::NetworkUnavailable,
+            DownloadErrorKind::Integrity => DownloadFailure::CorruptDownload,
+            DownloadErrorKind::FileSystem => DownloadFailure::LocalStorageFailure,
+            DownloadErrorKind::InvalidRequest => DownloadFailure::Internal {
+                message: self.message.clone(),
+            },
+            DownloadErrorKind::Internal => DownloadFailure::Internal {
+                message: self.message.clone(),
+            },
+        })
+    }
 }
 
 impl ModelManager {
@@ -337,8 +389,32 @@ impl ModelManager {
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
+            let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
+            let Some(download_failure) = failure.to_failure() else {
+                if let Some(model_id) = model_id.as_ref() {
+                    if let Ok(mut models) = self.models.write() {
+                        models.remove(model_id);
+                    }
+                    let _ = tokio::fs::remove_file(operation_manifest_path(
+                        &self.config.root,
+                        model_id,
+                    ))
+                    .await;
+                }
+                operation
+                    .sender
+                    .send_replace(ModelDownloadEvent::Cancelled {
+                        operation_id,
+                        model_id,
+                        completed_bytes,
+                        total_bytes,
+                    });
+                self.operations.lock().await.remove(&operation_key);
+                return;
+            };
+            let resumable = failure.resumable();
             if let Some(model_id) = model_id.as_ref() {
-                persist_operation_failure(&self.config.root, model_id, failure.code).await;
+                persist_operation_failure(&self.config.root, model_id, &download_failure).await;
             }
             if let Some(model_id) = model_id.as_ref()
                 && let Ok(mut models) = self.models.write()
@@ -348,25 +424,19 @@ impl ModelManager {
                 model.availability = ModelAvailability::Interrupted {
                     completed_bytes,
                     total_bytes,
-                    resumable: failure.resumable,
-                    reason: (!failure.resumable).then(|| failure.code.to_owned()),
-                    last_error: failure.code.to_owned(),
+                    resumable,
+                    failure: download_failure.clone(),
                     updated_at: now(),
                 };
                 model.updated_at = now();
             }
-            let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
             operation.sender.send_replace(ModelDownloadEvent::Failed {
                 operation_id,
                 model_id,
-                error: DownloadFailure {
-                    code: failure.code.to_owned(),
-                    message: failure.message,
-                    retryable: failure.retryable,
-                },
+                error: download_failure,
                 completed_bytes,
                 total_bytes,
-                resumable: failure.resumable,
+                resumable,
             });
         }
         self.operations.lock().await.remove(&operation_key);
@@ -381,7 +451,7 @@ impl ModelManager {
         operation.ensure_active()?;
         let (repository, revision) = package.repository_revision();
         let (owner, name) = repository.split_once('/').ok_or_else(|| DownloadError {
-            code: "invalid_request",
+            kind: DownloadErrorKind::InvalidRequest,
             message: "repository must be owner/name".to_owned(),
             retryable: false,
             resumable: false,
@@ -447,7 +517,7 @@ impl ModelManager {
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
         let available_bytes =
             fs2::available_space(&self.config.root).map_err(|error| DownloadError {
-                code: "disk_inspection_failed",
+                kind: DownloadErrorKind::FileSystem,
                 message: error.to_string(),
                 retryable: true,
                 resumable: true,
@@ -462,14 +532,14 @@ impl ModelManager {
                 completed_bytes,
                 total_bytes,
             });
-        if missing_bytes.saturating_add(self.config.disk_reserve_bytes) > available_bytes {
+        let required_bytes = missing_bytes.saturating_add(self.config.disk_reserve_bytes);
+        if required_bytes > available_bytes {
             return Err(DownloadError {
-                code: "insufficient_disk",
-                message: format!(
-                    "download requires {} bytes including reserve, but {} bytes are available",
-                    missing_bytes.saturating_add(self.config.disk_reserve_bytes),
-                    available_bytes
-                ),
+                kind: DownloadErrorKind::InsufficientDiskSpace {
+                    required_bytes,
+                    available_bytes,
+                },
+                message: "insufficient disk space".to_owned(),
                 retryable: false,
                 resumable: true,
             });
@@ -511,7 +581,7 @@ impl ModelManager {
         self.models
             .write()
             .map_err(|_| DownloadError {
-                code: "internal",
+                kind: DownloadErrorKind::Internal,
                 message: "inventory lock poisoned".to_owned(),
                 retryable: false,
                 resumable: true,
@@ -540,7 +610,7 @@ impl ModelManager {
             .acquire()
             .await
             .map_err(|error| DownloadError {
-                code: "internal",
+                kind: DownloadErrorKind::Internal,
                 message: error.to_string(),
                 retryable: false,
                 resumable: true,
@@ -582,7 +652,7 @@ impl ModelManager {
             stage: "downloading".to_owned(),
             started_at,
             updated_at: started_at,
-            last_error: None,
+            failure: None,
         };
         persist_operation_manifest(&self.config.root, &operation_manifest).await?;
 
@@ -713,7 +783,7 @@ impl ModelManager {
             .min_by_key(|component| component.shard_index.unwrap_or(0))
             .map(|component| snapshot.join(&component.path))
             .ok_or_else(|| DownloadError {
-                code: "publish_failed",
+                kind: DownloadErrorKind::Internal,
                 message: "published model has no runnable weight component".to_owned(),
                 retryable: false,
                 resumable: false,
@@ -742,7 +812,7 @@ impl ModelManager {
             self.template_assessor.as_deref(),
         )
         .map_err(|error| DownloadError {
-            code: "inspection_failed",
+            kind: DownloadErrorKind::Internal,
             message: error.to_string(),
             retryable: true,
             resumable: true,
@@ -751,7 +821,7 @@ impl ModelManager {
             .complete_and_publish_model(model)
             .await
             .map_err(|error| DownloadError {
-                code: "publish_failed",
+                kind: DownloadErrorKind::Internal,
                 message: error.to_string(),
                 retryable: true,
                 resumable: true,
@@ -802,7 +872,7 @@ async fn download_component_with_retry(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(error) if error.retryable && attempt + 1 < MAX_ATTEMPTS => {
+            Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_secs(1_u64 << attempt.min(4))).await;
             }
             Err(error) => return Err(error),
@@ -836,7 +906,7 @@ async fn download_component_once(
             .map_err(download_io)?;
     } else if partial_len < offset {
         return Err(DownloadError {
-            code: "size_mismatch",
+            kind: DownloadErrorKind::Integrity,
             message: format!(
                 "partial download is shorter than verified progress for {}",
                 component.path.display()
@@ -881,7 +951,7 @@ async fn download_component_once(
             }
         };
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| DownloadError {
-            code: "size_overflow",
+            kind: DownloadErrorKind::Integrity,
             message: "download chunk size overflows u64".to_owned(),
             retryable: false,
             resumable: false,
@@ -891,7 +961,7 @@ async fn download_component_once(
             .is_none_or(|next| next > component.size_bytes)
         {
             return Err(DownloadError {
-                code: "size_mismatch",
+                kind: DownloadErrorKind::Integrity,
                 message: format!(
                     "download exceeded expected size for {}",
                     component.path.display()
@@ -911,7 +981,7 @@ async fn download_component_once(
     if offset != component.size_bytes {
         persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
         return Err(DownloadError {
-            code: "size_mismatch",
+            kind: DownloadErrorKind::Integrity,
             message: format!(
                 "download ended at {offset} bytes; expected {} for {}",
                 component.size_bytes,
@@ -1051,7 +1121,7 @@ async fn quarantine_component_files(paths: &DownloadComponentPaths) -> Result<()
 
 fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
     DownloadError {
-        code: "invalid_checkpoint",
+        kind: DownloadErrorKind::Integrity,
         message: format!(
             "download integrity checkpoint does not match {}",
             component.path.display()
@@ -1063,9 +1133,9 @@ fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
 
 fn cancelled_error() -> DownloadError {
     DownloadError {
-        code: "cancelled",
+        kind: DownloadErrorKind::Cancelled,
         message: "download was cancelled".to_owned(),
-        retryable: true,
+        retryable: false,
         resumable: true,
     }
 }
@@ -1090,7 +1160,7 @@ async fn publish_snapshot_link(
                 return Ok(());
             }
             return Err(DownloadError {
-                code: "publication_conflict",
+                kind: DownloadErrorKind::FileSystem,
                 message: format!(
                     "snapshot path already exists: {}",
                     destination_clone.display()
@@ -1112,7 +1182,7 @@ async fn publish_snapshot_link(
     })
     .await
     .map_err(|error| DownloadError {
-        code: "publication_failed",
+        kind: DownloadErrorKind::FileSystem,
         message: error.to_string(),
         retryable: true,
         resumable: true,
@@ -1160,7 +1230,7 @@ async fn persist_managed_manifest(
 
 async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), DownloadError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| DownloadError {
-        code: "serialization_failed",
+        kind: DownloadErrorKind::Internal,
         message: error.to_string(),
         retryable: false,
         resumable: true,
@@ -1203,11 +1273,15 @@ async fn read_operation_manifest(
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn persist_operation_failure(root: &Path, model_id: &icn_contracts::ModelId, code: &str) {
+async fn persist_operation_failure(
+    root: &Path,
+    model_id: &icn_contracts::ModelId,
+    failure: &DownloadFailure,
+) {
     let Some(mut manifest) = read_operation_manifest(root, model_id).await else {
         return;
     };
-    manifest.last_error = Some(code.to_owned());
+    manifest.failure = Some(failure.clone());
     manifest.updated_at = now();
     for component in &mut manifest.components {
         let repo_root = root.join("hub").join(hf_repo_dir(&manifest.repository));
@@ -1287,7 +1361,7 @@ async fn acquire_lock(path: PathBuf) -> Result<File, DownloadError> {
     })
     .await
     .map_err(|error| DownloadError {
-        code: "lock_failed",
+        kind: DownloadErrorKind::FileSystem,
         message: error.to_string(),
         retryable: true,
         resumable: true,
@@ -1300,7 +1374,7 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Err(DownloadError {
-            code: "unsafe_path",
+            kind: DownloadErrorKind::FileSystem,
             message: format!("partial path is a symlink: {}", path.display()),
             retryable: false,
             resumable: false,
@@ -1346,7 +1420,7 @@ fn random_id(prefix: &str) -> Result<String, InventoryError> {
 
 fn inventory_download_error(error: InventoryError) -> DownloadError {
     DownloadError {
-        code: "internal",
+        kind: DownloadErrorKind::Internal,
         message: error.to_string(),
         retryable: false,
         resumable: true,
@@ -1354,10 +1428,7 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
 }
 
 fn missing_upstream_content(error: &DownloadError) -> bool {
-    matches!(
-        error.code,
-        "repository_not_found" | "revision_not_found" | "file_not_found"
-    )
+    matches!(error.kind, DownloadErrorKind::MissingSource)
 }
 
 async fn resolve_download_revision(
@@ -1383,7 +1454,7 @@ async fn resolve_download_revision(
         Err(error) => return Err(error),
     };
     let commit = api.sha.clone().ok_or_else(|| DownloadError {
-        code: "missing_metadata",
+        kind: DownloadErrorKind::Network,
         message: "Hugging Face repository response did not include a commit".to_owned(),
         retryable: true,
         resumable: false,
@@ -1391,7 +1462,7 @@ async fn resolve_download_revision(
     if revision == "main" {
         if !is_immutable_commit(&commit) {
             return Err(DownloadError {
-                code: "missing_metadata",
+                kind: DownloadErrorKind::Network,
                 message: "Hugging Face main did not resolve to an immutable commit".to_owned(),
                 retryable: true,
                 resumable: false,
@@ -1399,7 +1470,7 @@ async fn resolve_download_revision(
         }
     } else {
         require_requested_revision(revision, Some(&commit)).map_err(|message| DownloadError {
-            code: "revision_changed",
+            kind: DownloadErrorKind::SourceUnavailable,
             message,
             retryable: false,
             resumable: false,
@@ -1423,7 +1494,7 @@ async fn resolve_download_revision(
         };
         if metadata.size == 0 {
             return Err(DownloadError {
-                code: "missing_metadata",
+                kind: DownloadErrorKind::SourceUnavailable,
                 message: format!(
                     "Hugging Face did not report a non-zero size for {}",
                     component.path.display()
@@ -1497,7 +1568,7 @@ fn package_unavailable(
         "pinned model package is unavailable and current main is not equivalent"
     );
     DownloadError {
-        code: "package_unavailable",
+        kind: DownloadErrorKind::SourceUnavailable,
         message: match path {
             Some(path) => format!(
                 "the publisher no longer provides the catalog package at {}: {reason}",
@@ -1518,7 +1589,7 @@ async fn hub_api_metadata(
     let url =
         revision_metadata_url(client.endpoint(), repository, revision).map_err(|message| {
             DownloadError {
-                code: "invalid_request",
+                kind: DownloadErrorKind::InvalidRequest,
                 message,
                 retryable: false,
                 resumable: false,
@@ -1532,16 +1603,16 @@ async fn hub_api_metadata(
     let response = request.send().await.map_err(reqwest_download_error)?;
     let status = response.status();
     if !status.is_success() {
+        let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(DownloadError {
-            code: match status.as_u16() {
-                401 => "authentication_required",
-                403 => "forbidden",
-                404 => "repository_not_found",
-                429 => "rate_limited",
-                _ => "upstream_http_error",
+            kind: match status.as_u16() {
+                401 | 403 => DownloadErrorKind::SourceAccessDenied,
+                404 => DownloadErrorKind::MissingSource,
+                _ if retryable => DownloadErrorKind::Network,
+                _ => DownloadErrorKind::InvalidRequest,
             },
             message: format!("Hugging Face repository metadata returned HTTP {status}"),
-            retryable: status.as_u16() == 429 || status.is_server_error(),
+            retryable,
             resumable: false,
         });
     }
@@ -1565,7 +1636,7 @@ async fn resolve_remote_metadata(
         Ok(metadata) => {
             if metadata.commit_hash != commit {
                 return Err(DownloadError {
-                    code: "revision_changed",
+                    kind: DownloadErrorKind::SourceUnavailable,
                     message: format!("{} resolved outside pinned commit", path.display()),
                     retryable: true,
                     resumable: false,
@@ -1594,7 +1665,7 @@ async fn resolve_remote_metadata(
                 .iter()
                 .find(|candidate| candidate.rfilename == filename)
                 .ok_or_else(|| DownloadError {
-                    code: "file_not_found",
+                    kind: DownloadErrorKind::MissingSource,
                     message: format!("Hugging Face repository has no {}", path.display()),
                     retryable: false,
                     resumable: false,
@@ -1611,7 +1682,7 @@ async fn resolve_remote_metadata(
 
 fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
     DownloadError {
-        code: "transport_failed",
+        kind: DownloadErrorKind::Network,
         message: error.to_string(),
         retryable: error.is_timeout() || error.is_connect() || error.is_request(),
         resumable: false,
@@ -1619,24 +1690,33 @@ fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
 }
 
 fn map_hf_error(error: HFError) -> DownloadError {
-    let (code, retryable) = match &error {
-        HFError::AuthRequired { .. } => ("authentication_required", false),
-        HFError::Forbidden { .. } => ("forbidden", false),
-        HFError::RepoNotFound { .. } => ("repository_not_found", false),
-        HFError::RevisionNotFound { .. } => ("revision_not_found", false),
-        HFError::EntryNotFound { .. } => ("file_not_found", false),
-        HFError::RateLimited { .. } => ("rate_limited", true),
-        HFError::Request { .. } | HFError::Xet { .. } => ("transport_failed", true),
+    let (kind, retryable) = match &error {
+        HFError::AuthRequired { .. } | HFError::Forbidden { .. } => {
+            (DownloadErrorKind::SourceAccessDenied, false)
+        }
+        HFError::RepoNotFound { .. }
+        | HFError::RevisionNotFound { .. }
+        | HFError::EntryNotFound { .. } => (DownloadErrorKind::MissingSource, false),
+        HFError::RateLimited { .. } | HFError::Request { .. } | HFError::Xet { .. } => {
+            (DownloadErrorKind::Network, true)
+        }
         HFError::Http { context } => {
             let retryable = context.status.as_u16() == 408 || context.status.is_server_error();
-            ("upstream_http_error", retryable)
+            (
+                if retryable {
+                    DownloadErrorKind::Network
+                } else {
+                    DownloadErrorKind::SourceUnavailable
+                },
+                retryable,
+            )
         }
-        HFError::Io(_) => ("io_failed", true),
-        HFError::MalformedResponse { .. } => ("malformed_upstream_response", true),
-        _ => ("upstream_failed", false),
+        HFError::Io(_) => (DownloadErrorKind::FileSystem, true),
+        HFError::MalformedResponse { .. } => (DownloadErrorKind::Network, true),
+        _ => (DownloadErrorKind::SourceUnavailable, false),
     };
     DownloadError {
-        code,
+        kind,
         message: error.to_string(),
         retryable,
         resumable: retryable,
@@ -1645,7 +1725,7 @@ fn map_hf_error(error: HFError) -> DownloadError {
 
 fn download_io(error: impl std::fmt::Display) -> DownloadError {
     DownloadError {
-        code: "io_failed",
+        kind: DownloadErrorKind::FileSystem,
         message: error.to_string(),
         retryable: true,
         resumable: true,
@@ -1665,7 +1745,9 @@ fn watch_stream(receiver: watch::Receiver<ModelDownloadEvent>) -> DownloadEventS
             let event = receiver.borrow_and_update().clone();
             let terminal = matches!(
                 event,
-                ModelDownloadEvent::Ready { .. } | ModelDownloadEvent::Failed { .. }
+                ModelDownloadEvent::Ready { .. }
+                    | ModelDownloadEvent::Cancelled { .. }
+                    | ModelDownloadEvent::Failed { .. }
             );
             Some((event, (receiver, true, terminal)))
         },
@@ -1678,6 +1760,7 @@ fn current_model_id(event: &ModelDownloadEvent) -> Option<icn_contracts::ModelId
         ModelDownloadEvent::CheckingSpace { model_id, .. }
         | ModelDownloadEvent::Progress { model_id, .. } => Some(model_id.clone()),
         ModelDownloadEvent::Ready { model, .. } => Some(model.id.clone()),
+        ModelDownloadEvent::Cancelled { model_id, .. } => model_id.clone(),
         ModelDownloadEvent::Failed { model_id, .. } => model_id.clone(),
         ModelDownloadEvent::Resolving { .. } => None,
     }
@@ -1696,6 +1779,11 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
             ..
         }
         | ModelDownloadEvent::Failed {
+            completed_bytes,
+            total_bytes,
+            ..
+        }
+        | ModelDownloadEvent::Cancelled {
             completed_bytes,
             total_bytes,
             ..
@@ -1984,9 +2072,32 @@ mod tests {
 
         let error = integrity.verify(&component).expect_err("digest mismatch");
 
-        assert_eq!(error.code, "integrity_failed");
-        assert!(!error.retryable);
-        assert!(!error.resumable);
+        assert!(matches!(error.kind, DownloadErrorKind::Integrity));
+        assert!(!error.retryable());
+        assert!(!error.resumable());
+    }
+
+    #[test]
+    fn insufficient_disk_failure_preserves_required_and_available_bytes() {
+        let failure = DownloadError {
+            kind: DownloadErrorKind::InsufficientDiskSpace {
+                required_bytes: 37_923_968_128,
+                available_bytes: 33_440_665_600,
+            },
+            message: "insufficient disk space".to_owned(),
+            retryable: false,
+            resumable: true,
+        };
+
+        assert_eq!(
+            failure
+                .to_failure()
+                .expect("test failure is not cancellation"),
+            DownloadFailure::InsufficientDiskSpace {
+                required_bytes: 37_923_968_128,
+                available_bytes: 33_440_665_600,
+            }
+        );
     }
 
     #[test]
@@ -2012,7 +2123,7 @@ mod tests {
             size: expected.size_bytes + 1,
             sha256: Some(sha256.clone()),
         };
-        assert_eq!(
+        assert!(matches!(
             validate_equivalent_file(
                 "owner/repository",
                 &"a".repeat(40),
@@ -2021,9 +2132,9 @@ mod tests {
                 &different_size,
             )
             .expect_err("changed size")
-            .code,
-            "package_unavailable"
-        );
+            .kind,
+            DownloadErrorKind::SourceUnavailable
+        ));
 
         let changed = ResolvedRemoteMetadata {
             size: expected.size_bytes,
@@ -2037,7 +2148,7 @@ mod tests {
             &changed,
         )
         .expect_err("changed file");
-        assert_eq!(failure.code, "package_unavailable");
+        assert!(matches!(failure.kind, DownloadErrorKind::SourceUnavailable));
     }
 
     #[test]
@@ -2077,15 +2188,20 @@ mod tests {
 
     #[test]
     fn fallback_is_limited_to_definitive_missing_content() {
-        let failure = |code| DownloadError {
-            code,
+        let failure = |kind| DownloadError {
+            kind,
             message: String::new(),
             retryable: false,
             resumable: false,
         };
-        assert!(missing_upstream_content(&failure("revision_not_found")));
-        assert!(missing_upstream_content(&failure("file_not_found")));
-        assert!(!missing_upstream_content(&failure("rate_limited")));
-        assert!(!missing_upstream_content(&failure("transport_failed")));
+        assert!(missing_upstream_content(&failure(
+            DownloadErrorKind::MissingSource
+        )));
+        assert!(!missing_upstream_content(&failure(
+            DownloadErrorKind::SourceUnavailable
+        )));
+        assert!(!missing_upstream_content(&failure(
+            DownloadErrorKind::Network
+        )));
     }
 }

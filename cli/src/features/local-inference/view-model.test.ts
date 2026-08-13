@@ -5,6 +5,7 @@ import {
   buildLocalInferenceSelections,
   formatDownloadBytes,
   installedLocalModels,
+  modelDownloadFailureMessage,
   performanceRange,
   selectionConfigurationId,
   selectionProviderModelId,
@@ -20,6 +21,14 @@ import {
 } from "./test-fixtures"
 
 describe("unified local inference projection", () => {
+  it("formats structured insufficient-disk failures as passive user guidance", () => {
+    expect(modelDownloadFailureMessage({
+      _tag: "InsufficientDiskSpace",
+      requiredBytes: 37_923_968_128,
+      availableBytes: 33_440_665_600,
+    })).toBe("Not enough disk space. Free at least 4.48 GB and try again.")
+  })
+
   it("formats model artifacts in decimal gigabytes", () => {
     expect(formatDownloadBytes(30 * GIB)).toBe("32.2 GB")
   })
