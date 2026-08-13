@@ -120,11 +120,11 @@ fails the endpoint.
 
 ## Profiles
 
-ACN submits the exact profile contained in each catalog-published or retained serving
-configuration. Package inventory alone never creates a profile or configuration. Catalog generation
-rejects a reviewed profile above its artifact maximum; a pair is bounded by the lower component
-maximum. Profiles below 4,096 tokens are not submitted. ICN does not search a context range or
-choose a profile.
+ACN submits the exact profile contained in each issued catalog configuration. For an installed
+standalone package without a catalog configuration, ACN submits the profile produced by its
+canonical standard-profile rule. Catalog generation rejects a reviewed profile above its artifact
+maximum; a pair is bounded by the lower component maximum. Profiles below 4,096 tokens are not
+submitted. ICN does not search a context range or choose a profile.
 
 For that one profile, ACN requests performance samples at 25K, 50K, 75K, and full configured
 context. Sample depths above the configured context are omitted and duplicates are removed. The
@@ -219,8 +219,8 @@ persisted. Operational failures are never persisted.
 
 ## ACN demand boundary
 
-`LocalModelAssessor` is ACN's sole native-assessment demand owner for catalog-published and retained
-configurations, plus standard profile decisions for installed standalone bundles. ACN supplies the
+`LocalModelAssessor` is ACN's sole native-assessment demand owner for issued catalog
+configurations plus canonical standard profiles for installed standalone bundles. ACN supplies the
 bundle and chosen profile for standard demand; ICN constructs and canonically identifies the exact
 configuration it assesses. The semantic assessment key covers every native cache-identity input
 plus that exact configuration and requested performance-depth policy. Provider, recommendation,
@@ -235,11 +235,11 @@ configurations, and completion publishes only if that key remains current.
 ## Product behavior
 
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
-- One assessor evaluates catalog-published and retained configurations plus ACN's standard profile
-  decisions through the shared assessment service; ICN constructs every resulting exact
+- One assessor evaluates issued catalog configurations plus canonical standard profiles through
+  the shared assessment service; ICN constructs every resulting exact
   configuration, and recommendation policy consumes only private eligible catalog inputs.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
-- Retained configurations remain visible while assessment is pending or fails.
+- Resolved configurations remain visible while assessment is pending or fails.
 - Only completed `Fits` configurations can become installable catalog rows or enabled provider
   offerings; assessment itself creates no durable configuration.
 - Downloading never performs hardware calibration.

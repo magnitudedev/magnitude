@@ -1,14 +1,11 @@
-import { Effect, Option, Ref, Schema, Stream } from "effect"
+import { Effect, Option, Ref, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelDownloadIdSchema,
   ModelServingConfigurationIdSchema,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
-import { ModelStateSchema } from "@magnitudedev/storage"
-import { makeRetainedModelConfigurations } from "./retained-model-configurations"
 import { makeLocalModelInstaller } from "./local-model-installer"
-import { makeTestModelState } from "./model-state.test-support"
 import type { LocalModelPackagesApi } from "./local-model-packages"
 import type {
   ResolvedLocalModelConfiguration,
@@ -79,14 +76,8 @@ describe("LocalModelInstaller", () => {
     resolve: () => Ref.get(current),
   })
 
-  it("materializes an eligible resolution before admission and reinstalls from retained state", async () => {
+  it("admits an eligible derived configuration without persisting it", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
-      const initial = yield* Schema.decodeUnknown(ModelStateSchema)({
-          configurations: [],
-          configurationRecoveryCompleted: true,
-        })
-      const state = yield* makeTestModelState(initial)
-      const retained = makeRetainedModelConfigurations(state)
       const resolution = yield* Ref.make(Option.some(fitsResolution))
       const admittedBundles: unknown[] = []
       const packages: LocalModelPackagesApi = {
@@ -110,16 +101,12 @@ describe("LocalModelInstaller", () => {
         acknowledgeFailure: () => Effect.void,
         removeBundlePackages: () => Effect.void,
       }
-      const installer = yield* makeLocalModelInstaller(retained, packages, {
+      const installer = yield* makeLocalModelInstaller(packages, {
         exclusive: (operation) => operation,
       }, resolverFrom(resolution))
       const first = yield* installer.install(model.configuration.id)
-      yield* Ref.set(resolution, Option.none())
-      const second = yield* installer.install(model.configuration.id)
       return {
         first,
-        second,
-        retained: yield* retained.get,
         admittedBundles,
       }
     }))
@@ -128,20 +115,11 @@ describe("LocalModelInstaller", () => {
       _tag: "DownloadAdmitted",
       downloadId: "download-a",
     })
-    expect(result.second.providerModelId).toBe("configuration-a")
-    expect(result.second._tag).toBe("AlreadyInstalled")
-    expect(result.retained.map(({ id }) => id)).toEqual(["configuration-a"])
-    expect(result.admittedBundles).toHaveLength(2)
+    expect(result.admittedBundles).toEqual([model.configuration.bundle])
   })
 
-  it("rejects an unretained configuration without a current Fits resolution", async () => {
+  it("rejects a configuration without a current Fits resolution", async () => {
     const outcomes = await Effect.runPromise(Effect.gen(function* () {
-      const initial = yield* Schema.decodeUnknown(ModelStateSchema)({
-        configurations: [],
-        configurationRecoveryCompleted: true,
-      })
-      const state = yield* makeTestModelState(initial)
-      const retained = makeRetainedModelConfigurations(state)
       let admissions = 0
       const packages = {
         initialized: Effect.succeed(true),
@@ -160,7 +138,7 @@ describe("LocalModelInstaller", () => {
         removeBundlePackages: () => Effect.void,
       } satisfies LocalModelPackagesApi
       const resolution = yield* Ref.make<Option.Option<ResolvedLocalModelConfiguration>>(Option.none())
-      const installer = yield* makeLocalModelInstaller(retained, packages, {
+      const installer = yield* makeLocalModelInstaller(packages, {
         exclusive: (operation) => operation,
       }, resolverFrom(resolution))
 
@@ -197,13 +175,11 @@ describe("LocalModelInstaller", () => {
       const failed = yield* installer.install(model.configuration.id).pipe(Effect.either)
       return {
         tags: [missing, assessing, doesNotFit, failed].map((outcome) => outcome._tag),
-        retained: yield* retained.get,
         admissions,
       }
     }))
 
     expect(outcomes.tags).toEqual(["Left", "Left", "Left", "Left"])
-    expect(outcomes.retained).toEqual([])
     expect(outcomes.admissions).toBe(0)
   })
 })

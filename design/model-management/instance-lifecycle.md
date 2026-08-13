@@ -130,8 +130,9 @@ load boundary, minimum additional availability, and parallel sequence count. The
 preserves this evidence so clients can explain and retry the exact failed attempt without parsing a
 human-readable message or learning which platform-specific mechanism limited the allocation.
 
-After restart, ACN restores retained configurations and slot selections, projects their current
-provider offerings, and does not reconstruct prior instance identity or residency. New demand
+After restart, ACN restores slot selections, resolves their current configurations and provider
+offerings from catalog or standard-profile authorities, and does not reconstruct prior instance
+identity or residency. An unresolved selection remains unavailable without substitution. New demand
 creates a new admitted occurrence.
 
 ## Conformance

@@ -99,14 +99,11 @@ describe("local model configuration resolution", () => {
     }, new Set())).toBe(false)
   })
 
-  it("resolves one configuration per target with catalog, retained, standard precedence", () => {
+  it("resolves one configuration per target with catalog over standard precedence", () => {
     const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
     const standard = configuration("configuration-standard", bundle, 50_000)
     const catalog = configuration("configuration-catalog", bundle, 32_000)
-    const retained = configuration("configuration-retained", bundle, 24_000)
-
     expect([...resolveLocalModelConfigurations({
-      retained: [],
       catalog: [],
       installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
       assessed: new Map([[standard.id, {
@@ -116,7 +113,6 @@ describe("local model configuration resolution", () => {
       }]]),
     }).values()].map(({ configuration }) => configuration)).toEqual([standard])
     expect([...resolveLocalModelConfigurations({
-      retained: [],
       catalog: [catalog],
       installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
       assessed: new Map([
@@ -132,49 +128,6 @@ describe("local model configuration resolution", () => {
         }],
       ]),
     }).values()].map(({ configuration }) => configuration)).toEqual([catalog])
-    expect([...resolveLocalModelConfigurations({
-      retained: [retained],
-      catalog: [catalog],
-      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
-      assessed: new Map([
-        [standard.id, {
-          configuration: standard,
-          origin: "Standard",
-          assessment: { _tag: "Assessing" },
-        }],
-        [catalog.id, {
-          configuration: catalog,
-          origin: "Authored",
-          assessment: { _tag: "Assessing" },
-        }],
-        [retained.id, {
-          configuration: retained,
-          origin: "Authored",
-          assessment: { _tag: "Assessing" },
-        }],
-      ]),
-    }).values()].map(({ configuration }) => configuration)).toEqual([catalog])
-  })
-
-  it("preserves a retained configuration when its target is absent from the catalog", () => {
-    const retainedBundle = standaloneBundle({ _tag: "Local", path: "/models/retained" })
-    const otherBundle = standaloneBundle({ _tag: "Local", path: "/models/catalog" })
-    const catalogBundle = {
-      ...otherBundle,
-      package: {
-        ...otherBundle.package,
-        id: ModelPackageIdSchema.make("package-catalog"),
-      },
-    }
-    const retained = configuration("configuration-retained", retainedBundle, 24_000)
-    const catalog = configuration("configuration-catalog", catalogBundle, 32_000)
-
-    expect([...resolveLocalModelConfigurations({
-      retained: [retained],
-      catalog: [catalog],
-      installedPackageIds: new Set(),
-      assessed: new Map(),
-    }).values()].map(({ configuration }) => configuration)).toEqual([retained, catalog])
   })
 
   it("replaces generated standalone serving with the current catalog configuration for its target", () => {
@@ -203,7 +156,6 @@ describe("local model configuration resolution", () => {
     }]])
 
     const embeddedResolution = resolveLocalModelConfigurations({
-      retained: [],
       catalog: [embedded],
       installedPackageIds: new Set([standalone.package.id]),
       assessed,
@@ -212,7 +164,6 @@ describe("local model configuration resolution", () => {
     expect([...embeddedResolution.values()][0]?.configuration).toEqual(embedded)
 
     const separateResolution = resolveLocalModelConfigurations({
-      retained: [],
       catalog: [separate],
       installedPackageIds: new Set([standalone.package.id]),
       assessed,
@@ -226,7 +177,6 @@ describe("local model configuration resolution", () => {
     const staleCatalog = configuration("configuration-catalog", bundle, 32_000)
 
     expect(resolveLocalModelConfigurations({
-      retained: [],
       catalog: [],
       installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
       assessed: new Map([[staleCatalog.id, {
@@ -242,7 +192,6 @@ describe("local model configuration resolution", () => {
     const standard = configuration("configuration-standard", bundle, 50_000)
 
     expect(resolveLocalModelConfigurations({
-      retained: [],
       catalog: [],
       installedPackageIds: new Set(),
       assessed: new Map([[standard.id, {

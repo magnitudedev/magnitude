@@ -51,11 +51,9 @@ describe("new application-state initialization", () => {
     }).pipe(Effect.provide(StorageLive.pipe(Layer.provide(dependencies())))))
 
     expect(state.models).toEqual({
-      configurations: [],
       slots: { primary: Option.none(), secondary: Option.none() },
       recentModels: { primary: [], secondary: [] },
       favorites: [],
-      configurationRecoveryCompleted: false,
     })
     expect(state.onboarding).toEqual({ completed: false })
     expect(await Bun.file(paths.modelsFile).exists()).toBe(true)

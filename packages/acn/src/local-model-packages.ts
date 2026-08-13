@@ -30,7 +30,6 @@ import {
   IcnInstalledModels,
 } from "@magnitudedev/icn"
 import { makeObservedState } from "./mirrored-state"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
 import {
   modelDownloadFromIcn,
   modelPackageFromIcn,
@@ -118,13 +117,12 @@ export class LocalModelPackages extends Context.Tag("LocalModelPackages")<
 export const LocalModelPackagesLive: Layer.Layer<
   LocalModelPackages,
   never,
-  IcnCatalog | IcnClient | IcnDownloads | IcnInstalledModels | RetainedModelConfigurations
+  IcnCatalog | IcnClient | IcnDownloads | IcnInstalledModels
 > = Layer.scoped(LocalModelPackages, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const installed = yield* IcnInstalledModels
   const downloads = yield* IcnDownloads
   const client = yield* IcnClient
-  const retained = yield* RetainedModelConfigurations
   const mirror = yield* makeObservedState<ModelPackagesState>({
     inventory: { _tag: "Initializing" },
     entries: [],
@@ -168,12 +166,6 @@ export const LocalModelPackagesLive: Layer.Layer<
     const allPackages = new Map<ModelPackageId, ModelPackage>(
       catalogPackages.map((modelPackage) => [modelPackage.id, modelPackage]),
     )
-    for (const configuration of yield* retained.get) {
-      const referenced = servableModelBundlePackages(configuration.bundle)
-      for (const modelPackage of referenced) {
-        allPackages.set(ModelPackageIdSchema.make(modelPackage.id), modelPackage)
-      }
-    }
     for (const item of installedModels) {
       allPackages.set(item.package.id, item.package)
     }
@@ -231,7 +223,6 @@ export const LocalModelPackagesLive: Layer.Layer<
     catalog.changes.pipe(Stream.map(() => undefined)),
     installed.changes.pipe(Stream.map(() => undefined)),
     downloads.changes.pipe(Stream.map(() => undefined)),
-    retained.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" }).pipe(
     Stream.runForEach(() => project),
     Effect.forkScoped,

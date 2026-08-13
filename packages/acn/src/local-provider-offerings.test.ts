@@ -12,14 +12,13 @@ import {
   IcnInstalledModels,
 } from "@magnitudedev/icn"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
+import { LocalModelConfigurationResolver, localModelTargetIdentity } from "./local-model-configuration-resolver"
 import {
   LocalProviderOfferingsLive,
   providerOfferingPackageEvidence,
   sameProviderOfferingPackageEvidence,
 } from "./local-provider-offerings"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
 
 describe("local provider offering projection", () => {
   it("tracks package facts without changing exact configuration identity", () => {
@@ -86,14 +85,17 @@ describe("local provider offering projection", () => {
         },
       }
       const dependencies = Layer.mergeAll(
-        Layer.succeed(RetainedModelConfigurations, RetainedModelConfigurations.of({
-          get: Effect.succeed([configuration]),
-          recoveryCompleted: Effect.succeed(true),
+        Layer.succeed(LocalModelConfigurationResolver, LocalModelConfigurationResolver.of({
+          get: Effect.succeed(new Map([[
+            localModelTargetIdentity(configuration.bundle),
+            { configuration, assessment: Option.some({ _tag: "Assessing" }) },
+          ]])),
           changes: Stream.never,
-          resolve: () => Effect.succeed(Option.some(configuration)),
-          materialize: Effect.succeed,
-          remove: () => Effect.succeed(Option.none()),
-          completeRecovery: () => Effect.succeed([]),
+          catalogReady: Effect.succeed(true),
+          resolve: () => Effect.succeed(Option.some({
+            configuration,
+            assessment: Option.some({ _tag: "Assessing" }),
+          })),
         })),
         Layer.succeed(IcnCatalog, IcnCatalog.of({
           get: Effect.succeed({ revision: 1, state: { models: [], diagnostics: [] } }),
@@ -129,10 +131,6 @@ describe("local provider offering projection", () => {
           cancelDownload: () => Effect.dieMessage("unused"),
           acknowledgeFailure: () => Effect.dieMessage("unused"),
           removeBundlePackages: () => Effect.dieMessage("unused"),
-        })),
-        Layer.succeed(LocalModelAssessor, LocalModelAssessor.of({
-          state: Effect.never,
-          changes: Stream.never,
         })),
       )
       yield* Layer.build(LocalProviderOfferingsLive.pipe(Layer.provide(dependencies)))

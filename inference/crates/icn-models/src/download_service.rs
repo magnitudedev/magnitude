@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use futures_util::StreamExt;
@@ -8,42 +6,34 @@ use futures_util::future::BoxFuture;
 use getrandom::fill;
 use icn_contracts::models::{
     ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads, ModelDownloadsResponse,
-    ModelPackage, ModelPackageId, ServableModelBundle, StartModelDownloadRequest,
-    StartModelDownloadResponse,
+    ModelPackage, ModelPackageId, ModelPackageSource, ServableModelBundle,
+    StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{DownloadFailure, DownloadStage, InventoryError, ModelDownloadEvent};
-use serde::{Deserialize, Serialize};
 
 use crate::inventory::ModelManager;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DownloadAttemptId(String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DownloadAttempt {
-    #[serde(rename_all = "camelCase")]
     Pending {
         id: DownloadAttemptId,
         package_id: ModelPackageId,
     },
-    #[serde(rename_all = "camelCase")]
     Downloading {
         id: DownloadAttemptId,
         package_id: ModelPackageId,
         stage: DownloadStage,
         completed_bytes: u64,
         total_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes_per_second: Option<u64>,
     },
-    #[serde(rename_all = "camelCase")]
     Completed {
         id: DownloadAttemptId,
         package_id: ModelPackageId,
     },
-    #[serde(rename_all = "camelCase")]
     Failed {
         id: DownloadAttemptId,
         package_id: ModelPackageId,
@@ -51,7 +41,6 @@ enum DownloadAttempt {
         total_bytes: u64,
         failure: DownloadFailure,
     },
-    #[serde(rename_all = "camelCase")]
     Cancelled {
         id: DownloadAttemptId,
         package_id: ModelPackageId,
@@ -66,20 +55,16 @@ pub struct ManagedModelDownloads {
     records: Arc<RwLock<BTreeMap<DownloadAttemptId, AttemptRecord>>>,
     downloads: Arc<RwLock<BTreeMap<ModelDownloadId, DownloadRecord>>>,
     starts: Arc<tokio::sync::Mutex<()>>,
-    path: Arc<PathBuf>,
-    downloads_path: Arc<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct AttemptRecord {
     attempt: DownloadAttempt,
     package: ModelPackage,
-    #[serde(default)]
     sequence: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone)]
 struct DownloadRecord {
     id: ModelDownloadId,
     bundle: ServableModelBundle,
@@ -92,35 +77,11 @@ struct DownloadRecord {
 
 impl ManagedModelDownloads {
     pub async fn open(manager: Arc<ModelManager>) -> Result<Self, InventoryError> {
-        let path = manager.config.root.join("download-attempts.json");
-        let downloads_path = manager.config.root.join("model-downloads.json");
-        let mut records = load_records(&path);
-        for record in records.values_mut() {
-            let interrupted = matches!(
-                record.attempt,
-                DownloadAttempt::Pending { .. } | DownloadAttempt::Downloading { .. }
-            );
-            if interrupted {
-                let (id, package_id) = attempt_identity(&record.attempt);
-                let (completed_bytes, total_bytes) = attempt_progress(&record.attempt);
-                record.attempt = DownloadAttempt::Failed {
-                    id,
-                    package_id,
-                    completed_bytes,
-                    total_bytes,
-                    failure: DownloadFailure::Interrupted,
-                };
-            }
-        }
-        persist_records(&path, &records);
-        let downloads = load_download_records(&downloads_path);
         Ok(Self {
             manager,
-            records: Arc::new(RwLock::new(records)),
-            downloads: Arc::new(RwLock::new(downloads)),
+            records: Arc::new(RwLock::new(BTreeMap::new())),
+            downloads: Arc::new(RwLock::new(BTreeMap::new())),
             starts: Arc::new(tokio::sync::Mutex::new(())),
-            path: Arc::new(path),
-            downloads_path: Arc::new(downloads_path),
         })
     }
 
@@ -130,7 +91,6 @@ impl ManagedModelDownloads {
         };
         if let Some(record) = records.get_mut(id) {
             record.attempt = attempt;
-            persist_records(&self.path, &records);
         }
     }
 
@@ -244,6 +204,28 @@ fn bundle_packages(bundle: &ServableModelBundle) -> Vec<&ModelPackage> {
             }
         },
     }
+}
+
+fn validate_bundle_repository_revisions(packages: &[ModelPackage]) -> Result<(), InventoryError> {
+    let mut revisions = BTreeMap::new();
+    for package in packages {
+        let ModelPackageSource::HuggingFace {
+            repository,
+            revision,
+        } = &package.source
+        else {
+            continue;
+        };
+        if revisions
+            .insert(repository, revision)
+            .is_some_and(|existing| existing != revision)
+        {
+            return Err(InventoryError::InvalidRequest(format!(
+                "a model bundle cannot require multiple revisions of {repository}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn package_bytes(package: &ModelPackage) -> u64 {
@@ -445,74 +427,6 @@ fn random_download_id() -> Result<ModelDownloadId, InventoryError> {
     )))
 }
 
-fn load_records(path: &Path) -> BTreeMap<DownloadAttemptId, AttemptRecord> {
-    let mut records = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<AttemptRecord>>(&bytes).ok())
-        .unwrap_or_default();
-    for (index, record) in records.iter_mut().enumerate() {
-        if record.sequence == 0 {
-            record.sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-        }
-    }
-    records
-        .into_iter()
-        .map(|record| {
-            let (id, _) = attempt_identity(&record.attempt);
-            (id, record)
-        })
-        .collect()
-}
-
-fn persist_records_result(
-    path: &Path,
-    records: &BTreeMap<DownloadAttemptId, AttemptRecord>,
-) -> Result<(), InventoryError> {
-    let parent = path.parent().ok_or_else(|| {
-        InventoryError::Io("download attempt registry has no parent directory".to_owned())
-    })?;
-    fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
-    let temporary = path.with_extension("json.tmp");
-    let values = records.values().collect::<Vec<_>>();
-    let bytes =
-        serde_json::to_vec(&values).map_err(|error| InventoryError::Internal(error.to_string()))?;
-    fs::write(&temporary, bytes).map_err(|error| InventoryError::Io(error.to_string()))?;
-    fs::rename(temporary, path).map_err(|error| InventoryError::Io(error.to_string()))?;
-    Ok(())
-}
-
-fn persist_records(path: &Path, records: &BTreeMap<DownloadAttemptId, AttemptRecord>) {
-    let _ = persist_records_result(path, records);
-}
-
-fn load_download_records(path: &Path) -> BTreeMap<ModelDownloadId, DownloadRecord> {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<DownloadRecord>>(&bytes).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|record| (record.id.clone(), record))
-        .collect()
-}
-
-fn persist_download_records_result(
-    path: &Path,
-    records: &BTreeMap<ModelDownloadId, DownloadRecord>,
-) -> Result<(), InventoryError> {
-    let parent = path.parent().ok_or_else(|| {
-        InventoryError::Io("model download registry has no parent directory".to_owned())
-    })?;
-    fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
-    let temporary = path.with_extension("json.tmp");
-    let mut values = records.values().collect::<Vec<_>>();
-    values.sort_by_key(|record| record.sequence);
-    let bytes =
-        serde_json::to_vec(&values).map_err(|error| InventoryError::Internal(error.to_string()))?;
-    fs::write(&temporary, bytes).map_err(|error| InventoryError::Io(error.to_string()))?;
-    fs::rename(temporary, path).map_err(|error| InventoryError::Io(error.to_string()))?;
-    Ok(())
-}
-
 impl ModelDownloads for ManagedModelDownloads {
     fn start(
         &self,
@@ -535,6 +449,7 @@ impl ModelDownloads for ManagedModelDownloads {
                     "a separate speculative draft must be distinct from its target".to_owned(),
                 ));
             }
+            validate_bundle_repository_revisions(&packages)?;
             let active = {
                 let existing = self.records.read().map_err(|_| {
                     InventoryError::Internal("download registry lock poisoned".to_owned())
@@ -611,12 +526,6 @@ impl ModelDownloads for ManagedModelDownloads {
                     );
                     sequence = sequence.saturating_add(1);
                 }
-                if let Err(error) = persist_records_result(&self.path, &records) {
-                    for (id, _) in &new_attempts {
-                        records.remove(id);
-                    }
-                    return Err(error);
-                }
             }
             for ((package, (id, attempt)), stream) in missing
                 .into_iter()
@@ -657,12 +566,6 @@ impl ModelDownloads for ManagedModelDownloads {
                     .unwrap_or(0)
                     .saturating_add(1);
                 downloads.insert(id.clone(), record);
-                if let Err(error) =
-                    persist_download_records_result(&self.downloads_path, &downloads)
-                {
-                    downloads.remove(&id);
-                    return Err(error);
-                }
                 Some(projected)
             };
             Ok(StartModelDownloadResponse { download })
@@ -712,7 +615,6 @@ impl ModelDownloads for ManagedModelDownloads {
                         .get_mut(&id)
                         .expect("active model download must remain retained")
                         .cancelled = true;
-                    persist_download_records_result(&self.downloads_path, &downloads)?;
                     let record = downloads
                         .get(&id)
                         .cloned()
@@ -802,7 +704,6 @@ impl ModelDownloads for ManagedModelDownloads {
                 .get_mut(&id)
                 .expect("failed model download must remain retained")
                 .failure_acknowledged = true;
-            persist_download_records_result(&self.downloads_path, &downloads)?;
             Ok(model_download(
                 downloads
                     .get(&id)
@@ -820,6 +721,7 @@ mod tests {
         ModelFile, ModelFileId, ModelFileRole, ModelPackageId, ModelPackageProperties,
         ModelPackageSource, SpeculativeDraftSource, SpeculativeMethod,
     };
+    use std::path::PathBuf;
 
     fn package(id: &str, size_bytes: u64) -> ModelPackage {
         ModelPackage {
@@ -853,6 +755,21 @@ mod tests {
             draft_source: SpeculativeDraftSource::Separate { draft },
             method: SpeculativeMethod::DSpark,
         }
+    }
+
+    #[test]
+    fn bundle_rejects_two_revisions_of_one_repository() {
+        let target = package("package_target", 10);
+        let mut draft = package("package_draft", 20);
+        draft.source = ModelPackageSource::HuggingFace {
+            repository: "owner/repository".to_owned(),
+            revision: "c".repeat(40),
+        };
+
+        assert!(matches!(
+            validate_bundle_repository_revisions(&[target, draft]),
+            Err(InventoryError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -896,35 +813,6 @@ mod tests {
                 total_bytes: 30,
                 bytes_per_second: Some(4),
             }
-        );
-    }
-
-    #[test]
-    fn model_download_records_round_trip_with_their_stable_identity() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("model-downloads.json");
-        let id = ModelDownloadId("model_download_test".to_owned());
-        let records = BTreeMap::from([(
-            id.clone(),
-            DownloadRecord {
-                id: id.clone(),
-                bundle: ServableModelBundle::Standalone {
-                    package: package("package_test", 10),
-                },
-                attempt_ids: vec![DownloadAttemptId("attempt_test".to_owned())],
-                installed_package_ids_at_admission: Vec::new(),
-                cancelled: false,
-                failure_acknowledged: false,
-                sequence: 1,
-            },
-        )]);
-
-        persist_download_records_result(&path, &records).expect("persist model downloads");
-        assert_eq!(
-            load_download_records(&path)
-                .get(&id)
-                .map(|record| &record.id),
-            Some(&id)
         );
     }
 

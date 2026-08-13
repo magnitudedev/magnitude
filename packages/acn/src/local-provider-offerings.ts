@@ -28,9 +28,8 @@ import {
   packageInspectionFromIcn,
   recommendableModelFromIcn,
 } from "./local-model-icn-adapter"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
-import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
+import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver"
 import { makeObservedState } from "./mirrored-state"
 import { resolveBundlePresentation } from "./local-model-presentation"
 
@@ -139,13 +138,11 @@ export class LocalProviderOfferings extends Context.Tag("LocalProviderOfferings"
 export const LocalProviderOfferingsLive: Layer.Layer<
   LocalProviderOfferings,
   never,
-  RetainedModelConfigurations | IcnCatalog | IcnInstalledModels
-    | LocalModelAssessor | LocalModelPackages
+  IcnCatalog | IcnInstalledModels | LocalModelConfigurationResolver | LocalModelPackages
 > = Layer.scoped(LocalProviderOfferings, Effect.gen(function* () {
-  const retained = yield* RetainedModelConfigurations
   const catalog = yield* IcnCatalog
   const installed = yield* IcnInstalledModels
-  const assessments = yield* LocalModelAssessor
+  const resolver = yield* LocalModelConfigurationResolver
   const packages = yield* LocalModelPackages
 
   const capabilitySources = Effect.all({
@@ -182,7 +179,8 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   }))
 
   const list: LocalProviderOfferingsApi["list"] = Effect.gen(function* () {
-    const configurations = yield* retained.get
+    const configurations = [...(yield* resolver.get).values()].map(({ configuration }) =>
+      configuration)
     const sources = yield* capabilitySources
     return offeringsFrom(configurations, sources)
   }).pipe(
@@ -192,7 +190,7 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   )
 
   const changes = Stream.mergeAll([
-    retained.changes.pipe(Stream.map(() => undefined)),
+    resolver.changes,
     catalog.changes.pipe(Stream.map(() => undefined)),
     installed.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" })
@@ -214,11 +212,11 @@ export const LocalProviderOfferingsLive: Layer.Layer<
     && Option.getOrUndefined(left.failure)?.message === Option.getOrUndefined(right.failure)?.message
 
   const compute = Effect.gen(function* () {
-    const configurations = yield* retained.get
+    const resolved = [...(yield* resolver.get).values()]
+    const configurations = resolved.map(({ configuration }) => configuration)
     const sources = yield* capabilitySources
     const catalogModels = sources.catalog.models
     const packageSnapshot = yield* packages.snapshot
-    const assessmentState = yield* assessments.state
     const packageEntries = new Map(
       packageSnapshot.state.entries.map((entry) => [entry.package.id, entry]),
     )
@@ -234,8 +232,9 @@ export const LocalProviderOfferingsLive: Layer.Layer<
     const entries = configured.map((offering, index): ProviderModelCatalogEntry => {
       const { bundle, profile } = offering.configuration
       const installed = installedBundles[index] ?? false
-      const coordinated = assessmentState.get(offering.configuration.id)
-      const assessment = inspectable[index] ? coordinated?.assessment : undefined
+      const assessment = inspectable[index]
+        ? Option.getOrUndefined(resolved[index]?.assessment ?? Option.none())
+        : undefined
       const curated = catalogModels.find((model) =>
         sameBundle(model.configuration.bundle, bundle))
       const presentation = resolveBundlePresentation(bundle, curated && {
@@ -297,7 +296,6 @@ export const LocalProviderOfferingsLive: Layer.Layer<
     Stream.concat(Stream.mergeAll([
       changes,
       packages.changes.pipe(Stream.map(() => undefined)),
-      assessments.changes.pipe(Stream.map(() => undefined)),
     ], { concurrency: "unbounded" }).pipe(Stream.debounce("25 millis"))),
     Stream.runForEach(() => project),
     Effect.forkScoped,

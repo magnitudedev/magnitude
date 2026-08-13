@@ -1,15 +1,12 @@
 ---
 applies_to:
-  - packages/ai/src/provider/**
-  - packages/ai/src/response/**
-  - packages/harness/src/events.ts
-  - packages/harness/src/turn/dispatcher.ts
+  - packages/ai/src/**
+  - packages/harness/src/**
   - packages/icn/src/provider/**
   - packages/acn/src/local-provider-**
   - packages/acn/src/model-*.ts
   - packages/acn/src/provider-model-catalog.ts
-  - packages/agent/src/model/**
-  - packages/agent/src/errors/model-start.ts
+  - packages/agent/src/**
   - packages/acn-protocol/src/schemas/model-state.ts
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
@@ -23,19 +20,19 @@ or runtime residency.
 
 ## Provider offerings
 
-ACN owns durable retained model serving configurations. The local provider adapter projects each
-configuration as one offering containing a stable local provider model ID and that exact
-configuration. The offering is a projection rather than another persisted record.
+The local provider adapter projects each currently resolved model serving configuration as one
+offering containing a stable local provider model ID and that exact configuration. Both the
+configuration and offering are derived rather than persisted.
 
-Capabilities are not persisted as offering state. ACN resolves them from the recommendable catalog
-or installed package inspection. When neither source can establish capabilities, the retained
-configuration remains visible as disabled with conservative metadata rather than claiming support.
+ACN resolves configurations and capabilities from issued catalog entries or installed package
+inspection plus the canonical standard-profile rule. When current evidence cannot establish capabilities, the
+offering remains disabled with conservative metadata rather than claiming support.
 
 Within the separate `local` provider namespace, the provider model ID is exactly the serving
 configuration ID. ACN never prefixes or hashes package or profile data to create another identity.
 
 An offering exists independently of current installation, assessment, slot selection, or residency.
-ACN's local-offering projection combines the durable configuration with installed-package and assessment
+ACN's local-offering projection combines the resolved configuration with installed-package and assessment
 observations to produce the provider model catalog entry. This is the only place that derives local
 provider availability. When ICN can assess the exact configuration, that catalog entry carries the
 complete per-domain memory accounting unchanged: capacity, required allocation, compatibility
@@ -68,10 +65,9 @@ Unavailable snapshot before releasing ownership, so caller loss cannot strand `R
 
 Product visibility and grouping belong to
 [Local-model product projection](../model-management/local-model-product-projection.md). The provider
-adapter contributes one offering facet for each retained configuration; it does not enumerate
-installed packages or decide whether a product row exists. Bundle identity is its tagged structure
-and ordered package identities; the retained configuration is the provider's complete operational
-authority. Provider model IDs continue to distinguish configurations.
+adapter contributes one offering facet for each resolved configuration; it does not decide whether
+a product row exists. Bundle identity is its tagged structure and ordered package identities.
+Provider model IDs continue to distinguish exact configurations.
 
 ## Selection and resolution
 
@@ -83,8 +79,9 @@ requested effort and otherwise selects the provider model's default. Stored sele
 normalized through the same operation when the catalog becomes available. The client and agent do
 not independently repair reasoning effort.
 
-The local provider resolver maps the selected provider model ID directly to the exact retained
-configuration. Provider binding is cheap and has no runtime side effect.
+The local provider resolver maps the selected provider model ID to the exact current catalog or
+standard configuration. Provider binding is cheap and has no runtime side effect. Failure to
+resolve preserves the selection as unavailable; it never chooses another configuration.
 
 Existing recency-based slot substitution remains product behavior. It operates on stable provider
 model IDs and does not create, reassess, or rewrite offerings.
@@ -96,7 +93,7 @@ ICN owns one `ModelInstanceController` and currently permits at most one Ready l
 ACN's `ModelSlotController` is the product intent authority. A manual load and local request
 preparation use the same canonical slot and instance observation:
 
-1. resolve the selected retained configuration through its provider offering;
+1. resolve the selected configuration through its current provider offering;
 2. require all bundle packages to be installed;
 3. create a fresh `ModelInstanceId` and submit the exact configuration to ICN;
 4. bind the slot after native admission and observe that exact instance to Ready; and
@@ -172,7 +169,7 @@ reports the selected method, effective parameters, and whether drafting actually
 
 ## Failure behavior
 
-- Missing retained configuration: ACN rejects provider resolution.
+- Unresolved selected configuration: ACN rejects provider resolution without changing selection.
 - Missing package: the provider catalog entry and slot are unavailable; chat does not trigger a
   download.
 - Configuration no longer fits or is incompatible: the provider catalog entry is disabled and load
@@ -182,9 +179,9 @@ reports the selected method, effective parameters, and whether drafting actually
 
 ## Acceptance criteria
 
-- Every local provider call resolves through one retained exact configuration and one read-only
+- Every local provider call resolves through one exact current configuration and one read-only
   provider projection.
-- Runtime load receives the stored ICN configuration unchanged.
+- Runtime load receives the resolved ICN configuration unchanged.
 - Local availability is derived in one ACN projection.
 - Provider projection consumes assessment state and never admits assessment work.
 - Provider availability never determines local-model product visibility.
