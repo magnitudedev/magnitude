@@ -15,7 +15,7 @@ import {
 } from "@magnitudedev/sdk"
 import { OnboardingPersistence } from "../onboarding/persistence"
 import { ModelSlots, sameSlotSelection } from "../model-slots/service"
-import { LocalModels, sameDownloadAttemptIds } from "./service"
+import { LocalModels } from "./service"
 import {
   findLocalModelByConfigurationId,
   localModelProviderModelId,
@@ -206,7 +206,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           }
           if (admission._tag === "AlreadyInstalled"
             || acquisition._tag === "NotInstalled"
-            || !sameDownloadAttemptIds(acquisition.attemptIds, admission.attemptIds)) {
+            || acquisition.downloadId !== admission.downloadId) {
             return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
               configurationId: prepared.configurationId,
               resource: "installation",
@@ -235,7 +235,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
                 })
               : Effect.void
             const cancel = admission._tag === "DownloadAdmitted"
-              ? localModels.cancelDownload(admission.attemptIds).pipe(
+              ? localModels.cancelDownload(admission.downloadId).pipe(
                   Effect.tapError((failure) => setExecution({
                     _tag: "Failed",
                     configurationId: resolved.prepared.configurationId,

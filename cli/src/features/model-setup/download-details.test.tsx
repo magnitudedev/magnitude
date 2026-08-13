@@ -3,7 +3,7 @@ import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { beforeEach, expect, test, vi } from "vitest"
-import { DownloadAttemptIdSchema, ModelVariantLabelSchema } from "@magnitudedev/sdk"
+import { ModelDownloadIdSchema, ModelVariantLabelSchema } from "@magnitudedev/sdk"
 import { makeAcquiringModel, GIB } from "../local-inference/test-fixtures"
 
 const keyboard = vi.hoisted(() => ({
@@ -31,7 +31,7 @@ const onCancel = vi.fn()
 const model = makeAcquiringModel(
   {
     _tag: "Downloading",
-    attemptIds: [DownloadAttemptIdSchema.make("download_qwen")],
+    downloadId: ModelDownloadIdSchema.make("download_qwen"),
     stage: "downloading",
     completedBytes: 19 * GIB,
     totalBytes: 30 * GIB,

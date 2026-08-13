@@ -162,12 +162,13 @@ Generic agent code consumes the optional capability without branching on the loc
 
 ## Speculative decoding
 
-A speculative-decoding pair is explicit in the offering's configuration. ACN does not attach or
-remove a draft during provider resolution or chat.
+A speculative-decoding bundle is explicit in the offering's configuration, including its method
+and embedded or separate draft source. ACN does not attach, remove, or infer a draft or method
+during provider resolution or chat.
 
-ICN resolves target and draft components through one native planning path. Assessment and loading
-use the same exact bundle structure and speculative-selection policy. Runtime evidence reports whether
-drafting actually ran.
+ICN resolves embedded and separate draft capability through one native planning path. Assessment
+and loading use the same exact bundle structure and speculative-selection policy. Runtime evidence
+reports the selected method, effective parameters, and whether drafting actually ran.
 
 ## Failure behavior
 
@@ -195,4 +196,5 @@ drafting actually ran.
 - Preparation admission remains held until ICN accepts the request's generation lease.
 - Chat cannot mutate residency.
 - Slot selection and recency refer only to stable provider model IDs.
-- Target/draft composition is identical during assessment, load, and inference.
+- Speculative method and embedded/separate draft composition are identical during assessment, load,
+  and inference.

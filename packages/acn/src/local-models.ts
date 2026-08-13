@@ -2,7 +2,9 @@ import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsMirror,
   ServableModelBundleSchema,
+  sameServableModelBundleIdentity,
   servableModelBundlePackageIds,
+  servableModelBundlePackages,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
@@ -13,6 +15,7 @@ import {
   type LocalModelsState,
   type MemoryAssessment,
   type ModelFailure,
+  type ModelBundleDownload,
   type ModelPackageEntry,
   type ModelServingConfiguration,
   type ProviderModelCatalogEntry,
@@ -36,6 +39,8 @@ import {
 } from "./local-model-assessments"
 import { recommendableModelFromIcn } from "./local-model-icn-adapter"
 import {
+  configuredModelPackageIds,
+  isStandalonePackageCandidate,
   LocalModelConfigurationResolver,
   localModelBundleIdentity as bundleIdentity,
 } from "./local-model-configuration-resolver"
@@ -45,14 +50,14 @@ export { resolveBundlePresentation } from "./local-model-presentation"
 const GIB = 1024 ** 3
 
 const bundleDownloadBytes = (bundle: ServableModelBundle): number =>
-  bundlePackages(bundle).reduce((total, modelPackage) => total
+  servableModelBundlePackages(bundle).reduce((total, modelPackage) => total
     + modelPackage.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0)
 
 const installedBundle = (
   bundle: ServableModelBundle,
   entries: ReadonlyMap<string, ModelPackageEntry>,
 ): Extract<LocalModelAcquisitionState, { readonly _tag: "Installed" }> | undefined => {
-  const packages = bundlePackages(bundle)
+  const packages = servableModelBundlePackages(bundle)
   const packageEntries = packages.map((modelPackage) => entries.get(modelPackage.id))
   if (!packageEntries.every((entry) => entry?.localState._tag === "Installed")) {
     return undefined
@@ -66,11 +71,12 @@ const installedBundle = (
   return { _tag: "Installed", installedBytes, origins: [origin, ...remainingOrigins] }
 }
 
-const aggregateAcquisitionState = (
+export const aggregateAcquisitionState = (
   bundle: ServableModelBundle,
   entries: ReadonlyMap<string, ModelPackageEntry>,
+  downloads: readonly ModelBundleDownload[],
 ): LocalModelAcquisitionState => {
-  const packages = bundlePackages(bundle)
+  const packages = servableModelBundlePackages(bundle)
   const packageEntries = packages.map((modelPackage) => entries.get(modelPackage.id))
   const totalBytes = bundleDownloadBytes(bundle)
   const installedBytes = packages.reduce((total, modelPackage, index) =>
@@ -79,66 +85,54 @@ const aggregateAcquisitionState = (
       : 0), 0)
   const installation = installedBundle(bundle, entries)
   if (installation !== undefined) return installation
-
-  const downloading = packageEntries.flatMap((entry) =>
-    entry?.localState._tag === "Downloading" ? [entry.localState] : [])
-  const completedBytes = installedBytes + downloading.reduce(
-    (total, state) => total + state.completedBytes,
-    0,
-  )
-  if (downloading.length > 0) {
-    const stages = downloading.map(({ stage }) => stage)
-    const stage = stages.every((value) => value === stages[0])
-      ? stages[0] ?? "queued"
-      : stages.every((value) => value === "verifying" || value === "publishing")
-        ? "verifying" as const
-        : stages.some((value) => value === "downloading")
-          ? "downloading" as const
-          : stages[0] ?? "queued"
-    const rates = downloading.flatMap(({ bytesPerSecond }) => Option.toArray(bytesPerSecond))
-    return {
-      _tag: "Downloading",
-      attemptIds: downloading.map(({ attemptId }) => attemptId) as [
-        typeof downloading[number]["attemptId"],
-        ...Array<typeof downloading[number]["attemptId"]>,
-      ],
-      stage,
-      completedBytes,
-      totalBytes,
-      bytesPerSecond: rates.length === 0
-        ? Option.none()
-        : Option.some(rates.reduce((total, rate) => total + rate, 0)),
+  let current: ModelBundleDownload | undefined
+  for (let index = downloads.length - 1; index >= 0; index--) {
+    const candidate = downloads[index]
+    if (candidate !== undefined && sameServableModelBundleIdentity(candidate.bundle, bundle)) {
+      current = candidate
+      break
     }
   }
-
-  const failed = packageEntries.flatMap((entry) =>
-    entry?.localState._tag === "DownloadFailed" ? [entry.localState] : [])[0]
-  if (failed !== undefined) {
-    const attemptIds = packageEntries.flatMap((entry) =>
-      entry?.localState._tag === "DownloadFailed" ? [entry.localState.attemptId] : [])
-    return {
-      _tag: "Failed",
-      attemptIds: attemptIds as [typeof attemptIds[number], ...Array<typeof attemptIds[number]>],
-      completedBytes: installedBytes + packageEntries.reduce((total, entry) =>
-        total + (entry?.localState._tag === "DownloadFailed" ? entry.localState.completedBytes : 0), 0),
-      totalBytes,
-      failure: failed.failure,
-    }
-  }
-
-  const cancelledAttemptIds = packageEntries.flatMap((entry) =>
-    entry?.localState._tag === "DownloadCancelled" ? [entry.localState.attemptId] : [])
-  return cancelledAttemptIds.length > 0
-    ? {
-        _tag: "Cancelled",
-        attemptIds: cancelledAttemptIds as [
-          typeof cancelledAttemptIds[number],
-          ...Array<typeof cancelledAttemptIds[number]>,
-        ],
-        completedBytes,
-        totalBytes,
+  if (current === undefined) return { _tag: "NotInstalled", completedBytes: installedBytes, totalBytes }
+  switch (current.state._tag) {
+    case "Pending":
+      return {
+        _tag: "Downloading",
+        downloadId: current.id,
+        stage: "queued",
+        completedBytes: current.state.completedBytes,
+        totalBytes: current.state.totalBytes,
+        bytesPerSecond: Option.none(),
       }
-    : { _tag: "NotInstalled", completedBytes, totalBytes }
+    case "Downloading":
+      return {
+        _tag: "Downloading",
+        downloadId: current.id,
+        stage: current.state.stage,
+        completedBytes: current.state.completedBytes,
+        totalBytes: current.state.totalBytes,
+        bytesPerSecond: current.state.bytesPerSecond,
+      }
+    case "Completed":
+      return { _tag: "NotInstalled", completedBytes: installedBytes, totalBytes }
+    case "Failed":
+      return current.state.acknowledged
+        ? { _tag: "NotInstalled", completedBytes: installedBytes, totalBytes }
+        : {
+            _tag: "Failed",
+            downloadId: current.id,
+            completedBytes: current.state.completedBytes,
+            totalBytes: current.state.totalBytes,
+            failure: current.state.failure,
+          }
+    case "Cancelled":
+      return {
+        _tag: "Cancelled",
+        downloadId: current.id,
+        completedBytes: current.state.completedBytes,
+        totalBytes: current.state.totalBytes,
+      }
+  }
 }
 
 type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
@@ -385,11 +379,14 @@ export const LocalModelsLive: Layer.Layer<
     for (const { configuration } of resolvedConfigurations.values()) {
       addBundle(configuration.bundle)
     }
+    const configuredPackages = configuredModelPackageIds(
+      [...resolvedConfigurations.values()].map(({ configuration }) => configuration),
+    )
     for (const entry of packageState.entries) {
       if (entry.localState._tag !== "Installed") continue
-      const independentlyServable = entry.package.files.some(({ role }) =>
-        role === "weights" || role === "draft")
-      if (independentlyServable) addBundle({ _tag: "Standalone", package: entry.package })
+      if (isStandalonePackageCandidate(entry.package, configuredPackages)) {
+        addBundle({ _tag: "Standalone", package: entry.package })
+      }
     }
 
     const catalogByBundle = new Map(catalogModels.map((model) => [
@@ -425,8 +422,8 @@ export const LocalModelsLive: Layer.Layer<
         description: curated.description,
         license: curated.license,
       })
-      const acquisitionState = aggregateAcquisitionState(bundle, packageEntries)
-      const bundleEntries = bundlePackages(bundle).map((modelPackage) =>
+      const acquisitionState = aggregateAcquisitionState(bundle, packageEntries, packageState.downloads)
+      const bundleEntries = servableModelBundlePackages(bundle).map((modelPackage) =>
         packageEntries.get(modelPackage.id))
       const inspectionFailure = bundleEntries.flatMap((entry) =>
         entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible"

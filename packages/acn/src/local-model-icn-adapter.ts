@@ -1,6 +1,6 @@
 import { Effect, Option, ParseResult, Schema } from "effect"
 import type {
-  DownloadAttempt,
+  ModelBundleDownload,
   ServableModelBundle,
   ModelPackage,
   ModelPackageInspection,
@@ -9,7 +9,7 @@ import type {
   ServingProfile,
 } from "@magnitudedev/acn-protocol"
 import {
-  DownloadAttemptSchema,
+  ModelBundleDownloadSchema,
   ServableModelBundleSchema,
   ModelPackageInspectionSchema,
   ModelPackageSchema,
@@ -18,7 +18,7 @@ import {
   ServingProfileSchema,
 } from "@magnitudedev/acn-protocol"
 import type {
-  DownloadAttempt as NativeDownloadAttempt,
+  ModelDownload as NativeModelDownload,
   ServableModelBundle as NativeServableModelBundle,
   ModelPackageInspection as NativeModelPackageInspection,
   ModelPackage as NativeModelPackage,
@@ -45,7 +45,9 @@ const normalizeBundleFromIcn = (
   : {
       ...bundle,
       target: normalizeModelPackageFromIcn(bundle.target),
-      draft: normalizeModelPackageFromIcn(bundle.draft),
+      draftSource: bundle.draftSource._tag === "Embedded"
+        ? bundle.draftSource
+        : { ...bundle.draftSource, draft: normalizeModelPackageFromIcn(bundle.draftSource.draft) },
     }
 import {
   ServableModelBundle as NativeServableModelBundleSchema,
@@ -120,15 +122,19 @@ export const recommendableModelFromIcn = (
     })),
   )
 
-export const downloadAttemptFromIcn = (
-  attempt: NativeDownloadAttempt,
-): Effect.Effect<DownloadAttempt, ParseResult.ParseError> =>
-  Schema.validate(DownloadAttemptSchema)(attempt._tag === "Downloading"
-    ? {
-        ...attempt,
-        bytesPerSecond: Option.flatMap(attempt.bytesPerSecond, Option.fromNullable),
-      }
-    : attempt)
+export const modelDownloadFromIcn = (
+  download: NativeModelDownload,
+): Effect.Effect<ModelBundleDownload, ParseResult.ParseError> =>
+  Schema.validate(ModelBundleDownloadSchema)({
+    id: download.id,
+    bundle: normalizeBundleFromIcn(download.bundle),
+    state: download.state._tag === "Downloading"
+      ? {
+          ...download.state,
+          bytesPerSecond: Option.flatMap(download.state.bytesPerSecond, Option.fromNullable),
+        }
+      : download.state,
+  })
 
 export const bundleToIcnInput = (
   bundle: ServableModelBundle,
@@ -144,9 +150,12 @@ export const bundleToIcnInput = (
     const input = bundle._tag === "Standalone"
       ? { _tag: "Standalone" as const, package: yield* operand(bundle.package) }
       : {
-          _tag: "SpeculativeDecodingPair" as const,
+          _tag: "SpeculativeDecoding" as const,
           target: yield* operand(bundle.target),
-          draft: yield* operand(bundle.draft),
+          draftSource: bundle.draftSource._tag === "Embedded"
+            ? bundle.draftSource
+            : { _tag: "Separate" as const, draft: yield* operand(bundle.draftSource.draft) },
+          method: bundle.method,
         }
     return yield* Schema.decodeUnknown(NativeModelBundleInputSchema)(input)
   })

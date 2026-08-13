@@ -1,11 +1,13 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { DownloadAttemptIdSchema } from "@magnitudedev/sdk"
+import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
   formatDownloadBytes,
   installedLocalModels,
   modelDownloadFailureMessage,
+  localModelBundleKey,
+  localModelMaximumContextLength,
   performanceRange,
   selectionConfigurationId,
   selectionProviderModelId,
@@ -16,6 +18,7 @@ import {
   makeCatalogModel,
   makeModel,
   makeRecommendation,
+  makeStandaloneBundle,
   makeView,
   withDoesNotFitAssessment,
 } from "./test-fixtures"
@@ -69,7 +72,7 @@ describe("unified local inference projection", () => {
   it("keeps active acquisition visible without manufacturing a download record", () => {
     const model = makeAcquiringModel({
       _tag: "Downloading",
-      attemptIds: [DownloadAttemptIdSchema.make("attempt")],
+      downloadId: ModelDownloadIdSchema.make("download"),
       stage: "downloading",
       completedBytes: GIB,
       totalBytes: 2 * GIB,
@@ -98,5 +101,42 @@ describe("unified local inference projection", () => {
       lowerContext: 25_000,
       upperContext: 32_768,
     })
+  })
+
+  it("handles embedded and separate speculative bundle packages", () => {
+    const target = makeStandaloneBundle("package_target")
+    const draft = makeStandaloneBundle("package_draft")
+    if (target._tag !== "Standalone" || draft._tag !== "Standalone") {
+      throw new Error("test bundles must contain standalone packages")
+    }
+    const embedded = makeModel({
+      bundle: {
+        _tag: "SpeculativeDecoding",
+        target: target.package,
+        draftSource: { _tag: "Embedded" },
+        method: { _tag: "Mtp" },
+      },
+    })
+    const separate = makeModel({
+      bundle: {
+        _tag: "SpeculativeDecoding",
+        target: target.package,
+        draftSource: {
+          _tag: "Separate",
+          draft: {
+            ...draft.package,
+            properties: { ...draft.package.properties, maximumContextLength: 16_384 },
+          },
+        },
+        method: { _tag: "DSpark" },
+      },
+    })
+
+    expect(localModelBundleKey(embedded)).toContain("speculative:Mtp:Embedded:package_target")
+    expect(localModelMaximumContextLength(embedded)).toBe(32_768)
+    expect(localModelBundleKey(separate)).toContain(
+      "speculative:DSpark:Separate:package_target:package_draft",
+    )
+    expect(localModelMaximumContextLength(separate)).toBe(16_384)
   })
 })

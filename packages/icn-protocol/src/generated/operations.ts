@@ -7,14 +7,12 @@ export const acknowledgeModelDownloadFailureOperation = {
   operationId: "acknowledgeModelDownloadFailure",
   transport: "http",
   method: "POST",
-  path: "/v1/models/downloads/{attempt_id}/acknowledge-failure",
+  path: "/v1/models/downloads/{download_id}/acknowledge-failure",
   group: "models",
   successes: [
     {
       status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt,
-      ),
+      schema: S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
       mediaType: "application/json",
     },
   ],
@@ -30,7 +28,7 @@ export const acknowledgeModelDownloadFailureOperation = {
       mediaType: "application/json",
     },
   ],
-  pathParameters: S.Struct({ attempt_id: S.String }),
+  pathParameters: S.Struct({ download_id: S.String }),
 } as const
 
 export const applyChatTemplateOperation = {
@@ -106,14 +104,12 @@ export const cancelModelDownloadOperation = {
   operationId: "cancelModelDownload",
   transport: "http",
   method: "POST",
-  path: "/v1/models/downloads/{attempt_id}/cancel",
+  path: "/v1/models/downloads/{download_id}/cancel",
   group: "models",
   successes: [
     {
       status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt,
-      ),
+      schema: S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
       mediaType: "application/json",
     },
   ],
@@ -124,7 +120,7 @@ export const cancelModelDownloadOperation = {
       mediaType: "application/json",
     },
   ],
-  pathParameters: S.Struct({ attempt_id: S.String }),
+  pathParameters: S.Struct({ download_id: S.String }),
 } as const
 
 export const createChatCompletionOperation = {
@@ -194,31 +190,6 @@ export const getHardwareOperation = {
       mediaType: "application/json",
     },
   ],
-} as const
-
-export const getModelDownloadOperation = {
-  operationId: "getModelDownload",
-  transport: "http",
-  method: "GET",
-  path: "/v1/models/downloads/{attempt_id}",
-  group: "models",
-  successes: [
-    {
-      status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.DownloadAttempt, Schemas.DownloadAttemptEncoded> => Schemas.DownloadAttempt,
-      ),
-      mediaType: "application/json",
-    },
-  ],
-  errors: [
-    {
-      status: 404,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-  pathParameters: S.Struct({ attempt_id: S.String }),
 } as const
 
 export const getModelInstancesOperation = {

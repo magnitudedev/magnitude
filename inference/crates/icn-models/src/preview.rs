@@ -2257,7 +2257,7 @@ mod tests {
                 icn_contracts::ModelPreviewComponentSource {
                     path: PathBuf::from("draft.gguf"),
                     role: icn_contracts::ModelPreviewComponentRole::Draft {
-                        method: icn_contracts::models::SpeculativeMethod::DraftDFlash,
+                        method: icn_contracts::models::SpeculativeMethod::DFlash,
                     },
                 },
             ],

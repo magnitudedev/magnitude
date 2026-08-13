@@ -41,7 +41,10 @@ use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolP
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession, MtpVerificationResolution};
+use llama_cpp_2::speculative::{
+    SpeculativeMethod as NativeSpeculativeMethod, SpeculativeOperations, SpeculativeParams,
+    SpeculativeSession, SpeculativeVerificationResolution,
+};
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
@@ -125,7 +128,7 @@ pub fn execution_intent(
             projector.image_max_tokens = defaults.image_max_tokens;
             projector
         }),
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     }
 }
 
@@ -168,7 +171,7 @@ impl NativeBackend {
         &self,
         model_id: impl Into<String>,
         config: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: icn_contracts::SpeculativeDecodingConfig,
         hardware: HardwareSnapshot,
     ) -> Result<PreparedModelLoad, ModelLoadError> {
         let topology = MemoryTopology::from_snapshot(&hardware).ok_or_else(|| {
@@ -178,7 +181,7 @@ impl NativeBackend {
             Arc::clone(&self.backend),
             model_id.into(),
             config,
-            mtp_selection,
+            speculative,
             topology,
         )
     }
@@ -319,7 +322,7 @@ enum RequestPhase {
 struct BatchCommit {
     started_at: Instant,
     prompt_ends: Vec<(i32, usize)>,
-    mtp_indices: Vec<(i32, Vec<i32>)>,
+    speculative_indices: Vec<(i32, Vec<i32>)>,
     logits: Vec<(i32, i32)>,
 }
 
@@ -328,7 +331,7 @@ impl BatchCommit {
         Self {
             started_at,
             prompt_ends: Vec::new(),
-            mtp_indices: Vec::new(),
+            speculative_indices: Vec::new(),
             logits: Vec::new(),
         }
     }
@@ -353,8 +356,8 @@ impl BatchCommit {
         }
     }
 
-    fn record_mtp_indices(&mut self, sequence_id: i32, indices: Vec<i32>) {
-        self.mtp_indices.push((sequence_id, indices));
+    fn record_speculative_indices(&mut self, sequence_id: i32, indices: Vec<i32>) {
+        self.speculative_indices.push((sequence_id, indices));
     }
 
     fn record_logits(&mut self, sequence_id: i32, batch_index: i32) {
@@ -372,8 +375,8 @@ impl BatchCommit {
                 cached_tokens: request.cached_prompt_tokens,
             });
         }
-        for (sequence_id, indices) in self.mtp_indices {
-            request_by_sequence(active, sequence_id)?.mtp_indices = indices;
+        for (sequence_id, indices) in self.speculative_indices {
+            request_by_sequence(active, sequence_id)?.speculative_indices = indices;
         }
         for (sequence_id, batch_index) in self.logits {
             let request = request_by_sequence(active, sequence_id)?;
@@ -408,10 +411,10 @@ struct ActiveRequest<'model> {
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
-    mtp_started: bool,
-    mtp_draft: Vec<LlamaToken>,
-    mtp_indices: Vec<i32>,
-    mtp_replaying: bool,
+    speculative_started: bool,
+    speculative_draft: Vec<LlamaToken>,
+    speculative_indices: Vec<i32>,
+    speculative_replaying: bool,
     draft_tokens: usize,
     accepted_draft_tokens: usize,
     draft_ms: f64,
@@ -453,12 +456,6 @@ pub struct LlamaCompletionBackend {
     acceleration: String,
     commands: SyncSender<ExecutorCommand>,
     executor: Mutex<Option<JoinHandle<()>>>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub enum MtpCandidateSelection {
-    Automatic(Vec<PathBuf>),
-    Explicit(PathBuf),
 }
 
 /// Stable semantic phases of prepared native model loading.
@@ -503,7 +500,7 @@ impl PreparedModelLoad {
         backend: Arc<LlamaBackend>,
         model_id: String,
         config: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: icn_contracts::SpeculativeDecodingConfig,
         topology: MemoryTopology,
     ) -> Result<Self, ModelLoadError> {
         validate_model_config(&config).map_err(ModelLoadError::from)?;
@@ -516,8 +513,7 @@ impl PreparedModelLoad {
         let executor = thread::Builder::new()
             .name(format!("icn-llama-{model_id}"))
             .spawn(move || {
-                let result =
-                    prepare_native_plan(backend.as_ref(), &topology, config, mtp_selection);
+                let result = prepare_native_plan(backend.as_ref(), &topology, config, speculative);
                 match result {
                     Ok((planned, acceleration, phases)) => {
                         let timing_plan_identity = timing_plan_identity(&planned.assessed.plan);
@@ -621,7 +617,7 @@ impl PreparedModelLoad {
 #[derive(Debug)]
 pub enum ModelLoadError {
     InvalidConfiguration(String),
-    MtpSelection(String),
+    SpeculativePreflight(String),
     Planning(String),
     AssessmentRejected(Box<HardwareAssessment>),
     MemoryAttribution(LlamaMemoryBreakdownError),
@@ -634,7 +630,9 @@ impl std::fmt::Display for ModelLoadError {
             Self::InvalidConfiguration(message) => {
                 write!(formatter, "invalid model configuration: {message}")
             }
-            Self::MtpSelection(message) => write!(formatter, "MTP selection failed: {message}"),
+            Self::SpeculativePreflight(message) => {
+                write!(formatter, "speculative selection failed: {message}")
+            }
             Self::Planning(message) => write!(formatter, "native load planning failed: {message}"),
             Self::AssessmentRejected(assessment) => write!(
                 formatter,
@@ -804,14 +802,11 @@ fn prepare_native_plan(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     mut requested: ExecutionIntent,
-    mtp_selection: MtpCandidateSelection,
+    speculative: icn_contracts::SpeculativeDecodingConfig,
 ) -> Result<(icn_hardware::BackendLoadPlan, String, Vec<ModelLoadPhase>), ModelLoadError> {
-    let candidates = match &mtp_selection {
-        MtpCandidateSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
-        MtpCandidateSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
-    };
-    requested.mtp = icn_mtp::select_mtp_with_backend(backend, &requested, candidates)
-        .map_err(|error| ModelLoadError::MtpSelection(error.to_string()))?;
+    requested.speculative = speculative;
+    requested.speculative = icn_speculative::preflight_with_backend(backend, &requested)
+        .map_err(|error| ModelLoadError::SpeculativePreflight(error.to_string()))?;
     let planned = icn_hardware::plan_load_with_backend(backend, topology, &requested)
         .map_err(|error| ModelLoadError::Planning(error.to_string()))?;
     let acceleration = match &planned.assessed.assessment {
@@ -824,17 +819,17 @@ fn prepare_native_plan(
     };
     let mut phases = vec![ModelLoadPhase::TargetModel, ModelLoadPhase::TargetContext];
     if matches!(
-        planned.assessed.plan.mtp,
-        icn_contracts::MtpConfig::Enabled {
-            source: icn_contracts::MtpSource::Separate { .. },
+        planned.assessed.plan.speculative,
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
+            source: icn_contracts::SpeculativeDraftSource::Separate { .. },
             ..
         }
     ) {
         phases.push(ModelLoadPhase::DraftModel);
     }
     if matches!(
-        planned.assessed.plan.mtp,
-        icn_contracts::MtpConfig::Enabled { .. }
+        planned.assessed.plan.speculative,
+        icn_contracts::SpeculativeDecodingConfig::Enabled { .. }
     ) {
         phases.push(ModelLoadPhase::DraftContext);
     }
@@ -850,24 +845,26 @@ fn prepare_native_plan(
 }
 
 fn timing_plan_identity(config: &ExecutionIntent) -> String {
-    let mtp = match &config.mtp {
-        icn_contracts::MtpConfig::Disabled { .. } => serde_json::json!({ "enabled": false }),
-        icn_contracts::MtpConfig::Enabled {
+    let speculative = match &config.speculative {
+        icn_contracts::SpeculativeDecodingConfig::Disabled { .. } => {
+            serde_json::json!({ "enabled": false })
+        }
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
             source,
+            method,
             n_max,
             n_min,
-            p_min,
             cache_type_k,
             cache_type_v,
         } => serde_json::json!({
             "enabled": true,
             "source": match source {
-                icn_contracts::MtpSource::Bundled => "bundled",
-                icn_contracts::MtpSource::Separate { .. } => "separate",
+                icn_contracts::SpeculativeDraftSource::Embedded => "bundled",
+                icn_contracts::SpeculativeDraftSource::Separate { .. } => "separate",
             },
             "nMax": n_max,
             "nMin": n_min,
-            "pMin": p_min,
+            "method": method,
             "cacheTypeK": cache_type_k,
             "cacheTypeV": cache_type_v,
         }),
@@ -890,7 +887,7 @@ fn timing_plan_identity(config: &ExecutionIntent) -> String {
         "prefillQuantum": config.prefill_quantum,
         "execution": config.execution,
         "projector": projector,
-        "mtp": mtp,
+        "speculative": speculative,
     });
     format!("{:x}", Sha256::digest(evidence.to_string().as_bytes()))
 }
@@ -924,7 +921,7 @@ fn executor_main(
     #[cfg(not(feature = "mtmd"))]
     let auxiliary_allocations = Vec::<ResidentAllocation>::new();
     let config = planned.assessed.plan;
-    let native_mtp = planned.native_mtp.map(|plan| plan.into_parts());
+    let native_speculative = planned.native_speculative.map(|plan| plan.into_parts());
     let (model_path, model_params, context_params, threads, threads_batch) =
         planned.native.into_parts();
     let threads = match nonzero_i32(threads, "threads") {
@@ -976,10 +973,10 @@ fn executor_main(
     };
     observer.phase_completed(ModelLoadPhase::TargetContext);
     let mut context = Some(context);
-    let draft_model = match (&config.mtp, native_mtp.as_ref()) {
+    let draft_model = match (&config.speculative, native_speculative.as_ref()) {
         (
-            icn_contracts::MtpConfig::Enabled {
-                source: icn_contracts::MtpSource::Separate { model_path },
+            icn_contracts::SpeculativeDecodingConfig::Enabled {
+                source: icn_contracts::SpeculativeDraftSource::Separate { model_path },
                 ..
             },
             Some((_, draft_model_params, _, _, _)),
@@ -1000,9 +997,9 @@ fn executor_main(
                 }
             }
         }
-        (icn_contracts::MtpConfig::Enabled { .. }, None) => {
+        (icn_contracts::SpeculativeDecodingConfig::Enabled { .. }, None) => {
             let _ = ready.send(Err(InferenceError::InvalidConfig(
-                "native planner omitted the enabled MTP plan".to_owned(),
+                "native planner omitted the enabled speculative plan".to_owned(),
             )
             .into()));
             return;
@@ -1010,39 +1007,55 @@ fn executor_main(
         _ => None,
     };
     let draft_has_separate_model = draft_model.is_some();
-    let mut mtp = match &config.mtp {
-        icn_contracts::MtpConfig::Disabled { .. } => None,
-        icn_contracts::MtpConfig::Enabled {
+    let mut speculative = match &config.speculative {
+        icn_contracts::SpeculativeDecodingConfig::Disabled { .. } => None,
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
             n_max,
             n_min,
-            p_min,
+            method,
             ..
         } => {
             observer.phase_started(ModelLoadPhase::DraftContext);
-            let Some((_, _, draft_context_params, _, _)) = native_mtp.as_ref() else {
+            let Some((_, _, draft_context_params, _, _)) = native_speculative.as_ref() else {
                 let _ = ready.send(Err(InferenceError::InvalidConfig(
-                    "native planner omitted the enabled MTP context".to_owned(),
+                    "native planner omitted the enabled speculative context".to_owned(),
                 )
                 .into()));
                 return;
             };
             let draft_context_params = draft_context_params.clone();
             let draft_model = draft_model.as_ref().unwrap_or(&model);
-            match MtpSession::new_linked(
+            match SpeculativeSession::new_linked(
                 context.take().expect("target context is constructed once"),
                 draft_model,
                 &backend,
                 draft_context_params,
-                MtpParams {
+                SpeculativeParams {
+                    method: match method {
+                        icn_contracts::SpeculativeMethodConfig::Mtp {
+                            min_draft_probability,
+                        } => NativeSpeculativeMethod::Mtp {
+                            min_draft_probability: *min_draft_probability,
+                        },
+                        icn_contracts::SpeculativeMethodConfig::DFlash {
+                            min_sample_probability,
+                        } => NativeSpeculativeMethod::DFlash {
+                            min_sample_probability: *min_sample_probability,
+                        },
+                        icn_contracts::SpeculativeMethodConfig::DSpark {
+                            acceptance_threshold,
+                        } => NativeSpeculativeMethod::DSpark {
+                            acceptance_threshold: *acceptance_threshold,
+                        },
+                    },
                     n_max: i32::try_from(*n_max).unwrap_or(i32::MAX),
                     n_min: i32::try_from(*n_min).unwrap_or(i32::MAX),
-                    p_min: *p_min,
                 },
                 config.max_sequences,
             ) {
-                Ok(mtp) => {
+                Ok(speculative) => {
                     observer.phase_completed(ModelLoadPhase::DraftContext);
-                    Some(mtp)
+                    Some(speculative)
                 }
                 Err(error) => {
                     let _ = ready.send(Err(backend_error(error).into()));
@@ -1089,7 +1102,7 @@ fn executor_main(
             return;
         }
     };
-    if let Some(mtp) = mtp.as_mut() {
+    if let Some(speculative) = speculative.as_mut() {
         let mut draft_main_pool =
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads)) {
                 Ok(pool) => pool,
@@ -1098,7 +1111,7 @@ fn executor_main(
                     return;
                 }
             };
-        let (context, draft_context, mut operations) = mtp.split_all_mut();
+        let (context, draft_context, mut operations) = speculative.split_all_mut();
         if threads == threads_batch {
             let mut draft_attached = draft_context.attach_threadpool(&mut draft_main_pool);
             let mut attached = context.attach_threadpool(&mut main_pool);
@@ -1162,7 +1175,7 @@ fn executor_main(
     } else if threads == threads_batch {
         let mut context = context
             .take()
-            .expect("non-MTP target context remains owned");
+            .expect("non-speculative target context remains owned");
         let mut attached = context.attach_threadpool(&mut main_pool);
         observer.phase_completed(ModelLoadPhase::Runtime);
         run_initialized_executor(
@@ -1185,7 +1198,7 @@ fn executor_main(
     } else {
         let mut context = context
             .take()
-            .expect("non-MTP target context remains owned");
+            .expect("non-speculative target context remains owned");
         let mut batch_pool =
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
                 Ok(pool) => pool,
@@ -1256,7 +1269,7 @@ fn run_initialized_executor<'model>(
     draft_context: Option<&mut LlamaContext<'model>>,
     draft_has_separate_model: bool,
     auxiliary_allocations: &[ResidentAllocation],
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
     ready: &SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
@@ -1264,7 +1277,7 @@ fn run_initialized_executor<'model>(
     observer: &dyn ModelLoadObserver,
 ) {
     observer.phase_started(ModelLoadPhase::Warmup);
-    if let Err(error) = warm_up(model, context, mtp.as_deref_mut()) {
+    if let Err(error) = warm_up(model, context, speculative.as_deref_mut()) {
         let _ = ready.send(Err(error.into()));
         return;
     }
@@ -1309,7 +1322,7 @@ fn run_initialized_executor<'model>(
         chat_templates,
         context,
         draft_context,
-        mtp,
+        speculative,
         multimodal,
         commands,
         resident_allocations,
@@ -1409,7 +1422,7 @@ fn run_scheduler<'model>(
     chat_templates: &CommonChatTemplates,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
     resident_allocations: Vec<ResidentAllocation>,
@@ -1490,18 +1503,28 @@ fn run_scheduler<'model>(
             }
         }
 
-        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+        cleanup_requests(
+            context,
+            speculative.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
 
         if shutting_down {
             fail_queued(&mut queued, InferenceError::ExecutorStopped);
             fail_active(
                 context,
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 &mut sequence_pool,
                 &mut active,
                 InferenceError::ExecutorStopped,
             );
-            cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+            cleanup_requests(
+                context,
+                speculative.as_deref_mut(),
+                &mut sequence_pool,
+                &mut active,
+            );
             if active.is_empty() {
                 break;
             }
@@ -1512,7 +1535,7 @@ fn run_scheduler<'model>(
                 multimodal.as_ref(),
                 context,
                 draft_context.as_deref_mut(),
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 &mut sequence_pool,
                 &mut queued,
                 &mut active,
@@ -1523,11 +1546,16 @@ fn run_scheduler<'model>(
         sample_ready_requests(
             model,
             context,
-            mtp.as_deref_mut(),
+            speculative.as_deref_mut(),
             &mut sequence_pool,
             &mut active,
         );
-        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+        cleanup_requests(
+            context,
+            speculative.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
 
         let decoded = if shutting_down {
             false
@@ -1536,7 +1564,7 @@ fn run_scheduler<'model>(
                 model,
                 context,
                 draft_context.as_deref_mut(),
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 multimodal,
                 &mut planner,
                 &mut decode_buffer,
@@ -1567,7 +1595,12 @@ fn run_scheduler<'model>(
             }
         };
 
-        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+        cleanup_requests(
+            context,
+            speculative.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
 
         if !decoded {
             match commands.recv_timeout(IDLE_POLL_INTERVAL) {
@@ -1702,7 +1735,7 @@ fn admit_requests<'model>(
     multimodal: Option<&MultimodalRuntime<'model>>,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     queued: &mut VecDeque<QueuedCompletion>,
     active: &mut Vec<ActiveRequest<'model>>,
@@ -1774,7 +1807,7 @@ fn admit_requests<'model>(
                 let requested_start = request.processed_prompt_tokens;
                 let partial = clear_sequence_range(
                     context,
-                    mtp.as_deref_mut(),
+                    speculative.as_deref_mut(),
                     sequence_id,
                     i32::try_from(requested_start).unwrap_or(i32::MAX),
                     -1,
@@ -1815,7 +1848,7 @@ fn admit_requests<'model>(
                     });
                     if clear_sequence_range(
                         context,
-                        mtp.as_deref_mut(),
+                        speculative.as_deref_mut(),
                         sequence_id,
                         i32::try_from(request.processed_prompt_tokens).unwrap_or(i32::MAX),
                         -1,
@@ -1847,7 +1880,7 @@ fn admit_requests<'model>(
 fn sample_ready_requests<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut [ActiveRequest<'model>],
 ) {
@@ -1859,34 +1892,33 @@ fn sample_ready_requests<'model>(
         let _entered = current_span.enter();
         if request.cancelled.load(Ordering::Acquire) {
             cancel_request(request);
-            release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+            release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
             continue;
         }
-        if !request.mtp_started
-            && request.multimodal_prompt.is_none()
-            && let Some(operations) = mtp.as_deref_mut()
+        if !request.speculative_started
+            && let Some(operations) = speculative.as_deref_mut()
         {
             let sequence_id = request
                 .sequence_id()
                 .expect("ready request owns a sequence");
             if let Err(error) = operations.begin(sequence_id, &request.token_history) {
                 fail_request(request, backend_error(error));
-                discard_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                discard_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
                 continue;
             }
-            request.mtp_started = true;
+            request.speculative_started = true;
         }
         match request.sample_next(model, context, batch_index) {
             Ok(Some(reason)) => {
                 if let Err(error) = request.complete(reason) {
                     fail_request(request, error);
                 }
-                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
             }
             Ok(None) => {}
             Err(error) => {
                 fail_request(request, error);
-                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
             }
         }
     }
@@ -1897,17 +1929,17 @@ fn decode_batch<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     planner: &mut BatchPlanner,
     batch: &mut LlamaBatch<'_>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
-    if decode_multimodal_prefill(context, multimodal, active)? {
+    if decode_multimodal_prefill(context, speculative.as_deref_mut(), multimodal, active)? {
         return Ok(true);
     }
 
-    let can_checkpoint_prompt = mtp.is_none() || draft_context.is_some();
+    let can_checkpoint_prompt = speculative.is_none() || draft_context.is_some();
     if can_checkpoint_prompt {
         for request in active.iter_mut().filter(|request| {
             request.cache_prompt
@@ -1934,7 +1966,7 @@ fn decode_batch<'model>(
                     .filter(|checkpoint| !checkpoint.is_empty())
             });
             if let Some(target) = target_checkpoint
-                && (mtp.is_none() || draft_checkpoint.is_some())
+                && (speculative.is_none() || draft_checkpoint.is_some())
             {
                 request.prompt_checkpoints.push(PromptCheckpoint {
                     target,
@@ -1958,9 +1990,9 @@ fn decode_batch<'model>(
                 && request.outbound.is_empty()
                 && matches!(request.phase, RequestPhase::Decode { .. })
         })
-        .map(|request| request.mtp_draft.len())
+        .map(|request| request.speculative_draft.len())
         .sum::<usize>();
-    if let Some(operations) = mtp.as_mut() {
+    if let Some(operations) = speculative.as_mut() {
         let mut drafted_sequences = Vec::new();
         let started = Instant::now();
         let decode_count = active
@@ -1975,8 +2007,8 @@ fn decode_batch<'model>(
             .saturating_sub(decode_count)
             .saturating_sub(draft_extra_tokens);
         for request in active.iter_mut().filter(|request| {
-            request.mtp_started
-                && request.mtp_draft.is_empty()
+            request.speculative_started
+                && request.speculative_draft.is_empty()
                 && request.sequence_id().is_some()
                 && request.outbound.is_empty()
                 && matches!(request.phase, RequestPhase::Decode { .. })
@@ -2007,9 +2039,13 @@ fn decode_batch<'model>(
             let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
             for sequence_id in drafted_sequences {
                 let request = request_by_sequence(active, sequence_id)?;
-                request.mtp_draft = operations.take_draft(sequence_id).map_err(backend_error)?;
-                draft_extra_tokens = draft_extra_tokens.saturating_add(request.mtp_draft.len());
-                request.draft_tokens = request.draft_tokens.saturating_add(request.mtp_draft.len());
+                request.speculative_draft =
+                    operations.take_draft(sequence_id).map_err(backend_error)?;
+                draft_extra_tokens =
+                    draft_extra_tokens.saturating_add(request.speculative_draft.len());
+                request.draft_tokens = request
+                    .draft_tokens
+                    .saturating_add(request.speculative_draft.len());
                 request.draft_ms += elapsed;
             }
         }
@@ -2069,11 +2105,11 @@ fn decode_batch<'model>(
                 batch
                     .add(token, position, &[sequence_id], true)
                     .map_err(backend_error)?;
-                if request.mtp_draft.is_empty() {
+                if request.speculative_draft.is_empty() {
                     commit.record_logits(sequence_id, batch.n_tokens() - 1);
                 } else {
                     let mut indices = vec![batch.n_tokens() - 1];
-                    for (offset, draft) in request.mtp_draft.iter().copied().enumerate() {
+                    for (offset, draft) in request.speculative_draft.iter().copied().enumerate() {
                         let draft_position = position
                             .checked_add(i32::try_from(offset + 1).map_err(backend_error)?)
                             .ok_or_else(|| {
@@ -2086,7 +2122,7 @@ fn decode_batch<'model>(
                             .map_err(backend_error)?;
                         indices.push(batch.n_tokens() - 1);
                     }
-                    commit.record_mtp_indices(sequence_id, indices);
+                    commit.record_speculative_indices(sequence_id, indices);
                 }
             }
             BatchWork::Prefill {
@@ -2118,45 +2154,50 @@ fn decode_batch<'model>(
 
     let verification_started = Instant::now();
     context.decode(batch).map_err(backend_error)?;
-    if let Some(operations) = mtp.as_mut() {
+    if let Some(operations) = speculative.as_mut() {
         operations.process(batch).map_err(backend_error)?;
     }
     commit.apply(active)?;
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
-    if let Some(operations) = mtp.as_mut() {
-        verify_mtp_batch(model, context, operations, active, verification_ms)?;
+    if let Some(operations) = speculative.as_mut() {
+        verify_speculative_batch(model, context, operations, active, verification_ms)?;
     }
     Ok(true)
 }
 
-fn verify_mtp_batch<'model>(
+fn verify_speculative_batch<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
-    operations: &mut MtpOperations<'_>,
+    operations: &mut SpeculativeOperations<'_>,
     active: &mut [ActiveRequest<'model>],
     verification_ms: f64,
 ) -> Result<(), InferenceError> {
     for request in active
         .iter_mut()
-        .filter(|request| !request.mtp_draft.is_empty())
+        .filter(|request| !request.speculative_draft.is_empty())
     {
-        let sequence_id = request
-            .sequence_id()
-            .ok_or_else(|| InferenceError::Backend("MTP request lost its sequence".into()))?;
+        let sequence_id = request.sequence_id().ok_or_else(|| {
+            InferenceError::Backend("speculative request lost its sequence".into())
+        })?;
         let RequestPhase::Decode {
             token: pending,
-            position: _,
+            position: verification_start_position,
         } = request.phase
         else {
             return Err(InferenceError::Backend(
-                "MTP verification request was not in decode state".into(),
+                "speculative verification request was not in decode state".into(),
             ));
         };
         let sampler_checkpoint = request.sampler.snapshot().map_err(backend_error)?;
-        let proposed_drafts = request.mtp_draft.len();
+        let proposed_drafts = request.speculative_draft.len();
         let accepted = request
             .sampler
-            .sample_and_accept_n(context, &request.mtp_indices, &request.mtp_draft, false)
+            .sample_and_accept_n(
+                context,
+                &request.speculative_indices,
+                &request.speculative_draft,
+                false,
+            )
             .map_err(backend_error)?;
         if accepted.is_empty() {
             return Err(InferenceError::Backend(
@@ -2164,24 +2205,23 @@ fn verify_mtp_batch<'model>(
             ));
         }
         let accepted_drafts = accepted.len() - 1;
-        let committed_tokens = request
-            .token_history
-            .len()
+        let next_position = verification_start_position
             .checked_add(1)
-            .and_then(|count| count.checked_add(accepted_drafts))
-            .ok_or_else(|| InferenceError::Backend("MTP token history overflowed".into()))?;
-        let next_position = i32::try_from(committed_tokens).map_err(backend_error)?;
+            .and_then(|position| position.checked_add(i32::try_from(accepted_drafts).ok()?))
+            .ok_or_else(|| {
+                InferenceError::Backend("speculative position exceeded i32::MAX".into())
+            })?;
         let resolution = operations
             .resolve_verification(sequence_id, proposed_drafts, accepted_drafts, next_position)
             .map_err(backend_error)?;
-        if resolution == MtpVerificationResolution::Replay {
+        if resolution == SpeculativeVerificationResolution::Replay {
             request
                 .sampler
                 .restore(&sampler_checkpoint)
                 .map_err(backend_error)?;
-            request.mtp_draft = accepted;
-            request.mtp_indices.clear();
-            request.mtp_replaying = true;
+            request.speculative_draft = accepted;
+            request.speculative_indices.clear();
+            request.speculative_replaying = true;
             continue;
         }
 
@@ -2190,14 +2230,14 @@ fn verify_mtp_batch<'model>(
             .token_history
             .extend(accepted.iter().take(accepted_drafts).copied());
         let accepted_original_drafts =
-            accepted_drafts.saturating_sub(usize::from(request.mtp_replaying));
+            accepted_drafts.saturating_sub(usize::from(request.speculative_replaying));
         request.accepted_draft_tokens = request
             .accepted_draft_tokens
             .saturating_add(accepted_original_drafts);
         request.verification_ms += verification_ms;
-        request.mtp_draft.clear();
-        request.mtp_indices.clear();
-        request.mtp_replaying = false;
+        request.speculative_draft.clear();
+        request.speculative_indices.clear();
+        request.speculative_replaying = false;
 
         let mut terminal = None;
         for token in accepted.iter().copied() {
@@ -2226,6 +2266,7 @@ fn verify_mtp_batch<'model>(
 #[cfg(feature = "mtmd")]
 fn decode_multimodal_prefill<'model>(
     context: &mut LlamaContext<'model>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
@@ -2267,6 +2308,7 @@ fn decode_multimodal_prefill<'model>(
         context,
         sequence_id,
         batch_size,
+        speculative,
     );
     context.clear_abort_callback();
     if request.cancelled.load(Ordering::Acquire) {
@@ -2287,6 +2329,7 @@ fn decode_multimodal_prefill<'model>(
 #[cfg(not(feature = "mtmd"))]
 fn decode_multimodal_prefill<'model>(
     _context: &mut LlamaContext<'model>,
+    _speculative: Option<&mut SpeculativeOperations<'_>>,
     _multimodal: &mut Option<MultimodalRuntime<'model>>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
@@ -2341,7 +2384,7 @@ fn restore_prompt_checkpoint(
 
 fn cleanup_requests(
     context: &mut LlamaContext<'_>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut Vec<ActiveRequest<'_>>,
 ) {
@@ -2353,7 +2396,7 @@ fn cleanup_requests(
             cancel_request(&mut active[index]);
             release_sequence(
                 context,
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 sequence_pool,
                 &mut active[index],
             );
@@ -2362,7 +2405,7 @@ fn cleanup_requests(
             FlushOutcome::Empty if matches!(active[index].phase, RequestPhase::Terminal) => {
                 release_sequence(
                     context,
-                    mtp.as_deref_mut(),
+                    speculative.as_deref_mut(),
                     sequence_pool,
                     &mut active[index],
                 );
@@ -2375,7 +2418,7 @@ fn cleanup_requests(
             FlushOutcome::Disconnected => {
                 release_sequence(
                     context,
-                    mtp.as_deref_mut(),
+                    speculative.as_deref_mut(),
                     sequence_pool,
                     &mut active[index],
                 );
@@ -2438,7 +2481,7 @@ fn flush_outbound(request: &mut ActiveRequest<'_>) -> FlushOutcome {
 
 fn release_sequence(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     request: &mut ActiveRequest<'_>,
 ) {
@@ -2453,7 +2496,7 @@ fn release_sequence(
     // Full sequence removal is supported for every llama.cpp memory implementation. This is the
     // sole cache policy required by this milestone: a sequence is never reassigned while resident
     // state still belongs to the previous request.
-    match clear_sequence(context, mtp, sequence_id) {
+    match clear_sequence(context, speculative, sequence_id) {
         Ok(()) => sequence_pool.release(sequence.into_available(None)),
         Err(error) => {
             // Never hand a sequence to another request unless native state removal succeeded.
@@ -2467,7 +2510,7 @@ fn release_sequence(
 
 fn discard_sequence(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     request: &mut ActiveRequest<'_>,
 ) {
@@ -2475,7 +2518,7 @@ fn discard_sequence(
         return;
     };
     let sequence_id = sequence.id();
-    match clear_sequence(context, mtp, sequence_id) {
+    match clear_sequence(context, speculative, sequence_id) {
         Ok(()) => sequence_pool.release(sequence.into_available(None)),
         Err(error) => {
             sequence.quarantine();
@@ -2488,21 +2531,21 @@ fn discard_sequence(
 
 fn clear_sequence(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
 ) -> Result<(), InferenceError> {
-    clear_sequence_range(context, mtp, sequence_id, 0, -1)
+    clear_sequence_range(context, speculative, sequence_id, 0, -1)
 }
 
 fn clear_sequence_range(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
     start: i32,
     end: i32,
 ) -> Result<(), InferenceError> {
-    if let Some(mtp) = mtp {
-        return mtp
+    if let Some(speculative) = speculative {
+        return speculative
             .remove_sequence_range(sequence_id, start, end)
             .map_err(backend_error);
     }
@@ -2546,7 +2589,7 @@ fn fail_queued(queued: &mut VecDeque<QueuedCompletion>, reason: InferenceError) 
 
 fn fail_active(
     context: &mut LlamaContext<'_>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut [ActiveRequest<'_>],
     reason: InferenceError,
@@ -2555,7 +2598,7 @@ fn fail_active(
         if !matches!(request.phase, RequestPhase::Terminal) {
             fail_request(request, clone_inference_error(&reason));
         }
-        release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+        release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
     }
 }
 
@@ -2700,6 +2743,18 @@ fn validate_projector_config(
                 .into(),
         ));
     }
+    if matches!(
+        config.speculative,
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
+            method: icn_contracts::SpeculativeMethodConfig::Mtp { .. },
+            ..
+        }
+    ) {
+        return Err(InferenceError::InvalidConfig(
+            "multimodal projector mode does not support MTP because the native MTP drafter cannot consume media embedding batches"
+                .into(),
+        ));
+    }
     if config.batch_size > i32::MAX as u32 {
         return Err(InferenceError::InvalidConfig(
             "multimodal projector mode requires batch_size <= i32::MAX".into(),
@@ -2738,7 +2793,7 @@ fn validate_projector_config(
 fn warm_up(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
 ) -> Result<(), InferenceError> {
     let tokens = model
         .str_to_token(" ", AddBos::Always)
@@ -2747,8 +2802,8 @@ fn warm_up(
         let mut batch = LlamaBatch::new(1, 1);
         batch.add(token, 0, &[0], false).map_err(backend_error)?;
         context.decode(&mut batch).map_err(backend_error)?;
-        if let Some(mtp) = mtp {
-            mtp.process(&batch).map_err(backend_error)?;
+        if let Some(speculative) = speculative {
+            speculative.process(&batch).map_err(backend_error)?;
         }
         context.synchronize();
         context.clear_kv_cache();
@@ -2791,23 +2846,23 @@ fn model_properties(
         },
         reasoning: reasoning.profile,
         modalities,
-        mtp: match &config.mtp {
-            icn_contracts::MtpConfig::Disabled { reason } => {
-                icn_contracts::MtpRuntimeProperties::Disabled {
+        speculative: match &config.speculative {
+            icn_contracts::SpeculativeDecodingConfig::Disabled { reason } => {
+                icn_contracts::SpeculativeDecodingRuntimeProperties::Disabled {
                     reason: reason.clone(),
                 }
             }
-            icn_contracts::MtpConfig::Enabled {
+            icn_contracts::SpeculativeDecodingConfig::Enabled {
                 source,
+                method,
                 n_max,
                 n_min,
-                p_min,
                 ..
-            } => icn_contracts::MtpRuntimeProperties::Enabled {
+            } => icn_contracts::SpeculativeDecodingRuntimeProperties::Enabled {
                 source: source.clone(),
+                method: method.clone(),
                 n_max: *n_max,
                 n_min: *n_min,
-                p_min: *p_min,
             },
         },
         execution: ExecutionConfigReport {
@@ -3081,10 +3136,10 @@ impl<'model> ActiveRequest<'model> {
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
-                mtp_started: false,
-                mtp_draft: Vec::new(),
-                mtp_indices: Vec::new(),
-                mtp_replaying: false,
+                speculative_started: false,
+                speculative_draft: Vec::new(),
+                speculative_indices: Vec::new(),
+                speculative_replaying: false,
                 draft_tokens: 0,
                 accepted_draft_tokens: 0,
                 draft_ms: 0.0,
@@ -3973,7 +4028,7 @@ mod tests {
             .prepare_load(
                 "stories15m-retention-test",
                 intent,
-                MtpCandidateSelection::Automatic(Vec::new()),
+                icn_contracts::SpeculativeDecodingConfig::default(),
                 hardware,
             )
             .expect("prepare real model load");
@@ -4141,7 +4196,7 @@ mod tests {
                 ..ExecutionConfig::default()
             },
             projector: Some(ProjectorConfig::new(executable)),
-            mtp: icn_contracts::MtpConfig::default(),
+            speculative: icn_contracts::SpeculativeDecodingConfig::default(),
         }
     }
 
@@ -4181,6 +4236,32 @@ mod tests {
         let error = validate_model_config(&model_config_with_projector(2)).unwrap_err();
         assert!(error.to_string().contains("requires max_sequences=1"));
         validate_model_config(&model_config_with_projector(1)).unwrap();
+    }
+
+    #[cfg(feature = "mtmd")]
+    #[test]
+    fn projector_mode_rejects_embedded_and_separate_mtp_before_loading() {
+        for source in [
+            icn_contracts::SpeculativeDraftSource::Embedded,
+            icn_contracts::SpeculativeDraftSource::Separate {
+                model_path: "draft.gguf".into(),
+            },
+        ] {
+            let mut config = model_config_with_projector(1);
+            config.speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
+                source,
+                method: icn_contracts::SpeculativeMethodConfig::Mtp {
+                    min_draft_probability: 0.1,
+                },
+                n_max: 3,
+                n_min: 0,
+                cache_type_k: CacheType::F16,
+                cache_type_v: CacheType::F16,
+            };
+
+            let error = validate_model_config(&config).unwrap_err();
+            assert!(error.to_string().contains("does not support MTP"));
+        }
     }
 
     #[cfg(not(feature = "mtmd"))]

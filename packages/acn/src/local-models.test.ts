@@ -3,12 +3,15 @@ import { Option } from "effect"
 import {
   LocalInferenceMemoryDomainIdSchema,
   ModelFileIdSchema,
+  ModelDownloadIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ModelVariantLabelSchema,
   servableModelBundlePackageIds,
   type LocalInferenceHardware,
   type MemoryAssessment,
+  type ModelBundleDownload,
+  type ModelPackageEntry,
   type ModelServingConfiguration,
   type ServableModelBundle,
   type ModelPackageSource,
@@ -17,17 +20,24 @@ import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
   availabilityFromProviderProjection,
+  aggregateAcquisitionState,
   projectLocalModelMemory,
   resolveBundlePresentation,
 } from "./local-models"
-import { resolveLocalModelConfigurations } from "./local-model-configuration-resolver"
+import {
+  configuredModelPackageIds,
+  isStandalonePackageCandidate,
+  resolveLocalModelConfigurations,
+} from "./local-model-configuration-resolver"
 
 const GIB = 1024 ** 3
 
 const standaloneBundle = (
   source: ModelPackageSource,
   path = "model.gguf",
-): ServableModelBundle => ({
+  quantization = "Q4_K - Medium",
+  quantizationName = "4-bit",
+): Extract<ServableModelBundle, { readonly _tag: "Standalone" }> => ({
   _tag: "Standalone",
   package: {
     id: ModelPackageIdSchema.make("package-test"),
@@ -43,8 +53,8 @@ const standaloneBundle = (
     relationships: [],
     properties: {
       format: "gguf",
-      quantization: "Q4_K - Medium",
-      quantizationName: "4-bit",
+      quantization,
+      quantizationName,
       architecture: "test",
       maximumContextLength: 50_000,
     },
@@ -62,6 +72,33 @@ const configuration = (
 })
 
 describe("local model configuration resolution", () => {
+  it("reserves every package member of a configured speculative bundle", () => {
+    const target = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" }).package
+    const draft = {
+      ...standaloneBundle({ _tag: "Local", path: "/models/draft.gguf" }).package,
+      id: ModelPackageIdSchema.make("package-draft"),
+    }
+    const speculative = configuration("configuration-speculative", {
+      _tag: "SpeculativeDecoding",
+      target,
+      draftSource: { _tag: "Separate", draft },
+      method: { _tag: "DSpark" },
+    }, 50_000)
+
+    expect(configuredModelPackageIds([speculative])).toEqual(new Set([
+      target.id,
+      draft.id,
+    ]))
+    const configuredPackages = configuredModelPackageIds([speculative])
+    expect(isStandalonePackageCandidate(target, configuredPackages)).toBe(false)
+    expect(isStandalonePackageCandidate(draft, configuredPackages)).toBe(false)
+    expect(isStandalonePackageCandidate({
+      ...draft,
+      id: ModelPackageIdSchema.make("package-draft-role"),
+      files: draft.files.map((file) => ({ ...file, role: "draft" as const })),
+    }, new Set())).toBe(false)
+  })
+
   it("resolves one configuration per bundle with retained, catalog, standard precedence", () => {
     const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
     const standard = configuration("configuration-standard", bundle, 50_000)
@@ -149,6 +186,83 @@ describe("local model configuration resolution", () => {
         assessment: { _tag: "Assessing" },
       }]]),
     }).size).toBe(0)
+  })
+})
+
+describe("bundle download projection", () => {
+  it("retains one stable identity as packages in a speculative bundle complete", () => {
+    const target = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" }).package
+    const draft = {
+      ...standaloneBundle({ _tag: "Local", path: "/models/draft.gguf" }).package,
+      id: ModelPackageIdSchema.make("package-draft"),
+    }
+    const bundle: ServableModelBundle = {
+      _tag: "SpeculativeDecoding",
+      target,
+      draftSource: { _tag: "Separate", draft },
+      method: { _tag: "DSpark" },
+    }
+    const entries = new Map<string, ModelPackageEntry>([
+      [target.id, {
+        package: target,
+        localState: { _tag: "Installed", path: "/models/target.gguf", origin: "Magnitude" },
+        inspection: { _tag: "Pending" },
+      }],
+      [draft.id, {
+        package: draft,
+        localState: { _tag: "NotInstalled" },
+        inspection: { _tag: "Pending" },
+      }],
+    ])
+    const id = ModelDownloadIdSchema.make("bundle-download")
+    const downloads: readonly ModelBundleDownload[] = [{
+      id,
+      bundle,
+      state: {
+        _tag: "Downloading",
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 2,
+        bytesPerSecond: Option.some(10),
+      },
+    }]
+
+    expect(aggregateAcquisitionState(bundle, entries, downloads)).toMatchObject({
+      _tag: "Downloading",
+      downloadId: id,
+      completedBytes: 1,
+      totalBytes: 2,
+    })
+    expect(aggregateAcquisitionState(bundle, entries, [{
+      ...downloads[0]!,
+      state: { _tag: "Completed" },
+    }])).toMatchObject({
+      _tag: "NotInstalled",
+      completedBytes: 1,
+      totalBytes: 2,
+    })
+    expect(aggregateAcquisitionState(bundle, entries, [{
+      ...downloads[0]!,
+      state: {
+        _tag: "Failed",
+        completedBytes: 1,
+        totalBytes: 2,
+        failure: {
+          _tag: "InsufficientDiskSpace",
+          requiredBytes: 4,
+          availableBytes: 3,
+        },
+        acknowledged: false,
+      },
+    }])).toMatchObject({
+      _tag: "Failed",
+      downloadId: id,
+      failure: {
+        _tag: "InsufficientDiskSpace",
+        requiredBytes: 4,
+        availableBytes: 3,
+      },
+    })
   })
 })
 
@@ -358,6 +472,34 @@ describe("local model presentation", () => {
       variantLabel: "Q4_K - Medium",
       description: "",
       license: Option.none(),
+      quantization: "Q4_K - Medium",
+      precisionLabel: "4-bit",
+    })
+  })
+
+  it("presents only the target quantization for speculative bundles", () => {
+    const targetBundle = standaloneBundle(
+      { _tag: "Local", path: "/models" },
+      "target.gguf",
+      "Q4_K - Medium",
+      "4-bit",
+    )
+    const draftBundle = standaloneBundle(
+      { _tag: "Local", path: "/models" },
+      "draft.gguf",
+      "Q8_0",
+      "8-bit",
+    )
+    if (targetBundle._tag !== "Standalone" || draftBundle._tag !== "Standalone") {
+      throw new Error("test bundles must be standalone packages")
+    }
+
+    expect(resolveBundlePresentation({
+      _tag: "SpeculativeDecoding",
+      target: targetBundle.package,
+      draftSource: { _tag: "Separate", draft: draftBundle.package },
+      method: { _tag: "DSpark" },
+    }, curated)).toMatchObject({
       quantization: "Q4_K - Medium",
       precisionLabel: "4-bit",
     })

@@ -45,7 +45,7 @@ No match means cold prefill. Reuse never crosses a model, tokenizer, context, ad
 ## Commit boundary
 
 ```text
-assemble batch -> native decode -> linked MTP processing -> commit request progress
+assemble batch -> native decode -> linked speculative processing -> commit request progress
                      |                    |
                      `------ failure -----'--> discard staged progress + reset native state
 ```
@@ -63,8 +63,10 @@ A sampled token is likewise uncommitted until decode or speculative verification
 | Native cleanup failure | Quarantine the sequence |
 | Shared target/draft failure | Reset contexts; invalidate available prefixes; return active sequences empty |
 
-MTP retains only at aligned target/draft boundaries. Multimodal reuse remains disabled until exact
-token-and-media equivalence can be guaranteed.
+Speculative execution retains only at aligned target/draft boundaries. Native positions, including
+positions consumed by media embeddings, govern rollback and continuation; token-history length is
+not a position. Multimodal reuse remains disabled until exact token-and-media equivalence can be
+guaranteed.
 
 ## Capacity
 

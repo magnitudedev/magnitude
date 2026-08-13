@@ -419,9 +419,16 @@ fn retain_recent<T>(
 fn packages(configuration: &ModelServingConfiguration) -> Vec<&ModelPackage> {
     match &configuration.bundle {
         ServableModelBundle::Standalone { package } => vec![package],
-        ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => {
-            vec![target, draft]
-        }
+        ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source,
+            ..
+        } => match draft_source {
+            icn_contracts::models::SpeculativeDraftSource::Embedded => vec![target],
+            icn_contracts::models::SpeculativeDraftSource::Separate { draft } => {
+                vec![target, draft]
+            }
+        },
     }
 }
 
@@ -429,7 +436,17 @@ fn phase_work(configuration: &ModelServingConfiguration) -> BTreeMap<ModelLoadPh
     let mut result = BTreeMap::new();
     let (target, draft) = match &configuration.bundle {
         ServableModelBundle::Standalone { package } => (package, None),
-        ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => (target, Some(draft)),
+        ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source,
+            ..
+        } => (
+            target,
+            match draft_source {
+                icn_contracts::models::SpeculativeDraftSource::Embedded => None,
+                icn_contracts::models::SpeculativeDraftSource::Separate { draft } => Some(draft),
+            },
+        ),
     };
     let target_bytes = target
         .files

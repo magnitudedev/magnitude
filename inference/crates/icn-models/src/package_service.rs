@@ -336,14 +336,47 @@ pub fn servable_model_bundle_key(package_ids: &[&ModelPackageId]) -> ServableMod
     ServableModelBundleKey(format!("bundle_{:x}", digest.finalize()))
 }
 
+pub fn speculative_servable_model_bundle_key(
+    target: &ModelPackageId,
+    draft: Option<&ModelPackageId>,
+    method: &icn_contracts::models::SpeculativeMethod,
+) -> ServableModelBundleKey {
+    let mut digest = Sha256::new();
+    digest.update(b"magnitude-servable-model-bundle-v2\0speculative\0");
+    digest.update(target.0.as_bytes());
+    digest.update(b"\0");
+    digest.update(serde_json::to_vec(method).expect("speculative method is serializable"));
+    digest.update(b"\0");
+    match draft {
+        None => digest.update(b"embedded\0"),
+        Some(draft) => {
+            digest.update(b"separate\0");
+            digest.update(draft.0.as_bytes());
+            digest.update(b"\0");
+        }
+    }
+    ServableModelBundleKey(format!("bundle_{:x}", digest.finalize()))
+}
+
 pub fn servable_model_bundle_key_for_bundle(
     bundle: &ServableModelBundle,
 ) -> ServableModelBundleKey {
     match bundle {
         ServableModelBundle::Standalone { package } => servable_model_bundle_key(&[&package.id]),
-        ServableModelBundle::SpeculativeDecodingPair { target, draft, .. } => {
-            servable_model_bundle_key(&[&target.id, &draft.id])
-        }
+        ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source,
+            method,
+        } => speculative_servable_model_bundle_key(
+            &target.id,
+            match draft_source {
+                icn_contracts::models::SpeculativeDraftSource::Embedded => None,
+                icn_contracts::models::SpeculativeDraftSource::Separate { draft } => {
+                    Some(&draft.id)
+                }
+            },
+            method,
+        ),
     }
 }
 
@@ -731,24 +764,51 @@ impl InstalledModelPackages for ModelManager {
                     }
                     Ok(result)
                 }
-                ModelBundleInput::SpeculativeDecodingPair { target, draft } => {
+                ModelBundleInput::SpeculativeDecoding {
+                    target,
+                    draft_source,
+                    method,
+                } => {
                     let target = self.resolve_package_operand(target).await?;
-                    let draft = self.resolve_package_operand(draft).await?;
-                    let bundle_key =
-                        servable_model_bundle_key(&[&target.package.id, &draft.package.id]);
+                    let (draft_source, draft_model, draft_guard) = match draft_source {
+                        icn_contracts::models::SpeculativeDraftSourceInput::Embedded => (
+                            icn_contracts::models::SpeculativeDraftSource::Embedded,
+                            None,
+                            None,
+                        ),
+                        icn_contracts::models::SpeculativeDraftSourceInput::Separate { draft } => {
+                            let resolved = self.resolve_package_operand(draft).await?;
+                            if resolved.package.id == target.package.id {
+                                return Err(InventoryError::InvalidRequest(
+                                    "a separate speculative draft must be distinct from its target"
+                                        .to_owned(),
+                                ));
+                            }
+                            (
+                                icn_contracts::models::SpeculativeDraftSource::Separate {
+                                    draft: resolved.package,
+                                },
+                                Some(resolved.model),
+                                resolved.resolution_guard,
+                            )
+                        }
+                    };
+                    let bundle = ServableModelBundle::SpeculativeDecoding {
+                        target: target.package,
+                        draft_source,
+                        method,
+                    };
+                    let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
                     let mut result = ResolvedServableModelBundle::new(
                         bundle_key,
-                        ServableModelBundle::SpeculativeDecodingPair {
-                            target: target.package,
-                            draft: draft.package,
-                        },
+                        bundle,
                         target.model,
-                        Some(draft.model),
+                        draft_model,
                     );
                     if let Some(guard) = target.resolution_guard {
                         result = result.retain_resolution_guard(guard);
                     }
-                    if let Some(guard) = draft.resolution_guard {
+                    if let Some(guard) = draft_guard {
                         result = result.retain_resolution_guard(guard);
                     }
                     Ok(result)
@@ -779,9 +839,11 @@ mod tests {
     use std::path::PathBuf;
 
     use icn_contracts::ComponentRelationship;
-    use icn_contracts::models::{ModelFileId, ModelFileRelationship, SpeculativeMethod};
+    use icn_contracts::models::{
+        ModelFileId, ModelFileRelationship, ModelPackageId, SpeculativeMethod,
+    };
 
-    use super::{package_relationship, shard_count};
+    use super::{package_relationship, shard_count, speculative_servable_model_bundle_key};
 
     #[test]
     fn shard_count_uses_one_based_component_indices() {
@@ -802,7 +864,7 @@ mod tests {
             &ComponentRelationship::DraftFor {
                 draft,
                 model: target,
-                method: SpeculativeMethod::DraftDFlash,
+                method: SpeculativeMethod::DFlash,
             },
             &ids,
         );
@@ -810,9 +872,30 @@ mod tests {
         assert!(matches!(
             relationship,
             Some(ModelFileRelationship::DraftFor {
-                method: SpeculativeMethod::DraftDFlash,
+                method: SpeculativeMethod::DFlash,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn speculative_bundle_identity_includes_source_method_and_separate_draft() {
+        let target = ModelPackageId("target".to_owned());
+        let draft = ModelPackageId("draft".to_owned());
+        let embedded =
+            speculative_servable_model_bundle_key(&target, None, &SpeculativeMethod::Mtp);
+        let dflash = speculative_servable_model_bundle_key(
+            &target,
+            Some(&draft),
+            &SpeculativeMethod::DFlash,
+        );
+        let dspark = speculative_servable_model_bundle_key(
+            &target,
+            Some(&draft),
+            &SpeculativeMethod::DSpark,
+        );
+
+        assert_ne!(embedded, dflash);
+        assert_ne!(dflash, dspark);
     }
 }

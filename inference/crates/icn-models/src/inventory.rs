@@ -1532,7 +1532,7 @@ fn is_execution_companion(path: &Path, name: &str) -> bool {
 fn is_execution_companion_name(name: &str) -> bool {
     name.trim_end_matches(".gguf")
         .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|part| matches!(part, "dflash" | "draft" | "eagle3" | "mtp"))
+        .any(|part| matches!(part, "dflash" | "dspark" | "draft" | "eagle3" | "mtp"))
 }
 
 fn components_for_group(
@@ -2221,6 +2221,7 @@ mod tests {
             Some("laguna-s-2.1-Q4_K_M.gguf"),
         );
         assert!(is_execution_companion_name("laguna-s-2.1-dflash-bf16.gguf"));
+        assert!(is_execution_companion_name("qwen3.5-dspark-q8.gguf"));
         assert!(is_execution_companion_name("eagle3-qwen-4b.gguf"));
         assert!(is_execution_companion_name("qwen-mtp-bf16.gguf"));
         assert!(!is_execution_companion_name("draftsmanship-q4.gguf"));

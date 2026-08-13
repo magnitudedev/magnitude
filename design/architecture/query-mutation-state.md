@@ -386,7 +386,7 @@ It is never represented by a singleton `installingId`, `busy`, or error side cha
 
 Mutation success includes synchronization with every canonical query whose visibility is promised
 by the command. A command that admits a download remains pending until a fresh local-model snapshot
-shows that exact configuration with either the admitted attempt identities or installed
+shows that exact configuration with either the admitted model-download identity or installed
 acquisition. Mutation synchronization does not wait for the admitted download or later provider
 publication to finish; progress, physical completion, and serving readiness remain authoritative
 query state consumed by the dependent Effect.

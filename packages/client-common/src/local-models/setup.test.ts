@@ -5,7 +5,7 @@ import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
   AssessmentEnvironmentIdSchema,
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   ModelAssessmentIdSchema,
   ModelInstanceIdSchema,
   ModelPackageIdSchema,
@@ -33,7 +33,7 @@ import { OnboardingModelSetup } from "./setup"
 const configurationId = ModelServingConfigurationIdSchema.make("setup-configuration")
 const providerModelId = ProviderModelIdSchema.make("setup-model")
 const instanceId = ModelInstanceIdSchema.make("setup-instance")
-const attemptId = DownloadAttemptIdSchema.make("setup-attempt")
+const downloadId = ModelDownloadIdSchema.make("setup-attempt")
 const reasoningEffort = ReasoningEffortSchema.make("none")
 const localProviderId = ProviderIdSchema.make("local")
 const allocation = {
@@ -162,13 +162,13 @@ const configuredSlots = (
 })
 
 describe("installationAdmissionIsVisible", () => {
-  it("accepts the exact admitted attempts before a provider identity exists", () => {
+  it("accepts the exact admitted model download before a provider identity exists", () => {
     const uninstalled = makeModel(false)
     const downloading: LocalModel = {
       ...uninstalled,
       acquisitionState: {
         _tag: "Downloading",
-        attemptIds: [attemptId],
+        downloadId,
         stage: "downloading",
         completedBytes: 0,
         totalBytes: 1,
@@ -184,9 +184,34 @@ describe("installationAdmissionIsVisible", () => {
     expect(installationAdmissionIsVisible(state, configurationId, {
       _tag: "DownloadAdmitted",
       providerModelId,
-      attemptIds: [attemptId],
+      downloadId,
     })).toBe(true)
     expect(Option.isNone(localModelProviderModelId(downloading))).toBe(true)
+  })
+
+  it("rejects a different model-download occurrence for the same configuration", () => {
+    const uninstalled = makeModel(false)
+    const state: LocalModelsState = {
+      inventoryState: { _tag: "Ready" },
+      models: [{
+        ...uninstalled,
+        acquisitionState: {
+          _tag: "Downloading",
+          downloadId: ModelDownloadIdSchema.make("replacement-download"),
+          stage: "downloading",
+          completedBytes: 0,
+          totalBytes: 1,
+          bytesPerSecond: Option.none(),
+        },
+      }],
+      discoveryState: { _tag: "Ready", progress: [] },
+    }
+
+    expect(installationAdmissionIsVisible(state, configurationId, {
+      _tag: "DownloadAdmitted",
+      providerModelId,
+      downloadId,
+    })).toBe(false)
   })
 
   it("accepts the exact installed configuration while provider publication is pending", () => {
@@ -206,7 +231,7 @@ describe("installationAdmissionIsVisible", () => {
     }, configurationId, {
       _tag: "DownloadAdmitted",
       providerModelId,
-      attemptIds: [attemptId],
+      downloadId,
     })).toBe(true)
   })
 })
@@ -231,7 +256,7 @@ const makeHarness = (options: HarnessOptions) => {
       ...model,
       acquisitionState: {
         _tag: "Downloading",
-        attemptIds: [attemptId],
+        downloadId,
         stage: "downloading",
         completedBytes: 0,
         totalBytes: 1,
@@ -253,7 +278,7 @@ const makeHarness = (options: HarnessOptions) => {
   let revision = 0
   const calls: string[] = []
   const stoppedInstances: unknown[] = []
-  const cancelledAttempts: unknown[] = []
+  const cancelledDownloads: unknown[] = []
   const rpc = ((name: string, payload: any) => Effect.suspend(() => {
     calls.push(name)
     switch (name) {
@@ -272,7 +297,7 @@ const makeHarness = (options: HarnessOptions) => {
                 ...uninstalled,
                 acquisitionState: {
                   _tag: "Failed" as const,
-                  attemptIds: [attemptId],
+                  downloadId,
                   completedBytes: 0,
                   totalBytes: 1,
                   failure: options.downloadFailure,
@@ -286,7 +311,7 @@ const makeHarness = (options: HarnessOptions) => {
                 ...uninstalled,
                 acquisitionState: {
                   _tag: "Downloading" as const,
-                  attemptIds: [attemptId],
+                  downloadId,
                   stage: "downloading" as const,
                   completedBytes: 0,
                   totalBytes: 1,
@@ -303,7 +328,7 @@ const makeHarness = (options: HarnessOptions) => {
         return Effect.succeed({
           _tag: "DownloadAdmitted",
           providerModelId,
-          attemptIds: [attemptId],
+          downloadId,
         })
       }
       case "AssignSlot": {
@@ -336,14 +361,14 @@ const makeHarness = (options: HarnessOptions) => {
         slots = configuredSlots("Stopped", payload.instanceId)
         return Effect.succeed({})
       case "CancelModelDownload":
-        cancelledAttempts.push(payload.attemptIds)
+        cancelledDownloads.push(payload.downloadId)
         models = {
           ...models,
           models: [{
             ...model,
             acquisitionState: {
               _tag: "Cancelled",
-              attemptIds: [attemptId],
+              downloadId,
               completedBytes: 0,
               totalBytes: 1,
             },
@@ -386,7 +411,7 @@ const makeHarness = (options: HarnessOptions) => {
     registry,
     service,
     stoppedInstances,
-    cancelledAttempts,
+    cancelledDownloads,
     onboardingCompleted: () => onboardingCompleted,
   }
 }
@@ -581,7 +606,7 @@ describe("OnboardingModelSetupService", () => {
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
     await Effect.runPromise(Fiber.join(start))
-    expect(harness.cancelledAttempts).toEqual([[attemptId]])
+    expect(harness.cancelledDownloads).toEqual([downloadId])
     expect(harness.calls).not.toContain("AssignSlot")
     expect(harness.calls).not.toContain("LoadModel")
     harness.registry.dispose()

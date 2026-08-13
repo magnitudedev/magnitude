@@ -2,7 +2,7 @@ import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
 import {
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
   LocalModelInstallationAdmissionSchema,
@@ -32,15 +32,13 @@ export const InstallModel = Rpc.make("InstallModel", {
 })
 
 export const CancelModelDownload = Rpc.make("CancelModelDownload", {
-  payload: Schema.Struct({
-    attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema),
-  }),
+  payload: Schema.Struct({ downloadId: ModelDownloadIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
 export const DismissModelDownloadFailure = Rpc.make("DismissModelDownloadFailure", {
-  payload: Schema.Struct({ attemptIds: Schema.NonEmptyArray(DownloadAttemptIdSchema) }),
+  payload: Schema.Struct({ downloadId: ModelDownloadIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })

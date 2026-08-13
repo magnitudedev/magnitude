@@ -10,6 +10,7 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{
     MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunkType, MtmdInputChunks, MtmdInputText,
 };
+use llama_cpp_2::speculative::SpeculativeOperations;
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
@@ -209,18 +210,27 @@ impl<'model> MultimodalRuntime<'model> {
         llama_context: &mut LlamaContext<'_>,
         sequence_id: i32,
         batch_size: i32,
+        speculative: Option<&mut SpeculativeOperations<'_>>,
     ) -> Result<i32, InferenceError> {
-        prompt
-            .chunks
-            .eval_chunks(
+        match speculative {
+            Some(speculative) => prompt.chunks.eval_chunks_speculative(
+                &mut self.context,
+                speculative,
+                0,
+                sequence_id,
+                batch_size,
+                true,
+            ),
+            None => prompt.chunks.eval_chunks(
                 &mut self.context,
                 llama_context,
                 0,
                 sequence_id,
                 batch_size,
                 true,
-            )
-            .map_err(native_error)
+            ),
+        }
+        .map_err(native_error)
     }
 }
 

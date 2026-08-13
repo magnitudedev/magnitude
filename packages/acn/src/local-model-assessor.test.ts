@@ -22,6 +22,7 @@ describe("LocalModelAssessor", () => {
         readonly state: {
           readonly inventory: { readonly _tag: "Ready" }
           readonly entries: readonly ModelPackageEntry[]
+          readonly downloads: readonly never[]
         }
       }>()
       const packageId = ModelPackageIdSchema.make("package-test")
@@ -60,7 +61,7 @@ describe("LocalModelAssessor", () => {
       }
       const packageSnapshot = {
         revision: 1,
-        state: { inventory: { _tag: "Ready" as const }, entries: [packageEntry] },
+        state: { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] },
       }
       const configuration = {
         id: ModelServingConfigurationIdSchema.make("configuration-test"),
@@ -108,8 +109,8 @@ describe("LocalModelAssessor", () => {
           changes: Stream.fromPubSub(packageChanges),
           installedPackageIds: Effect.succeed(new Set([packageId])),
           admitBundle: () => Effect.dieMessage("unused"),
-          cancelAttempts: () => Effect.dieMessage("unused"),
-          acknowledgeFailures: () => Effect.dieMessage("unused"),
+          cancelDownload: () => Effect.dieMessage("unused"),
+          acknowledgeFailure: () => Effect.dieMessage("unused"),
           removeBundlePackages: () => Effect.dieMessage("unused"),
         })),
         Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({

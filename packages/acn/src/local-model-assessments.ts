@@ -13,6 +13,7 @@ import {
   LocalModelMutationFailed,
   MemoryAssessmentSchema,
   ModelAssessmentIdSchema,
+  servableModelBundlePackages,
   type FitsModelAssessment,
   type AssessmentEnvironmentId,
   type LocalInferenceError,
@@ -41,12 +42,8 @@ type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
 const bundleMaximumContextLength = (
   bundle: ServableModelBundle,
-): number => bundle._tag === "Standalone"
-    ? bundle.package.properties.maximumContextLength
-    : Math.min(
-        bundle.target.properties.maximumContextLength,
-        bundle.draft.properties.maximumContextLength,
-      )
+): number => Math.min(...servableModelBundlePackages(bundle)
+  .map(({ properties }) => properties.maximumContextLength))
 
 const assessmentProfile = (contextLength: number): AssessmentProfiles =>
   contextLength >= MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH ? [{ contextLength }] : []

@@ -1,7 +1,7 @@
 ---
 applies_to:
   - inference/crates/icn-engine/**
-  - inference/crates/icn-mtp/**
+  - inference/crates/icn-speculative/**
   - inference/crates/icn-contracts/src/lib.rs
   - inference/crates/icn-contracts/src/output.rs
   - inference/crates/icn-api/src/lib.rs
@@ -39,7 +39,7 @@ single executor thread
   +-- scheduler + sequence pool
   +-- llama.cpp target context
   +-- optional projector
-  `-- optional MTP target/draft state
+  `-- optional speculative target/draft state
   |
   | bounded result streams
   v
@@ -69,7 +69,7 @@ Rules:
 
 - Native plans are pointer-safe, process-local values and are never reconstructed from summaries.
 - Assessment discards its plan; resident loading replans under current conditions.
-- Assessment and loading use the same MTP selector and policy fingerprint.
+- Assessment and loading use the same speculative-decoding selector and policy fingerprint.
 - Execution identity includes the selected components and serving-configuration revision.
 - A serving worker initializes one installation-authorized native backend for its lifetime.
 - Load success requires exhaustive resident-allocation evidence with every location resolved to one
@@ -97,9 +97,12 @@ submit
   -> terminal result
 ```
 
-Prompt progress becomes committed only after target decode and linked MTP processing succeed.
+Prompt progress becomes committed only after target decode and linked speculative processing
+succeed, including every token or embedding sub-batch in a multimodal prompt.
 Batch effects are staged separately from requests until that boundary. A sampled token becomes
 committed only when a later decode or speculative-verification step accepts it.
+Multimodal projector execution supports only speculative methods that can advance from embedding
+sub-batches; MTP is rejected during configuration validation.
 
 Lifecycle observations report queueing, preparation, prefill, and generation start. They are
 coalesced, rate-limited latest-state signals and may be replaced rather than delay inference.
@@ -147,8 +150,9 @@ Token output passes through UTF-8 buffering, stop detection, and semantic parsin
 tool-call policy remains outside the native parser.
 
 Final metrics cover queue, prompt, decode, first-token latency, throughput, sampler/parser time,
-reused prompt tokens, and MTP draft/acceptance/verification when enabled. The server also reports the
-resolved execution configuration. Lifecycle control chunks contain no semantic choices.
+reused prompt tokens, and speculative draft/acceptance/verification when enabled. The server also
+reports the selected method, effective draft bounds, and resolved execution configuration.
+Lifecycle control chunks contain no semantic choices.
 
 ## Boundaries
 
@@ -164,3 +168,7 @@ explicit approval under the inference fork-maintenance policy.
 - Request-visible prompt progress reflects committed native work only.
 - Prompt reuse is optional and cannot change inference semantics.
 - Assessment and resident loading produce comparable normalized execution evidence.
+- MTP, DFlash, and DSpark use one shared speculative lifecycle; method-specific behavior remains
+  explicit and is delegated to the pinned native implementation.
+- Target and draft state advance atomically. Failure after either side advances resets both before
+  the sequence can be reused.

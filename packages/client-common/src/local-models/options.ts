@@ -5,6 +5,7 @@ import type {
   LocalModelsState,
   ModelSlotsState,
 } from "@magnitudedev/sdk"
+import { servableModelBundlePackages } from "@magnitudedev/sdk"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import {
   installedLocalModels,
@@ -35,7 +36,9 @@ const intentOrder = {
 export const localModelBundleKey = (model: LocalModel): string =>
   model.bundle._tag === "Standalone"
     ? `package:${model.bundle.package.id}`
-    : `speculative-pair:${model.bundle.target.id}:${model.bundle.draft.id}`
+    : `speculative:${model.bundle.method._tag}:${model.bundle.draftSource._tag}:${servableModelBundlePackages(model.bundle)
+      .map(({ id }) => id)
+      .join(":")}`
 
 export const localModelOptions = (
   models: LocalModelsState,

@@ -121,13 +121,13 @@ describe("local provider offering projection", () => {
           initialized: Effect.succeed(true),
           snapshot: Effect.succeed({
             revision: 1,
-            state: { inventory: { _tag: "Ready" }, entries: [packageEntry] },
+            state: { inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] },
           }),
           changes: Stream.never,
           installedPackageIds: Effect.succeed(new Set([packageId])),
           admitBundle: () => Effect.dieMessage("unused"),
-          cancelAttempts: () => Effect.dieMessage("unused"),
-          acknowledgeFailures: () => Effect.dieMessage("unused"),
+          cancelDownload: () => Effect.dieMessage("unused"),
+          acknowledgeFailure: () => Effect.dieMessage("unused"),
           removeBundlePackages: () => Effect.dieMessage("unused"),
         })),
         Layer.succeed(LocalModelAssessor, LocalModelAssessor.of({

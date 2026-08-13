@@ -1,7 +1,7 @@
 import { Effect, Option, Ref, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
   ModelServingConfigurationIdSchema,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
@@ -93,7 +93,7 @@ describe("LocalModelInstaller", () => {
         initialized: Effect.succeed(true),
         snapshot: Effect.succeed({
           revision: 0,
-          state: { inventory: { _tag: "Ready" }, entries: [] },
+          state: { inventory: { _tag: "Ready" }, entries: [], downloads: [] },
         }),
         changes: Stream.never,
         installedPackageIds: Effect.succeed(new Set()),
@@ -102,12 +102,12 @@ describe("LocalModelInstaller", () => {
           return admittedBundles.length === 1
             ? {
                 _tag: "DownloadAdmitted" as const,
-                attemptIds: [DownloadAttemptIdSchema.make("attempt-a")],
+                downloadId: ModelDownloadIdSchema.make("download-a"),
               }
             : { _tag: "AlreadyInstalled" as const }
         }),
-        cancelAttempts: () => Effect.void,
-        acknowledgeFailures: () => Effect.void,
+        cancelDownload: () => Effect.void,
+        acknowledgeFailure: () => Effect.void,
         removeBundlePackages: () => Effect.void,
       }
       const installer = yield* makeLocalModelInstaller(retained, packages, {
@@ -126,7 +126,7 @@ describe("LocalModelInstaller", () => {
     expect(result.first.providerModelId).toBe("configuration-a")
     expect(result.first).toMatchObject({
       _tag: "DownloadAdmitted",
-      attemptIds: ["attempt-a"],
+      downloadId: "download-a",
     })
     expect(result.second.providerModelId).toBe("configuration-a")
     expect(result.second._tag).toBe("AlreadyInstalled")
@@ -147,7 +147,7 @@ describe("LocalModelInstaller", () => {
         initialized: Effect.succeed(true),
         snapshot: Effect.succeed({
           revision: 0,
-          state: { inventory: { _tag: "Ready" as const }, entries: [] },
+          state: { inventory: { _tag: "Ready" as const }, entries: [], downloads: [] },
         }),
         changes: Stream.never,
         installedPackageIds: Effect.succeed(new Set<string>()),
@@ -155,8 +155,8 @@ describe("LocalModelInstaller", () => {
           admissions += 1
           return { _tag: "AlreadyInstalled" as const }
         }),
-        cancelAttempts: () => Effect.void,
-        acknowledgeFailures: () => Effect.void,
+        cancelDownload: () => Effect.void,
+        acknowledgeFailure: () => Effect.void,
         removeBundlePackages: () => Effect.void,
       } satisfies LocalModelPackagesApi
       const resolution = yield* Ref.make<Option.Option<ResolvedLocalModelConfiguration>>(Option.none())
