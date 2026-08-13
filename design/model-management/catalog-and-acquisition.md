@@ -36,10 +36,12 @@ selection, and runtime residency remain separate facts.
 The recommendable catalog is immutable release data. Human-reviewed declarations identify each
 artifact variant by its exact upstream format selector, short variant label, fidelity rank, and
 quantization-aware-training fact. Each variant publishes one exact default
-`ModelServingConfiguration`, required companion components, base presentation, and recommendation
-evidence. A declaration may identify a separately packaged speculative draft from another upstream
-repository. Every distinct package source is locked independently, and the same immutable draft
-package may be referenced by multiple target-variant bundles without duplicating its installation.
+`ModelServingConfiguration`, required package components, base presentation, and recommendation
+evidence. Speculative decoding is selected explicitly as either capability embedded in the target
+GGUF or an exact draft file in the target or another repository. Every package source is locked;
+a same-repository draft uses the target revision, while a different repository has its own lock.
+The same immutable draft package may be referenced by multiple target-variant bundles without
+duplicating its installation.
 The configuration and its ICN-issued identity are published independently of hardware assessment.
 Advancing the source lock is an explicit development operation.
 
@@ -48,9 +50,9 @@ inspection, template analysis, and native planning. It emits a self-contained pl
 for every target and separately packaged draft and proves that compact planner inputs yield the
 same native assessments as their source metadata at each declaration's catalog profile. Repeated
 references to one immutable package reuse one package identity and one content payload. A declared
-profile above the exact bundle maximum, a missing or differently typed companion or draft, an
-unresolved entry, incomplete coverage, integrity mismatch, or assessment mismatch fails generation
-or ICN readiness.
+embedded draft without inspected NextN layers, a profile above the exact bundle maximum, a missing
+or differently typed draft, an unresolved entry, incomplete coverage, integrity mismatch, or
+assessment mismatch fails generation or ICN readiness.
 
 Runtime catalog use performs no upstream discovery and does not follow mutable revisions. Adding a
 model, format, or upstream revision requires a new reviewed release catalog.
@@ -219,8 +221,8 @@ exists for the bundle; ICN constructs and canonically identifies the configurati
 - Catalog membership implies only eligibility for assessment and recommendation.
 - Format, variant label, fidelity rank, and quantization-aware-training status are explicit reviewed
   catalog facts; no downstream layer reconstructs one from another.
-- Every catalog bundle publishes the exact reviewed serving profile and required companion set used
-  to construct its package.
+- Every catalog bundle publishes the exact reviewed serving profile and speculative method/source
+  selected for execution.
 - Every catalog and standard serving configuration carries canonical identity constructed by ICN;
   ACN never recreates that identity.
 - Runtime setup requires no network access to reconstruct the release catalog.

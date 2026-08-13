@@ -10,6 +10,7 @@ import {
   localModelMaximumContextLength,
   performanceRange,
   selectionConfigurationId,
+  selectionMetadata,
   selectionProviderModelId,
 } from "./view-model"
 import {
@@ -138,5 +139,46 @@ describe("unified local inference projection", () => {
       "speculative:DSpark:Separate:package_target:package_draft",
     )
     expect(localModelMaximumContextLength(separate)).toBe(16_384)
+  })
+
+  it("shows the configured speculative method in selection metadata", () => {
+    const target = makeStandaloneBundle("package_target")
+    const draft = makeStandaloneBundle("package_draft")
+    if (target._tag !== "Standalone" || draft._tag !== "Standalone") {
+      throw new Error("test bundles must contain standalone packages")
+    }
+    const model = makeModel({
+      bundle: {
+        _tag: "SpeculativeDecoding",
+        target: target.package,
+        draftSource: { _tag: "Separate", draft: draft.package },
+        method: { _tag: "DFlash" },
+      },
+    })
+    const view = makeView({ models: [model] })
+    const [selection] = buildLocalInferenceSelections(view.models, view.slots)
+
+    expect(selectionMetadata(selection!)).toMatch(/ · DFlash$/)
+
+    const embedded = makeModel({
+      bundle: {
+        _tag: "SpeculativeDecoding",
+        target: target.package,
+        draftSource: { _tag: "Embedded" },
+        method: { _tag: "Mtp" },
+      },
+    })
+    const [embeddedSelection] = buildLocalInferenceSelections(
+      makeView({ models: [embedded] }).models,
+      makeView().slots,
+    )
+    expect(selectionMetadata(embeddedSelection!)).toMatch(/ · MTP$/)
+
+    const standalone = makeModel()
+    const [standaloneSelection] = buildLocalInferenceSelections(
+      makeView({ models: [standalone] }).models,
+      makeView().slots,
+    )
+    expect(selectionMetadata(standaloneSelection!)).not.toMatch(/ · (MTP|DFlash|DSpark)$/)
   })
 })

@@ -5240,7 +5240,7 @@
             }
           }
         ],
-        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a companion."
+        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a separate draft\npackage."
       },
       "SplitModeResponse": {
         "type": "string",

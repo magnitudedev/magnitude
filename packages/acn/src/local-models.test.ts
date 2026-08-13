@@ -99,7 +99,7 @@ describe("local model configuration resolution", () => {
     }, new Set())).toBe(false)
   })
 
-  it("resolves one configuration per bundle with retained, catalog, standard precedence", () => {
+  it("resolves one configuration per target with catalog, retained, standard precedence", () => {
     const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
     const standard = configuration("configuration-standard", bundle, 50_000)
     const catalog = configuration("configuration-catalog", bundle, 32_000)
@@ -153,7 +153,72 @@ describe("local model configuration resolution", () => {
           assessment: { _tag: "Assessing" },
         }],
       ]),
-    }).values()].map(({ configuration }) => configuration)).toEqual([retained])
+    }).values()].map(({ configuration }) => configuration)).toEqual([catalog])
+  })
+
+  it("preserves a retained configuration when its target is absent from the catalog", () => {
+    const retainedBundle = standaloneBundle({ _tag: "Local", path: "/models/retained" })
+    const otherBundle = standaloneBundle({ _tag: "Local", path: "/models/catalog" })
+    const catalogBundle = {
+      ...otherBundle,
+      package: {
+        ...otherBundle.package,
+        id: ModelPackageIdSchema.make("package-catalog"),
+      },
+    }
+    const retained = configuration("configuration-retained", retainedBundle, 24_000)
+    const catalog = configuration("configuration-catalog", catalogBundle, 32_000)
+
+    expect([...resolveLocalModelConfigurations({
+      retained: [retained],
+      catalog: [catalog],
+      installedPackageIds: new Set(),
+      assessed: new Map(),
+    }).values()].map(({ configuration }) => configuration)).toEqual([retained, catalog])
+  })
+
+  it("replaces generated standalone serving with the current catalog configuration for its target", () => {
+    const standalone = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" })
+    const standard = configuration("configuration-standard", standalone, 50_000)
+    const embedded = configuration("configuration-catalog-embedded", {
+      _tag: "SpeculativeDecoding",
+      target: standalone.package,
+      draftSource: { _tag: "Embedded" },
+      method: { _tag: "Mtp" },
+    }, 50_000)
+    const draft = {
+      ...standaloneBundle({ _tag: "Local", path: "/models/draft.gguf" }).package,
+      id: ModelPackageIdSchema.make("package-draft"),
+    }
+    const separate = configuration("configuration-catalog-separate", {
+      _tag: "SpeculativeDecoding",
+      target: standalone.package,
+      draftSource: { _tag: "Separate", draft },
+      method: { _tag: "DFlash" },
+    }, 50_000)
+    const assessed = new Map([[standard.id, {
+      configuration: standard,
+      origin: "Standard" as const,
+      assessment: { _tag: "Assessing" as const },
+    }]])
+
+    const embeddedResolution = resolveLocalModelConfigurations({
+      retained: [],
+      catalog: [embedded],
+      installedPackageIds: new Set([standalone.package.id]),
+      assessed,
+    })
+    expect(embeddedResolution.size).toBe(1)
+    expect([...embeddedResolution.values()][0]?.configuration).toEqual(embedded)
+
+    const separateResolution = resolveLocalModelConfigurations({
+      retained: [],
+      catalog: [separate],
+      installedPackageIds: new Set([standalone.package.id]),
+      assessed,
+    })
+    expect(separateResolution.size).toBe(1)
+    expect([...separateResolution.values()][0]?.configuration).toEqual(separate)
   })
 
   it("does not reinterpret removed authored configurations as standard resolutions", () => {

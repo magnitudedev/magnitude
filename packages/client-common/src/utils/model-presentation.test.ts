@@ -1,7 +1,11 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { ModelVariantLabelSchema } from "@magnitudedev/sdk"
-import { formatLocalModelDisplayName, formatModelDisplayName } from "./model-presentation"
+import {
+  formatLocalModelDisplayName,
+  formatModelDisplayName,
+  formatSpeculativeMethod,
+} from "./model-presentation"
 
 describe("model presentation", () => {
   it("appends a structured variant label", () => {
@@ -22,5 +26,11 @@ describe("model presentation", () => {
         variantLabel: ModelVariantLabelSchema.make("Q4 QAT"),
       },
     })).toBe("Gemma 4 12B (Q4 QAT)")
+  })
+
+  it("formats speculative methods consistently", () => {
+    expect(formatSpeculativeMethod({ _tag: "Mtp" })).toBe("MTP")
+    expect(formatSpeculativeMethod({ _tag: "DFlash" })).toBe("DFlash")
+    expect(formatSpeculativeMethod({ _tag: "DSpark" })).toBe("DSpark")
   })
 })

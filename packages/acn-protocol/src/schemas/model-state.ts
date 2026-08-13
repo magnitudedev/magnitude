@@ -364,6 +364,10 @@ export const servableModelBundlePackageIds = (
   bundle: ServableModelBundle,
 ): readonly ModelPackageId[] => servableModelBundlePackages(bundle).map(({ id }) => id)
 
+export const servableModelBundleTargetPackageId = (
+  bundle: ServableModelBundle,
+): ModelPackageId => bundle._tag === "Standalone" ? bundle.package.id : bundle.target.id
+
 export const sameServableModelBundleIdentity = (
   left: ServableModelBundle,
   right: ServableModelBundle,
@@ -764,9 +768,9 @@ export const LocalModelsStateSchema = Schema.Struct({
   models: Schema.Array(LocalModelSchema),
   discoveryState: LocalModelDiscoveryStateSchema,
 }).pipe(Schema.filter(({ models }) => {
-  const identities = models.map(({ bundle }) => servableModelBundlePackageIds(bundle).join("\0"))
+  const identities = models.map(({ bundle }) => servableModelBundleTargetPackageId(bundle))
   return new Set(identities).size === identities.length
-}, { message: () => "local models must have unique servable-bundle identities" }))
+}, { message: () => "local models must have unique target-package identities" }))
 export type LocalModelsState = typeof LocalModelsStateSchema.Type
 
 export const ModelPackagesStateSchema = Schema.Struct({

@@ -14,7 +14,7 @@ import type {
   ResolvedLocalModelConfiguration,
   LocalModelConfigurationResolverApi,
 } from "./local-model-configuration-resolver"
-import { localModelBundleIdentity } from "./local-model-configuration-resolver"
+import { localModelTargetIdentity } from "./local-model-configuration-resolver"
 
 const model = {
   id: "recommendable-a",
@@ -70,7 +70,7 @@ describe("LocalModelInstaller", () => {
     get: Ref.get(current).pipe(Effect.map(Option.match({
       onNone: () => new Map(),
       onSome: (resolved) => new Map([[
-        localModelBundleIdentity(resolved.configuration.bundle),
+        localModelTargetIdentity(resolved.configuration.bundle),
         resolved,
       ]]),
     }))),

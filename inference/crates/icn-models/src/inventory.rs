@@ -26,6 +26,7 @@ use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
+const MODEL_INSPECTION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CacheEvidence {
@@ -1336,6 +1337,7 @@ pub(crate) fn build_model(
                         parameter_count: inspection.parameter_count,
                         active_parameter_count: inspection.active_parameter_count,
                         training_context_length: inspection.training_context_length,
+                        nextn_predict_layers: inspection.nextn_predict_layers,
                         tokenizer: inspection.tokenizer,
                         modalities,
                         base_models: inspection.base_models,
@@ -1404,6 +1406,7 @@ fn model_inspection_evidence(
     has_projector: bool,
 ) -> Result<String, InventoryError> {
     serde_json::to_string(&(
+        MODEL_INSPECTION_SCHEMA_VERSION,
         &content_id.0,
         assessor_identity,
         primary_name,

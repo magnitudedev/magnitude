@@ -44,7 +44,7 @@ temporarily unable to load. Those are facets of the same model, not different en
 
 ## Canonical row
 
-Each `LocalModel` is identified by exact servable-bundle structure and contains:
+Each `LocalModel` is identified by its target package and contains:
 
 - the complete bundle;
 - presentation and download size; presentation keeps the base display name, short variant label,
@@ -86,13 +86,16 @@ provider offering projection is catching up; that interval is `Preparing`, never
 
 ## Membership and configuration
 
-A row exists for every release-catalog bundle and every independently servable installed bundle.
-Exact bundle identity coalesces those sources into one row. Catalog removal cannot hide an
-installed bundle; package removal removes a non-catalog row but leaves a catalog row as uninstalled.
-Packages that are members of a catalog or retained bundle do not create additional standalone rows;
-the bundle is the product identity. In particular, a separately packaged speculative draft appears
-through its speculative bundle, not as an ordinary model beside that bundle. A package containing
-only draft-role payload is not evidence of standalone servability.
+A row exists for every release-catalog target and every independently servable installed target.
+Target-package identity coalesces those sources into one row, while configuration precedence
+selects that row's current standalone or speculative bundle. The catalog is authoritative for a
+target; retained state preserves configurations only for targets absent from the catalog, and a
+generated standard configuration is the final fallback. Catalog removal cannot hide an installed
+target; package removal removes a non-catalog row but leaves a catalog row as uninstalled.
+Packages that are members of a catalog or retained bundle do not create additional standalone rows.
+In particular, a separately packaged speculative draft appears through its target's speculative
+bundle, not as an ordinary model beside that bundle. A package containing only draft-role payload
+is not evidence of standalone servability.
 
 `catalogMembershipState` is `NotInCatalog` or `InCatalog`. `InCatalog` carries the complete catalog
 data required by product presentation: intelligence score and source, fidelity rank,
@@ -111,8 +114,8 @@ The backend decides at most one serving configuration for a bundle, in this orde
    non-catalog standalone bundle.
 
 Catalog, retained, and standard assessment demand may coexist internally. They never become
-parallel client rows or multiple product choices for one bundle. Source provenance is not product
-identity.
+parallel client rows or multiple product choices for one target. Source provenance and the selected
+serving method are not row identity.
 
 ## Lifecycle and consistency
 
@@ -164,7 +167,7 @@ authorization.
 
 ## Conformance
 
-- Exact bundle identity produces at most one `LocalModel` row.
+- Target-package identity produces exactly one current `LocalModel` row.
 - Every catalog bundle and every independently servable installed bundle is represented.
 - Catalog membership is explicit and an `InCatalog` row carries complete catalog data.
 - Acquisition, serving, recommendation, availability, and memory guidance are facets of that row,

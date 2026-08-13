@@ -42,7 +42,7 @@ import {
   configuredModelPackageIds,
   isStandalonePackageCandidate,
   LocalModelConfigurationResolver,
-  localModelBundleIdentity as bundleIdentity,
+  localModelTargetIdentity as targetIdentity,
 } from "./local-model-configuration-resolver"
 import { bundlePackages, resolveBundlePresentation } from "./local-model-presentation"
 export { resolveBundlePresentation } from "./local-model-presentation"
@@ -368,7 +368,7 @@ export const LocalModelsLive: Layer.Layer<
 
     const groups = new Map<string, ServableModelBundle>()
     const addBundle = (bundle: ServableModelBundle) => {
-      const identity = bundleIdentity(bundle)
+      const identity = targetIdentity(bundle)
       const existing = groups.get(identity)
       if (existing === undefined) {
         groups.set(identity, bundle)
@@ -389,33 +389,39 @@ export const LocalModelsLive: Layer.Layer<
       }
     }
 
-    const catalogByBundle = new Map(catalogModels.map((model) => [
-      bundleIdentity(model.configuration.bundle),
+    const catalogByTarget = new Map(catalogModels.map((model) => [
+      targetIdentity(model.configuration.bundle),
       model,
     ]))
     const recommendationCandidates = recommendationState._tag === "Ready"
       ? recommendationState.catalog
       : []
-    const recommendationsByConfiguration = new Map<string, LocalModelRecommendation[]>()
+    const recommendationTargetByConfiguration = new Map(recommendationCandidates.map((candidate) => [
+      candidate.model.configuration.id,
+      targetIdentity(candidate.model.configuration.bundle),
+    ]))
+    const recommendationsByTarget = new Map<string, LocalModelRecommendation[]>()
     if (recommendationState._tag === "Ready") {
       for (const recommendation of recommendationState.recommendations) {
-        const entries = recommendationsByConfiguration.get(recommendation.configurationId) ?? []
+        const target = recommendationTargetByConfiguration.get(recommendation.configurationId)
+        if (target === undefined) continue
+        const entries = recommendationsByTarget.get(target) ?? []
         entries.push({
           id: recommendation.id,
           intent: recommendation.intent,
           explanation: recommendation.explanation,
         })
-        recommendationsByConfiguration.set(recommendation.configurationId, entries)
+        recommendationsByTarget.set(target, entries)
       }
     }
-    const recommendationOrder = new Map(recommendationCandidates.map((candidate, index) => [
-      candidate.model.configuration.id,
+    const recommendationOrderByTarget = new Map(recommendationCandidates.map((candidate, index) => [
+      targetIdentity(candidate.model.configuration.bundle),
       index,
     ]))
 
     const models: LocalModel[] = [...groups.values()].map((bundle): LocalModel => {
-      const identity = bundleIdentity(bundle)
-      const curated = catalogByBundle.get(identity)
+      const identity = targetIdentity(bundle)
+      const curated = catalogByTarget.get(identity)
       const presentation = resolveBundlePresentation(bundle, curated && {
         displayName: curated.displayName,
         variantLabel: curated.variantLabel,
@@ -533,7 +539,7 @@ export const LocalModelsLive: Layer.Layer<
           capabilities,
           assessment,
           availabilityState,
-          recommendations: recommendationsByConfiguration.get(configuration.id) ?? [],
+          recommendations: recommendationsByTarget.get(identity) ?? [],
         }
       }
       return {
@@ -545,26 +551,14 @@ export const LocalModelsLive: Layer.Layer<
         servingState,
       }
     }).sort((left, right) => {
-      const leftConfigurationId = left.servingState._tag === "Resolving"
-        ? undefined
-        : Option.getOrUndefined(left.servingState._tag === "Failed"
-          ? left.servingState.configuration
-          : Option.some(left.servingState.configuration))?.id
-      const rightConfigurationId = right.servingState._tag === "Resolving"
-        ? undefined
-        : Option.getOrUndefined(right.servingState._tag === "Failed"
-          ? right.servingState.configuration
-          : Option.some(right.servingState.configuration))?.id
-      const leftOrder = leftConfigurationId === undefined
-        ? Number.MAX_SAFE_INTEGER
-        : recommendationOrder.get(leftConfigurationId) ?? Number.MAX_SAFE_INTEGER
-      const rightOrder = rightConfigurationId === undefined
-        ? Number.MAX_SAFE_INTEGER
-        : recommendationOrder.get(rightConfigurationId) ?? Number.MAX_SAFE_INTEGER
+      const leftOrder = recommendationOrderByTarget.get(targetIdentity(left.bundle))
+        ?? Number.MAX_SAFE_INTEGER
+      const rightOrder = recommendationOrderByTarget.get(targetIdentity(right.bundle))
+        ?? Number.MAX_SAFE_INTEGER
       return leftOrder - rightOrder
         || left.presentation.displayName.localeCompare(right.presentation.displayName)
         || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
-        || bundleIdentity(left.bundle).localeCompare(bundleIdentity(right.bundle))
+        || targetIdentity(left.bundle).localeCompare(targetIdentity(right.bundle))
     })
 
     const discoveryState = recommendationState._tag === "Loading"
