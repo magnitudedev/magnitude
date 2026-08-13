@@ -81,7 +81,7 @@ The ICN package owns:
 
 The package owns exact hardware, recommendable-catalog, installed-package, and download observation
 plus the local provider adaptation because those capabilities compose the one generated ICN client.
-It does not own recommendation policy, retained configurations, user selection, ACN RPC state, cloud
+It does not own recommendation policy, user selection, ACN RPC state, cloud
 provider routing, or client presentation. It does not independently inspect hardware or GGUF files
 in Bun; it obtains those facts through generated ICN operations. It contains no fallback
 implementation of an ICN operation and no hand-written HTTP client, SSE parser, wire schema, or
@@ -182,9 +182,9 @@ External caches or directories participate only when they are supplied explicitl
 import/source roots. ACN supplies no such roots for the product-managed ICN.
 
 Per-request context length belongs to an explicit model serving configuration supplied to
-assessment and load. ACN persists that exact configuration as retained model state and projects its
-provider offering; ICN owns its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,
-or process-launch field. Native sequence capacity, physical context allocation, batching, GPU
+assessment and load. ACN resolves that configuration from catalog or standard-profile authorities
+and projects its provider offering without persisting either. ICN owns configuration identity and
+ephemeral residency. Native sequence capacity, physical context allocation, batching, GPU
 placement, KV policy, projector, and speculative-decoding selection are ICN-owned plan resolution. This
 separation lets one ICN live for one ACN lifetime while models and configurations change
 independently.
@@ -346,7 +346,7 @@ not an ICN resource.
 Model load accepts one exact model serving configuration plus the branded model-instance identity
 created by ACN before admission. The configuration contains the target
 and per-request context length; ICN owns its stable identity and ACN passes it unchanged from the
-retained configuration selected through the provider offering. After proving the exact one-sequence baseline, load selects the largest
+current configuration resolved through the provider offering. After proving the exact one-sequence baseline, load selects the largest
 native sequence capacity from one through four whose full-context allocation fits stable and live
 memory policy. That resolved capacity belongs to residency execution evidence and may differ across
 cold loads of the same configuration.

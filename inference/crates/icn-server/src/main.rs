@@ -21,9 +21,9 @@ use icn_contracts::models::{
     ModelAssessmentProfile as DomainModelAssessmentProfile, ModelAssessor, ModelBundleInput,
     ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceFailure, ModelInstanceId,
     ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadEvent,
-    ModelLoadPlan, ModelLoadStage, ModelPackageId, ModelPackageOperand, ModelReleaseReason,
-    ModelServingConfiguration, ModelServingConfigurationId, ModelStoppingAllocation,
-    PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
+    ModelLoadPlan, ModelLoadStage, ModelPackage, ModelPackageId, ModelPackageOperand,
+    ModelReleaseReason, ModelServingConfiguration, ModelServingConfigurationId,
+    ModelStoppingAllocation, PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
     RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
     SpeculativeDraftSource as ModelSpeculativeDraftSource, SpeculativeDraftSourceInput,
     SpeculativeMethod,
@@ -5359,6 +5359,33 @@ async fn main() -> anyhow::Result<()> {
             let mut inventory_config = InventoryConfig::with_roots(inventory_root, cache_root)
                 .context("invalid model inventory configuration")?;
             inventory_config.hf_cache_dirs.extend(hf_caches);
+            let release_catalog = installation
+                .as_ref()
+                .map(open_installation_catalog)
+                .transpose()?
+                .map(Arc::new);
+            if let Some(catalog) = &release_catalog {
+                let mut packages = std::collections::BTreeMap::new();
+                for model in &catalog.catalog().models {
+                    match &model.configuration.bundle {
+                        DomainServableModelBundle::Standalone { package } => {
+                            packages.insert(package.id.clone(), package.clone());
+                        }
+                        DomainServableModelBundle::SpeculativeDecoding {
+                            target,
+                            draft_source,
+                            ..
+                        } => {
+                            packages.insert(target.id.clone(), target.clone());
+                            if let ModelSpeculativeDraftSource::Separate { draft } = draft_source {
+                                packages.insert(draft.id.clone(), draft.clone());
+                            }
+                        }
+                    }
+                }
+                inventory_config.catalog_packages =
+                    packages.into_values().collect::<Vec<ModelPackage>>();
+            }
             let plan_defaults = model_plan_defaults();
             let native_backend = initialize_native_runtime(&runtime_authority)?;
             let inventory = Arc::new(
@@ -5447,11 +5474,6 @@ async fn main() -> anyhow::Result<()> {
                 hardware_calibration,
                 enabled_backends,
             );
-            let release_catalog = installation
-                .as_ref()
-                .map(open_installation_catalog)
-                .transpose()?
-                .map(Arc::new);
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
                     .await

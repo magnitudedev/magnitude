@@ -9,7 +9,6 @@ pub mod gguf;
 mod hugging_face;
 mod identity;
 mod inventory;
-mod manifest;
 mod package_service;
 mod planner_stub;
 mod preview;

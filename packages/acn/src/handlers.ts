@@ -44,8 +44,8 @@ import { LocalModels } from "./local-models";
 import { servableModelBundlePackageIds } from "@magnitudedev/acn-protocol";
 import { ClientLeaseManager } from "./client-lease-manager";
 import { LocalModelInstaller } from "./local-model-installer";
-import { RetainedModelConfigurations } from "./retained-model-configurations";
 import { LocalModelConfigurationCoordinator } from "./local-model-configuration-coordinator";
+import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -71,7 +71,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const localModelPackages = yield* LocalModelPackages;
     const localModels = yield* LocalModels;
     const localModelInstaller = yield* LocalModelInstaller;
-    const retainedConfigurations = yield* RetainedModelConfigurations;
+    const localModelConfigurations = yield* LocalModelConfigurationResolver;
     const modelConfigurationCoordinator = yield* LocalModelConfigurationCoordinator;
     const clientLeases = yield* ClientLeaseManager;
     const displayViewIntrospector = yield* Effect.serviceOption(
@@ -152,7 +152,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
     const deleteLocalModel = (configurationId: ModelServingConfigurationId) =>
       modelConfigurationCoordinator.exclusive(Effect.gen(function* () {
-      const configuration = yield* retainedConfigurations.resolve(configurationId);
+      const configuration = yield* localModelConfigurations.resolve(configurationId);
       if (Option.isNone(configuration)) {
         return yield* new LocalModelMutationFailed({
           code: "local_model_not_found",
@@ -179,16 +179,18 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           yield* modelSlots.stopModel(slot.instance.value.id);
         }
       }
-      const retainedPackageIds = new Set((yield* retainedConfigurations.get)
-        .filter((candidate) => candidate.id !== configurationId)
-        .flatMap((candidate) => servableModelBundlePackageIds(candidate.bundle)));
-      yield* localModelPackages.removeBundlePackages(configuration.value.bundle, retainedPackageIds);
-      yield* retainedConfigurations.remove(configurationId).pipe(
-        Effect.mapError((error) => new LocalModelMutationFailed({
-          code: "remove_local_model_configuration_failed",
-          message: error.message,
-          retryable: true,
-        })),
+      const installedPackageIds = yield* localModelPackages.installedPackageIds;
+      const referencedPackageIds = new Set(
+        [...(yield* localModelConfigurations.get).values()]
+          .map(({ configuration }) => configuration)
+          .filter((candidate) => candidate.id !== configurationId)
+          .filter((candidate) => servableModelBundlePackageIds(candidate.bundle)
+            .every((packageId) => installedPackageIds.has(packageId)))
+          .flatMap((candidate) => servableModelBundlePackageIds(candidate.bundle)),
+      );
+      yield* localModelPackages.removeBundlePackages(
+        configuration.value.configuration.bundle,
+        referencedPackageIds,
       );
       return {};
       }));

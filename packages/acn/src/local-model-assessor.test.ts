@@ -10,7 +10,6 @@ import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
 import { LocalModelAssessments } from "./local-model-assessments"
 import { LocalModelAssessor, LocalModelAssessorLive } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
 
 describe("LocalModelAssessor", () => {
   it("does not reassess unchanged semantic evidence", async () => {
@@ -72,18 +71,35 @@ describe("LocalModelAssessor", () => {
         ...configuration,
         id: ModelServingConfigurationIdSchema.make("configuration-sibling"),
       }
+      const catalogModel = (id: string, configuration: typeof siblingConfiguration) => ({
+        id,
+        checkpointId: "checkpoint-test",
+        configuration,
+        displayName: "Test",
+        variantLabel: "Q4",
+        description: "Test",
+        license: "test",
+        capabilities: packageEntry.inspection._tag === "Inspected"
+          ? packageEntry.inspection.capabilities
+          : undefined,
+        qualityScore: 1,
+        qualityScoreProvenance: "test",
+        fidelityRank: 1,
+        quantizationAware: false,
+        qualityEvidence: [],
+      })
       const dependencies = Layer.mergeAll(
-        Layer.succeed(RetainedModelConfigurations, RetainedModelConfigurations.of({
-          get: Effect.succeed([configuration, siblingConfiguration]),
-          recoveryCompleted: Effect.succeed(true),
-          changes: Stream.never,
-          resolve: () => Effect.succeed(Option.some(configuration)),
-          materialize: Effect.succeed,
-          remove: () => Effect.succeed(Option.none()),
-          completeRecovery: () => Effect.succeed([]),
-        })),
         Layer.succeed(IcnCatalog, IcnCatalog.of({
-          get: Effect.succeed({ revision: 1, state: { models: [], diagnostics: [] } }),
+          get: Effect.succeed({
+            revision: 1,
+            state: {
+              models: [
+                catalogModel("recommendable-test", configuration),
+                catalogModel("recommendable-sibling", siblingConfiguration),
+              ] as never,
+              diagnostics: [],
+            },
+          }),
           changes: Stream.never,
           ready: Effect.succeed(true),
           refresh: Effect.void,

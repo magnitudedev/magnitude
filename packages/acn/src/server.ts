@@ -75,9 +75,7 @@ import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { ModelSelectionLive } from "./model-selection"
-import { RetainedModelConfigurationsLive } from "./retained-model-configurations"
 import { LocalModelConfigurationCoordinatorLive } from "./local-model-configuration-coordinator"
-import { ConfigurationRecoveryLive } from "./configuration-recovery"
 import { makeAcnIcn } from "./icn"
 import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelAssessorLive } from "./local-model-assessor"
@@ -399,17 +397,9 @@ const addLocalInferenceServices = <A, E, R>(
     LocalModelConfigurationCoordinatorLive,
     withSelection,
   )
-  const withConfiguration = Layer.provideMerge(
-    RetainedModelConfigurationsLive,
-    withConfigurationCoordinator,
-  )
-  const withConfigurationRecovery = Layer.provideMerge(
-    ConfigurationRecoveryLive,
-    withConfiguration,
-  )
   const withCustomEndpoints = Layer.provideMerge(
     CustomEndpointsLive,
-    withConfigurationRecovery,
+    withConfigurationCoordinator,
   )
   const withHardware = Layer.provideMerge(
     LocalInferenceHardwareLive,

@@ -25,8 +25,6 @@ const selection = (providerId: string, providerModelId: string) =>
   })
 
 const emptyState = Schema.decodeUnknownSync(ModelStateSchema)({
-  configurations: [],
-  configurationRecoveryCompleted: true,
 })
 
 describe('ModelSelection', () => {

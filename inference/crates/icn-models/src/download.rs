@@ -24,8 +24,7 @@ use tokio::sync::watch;
 
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, model_id};
-use crate::inventory::{ModelManager, build_model, hf_repo_dir, now};
-use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationComponent, OperationManifest};
+use crate::inventory::{ModelManager, build_model, hf_repo_dir, now, repository_lock_path};
 use crate::validation::ValidatedDownloadPackage;
 
 const MAX_ATTEMPTS: usize = 5;
@@ -395,11 +394,6 @@ impl ModelManager {
                     if let Ok(mut models) = self.models.write() {
                         models.remove(model_id);
                     }
-                    let _ = tokio::fs::remove_file(operation_manifest_path(
-                        &self.config.root,
-                        model_id,
-                    ))
-                    .await;
                 }
                 operation
                     .sender
@@ -413,9 +407,6 @@ impl ModelManager {
                 return;
             };
             let resumable = failure.resumable();
-            if let Some(model_id) = model_id.as_ref() {
-                persist_operation_failure(&self.config.root, model_id, &download_failure).await;
-            }
             if let Some(model_id) = model_id.as_ref()
                 && let Ok(mut models) = self.models.write()
                 && let Some(model) = models.get_mut(model_id)
@@ -457,6 +448,8 @@ impl ModelManager {
             resumable: false,
         })?;
         let repo = self.client.model(owner.to_owned(), name.to_owned());
+        let repository_lock =
+            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
 
         let pinned = resolve_download_revision(
             &self.client,
@@ -618,44 +611,6 @@ impl ModelManager {
         tokio::fs::create_dir_all(repo_root.join("blobs"))
             .await
             .map_err(download_io)?;
-        tokio::fs::create_dir_all(&snapshot)
-            .await
-            .map_err(download_io)?;
-
-        let lock_path = self
-            .config
-            .root
-            .join("locks")
-            .join(format!("{}.lock", model_id.0));
-        let lock_file = acquire_lock(lock_path).await?;
-        let mut operation_manifest = OperationManifest {
-            version: MANIFEST_VERSION,
-            operation_id: operation_id.to_owned(),
-            model_id: model_id.clone(),
-            content_id: content_id.clone(),
-            repository: repository.clone(),
-            requested_revision: revision.clone(),
-            commit: commit.clone(),
-            components: components
-                .iter()
-                .map(|component| OperationComponent {
-                    path: component.path.clone(),
-                    role: component.role.clone(),
-                    content: component.content.clone(),
-                    shard_index: component.shard_index,
-                    relationship: component.relationship.clone(),
-                    expected_size: component.size_bytes,
-                    content_key: blob_key(&component.content),
-                    completed_bytes: 0,
-                })
-                .collect(),
-            stage: "downloading".to_owned(),
-            started_at,
-            updated_at: started_at,
-            failure: None,
-        };
-        persist_operation_manifest(&self.config.root, &operation_manifest).await?;
-
         let started = Instant::now();
         let mut resumed_by_component = Vec::with_capacity(components.len());
         for component in &components {
@@ -731,15 +686,8 @@ impl ModelManager {
                 &operation.cancelled,
             )
             .await?;
-            operation_manifest.components[index].completed_bytes = component.size_bytes;
-            operation_manifest.updated_at = now();
-            persist_operation_manifest(&self.config.root, &operation_manifest).await?;
-            publish_snapshot_link(&repo_root, &snapshot, component).await?;
         }
 
-        operation_manifest.stage = "verifying".to_owned();
-        operation_manifest.updated_at = now();
-        persist_operation_manifest(&self.config.root, &operation_manifest).await?;
         if let Some(last) = components.last() {
             operation.sender.send_replace(ModelDownloadEvent::Progress {
                 operation_id: operation_id.to_owned(),
@@ -757,22 +705,16 @@ impl ModelManager {
             });
         }
 
-        let manifest = ManagedManifest {
-            version: MANIFEST_VERSION,
-            model_id: model_id.clone(),
-            content_id,
-            repository: repository.to_owned(),
-            requested_revision: revision.to_owned(),
-            commit,
-            components,
-            created_at: started_at,
-            ready_at: now(),
-        };
-        persist_managed_manifest(&self.config.root, &manifest).await?;
-        let operation_path = operation_manifest_path(&self.config.root, &model_id);
-        let _ = tokio::fs::remove_file(operation_path).await;
-        let primary = manifest
-            .components
+        operation.ensure_active()?;
+        replace_other_snapshots(&repo_root, &commit).await?;
+        tokio::fs::create_dir_all(&snapshot)
+            .await
+            .map_err(download_io)?;
+        for component in &components {
+            publish_snapshot_link(&repo_root, &snapshot, component).await?;
+        }
+        let ready_at = now();
+        let primary = components
             .iter()
             .filter(|component| {
                 matches!(
@@ -789,21 +731,21 @@ impl ModelManager {
                 resumable: false,
             })?;
         let model = build_model(
-            manifest.model_id.clone(),
-            manifest.content_id.clone(),
-            manifest.created_at,
-            manifest.ready_at,
+            model_id.clone(),
+            content_id,
+            started_at,
+            ready_at,
             ModelSource::HuggingFace {
-                repository: manifest.repository.clone(),
-                requested_revision: manifest.requested_revision.clone(),
-                commit: manifest.commit.clone(),
+                repository: repository.clone(),
+                requested_revision: revision.clone(),
+                commit,
                 metadata: None,
             },
             ModelLocation::MagnitudeCache {
-                total_bytes: manifest.components.iter().map(|item| item.size_bytes).sum(),
-                components: manifest.components.clone(),
+                total_bytes,
+                components,
                 integrity: Integrity::Verified {
-                    method: "manifest".to_owned(),
+                    method: "content_identity".to_owned(),
                 },
             },
             &primary,
@@ -830,9 +772,30 @@ impl ModelManager {
             operation_id: operation_id.to_owned(),
             model: Box::new(ready),
         });
-        drop(lock_file);
+        drop(repository_lock);
         Ok(())
     }
+}
+
+async fn replace_other_snapshots(repo_root: &Path, commit: &str) -> Result<(), DownloadError> {
+    let snapshots = repo_root.join("snapshots");
+    tokio::fs::create_dir_all(&snapshots)
+        .await
+        .map_err(download_io)?;
+    let mut entries = tokio::fs::read_dir(&snapshots).await.map_err(download_io)?;
+    while let Some(entry) = entries.next_entry().await.map_err(download_io)? {
+        if entry.file_name().to_string_lossy() == commit {
+            continue;
+        }
+        let path = entry.path();
+        let kind = entry.file_type().await.map_err(download_io)?;
+        if kind.is_dir() && !kind.is_symlink() {
+            tokio::fs::remove_dir_all(path).await.map_err(download_io)?;
+        } else {
+            tokio::fs::remove_file(path).await.map_err(download_io)?;
+        }
+    }
+    Ok(())
 }
 
 async fn download_component_with_retry(
@@ -1208,26 +1171,6 @@ fn pathdiff(path: &Path, base: &Path) -> PathBuf {
     result
 }
 
-async fn persist_operation_manifest(
-    root: &Path,
-    manifest: &OperationManifest,
-) -> Result<(), DownloadError> {
-    atomic_json(&operation_manifest_path(root, &manifest.model_id), manifest).await
-}
-
-async fn persist_managed_manifest(
-    root: &Path,
-    manifest: &ManagedManifest,
-) -> Result<(), DownloadError> {
-    atomic_json(
-        &root
-            .join("installations")
-            .join(format!("{}.json", manifest.model_id.0)),
-        manifest,
-    )
-    .await
-}
-
 async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), DownloadError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| DownloadError {
         kind: DownloadErrorKind::Internal,
@@ -1261,39 +1204,6 @@ async fn sync_parent(path: &Path) -> Result<(), DownloadError> {
     };
     let directory = tokio::fs::File::open(parent).await.map_err(download_io)?;
     directory.sync_all().await.map_err(download_io)
-}
-
-async fn read_operation_manifest(
-    root: &Path,
-    model_id: &icn_contracts::ModelId,
-) -> Option<OperationManifest> {
-    let bytes = tokio::fs::read(operation_manifest_path(root, model_id))
-        .await
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-async fn persist_operation_failure(
-    root: &Path,
-    model_id: &icn_contracts::ModelId,
-    failure: &DownloadFailure,
-) {
-    let Some(mut manifest) = read_operation_manifest(root, model_id).await else {
-        return;
-    };
-    manifest.failure = Some(failure.clone());
-    manifest.updated_at = now();
-    for component in &mut manifest.components {
-        let repo_root = root.join("hub").join(hf_repo_dir(&manifest.repository));
-        let paths = DownloadComponentPaths::new(&repo_root.join("blobs"), &component.content_key);
-        component.completed_bytes =
-            recoverable_download_bytes(&paths, &component.content, component.expected_size).await;
-    }
-    let _ = persist_operation_manifest(root, &manifest).await;
-}
-
-fn operation_manifest_path(root: &Path, model_id: &icn_contracts::ModelId) -> PathBuf {
-    root.join("operations").join(format!("{}.json", model_id.0))
 }
 
 async fn resumable_bytes(repo_root: &Path, components: &[ModelComponent]) -> u64 {
@@ -1856,6 +1766,32 @@ mod tests {
                 maximum_context_length: 1,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn publishing_a_revision_removes_other_snapshots_but_retains_blobs() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("repository");
+        tokio::fs::create_dir_all(repository.join("snapshots/old"))
+            .await
+            .expect("old snapshot");
+        tokio::fs::create_dir_all(repository.join("snapshots/current"))
+            .await
+            .expect("current snapshot");
+        tokio::fs::create_dir_all(repository.join("blobs"))
+            .await
+            .expect("blobs");
+        tokio::fs::write(repository.join("blobs/model"), b"verified")
+            .await
+            .expect("blob");
+
+        replace_other_snapshots(&repository, "current")
+            .await
+            .expect("single managed revision");
+
+        assert!(!repository.join("snapshots/old").exists());
+        assert!(repository.join("snapshots/current").is_dir());
+        assert!(repository.join("blobs/model").is_file());
     }
 
     #[tokio::test]

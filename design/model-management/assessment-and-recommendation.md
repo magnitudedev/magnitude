@@ -4,11 +4,7 @@ applies_to:
   - inference/crates/icn-models/**
   - inference/crates/icn-api/**
   - packages/icn/src/hardware/**
-  - packages/acn/src/local-model-assessment*.ts
-  - packages/acn/src/local-model-assessor.ts
-  - packages/acn/src/local-model-recommendations.ts
-  - packages/acn/src/local-model-recommendation-policy.ts
-  - packages/acn/src/local-models.ts
+  - packages/acn/src/local-model-**
   - packages/acn-protocol/src/schemas/model-state.ts
   - cli/src/features/model-setup/**
 ---
@@ -33,7 +29,6 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 %%{init: { "theme": "dark", "themeVariables": { "background": "#16161d", "primaryColor": "#272733", "primaryTextColor": "#fafafa", "primaryBorderColor": "#a1a1aa", "lineColor": "#e4e4e7", "textColor": "#fafafa", "actorBkg": "#272733", "actorBorder": "#a1a1aa", "actorTextColor": "#fafafa", "actorLineColor": "#a1a1aa", "signalColor": "#e4e4e7", "signalTextColor": "#fafafa", "labelBoxBkgColor": "#272733", "labelBoxBorderColor": "#a1a1aa", "labelTextColor": "#fafafa", "loopTextColor": "#fafafa" } } }%%
 sequenceDiagram
     participant Catalog
-    participant State as Retained
     participant Inventory
     participant ACN
     participant ICN
@@ -43,11 +38,8 @@ sequenceDiagram
     alt Catalog configuration
         Catalog->>ACN: Reviewed configuration (bundle, profile, canonical ID)
         ACN->>ACN: Preserve reviewed profile
-    else Retained configuration
-        State->>ACN: Persisted configuration (bundle, profile, canonical ID)
-        ACN->>ACN: Preserve persisted profile
     else Standard configuration
-        Inventory->>ACN: Inspected standalone bundle without authored intent
+        Inventory->>ACN: Inspected standalone bundle without catalog configuration
         ACN->>ACN: Choose standard profile
     end
 
@@ -56,22 +48,22 @@ sequenceDiagram
     ICN->>ICN: Assess compatibility, memory, and performance
     ICN-->>ACN: Exact configuration and terminal result
 
-    alt Catalog or retained configuration
+    alt Catalog configuration
         ACN->>ACN: Require returned configuration to equal authored configuration
     else Standard configuration
         ACN->>ACN: Accept ICN-constructed configuration
     end
 
     ACN->>Resolver: Publish configuration and assessment
-    Resolver->>Resolver: Select retained, otherwise catalog, otherwise standard
+    Resolver->>Resolver: Select catalog, otherwise standard
     ACN->>Recommender: Evaluate Fits catalog configuration
 ```
 
-ACN always supplies the serving profile used for assessment. For catalog and retained intent it
-preserves the existing profile; only standard intent requires ACN to choose one by policy. ICN
+ACN always supplies the serving profile used for assessment. For catalog input it preserves the
+reviewed profile; standard input requires ACN to choose one by policy. ICN
 always constructs and canonically identifies the exact serving configuration for the supplied
 bundle and profile. ACN accepts that returned configuration for standard intent and requires exact
-equality with the authored catalog or retained configuration when such intent exists.
+equality with the authored catalog configuration.
 
 The rejection proof compares exact, content-deduplicated tensor storage with aggregate stable
 physical capacity. Uncertain bundles proceed. File/download size is not rejection evidence.
@@ -80,16 +72,15 @@ physical capacity. Uncertain bundles proceed. File/download size is not rejectio
 
 ACN exposes one assessment executor accepting exact bundles and profiles. It owns the
 scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
-One ACN local-model assessor owns demand for release-catalog configurations, retained
-configurations, and standard profile decisions made only for inspected standalone bundles with no
-retained or catalog configuration. ACN supplies the chosen bundle and profile for standard demand;
+One ACN local-model assessor owns demand for issued catalog configurations and standard profile
+decisions made only for inspected standalone bundles with no catalog configuration. ACN supplies
+the chosen bundle and profile for standard demand;
 ICN constructs and identifies the corresponding serving configuration as part of assessment.
 Recommendation, provider-offering, and local-model projections consume its state and
 never invoke assessment independently. Recommendation policy consumes only release-catalog
-candidates. Each release-catalog configuration uses its reviewed catalog profile. A retained
-configuration uses its exact persisted profile unchanged. ACN chooses the standard profile bounded
-by the package maximum for an inspected standalone package only when no retained or catalog
-configuration exists for that bundle. ICN, not ACN, constructs and canonically identifies the
+candidates. Each release-catalog configuration uses its reviewed catalog profile. ACN chooses the
+standard profile bounded by the package maximum for an inspected standalone package only when no
+catalog configuration exists for that bundle. ICN, not ACN, constructs and canonically identifies the
 resulting configuration. Package installation origin does not affect this decision.
 
 ICN persists every completed exact profile result, including `DoesNotFit`, and performs
@@ -130,7 +121,7 @@ are not assessment inputs. Revisions may require a reread; revision inequality n
 assessment by itself.
 
 Reconciliation is serialized and invalidations are coalesced. It assesses only new or changed keys,
-preserves terminal results for unchanged keys, and removes state only when catalog, retained, and
+preserves terminal results for unchanged keys, and removes state only when catalog and
 installed-package demand no longer includes the configuration. Completion rechecks the semantic key before publication;
 a result for a superseded key is discarded and reconciliation continues without overwriting newer
 state.
@@ -145,15 +136,13 @@ evidence and any selected recommendation intents.
 Performance evidence is an ordered set of samples for the same configuration. Samples above the
 configured context are omitted, and the final sample is always the configured context.
 
-Recommendation evidence is present only when the bundle comes from the recommendable catalog.
-Retained configurations outside the current catalog remain selectable provider offerings without
-fabricated intelligence, fidelity, or quality values when exact assessment and package evidence
-make them available.
+Recommendation evidence is present only when the bundle is active in the recommendable catalog.
+Deprecated catalog configurations remain resolvable and assessable but receive no fabricated
+intelligence, fidelity, quality, or recommendation evidence.
 
 `DoesNotFit` and `Incompatible` are completed evidence but are not selectable. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.
-Retained configurations remain durable independently of recommendation publication. Installed
-packages remain present in the [local-model product projection](./local-model-product-projection.md)
+Installed packages remain present in the [local-model product projection](./local-model-product-projection.md)
 independently of assessment and offering publication.
 
 ## Assessment lifecycle
@@ -227,10 +216,10 @@ Cached assessment never authorizes loading.
 ## Conformance
 
 - Every release-catalog choice publishes one reviewed configuration whose profile does not exceed
-  its exact bundle maximum. Retained configurations are assessed at their exact stored profiles.
-- For every inspected independently servable package without a retained or catalog configuration,
-  ACN makes one standard profile decision and ICN constructs and assesses its exact configuration.
-- A package already participating in a retained or catalog bundle is assessed only through that
+  its exact bundle maximum.
+- For every inspected independently servable package without a catalog configuration, ACN applies
+  the canonical standard-profile rule and ICN constructs and assesses its exact configuration.
+- A package already participating in a catalog bundle is assessed only through that
   bundle. Separate speculative companions are never submitted again as standalone targets.
 - All missing profiles for one bundle are submitted together.
 - Equivalent concurrent misses perform one native assessment.

@@ -3,187 +3,101 @@ applies_to:
   - packages/acn/src/local-provider-**
   - packages/acn/src/provider-model-catalog.ts
   - packages/acn/src/model-selection.ts
-  - packages/acn/src/retained-model-configurations.ts
   - packages/acn/src/model-slot-**
-  - packages/acn/src/local-model-recommendations.ts
+  - packages/acn/src/local-model-**
   - packages/acn/src/handlers.ts
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
-  - packages/client-common/src/local-models/**
-  - packages/client-common/src/model-slots/**
-  - packages/client-common/src/onboarding/**
-  - packages/client-common/src/hooks/use-onboarding-model-setup.ts
-  - packages/client-common/src/hooks/use-local-inference-state.ts
-  - cli/src/features/model-setup/**
-  - cli/src/features/model-menus/**
+  - packages/client-common/src/**/local-model*
 ---
 
 # Model offerings and selection
 
-This document defines how retained local configurations project into provider choices and durable
-slot selections. Terms follow [Model-management terminology](./terminology.md).
+This document defines derived local provider offerings and durable slot selections. Terms follow
+[Model-management terminology](./terminology.md).
 
 ## Provider boundary
 
-Generic provider and agent code sees an ordinary `(ProviderId, ProviderModelId)` and bound model. It
-does not see packages, downloads, assessments, recommendation-policy inputs, native plans, or residency.
+Generic provider and agent code sees an ordinary `(ProviderId, ProviderModelId)` and bound model.
+It does not see packages, downloads, assessments, native plans, or residency.
 
-ACN owns one durable retained local configuration per bundle. The local provider adapter projects
-each one as:
+The local provider adapter projects each currently resolved `ModelServingConfiguration` as one
+offering. For the local provider, the provider-model ID represents the ICN-issued configuration ID
+within the `local` namespace. The brands remain distinct even though their string values match.
 
-```text
-ProviderOffering
-  provider identity
-  provider-model identity
-  exact ModelServingConfiguration
-```
+Configurations and offerings are not persisted. ACN derives them continuously from:
 
-For the local provider, ACN represents the ICN-issued serving-configuration identity within the
-`local` provider namespace. The values remain different branded concepts: configuration identity
-addresses retained local state, while provider-model identity addresses its generic provider
-projection. Capabilities are resolved from current authoritative catalog or installed-package
-evidence and are not persisted as another offering record.
-Provider-catalog entries also carry an optional presentation-only variant label. Local offerings
-publish it from the shared ACN local-model presentation resolver; remote and custom offerings omit
-it unless their provider owns equivalent structured metadata. Slot descriptors copy this field so
-status surfaces never recover it from a display string.
+- issued catalog configurations, including deprecated entries required by durable references; and
+- ICN-issued standard configurations from the canonical stable standard-profile rule for inspected
+  independently servable packages not described by the catalog.
+
+Capabilities, presentation, installation, and assessment are joined from their current authorities
+and are not copied into offering state.
 
 ## Offering availability
 
-Configuration retention and offering availability are different facts. A configuration remains
-durable while its packages are absent, downloading, being inspected, or temporarily unavailable.
-Its provider offering remains present, while its provider-catalog projection is enabled only when
-every required package is installed and its exact configuration has a current `Fits` assessment.
+An offering exists when its exact configuration is currently resolvable. Availability is derived
+separately: it is enabled only when every required package is installed and the exact configuration
+has a current `Fits` assessment. Missing files, pending inspection, insufficient resources, or
+dependency failure disable the offering without deleting a durable slot selection that references
+it.
 
-Assessment publishes per-configuration results independently of retained configuration existence.
-Provider projection observes retained configurations and authoritative package and assessment state;
-it never materializes, defaults, substitutes, or rewrites configurations. Catalog-only choices and
-unretained standalone packages are not provider offerings. Their visibility belongs to
-[Local-model product projection](./local-model-product-projection.md), not to provider availability.
+An unresolved provider-model identity has no fabricated offering. Slots retain that identity as
+unresolved user intent until its authority becomes available again. ACN never substitutes another
+configuration by bundle similarity, filename, array position, or current recommendation.
 
-## Selecting a catalog option
+## Installation
 
-A catalog configuration is visible before retention on its unified local-model row. Only a
-completed eligible assessed row permits acquisition; it introduces no identity beyond its exact
-configuration. The client-owned
-selection pipeline is:
+Installation accepts one current `ModelServingConfigurationId`. ACN resolves it from the current
+configuration projection, validates exact `Fits` evidence, rechecks the same resolution at
+admission, and asks ICN to acquire its bundle. It performs no durable configuration write.
 
 ```text
-InstallModel(configurationId)                         -> AlreadyInstalled(providerModelId)
-                                                     | DownloadAdmitted(providerModelId, ModelDownloadId)
-  -> AssignSlot(slotId, providerModelId)
-  -> LoadModel(slotId, exact selection)              [if residency is requested]
+InstallModel(configurationId) -> AlreadyInstalled(providerModelId)
+                               | DownloadAdmitted(providerModelId, ModelDownloadId)
 ```
 
-Installation resolves a retained configuration first or a catalog configuration for first adoption,
-durably retains it, and privately admits acquisition for its exact bundle. Retaining a different
-configuration for the same bundle replaces the prior retained configuration; it does not create a
-second choice for the same installed model. Assignment stores the
-resulting provider identity as durable slot intent. Loading acts only on that slot and resolves the
-same retained configuration. Load admission atomically verifies that the slot still contains the
-requested selection, so concurrent reassignment is rejected instead of loading its replacement.
-`AssignSlot` also carries reasoning effort; the shorthand highlights
-the identities that determine each stage.
-
-After installation, provider and slot operations use `(ProviderId, ProviderModelId)` and do not use
-catalog membership as authority. Persisted state contains exact serving configurations and slot
-selection, never recommendation membership or provider-offering records.
+The returned provider-model identity is deterministic from configuration identity. Download
+identity is process-local and exists only for observation and cancellation of that occurrence.
+Installation, assignment, and loading remain separate mutations.
 
 ## Slot selection
 
 A slot selection is the user's durable choice of provider, provider model, and normalized reasoning
-effort for one product role. It references a provider offering and copies none of its package,
-source, assessment, recommendation, or runtime state.
+effort for one product role. It copies no configuration, package, source, assessment, or runtime
+state. Favorites and recency use the same complete provider-qualified identity.
 
-Selection comparison requires both concrete provider and provider-model identities. An unassigned
-slot, catalog-only configuration, unretained model, or unavailable observation has no substitute
-selection key; absence never compares as identity.
+Assignment validates the exact current offering, normalizes reasoning effort, durably stores the
+selection, and atomically publishes slot and agent-model configuration. Later unavailability does
+not discard selection. Explicit user deletion may clear affected selections only when that deletion
+operation promises to forget the chosen model, not merely because files disappeared.
 
-Assignment validates the exact offering before commit. A successful assignment means ACN has:
-
-- confirmed the offering is assignable from current authoritative state;
-- normalized reasoning effort against the provider model;
-- durably stored the selection; and
-- atomically published slot and agent-model configuration.
-
-A rejected assignment leaves the previous selection unchanged. Assignment never creates a blocked
-slot. Conditions may degrade after assignment; the slot then projects the authoritative
-unavailability without discarding user intent. Authoritative deletion of an authored provider or
-model is not temporary unavailability: it clears slots selecting that deleted identity without
-substituting another model.
-
-Assignment acknowledges after the durable selection and published configuration commit. When that
-commit displaces the final slot using a resident local instance, the model-slot owner starts exact
-instance replacement cleanup in its own service scope. That cleanup does not delay assignment
-acknowledgement and cannot change the committed selection; its lifecycle remains observable through
-the slot and instance authorities.
+Loading resolves the selected provider-model identity again through the current provider offering
+and submits that exact configuration to ICN. The slot controller rechecks selection before native
+admission so concurrent reassignment cannot load a replacement accidentally.
 
 ## Composite client workflows
 
-Onboarding model setup is owned by one client-side service in client-common. The service owns
-only its in-memory causal state: the explicit configuration choice and exact admission, provider,
-selection, and instance identities returned by its composed operations. It exposes one passive
-derived state atom and explicit start, cancel, and skip Effects. Those commands execute in the
-connection's existing Effect runtime and compose the lower domain services' semantic Effects.
+Onboarding owns only process-local causal identities returned by its composed operations. It may
+install, await the same configuration becoming selectable, assign, and load. It does not copy model
+or configuration state.
 
-The start command follows exactly one of these paths:
+Download synchronization uses the admitted process-local download identity or observes that the
+same configuration is already installed. Process restart returns onboarding to passive choice;
+catalog and artifact reconciliation reconstruct current models and offerings independently.
 
-```text
-exact chosen instance already ready -> complete onboarding
-installed choice -> assign -> load -> await exact instance ready -> complete
-uninstalled choice -> install -> await exact selectable installation -> assign -> load
-                   -> await exact instance ready -> complete
-```
-
-Mutation synchronization validates that each exact admission, selection, or instance is visible in
-the affected canonical query before dependent work begins. Background completion is observed by
-the same model-download or instance identity through `LocalModels` or `ModelSlots`. The service state joins
-those identities with canonical model and slot snapshots, so progress and lifecycle remain
-backend-owned and are never copied into service state.
-
-Download admission synchronization requires the chosen configuration to expose either the exact
-admitted model-download identity or installed acquisition. Provider publication is a later readiness
-condition: physical installation with `Preparing` availability remains a waiting state, and
-assignment begins only when that same configuration is `Selectable` with the provider-model
-identity returned by admission. Publication order therefore cannot become model replacement or a
-signal to restart setup.
-
-For an admitted multi-package download, package components may complete independently before the
-first synchronized snapshot. The aggregate model row continues to expose the one `ModelDownloadId`
-returned by admission; synchronization never depends on internal package-attempt membership.
-
-Opening or remounting onboarding only reads the service state. It cannot select or load a model.
-Only an explicit configuration-ID submission starts setup; current slot state and mutation history
-are never choice inputs. Component unmount does not interrupt active work. Process restart returns
-to passive choosing and does not reconstruct intent from surviving backend facts.
-
-Cancellation signals the one active continuation. After an admission it invokes the ordinary
-exact-model-download cancel or exact-instance stop mutation and waits for that mutation's exact
-query synchronization. It never searches mutation history, targets a current-but-unowned slot
-instance, or clears durable slot selection.
-
-## Favorites
-
-A favorite is a durable preference over `(ProviderId, ProviderModelId)`. Favoriting never installs,
-offers, selects, loads, or stops a model. An open selection menu retains its captured ordering;
-preference and recency changes affect the next menu entry.
+Cancellation addresses the exact active download or instance identity. It never searches mutation
+history, guesses from files, or clears durable selection.
 
 ## Conformance
 
-- Provider identity never depends on recommendation membership or package presence.
-- Product installation addresses configuration identity and returns its local provider-model
-  representation; bundle structure remains private to package acquisition.
-- Provider projection is exactly one-to-one with retained configurations and never creates durable
-  model state.
-- At most one retained configuration and provider offering exist for one bundle.
-- Catalog configurations and unretained standalone packages remain visible according to the product projection
-  without becoming provider offerings.
-- Installing a configuration retains it before assignment and installation admission returns.
-- Catalog row identity is not persisted as user intent.
-- Assignment commits durable selection and published configuration atomically.
-- Selection matching always uses one concrete provider-qualified offering identity.
-- Selection, acquisition, assignment, and loading remain distinct mutations even when composed by a client.
-- Composite client interactions carry dependencies through function outputs; service state retains
-  only causal identity and never a parallel model lifecycle.
+- Provider offerings are derived and have no persistence surface.
+- Model state contains no serving configuration or bundle copy.
+- Every offering maps one exact current configuration to one provider-model identity.
+- Installation performs no durable write beyond artifact acquisition itself.
+- Assignment persists only provider-qualified selection and reasoning effort.
+- Unavailability preserves selection as unresolved intent and never substitutes another model.
+- Loading re-resolves and validates the exact selected configuration.
+- Download identities are used only within the owning process lifetime.
 - Generic provider code remains independent of local-model management concepts.

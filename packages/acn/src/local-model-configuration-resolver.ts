@@ -16,7 +16,6 @@ import {
   type CoordinatedLocalModelAssessment,
 } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
 
 export interface ResolvedLocalModelConfiguration {
   readonly configuration: ModelServingConfiguration
@@ -64,7 +63,6 @@ export const isStandalonePackageCandidate = (
 const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 
 export const resolveLocalModelConfigurations = (input: {
-  readonly retained: readonly ModelServingConfiguration[]
   readonly catalog: readonly ModelServingConfiguration[]
   readonly assessed: ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>
   readonly installedPackageIds: ReadonlySet<string>
@@ -76,9 +74,6 @@ export const resolveLocalModelConfigurations = (input: {
     )) {
       configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
     }
-  }
-  for (const configuration of input.retained) {
-    configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
   }
   for (const configuration of input.catalog) {
     configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
@@ -102,15 +97,13 @@ const failure = (error: unknown) => new LocalModelMutationFailed({
 export const LocalModelConfigurationResolverLive: Layer.Layer<
   LocalModelConfigurationResolver,
   never,
-  RetainedModelConfigurations | IcnCatalog | LocalModelAssessor | LocalModelPackages
+  IcnCatalog | LocalModelAssessor | LocalModelPackages
 > = Layer.effect(LocalModelConfigurationResolver, Effect.gen(function* () {
-  const retained = yield* RetainedModelConfigurations
   const catalog = yield* IcnCatalog
   const assessor = yield* LocalModelAssessor
   const packages = yield* LocalModelPackages
 
   const get = Effect.gen(function* () {
-    const retainedConfigurations = yield* retained.get
     const catalogConfigurations = (yield* catalog.ready)
       ? yield* Effect.forEach(
           (yield* catalog.get).state.models,
@@ -118,7 +111,6 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
         ).pipe(Effect.map((models) => models.map(({ configuration }) => configuration)))
       : []
     return resolveLocalModelConfigurations({
-      retained: retainedConfigurations,
       catalog: catalogConfigurations,
       assessed: yield* assessor.state,
       installedPackageIds: yield* packages.installedPackageIds,
@@ -126,7 +118,6 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
   }).pipe(Effect.mapError(failure))
 
   const changes = Stream.mergeAll([
-    retained.changes.pipe(Stream.map(() => undefined)),
     catalog.changes.pipe(Stream.map(() => undefined)),
     assessor.changes.pipe(Stream.map(() => undefined)),
     packages.changes.pipe(Stream.map(() => undefined)),

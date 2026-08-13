@@ -26,7 +26,6 @@ import {
 } from "./local-model-configuration-resolver"
 import { LocalModelPackages } from "./local-model-packages"
 import { makeObservedState } from "./mirrored-state"
-import { RetainedModelConfigurations } from "./retained-model-configurations"
 
 const CoordinatedLocalModelAssessmentStateSchema = Schema.Union(
   Schema.TaggedStruct("Assessing", {}),
@@ -223,13 +222,11 @@ export const LocalModelAssessorLive: Layer.Layer<
   LocalModelAssessor,
   never,
   IcnCatalog | IcnHardware | LocalModelAssessments | LocalModelPackages
-    | RetainedModelConfigurations
 > = Layer.scoped(LocalModelAssessor, Effect.gen(function* () {
   const catalog = yield* IcnCatalog
   const hardware = yield* IcnHardware
   const assessments = yield* LocalModelAssessments
   const packages = yield* LocalModelPackages
-  const retained = yield* RetainedModelConfigurations
   const observed = yield* makeObservedState<AssessorState>({
     desired: new Map(),
     published: new Map(),
@@ -238,7 +235,6 @@ export const LocalModelAssessorLive: Layer.Layer<
   const lock = yield* Effect.makeSemaphore(1)
 
   const readDesired = Effect.gen(function* () {
-    const retainedConfigurations = yield* retained.get
     const catalogConfigurations = (yield* catalog.ready)
       ? yield* Effect.forEach(
           (yield* catalog.get).state.models,
@@ -248,18 +244,7 @@ export const LocalModelAssessorLive: Layer.Layer<
     const packageState = (yield* packages.snapshot).state
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     const hardwareState = (yield* hardware.get).state
-    const authoredConfigurations = new Map<ModelServingConfigurationId, ModelServingConfiguration>()
-    for (const configuration of catalogConfigurations) {
-      authoredConfigurations.set(configuration.id, configuration)
-    }
-    for (const configuration of retainedConfigurations) {
-      authoredConfigurations.set(configuration.id, configuration)
-    }
-    const configuredConfigurations = [
-      ...catalogConfigurations,
-      ...retainedConfigurations,
-    ]
-    const configuredPackages = configuredModelPackageIds(configuredConfigurations)
+    const configuredPackages = configuredModelPackageIds(catalogConfigurations)
 
     const hardwareEvidence = {
       nativeBuild: hardwareState.native_build,
@@ -268,9 +253,8 @@ export const LocalModelAssessorLive: Layer.Layer<
       assessmentReserveBytes: hardwareState.system_memory.assess_reserve_bytes,
       backends: [...hardwareState.enabled_backends],
     }
-    const catalogIds = new Set(catalogConfigurations.map(({ id }) => id))
     const desired = new Map<AssessmentDemandKey, DesiredAssessment>()
-    for (const configuration of authoredConfigurations.values()) {
+    for (const configuration of catalogConfigurations) {
       const packageEvidence = servableModelBundlePackageIds(configuration.bundle).map((packageId) => {
         const entry = packageEntries.get(packageId)
         return {
@@ -279,9 +263,6 @@ export const LocalModelAssessorLive: Layer.Layer<
           inspection: entry?.inspection._tag ?? "Pending",
         }
       })
-      const installedAndInspected = packageEvidence.every((entry) =>
-        entry.installed && entry.inspection === "Inspected")
-      if (!catalogIds.has(configuration.id) && !installedAndInspected) continue
       const semanticInput = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({
         configuration: yield* Schema.encode(ModelServingConfigurationSchema)(configuration),
         hardware: hardwareEvidence,
@@ -426,7 +407,6 @@ export const LocalModelAssessorLive: Layer.Layer<
 
   yield* Stream.make(undefined).pipe(
     Stream.concat(Stream.mergeAll([
-      retained.changes.pipe(Stream.map(() => undefined)),
       catalog.changes.pipe(Stream.map(() => undefined)),
       packages.changes.pipe(Stream.map(() => undefined)),
       hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
