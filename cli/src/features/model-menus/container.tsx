@@ -21,6 +21,7 @@ import {
   localModelConfigurationId,
   localModelProviderModelId,
   localModelCapabilities,
+  localModelSpeculativeMethodLabel,
   truncateToDisplayWidth,
   type NotificationState,
   usePlatform,
@@ -1273,9 +1274,8 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   const recommendationText = recommendationLabel(recommendation)
   const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
-  const speculativeText = model.bundle._tag === "Standalone"
-    ? "—"
-    : model.bundle.method._tag === "Mtp" ? "MTP" : model.bundle.method._tag
+  const speculativeMethod = localModelSpeculativeMethodLabel(model)
+  const speculativeText = Option.getOrElse(speculativeMethod, () => "—")
   const backgroundColor = focused
     ? theme.surfaceHover
     : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
@@ -1297,7 +1297,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
     const metadata = [
       recommendationText,
       memoryText,
-      ...(model.bundle._tag === "SpeculativeDecoding" ? [speculativeText] : []),
+      ...Option.match(speculativeMethod, { onNone: () => [], onSome: (method) => [method] }),
       ...(layout.showSpeed ? [speedText] : []),
     ]
       .filter((value) => value !== "")

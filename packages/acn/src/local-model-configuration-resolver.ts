@@ -3,6 +3,7 @@ import {
   LocalModelMutationFailed,
   ModelServingConfigurationSchema,
   servableModelBundlePackageIds,
+  servableModelBundleTargetPackageId,
   type LocalInferenceError,
   type ModelPackage,
   type ModelServingConfiguration,
@@ -22,14 +23,14 @@ export interface ResolvedLocalModelConfiguration {
   readonly assessment: Option.Option<CoordinatedLocalModelAssessment["assessment"]>
 }
 
-const LocalModelBundleIdentitySchema = Schema.String.pipe(
-  Schema.brand("LocalModelBundleIdentity"),
+const LocalModelTargetIdentitySchema = Schema.String.pipe(
+  Schema.brand("LocalModelTargetIdentity"),
 )
-type LocalModelBundleIdentity = typeof LocalModelBundleIdentitySchema.Type
+type LocalModelTargetIdentity = typeof LocalModelTargetIdentitySchema.Type
 
 export interface LocalModelConfigurationResolverApi {
   readonly get: Effect.Effect<
-    ReadonlyMap<LocalModelBundleIdentity, ResolvedLocalModelConfiguration>,
+    ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration>,
     LocalInferenceError
   >
   readonly changes: Stream.Stream<void>
@@ -43,14 +44,10 @@ export class LocalModelConfigurationResolver extends Context.Tag(
   "LocalModelConfigurationResolver",
 )<LocalModelConfigurationResolver, LocalModelConfigurationResolverApi>() {}
 
-export const localModelBundleIdentity = (
+export const localModelTargetIdentity = (
   bundle: ModelServingConfiguration["bundle"],
-): LocalModelBundleIdentity => LocalModelBundleIdentitySchema.make(
-  bundle._tag === "Standalone"
-    ? `Standalone\0${bundle.package.id}`
-    : bundle.draftSource._tag === "Embedded"
-      ? `SpeculativeDecoding\0${bundle.target.id}\0Embedded\0${JSON.stringify(bundle.method)}`
-      : `SpeculativeDecoding\0${bundle.target.id}\0Separate\0${bundle.draftSource.draft.id}\0${JSON.stringify(bundle.method)}`,
+): LocalModelTargetIdentity => LocalModelTargetIdentitySchema.make(
+  servableModelBundleTargetPackageId(bundle),
 )
 
 export const configuredModelPackageIds = (
@@ -71,20 +68,20 @@ export const resolveLocalModelConfigurations = (input: {
   readonly catalog: readonly ModelServingConfiguration[]
   readonly assessed: ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>
   readonly installedPackageIds: ReadonlySet<string>
-}): ReadonlyMap<LocalModelBundleIdentity, ResolvedLocalModelConfiguration> => {
-  const configurations = new Map<LocalModelBundleIdentity, ModelServingConfiguration>()
+}): ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration> => {
+  const configurations = new Map<LocalModelTargetIdentity, ModelServingConfiguration>()
   for (const { configuration, origin } of input.assessed.values()) {
     if (origin === "Standard" && servableModelBundlePackageIds(configuration.bundle).every(
       (packageId) => input.installedPackageIds.has(packageId),
     )) {
-      configurations.set(localModelBundleIdentity(configuration.bundle), configuration)
+      configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
     }
   }
-  for (const configuration of input.catalog) {
-    configurations.set(localModelBundleIdentity(configuration.bundle), configuration)
-  }
   for (const configuration of input.retained) {
-    configurations.set(localModelBundleIdentity(configuration.bundle), configuration)
+    configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
+  }
+  for (const configuration of input.catalog) {
+    configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
   }
   return new Map([...configurations].map(([identity, configuration]) => {
     const assessed = input.assessed.get(configuration.id)

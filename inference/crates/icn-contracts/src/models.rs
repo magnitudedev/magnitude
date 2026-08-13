@@ -195,7 +195,8 @@ pub enum ModelFileRole {
 /// Native algorithm used by a speculative decoding stage.
 ///
 /// Method and artifact packaging are intentionally independent. The enclosing speculative bundle
-/// declares whether the selected method is embedded in the target or supplied by a companion.
+/// declares whether the selected method is embedded in the target or supplied by a separate draft
+/// package.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]

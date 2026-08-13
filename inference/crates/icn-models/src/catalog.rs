@@ -8,17 +8,16 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
-    ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedServableModelBundle,
-    ServableModelBundle, ServableModelBundleKey, ServingProfile, SpeculativeDraftSource,
-    SpeculativeMethod,
+    CatalogDiagnostic, ModelFailure, ModelPackage, ModelPackageSource, ModelServingConfiguration,
+    RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
+    RecommendableModelId, ResolvedServableModelBundle, ServableModelBundle, ServableModelBundleKey,
+    ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
-    ModelComponent, ModelId, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
-    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    ModelComponent, ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent,
+    ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,8 +57,6 @@ struct CatalogModel {
     variants: Vec<CatalogVariant>,
     context_length: u32,
     #[serde(default)]
-    companions: Vec<CatalogCompanion>,
-    #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
     quality_score: f64,
@@ -84,14 +81,20 @@ struct CatalogSpeculativeDecoding {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CatalogSpeculativeDraftSource {
-    repository: String,
-    path: PathBuf,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum CatalogSpeculativeDraftSource {
+    Embedded,
+    File {
+        #[serde(default)]
+        repository: Option<String>,
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 enum CatalogSpeculativeMethod {
+    #[serde(rename = "mtp")]
+    Mtp,
     #[serde(rename = "dflash")]
     DFlash,
     #[serde(rename = "dspark")]
@@ -101,29 +104,21 @@ enum CatalogSpeculativeMethod {
 impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
     fn from(method: CatalogSpeculativeMethod) -> Self {
         match method {
+            CatalogSpeculativeMethod::Mtp => Self::Mtp,
             CatalogSpeculativeMethod::DFlash => Self::DFlash,
             CatalogSpeculativeMethod::DSpark => Self::DSpark,
         }
     }
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CatalogCompanion {
-    path: PathBuf,
-    role: CatalogCompanionRole,
-}
-
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-enum CatalogCompanionRole {
-    Mtp,
-}
-
-impl From<CatalogCompanionRole> for ModelPreviewComponentRole {
-    fn from(role: CatalogCompanionRole) -> Self {
-        match role {
-            CatalogCompanionRole::Mtp => Self::Mtp,
+impl CatalogSpeculativeDraftSource {
+    fn file<'a>(&'a self, target_repository: &'a str) -> Option<(&'a str, &'a Path)> {
+        match self {
+            Self::Embedded => None,
+            Self::File { repository, path } => Some((
+                repository.as_deref().unwrap_or(target_repository),
+                path.as_path(),
+            )),
         }
     }
 }
@@ -213,16 +208,6 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             .iter()
             .map(|variant| variant.variant_label.as_str())
             .collect::<BTreeSet<_>>();
-        let companion_paths = model
-            .companions
-            .iter()
-            .map(|companion| &companion.path)
-            .collect::<BTreeSet<_>>();
-        let companion_roles = model
-            .companions
-            .iter()
-            .map(|companion| companion.role)
-            .collect::<BTreeSet<_>>();
         if model.id.is_empty()
             || model.display_name.is_empty()
             || model.description.is_empty()
@@ -240,18 +225,23 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     || variant.fidelity_rank == 0
             })
             || model.context_length < MIN_CATALOG_CONTEXT_LENGTH
-            || companion_paths.len() != model.companions.len()
-            || companion_roles.len() != model.companions.len()
-            || model
-                .companions
-                .iter()
-                .any(|companion| companion.path.as_os_str().is_empty())
             || model
                 .speculative_decoding
                 .as_ref()
                 .is_some_and(|speculative| {
-                    speculative.draft.repository.is_empty()
-                        || speculative.draft.path.as_os_str().is_empty()
+                    matches!(
+                        (&speculative.method, &speculative.draft),
+                        (
+                            CatalogSpeculativeMethod::DFlash | CatalogSpeculativeMethod::DSpark,
+                            CatalogSpeculativeDraftSource::Embedded
+                        )
+                    ) || match &speculative.draft {
+                        CatalogSpeculativeDraftSource::Embedded => false,
+                        CatalogSpeculativeDraftSource::File { repository, path } => {
+                            repository.as_ref().is_some_and(String::is_empty)
+                                || path.as_os_str().is_empty()
+                        }
+                    }
                 })
             || model.license.is_empty()
             || !model.quality_score.is_finite()
@@ -285,10 +275,11 @@ pub async fn advance_model_catalog_lock(
             let models = Arc::clone(&models);
             async move {
                 let entry_id = declaration.id;
+                let target_repository = declaration.repository;
                 let target = refresh_hugging_face_repository(
                     &models,
                     HuggingFaceRepositoryRequest {
-                        repository: declaration.repository,
+                        repository: target_repository.clone(),
                         revision: "main".to_owned(),
                     },
                 )
@@ -298,12 +289,22 @@ pub async fn advance_model_catalog_lock(
                         "failed to resolve catalog entry {entry_id}: {error}"
                     ))
                 })?;
-                let speculative_draft = match declaration.speculative_decoding {
-                    Some(speculative) => Some(
+                let speculative_draft = match declaration
+                    .speculative_decoding
+                    .and_then(|speculative| match speculative.draft {
+                        CatalogSpeculativeDraftSource::Embedded => None,
+                        CatalogSpeculativeDraftSource::File { repository, .. } => {
+                            Some(repository.unwrap_or_else(|| target_repository.clone()))
+                        }
+                    }) {
+                    Some(repository) if repository == target_repository => {
+                        Some(target.commit.clone())
+                    }
+                    Some(repository) => Some(
                         refresh_hugging_face_repository(
                             &models,
                             HuggingFaceRepositoryRequest {
-                                repository: speculative.draft.repository,
+                                repository,
                                 revision: "main".to_owned(),
                             },
                         )
@@ -362,7 +363,16 @@ fn validate_model_catalog_lock(
             return true;
         };
         !valid_commit(&entry.target)
-            || entry.speculative_draft.is_some() != model.speculative_decoding.is_some()
+            || entry.speculative_draft.is_some()
+                != model
+                    .speculative_decoding
+                    .as_ref()
+                    .is_some_and(|speculative| {
+                        matches!(
+                            speculative.draft,
+                            CatalogSpeculativeDraftSource::File { .. }
+                        )
+                    })
             || entry
                 .speculative_draft
                 .as_ref()
@@ -932,59 +942,58 @@ fn validate_resolved_catalog(
                 model.checkpoint_id
             ))
         })?;
-        let (target, draft, method) = match &model.configuration.bundle {
+        let (target, draft_source, method) = match &model.configuration.bundle {
             ServableModelBundle::Standalone { package } => (package, None, None),
             ServableModelBundle::SpeculativeDecoding {
                 target,
-                draft_source: SpeculativeDraftSource::Separate { draft },
+                draft_source,
                 method,
-            } => (target, Some(draft), Some(method.clone())),
-            ServableModelBundle::SpeculativeDecoding {
-                draft_source: SpeculativeDraftSource::Embedded,
-                ..
-            } => {
-                return Err(InventoryError::Integrity(format!(
-                    "release catalog bundle {} unexpectedly uses an embedded draft",
-                    model.id.0
-                )));
-            }
+            } => (target, Some(draft_source), Some(method)),
         };
-        let expected_mtp_paths = declaration
-            .companions
-            .iter()
-            .filter(|companion| matches!(companion.role, CatalogCompanionRole::Mtp))
-            .map(|companion| companion.path.as_path())
-            .collect::<BTreeSet<_>>();
-        let actual_mtp_paths = target
-            .files
-            .iter()
-            .filter(|file| file.role == ModelFileRole::Mtp)
-            .map(|file| file.path.as_path())
-            .collect::<BTreeSet<_>>();
-        let speculative_matches = match (&declaration.speculative_decoding, draft, method) {
+        let speculative_matches = match (&declaration.speculative_decoding, draft_source, method) {
             (None, None, None) => true,
-            (Some(speculative), Some(draft), Some(method)) => {
+            (
+                Some(CatalogSpeculativeDecoding {
+                    method: expected_method,
+                    draft: CatalogSpeculativeDraftSource::Embedded,
+                }),
+                Some(SpeculativeDraftSource::Embedded),
+                Some(method),
+            ) => expected_lock.speculative_draft.is_none() && method == &(*expected_method).into(),
+            (
+                Some(CatalogSpeculativeDecoding {
+                    method: expected_method,
+                    draft: CatalogSpeculativeDraftSource::File { .. },
+                }),
+                Some(SpeculativeDraftSource::Separate { draft }),
+                Some(method),
+            ) => {
                 let Some(expected_draft_commit) = expected_lock.speculative_draft.as_deref() else {
                     return Err(InventoryError::Integrity(format!(
                         "model catalog lock is missing {} speculative draft",
                         model.checkpoint_id
                     )));
                 };
-                method == speculative.method.into()
+                let Some((expected_repository, expected_path)) = declaration
+                    .speculative_decoding
+                    .as_ref()
+                    .and_then(|speculative| speculative.draft.file(&declaration.repository))
+                else {
+                    return Err(InventoryError::Integrity(
+                        "file draft declaration lost its source".to_owned(),
+                    ));
+                };
+                method == &(*expected_method).into()
                     && package_source_matches(
                         &draft.source,
-                        &speculative.draft.repository,
+                        expected_repository,
                         expected_draft_commit,
                     )
-                    && draft
-                        .files
-                        .iter()
-                        .any(|file| file.path == speculative.draft.path)
+                    && draft.files.iter().any(|file| file.path == expected_path)
             }
             _ => false,
         };
         if model.configuration.profile.context_length != declaration.context_length
-            || expected_mtp_paths != actual_mtp_paths
             || !package_source_matches(
                 &target.source,
                 &declaration.repository,
@@ -1025,18 +1034,42 @@ fn recommendable_model(
     let has_draft = draft.is_some();
     let bundle = match &declaration.speculative_decoding {
         None => ServableModelBundle::Standalone { package: target },
-        Some(speculative) => ServableModelBundle::SpeculativeDecoding {
-            target,
-            draft_source: SpeculativeDraftSource::Separate {
-                draft: draft.ok_or_else(|| {
-                    InventoryError::Integrity(format!(
-                        "{} has no resolved speculative draft",
-                        declaration.id
-                    ))
-                })?,
-            },
-            method: speculative.method.into(),
-        },
+        Some(speculative) => {
+            let draft_source = match speculative.draft {
+                CatalogSpeculativeDraftSource::Embedded => {
+                    let InventoryProperties::Inspected {
+                        nextn_predict_layers,
+                        ..
+                    } = properties
+                    else {
+                        return Err(InventoryError::Integrity(format!(
+                            "{} cannot verify its embedded speculative draft",
+                            declaration.id
+                        )));
+                    };
+                    if nextn_predict_layers.unwrap_or(0) == 0 {
+                        return Err(InventoryError::Integrity(format!(
+                            "{} declares an embedded speculative draft but its target GGUF has no NextN layers",
+                            declaration.id
+                        )));
+                    }
+                    SpeculativeDraftSource::Embedded
+                }
+                CatalogSpeculativeDraftSource::File { .. } => SpeculativeDraftSource::Separate {
+                    draft: draft.ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "{} has no resolved speculative draft",
+                            declaration.id
+                        ))
+                    })?,
+                },
+            };
+            ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method: speculative.method.into(),
+            }
+        }
     };
     if declaration.speculative_decoding.is_none() && has_draft {
         return Err(InventoryError::Integrity(format!(
@@ -1171,14 +1204,6 @@ impl ResolvingRecommendableCatalog {
             )));
         }
         let primary = matches.remove(0);
-        let additional_components = declaration
-            .companions
-            .iter()
-            .map(|companion| ModelPreviewComponentSource {
-                path: companion.path.clone(),
-                role: companion.role.into(),
-            })
-            .collect();
         let target_prepared = self
             .models
             .prepare_preview_from_repository_snapshot(
@@ -1186,32 +1211,34 @@ impl ResolvingRecommendableCatalog {
                     repository: snapshot.repository.clone(),
                     revision: snapshot.commit.clone(),
                     primary_gguf: primary.path.clone(),
-                    additional_components,
+                    additional_components: Vec::new(),
                 },
                 snapshot,
             )
             .await?;
         let (target, mut headers, mut planner_stubs) =
             self.release_planner_package(target_prepared, &primary.path)?;
-        let draft = match &declaration.speculative_decoding {
-            Some(speculative) => {
-                let snapshot = snapshots
-                    .get(&speculative.draft.repository)
-                    .ok_or_else(|| {
-                        InventoryError::Integrity(format!(
-                            "draft repository {} was not resolved",
-                            speculative.draft.repository
-                        ))
-                    })?;
+        let draft = match declaration
+            .speculative_decoding
+            .as_ref()
+            .and_then(|speculative| speculative.draft.file(&declaration.repository))
+        {
+            Some((draft_repository, draft_path)) => {
+                let snapshot = snapshots.get(draft_repository).ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "draft repository {} was not resolved",
+                        draft_repository
+                    ))
+                })?;
                 if !snapshot
                     .gguf_files
                     .iter()
-                    .any(|file| file.path == speculative.draft.path)
+                    .any(|file| file.path == draft_path)
                 {
                     return Err(InventoryError::Integrity(format!(
                         "{} has no draft file {}",
-                        speculative.draft.repository,
-                        speculative.draft.path.display()
+                        draft_repository,
+                        draft_path.display()
                     )));
                 }
                 let prepared = self
@@ -1220,14 +1247,14 @@ impl ResolvingRecommendableCatalog {
                         &ModelPreviewSource {
                             repository: snapshot.repository.clone(),
                             revision: snapshot.commit.clone(),
-                            primary_gguf: speculative.draft.path.clone(),
+                            primary_gguf: draft_path.to_path_buf(),
                             additional_components: Vec::new(),
                         },
                         snapshot,
                     )
                     .await?;
                 let (draft, draft_headers, draft_stubs) =
-                    self.release_planner_package(prepared, &speculative.draft.path)?;
+                    self.release_planner_package(prepared, draft_path)?;
                 merge_content_map(&mut headers, draft_headers, "source header")?;
                 merge_content_map(&mut planner_stubs, draft_stubs, "planner stub")?;
                 Some(draft)
@@ -1485,16 +1512,23 @@ impl ResolvingRecommendableCatalog {
             })?;
             insert_locked_repository(&mut repositories, &declaration.repository, &entry.target)?;
             if let Some(speculative) = &declaration.speculative_decoding {
-                insert_locked_repository(
-                    &mut repositories,
-                    &speculative.draft.repository,
-                    entry.speculative_draft.as_deref().ok_or_else(|| {
-                        InventoryError::Integrity(format!(
-                            "model catalog lock is missing {} speculative draft",
-                            declaration.id
-                        ))
-                    })?,
-                )?;
+                if let Some((repository, _)) = speculative.draft.file(&declaration.repository) {
+                    insert_locked_repository(
+                        &mut repositories,
+                        repository,
+                        entry.speculative_draft.as_deref().ok_or_else(|| {
+                            InventoryError::Integrity(format!(
+                                "model catalog lock is missing {} speculative draft",
+                                declaration.id
+                            ))
+                        })?,
+                    )?;
+                } else if entry.speculative_draft.is_some() {
+                    return Err(InventoryError::Integrity(format!(
+                        "model catalog lock unexpectedly includes {} embedded speculative draft",
+                        declaration.id
+                    )));
+                }
             }
         }
         let repositories = repositories.into_iter().collect::<Vec<_>>();
@@ -1544,13 +1578,15 @@ impl ResolvingRecommendableCatalog {
                 .map(|(declaration_index, declaration)| async move {
                     let mut variants = Vec::with_capacity(declaration.variants.len());
                     for (variant_index, variant) in declaration.variants.iter().enumerate() {
-                        let missing_repository = std::iter::once(&declaration.repository)
-                            .chain(
-                                declaration
-                                    .speculative_decoding
-                                    .iter()
-                                    .map(|speculative| &speculative.draft.repository),
-                            )
+                        let missing_repository = std::iter::once(declaration.repository.as_str())
+                            .chain(declaration.speculative_decoding.iter().filter_map(
+                                |speculative| {
+                                    speculative
+                                        .draft
+                                        .file(&declaration.repository)
+                                        .map(|(repository, _)| repository)
+                                },
+                            ))
                             .find(|repository| !resolved_snapshots.contains_key(*repository));
                         let result =
                             match missing_repository {
@@ -1777,24 +1813,102 @@ mod tests {
     }
 
     #[test]
-    fn gemma_catalog_declares_root_mtp_companions() {
+    fn gemma_catalog_declares_same_repository_mtp_drafts() {
         let source = catalog_source().expect("catalog source");
+        let lock = model_catalog_lock().expect("catalog lock");
         for model in source
             .models
             .iter()
             .filter(|model| model.id.starts_with("gemma-4-"))
         {
-            let [companion] = model.companions.as_slice() else {
-                panic!("{} must declare one MTP companion", model.id);
+            let Some(speculative) = model.speculative_decoding.as_ref() else {
+                panic!("{} must declare speculative decoding", model.id);
             };
-            assert!(matches!(companion.role, CatalogCompanionRole::Mtp));
+            assert!(matches!(speculative.method, CatalogSpeculativeMethod::Mtp));
+            let CatalogSpeculativeDraftSource::File { repository, path } = &speculative.draft
+            else {
+                panic!("{} must declare a file draft", model.id);
+            };
+            assert_eq!(repository, &None);
             assert!(
-                companion
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with("mtp-gemma-4-"))
+                path.file_name()
+                    .is_some_and(|name| { name.to_string_lossy().starts_with("mtp-gemma-4-") })
+            );
+            let entry = lock.get(&model.id).expect("Gemma lock entry");
+            assert_eq!(
+                entry.speculative_draft.as_deref(),
+                Some(entry.target.as_str())
             );
         }
+    }
+
+    #[test]
+    fn catalog_declares_verified_embedded_mtp_models_explicitly() {
+        let source = catalog_source().expect("catalog source");
+        for id in [
+            "qwen3.5-4b",
+            "qwen3.5-9b",
+            "qwen3.5-122b-a10b",
+            "nemotron-3.5-lightning-30b-a3b",
+            "glm-5.2",
+        ] {
+            let model = source
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .unwrap_or_else(|| panic!("missing {id} catalog model"));
+            let speculative = model
+                .speculative_decoding
+                .as_ref()
+                .unwrap_or_else(|| panic!("{id} must declare speculative decoding"));
+            assert!(matches!(speculative.method, CatalogSpeculativeMethod::Mtp));
+            assert!(matches!(
+                speculative.draft,
+                CatalogSpeculativeDraftSource::Embedded
+            ));
+        }
+    }
+
+    #[test]
+    fn qwen_36_variants_share_their_dflash_drafts() {
+        let source = catalog_source().expect("catalog source");
+        let assert_dflash = |id: &str, repository: &str, path: &str| {
+            let model = source
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .unwrap_or_else(|| panic!("missing {id} catalog model"));
+            let speculative = model
+                .speculative_decoding
+                .as_ref()
+                .unwrap_or_else(|| panic!("{id} must use speculative decoding"));
+
+            assert_eq!(model.variants.len(), 4);
+            assert!(matches!(
+                speculative.method,
+                CatalogSpeculativeMethod::DFlash
+            ));
+            let CatalogSpeculativeDraftSource::File {
+                repository: declared_repository,
+                path: declared_path,
+            } = &speculative.draft
+            else {
+                panic!("{id} must declare a file draft");
+            };
+            assert_eq!(declared_repository.as_deref(), Some(repository));
+            assert_eq!(declared_path, Path::new(path));
+        };
+
+        assert_dflash(
+            "qwen3.6-27b",
+            "magnitudedev/Qwen3.6-27B-DFlash-GGUF",
+            "Qwen3.6-27B-DFlash-Q8_0.gguf",
+        );
+        assert_dflash(
+            "qwen3.6-35b-a3b",
+            "magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF",
+            "Qwen3.6-35B-A3B-DFlash-Q8_0.gguf",
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ import {
   formatLocalModelDisplayName,
   localModelBundleKey,
   localModelOptions,
+  localModelSpeculativeMethodLabel,
   type LocalModelOption,
 } from "@magnitudedev/client-common"
 export {
@@ -354,9 +355,14 @@ export const selectionMetadata = ({ model }: LocalInferenceSelection): string =>
     onNone: () => localModelMaximumContextLength(model),
     onSome: ({ profile }) => profile.contextLength,
   })
-  return `${model.presentation.precisionLabel} · ${model.presentation.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
-    contextLength,
-  )} ctx`
+  const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
+  return [
+    model.presentation.precisionLabel,
+    model.presentation.quantization,
+    formatDownloadBytes(model.downloadBytes),
+    `${formatContext(contextLength)} ctx`,
+    speculativeMethod,
+  ].filter((value): value is string => value !== null).join(" · ")
 }
 
 export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>

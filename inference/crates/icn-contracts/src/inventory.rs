@@ -450,6 +450,7 @@ pub enum InventoryProperties {
         parameter_count: Option<u64>,
         active_parameter_count: Option<u64>,
         training_context_length: Option<u32>,
+        nextn_predict_layers: Option<u32>,
         tokenizer: Option<String>,
         modalities: Vec<String>,
         base_models: Vec<String>,

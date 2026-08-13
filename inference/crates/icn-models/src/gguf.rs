@@ -207,6 +207,10 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     if let Some(value) = string_value(&metadata, "tokenizer.chat_template") {
         fingerprint_material.extend_from_slice(value.as_bytes());
     }
+    if let Some(value) = nextn_predict_layers {
+        fingerprint_material.extend_from_slice(b"nextn_predict_layers");
+        fingerprint_material.extend_from_slice(&value.to_le_bytes());
+    }
 
     Ok(GgufInspection {
         version,
@@ -532,5 +536,38 @@ mod tests {
         assert_eq!(result.tool_use_template.as_deref(), Some("tool-template"));
         assert_eq!(result.bos_token.as_deref(), Some("<bos>"));
         assert_eq!(result.eos_token.as_deref(), Some("<eos>"));
+    }
+
+    #[test]
+    fn extracts_embedded_nextn_layer_count() {
+        let path = std::env::temp_dir().join(format!(
+            "icn-gguf-nextn-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+
+        push_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(&mut bytes, "qwen35");
+        push_string(&mut bytes, "qwen35.nextn_predict_layers");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+
+        std::fs::write(&path, bytes).unwrap();
+        let result = inspect(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.nextn_predict_layers, Some(4));
+        assert!(
+            result
+                .fingerprint_material
+                .windows(b"nextn_predict_layers".len())
+                .any(|window| window == b"nextn_predict_layers")
+        );
     }
 }
