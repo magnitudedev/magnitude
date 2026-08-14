@@ -27,6 +27,7 @@
     "onboarding:reset": "bun run scripts/reset-onboarding.ts",
     "design-docs": "bun run scripts/design-docs.ts",
     "session": "bun run --cwd evals session",
+    "benchmark": "bun run packages/inference-benchmark/src/cli.ts",
     "tbench": "bun run evals/tbench/cli.ts",
     "dash": "bun run --cwd packages/tracing dashboard",
     "events": "cat ~/.magnitude/logs/events.jsonl",
