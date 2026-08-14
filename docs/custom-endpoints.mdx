@@ -8,32 +8,28 @@ Add any OpenAI-compatible Chat Completions endpoint to `~/.magnitude/config.json
 
 ## Configure a custom endpoint
 
-Add an endpoint under `providers`, preserving any other fields already in the file. This example configures OpenRouter with GLM 5.2:
+Add an endpoint under `providers`, preserving any other fields already in the file. This example configures llama.cpp with Qwen3.6 27B:
 
 ```json
 {
   "providers": {
-    "openrouter": {
-      "displayName": "OpenRouter",
+    "llama-cpp": {
+      "displayName": "llama.cpp",
       "connection": {
-        "baseUrl": "https://openrouter.ai/api/v1",
+        "baseUrl": "http://127.0.0.1:8080/v1",
         "authentication": {
-          "type": "bearer",
-          "credential": {
-            "type": "environment",
-            "variable": "OPENROUTER_API_KEY"
-          }
+          "type": "none"
         }
       },
       "models": {
-        "z-ai/glm-5.2": {
-          "displayName": "GLM 5.2",
-          "contextWindow": 1048576,
-          "maxOutputTokens": 128000,
+        "qwen3.6-27b": {
+          "displayName": "Qwen3.6 27B",
+          "contextWindow": 100000,
+          "maxOutputTokens": 100000,
           "capabilities": {
             "reasoning": {
-              "efforts": ["high", "xhigh"],
-              "defaultEffort": "high"
+              "efforts": ["none", "max"],
+              "defaultEffort": "max"
             }
           }
         }
@@ -43,11 +39,7 @@ Add an endpoint under `providers`, preserving any other fields already in the fi
 }
 ```
 
-Set the referenced credential before starting Magnitude:
-
-```bash
-export OPENROUTER_API_KEY="your-key"
-```
+Change `baseUrl` to wherever your llama.cpp server is running. The key under `models` must match the model ID exposed by the server; this example assumes it is `qwen3.6-27b`.
 
 ## Configuration shape
 
@@ -84,7 +76,7 @@ type EnvironmentCredential = {
 }
 ```
 
-The example uses OpenRouter's published [GLM 5.2 model ID and limits](https://openrouter.ai/z-ai/glm-5.2). For another endpoint:
+For another endpoint:
 
 - use its API root as `baseUrl`; do not include `/chat/completions`;
 - use each model's exact API model ID as its key under `models`;

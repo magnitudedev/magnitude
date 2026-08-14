@@ -1,0 +1,35 @@
+---
+title: FAQ
+description: "Common questions about Magnitude"
+icon: message-circle-question-mark
+---
+
+## What is Magnitude?
+
+Magnitude is an open source agent with local models built in. Everything runs directly on your machine.
+
+## How is Magnitude different from Ollama or Hermes?
+
+Ollama runs local models. Hermes is an agent that can use local models. Magnitude combines both in one: it profiles your hardware, recommends and downloads models, then configures and runs them inside the agent. Nothing else to set up.
+
+## What hardware do I need?
+
+There’s no fixed minimum. Magnitude profiles your hardware and recommends the best models for your machine. More memory lets you run larger models.
+
+## Does my data go to the cloud?
+
+No. When using Magnitude's built-in local models, your prompts and files stay on your machine.
+
+When using your own inference server, model requests go to the endpoint you configure.
+
+## Can Magnitude run completely offline?
+
+Yes. Once Magnitude and a model are downloaded, you can use it without an internet connection.
+
+## Can I use models outside the catalog?
+
+Yes. You can [download compatible GGUF models from Hugging Face](/models#download-a-model-outside-the-catalog) and use them in Magnitude.
+
+## Can I use my own inference server?
+
+Yes. You can [connect a llama.cpp, vLLM, or other OpenAI-compatible inference server](/custom-endpoints) and use its models in Magnitude.
