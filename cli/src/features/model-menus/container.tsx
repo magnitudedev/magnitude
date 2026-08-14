@@ -26,12 +26,14 @@ import {
   type NotificationState,
   usePlatform,
   useLocalInferenceHardware,
+  useCatalogModels,
   useLocalModelActions,
   useLocalModelsSelector,
   useModelSlotActions,
   usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
+  type CatalogModelReconciliationState,
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
@@ -224,6 +226,9 @@ export const localModelReadinessStatus = (
   const assessment = model.servingState.assessment
   if (assessment._tag === "Incompatible") return "Error"
   if (assessment._tag === "DoesNotFit") return "Doesn’t fit"
+  if (model.upgradeState._tag === "Available") return "Update available"
+  if (model.upgradeState._tag === "Upgrading") return "Updating"
+  if (model.upgradeState._tag === "Failed") return "Update error"
   return model.acquisitionState._tag === "Installed"
     ? localModelInstalledStatus(model)
     : "Available"
@@ -883,7 +888,6 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
       return
     }
     const createAction = action.value
-    if (modelActions.isInstalling(createAction.configurationId)) return
     modelActions.installAndAssign(
       createAction.configurationId,
       PRIMARY_SLOT_ID,
@@ -1216,13 +1220,22 @@ export const huggingFaceRepositoryUrls = (
 
 export const catalogStatus = (
   model: LocalModel,
-  installationStarting = false,
+  reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
 ): string => {
-  const acquisitionState = model.acquisitionState
-  if (acquisitionState._tag === "Downloading") {
-    return `Downloading ${Math.round(acquisitionState.completedBytes / Math.max(1, acquisitionState.totalBytes) * 100)}%`
+  if (reconciliationState._tag === "Transferring") {
+    const verb = reconciliationState.operation === "Update" ? "Updating" : "Downloading"
+    return `${verb} ${Math.round(reconciliationState.completedBytes
+      / Math.max(1, reconciliationState.totalBytes) * 100)}%`
   }
-  if (installationStarting) return "Starting download…"
+  if (reconciliationState._tag === "Starting") {
+    return reconciliationState.operation === "Update" ? "Starting update…" : "Starting download…"
+  }
+  if (reconciliationState._tag === "Failed") {
+    return reconciliationState.operation === "Update" ? "Update failed" : "Download failed"
+  }
+  const acquisitionState = model.acquisitionState
+  if (model.upgradeState._tag === "Available") return "Update available"
+  if (model.upgradeState._tag === "Failed") return "Update failed"
   if (acquisitionState._tag === "NotInstalled"
     || acquisitionState._tag === "Cancelled") return "Available"
   if (acquisitionState._tag === "Failed") return "Download failed"
@@ -1239,7 +1252,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   recommendation,
   focused,
   pendingDelete,
-  installationStarting,
+  reconciliationState,
   index,
   layout,
   rowId,
@@ -1251,7 +1264,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   readonly recommendation: Option.Option<LocalModelRecommendation>
   readonly focused: boolean
   readonly pendingDelete: boolean
-  readonly installationStarting: boolean
+  readonly reconciliationState: CatalogModelReconciliationState
   readonly index: number
   readonly layout: CatalogLayout
   readonly rowId: string
@@ -1261,12 +1274,12 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   const theme = useTheme()
   const status = pendingDelete
     ? "Delete [y/n]"
-    : catalogStatus(model, installationStarting)
+    : catalogStatus(model, reconciliationState)
   const statusColor = pendingDelete
     ? theme.warning
-    : model.acquisitionState._tag === "Failed"
+    : model.acquisitionState._tag === "Failed" || reconciliationState._tag === "Failed"
       ? theme.error
-      : installationStarting
+      : reconciliationState._tag === "Starting" || reconciliationState._tag === "Transferring"
         || model.acquisitionState._tag === "Downloading"
         || model.acquisitionState._tag === "Installed"
         ? theme.primary
@@ -1400,18 +1413,17 @@ const CatalogMenu = memo(function CatalogMenu({
   const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const menuWidth = menuSize.width ?? 80
   const layout = deriveCatalogLayout(menuWidth)
-  const snapshot = useLocalModelsSelector(
-    selectModelMenusLocalModelsState,
-    modelMenusLocalModelsStateEquivalent,
-  )
+  const catalogView = Result.value(useCatalogModels())
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
-  const catalogModels = Option.match(snapshot, {
-    onNone: () => [] as readonly LocalModel[],
-    onSome: ({ models }) => catalogLocalModels(models),
+  const catalogModels = Option.match(catalogView, {
+    onNone: () => [],
+    onSome: ({ models }) => models.filter(({ model }) =>
+      model.servingState._tag === "Assessed"
+        && model.servingState.assessment._tag === "Fits"),
   })
   const recommendationsReady = Option.exists(
-    snapshot,
+    catalogView,
     (models) => models.discoveryState._tag === "Ready",
   )
   const recommendationFor = useCallback((model: LocalModel) =>
@@ -1423,7 +1435,7 @@ const CatalogMenu = memo(function CatalogMenu({
       && model.servingState.assessment._tag === "Fits"
       ? model.servingState.assessment.memory.totalRequiredBytes
       : undefined
-  const candidates = [...catalogModels].sort((left, right) => {
+  const candidates = catalogModels.map(({ model }) => model).sort((left, right) => {
     const leftInstalled = left.acquisitionState._tag === "Installed"
     const rightInstalled = right.acquisitionState._tag === "Installed"
     return (leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1)
@@ -1439,21 +1451,22 @@ const CatalogMenu = memo(function CatalogMenu({
   const configurationIdFor = (model: LocalModel) => Option.getOrUndefined(
     localModelConfigurationId(model),
   )
+  const reconciliationStateFor = (model: LocalModel): CatalogModelReconciliationState => {
+    const configurationId = configurationIdFor(model)
+    if (configurationId === undefined) return { _tag: "Idle" }
+    return catalogModels.find(({ model: candidate }) =>
+      configurationIdFor(candidate) === configurationId)?.reconciliationState ?? { _tag: "Idle" }
+  }
   const cursorIndex = Math.max(0, candidates.findIndex((model) =>
     configurationIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
   const detail = candidates.find((model) => configurationIdFor(model) === detailId) ?? null
   const detailConfigurationId = detail === null ? undefined : configurationIdFor(detail)
   const detailMemoryBytes = detail === null ? undefined : memoryBytesFor(detail)
-  const installationStartingFor = (model: LocalModel): boolean => {
-    const configurationId = configurationIdFor(model)
-    return configurationId !== undefined && modelActions.isInstalling(configurationId)
-  }
-  const detailInstallationStarting = detail !== null
-    && installationStartingFor(detail)
-  const detailInstallationFailed = detailConfigurationId !== undefined
-    && modelActions.installationFailed(detailConfigurationId)
-  const progress = Option.match(snapshot, {
+  const detailReconciliationState: CatalogModelReconciliationState = detail === null
+    ? { _tag: "Idle" }
+    : reconciliationStateFor(detail)
+  const progress = Option.match(catalogView, {
     onNone: () => [],
     onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
   })
@@ -1462,16 +1475,19 @@ const CatalogMenu = memo(function CatalogMenu({
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("primary" | "cancel" | "select")[]
     const actions: ("primary" | "cancel" | "select")[] = []
-    if (detail.acquisitionState._tag === "Downloading") actions.push("cancel")
-    else if (detailInstallationStarting) return actions
+    if (detail.acquisitionState._tag === "Downloading"
+      || detail.upgradeState._tag === "Upgrading") actions.push("cancel")
+    else if (detailReconciliationState._tag === "Starting") return actions
     else if (detail.acquisitionState._tag === "Installed") {
+      if (detail.upgradeState._tag === "Available"
+        || detail.upgradeState._tag === "Failed") actions.push("primary")
       if (detail.servingState._tag === "Assessed"
         && (detail.servingState.availabilityState._tag === "Selectable"
           || detail.servingState.availabilityState._tag === "Installable")) actions.push("select")
     }
     else actions.push("primary")
     return actions
-  }, [detail, detailInstallationStarting])
+  }, [detail, detailReconciliationState])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
 
@@ -1487,10 +1503,12 @@ const CatalogMenu = memo(function CatalogMenu({
     const configurationId = configurationIdFor(model)
     if (configurationId === undefined
       || model.acquisitionState._tag === "Downloading"
-      || model.acquisitionState._tag === "Installed"
-      || modelActions.isInstalling(configurationId)) return
+      || (model.acquisitionState._tag === "Installed"
+        && model.upgradeState._tag !== "Available"
+        && model.upgradeState._tag !== "Failed")
+      || reconciliationStateFor(model)._tag === "Starting") return
     modelActions.install(configurationId)
-  }, [modelActions])
+  }, [modelActions, catalogModels])
 
   const selectCandidate = useCallback((model: LocalModel) => {
     if (model.servingState._tag !== "Assessed"
@@ -1526,6 +1544,8 @@ const CatalogMenu = memo(function CatalogMenu({
     if (action === "cancel") {
       if (detail.acquisitionState._tag === "Downloading") {
         modelActions.cancel(detail.acquisitionState.downloadId)
+      } else if (detail.upgradeState._tag === "Upgrading") {
+        modelActions.cancel(detail.upgradeState.downloadId)
       }
       return
     }
@@ -1598,6 +1618,9 @@ const CatalogMenu = memo(function CatalogMenu({
       if (cursor.acquisitionState._tag === "Downloading") {
         modelActions.cancel(cursor.acquisitionState.downloadId)
         key.preventDefault()
+      } else if (cursor.upgradeState._tag === "Upgrading") {
+        modelActions.cancel(cursor.upgradeState.downloadId)
+        key.preventDefault()
       } else if (cursor.acquisitionState._tag === "Installed") {
         setPendingDeleteId(configurationIdFor(cursor) ?? null)
         key.preventDefault()
@@ -1609,10 +1632,18 @@ const CatalogMenu = memo(function CatalogMenu({
     const recommendation = recommendationFor(detail)
     const downloading = detail.acquisitionState._tag === "Downloading"
     const downloaded = detail.acquisitionState._tag === "Installed"
-    const failed = detail.acquisitionState._tag === "Failed"
+    const downloadFailure = detail.acquisitionState._tag === "Failed"
+      ? detail.acquisitionState.failure
+      : detail.upgradeState._tag === "Failed"
+        ? detail.upgradeState.failure
+        : undefined
+    const failed = downloadFailure !== undefined
+    const updateAvailable = detail.upgradeState._tag === "Available"
+      || detail.upgradeState._tag === "Failed"
     const detailActionLabel = {
-      primary: failed ? "Retry download" : "Download",
-      cancel: "Cancel download",
+      primary: updateAvailable ? (failed ? "Retry update" : "Update")
+        : failed ? "Retry download" : "Download",
+      cancel: detail.upgradeState._tag === "Upgrading" ? "Cancel update" : "Cancel download",
       select: "Select this model",
     } as const
     return (
@@ -1664,17 +1695,24 @@ const CatalogMenu = memo(function CatalogMenu({
             Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}
           </text>
           <text style={{ fg: theme.muted }}>
-            Status: <span fg={failed ? theme.error : detailInstallationStarting || downloading || downloaded ? theme.primary : theme.muted}>
-              {catalogStatus(detail, detailInstallationStarting)}
+            Status: <span fg={failed ? theme.error
+              : detailReconciliationState._tag === "Starting"
+                || detailReconciliationState._tag === "Transferring"
+                || downloading || downloaded ? theme.primary : theme.muted}>
+              {catalogStatus(detail, detailReconciliationState)}
             </span>
           </text>
-          {failed && (
+          {downloadFailure !== undefined && (
             <text style={{ fg: theme.error }}>
-              {modelDownloadFailureMessage(detail.acquisitionState.failure)}
+              {modelDownloadFailureMessage(downloadFailure)}
             </text>
           )}
-          {detailInstallationFailed && (
-            <text style={{ fg: theme.error }}>Failed to install the local model.</text>
+          {detailReconciliationState._tag === "Failed" && (
+            <text style={{ fg: theme.error }}>
+              {detailReconciliationState.operation === "Update"
+                ? "Failed to update the local model."
+                : "Failed to install the local model."}
+            </text>
           )}
           {Result.isFailure(slotActions.assignResult) && (
             <text style={{ fg: theme.error }}>Failed to update model selection.</text>
@@ -1782,7 +1820,7 @@ const CatalogMenu = memo(function CatalogMenu({
               recommendation={recommendationFor(candidate)}
               focused={focused}
               pendingDelete={pendingDelete}
-              installationStarting={installationStartingFor(candidate)}
+              reconciliationState={reconciliationStateFor(candidate)}
               index={index}
               layout={layout}
               rowId={catalogCandidateRowId(configurationId)}

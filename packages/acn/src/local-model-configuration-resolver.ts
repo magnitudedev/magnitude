@@ -5,20 +5,29 @@ import {
   servableModelBundlePackageIds,
   servableModelBundleTargetPackageId,
   type LocalInferenceError,
+  type CatalogIdentity,
   type ModelPackage,
   type ModelServingConfiguration,
   type ModelServingConfigurationId,
+  type RecommendableModel,
+  type InstalledCatalogAttribution,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalog } from "@magnitudedev/icn"
-import { recommendableModelFromIcn } from "./local-model-icn-adapter"
+import { IcnModels } from "@magnitudedev/icn"
+import {
+  catalogIdentityFromIcn,
+  catalogModelDefinitionFromIcn,
+  catalogModelEffectiveConfigurationFromIcn,
+} from "./local-model-icn-adapter"
 import {
   LocalModelAssessor,
   type CoordinatedLocalModelAssessment,
 } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
+import { localCatalogProviderModelId } from "./local-provider-model-id"
 
 export interface ResolvedLocalModelConfiguration {
-  readonly configuration: ModelServingConfiguration
+  readonly servingConfiguration: ModelServingConfiguration
+  readonly catalogIdentity: Option.Option<CatalogIdentity>
   readonly assessment: Option.Option<CoordinatedLocalModelAssessment["assessment"]>
 }
 
@@ -63,28 +72,57 @@ export const isStandalonePackageCandidate = (
 const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 
 export const resolveLocalModelConfigurations = (input: {
-  readonly catalog: readonly ModelServingConfiguration[]
+  readonly catalog: readonly RecommendableModel[]
+  readonly effectiveCatalogConfigurations: readonly {
+    readonly identity: CatalogIdentity
+    readonly configuration: ModelServingConfiguration
+  }[]
   readonly assessed: ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>
   readonly installedPackageIds: ReadonlySet<string>
+  readonly catalogAttributionByPackageId?: ReadonlyMap<string, InstalledCatalogAttribution>
 }): ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration> => {
   const configurations = new Map<LocalModelTargetIdentity, ModelServingConfiguration>()
   for (const { configuration, origin } of input.assessed.values()) {
     if (origin === "Standard" && servableModelBundlePackageIds(configuration.bundle).every(
       (packageId) => input.installedPackageIds.has(packageId),
     )) {
-      configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
+      const attribution = input.catalogAttributionByPackageId?.get(
+        servableModelBundleTargetPackageId(configuration.bundle),
+      )
+      if (attribution?._tag !== "Attributed") {
+        configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
+      }
     }
   }
-  for (const configuration of input.catalog) {
-    configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
+  const catalogByIdentity = new Map(input.catalog.map((model) => [
+    LocalModelTargetIdentitySchema.make(localCatalogProviderModelId(model)),
+    model,
+  ]))
+  const effectiveCatalogByIdentity = new Map(input.effectiveCatalogConfigurations.map((entry) => [
+    LocalModelTargetIdentitySchema.make(localCatalogProviderModelId(entry.identity)),
+    entry.configuration,
+  ]))
+  for (const [identity, model] of catalogByIdentity) {
+    configurations.set(
+      identity,
+      effectiveCatalogByIdentity.get(identity) ?? model.configuration,
+    )
   }
-  return new Map([...configurations].map(([identity, configuration]) => {
-    const assessed = input.assessed.get(configuration.id)
+  return new Map([...configurations].map(([identity, servingConfiguration]) => {
+    const assessed = input.assessed.get(servingConfiguration.id)
     const assessment = assessed !== undefined
-      && sameConfiguration(assessed.configuration, configuration)
+      && sameConfiguration(assessed.configuration, servingConfiguration)
       ? Option.some(assessed.assessment)
       : Option.none()
-    return [identity, { configuration, assessment }] as const
+    const catalogModel = catalogByIdentity.get(identity)
+    return [identity, {
+      servingConfiguration,
+      catalogIdentity: Option.fromNullable(catalogModel).pipe(Option.map(({ modelId, variantId }) => ({
+        modelId,
+        variantId,
+      }))),
+      assessment,
+    }] as const
   }))
 }
 
@@ -97,28 +135,53 @@ const failure = (error: unknown) => new LocalModelMutationFailed({
 export const LocalModelConfigurationResolverLive: Layer.Layer<
   LocalModelConfigurationResolver,
   never,
-  IcnCatalog | LocalModelAssessor | LocalModelPackages
+  IcnModels | LocalModelAssessor | LocalModelPackages
 > = Layer.effect(LocalModelConfigurationResolver, Effect.gen(function* () {
-  const catalog = yield* IcnCatalog
+  const models = yield* IcnModels
   const assessor = yield* LocalModelAssessor
   const packages = yield* LocalModelPackages
 
   const get = Effect.gen(function* () {
-    const catalogConfigurations = (yield* catalog.ready)
-      ? yield* Effect.forEach(
-          (yield* catalog.get).state.models,
-          recommendableModelFromIcn,
-        ).pipe(Effect.map((models) => models.map(({ configuration }) => configuration)))
+    const nativeCatalogModels = (yield* models.initialized)
+      ? (yield* models.get).state.catalogModels
       : []
+    const catalogModels = yield* Effect.forEach(
+      nativeCatalogModels,
+      catalogModelDefinitionFromIcn,
+    )
+    const effectiveCatalogConfigurationOptions = yield* Effect.forEach(
+      nativeCatalogModels,
+      (model) =>
+        Effect.all([
+          catalogIdentityFromIcn(model),
+          catalogModelEffectiveConfigurationFromIcn(model),
+        ]).pipe(Effect.map(([identity, configuration]) => Option.map(
+          configuration,
+          (effective) => [
+            identity,
+            effective,
+          ] as const,
+        ))),
+    )
+    const effectiveCatalogConfigurations = effectiveCatalogConfigurationOptions.flatMap((entry) =>
+      Option.isSome(entry)
+        ? [{ identity: entry.value[0], configuration: entry.value[1] }]
+        : [])
+    const packageState = (yield* packages.snapshot).state
     return resolveLocalModelConfigurations({
-      catalog: catalogConfigurations,
+      catalog: catalogModels,
+      effectiveCatalogConfigurations,
       assessed: yield* assessor.state,
       installedPackageIds: yield* packages.installedPackageIds,
+      catalogAttributionByPackageId: new Map(packageState.entries.map((entry) => [
+        entry.package.id,
+        entry.catalogAttribution,
+      ])),
     })
   }).pipe(Effect.mapError(failure))
 
   const changes = Stream.mergeAll([
-    catalog.changes.pipe(Stream.map(() => undefined)),
+    models.changes.pipe(Stream.map(() => undefined)),
     assessor.changes.pipe(Stream.map(() => undefined)),
     packages.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" })
@@ -126,9 +189,9 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
   return LocalModelConfigurationResolver.of({
     get,
     changes,
-    catalogReady: catalog.ready,
+    catalogReady: models.initialized,
     resolve: (configurationId) => get.pipe(Effect.map((resolved) =>
-      Option.fromNullable([...resolved.values()].find(({ configuration }) =>
-        configuration.id === configurationId)))),
+      Option.fromNullable([...resolved.values()].find(({ servingConfiguration }) =>
+        servingConfiguration.id === configurationId)))),
   })
 }))

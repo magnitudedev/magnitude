@@ -10,6 +10,7 @@ import {
   type LocalModelAcquisitionState,
   type LocalModelAssessment,
   type LocalModelAvailabilityState,
+  type LocalModelUpgradeState,
   type LocalModelMemory,
   type LocalModelRecommendation,
   type LocalModelsState,
@@ -22,13 +23,13 @@ import {
   type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/ai"
-import { IcnCatalog, IcnInstances } from "@magnitudedev/icn"
+import { IcnInstances, IcnModels } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
-import { LocalProviderOfferings, localProviderModelId } from "./local-provider-offerings"
+import { LocalProviderOfferings, localCatalogProviderModelId, localProviderModelId } from "./local-provider-offerings"
 import {
   providerOfferingPackageEvidence,
   sameProviderOfferingPackageEvidence,
@@ -37,7 +38,7 @@ import {
   localModelAssessmentProfiles,
   MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH,
 } from "./local-model-assessments"
-import { recommendableModelFromIcn } from "./local-model-icn-adapter"
+import { catalogIdentityFromIcn, catalogModelDefinitionFromIcn } from "./local-model-icn-adapter"
 import {
   configuredModelPackageIds,
   isStandalonePackageCandidate,
@@ -134,6 +135,46 @@ export const aggregateAcquisitionState = (
       }
   }
 }
+
+export const deriveCatalogUpgradeState = (
+  input: {
+    readonly inCatalog: boolean
+    readonly nativeUpdateAvailable: boolean
+    readonly currentAcquisitionState: LocalModelAcquisitionState
+    readonly desiredAcquisitionState: LocalModelAcquisitionState
+    readonly hasPriorCatalogTarget: boolean
+  },
+): LocalModelUpgradeState => !input.inCatalog
+  ? { _tag: "NotApplicable" }
+  : input.nativeUpdateAvailable
+    ? input.desiredAcquisitionState._tag === "Downloading"
+      ? {
+          _tag: "Upgrading",
+          downloadId: input.desiredAcquisitionState.downloadId,
+          stage: input.desiredAcquisitionState.stage,
+          completedBytes: input.desiredAcquisitionState.completedBytes,
+          totalBytes: input.desiredAcquisitionState.totalBytes,
+          bytesPerSecond: input.desiredAcquisitionState.bytesPerSecond,
+        }
+      : input.desiredAcquisitionState._tag === "Failed"
+        ? { _tag: "Failed", failure: input.desiredAcquisitionState.failure }
+        : { _tag: "Available" }
+    : input.currentAcquisitionState._tag === "Installed"
+    ? { _tag: "Current" }
+    : !input.hasPriorCatalogTarget
+      ? { _tag: "NotApplicable" }
+      : input.currentAcquisitionState._tag === "Downloading"
+        ? {
+            _tag: "Upgrading",
+            downloadId: input.currentAcquisitionState.downloadId,
+            stage: input.currentAcquisitionState.stage,
+            completedBytes: input.currentAcquisitionState.completedBytes,
+            totalBytes: input.currentAcquisitionState.totalBytes,
+            bytesPerSecond: input.currentAcquisitionState.bytesPerSecond,
+          }
+        : input.currentAcquisitionState._tag === "Failed"
+          ? { _tag: "Failed", failure: input.currentAcquisitionState.failure }
+          : { _tag: "Available" }
 
 type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
 
@@ -304,11 +345,11 @@ export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalMo
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
-  IcnCatalog | LocalModelPackages | LocalModelRecommendations
+  IcnModels | LocalModelPackages | LocalModelRecommendations
     | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
     | IcnInstances | MirroredStateChanges
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
-  const catalog = yield* IcnCatalog
+  const icnModels = yield* IcnModels
   const packages = yield* LocalModelPackages
   const recommendations = yield* LocalModelRecommendations
   const resolver = yield* LocalModelConfigurationResolver
@@ -325,12 +366,15 @@ export const LocalModelsLive: Layer.Layer<
 
   const project = lock.withPermits(1)(Effect.gen(function* () {
     const packageState = (yield* packages.snapshot).state
+    const nativeCatalogModels = (yield* icnModels.get).state.catalogModels
     const catalogModels = yield* Effect.forEach(
-      (yield* catalog.get).state.models,
-      recommendableModelFromIcn,
+      nativeCatalogModels,
+      catalogModelDefinitionFromIcn,
     )
     const recommendationState = (yield* recommendations.snapshot).state
-    const resolvedConfigurations = yield* resolver.get
+    const resolvedConfigurations = new Map<string, import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration>(
+      yield* resolver.get,
+    )
     const configured = yield* offerings.list
     const projectedOfferings = yield* offerings.state
     const hardwareState = (yield* hardware.snapshot).state
@@ -367,8 +411,8 @@ export const LocalModelsLive: Layer.Layer<
     )
 
     const groups = new Map<string, ServableModelBundle>()
-    const addBundle = (bundle: ServableModelBundle) => {
-      const identity = targetIdentity(bundle)
+    const addBundle = (bundle: ServableModelBundle, explicitIdentity?: string) => {
+      const identity = explicitIdentity ?? targetIdentity(bundle)
       const existing = groups.get(identity)
       if (existing === undefined) {
         groups.set(identity, bundle)
@@ -376,29 +420,37 @@ export const LocalModelsLive: Layer.Layer<
         throw new Error(`Servable model bundle ${identity} has conflicting package definitions`)
       }
     }
-    for (const { configuration } of resolvedConfigurations.values()) {
-      addBundle(configuration.bundle)
+    for (const [identity, { servingConfiguration }] of resolvedConfigurations) {
+      addBundle(servingConfiguration.bundle, identity)
     }
     const configuredPackages = configuredModelPackageIds(
-      [...resolvedConfigurations.values()].map(({ configuration }) => configuration),
+      [...resolvedConfigurations.values()].map(({ servingConfiguration }) => servingConfiguration),
     )
     for (const entry of packageState.entries) {
       if (entry.localState._tag !== "Installed") continue
+      if (entry.catalogAttribution._tag === "Attributed") continue
       if (isStandalonePackageCandidate(entry.package, configuredPackages)) {
         addBundle({ _tag: "Standalone", package: entry.package })
       }
     }
 
-    const catalogByTarget = new Map(catalogModels.map((model) => [
-      targetIdentity(model.configuration.bundle),
+    const catalogByTarget = new Map<string, (typeof catalogModels)[number]>(catalogModels.map((model) => [
+      localCatalogProviderModelId(model),
       model,
     ]))
+    const nativeCatalogByTarget = new Map<string, (typeof nativeCatalogModels)[number]>(
+      yield* Effect.forEach(nativeCatalogModels, (model) =>
+        catalogIdentityFromIcn(model).pipe(Effect.map((identity) => [
+          localCatalogProviderModelId(identity),
+          model,
+        ] as const))),
+    )
     const recommendationCandidates = recommendationState._tag === "Ready"
       ? recommendationState.catalog
       : []
     const recommendationTargetByConfiguration = new Map(recommendationCandidates.map((candidate) => [
       candidate.model.configuration.id,
-      targetIdentity(candidate.model.configuration.bundle),
+      localCatalogProviderModelId(candidate.model),
     ]))
     const recommendationsByTarget = new Map<string, LocalModelRecommendation[]>()
     if (recommendationState._tag === "Ready") {
@@ -414,13 +466,12 @@ export const LocalModelsLive: Layer.Layer<
         recommendationsByTarget.set(target, entries)
       }
     }
-    const recommendationOrderByTarget = new Map(recommendationCandidates.map((candidate, index) => [
-      targetIdentity(candidate.model.configuration.bundle),
+    const recommendationOrderByTarget = new Map<string, number>(recommendationCandidates.map((candidate, index) => [
+      localCatalogProviderModelId(candidate.model),
       index,
     ]))
 
-    const models: LocalModel[] = [...groups.values()].map((bundle): LocalModel => {
-      const identity = targetIdentity(bundle)
+    const models: LocalModel[] = [...groups.entries()].map(([identity, bundle]): LocalModel => {
       const curated = catalogByTarget.get(identity)
       const presentation = resolveBundlePresentation(bundle, curated && {
         displayName: curated.displayName,
@@ -429,6 +480,28 @@ export const LocalModelsLive: Layer.Layer<
         license: curated.license,
       })
       const acquisitionState = aggregateAcquisitionState(bundle, packageEntries, packageState.downloads)
+      const hasPriorCatalogTarget = packageState.entries.some((entry) =>
+        entry.localState._tag === "Installed"
+          && entry.catalogAttribution._tag === "Attributed"
+          && localCatalogProviderModelId(entry.catalogAttribution) === identity
+          && !servableModelBundlePackageIds(bundle).includes(entry.package.id))
+      const catalogLocalState = nativeCatalogByTarget.get(identity)?.localState
+      const updateAvailable = catalogLocalState?._tag === "Installed"
+        && catalogLocalState.updateState._tag === "Available"
+      const desiredAcquisitionState = curated === undefined
+        ? acquisitionState
+        : aggregateAcquisitionState(
+            curated.configuration.bundle,
+            packageEntries,
+            packageState.downloads,
+          )
+      const upgradeState = deriveCatalogUpgradeState({
+        inCatalog: curated !== undefined,
+        nativeUpdateAvailable: updateAvailable,
+        currentAcquisitionState: acquisitionState,
+        desiredAcquisitionState,
+        hasPriorCatalogTarget,
+      })
       const bundleEntries = servableModelBundlePackages(bundle).map((modelPackage) =>
         packageEntries.get(modelPackage.id))
       const inspectionFailure = bundleEntries.flatMap((entry) =>
@@ -440,17 +513,22 @@ export const LocalModelsLive: Layer.Layer<
       const inspectionComplete = acquisitionState._tag !== "Installed"
         || bundleEntries.every((entry) => entry?.inspection._tag === "Inspected")
       const resolved = resolvedConfigurations.get(identity)
-      const configuration = resolved?.configuration
+      const configuration = resolved?.servingConfiguration
       const coordinatedAssessment = resolved === undefined
         ? undefined
         : Option.getOrUndefined(resolved.assessment)
       const capabilities = curated?.capabilities
         ?? (primaryInspection?._tag === "Inspected" ? primaryInspection.capabilities : undefined)
+      const attribution = packageEntries.get(primaryPackage.id)?.catalogAttribution
       const catalogMembershipState: LocalModel["catalogMembershipState"] = curated === undefined
-        ? { _tag: "NotInCatalog" }
+        ? attribution?._tag === "Failed"
+          ? { _tag: "AttributionFailed", failure: attribution.failure }
+          : { _tag: "NotInCatalog" }
         : {
             _tag: "InCatalog",
             catalogData: {
+              modelId: curated.modelId,
+              variantId: curated.variantId,
               intelligenceScore: curated.qualityScore,
               intelligenceScoreSource: curated.qualityScoreProvenance,
               fidelityRank: curated.fidelityRank,
@@ -521,7 +599,9 @@ export const LocalModelsLive: Layer.Layer<
               }
         const providerModelId = providerIdByConfiguration.get(configuration.id)
           ?? (acquisitionState._tag === "Installed"
-            ? localProviderModelId(configuration.id)
+            ? curated === undefined
+              ? localProviderModelId(configuration.id)
+              : localCatalogProviderModelId(curated)
             : undefined)
         const availabilityState = assessment._tag !== "Fits"
           ? unavailableAssessment(assessment, providerModelId)
@@ -548,17 +628,21 @@ export const LocalModelsLive: Layer.Layer<
         downloadBytes: bundleDownloadBytes(bundle),
         catalogMembershipState,
         acquisitionState,
+        upgradeState,
         servingState,
       }
     }).sort((left, right) => {
-      const leftOrder = recommendationOrderByTarget.get(targetIdentity(left.bundle))
+      const productIdentity = (model: LocalModel) => model.catalogMembershipState._tag === "InCatalog"
+        ? localCatalogProviderModelId(model.catalogMembershipState.catalogData)
+        : targetIdentity(model.bundle)
+      const leftOrder = recommendationOrderByTarget.get(productIdentity(left))
         ?? Number.MAX_SAFE_INTEGER
-      const rightOrder = recommendationOrderByTarget.get(targetIdentity(right.bundle))
+      const rightOrder = recommendationOrderByTarget.get(productIdentity(right))
         ?? Number.MAX_SAFE_INTEGER
       return leftOrder - rightOrder
         || left.presentation.displayName.localeCompare(right.presentation.displayName)
         || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
-        || targetIdentity(left.bundle).localeCompare(targetIdentity(right.bundle))
+        || productIdentity(left).localeCompare(productIdentity(right))
     })
 
     const discoveryState = recommendationState._tag === "Loading"
@@ -583,7 +667,7 @@ export const LocalModelsLive: Layer.Layer<
   yield* project
   yield* Stream.mergeAll([
     packages.changes,
-    catalog.changes,
+    icnModels.changes,
     recommendations.changes,
     resolver.changes,
     offerings.changes,

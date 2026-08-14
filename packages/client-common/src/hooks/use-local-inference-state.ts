@@ -12,7 +12,10 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { LocalModels, useLocalModelMutations } from "../local-models/service"
+import {
+  LocalModels,
+  useLocalModelMutations,
+} from "../local-models/service"
 import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
 import { useMirroredState } from "./use-mirrored-state"
 
@@ -47,6 +50,14 @@ export const useLocalModelsSelector = <Selection,>(
     ))
   }, [equivalent, selector, service])
   return useAtomValue(selection)
+}
+
+export const useCatalogModels = () => {
+  const client = useAgentClient()
+  const service = useMemo(() => client.effectQuery.runtime.atom(LocalModels), [client])
+  const catalog = useMemo(() => Atom.make((get) =>
+    Result.flatMap(get(service), (models) => get(models.catalog))), [service])
+  return useAtomValue(catalog)
 }
 
 export const useModelSlots = () => {

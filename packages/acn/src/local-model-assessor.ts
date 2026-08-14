@@ -13,13 +13,16 @@ import {
   type ServableModelBundle,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
+import { IcnHardware, IcnModels } from "@magnitudedev/icn"
 import {
   LocalModelAssessments,
   localModelAssessmentProfiles,
   type LocalModelAssessmentResult,
 } from "./local-model-assessments"
-import { recommendableModelFromIcn } from "./local-model-icn-adapter"
+import {
+  catalogModelDefinitionFromIcn,
+  catalogModelEffectiveConfigurationFromIcn,
+} from "./local-model-icn-adapter"
 import {
   configuredModelPackageIds,
   isStandalonePackageCandidate,
@@ -140,9 +143,6 @@ const bundleDemandKey = (bundle: ServableModelBundle): string =>
       ? `SpeculativeDecoding\0${bundle.target.id}\0Embedded\0${JSON.stringify(bundle.method)}`
       : `SpeculativeDecoding\0${bundle.target.id}\0Separate\0${bundle.draftSource.draft.id}\0${JSON.stringify(bundle.method)}`
 
-const sameBundle = Schema.equivalence(ServableModelBundleSchema)
-const sameProfile = Schema.equivalence(ServingProfileSchema)
-
 const completedAssessment = (
   result: LocalModelAssessmentResult,
   request: DesiredAssessment,
@@ -167,33 +167,28 @@ const completedAssessment = (
       assessment: { _tag: "Failed", failure: result.failure },
     } : undefined
   }
-  const resultForConfiguration = result.assessments.find(({ configuration }) =>
-    request._tag === "Authored"
-      ? configurationEquivalent(configuration, request.configuration)
-      : sameBundle(configuration.bundle, request.bundle)
-        && sameProfile(configuration.profile, request.profile))
-  if (resultForConfiguration === undefined) {
-    return request._tag === "Authored" ? {
-      configuration: request.configuration,
-      assessment: {
-        _tag: "Failed",
-        failure: {
-          code: "model_assessment_configuration_mismatch",
-          message: `Native assessment did not return configuration ${request.configuration.id}`,
-          retryable: true,
-        },
-      },
-    } : undefined
-  }
+  const resultForConfiguration = result.assessments[0]!
+  const configuration = request._tag === "Authored"
+    ? request.configuration
+    : resultForConfiguration.configuration
   if (resultForConfiguration._tag === "Fits") {
     return {
-      configuration: resultForConfiguration.configuration,
-      assessment: { _tag: "Fits", assessment: resultForConfiguration.assessment },
+      configuration,
+      assessment: {
+        _tag: "Fits",
+        assessment: request._tag === "Authored"
+          ? {
+              ...resultForConfiguration.assessment,
+              profile: request.configuration.profile,
+              configurationId: request.configuration.id,
+            }
+          : resultForConfiguration.assessment,
+      },
     }
   }
   if (resultForConfiguration._tag === "DoesNotFit") {
     return {
-      configuration: resultForConfiguration.configuration,
+      configuration,
       assessment: {
         _tag: "DoesNotFit",
         assessmentId: resultForConfiguration.assessmentId,
@@ -209,7 +204,7 @@ const completedAssessment = (
     }
   }
   return {
-    configuration: resultForConfiguration.configuration,
+    configuration,
     assessment: {
       _tag: "Incompatible",
       environmentId: result.environmentId,
@@ -221,9 +216,9 @@ const completedAssessment = (
 export const LocalModelAssessorLive: Layer.Layer<
   LocalModelAssessor,
   never,
-  IcnCatalog | IcnHardware | LocalModelAssessments | LocalModelPackages
+  IcnModels | IcnHardware | LocalModelAssessments | LocalModelPackages
 > = Layer.scoped(LocalModelAssessor, Effect.gen(function* () {
-  const catalog = yield* IcnCatalog
+  const models = yield* IcnModels
   const hardware = yield* IcnHardware
   const assessments = yield* LocalModelAssessments
   const packages = yield* LocalModelPackages
@@ -235,12 +230,22 @@ export const LocalModelAssessorLive: Layer.Layer<
   const lock = yield* Effect.makeSemaphore(1)
 
   const readDesired = Effect.gen(function* () {
-    const catalogConfigurations = (yield* catalog.ready)
-      ? yield* Effect.forEach(
-          (yield* catalog.get).state.models,
-          recommendableModelFromIcn,
-        ).pipe(Effect.map((models) => models.map(({ configuration }) => configuration)))
+    const catalogModels = (yield* models.initialized)
+      ? (yield* models.get).state.catalogModels
       : []
+    const desiredCatalogConfigurations = yield* Effect.forEach(
+      catalogModels,
+      (model) => catalogModelDefinitionFromIcn(model).pipe(
+        Effect.map(({ configuration }) => configuration),
+      ),
+    )
+    const effectiveCatalogConfigurations = (
+      yield* Effect.forEach(catalogModels, catalogModelEffectiveConfigurationFromIcn)
+    ).flatMap((configuration) => Option.isSome(configuration) ? [configuration.value] : [])
+    const catalogConfigurations = [
+      ...desiredCatalogConfigurations,
+      ...effectiveCatalogConfigurations,
+    ]
     const packageState = (yield* packages.snapshot).state
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     const hardwareState = (yield* hardware.get).state
@@ -407,7 +412,7 @@ export const LocalModelAssessorLive: Layer.Layer<
 
   yield* Stream.make(undefined).pipe(
     Stream.concat(Stream.mergeAll([
-      catalog.changes.pipe(Stream.map(() => undefined)),
+      models.changes.pipe(Stream.map(() => undefined)),
       packages.changes.pipe(Stream.map(() => undefined)),
       hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
     ], { concurrency: "unbounded" }).pipe(Stream.debounce("25 millis"))),

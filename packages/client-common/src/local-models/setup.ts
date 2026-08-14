@@ -4,7 +4,7 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ReasoningEffortSchema,
-  type LocalModelInstallationAdmission,
+  type CatalogModelReconciliationAdmission,
   type LocalModelsState,
   type ModelInstanceId,
   type ModelServingConfigurationId,
@@ -168,7 +168,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       })
       const awaitInstalled = (
         prepared: PreparedModel,
-        admission: LocalModelInstallationAdmission,
+        admission: CatalogModelReconciliationAdmission,
       ) => terminalFact(Registry.toStreamResult(registry, localModels.state).pipe(
         Stream.map((current): TerminalFact<InstalledModel> => {
           const model = findLocalModelByConfigurationId(current.models, prepared.configurationId)
@@ -204,7 +204,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
               value: { ...prepared, providerModelId: admission.providerModelId },
             }
           }
-          if (admission._tag === "AlreadyInstalled"
+          if (admission._tag === "Current"
             || acquisition._tag === "NotInstalled"
             || acquisition.downloadId !== admission.downloadId) {
             return { _tag: "Failed", failure: new OnboardingModelResourceChanged({

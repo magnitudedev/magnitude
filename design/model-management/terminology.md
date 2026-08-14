@@ -63,9 +63,10 @@ run now. Cached assessment never authorizes loading.
 
 | Term | Meaning |
 |---|---|
+| **Catalog identity** | Structured pair of branded `CatalogModelId` and branded format-qualified `CatalogVariantId`, independent of exact target package and drafter. |
 | **Recommendable model** | One active catalog configuration plus presentation, capabilities, license, and ranking data. |
 | **Deprecated catalog entry** | An issued configuration excluded from recommendation and first-time discovery while remaining resolvable by identity. |
-| **Local model** | One client-facing product row for an exact bundle, with acquisition and serving state. |
+| **Local model** | One client-facing product row: stable catalog product or exact non-catalog target, with acquisition, upgrade, and serving state. |
 | **Provider offering** | A provider-facing projection of one currently resolved serving configuration. |
 | **Slot selection** | The user's durable provider-qualified choice and reasoning effort for one product role. |
 | **Model slot** | Durable role intent joined with current availability, actions, and optional instance state. |
@@ -83,24 +84,32 @@ configurations are release data. Package inventory, serving configurations, offe
 download occurrences, presentation, and instances are derived or process-local and are not copied
 into model state.
 
+`ManagedModelStore` is the exclusive mutation boundary for Magnitude-owned model artifacts. It
+observes installed packages from files, reconciles exact desired packages additively, and removes
+only exact addressed packages. Catalog and client layers never manipulate its filesystem layout.
+
 A slot persists only `(ProviderId, ProviderModelId, reasoningEffort)`. For the local provider,
-`ProviderModelId` represents the canonical configuration identity. The catalog resolves issued
-configuration identities, including deprecated entries. Standard configurations are reconstructed
+`ProviderModelId` is derived from `CatalogIdentity` at the local provider boundary for a catalog product and represents canonical configuration
+identity for a standard product. The catalog resolves stable products to their effective exact
+configuration. Standard configurations are reconstructed
 from inspected packages and the canonical standard-profile rule. That rule does not reinterpret an
-existing package identity across releases. If an identity cannot be resolved, the
-slot remains explicit unresolved user intent; it is never substituted silently.
+existing package identity across releases. While provider authority is unavailable, a selection is
+retained without guessing. Once authoritative resolution proves the identity absent, ACN clears the
+selection; it never substitutes silently.
 
 ## Product projection
 
-Every active catalog bundle and every independently servable installed package is represented.
-Exact bundle identity coalesces catalog, artifact, acquisition, assessment, recommendation, and
-provider facts into one row. Configuration resolution is exact catalog configuration first,
-otherwise ICN-issued standard configuration for an inspected standalone package.
+Every active catalog product and every independently servable installed non-catalog package is
+represented. `CatalogIdentity` coalesces catalog, artifact, acquisition, assessment, recommendation,
+and provider facts across exact bundle changes. A catalog product retains one attributed runnable
+configuration until its desired exact catalog bundle is complete. Non-catalog resolution uses the
+ICN-issued standard configuration for an inspected standalone package.
 
 ## Identity map
 
 | Identity | Identifies | Lifetime and owner |
 |---|---|---|
+| `CatalogIdentity` | One stable catalog model and format-qualified quality track | Stable, catalog-authored structured pair |
 | `ModelPackageId` | One immutable package | Stable, ICN |
 | `ModelServingConfigurationId` | One exact bundle/profile combination | Stable, ICN-issued catalog or policy result |
 | `ModelDownloadId` | One exact-bundle acquisition occurrence | ICN process lifetime |

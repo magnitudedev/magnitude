@@ -1,105 +1,84 @@
 ---
 applies_to:
+  - inference/crates/icn-contracts/src/models.rs
+  - inference/crates/icn-models/**
+  - packages/icn/src/models/**
   - packages/acn/src/local-model-**
   - packages/acn-protocol/src/rpcs/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - packages/agent/src/ambient/config-ambient.ts
-  - packages/client-common/src/hooks/use-local-inference-state.ts
-  - packages/client-common/src/hooks/use-onboarding-model-setup.ts
   - packages/client-common/src/local-models/**
-  - packages/client-common/src/utils/model-presentation.ts
   - cli/src/features/local-inference/**
   - cli/src/features/model-*/**
 ---
 
 # Local-model product projection
 
-This document defines the ACN-owned local-model read model and its client contract. Terms follow
-[Model-management terminology](./terminology.md).
+This document defines the authoritative model read boundary and the client-facing local-model
+projection.
 
-## Boundary
+## ICN model boundary
 
-ACN joins release catalog, filesystem-derived package inventory, artifact inspection, assessment,
-process-local acquisition, provider publication, recommendations, and live memory observations into
-one product model. Clients consume that model directly and do not correlate parallel collections.
+ICN publishes one `Models` snapshot. It contains every catalog model with its desired
+configuration and current local state, plus every independently servable installed target not
+attributed to a catalog model. ACN does not reconstruct catalog products by joining a catalog list
+to a separate installed-package list.
 
-`LocalModelsState.models` contains one row for every active catalog bundle and every independently
-servable installed target. A row may be uninstalled, downloading, installed, assessing,
-recommended, selectable, or unavailable. These are facets of one row, not persisted entities.
+A catalog model is identified by one `CatalogIdentity`. Its local state is:
 
-## Canonical row
+- `NotInstalled`; or
+- `Installed`, carrying the current installation and its update state. The installation contains
+  the effective configuration or an explicit unavailability failure and all present affiliated
+  packages. The update state is `Current` or `Available`; `Available` contains missing desired
+  package IDs and superseded package IDs.
 
-Each `LocalModel` contains its exact bundle, presentation, download size, catalog membership,
-acquisition state, and serving state. State machines use tagged unions.
+The filesystem is the presence authority. An attributed target makes its catalog model installed
+and visible even when desired dependencies are missing or the exact desired bundle has changed.
+An unattributed or attribution-failed target remains visible as a standalone installed model.
 
-`acquisitionState` is `NotInstalled`, `Downloading`, `Failed`, `Cancelled`, or `Installed`.
-Downloading, failed, and cancelled states may carry the exact process-local `ModelDownloadId`.
-Package-attempt membership is private to ICN. Restart clears non-installed acquisition occurrences;
-the next snapshot derives installed state from current files.
+## Exact desired/current comparison
 
-`servingState` is `Resolving`, `Assessing`, `Failed`, or `Assessed`. An assessed row contains its
-current exact configuration, capabilities, assessment, availability, and recommendations.
-Assessment is `Fits`, `DoesNotFit`, or `Incompatible`. Advisory live headroom is nested with its
-stable memory evidence but never authorizes loading.
+For one catalog identity:
 
-`availabilityState` is `Installable`, `Preparing`, `Selectable`, or `Unavailable`. Once a current
-configuration resolves, its deterministic local provider-model identity is preserved through
-preparation and unavailability so durable slot selection can correlate it. `Selectable` requires
-both installed files and a current provider offering.
+```text
+desired     = package IDs in the current catalog bundle
+present     = package IDs observed on the filesystem
+affiliated  = present package IDs affiliated with the catalog identity
+missing     = desired - present
+superseded  = affiliated - desired
+```
 
-## Membership and configuration
+The model has `updateState: Available` when either `missing` or `superseded` is non-empty. No
+persisted version, manifest, configuration, or cached completeness flag participates.
 
-Target-package identity coalesces sources into one row. Catalog removal from active discovery does
-not hide an installed target. A separately packaged speculative draft appears through its catalog
-target rather than as an independently servable row unless inspection proves independent
-servability.
+Superseded packages remain present and runnable while `missing` is non-empty. Once an authoritative
+installed-set change makes `missing` empty, catalog maintenance may remove the exact `superseded`
+IDs. Request handlers and individual package attempts do not own this transition.
 
-Catalog membership is explicit presentation and recommendation evidence; it is not inferred from
-installation, assessment, or availability. `MagnitudeStore` and `HuggingFaceCache` are equally
-runnable origins, with ownership-sensitive operations determined by origin.
+The desired configuration is effective when its whole bundle is present. Otherwise ICN keeps the
+current desired target runnable as standalone, or one unique prior attributed target runnable as
+standalone. Multiple prior targets with no current target produce a visible typed unavailability
+failure; they are never hidden or guessed between.
 
-ACN resolves one current configuration for a row:
+## ACN product projection
 
-1. the exact issued catalog configuration for that target, including a deprecated entry; otherwise
-2. the ICN-issued standard configuration for an installed inspected standalone package, using the
-   canonical stable standard-profile rule.
+ACN enriches the ICN model snapshot with assessment, provider publication, recommendations, and
+live memory observations. Clients consume one `LocalModel` row and do not correlate parallel
+collections.
 
-Configurations are derived and never persisted in model state. Catalog and standard assessment
-demand may coexist internally but never create parallel product rows.
+`acquisitionState` describes first acquisition. `upgradeState` is `NotApplicable`, `Current`,
+`Available`, `Upgrading`, or `Failed`. An installed model may remain selectable while its upgrade
+state is `Available` or `Upgrading`.
 
-## Lifecycle and consistency
-
-Reconciliation reads all contributing authorities and commits one complete snapshot. Missing files
-change installed acquisition immediately after inventory convergence. Restoring valid files restores
-the row without another state mutation. Invalid artifacts remain visible with their inspection
-failure when they form an independently identified candidate.
-
-When ACN observes a download complete, it refreshes installed inventory before projecting terminal
-completion. Historical completion never substitutes for current files. Catalog or recommendation
-failure cannot erase installed non-catalog rows.
-
-Discovery reports `Loading`, `Ready`, or `Failed` for portfolio production. A successful empty
-collection is distinct from discovery failure. Restart does not reconstruct download occurrences;
-it reconstructs rows from catalog and current artifacts.
-
-## Client behavior
-
-Onboarding renders fitting installed or recommended rows. Catalog renders fitting active catalog
-rows. Models renders installed rows and preserves their assessment or availability failures.
-Persistent download UI reads acquisition state from these rows and stores no second counter or
-lifecycle.
-
-Clients render presentation fields directly and never infer identity, variant, quantization, or
-availability from display strings. Recommendation and memory guidance remain independent evidence.
+Catalog membership carries structured branded identity components. Only the local provider adapter
+serializes them into a provider-model identity. Configurations, product rows, and upgrade state are
+derived and never persisted.
 
 ## Conformance
 
-- Exact target identity produces one current row.
-- Every active catalog bundle and independently servable installed target is represented.
-- Completed files, not acquisition history or cached state, determine `Installed`.
-- Serving configurations and provider offerings are reconstructed, not persisted.
-- Process restart clears acquisition occurrences without hiding installed artifacts.
-- Catalog failure cannot hide independently servable installed targets.
-- Clients consume acquisition, serving, recommendation, availability, and memory from one row.
-- Advisory memory state never authorizes loading.
-- Download observation and cancellation correlate the exact process-local download identity.
+- Every active catalog model and independently servable installed target is represented.
+- One catalog identity produces one row across target, dependency, repository, and drafter changes.
+- A prior target stays runnable until the desired bundle is complete.
+- Any exact desired/current package difference produces update availability.
+- Completed files, not download history or cached state, determine presence.
+- Catalog or attribution failure cannot hide an installed target.
+- Clients consume acquisition, reconciliation, serving, and recommendation state from one row.

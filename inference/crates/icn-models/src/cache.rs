@@ -19,7 +19,7 @@ const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 pub enum ModelIndexKind {
     Artifact,
     ArtifactInspection,
-    TensorStorage,
+    GgufInspection,
     HuggingFaceRepositorySnapshot,
     RecommendableModelCatalog,
     HardwareAssessment,
@@ -33,7 +33,7 @@ impl ModelIndexKind {
         match self {
             Self::Artifact => "artifacts",
             Self::ArtifactInspection => "inspections/artifacts",
-            Self::TensorStorage => "inspections/tensor-storage",
+            Self::GgufInspection => "inspections/gguf",
             Self::HuggingFaceRepositorySnapshot => "sources/hugging-face/repositories",
             Self::RecommendableModelCatalog => "catalogs/recommendable-models",
             Self::HardwareAssessment => "assessments/hardware",
@@ -353,6 +353,8 @@ mod tests {
                         quantization_name: "4-bit".to_owned(),
                         architecture: "test".to_owned(),
                         maximum_context_length: context_length,
+                        intrinsic_model_id: None,
+                        intrinsic_quality_id: None,
                     },
                 },
             },

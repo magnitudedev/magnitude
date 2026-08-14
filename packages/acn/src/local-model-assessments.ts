@@ -5,6 +5,7 @@ import {
   Layer,
   Option,
   ParseResult,
+  Schema,
 } from "effect"
 import {
   FitsModelAssessmentSchema,
@@ -14,6 +15,7 @@ import {
   MemoryAssessmentSchema,
   ModelAssessmentIdSchema,
   servableModelBundlePackages,
+  ServingProfileSchema,
   type FitsModelAssessment,
   type AssessmentEnvironmentId,
   type LocalInferenceError,
@@ -216,6 +218,57 @@ export const localModelAssessmentResultFromIcn = (
         }
       })
 
+const sameProfile = Schema.equivalence(ServingProfileSchema)
+
+const validateRequestedProfiles = (
+  requestedProfiles: readonly ServingProfile[],
+): Effect.Effect<void, LocalModelMutationFailed> => Effect.gen(function* () {
+  if (requestedProfiles.length === 0) {
+    return yield* failure(
+      "invalid_model_assessment_request",
+      "A model assessment request must contain at least one profile.",
+    )
+  }
+  if (requestedProfiles.some((profile, index) =>
+    requestedProfiles.slice(0, index).some((other) => sameProfile(profile, other)))) {
+    return yield* failure(
+      "invalid_model_assessment_request",
+      "A model assessment request contains duplicate profiles.",
+    )
+  }
+})
+
+export const correlateLocalModelAssessmentProfiles = (
+  requestedProfiles: readonly ServingProfile[],
+  assessments: readonly LocalModelAssessment[],
+): Effect.Effect<readonly LocalModelAssessment[], LocalModelMutationFailed> => Effect.gen(function* () {
+  yield* validateRequestedProfiles(requestedProfiles)
+
+  const remaining = [...assessments]
+  const correlated: LocalModelAssessment[] = []
+  for (const profile of requestedProfiles) {
+    const matchingIndexes = remaining.flatMap((assessment, index) =>
+      sameProfile(assessment.configuration.profile, profile) ? [index] : [])
+    if (matchingIndexes.length !== 1) {
+      return yield* failure(
+        "invalid_model_assessment_response",
+        matchingIndexes.length === 0
+          ? `Native assessment returned no result for profile ${profile.contextLength}.`
+          : `Native assessment returned duplicate results for profile ${profile.contextLength}.`,
+      )
+    }
+    correlated.push(remaining[matchingIndexes[0]!]!)
+    remaining.splice(matchingIndexes[0]!, 1)
+  }
+  if (remaining.length !== 0) {
+    return yield* failure(
+      "invalid_model_assessment_response",
+      "Native assessment returned results for unrequested profiles.",
+    )
+  }
+  return correlated
+})
+
 export interface LocalModelAssessmentsApi {
   readonly assess: (
     requests: readonly LocalModelAssessmentRequest[],
@@ -251,9 +304,14 @@ export const LocalModelAssessmentsLive: Layer.Layer<
         const installedIds = yield* packages.installedPackageIds
         const nativeRequests = yield* Effect.forEach(
           requests,
-          ({ bundle, profiles }, index) => bundleToIcnInput(bundle, installedIds).pipe(
-            Effect.map((nativeBundle) => ({ index, nativeBundle, profiles })),
-          ),
+          ({ bundle, profiles }, index) => Effect.gen(function* () {
+            yield* validateRequestedProfiles(profiles)
+            return {
+              index,
+              nativeBundle: yield* bundleToIcnInput(bundle, installedIds),
+              profiles,
+            }
+          }),
         )
         const batchSize = 8
         const nativeResults: Array<{
@@ -287,6 +345,18 @@ export const LocalModelAssessmentsLive: Layer.Layer<
             })
           }
           expectedEnvironmentId = Option.some(environmentId)
+          const expectedRequestIds = new Set(batch.map(({ index }) => `assessment-${index}`))
+          const returnedRequestIds = response.results.map(({ requestId }) => String(requestId))
+          if (
+            returnedRequestIds.length !== expectedRequestIds.size
+            || new Set(returnedRequestIds).size !== returnedRequestIds.length
+            || returnedRequestIds.some((requestId) => !expectedRequestIds.has(requestId))
+          ) {
+            return yield* failure(
+              "invalid_model_assessment_response",
+              "Native assessment returned missing, duplicate, or unrequested request results.",
+            )
+          }
           nativeResults.push(...response.results.map((result) => ({ environmentId, result })))
           yield* onProgress(Math.min(offset + batch.length, requests.length), requests.length)
         }
@@ -296,16 +366,26 @@ export const LocalModelAssessmentsLive: Layer.Layer<
         ]))
         return yield* Effect.forEach(
           nativeRequests,
-          ({ index }) => Effect.gen(function* () {
+          ({ index, profiles }) => Effect.gen(function* () {
             const found = Option.fromNullable(byRequest.get(`assessment-${index}`))
             if (Option.isNone(found)) {
-              return yield* Effect.dieMessage("ICN returned no assessment result")
+              return yield* failure(
+                "invalid_model_assessment_response",
+                `Native assessment returned no result for request assessment-${index}.`,
+              )
             }
             const decoded = yield* localModelAssessmentResultFromIcn(
               found.value.result,
               found.value.environmentId,
             ).pipe(Effect.orDie)
-            return decoded
+            if (decoded._tag !== "Assessed") return decoded
+            return {
+              ...decoded,
+              assessments: yield* correlateLocalModelAssessmentProfiles(
+                profiles,
+                decoded.assessments,
+              ),
+            }
           }),
         )
       })

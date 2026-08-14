@@ -64,6 +64,8 @@ describe("local provider offering projection", () => {
           quantizationName: "4-bit",
           architecture: "test",
           maximumContextLength: 32_768,
+          intrinsicModelId: Option.none(),
+          intrinsicQualityId: Option.none(),
         },
       }
       const configuration = {
@@ -83,18 +85,24 @@ describe("local provider offering projection", () => {
             reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
           },
         },
+        catalogAttribution: { _tag: "NotCatalogTarget" },
       }
       const dependencies = Layer.mergeAll(
         Layer.succeed(LocalModelConfigurationResolver, LocalModelConfigurationResolver.of({
           get: Effect.succeed(new Map([[
             localModelTargetIdentity(configuration.bundle),
-            { configuration, assessment: Option.some({ _tag: "Assessing" }) },
+            {
+              servingConfiguration: configuration,
+              assessment: Option.some({ _tag: "Assessing" }),
+              catalogIdentity: Option.none(),
+            },
           ]])),
           changes: Stream.never,
           catalogReady: Effect.succeed(true),
           resolve: () => Effect.succeed(Option.some({
-            configuration,
+            servingConfiguration: configuration,
             assessment: Option.some({ _tag: "Assessing" }),
+            catalogIdentity: Option.none(),
           })),
         })),
         Layer.succeed(IcnCatalog, IcnCatalog.of({

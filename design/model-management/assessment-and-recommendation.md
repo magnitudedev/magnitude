@@ -46,10 +46,10 @@ sequenceDiagram
     ACN->>ICN: Assess exact bundle at profile with sampling policy
     ICN->>ICN: Construct canonical configuration from bundle and profile
     ICN->>ICN: Assess compatibility, memory, and performance
-    ICN-->>ACN: Exact configuration and terminal result
+    ICN-->>ACN: Request-correlated terminal result
 
     alt Catalog configuration
-        ACN->>ACN: Require returned configuration to equal authored configuration
+        ACN->>ACN: Attach evidence to submitted catalog configuration
     else Standard configuration
         ACN->>ACN: Accept ICN-constructed configuration
     end
@@ -62,26 +62,39 @@ sequenceDiagram
 ACN always supplies the serving profile used for assessment. For catalog input it preserves the
 reviewed profile; standard input requires ACN to choose one by policy. ICN
 always constructs and canonically identifies the exact serving configuration for the supplied
-bundle and profile. ACN accepts that returned configuration for standard intent and requires exact
-equality with the authored catalog configuration.
+bundle and profile. Each ACN request carries one or more unique profiles. The response is correlated
+first by exact request identity and then by exact profile identity within that request. For catalog
+intent, ACN attaches the returned evidence to the submitted catalog configuration. For standard
+intent, ACN accepts the ICN-constructed configuration. ACN never compares copied configuration
+records to correlate a result.
 
 The rejection proof compares exact, content-deduplicated tensor storage with aggregate stable
 physical capacity. Uncertain bundles proceed. File/download size is not rejection evidence.
+GGUF-derived identity, capabilities, and tensor storage share one optimistic inspection cache per
+immutable component. An absent or malformed cache entry reparses the component and cannot change
+artifact presence.
 
 ## Assessment service
 
 ACN exposes one assessment executor accepting exact bundles and profiles. It owns the
 scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
-One ACN local-model assessor owns demand for issued catalog configurations and standard profile
-decisions made only for inspected standalone bundles with no catalog configuration. ACN supplies
-the chosen bundle and profile for standard demand;
+Every executor request carries one bundle and one or more unique profiles so ICN can share model
+opening across their assessment. Missing, duplicate, or unrequested profile outcomes violate the
+assessment operation contract; they fail the operation rather than becoming a model compatibility
+or capacity state.
+One ACN local-model assessor owns demand for each catalog model's desired configuration, its
+installed effective configuration when different, and standard profile decisions made only for
+inspected uncatalogued packages. Desired catalog assessment supports recommendation and acquisition;
+effective catalog assessment supports current serving. ACN supplies the chosen bundle and profile for standard demand;
 ICN constructs and identifies the corresponding serving configuration as part of assessment.
 Recommendation, provider-offering, and local-model projections consume its state and
 never invoke assessment independently. Recommendation policy consumes only release-catalog
 candidates. Each release-catalog configuration uses its reviewed catalog profile. ACN chooses the
 standard profile bounded by the package maximum for an inspected standalone package only when no
 catalog configuration exists for that bundle. ICN, not ACN, constructs and canonically identifies the
-resulting configuration. Package installation origin does not affect this decision.
+resulting configuration. Package installation origin does not affect this decision. An installed
+catalog target is never reclassified as a standard model merely because its desired bundle differs;
+it remains the effective configuration of the same `CatalogIdentity`.
 
 ICN persists every completed exact profile result, including `DoesNotFit`, and performs
 single-flight native work. Repeated reads consume current results and do not trigger native
@@ -227,6 +240,7 @@ Cached assessment never authorizes loading.
 - A changed semantic key reassesses only the affected configurations.
 - Provider-offering and local-model projection never invoke assessment.
 - Assessment completion cannot publish against a superseded semantic key.
+- Assessment results correlate by exact request and profile identity, never by configuration-record comparison.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
 - The recommendation eligibility floor uses full-context performance; ranking and relative
   comparisons use the bounded 50K sample.

@@ -13,7 +13,7 @@ const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STRING_ARRAY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DIMS: u32 = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GgufInspection {
     pub version: u32,
     pub architecture: Option<String>,
@@ -38,7 +38,7 @@ pub struct GgufInspection {
     pub execution_role: Option<GgufExecutionRole>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GgufExecutionRole {
     Draft,
 }

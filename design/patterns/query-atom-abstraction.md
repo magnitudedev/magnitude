@@ -243,18 +243,18 @@ This example is illustrative; names are domain-specific rather than prescribed i
 ```ts
 interface LocalModels {
   readonly state: Atom<Result<LocalModelsState, LocalModelsError>>
-  readonly install: (
-    configurationId: ModelServingConfigurationId,
-  ) => Effect<LocalModelInstallationAdmission, InstallError>
-  readonly installationFor: (
-    configurationId: ModelServingConfigurationId,
-  ) => Atom<Result<LocalModelInstallationAdmission, InstallError>>
+  readonly reconcile: (
+    identity: CatalogIdentity,
+  ) => Effect<CatalogModelReconciliationAdmission, ReconciliationError>
+  readonly reconciliationFor: (
+    identity: CatalogIdentity,
+  ) => Atom<Result<CatalogModelReconciliationAdmission, ReconciliationError>>
 }
 ```
 
-The service privately implements `install` with `Mutation.execute`. A composed setup service can
+The service privately implements `reconcile` with `Mutation.execute`. A composed setup service can
 flat-map its returned admission into slot assignment. A hook can adapt the same Effect to a click
-handler and expose `installationFor(id)` to render pending or rejected command intent. Neither
+handler and expose `reconciliationFor(identity)` to render pending or rejected command intent. Neither
 caller receives the underlying Mutation atom or its global history.
 
 Non-conforming shapes include:

@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
 use icn_contracts::models::{
-    InstalledModelPackage, InstalledModelPackagesResponse, ModelAssessment, ModelFileRelationship,
-    ModelFileRole, ModelPackage, ModelPackageId, ModelPackageSource,
+    CatalogPackageRole, InstalledModelPackage, InstalledModelPackagesResponse, ModelAssessment,
+    ModelFileRelationship, ModelFileRole, ModelPackage, ModelPackageId, ModelPackageSource,
+    RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
 };
 use icn_contracts::{
     CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, Integrity,
@@ -20,9 +21,11 @@ use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelCache, ModelIndexKind};
+use crate::catalog_affiliations::CatalogAffiliations;
 use crate::download::blob_key;
 use crate::gguf;
 use crate::identity::{content_id, fingerprint, model_id};
+use crate::store_fs::ensure_store_layout;
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
@@ -54,13 +57,13 @@ type HydratedInventory = (
     InstalledPackageSnapshot,
 );
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InstalledPackageRecord {
     pub(crate) installed: InstalledModelPackage,
     pub(crate) model: InventoryModel,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InstalledPackageSnapshot {
     pub(crate) records: BTreeMap<ModelPackageId, InstalledPackageRecord>,
 }
@@ -89,7 +92,32 @@ pub struct InventoryConfig {
     pub hf_cache_dirs: Vec<PathBuf>,
     pub max_concurrent_downloads: usize,
     pub disk_reserve_bytes: u64,
-    pub catalog_packages: Vec<ModelPackage>,
+    pub catalog_models: Vec<RecommendableModel>,
+}
+
+pub(crate) fn catalog_target(model: &RecommendableModel) -> &ModelPackage {
+    match &model.configuration.bundle {
+        ServableModelBundle::Standalone { package } => package,
+        ServableModelBundle::SpeculativeDecoding { target, .. } => target,
+    }
+}
+
+pub(crate) fn catalog_packages(
+    model: &RecommendableModel,
+) -> impl Iterator<Item = (&ModelPackage, CatalogPackageRole)> {
+    let target = std::iter::once((catalog_target(model), CatalogPackageRole::Target));
+    let dependency = match &model.configuration.bundle {
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            ..
+        } => Some((draft, CatalogPackageRole::Dependency)),
+        ServableModelBundle::Standalone { .. }
+        | ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Embedded,
+            ..
+        } => None,
+    };
+    target.chain(dependency)
 }
 
 impl InventoryConfig {
@@ -123,12 +151,12 @@ impl InventoryConfig {
             hf_cache_dirs: Vec::new(),
             max_concurrent_downloads: 2,
             disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
-            catalog_packages: Vec::new(),
+            catalog_models: Vec::new(),
         })
     }
 }
 
-pub struct ModelManager {
+pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
     pub(crate) http: reqwest::Client,
@@ -141,11 +169,18 @@ pub struct ModelManager {
     pub(crate) package_digests: Arc<RwLock<BTreeMap<PathBuf, (u64, SystemTime, String)>>>,
     pub(crate) installed_packages: Arc<RwLock<InstalledPackageSnapshot>>,
     pub(crate) model_assessments: Arc<RwLock<BTreeMap<String, ModelAssessment>>>,
+    pub(crate) catalog_affiliations: Arc<RwLock<CatalogAffiliations>>,
+    pub(crate) catalog_affiliations_dirty: Arc<AtomicBool>,
     cache_evidence: Arc<RwLock<BTreeMap<ModelId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
     reconciliation_running: Arc<AtomicBool>,
     reconciliation_complete: Arc<AtomicBool>,
+    installed_packages_observer: Arc<RwLock<Option<Weak<dyn InstalledPackagesObserver>>>>,
+}
+
+pub(crate) trait InstalledPackagesObserver: Send + Sync {
+    fn installed_packages_changed(&self);
 }
 
 struct ReconciliationLease(Arc<AtomicBool>);
@@ -156,7 +191,7 @@ impl Drop for ReconciliationLease {
     }
 }
 
-impl Clone for ModelManager {
+impl Clone for ManagedModelStore {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -170,16 +205,41 @@ impl Clone for ModelManager {
             package_digests: Arc::clone(&self.package_digests),
             installed_packages: Arc::clone(&self.installed_packages),
             model_assessments: Arc::clone(&self.model_assessments),
+            catalog_affiliations: Arc::clone(&self.catalog_affiliations),
+            catalog_affiliations_dirty: Arc::clone(&self.catalog_affiliations_dirty),
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
             reconciliation_running: Arc::clone(&self.reconciliation_running),
             reconciliation_complete: Arc::clone(&self.reconciliation_complete),
+            installed_packages_observer: Arc::clone(&self.installed_packages_observer),
         }
     }
 }
 
-impl ModelManager {
+impl ManagedModelStore {
+    pub(crate) fn set_installed_packages_observer(
+        &self,
+        observer: Weak<dyn InstalledPackagesObserver>,
+    ) -> Result<(), InventoryError> {
+        *self.installed_packages_observer.write().map_err(|_| {
+            InventoryError::Internal("installed-package observer lock poisoned".to_owned())
+        })? = Some(observer);
+        self.notify_installed_packages_changed();
+        Ok(())
+    }
+
+    fn notify_installed_packages_changed(&self) {
+        let observer = self
+            .installed_packages_observer
+            .read()
+            .ok()
+            .and_then(|observer| observer.as_ref().and_then(Weak::upgrade));
+        if let Some(observer) = observer {
+            observer.installed_packages_changed();
+        }
+    }
+
     pub(crate) fn installed_packages_response(
         &self,
     ) -> Result<InstalledModelPackagesResponse, InventoryError> {
@@ -210,7 +270,7 @@ impl ModelManager {
         template_assessor: Option<Arc<dyn TemplateAssessor>>,
     ) -> Result<Self, InventoryError> {
         validate_config(&config)?;
-        create_layout(&config.root).await?;
+        ensure_store_layout(&config.root).await?;
         let client_builder = HFClient::builder().cache_dir(config.root.join("hub"));
         let explicit_token = std::env::var("HF_TOKEN")
             .ok()
@@ -223,6 +283,7 @@ impl ModelManager {
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
         let cache = ModelCache::new(&config.cache_root);
+        let catalog_affiliations = CatalogAffiliations::load(&config.root);
         let manager = Self {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
@@ -235,11 +296,14 @@ impl ModelManager {
             package_digests: Arc::new(RwLock::new(BTreeMap::new())),
             installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
             model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
+            catalog_affiliations: Arc::new(RwLock::new(catalog_affiliations)),
+            catalog_affiliations_dirty: Arc::new(AtomicBool::new(false)),
             cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
             reconciliation_running: Arc::new(AtomicBool::new(false)),
             reconciliation_complete: Arc::new(AtomicBool::new(false)),
+            installed_packages_observer: Arc::new(RwLock::new(None)),
         };
         manager.request_installed_model_reconciliation();
         manager.start_installed_model_reconciler();
@@ -396,11 +460,19 @@ impl ModelManager {
             .write()
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
             next_evidence;
-        *self.installed_packages.write().map_err(|_| {
-            InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-        })? = installed_packages;
+        let installed_packages_changed = {
+            let mut current = self.installed_packages.write().map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?;
+            let changed = *current != installed_packages;
+            *current = installed_packages;
+            changed
+        };
         self.ensure_generation.fetch_add(1, Ordering::Release);
-        self.reconciliation_complete.store(true, Ordering::Release);
+        let became_authoritative = !self.reconciliation_complete.swap(true, Ordering::AcqRel);
+        if installed_packages_changed || became_authoritative {
+            self.notify_installed_packages_changed();
+        }
         Ok(())
     }
 
@@ -499,34 +571,6 @@ impl ModelManager {
             .read()
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
             .clone();
-        if matches!(&model.location, ModelLocation::MagnitudeCache { .. })
-            && let ModelSource::HuggingFace {
-                repository, commit, ..
-            } = &model.source
-        {
-            let removed = models
-                .iter()
-                .filter_map(
-                    |(id, candidate)| match (&candidate.location, &candidate.source) {
-                        (
-                            ModelLocation::MagnitudeCache { .. },
-                            ModelSource::HuggingFace {
-                                repository: candidate_repository,
-                                commit: candidate_commit,
-                                ..
-                            },
-                        ) if candidate_repository == repository && candidate_commit != commit => {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    },
-                )
-                .collect::<Vec<_>>();
-            for id in removed {
-                models.remove(&id);
-                cache.remove(&id);
-            }
-        }
         models.insert(model.id.clone(), model.clone());
         if let Some(evidence) = evidence {
             cache.insert(model.id.clone(), evidence);
@@ -549,6 +593,7 @@ impl ModelManager {
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
         self.request_installed_model_reconciliation();
+        self.notify_installed_packages_changed();
         Ok(model)
     }
 
@@ -588,6 +633,7 @@ impl ModelManager {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.notify_installed_packages_changed();
         Ok(())
     }
 }
@@ -744,21 +790,6 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
     Ok(())
 }
 
-async fn create_layout(root: &Path) -> Result<(), InventoryError> {
-    for relative in ["hub", "locks", "quarantine"] {
-        let path = root.join(relative);
-        tokio::fs::create_dir_all(&path).await.map_err(io_error)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                .await
-                .map_err(io_error)?;
-        }
-    }
-    Ok(())
-}
-
 struct InventoryScan {
     models: BTreeMap<ModelId, InventoryModel>,
     observations: BTreeMap<ModelId, String>,
@@ -909,66 +940,69 @@ fn scan_managed(
         };
         let repository_root = repo_entry.path();
         let snapshots = read_dir_sorted(&repository_root.join("snapshots"))?;
-        if snapshots.len() != 1 {
-            continue;
-        }
-        let snapshot_entry = &snapshots[0];
-        let snapshot_kind = snapshot_entry.file_type().map_err(io_error)?;
-        if !snapshot_kind.is_dir() || snapshot_kind.is_symlink() {
-            continue;
-        }
-        count += 1;
-        if count > MAX_SCAN_ENTRIES {
-            return Err(InventoryError::Io(
-                "managed model scan exceeded entry bound".to_owned(),
-            ));
-        }
-        let snapshot = snapshot_entry.path();
-        let commit = snapshot_entry.file_name().to_string_lossy().into_owned();
-        append_discovered_groups(&repository, &repository_root, &snapshot, &commit, output)?;
-        for package in &config.catalog_packages {
-            let ModelPackageSource::HuggingFace {
-                repository: package_repository,
-                revision,
-            } = &package.source
-            else {
-                continue;
-            };
-            if package_repository != &repository {
+        for snapshot_entry in snapshots {
+            let snapshot_kind = snapshot_entry.file_type().map_err(io_error)?;
+            if !snapshot_kind.is_dir() || snapshot_kind.is_symlink() {
                 continue;
             }
-            let components = components_for_catalog_package(package)?;
-            if !catalog_components_present(&snapshot, &repository_root, &components) {
-                continue;
+            count += 1;
+            if count > MAX_SCAN_ENTRIES {
+                return Err(InventoryError::Io(
+                    "managed model scan exceeded entry bound".to_owned(),
+                ));
             }
-            let primary = match primary_path(&snapshot, &components) {
-                Some(path) => path,
-                None => continue,
-            };
-            let content = content_id(&components);
-            let id = model_id("magnitude-cache", &snapshot, &content);
-            let timestamp = modified_seconds(&snapshot).unwrap_or_else(now);
-            output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
-                id,
-                content_id: content,
-                created: timestamp,
-                ready_at: timestamp,
-                source: ModelSource::HuggingFace {
-                    repository: package_repository.clone(),
-                    requested_revision: revision.clone(),
-                    commit: commit.clone(),
-                    metadata: None,
-                },
-                location: ModelLocation::MagnitudeCache {
-                    total_bytes: components.iter().map(|item| item.size_bytes).sum(),
-                    components,
-                    integrity: Integrity::Verified {
-                        method: "catalog_content_identity".to_owned(),
+            let snapshot = snapshot_entry.path();
+            let commit = snapshot_entry.file_name().to_string_lossy().into_owned();
+            append_discovered_groups(&repository, &repository_root, &snapshot, &commit, output)?;
+            for package in config
+                .catalog_models
+                .iter()
+                .flat_map(catalog_packages)
+                .map(|(package, _)| package)
+            {
+                let ModelPackageSource::HuggingFace {
+                    repository: package_repository,
+                    revision,
+                } = &package.source
+                else {
+                    continue;
+                };
+                if package_repository != &repository {
+                    continue;
+                }
+                let components = components_for_catalog_package(package)?;
+                if !catalog_components_present(&snapshot, &repository_root, &components) {
+                    continue;
+                }
+                let primary = match primary_path(&snapshot, &components) {
+                    Some(path) => path,
+                    None => continue,
+                };
+                let content = content_id(&components);
+                let id = model_id("magnitude-cache", &snapshot, &content);
+                let timestamp = modified_seconds(&snapshot).unwrap_or_else(now);
+                output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
+                    id,
+                    content_id: content,
+                    created: timestamp,
+                    ready_at: timestamp,
+                    source: ModelSource::HuggingFace {
+                        repository: package_repository.clone(),
+                        requested_revision: revision.clone(),
+                        commit: commit.clone(),
+                        metadata: None,
                     },
-                },
-                primary,
-                deletable: true,
-            })));
+                    location: ModelLocation::MagnitudeCache {
+                        total_bytes: components.iter().map(|item| item.size_bytes).sum(),
+                        components,
+                        integrity: Integrity::Verified {
+                            method: "catalog_content_identity".to_owned(),
+                        },
+                    },
+                    primary,
+                    deletable: true,
+                })));
+            }
         }
     }
     Ok(())
@@ -1883,9 +1917,44 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use icn_contracts::models::{
-        InstalledModelPackages, ModelFile, ModelFileId, ModelFileRole, ModelPackageInspection,
-        ModelPackageProperties,
+        CatalogModelId, CatalogVariantId, InstalledModelPackages, ModelCapabilities, ModelFile,
+        ModelFileId, ModelFileRole, ModelPackageInspection, ModelPackageProperties,
+        ModelReasoningCapabilities, ModelServingConfiguration, ModelServingConfigurationId,
+        RecommendableModel, ServableModelBundle, ServingProfile,
     };
+
+    fn catalog_model(package: ModelPackage) -> RecommendableModel {
+        RecommendableModel {
+            model_id: CatalogModelId("catalog".to_owned()),
+            variant_id: CatalogVariantId("gguf:q4".to_owned()),
+            configuration: ModelServingConfiguration {
+                id: ModelServingConfigurationId("catalog-configuration".to_owned()),
+                bundle: ServableModelBundle::Standalone { package },
+                profile: ServingProfile {
+                    context_length: 4_096,
+                },
+            },
+            display_name: "Catalog model".to_owned(),
+            variant_label: "Q4".to_owned(),
+            description: String::new(),
+            license: "test".to_owned(),
+            capabilities: ModelCapabilities {
+                vision: false,
+                tools: false,
+                structured_output: false,
+                reasoning: ModelReasoningCapabilities {
+                    supported: false,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                },
+            },
+            quality_score: 0.0,
+            quality_score_provenance: "test".to_owned(),
+            fidelity_rank: 0,
+            quantization_aware: false,
+            quality_evidence: Vec::new(),
+        }
+    }
     use icn_contracts::{
         CapabilityEvidence, ModelInventory, ReasoningControlDomain, ReasoningDelimiters,
         ReasoningVisibility, TemplateAssessment, TemplateCapabilities,
@@ -1902,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_inventory_reads_catalog_packages_from_files_and_ignores_old_state() {
+    fn managed_inventory_derives_catalog_packages_from_files() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let store = temporary
             .path()
@@ -1936,13 +2005,6 @@ mod tests {
         fs::hard_link(blobs.join(&artifact_name), snapshot.join(&artifact_name))
             .expect("snapshot link");
 
-        fs::create_dir_all(store.join("installations")).expect("obsolete state directory");
-        fs::write(
-            store.join("installations/obsolete.json"),
-            br#"{"version":999,"model_id":"hidden-by-old-version"}"#,
-        )
-        .expect("obsolete state");
-
         let model_file = ModelFile {
             id: ModelFileId(format!("file_{digest}")),
             path: PathBuf::from(&artifact_name),
@@ -1953,7 +2015,7 @@ mod tests {
         };
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).expect("config");
-        config.catalog_packages = vec![ModelPackage {
+        config.catalog_models = vec![catalog_model(ModelPackage {
             id: ModelPackageId("package_catalog".to_owned()),
             source: ModelPackageSource::HuggingFace {
                 repository: repository.to_owned(),
@@ -1967,8 +2029,10 @@ mod tests {
                 quantization_name: "unknown".to_owned(),
                 architecture: "unknown".to_owned(),
                 maximum_context_length: 4_096,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             },
-        }];
+        })];
 
         let result = scan(
             &config,
@@ -2013,7 +2077,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_inventory_scans_unmatched_models_and_rejects_multiple_revisions() {
+    fn managed_inventory_scans_each_complete_snapshot_independently() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let store = temporary
             .path()
@@ -2059,7 +2123,7 @@ mod tests {
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).expect("config");
-        config.catalog_packages = vec![ModelPackage {
+        config.catalog_models = vec![catalog_model(ModelPackage {
             id: ModelPackageId("package_catalog".to_owned()),
             source: ModelPackageSource::HuggingFace {
                 repository: repository.to_owned(),
@@ -2080,8 +2144,10 @@ mod tests {
                 quantization_name: "unknown".to_owned(),
                 architecture: "unknown".to_owned(),
                 maximum_context_length: 4_096,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             },
-        }];
+        })];
 
         let discovered = scan(
             &config,
@@ -2094,14 +2160,14 @@ mod tests {
 
         fs::create_dir_all(repository_root.join("snapshots/other-commit"))
             .expect("second snapshot");
-        let ambiguous = scan(
+        let with_incomplete_second_snapshot = scan(
             &config,
             &cache,
             Some(&CompleteTemplateAssessor::default()),
             &BTreeMap::new(),
         )
-        .expect("ambiguous managed repository is isolated");
-        assert!(ambiguous.models.is_empty());
+        .expect("managed snapshots");
+        assert_eq!(with_incomplete_second_snapshot.models.len(), 2);
     }
 
     #[derive(Default)]
@@ -2211,7 +2277,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ModelManager::open_with_template_assessor(
+        let manager = ManagedModelStore::open_with_template_assessor(
             config,
             Some(Arc::new(CompleteTemplateAssessor::default())),
         )
@@ -2234,7 +2300,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let model_path = temporary.path().join("active.gguf");
         write_minimal_gguf(&model_path);
-        let manager = ModelManager::open_with_template_assessor(
+        let manager = ManagedModelStore::open_with_template_assessor(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
@@ -2263,7 +2329,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ModelManager::open_with_template_assessor(
+        let manager = ManagedModelStore::open_with_template_assessor(
             config,
             Some(Arc::new(CompleteTemplateAssessor::default())),
         )
@@ -2285,7 +2351,7 @@ mod tests {
     #[tokio::test]
     async fn installed_package_query_never_waits_for_reconciliation() {
         let temporary = tempfile::tempdir().unwrap();
-        let manager = ModelManager::open(
+        let manager = ManagedModelStore::open(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
@@ -2324,7 +2390,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ModelManager::open_with_template_assessor(
+        let manager = ManagedModelStore::open_with_template_assessor(
             config,
             Some(Arc::new(CompleteTemplateAssessor {
                 reject_name: Some("broken"),
@@ -2421,7 +2487,7 @@ mod tests {
         config.hf_cache_dirs.push(hf_cache);
         let template = Arc::new(CompleteTemplateAssessor::default());
         let manager =
-            ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
+            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
         assert!(manager.models.read().unwrap().is_empty());
@@ -2445,7 +2511,7 @@ mod tests {
 
         fs::remove_file(source.join("model.gguf")).unwrap();
         let reopened =
-            ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
+            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
         let warm = reopened.list().await.unwrap();
@@ -2484,7 +2550,7 @@ mod tests {
             ..CompleteTemplateAssessor::default()
         });
         let manager =
-            ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
+            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
@@ -2503,7 +2569,7 @@ mod tests {
         fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
 
         let reopened =
-            ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
+            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
         reopened.ensure_installed_model_inventory().await.unwrap();
@@ -2520,7 +2586,7 @@ mod tests {
         fs::write(one_inspection, b"not json").unwrap();
         fs::write(&index_path, b"not json").unwrap();
         let corrupted =
-            ModelManager::open_with_template_assessor(config.clone(), Some(template.clone()))
+            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
                 .await
                 .unwrap();
         corrupted.ensure_installed_model_inventory().await.unwrap();
@@ -2529,9 +2595,10 @@ mod tests {
 
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
-        let uncached = ModelManager::open_with_template_assessor(config, Some(template.clone()))
-            .await
-            .unwrap();
+        let uncached =
+            ManagedModelStore::open_with_template_assessor(config, Some(template.clone()))
+                .await
+                .unwrap();
         uncached.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);

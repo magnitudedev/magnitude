@@ -47,7 +47,7 @@ repositories are presented as themed, underlined links that open in the user's b
 pointer-hover feedback.
 
 After a user requests installation, Catalog presents `Starting download…` for that exact
-configuration while the `InstallModel` mutation awaits ACN admission and synchronized query
+configuration while the `ReconcileCatalogModel` mutation awaits ACN admission and synchronized query
 visibility. The action is unavailable for that configuration only; other configurations may be
 installed concurrently. Once the canonical local-model query publishes acquisition, its
 `Downloading` progress replaces command status. A typed admission rejection settles the scoped

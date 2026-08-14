@@ -5,6 +5,7 @@ import {
   ModelSlotMutationRejected,
   type DisplayViewShape,
   type ModelServingConfigurationId,
+  ModelDownloadIdSchema,
   type SessionError,
 } from "@magnitudedev/acn-protocol";
 import { Cause, Chunk, Effect, Option, Stream } from "effect";
@@ -43,9 +44,10 @@ import { LocalModelPackages } from "./local-model-packages";
 import { LocalModels } from "./local-models";
 import { servableModelBundlePackageIds } from "@magnitudedev/acn-protocol";
 import { ClientLeaseManager } from "./client-lease-manager";
-import { LocalModelInstaller } from "./local-model-installer";
 import { LocalModelConfigurationCoordinator } from "./local-model-configuration-coordinator";
 import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver";
+import { localCatalogProviderModelId } from "./local-provider-model-id";
+import { IcnModels } from "@magnitudedev/icn";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -70,7 +72,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const localHardware = yield* LocalInferenceHardware;
     const localModelPackages = yield* LocalModelPackages;
     const localModels = yield* LocalModels;
-    const localModelInstaller = yield* LocalModelInstaller;
+    const icnModels = yield* IcnModels;
     const localModelConfigurations = yield* LocalModelConfigurationResolver;
     const modelConfigurationCoordinator = yield* LocalModelConfigurationCoordinator;
     const clientLeases = yield* ClientLeaseManager;
@@ -160,10 +162,14 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           retryable: false,
         });
       }
+      const providerModelId = Option.match(configuration.value.catalogIdentity, {
+        onNone: () => configuration.value.servingConfiguration.id,
+        onSome: localCatalogProviderModelId,
+      });
       const slots = (yield* modelSlots.snapshot).state.slots;
       for (const slot of [slots.primary, slots.secondary]) {
         if (slot._tag === "ConfiguredLocal"
-          && String(slot.selection.providerModelId) === String(configurationId)
+          && String(slot.selection.providerModelId) === String(providerModelId)
           && Option.isSome(slot.instance)
           && (slot.instance.value.lifecycle._tag === "Loading"
             || slot.instance.value.lifecycle._tag === "Stopping")) {
@@ -173,7 +179,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           });
         }
         if (slot._tag === "ConfiguredLocal"
-          && String(slot.selection.providerModelId) === String(configurationId)
+          && String(slot.selection.providerModelId) === String(providerModelId)
           && Option.isSome(slot.instance)
           && slot.instance.value.lifecycle._tag === "Ready") {
           yield* modelSlots.stopModel(slot.instance.value.id);
@@ -182,16 +188,35 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       const installedPackageIds = yield* localModelPackages.installedPackageIds;
       const referencedPackageIds = new Set(
         [...(yield* localModelConfigurations.get).values()]
-          .map(({ configuration }) => configuration)
+          .map(({ servingConfiguration }) => servingConfiguration)
           .filter((candidate) => candidate.id !== configurationId)
           .filter((candidate) => servableModelBundlePackageIds(candidate.bundle)
             .every((packageId) => installedPackageIds.has(packageId)))
           .flatMap((candidate) => servableModelBundlePackageIds(candidate.bundle)),
       );
       yield* localModelPackages.removeBundlePackages(
-        configuration.value.configuration.bundle,
+        configuration.value.servingConfiguration.bundle,
         referencedPackageIds,
       );
+      if (Option.isSome(configuration.value.catalogIdentity)) {
+        const packageState = (yield* localModelPackages.snapshot).state;
+        const activePackageIds = new Set(
+          servableModelBundlePackageIds(configuration.value.servingConfiguration.bundle),
+        );
+        for (const entry of packageState.entries) {
+          if (entry.localState._tag !== "Installed"
+            || entry.catalogAttribution._tag !== "Attributed"
+            || entry.catalogAttribution.modelId !== configuration.value.catalogIdentity.value.modelId
+            || entry.catalogAttribution.variantId !== configuration.value.catalogIdentity.value.variantId
+            || activePackageIds.has(entry.package.id)) {
+            continue;
+          }
+          yield* localModelPackages.removeBundlePackages(
+            { _tag: "Standalone", package: entry.package },
+            referencedPackageIds,
+          );
+        }
+      }
       return {};
       }));
 
@@ -390,10 +415,25 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           mirroredStateChanges.stream,
         ),
 
-      InstallModel: ({ configurationId }) =>
+      ReconcileCatalogModel: ({ modelId, variantId }) =>
         observeRpcDefects(
-          "InstallModel",
-          localModelInstaller.install(configurationId).pipe(
+          "ReconcileCatalogModel",
+          icnModels.reconcileCatalogModel(modelId, variantId).pipe(
+            Effect.mapError((error) => new LocalModelMutationFailed({
+              code: "catalog_model_reconciliation_failed",
+              message: String(error),
+              retryable: true,
+            })),
+            Effect.map((admission) => {
+              const providerModelId = localCatalogProviderModelId({ modelId, variantId });
+              return admission._tag === "Current"
+                ? { _tag: "Current" as const, providerModelId }
+                : {
+                    _tag: "DownloadAdmitted" as const,
+                    providerModelId,
+                    downloadId: ModelDownloadIdSchema.make(admission.downloadId),
+                  };
+            }),
             Effect.tap(() => localModels.refresh),
           ),
         ),

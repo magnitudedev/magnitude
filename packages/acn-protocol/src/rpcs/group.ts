@@ -76,7 +76,7 @@ const AtMostOnceDemandRpcs = RpcGroup.make(
   Agent.Interrupt,
   Files.UploadAttachment,
   Config.RefreshModelCatalog,
-  LocalInference.InstallModel,
+  LocalInference.ReconcileCatalogModel,
   LocalInference.CancelModelDownload,
   LocalInference.DismissModelDownloadFailure,
   LocalInference.DeleteLocalModel,

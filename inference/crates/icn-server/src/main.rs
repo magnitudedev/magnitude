@@ -21,9 +21,9 @@ use icn_contracts::models::{
     ModelAssessmentProfile as DomainModelAssessmentProfile, ModelAssessor, ModelBundleInput,
     ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceFailure, ModelInstanceId,
     ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadEvent,
-    ModelLoadPlan, ModelLoadStage, ModelPackage, ModelPackageId, ModelPackageOperand,
-    ModelReleaseReason, ModelServingConfiguration, ModelServingConfigurationId,
-    ModelStoppingAllocation, PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
+    ModelLoadPlan, ModelLoadStage, ModelPackageId, ModelPackageOperand, ModelReleaseReason,
+    ModelServingConfiguration, ModelServingConfigurationId, ModelStoppingAllocation,
+    PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
     RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
     SpeculativeDraftSource as ModelSpeculativeDraftSource, SpeculativeDraftSourceInput,
     SpeculativeMethod,
@@ -40,8 +40,8 @@ use icn_engine::{
 };
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ReleaseCatalog,
-    ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog,
+    InventoryConfig, ManagedCatalogModels, ManagedModelDownloads, ManagedModelStore, ModelCache,
+    ReleaseCatalog, ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog,
     servable_model_bundle_key, serving_configuration_id, serving_configuration_identity_is_valid,
     speculative_servable_model_bundle_key,
 };
@@ -714,7 +714,7 @@ type NativeAssessorServices = (
 );
 
 fn native_assessor_services(
-    inventory: &Arc<ModelManager>,
+    inventory: &Arc<ManagedModelStore>,
     planning_executor: PlanningExecutor,
     native_backend: NativeBackend,
     defaults: ModelPlanDefaults,
@@ -1808,7 +1808,7 @@ impl NativeResolvedModelAssessor {
 }
 
 struct NativeModelAssessor {
-    models: Arc<ModelManager>,
+    models: Arc<ManagedModelStore>,
     assessor: Arc<NativeResolvedModelAssessor>,
     release_catalog: Arc<ReleaseCatalog>,
 }
@@ -1822,7 +1822,7 @@ struct AssessmentEnvironment {
 
 impl NativeModelAssessor {
     fn new(
-        models: Arc<ModelManager>,
+        models: Arc<ManagedModelStore>,
         assessor: Arc<NativeResolvedModelAssessor>,
         release_catalog: Arc<ReleaseCatalog>,
     ) -> Self {
@@ -3302,7 +3302,7 @@ impl HardwareProvider for NativeResolvedModelAssessor {
 
 #[derive(Clone)]
 struct NativeModelInstanceController {
-    inventory: Arc<ModelManager>,
+    inventory: Arc<ManagedModelStore>,
     assessor: Arc<NativeResolvedModelAssessor>,
     native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
     worker_launcher: NativeWorkerLauncher,
@@ -3540,7 +3540,7 @@ impl NativeModelInstanceController {
     const DISCONNECTED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     fn new(
-        inventory: Arc<ModelManager>,
+        inventory: Arc<ManagedModelStore>,
         assessor: Arc<NativeResolvedModelAssessor>,
         native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
         worker_launcher: NativeWorkerLauncher,
@@ -5198,6 +5198,19 @@ impl ModelInstanceController for NativeModelInstanceController {
     }
 }
 
+impl icn_contracts::models::CatalogPackageRemover for NativeModelInstanceController {
+    fn remove_catalog_package(
+        &self,
+        package_id: ModelPackageId,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        Box::pin(async move {
+            <Self as ModelInstanceController>::remove_installed(self, package_id)
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
 fn open_installation_catalog(
     installation: &installation::Installation,
 ) -> anyhow::Result<ReleaseCatalog> {
@@ -5365,31 +5378,12 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()?
                 .map(Arc::new);
             if let Some(catalog) = &release_catalog {
-                let mut packages = std::collections::BTreeMap::new();
-                for model in &catalog.catalog().models {
-                    match &model.configuration.bundle {
-                        DomainServableModelBundle::Standalone { package } => {
-                            packages.insert(package.id.clone(), package.clone());
-                        }
-                        DomainServableModelBundle::SpeculativeDecoding {
-                            target,
-                            draft_source,
-                            ..
-                        } => {
-                            packages.insert(target.id.clone(), target.clone());
-                            if let ModelSpeculativeDraftSource::Separate { draft } = draft_source {
-                                packages.insert(draft.id.clone(), draft.clone());
-                            }
-                        }
-                    }
-                }
-                inventory_config.catalog_packages =
-                    packages.into_values().collect::<Vec<ModelPackage>>();
+                inventory_config.catalog_models = catalog.catalog().models.clone();
             }
             let plan_defaults = model_plan_defaults();
             let native_backend = initialize_native_runtime(&runtime_authority)?;
             let inventory = Arc::new(
-                ModelManager::open_with_template_assessor(
+                ManagedModelStore::open_with_template_assessor(
                     inventory_config,
                     Some(Arc::new(NativeTemplateAssessor {
                         worker_launcher: worker_launcher.clone(),
@@ -5505,9 +5499,17 @@ async fn main() -> anyhow::Result<()> {
             }
             .with_installed_packages(inventory.clone())
             .with_hardware(model_assessor.clone())
-            .with_model_downloads(model_downloads)
+            .with_model_downloads(model_downloads.clone())
             .with_identity(identity);
             if let Some(release_catalog) = release_catalog {
+                if let Some(model_controller) = &model_controller {
+                    state = state.with_catalog_models(ManagedCatalogModels::new(
+                        inventory.clone(),
+                        release_catalog.catalog().clone(),
+                        model_downloads,
+                        model_controller.clone(),
+                    )?);
+                }
                 state = state
                     .with_model_assessor(Arc::new(NativeModelAssessor::new(
                         inventory,
@@ -6544,7 +6546,7 @@ mod tests {
             )
             .expect("link parity fixture into Hugging Face cache");
             config.hf_cache_dirs.push(hf_cache);
-            let manager = ModelManager::open_with_template_assessor(
+            let manager = ManagedModelStore::open_with_template_assessor(
                 config,
                 Some(Arc::new(NativeTemplateAssessor {
                     worker_launcher: NativeWorkerLauncher::development(),

@@ -80,8 +80,9 @@ normalized through the same operation when the catalog becomes available. The cl
 not independently repair reasoning effort.
 
 The local provider resolver maps the selected provider model ID to the exact current catalog or
-standard configuration. Provider binding is cheap and has no runtime side effect. Failure to
-resolve preserves the selection as unavailable; it never chooses another configuration.
+standard configuration. Provider binding is cheap and has no runtime side effect. Temporary
+authority failure preserves the selection as unavailable. A complete authoritative projection
+that lacks the identity clears the selection; neither case chooses another configuration.
 
 Existing recency-based slot substitution remains product behavior. It operates on stable provider
 model IDs and does not create, reassess, or rewrite offerings.
@@ -169,7 +170,7 @@ reports the selected method, effective parameters, and whether drafting actually
 
 ## Failure behavior
 
-- Unresolved selected configuration: ACN rejects provider resolution without changing selection.
+- Selected identity absent from an authoritative offering projection: ACN clears the selection.
 - Missing package: the provider catalog entry and slot are unavailable; chat does not trigger a
   download.
 - Configuration no longer fits or is incompatible: the provider catalog entry is disabled and load

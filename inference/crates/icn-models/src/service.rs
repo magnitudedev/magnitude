@@ -1,17 +1,17 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use icn_contracts::{
     DeletePlan, DeletedModel, InventoryError, InventoryModel, ModelAvailability, ModelId,
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
-use crate::inventory::{ModelManager, hf_repo_dir, repository_lock_path};
+use crate::inventory::{ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::store_fs::acquire_exclusive_lock;
 
-impl ModelInventory for ModelManager {
+impl ModelInventory for ManagedModelStore {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
         Box::pin(async move {
             let mut models = self
@@ -80,6 +80,7 @@ impl ModelInventory for ModelManager {
     fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
+            self.ensure_installed_model_inventory().await?;
             let observed = self
                 .models
                 .read()
@@ -569,15 +570,7 @@ fn remove_empty_parents(path: &Path, stop: &Path) {
 }
 
 fn acquire_delete_lock(path: &Path) -> Result<File, InventoryError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(io_error)?;
-    FileExt::lock_exclusive(&file).map_err(io_error)?;
-    Ok(file)
+    acquire_exclusive_lock(path)
 }
 
 fn io_error(error: impl std::fmt::Display) -> InventoryError {

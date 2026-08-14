@@ -1,6 +1,7 @@
 import {
   Context,
   Deferred,
+  Either,
   Effect,
   Exit,
   Layer,
@@ -511,13 +512,54 @@ export const ModelSlotControllerLive: Layer.Layer<
     )
   }))
 
-  yield* rebuild
+  const providerIdentityIsAuthoritative = (
+    providerId: ProviderId,
+    state: ProviderModelCatalogState,
+  ): boolean => state._tag === "Ready"
+    || state._tag === "Degraded"
+      && !state.failures.some((item) =>
+        item._tag === "ProviderFailure" && item.providerId === providerId)
+
+  const reconcileSelections = Effect.gen(function* () {
+    const configured = yield* modelSelection.get
+    const catalogState = (yield* catalog.snapshot).state
+    const contents = catalogContents(catalogState)
+    const localReady = yield* localOfferings.ready
+    const localResult = yield* Effect.either(localOfferings.list)
+    const localIds = Either.isRight(localResult)
+      ? new Set(localResult.right.map(({ providerModelId }) => providerModelId))
+      : undefined
+    for (const slotId of [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID] as const) {
+      const selected = configured.slots[slotKey(slotId)]
+      if (Option.isNone(selected)) continue
+      const selection = selected.value
+      if (selection.providerId === LOCAL_PROVIDER_ID && !localReady) continue
+      if (!providerIdentityIsAuthoritative(selection.providerId, catalogState)) continue
+      const exists = selection.providerId === LOCAL_PROVIDER_ID
+        ? localIds?.has(selection.providerModelId)
+        : contents.models.some((model) => model.providerId === selection.providerId
+          && model.providerModelId === selection.providerModelId)
+      if (exists === false) {
+        yield* modelSelection.updateSlot(slotId, Option.none()).pipe(Effect.orDie)
+      }
+    }
+  })
+
+  const reconcileAndRebuild = commandLock.withPermits(1)(
+    reconcileSelections.pipe(Effect.zipRight(rebuild)),
+  )
+
+  yield* reconcileAndRebuild
   yield* Effect.forkIn(modelSelection.changes.pipe(
-    Stream.runForEach(() => rebuild),
+    Stream.runForEach(() => reconcileAndRebuild),
   ), scope)
   yield* Effect.forkIn(localPackages.changes.pipe(Stream.runForEach(() => rebuild)), scope)
-  yield* Effect.forkIn(localOfferings.changes.pipe(Stream.runForEach(() => rebuild)), scope)
-  yield* Effect.forkIn(catalog.changes.pipe(Stream.runForEach(() => rebuild)), scope)
+  yield* Effect.forkIn(localOfferings.changes.pipe(
+    Stream.runForEach(() => reconcileAndRebuild),
+  ), scope)
+  yield* Effect.forkIn(catalog.changes.pipe(
+    Stream.runForEach(() => reconcileAndRebuild),
+  ), scope)
   yield* Effect.forkIn(observedInstances.changes.pipe(
     Stream.runForEach(() => rebuild),
   ), scope)
