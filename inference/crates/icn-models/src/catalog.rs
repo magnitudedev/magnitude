@@ -271,11 +271,11 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     Ok(source)
 }
 
-fn valid_identity_component(value: &str) -> bool {
+pub(crate) fn valid_identity_component(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && !value.contains(':')
 }
 
-fn valid_variant_id(value: &str) -> bool {
+pub(crate) fn valid_variant_id(value: &str) -> bool {
     let mut components = value.split(':');
     matches!(
         (components.next(), components.next(), components.next()),

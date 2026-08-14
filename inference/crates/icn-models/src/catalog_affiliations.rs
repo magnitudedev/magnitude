@@ -10,6 +10,8 @@ use icn_contracts::models::{
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::catalog::{valid_identity_component, valid_variant_id};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CatalogAffiliations {
     entries: BTreeSet<CatalogPackageAffiliation>,
@@ -103,7 +105,7 @@ fn decode_entry(value: &Value) -> Option<CatalogPackageAffiliation> {
 }
 
 fn valid_affiliation(affiliation: &CatalogPackageAffiliation) -> bool {
-    valid_model_id(&affiliation.model_id.0)
+    valid_identity_component(&affiliation.model_id.0)
         && valid_variant_id(&affiliation.variant_id.0)
         && !affiliation.package_id.0.is_empty()
         && affiliation.package_id.0.trim() == affiliation.package_id.0
@@ -112,19 +114,6 @@ fn valid_affiliation(affiliation: &CatalogPackageAffiliation) -> bool {
 
 fn path(root: &Path) -> std::path::PathBuf {
     root.join("catalog-affiliations.json")
-}
-
-fn valid_model_id(value: &str) -> bool {
-    !value.is_empty() && value.trim() == value && !value.contains(':')
-}
-
-fn valid_variant_id(value: &str) -> bool {
-    let mut parts = value.split(':');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(format), Some(quality), None)
-            if valid_model_id(format) && valid_model_id(quality)
-    )
 }
 
 fn valid_repository(value: &str) -> bool {

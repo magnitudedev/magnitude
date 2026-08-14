@@ -42,7 +42,13 @@ export interface LocalModelConfigurationResolverApi {
     LocalInferenceError
   >
   readonly changes: Stream.Stream<void>
-  readonly catalogReady: Effect.Effect<boolean>
+  /**
+   * True once the resolved configuration set is a complete account of the
+   * local models that exist: the native catalog has been observed and every
+   * currently desired assessment has completed. Absence of a configuration is
+   * only meaningful when this is true.
+   */
+  readonly settled: Effect.Effect<boolean>
   readonly resolve: (
     configurationId: ModelServingConfigurationId,
   ) => Effect.Effect<Option.Option<ResolvedLocalModelConfiguration>, LocalInferenceError>
@@ -189,7 +195,9 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
   return LocalModelConfigurationResolver.of({
     get,
     changes,
-    catalogReady: models.initialized,
+    settled: Effect.gen(function* () {
+      return (yield* models.initialized) && (yield* assessor.settled)
+    }),
     resolve: (configurationId) => get.pipe(Effect.map((resolved) =>
       Option.fromNullable([...resolved.values()].find(({ servingConfiguration }) =>
         servingConfiguration.id === configurationId)))),

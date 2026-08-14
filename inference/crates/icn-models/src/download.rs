@@ -900,7 +900,7 @@ async fn download_component_once(
     if offset == component.size_bytes {
         progress(component.size_bytes, DownloadStage::Verifying);
         if let Err(error) = integrity.verify(component) {
-            quarantine_component_files(paths).await?;
+            discard_component_files(paths).await?;
             return Err(error);
         }
         publish_verified_blob(paths).await?;
@@ -977,7 +977,7 @@ async fn download_component_once(
     drop(file);
     progress(component.size_bytes, DownloadStage::Verifying);
     if let Err(error) = integrity.verify(component) {
-        quarantine_component_files(paths).await?;
+        discard_component_files(paths).await?;
         return Err(error);
     }
     publish_verified_blob(paths).await?;
@@ -992,14 +992,14 @@ async fn recover_partial(
     let record = read_integrity_record(&paths.checkpoint).await;
     let Some((partial_len, record)) = partial_len.zip(record) else {
         if partial_len.is_some() || paths.checkpoint.exists() {
-            quarantine_component_files(paths).await?;
+            discard_component_files(paths).await?;
         }
         return Ok(DownloadIntegrity::empty(component));
     };
     let integrity = match DownloadIntegrity::restore(component, record) {
         Ok(integrity) if partial_len >= integrity.bytes => integrity,
         _ => {
-            quarantine_component_files(paths).await?;
+            discard_component_files(paths).await?;
             return Ok(DownloadIntegrity::empty(component));
         }
     };
@@ -1034,7 +1034,7 @@ async fn recover_completed_blob(
         return Ok(true);
     }
 
-    quarantine_component_files(paths).await?;
+    discard_component_files(paths).await?;
     Ok(false)
 }
 
@@ -1094,9 +1094,18 @@ async fn regular_file_len(path: &Path) -> Option<u64> {
     (metadata.is_file() && !metadata.file_type().is_symlink()).then_some(metadata.len())
 }
 
-async fn quarantine_component_files(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
+async fn discard_component_files(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
     for path in [&paths.partial, &paths.blob, &paths.checkpoint] {
-        quarantine(path).await?;
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                tokio::fs::remove_file(path).await.map_err(download_io)?;
+            }
+            // The store only ever writes regular files at these paths; anything
+            // else is foreign and is preserved by rename instead of deleted.
+            Ok(_) => quarantine(path).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(download_io(error)),
+        }
     }
     Ok(())
 }
