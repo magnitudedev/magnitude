@@ -86,7 +86,7 @@ const candidate = (input: {
             quantization: `Q${fidelity}`,
             quantizationName: `${fidelity}-bit`,
             architecture: input.architecture ?? "dense",
-            maximumContextLength: context,
+            maximumContextLength: Option.some(context),
             intrinsicModelId: Option.some(catalogModelId),
             intrinsicQualityId: Option.some(`Q${fidelity}`),
           },

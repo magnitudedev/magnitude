@@ -15,7 +15,7 @@
   "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
   "nemotron-3.5-lightning-30b-a3b": {
     "target": "88d7ce0b0fa385c5108866ce5d33690927531a37",
-    "speculativeDraft": "3a5762f73f039c7894ac281bbb1475d9513a74a6"
+    "speculativeDraft": "cb86a5267e902064e551f028e97abb11990c258d"
   },
   "qwen3.5-122b-a10b": { "target": "907becb33103ab66b23da06a2dc74a5fca0583bd" },
   "qwen3.5-4b": { "target": "86835bf9949e4d14d6860f7910b1340ad4f271a9" },

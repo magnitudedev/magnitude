@@ -50,7 +50,7 @@ export const makeStandaloneBundle = (id: string = TEST_PACKAGE_ID): ServableMode
       quantization: "Q4_K_M",
       quantizationName: "4-bit",
       architecture: "test",
-      maximumContextLength: 32_768,
+      maximumContextLength: Option.some(32_768),
       intrinsicModelId: Option.none(),
       intrinsicQualityId: Option.none(),
     },

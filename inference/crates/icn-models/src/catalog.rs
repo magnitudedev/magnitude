@@ -526,9 +526,12 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
             !serving_configuration_identity_is_valid(&model.configuration)
                 || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
                 || servable_bundle_packages(&model.configuration.bundle).any(|package| {
-                    model.configuration.profile.context_length
-                        > package.properties.maximum_context_length
-                        || !matches!(
+                    package
+                        .properties
+                        .maximum_context_length
+                        .is_some_and(|maximum| {
+                            model.configuration.profile.context_length > maximum
+                        }) || !matches!(
                             &package.source,
                             ModelPackageSource::HuggingFace { revision, .. }
                                 if valid_commit(revision)
@@ -1311,20 +1314,24 @@ impl ResolvingRecommendableCatalog {
             }
             None => None,
         };
-        let maximum_context_length =
+        let maximum_context_length = std::iter::once(
+            target.package.properties.maximum_context_length,
+        )
+        .chain(
             draft
                 .as_ref()
-                .map_or(target.package.properties.maximum_context_length, |draft| {
-                    target
-                        .package
-                        .properties
-                        .maximum_context_length
-                        .min(draft.package.properties.maximum_context_length)
-                });
-        if declaration.context_length > maximum_context_length {
+                .map(|draft| draft.package.properties.maximum_context_length),
+        )
+        .flatten()
+        .min();
+        if maximum_context_length
+            .is_some_and(|maximum| declaration.context_length > maximum)
+        {
             return Err(InventoryError::Integrity(format!(
                 "{} configures {} context tokens above the artifact maximum of {}",
-                declaration.id, declaration.context_length, maximum_context_length
+                declaration.id,
+                declaration.context_length,
+                maximum_context_length.expect("checked as present")
             )));
         }
         let model = recommendable_model(

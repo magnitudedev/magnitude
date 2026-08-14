@@ -102,7 +102,7 @@ fn package_properties(
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned()),
             architecture: architecture.clone().unwrap_or_else(|| "unknown".to_owned()),
-            maximum_context_length: training_context_length.unwrap_or(1).max(1),
+            maximum_context_length: *training_context_length,
             intrinsic_model_id,
             intrinsic_quality_id,
         },
@@ -112,7 +112,7 @@ fn package_properties(
                 quantization: "unknown".to_owned(),
                 quantization_name: "unknown".to_owned(),
                 architecture: "unknown".to_owned(),
-                maximum_context_length: 1,
+                maximum_context_length: None,
                 intrinsic_model_id: None,
                 intrinsic_quality_id: None,
             }

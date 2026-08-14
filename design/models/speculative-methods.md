@@ -30,7 +30,7 @@ configured artifact; `Best known method` intentionally contains no links.
 | Laguna S 2.1 118B-A8B | None known | None | — | — |
 | Qwen3.5 122B-A10B | MTP | MTP | Embedded | [Target model](https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF) |
 | Nemotron 3 Super 120B-A12B | MTP | None | — | — |
-| Nemotron 3.5 Lightning 30B-A3B | DSpark | DSpark | Separate file, draft repo | [NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark.gguf](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF/blob/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark.gguf) |
+| Nemotron 3.5 Lightning 30B-A3B | DFlash | DFlash | Separate file, draft repo | [NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF/blob/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf) |
 | DeepSeek V4 Flash 284B-A13B | DSpark | DSpark | Separate file, target repo | [dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/blob/main/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf) |
 | Nemotron 3 Ultra 550B-A55B | MTP | None | — | — |
 | GLM 5.2 753B-A40B | MTP | MTP | Embedded | [Target model](https://huggingface.co/unsloth/GLM-5.2-GGUF) |

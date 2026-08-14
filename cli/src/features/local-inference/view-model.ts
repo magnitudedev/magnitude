@@ -35,8 +35,14 @@ export type LocalInferenceSelection = LocalModelOption
 
 const modelPackages = (model: LocalModel) => servableModelBundlePackages(model.bundle)
 
-export const localModelMaximumContextLength = (model: LocalModel): number =>
-  Math.min(...modelPackages(model).map(({ properties }) => properties.maximumContextLength))
+export const localModelMaximumContextLength = (model: LocalModel): Option.Option<number> => {
+  const known = modelPackages(model).flatMap(({ properties }) =>
+    Option.match(properties.maximumContextLength, {
+      onNone: () => [],
+      onSome: (maximum) => [maximum],
+    }))
+  return known.length === 0 ? Option.none() : Option.some(Math.min(...known))
+}
 
 export const localModelDownloadBytes = (model: LocalModel): number =>
   model.downloadBytes
@@ -350,12 +356,12 @@ export const selectionMetadata = ({ model }: LocalInferenceSelection): string =>
       : Option.some(model.servingState.configuration)
   const contextLength = Option.match(configuration, {
     onNone: () => localModelMaximumContextLength(model),
-    onSome: ({ profile }) => profile.contextLength,
+    onSome: ({ profile }) => Option.some(profile.contextLength),
   })
   const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
   return [
     formatDownloadBytes(model.downloadBytes),
-    `${formatContext(contextLength)} ctx`,
+    Option.map(contextLength, (context) => `${formatContext(context)} ctx`).pipe(Option.getOrNull),
     speculativeMethod,
   ].filter((value): value is string => value !== null).join(" · ")
 }

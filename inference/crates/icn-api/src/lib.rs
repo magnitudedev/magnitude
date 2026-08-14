@@ -548,7 +548,9 @@ pub struct PropsResponse {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningProfileResponse {
-    pub default_reasoning_effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub default_reasoning_effort: Option<String>,
     pub reasoning_efforts: Vec<String>,
 }
 
@@ -2194,7 +2196,11 @@ fn validate_apply_template_request(
 
 fn props_response(properties: ModelProperties) -> PropsResponse {
     let reasoning = ReasoningProfileResponse {
-        default_reasoning_effort: properties.reasoning.default_effort.0.clone(),
+        default_reasoning_effort: properties
+            .reasoning
+            .default_effort
+            .as_ref()
+            .map(|effort| effort.0.clone()),
         reasoning_efforts: properties
             .reasoning
             .mappings
@@ -2699,17 +2705,32 @@ fn reasoning_control(
                     "thinking_budget_tokens cannot be used when raw template controls disable reasoning",
                 ));
             }
+            let effort = profile.default_effort.clone().ok_or_else(|| {
+                ApiError::invalid(
+                    "thinking_budget_tokens requires a classified reasoning default",
+                )
+            })?;
             return Ok(ReasoningControl::Resolved {
-                effort: profile.default_effort.clone(),
+                effort,
                 controls: icn_contracts::NativeReasoningControls::default(),
                 automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
                 explicit_budget_tokens: budget_tokens,
                 template_fingerprint: profile.template_fingerprint.clone(),
             });
         }
-        None => profile
-            .mapping(&profile.default_effort)
-            .expect("reasoning profile contains its default mapping"),
+        None => {
+            let Some(default_effort) = profile.default_effort.as_ref() else {
+                if budget_tokens.is_some() {
+                    return Err(ApiError::invalid(
+                        "thinking_budget_tokens requires a classified reasoning default",
+                    ));
+                }
+                return Ok(ReasoningControl::ModelDefault);
+            };
+            profile
+                .mapping(default_effort)
+                .expect("classified reasoning default has a mapping")
+        }
     };
 
     if budget_tokens.is_some() && selected.effort.as_str() == "none" {
@@ -3192,7 +3213,7 @@ impl CompletionBackend for FakeBackend {
                 enable_thinking: true,
             },
             reasoning: icn_contracts::ReasoningProfile {
-                default_effort: icn_contracts::NormalizedReasoningEffort("high".into()),
+                default_effort: Some(icn_contracts::NormalizedReasoningEffort("high".into())),
                 mappings: vec![
                     icn_contracts::ReasoningEffortMapping {
                         effort: icn_contracts::NormalizedReasoningEffort("none".into()),

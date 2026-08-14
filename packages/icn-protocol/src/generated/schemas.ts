@@ -1598,7 +1598,10 @@ export const ModelPackageProperties = S.Struct({
   format: S.String,
   intrinsicModelId: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   intrinsicQualityId: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  maximumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  maximumContextLength: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
   quantization: S.String,
   quantizationName: S.String,
 })
@@ -1755,7 +1758,7 @@ export type ReasoningEffortRequest = S.Schema.Type<typeof ReasoningEffortRequest
 export type ReasoningEffortRequestEncoded = S.Schema.Encoded<typeof ReasoningEffortRequest>
 
 export const ReasoningProfileResponse = S.Struct({
-  default_reasoning_effort: S.String,
+  default_reasoning_effort: S.optionalWith(S.String, { exact: true, as: "Option" }),
   reasoning_efforts: S.Array(S.String),
 })
 export type ReasoningProfileResponse = S.Schema.Type<typeof ReasoningProfileResponse>

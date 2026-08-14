@@ -44,8 +44,14 @@ type AssessmentProfiles = readonly [] | readonly [ServingProfile]
 
 const bundleMaximumContextLength = (
   bundle: ServableModelBundle,
-): number => Math.min(...servableModelBundlePackages(bundle)
-  .map(({ properties }) => properties.maximumContextLength))
+): Option.Option<number> => {
+  const known = servableModelBundlePackages(bundle).flatMap(({ properties }) =>
+    Option.match(properties.maximumContextLength, {
+      onNone: () => [],
+      onSome: (maximum) => [maximum],
+    }))
+  return known.length === 0 ? Option.none() : Option.some(Math.min(...known))
+}
 
 const assessmentProfile = (contextLength: number): AssessmentProfiles =>
   contextLength >= MINIMUM_LOCAL_MODEL_CONTEXT_LENGTH ? [{ contextLength }] : []
@@ -54,7 +60,10 @@ export const localModelAssessmentProfiles = (
   bundle: ServableModelBundle,
   contextLength: number = DEFAULT_LOCAL_MODEL_CONTEXT_LENGTH,
 ): readonly ServingProfile[] => assessmentProfile(
-  Math.min(contextLength, bundleMaximumContextLength(bundle)),
+  Option.match(bundleMaximumContextLength(bundle), {
+    onNone: () => contextLength,
+    onSome: (maximum) => Math.min(contextLength, maximum),
+  }),
 )
 
 export const performanceSampleContextTokens = (

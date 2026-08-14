@@ -403,7 +403,7 @@ mod tests {
                 quantization: "Q4".to_owned(),
                 quantization_name: "4-bit".to_owned(),
                 architecture: "test".to_owned(),
-                maximum_context_length: 4_096,
+                maximum_context_length: Some(4_096),
                 intrinsic_model_id: Some("catalog".to_owned()),
                 intrinsic_quality_id: Some("Q4".to_owned()),
             },
