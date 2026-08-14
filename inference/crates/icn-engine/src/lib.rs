@@ -807,8 +807,16 @@ fn prepare_native_plan(
     requested.speculative = speculative;
     requested.speculative = icn_speculative::preflight_with_backend(backend, &requested)
         .map_err(|error| ModelLoadError::SpeculativePreflight(error.to_string()))?;
-    let planned = icn_hardware::plan_load_with_backend(backend, topology, &requested)
-        .map_err(|error| ModelLoadError::Planning(error.to_string()))?;
+    let planned = match icn_hardware::plan_load_with_backend(backend, topology, &requested)
+        .map_err(|error| ModelLoadError::Planning(error.to_string()))?
+    {
+        icn_hardware::BackendLoadPlanningOutcome::Planned(planned) => planned,
+        icn_hardware::BackendLoadPlanningOutcome::Rejected(assessed) => {
+            return Err(ModelLoadError::AssessmentRejected(Box::new(
+                assessed.assessment,
+            )));
+        }
+    };
     let acceleration = match &planned.assessed.assessment {
         HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
         assessment => {

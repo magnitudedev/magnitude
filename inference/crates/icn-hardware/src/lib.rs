@@ -802,6 +802,12 @@ pub struct BackendLoadPlan {
     pub native_speculative: Option<NativeParameterPlan>,
 }
 
+/// Exact load planning either produces executable native parameters or a complete rejection.
+pub enum BackendLoadPlanningOutcome {
+    Planned(BackendLoadPlan),
+    Rejected(AssessedExecutionPlan),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AssessmentError {
     #[error(transparent)]
@@ -853,23 +859,13 @@ pub fn plan_load_with_backend(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     requested: &ExecutionIntent,
-) -> Result<BackendLoadPlan, AssessmentError> {
+) -> Result<BackendLoadPlanningOutcome, AssessmentError> {
     let (assessed, native) = plan_and_assess(backend, topology, requested, false)?;
-    let native = match (native, &assessed.assessment) {
-        (Some(native), _) => native,
-        (None, HardwareAssessment::IncompatibleArtifact { code, message }) => {
-            return Err(AssessmentError::IncompatibleArtifact {
-                code: code.clone(),
-                message: message.clone(),
-            });
-        }
-        (None, HardwareAssessment::InvalidArtifact { code, message }) => {
-            return Err(AssessmentError::InvalidArtifact {
-                code: code.clone(),
-                message: message.clone(),
-            });
-        }
-        (None, _) => return Err(AssessmentError::MissingMeasurements),
+    let Some(native) = native else {
+        return match assessed.assessment {
+            HardwareAssessment::Fits { .. } => Err(AssessmentError::MissingMeasurements),
+            _ => Ok(BackendLoadPlanningOutcome::Rejected(assessed)),
+        };
     };
     let native_speculative = match requested.speculative {
         SpeculativeDecodingConfig::Disabled { .. } => None,
@@ -883,11 +879,11 @@ pub fn plan_load_with_backend(
             .native,
         ),
     };
-    Ok(BackendLoadPlan {
+    Ok(BackendLoadPlanningOutcome::Planned(BackendLoadPlan {
         assessed,
         native,
         native_speculative,
-    })
+    }))
 }
 
 fn plan_and_assess(
