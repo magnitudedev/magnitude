@@ -20,6 +20,7 @@ export interface CatalogLayout {
   readonly mode: CatalogLayoutMode
   readonly contentWidth: number
   readonly modelWidth: number
+  readonly columnGap: number
   readonly columns: CatalogColumnWidths
   readonly showIntelligence: boolean
   readonly showQuality: boolean
@@ -29,7 +30,8 @@ export interface CatalogLayout {
 }
 
 const HORIZONTAL_PADDING = 4
-const CURSOR_WIDTH = 2
+const CURSOR_WIDTH = 1
+const COLUMN_GAP = 1
 
 const FULL_COLUMNS: CatalogColumnWidths = {
   recommendation: 14,
@@ -38,7 +40,7 @@ const FULL_COLUMNS: CatalogColumnWidths = {
   intelligence: 12,
   quality: 10,
   speed: 10,
-  status: 15,
+  status: 16,
 }
 
 const COMPACT_COLUMNS: CatalogColumnWidths = {
@@ -48,7 +50,7 @@ const COMPACT_COLUMNS: CatalogColumnWidths = {
   intelligence: 0,
   quality: 0,
   speed: 10,
-  status: 14,
+  status: 16,
 }
 
 const QUALITY_COLUMNS: CatalogColumnWidths = {
@@ -75,6 +77,12 @@ const columnTotal = (columns: CatalogColumnWidths): number =>
   + columns.speed
   + columns.status
 
+const tableGapTotal = (columns: CatalogColumnWidths): number =>
+  COLUMN_GAP * (1 + Object.values(columns).filter((columnWidth) => columnWidth > 0).length)
+
+const tableModelWidth = (contentWidth: number, columns: CatalogColumnWidths): number =>
+  Math.max(1, contentWidth - CURSOR_WIDTH - columnTotal(columns) - tableGapTotal(columns))
+
 export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
   const width = Math.max(1, Math.floor(measuredWidth))
   const contentWidth = Math.max(1, width - HORIZONTAL_PADDING)
@@ -83,7 +91,8 @@ export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
     return {
       mode: "full",
       contentWidth,
-      modelWidth: Math.max(1, contentWidth - CURSOR_WIDTH - columnTotal(FULL_COLUMNS)),
+      modelWidth: tableModelWidth(contentWidth, FULL_COLUMNS),
+      columnGap: COLUMN_GAP,
       columns: FULL_COLUMNS,
       showIntelligence: true,
       showQuality: true,
@@ -97,7 +106,8 @@ export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
     return {
       mode: "quality",
       contentWidth,
-      modelWidth: Math.max(1, contentWidth - CURSOR_WIDTH - columnTotal(QUALITY_COLUMNS)),
+      modelWidth: tableModelWidth(contentWidth, QUALITY_COLUMNS),
+      columnGap: COLUMN_GAP,
       columns: QUALITY_COLUMNS,
       showIntelligence: false,
       showQuality: true,
@@ -111,7 +121,8 @@ export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
     return {
       mode: "compact",
       contentWidth,
-      modelWidth: Math.max(1, contentWidth - CURSOR_WIDTH - columnTotal(COMPACT_COLUMNS)),
+      modelWidth: tableModelWidth(contentWidth, COMPACT_COLUMNS),
+      columnGap: COLUMN_GAP,
       columns: COMPACT_COLUMNS,
       showIntelligence: false,
       showQuality: false,
@@ -126,6 +137,7 @@ export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
     mode: minimal ? "minimal" : "stacked",
     contentWidth,
     modelWidth: Math.max(1, contentWidth - CURSOR_WIDTH),
+    columnGap: COLUMN_GAP,
     columns: EMPTY_COLUMNS,
     showIntelligence: false,
     showQuality: false,

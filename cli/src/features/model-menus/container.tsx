@@ -1364,9 +1364,17 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
       id={rowId}
       onClick={onClick}
       onMouseOver={onMouseOver}
-      style={{ flexDirection: "row", width: "100%", backgroundColor }}
+      style={{
+        flexDirection: "row",
+        columnGap: layout.columnGap,
+        width: "100%",
+        height: 1,
+        minHeight: 1,
+        flexShrink: 0,
+        backgroundColor,
+      }}
     >
-      <text style={{ fg: focused ? theme.primary : theme.foreground, width: 2 }} wrapMode="none">
+      <text style={{ fg: focused ? theme.primary : theme.foreground, width: 1 }} wrapMode="none">
         {focused ? "›" : " "}
       </text>
       <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
@@ -1628,6 +1636,16 @@ const CatalogMenu = memo(function CatalogMenu({
     }
   }, [candidates, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, focusedDetailAction, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
 
+  if (menuSize.width === null) {
+    return (
+      <box
+        ref={menuSize.ref}
+        onSizeChange={menuSize.onSizeChange}
+        style={{ flexGrow: 1, minHeight: 0, flexDirection: "column" }}
+      />
+    )
+  }
+
   if (detail) {
     const recommendation = recommendationFor(detail)
     const downloading = detail.acquisitionState._tag === "Downloading"
@@ -1780,8 +1798,15 @@ const CatalogMenu = memo(function CatalogMenu({
         contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
       }}>
         {!layout.stackedRows && (
-          <box style={{ flexDirection: "row", width: "100%" }}>
-            <text style={{ fg: theme.muted, width: 2 }} wrapMode="none"> </text>
+          <box style={{
+            flexDirection: "row",
+            columnGap: layout.columnGap,
+            width: "100%",
+            height: 1,
+            minHeight: 1,
+            flexShrink: 0,
+          }}>
+            <text style={{ fg: theme.muted, width: 1 }} wrapMode="none"> </text>
             <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
             <text style={{ fg: theme.muted, width: layout.columns.recommendation }} wrapMode="none">RECOMMENDATION</text>
             <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>
