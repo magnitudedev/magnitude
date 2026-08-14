@@ -1,12 +1,9 @@
 ---
 applies_to:
-  - packages/acn/src/agent-runtime.ts
-  - packages/acn/src/session-*.ts
-  - packages/acn/src/active-session-statuses.ts
-  - packages/acn/src/display-view-streams.ts
-  - packages/acn/src/agent-persistence.ts
-  - packages/acn-protocol/src/rpcs/shell.ts
-  - packages/acn-protocol/src/schemas/shell.ts
+  - packages/acn/src/*.ts
+  - packages/client-common/src/headless/session-runner.ts
+  - packages/sdk/src/headless-rpcs.ts
+  - packages/acn-protocol/src/*/shell.ts
   - packages/agent/src/events.ts
   - packages/agent/src/session-work-status.ts
   - packages/agent/src/process/detached-process-registry*.ts
@@ -31,9 +28,10 @@ A resident runtime unloads after two minutes without session work. Commands, age
 display materialization, shape changes, resynchronization, and preload count as work. Merely
 watching a session does not. The final claim starts that generation's idle timer.
 
-Agent work has one authoritative status covering turns, queued triggers, workers, compaction, and
-owned detached processes. Runtime retention and UI consume that status instead of reconstructing
-work independently.
+Agent work has one authoritative status covering accepted user messages awaiting resolution,
+turns, queued triggers, workers, compaction, and owned detached processes. Runtime retention and UI
+consume that status instead of reconstructing work independently. The transition from accepted
+input to a queued or active turn therefore cannot expose a false quiescent interval.
 
 Resolving a session under the runtime admission lock never waits for that session's retirement, so
 one wedged generation cannot block unrelated sessions. Work arriving behind abnormal retirement
@@ -42,6 +40,16 @@ unsent input. Persistent retirement failure requests controlled ACN replacement;
 never reopened into a partially closed generation.
 
 ## Drafts, creation, and deletion
+
+A non-interactive client chooses a branded session ID before dispatching `CreateSession` and flushes
+that receipt before the RPC can leave the process. Ambiguous transport termination therefore never
+loses the durable recovery key. Its client-specific SDK RPC group decodes every daemon result with
+strict excess-property rejection before generic RPC normalization. A `Worked` root is terminal only
+when the authoritative root timeline contains a complete ordered success or failure record; missing,
+empty, or internally inconsistent `messages.order` remains nonterminal and fails closed if the stream
+ends. An authoritative `Interrupted` root is terminal once that timeline is idle, non-streaming, and
+internally consistent; interruption can precede assistant output, so it does not require fabricated
+success or failure evidence.
 
 A draft stores session intent, not a runtime. Preload and claim phases are outcome-total:
 cancellation removes a preloading record or restores a claim. Claiming linearizes session creation;
@@ -80,7 +88,13 @@ on downstream finalizers. Late output from the old generation
 is rejected while cleanup finishes asynchronously.
 
 The client retains its last display state. Later materialization, shape change, or resync reloads the
-runtime, reattaches the display, and emits a complete snapshot.
+runtime and serializes one atomic shape-plus-snapshot commit per display registration. The accepted
+full state crosses a subscriber admission fence before any live update; stale events from the prior
+shape or runtime generation are rejected. The runtime stream subscribes before sampling cached state
+and fences that handoff with a monotonic per-view sequence: queued updates at or below the sample are
+duplicate replay, while every higher sequence remains observable. A replacement stream subscribes
+before installation but gates snapshot and failure publication until its generation is current, so
+updates produced while the predecessor closes cannot be discarded.
 
 ## Guarantees
 
@@ -90,4 +104,4 @@ runtime, reattaches the display, and emits a complete snapshot.
 - Admission and retirement cannot cross, and old cleanup cannot affect a replacement.
 - Draft cancellation cannot strand preloading or claiming.
 - Deletion accepts no work after its commit point.
-- Display recovery cannot publish late events from a retired generation.
+- Display recovery cannot publish late events from a retired generation or pre-commit shape.

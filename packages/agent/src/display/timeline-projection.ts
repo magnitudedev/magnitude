@@ -11,7 +11,7 @@
  */
 
 import { Signal, Projection } from '@magnitudedev/event-core'
-import { DisplayMessage as ProtocolDisplayMessageSchema } from '@magnitudedev/acn-protocol'
+import { DisplayMessage as ProtocolDisplayMessageSchema, ForkIdSchema } from '@magnitudedev/acn-protocol'
 import type { ToolStepPresentation } from '@magnitudedev/acn-protocol'
 import { Effect, Option } from 'effect'
 import type { AppEvent } from '../events'
@@ -1219,14 +1219,16 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
       let nextParentState: DisplayTimelineState = { ...parentState, messages: index }
 
       if (parentForkId === null && value.reason !== 'interrupt') {
+        const resumeCount = Option.getOrElse(msg.resumeCount, () => 0)
         const finishedMsg: WorkerFinishedMessage = {
-          id: `worker_finished:${value.agentId}:${value.timestamp}`,
+          id: `worker_finished:${value.agentId}:${resumeCount}:${value.timestamp}`,
           type: 'worker_finished',
           workerRole: value.role,
           workerId: value.agentId,
+          forkId: ForkIdSchema.make(forkId),
           cumulativeTotalTimeMs,
           cumulativeTotalToolsUsed: totalToolsUsed(msg.toolCounts),
-          resumed: Option.getOrElse(msg.resumeCount, () => 0) > 0,
+          resumed: resumeCount > 0,
           timestamp: value.timestamp,
         }
         nextParentState = yield* insertMessageIntoFork(messagesHandle, nextParentState, finishedMsg)

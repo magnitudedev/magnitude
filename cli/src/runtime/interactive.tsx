@@ -512,7 +512,7 @@ export const runInteractiveCommand = (
   return result.code
 })
 
-const developmentLaunchCommand = (
+export const developmentLaunchCommand = (
   options: InteractiveLaunchOptions,
 ): Option.Option<Arr.NonEmptyReadonlyArray<string>> => options.developmentBuild
   ? Option.some([

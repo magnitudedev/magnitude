@@ -746,6 +746,10 @@ export interface CodingAgentSession {
     readonly stream: (viewId: string) => Stream.Stream<DisplayViewSnapshot, DisplayViewNotFoundError | DisplayViewRuntimeError>
     readonly snapshot: (viewId: string) => Effect.Effect<DisplayViewSnapshot, DisplayViewNotFoundError | DisplayViewRuntimeError>
     readonly setShape: (viewId: string, shape: DisplayViewShape) => Effect.Effect<void, DisplayViewRuntimeError>
+    readonly setShapeAndSnapshot: (
+      viewId: string,
+      shape: DisplayViewShape,
+    ) => Effect.Effect<DisplayViewSnapshot, DisplayViewRuntimeError>
     readonly close: (viewId: string) => Effect.Effect<void>
   }
   readonly send: (event: AppEvent) => Effect.Effect<void>
@@ -830,11 +834,13 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     const turn = yield* TurnProjection.Tag
     const agents = yield* AgentLifecycleProjection.Tag
     const compaction = yield* CompactionProjection.Tag
+    const userMessages = yield* UserMessageResolutionProjection.Tag
     const execution = yield* ExecutionManager
     return deriveSessionWorkStatus({
       turns: yield* turn.getAllForks(),
       agents: yield* agents.get,
       compactions: yield* compaction.getAllForks(),
+      pendingUserMessageCount: (yield* userMessages.get).rawByMessageId.size,
       detachedProcessCount: yield* execution.detachedProcessCount,
     })
   })
@@ -844,11 +850,13 @@ export function createCodingAgentSession(options: CreateClientOptions) {
       const turn = yield* TurnProjection.Tag
       const agents = yield* AgentLifecycleProjection.Tag
       const compaction = yield* CompactionProjection.Tag
+      const userMessages = yield* UserMessageResolutionProjection.Tag
       const execution = yield* ExecutionManager
       return Stream.mergeAll([
         turn.state.changes.pipe(Stream.map(() => undefined)),
         agents.state.changes.pipe(Stream.map(() => undefined)),
         compaction.state.changes.pipe(Stream.map(() => undefined)),
+        userMessages.state.changes.pipe(Stream.map(() => undefined)),
         execution.detachedProcessChanges.pipe(Stream.map(() => undefined)),
       ], { concurrency: 'unbounded' }).pipe(
         Stream.mapEffect(() => readWorkStatus),
@@ -892,6 +900,11 @@ export function createCodingAgentSession(options: CreateClientOptions) {
       setShape: Surface.command((viewId: string, shape: DisplayViewShape) =>
         Effect.flatMap(DisplayViewRuntime, (runtime) =>
           runtime.setShape(viewId, shape)
+        )
+      ),
+      setShapeAndSnapshot: Surface.command((viewId: string, shape: DisplayViewShape) =>
+        Effect.flatMap(DisplayViewRuntime, (runtime) =>
+          runtime.setShapeAndSnapshot(viewId, shape)
         )
       ),
       close: Surface.command((viewId: string) =>

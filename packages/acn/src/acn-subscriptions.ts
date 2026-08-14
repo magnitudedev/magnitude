@@ -70,13 +70,17 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
     const state = yield* Ref.make(emptyState)
     const semaphore = yield* Effect.makeSemaphore(1)
 
-    const unregister = (clientId: number, requestId: string) =>
+    const unregister = (
+      clientId: number,
+      requestId: string,
+      owner: ActiveSubscription,
+    ) =>
       semaphore.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* Ref.get(state)
           const client = current.active.get(clientId)
           const subscription = client?.get(requestId)
-          if (!subscription) return
+          if (subscription !== owner) return
 
           const nextClient = new Map(client)
           nextClient.delete(requestId)
@@ -106,12 +110,19 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
             Effect.forkIn(scope),
           )
           const client = new Map(current.active.get(registration.clientId) ?? [])
-          client.set(registration.requestId, { ...registration, keepalive })
+          const previous = client.get(registration.requestId)
+          const subscription = { ...registration, keepalive } satisfies ActiveSubscription
+          client.set(registration.requestId, subscription)
           const active = new Map(current.active)
           active.set(registration.clientId, client)
           yield* Ref.set(state, { ...current, active })
+          if (previous) yield* Fiber.interruptFork(previous.keepalive)
           return Option.some({
-            unregister: unregister(registration.clientId, registration.requestId),
+            unregister: unregister(
+              registration.clientId,
+              registration.requestId,
+              subscription,
+            ),
           })
         }),
       ).pipe(

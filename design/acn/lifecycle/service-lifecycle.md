@@ -8,6 +8,8 @@ applies_to:
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
   - packages/acn-protocol/src/schemas/acn-health.ts
+  - packages/sdk/src/testing/acn-process-attestation.ts
+  - cli/src/headless/e2e-harness.ts
 ---
 
 # ACN service lifecycle
@@ -93,6 +95,11 @@ The control router accepts shutdown before application readiness. The process re
 idempotently commits `Stopping` and returns after that transition. Safety against delayed shutdown
 belongs to manager-side owner and exact-process revalidation, not a required endpoint token.
 
+Lifecycle E2E attestation observes the complete canonical owner while that exact process occurrence is
+live. After client teardown and explicit stop, the SDK proves the original process group absent and
+rejects any coordination row that identifies a live successor or surviving successor tree. A PID-only
+poll, direct SQL schema copy, or dead root without descendant-tree proof is not lifecycle evidence.
+
 ## Guarantees
 
 - One lifecycle value governs health, readiness, work admission, idleness, and shutdown.
@@ -104,3 +111,5 @@ belongs to manager-side owner and exact-process revalidation, not a required end
 - Observation cannot retain ACN, and operation duration cannot replace it.
 - The stopping transition is single-flight; cooperative teardown and external exact-process-group escalation
   are independently bounded.
+- E2E shutdown evidence names one exact owner occurrence, proves its complete tree absent, and fails
+  when coordination identifies a live or surviving successor.

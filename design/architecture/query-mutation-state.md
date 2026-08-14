@@ -31,11 +31,11 @@ observer <----query------+--------+
 | --- | --- | --- |
 | State | Information retained over time | Current truth |
 | Owner | Component responsible for state invariants | Valid changes and lifetime |
-| Mutation | Request crossing an ownership boundary | Submission, rejection, acknowledgement |
-| Query | Observation or derivation | Fetching, caching, observational failure |
+| Mutation | Request for owned change or resource acquisition | Submission, rejection, acknowledgement |
+| Query | Passive observation or derivation | Fetching, caching, observational failure |
 
 ```text
-change crosses boundary as mutation
+owned change or acquisition crosses boundary as mutation
 truth crosses boundary as query
 ```
 
@@ -162,7 +162,10 @@ dependency graph, and renderer lifetime are defined by
 
 ## Queries
 
-Queries observe state or compose observations. They never request product change.
+Queries observe state or compose observations. A query itself never requests product change or
+resource-lifecycle change. An operation may explicitly pair a resource-acquisition mutation with a
+subsequent query—for example, materializing display subscription admission—but that admission must
+define mutation identity, concurrency, cancellation, and acknowledgement before observation begins.
 
 ```text
 authoritative state
@@ -418,6 +421,65 @@ component
 - Mutation receipts may await query visibility; they do not create another resource state.
 - Reconnection preserves client state and rereads authoritative ACN state.
 
+### Bounded non-interactive clients
+
+```text
+CLI command -> client-common scoped Effect service -> SDK RPC client -> ACN
+                                                    |
+                                                    +-> accepted display snapshot/stream
+```
+
+- React surfaces use `AgentClient` atoms. A bounded non-interactive command may instead use a
+  scoped client-common Effect service when no React lifetime exists; the CLI surface still does not
+  import ACN, agent, protocol, provider, or inference packages.
+- Initial headless work is part of `CreateSession`, so acknowledgement follows durable session
+  creation and work admission instead of a client-local runtime path.
+- Headless display subscription admission explicitly acquires the requested materialized view before
+  observation begins. ACN installs subscriber cleanup before that resource-acquisition mutation, so
+  transport or admission failure cannot leave a shape-only registration behind; passive interactive
+  reconnects remain non-materializing queries.
+- Output and completion derive from the accepted display snapshot and stream. Stream loss before a
+  terminal root state is an observational failure, not success and not a domain cancellation.
+- Headless output follows authoritative timeline message order. Compact presentation entries must
+  expand when necessary to preserve intervening data-only lifecycle records. A presented tool step
+  or summary is admissible only when its ids, tool key, canonical presentation tool keys, terminal
+  phase, and summary count agree with authoritative tool messages in that timeline. A terminal
+  summary cannot make a referenced canonical tool presentation terminal while that presentation
+  remains streaming or executing. Every presented message id must also occur in authoritative message order, and
+  reconnect deduplication uses that message id rather than replaceable presentation
+  entry identity. Tool commands, failure state, and error text come from the authoritative tool
+  message presentation; summaries derive only safe key, count, and failure facts from their referenced
+  messages. Presentation payloads cannot fabricate output, lifecycle accounting, or usage.
+- Each headless output record occupies one physical line. Untrusted terminal controls are removed,
+  embedded line breaks are escaped, and Unicode line/paragraph separators (U+2028/U+2029) are
+  rendered visibly before stdout or stderr writes. Bidirectional formatting controls are likewise
+  rendered as visible Unicode escapes so they cannot reorder terminal or log-viewer text.
+- Delegated-worker progress and terminal totals reconcile by stable fork identity; independently
+  observed workers remain additive across tail snapshots and resynchronization. Cumulative per-fork
+  totals are monotonic, so stale lower completion records neither reduce usage nor re-emit lifecycle
+  output. An authoritative worker resume starts a new lifecycle occurrence, so its later equal-count
+  completion remains visible even when its millisecond timestamp equals the prior completion; it does
+  not add cumulative tool usage again. Completion message identity includes that resume occurrence,
+  preventing equal-millisecond stints from colliding in addressed storage. Activity from the current
+  resumed generation may advance cumulative usage; activity from an already completed or older
+  generation is contradictory and is rejected before lifecycle, progress, or control accounting.
+- The client rereads session metadata after terminal display state. This verifies query visibility;
+  it does not create a second persistence authority. Real E2E validation requires the exact persisted
+  prompt as both first and last user message and an exact user-message count of one.
+- Real daemon-backed headless verification uses an isolated credential-free environment. Its loopback
+  provider accepts exactly one agent request and one title request with exact role sequences, wrapped
+  prompt/system text, options, and a canonical digest of every complete tool description and parameter
+  schema. It rechecks accepted and rejected request counts only after the daemon process is proven dead,
+  so shutdown traffic cannot produce a false green.
+- The RPC client scope and platform runtime close on success, failure, or signal interruption.
+  Admitted session work remains domain-owned if the observer disconnects. Final stdout and stderr
+  draining, command-fiber interruption, and acquired-platform close are time-bounded so backpressure
+  or stalled cleanup cannot prevent process exit. A signal that wins platform acquisition waits only
+  a bounded grace for late cleanup before returning its exact signal status.
+- Session runtime options, including headless prompting, are fixed at session creation. A headless
+  client must reject resume until the protocol defines a concurrency-safe way to observe or change
+  those options; it must not retrofit them through direct runtime access.
+
 ### Sessions, events, projections, and workers
 
 ```text
@@ -441,7 +503,8 @@ agent accepted shape + projections --> display query --> client
 ```
 
 - Requested shape and accepted display state have different owners.
-- Opening a stream cannot mutate display shape.
+- Passive observation cannot overwrite an existing display shape. An explicitly materializing stream
+  may establish its initial requested shape only as part of atomic subscriber admission.
 - Resync rereads a full accepted snapshot.
 - Display state does not become a second session or agent authority.
 

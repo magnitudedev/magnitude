@@ -129,11 +129,15 @@ export const WorkerResumedMessage = Schema.Struct({
 })
 export type WorkerResumedMessage = Schema.Schema.Type<typeof WorkerResumedMessage>
 
+export const ForkIdSchema = Schema.String.pipe(Schema.brand("ForkId"))
+export type ForkId = Schema.Schema.Type<typeof ForkIdSchema>
+
 export const WorkerFinishedMessage = Schema.Struct({
   id: Schema.String,
   type: Schema.Literal("worker_finished"),
   workerRole: Schema.String,
   workerId: Schema.String,
+  forkId: ForkIdSchema,
   cumulativeTotalTimeMs: Schema.Number,
   cumulativeTotalToolsUsed: Schema.Number,
   resumed: Schema.Boolean,

@@ -66,4 +66,37 @@ describe("AcnSubscriptions", () => {
     expect(controls.controls).toEqual([])
     expect(controls.closed).toBe(true)
   })
+
+  it("keeps replacement ownership when an older same-key handle unregisters", async () => {
+    const program = Effect.gen(function* () {
+      const subscriptions = yield* AcnSubscriptions
+      const first = yield* Ref.make<AcnSubscriptionControl[]>([])
+      const replacement = yield* Ref.make<AcnSubscriptionControl[]>([])
+      const firstHandle = yield* subscriptions.register({
+        clientId: 1,
+        requestId: "duplicate",
+        emit: (control) => Ref.update(first, (all) => [...all, control]),
+        close: Effect.void,
+      })
+      yield* subscriptions.register({
+        clientId: 1,
+        requestId: "duplicate",
+        emit: (control) => Ref.update(replacement, (all) => [...all, control]),
+        close: Effect.void,
+      })
+
+      yield* firstHandle.unregister
+      yield* subscriptions.terminate
+      return {
+        first: yield* Ref.get(first),
+        replacement: yield* Ref.get(replacement),
+      }
+    }).pipe(Effect.provide(AcnSubscriptionsLive))
+    const result = await Effect.runPromise(Effect.scoped(program))
+
+    expect(result.first).toEqual([])
+    expect(result.replacement).toEqual([
+      { _tag: "terminated", reason: "acn-shutdown" },
+    ])
+  })
 })

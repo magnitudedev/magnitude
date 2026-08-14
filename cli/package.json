@@ -15,6 +15,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bunx --bun vitest run src/persistence/json-chat-persistence.test.ts src/persistence/session-utils.test.ts",
     "test:all": "bunx --bun vitest run",
+    "test:headless-e2e": "bun run src/headless/e2e-harness.ts",
     "logs": "bun run --cwd ../evals session logs",
     "logs:tail": "bun run --cwd ../evals session logs --tail",
     "logs:clear": "bun run --cwd ../evals session logs --clear"

@@ -1,512 +1,510 @@
-import ansis from 'ansis'
-
-type ToolEvent = Extract<AppEvent, { type: 'tool_event' }>
-type ToolLifecycle = ToolEvent['event']
-type ToolResult = Extract<ToolLifecycle, { _tag: 'ToolExecutionEnded' }>['result']
-type ToolResultTag = 'Success' | 'Error' | 'Denied' | 'Interrupted' | 'InputRejected'
-type ToolResultLike = { readonly _tag: ToolResultTag; readonly [key: string]: unknown }
-
-type UserPart = { readonly _tag: 'TextPart'; readonly text?: string } | { readonly _tag: string; readonly text?: string }
-type TurnOutcome = { readonly _tag: string; readonly [key: string]: any }
-type ToolLifecycleEvent =
-  | { readonly _tag: 'ToolInputFieldChunk'; readonly field: string; readonly delta: string }
-  | { readonly _tag: 'ToolInputFieldComplete'; readonly field: string; readonly value: unknown }
-  | { readonly _tag: 'ToolExecutionStarted'; readonly input: Record<string, unknown> }
-  | { readonly _tag: 'ToolExecutionEnded'; readonly result: ToolResultLike }
-
-export type AppEvent =
-  | { readonly type: 'user_message'; readonly content: readonly UserPart[]; readonly synthetic: boolean; readonly taskMode: boolean }
-  | { readonly type: 'message_start'; readonly forkId: string | null; readonly turnId: string; readonly id: string; readonly destination: { readonly kind: string } }
-  | { readonly type: 'message_chunk'; readonly forkId: string | null; readonly turnId: string; readonly id: string; readonly text: string }
-  | { readonly type: 'message_end'; readonly forkId: string | null; readonly turnId: string; readonly id: string }
-  | { readonly type: 'agent_created'; readonly forkId: string; readonly agentId: string; readonly role: string; readonly name: string }
-  | { readonly type: 'agent_killed'; readonly forkId: string; readonly reason: string }
-  | { readonly type: 'worker_user_killed'; readonly forkId: string }
-  | { readonly type: 'worker_idle_closed'; readonly forkId: string }
-  | { readonly type: 'tool_event'; readonly forkId: string | null; readonly toolCallId: string; readonly toolKey: string; readonly event: ToolLifecycleEvent }
-  | { readonly type: 'turn_outcome'; readonly forkId: string | null; readonly outcome: TurnOutcome }
-  | { readonly type: 'interrupt'; readonly forkId: string | null }
+import { stripVTControlCharacters } from "node:util"
+import { Option } from "effect"
+import {
+  forkIdToKey,
+  type DisplayMessage,
+  type DisplayTimelineEntry,
+  type DisplayViewSnapshot,
+  type ToolStepPresentation,
+} from "@magnitudedev/sdk"
 
 export interface HeadlessOutput {
   readonly lines: readonly string[]
   readonly toolCount: number
 }
 
-interface AgentInfo {
-  readonly forkId: string
-  readonly agentId: string
-  readonly role: string
-  readonly name: string
-}
-
-interface BufferedMessage {
-  readonly forkId: string | null
-  readonly turnId: string
-  readonly destination: Extract<AppEvent, { type: 'message_start' }>['destination']
-  text: string
-}
-
-interface ToolRecord {
-  readonly toolCallId: string
-  readonly forkId: string | null
-  readonly toolKey: string
-  readonly input: Record<string, unknown>
-  result?: ToolResult
-}
-
-const hiddenTools = new Set([
-  'createTask',
-  'updateTask',
-  'killWorker',
-  'reassignWorker',
-  'messageWorker',
-  'messageAdvisor',
-  'finishGoal',
-  'compact',
+const terminalToolPhases: ReadonlySet<ToolStepPresentation["phase"]> = new Set([
+  "completed",
+  "error",
+  "rejected",
+  "interrupted",
 ])
+const dataOnlyMessageTypes: ReadonlySet<DisplayMessage["type"]> = new Set([
+  "fork_activity",
+  "fork_result",
+  "worker_resumed",
+  "worker_finished",
+  "worker_killed",
+  "worker_user_killed",
+])
+const unsafeTerminalControlCharacters = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g
+const unsafeUnicodeDisplayControlCharacters = /[\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g
+const defaultIgnorableUnicodeCharacters = /[\u00ad\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200d\u2060-\u2065\u206a-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\u{1bca0}-\u{1bcaf}\u{1d173}-\u{1d17a}\ufff0-\ufff8\u{e0000}-\u{e0fff}]/gu
+const cliOwnedRecordPrefix = /^(?:> |\$ |↳ |▶ |· |✓ |✗ |⚠ |■ |▸ |→ |✎ |\/ Search |◫ |⌕ |↓ |◇ |↶ |◉ |Connection issue: retrying|Session: |Error:)/
 
-const ok = ansis.hex('#1f9670').bold
-const err = ansis.hex('#f87171').bold
-const dim = ansis.hex('#94a3b8')
+export function sanitizeHeadlessText(value: string): string {
+  return stripVTControlCharacters(value.replace(/\r\n?/g, "\n"))
+    .replace(/\t/g, " ")
+    .replace(/\n/g, "\\n")
+    .replace(defaultIgnorableUnicodeCharacters, "")
+    .replace(
+      unsafeUnicodeDisplayControlCharacters,
+      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    )
+    .replace(unsafeTerminalControlCharacters, "")
+}
 
+/**
+ * Renders only authoritative, materialized display state. Message IDs and tool
+ * message IDs make reconnect/resync snapshots idempotent; streaming assistant
+ * messages and running tools remain pending until their terminal projection is
+ * visible.
+ */
 export function createHeadlessOutputRenderer() {
-  const agentsByFork = new Map<string, AgentInfo>()
-  const agentsById = new Map<string, AgentInfo>()
-  const announcedAgents = new Set<string>()
-  const messages = new Map<string, BufferedMessage>()
-  const tools = new Map<string, ToolRecord>()
-  const completedTools = new Set<string>()
-  let toolCount = 0
+  const emittedPresentationMessageIds = new Set<string>()
+  const emittedDataMessageIds = new Set<string>()
+  const seenToolMessageIds = new Set<string>()
+  const countedToolMessageIds = new Set<string>()
+  const countedWorkerControlMessageIds = new Set<string>()
+  const workerToolProgress = new Map<string, number>()
+  const completedWorkerToolCounts = new Map<string, number>()
+  const workerCompletionTimestamps = new Map<string, number>()
+  const workerResumeGenerations = new Map<string, number>()
+  const workerCompletionResumeGenerations = new Map<string, number>()
 
-  function handleEvent(event: AppEvent): HeadlessOutput {
-    const lines: string[] = []
+  const observeWorkerCompletion = (
+    message: Extract<DisplayMessage, { readonly type: "worker_finished" }>,
+  ): boolean => {
+    const previousCompletionTools = completedWorkerToolCounts.get(message.forkId)
+    const previousTools = Math.max(
+      workerToolProgress.get(message.forkId) ?? 0,
+      previousCompletionTools ?? 0,
+    )
+    const previousTimestamp = workerCompletionTimestamps.get(message.forkId)
+    const resumeGeneration = workerResumeGenerations.get(message.workerId) ?? 0
+    const previousResumeGeneration = workerCompletionResumeGenerations.get(message.forkId)
+    if (message.cumulativeTotalToolsUsed < previousTools) return false
+    if (previousCompletionTools !== undefined) {
+      if (
+        message.cumulativeTotalToolsUsed === previousCompletionTools
+        && previousTimestamp !== undefined
+        && message.timestamp <= previousTimestamp
+        && resumeGeneration === previousResumeGeneration
+      ) return false
+    }
+    completedWorkerToolCounts.set(message.forkId, message.cumulativeTotalToolsUsed)
+    workerCompletionResumeGenerations.set(message.forkId, resumeGeneration)
+    workerCompletionTimestamps.set(
+      message.forkId,
+      Math.max(previousTimestamp ?? message.timestamp, message.timestamp),
+    )
+    return true
+  }
 
-    switch (event.type) {
-      case 'user_message': {
-        const text = textFromParts(event.content)
-        if (text.trim()) {
-          lines.push(event.synthetic ? `> [autopilot] ${text}` : renderUserMessage(text, event.taskMode))
-        }
-        break
-      }
+  const totalToolCount = (): number => {
+    const workerForkIds = new Set([
+      ...workerToolProgress.keys(),
+      ...completedWorkerToolCounts.keys(),
+    ])
+    const delegatedWorkerTools = [...workerForkIds].reduce((total, forkId) =>
+      total + Math.max(
+        workerToolProgress.get(forkId) ?? 0,
+        completedWorkerToolCounts.get(forkId) ?? 0,
+      ), 0)
+    return countedToolMessageIds.size
+      + countedWorkerControlMessageIds.size
+      + delegatedWorkerTools
+  }
 
-      case 'message_start': {
-        if (event.destination.kind !== 'user') break
-        messages.set(event.id, {
-          forkId: event.forkId,
-          turnId: event.turnId,
-          destination: event.destination,
-          text: '',
-        })
-        break
-      }
-
-      case 'message_chunk': {
-        const msg = messages.get(event.id)
-        if (!msg || msg.turnId !== event.turnId || msg.forkId !== event.forkId) break
-        msg.text += event.text
-        break
-      }
-
-      case 'message_end': {
-        const msg = messages.get(event.id)
-        if (!msg || msg.turnId !== event.turnId || msg.forkId !== event.forkId) break
-        messages.delete(event.id)
-
-        // Headless is a coherent log, not a live stream. Only completed root
-        // user-facing messages are emitted as prose; worker messages are covered
-        // by worker/tool progress lines.
-        if (msg.forkId === null) {
-          const text = msg.text.trim()
-          if (text) lines.push(text)
-        }
-        break
-      }
-
-      case 'agent_created': {
-        const agent: AgentInfo = {
-          forkId: event.forkId,
-          agentId: event.agentId,
-          role: event.role,
-          name: event.name,
-        }
-        agentsByFork.set(event.forkId, agent)
-        agentsById.set(event.agentId, agent)
-        if (!announcedAgents.has(event.agentId)) {
-          announcedAgents.add(event.agentId)
-          lines.push(renderAgentStart(agent))
-        }
-        break
-      }
-
-      case 'agent_killed': {
-        const agent = agentForFork(event.forkId, agentsByFork)
-        lines.push(`■ ${agentLabel(agent, event.forkId)} killed · ${event.reason}`)
-        break
-      }
-
-      case 'worker_user_killed': {
-        const agent = agentForFork(event.forkId, agentsByFork)
-        lines.push(`■ ${agentLabel(agent, event.forkId)} stopped by user`)
-        break
-      }
-
-      case 'worker_idle_closed': {
-        const agent = agentForFork(event.forkId, agentsByFork)
-        lines.push(`✓ ${agentLabel(agent, event.forkId)} closed`)
-        break
-      }
-
-      case 'tool_event': {
-        const output = handleToolEvent(event, tools, completedTools, agentsByFork, agentsById, announcedAgents)
-        if (output) {
-          toolCount++
-          lines.push(output)
-        }
-        break
-      }
-
-      case 'turn_outcome': {
-        if (event.forkId !== null) {
-          const agent = agentForFork(event.forkId, agentsByFork)
-          if (!outcomeWillContinue(event.outcome)) {
-            lines.push(renderWorkerOutcome(agent, event.outcome, event.forkId))
-          }
-        } else {
-          const line = renderRootOutcome(event.outcome)
-          if (line) lines.push(line)
-        }
-        break
-      }
-
-      case 'interrupt':
-        lines.push(dim(event.forkId === null ? '■ Interrupted' : '■ Worker interrupted'))
-        break
+  const handleSnapshot = (snapshot: DisplayViewSnapshot): HeadlessOutput => {
+    const timeline = rootTimeline(snapshot)
+    const messages = timeline?.messages.byId ?? {}
+    const messageOrder = timeline?.messages.order ?? []
+    const messagePositions = new Map(messageOrder.map((messageId, position) => [messageId, position]))
+    const pendingLines: Array<{
+      readonly position: number
+      readonly timestamp: number
+      readonly order: number
+      readonly line: string
+    }> = []
+    const emit = (messageId: string, timestamp: number, line: string): void => {
+      pendingLines.push({
+        position: messagePositions.get(messageId) ?? messageOrder.length,
+        timestamp,
+        order: pendingLines.length,
+        line: sanitizeHeadlessText(line),
+      })
+    }
+    const isAuthoritativeTool = (messageId: string, toolKey: string): boolean => {
+      const message = messages[messageId]
+      return messagePositions.has(messageId)
+        && message?.type === "tool"
+        && message.toolKey === toolKey
+    }
+    const authoritativeToolFailed = (messageId: string): boolean => {
+      const message = messages[messageId]
+      return message?.type === "tool"
+        && Option.isSome(message.presentation)
+        && message.presentation.value.failed
     }
 
-    return { lines, toolCount }
+    for (const messageId of messageOrder) {
+      const message = messages[messageId]
+      if (!message || message.id !== messageId || !dataOnlyMessageTypes.has(message.type)) continue
+
+      const firstObservation = !emittedDataMessageIds.has(messageId)
+      let toolProgress: { readonly delta: number; readonly total: number } | null = null
+      let staleForkActivity = false
+      if (message.type === "fork_activity") {
+        const total = totalForkTools(message.toolCounts)
+        const activityGeneration = Option.getOrElse(message.resumeCount, () => 0)
+        const completedGeneration = workerCompletionResumeGenerations.get(message.forkId)
+        staleForkActivity = completedGeneration !== undefined
+          && activityGeneration <= completedGeneration
+        const previous = Math.max(
+          workerToolProgress.get(message.forkId) ?? 0,
+          completedWorkerToolCounts.get(message.forkId) ?? 0,
+        )
+        const resumedInitialActivity = firstObservation && !isInitialForkActivity(message)
+        if (resumedInitialActivity) {
+          workerToolProgress.set(message.forkId, Math.max(previous, total))
+        } else if (!staleForkActivity && total > previous) {
+          workerToolProgress.set(message.forkId, total)
+          toolProgress = { delta: total - previous, total }
+        }
+      }
+
+      if (firstObservation) {
+        emittedDataMessageIds.add(messageId)
+        if (message.type === "worker_resumed") {
+          workerResumeGenerations.set(
+            message.workerId,
+            (workerResumeGenerations.get(message.workerId) ?? 0) + 1,
+          )
+        }
+        if (
+          (message.type === "fork_activity" && isInitialForkActivity(message) && !staleForkActivity)
+          || message.type === "worker_resumed"
+          || message.type === "worker_killed"
+        ) {
+          countedWorkerControlMessageIds.add(message.id)
+        }
+        const shouldRender = !staleForkActivity
+          && (message.type !== "worker_finished" || observeWorkerCompletion(message))
+        const line = shouldRender ? renderDisplayMessage(message) : null
+        if (line) emit(message.id, message.timestamp, line)
+      }
+
+      if (message.type === "fork_activity" && toolProgress !== null) {
+        emit(
+          message.id,
+          message.timestamp,
+          `· [${message.forkId}] +${toolProgress.delta} worker ${toolProgress.delta === 1 ? "tool" : "tools"} · ${toolProgress.total} total`,
+        )
+      }
+    }
+
+    for (const entry of rootEntries(snapshot)) {
+      switch (entry.kind) {
+        case "message": {
+          const message = messages[entry.messageId]
+          if (!message || message.id !== entry.messageId || !messagePositions.has(entry.messageId)) continue
+          if (emittedPresentationMessageIds.has(entry.messageId)) continue
+          if (dataOnlyMessageTypes.has(message.type) && emittedDataMessageIds.has(entry.messageId)) continue
+          if (entry.streaming) continue
+          emittedPresentationMessageIds.add(entry.messageId)
+          const shouldRender = message.type !== "worker_finished" || observeWorkerCompletion(message)
+          const line = shouldRender ? renderDisplayMessage(message) : null
+          if (line) emit(entry.messageId, entry.timestamp, line)
+          break
+        }
+        case "tool_step": {
+          if (!terminalToolPhases.has(entry.step.phase)) continue
+          const message = messages[entry.messageId]
+          if (!isAuthoritativeTool(entry.messageId, entry.step.toolKey) || message?.type !== "tool") continue
+          if (seenToolMessageIds.has(entry.messageId)) continue
+          const canonicalStep = Option.getOrNull(message.presentation)
+          if (
+            canonicalStep === null
+            || canonicalStep.toolKey !== message.toolKey
+            || !terminalToolPhases.has(canonicalStep.phase)
+          ) continue
+          seenToolMessageIds.add(entry.messageId)
+          countedToolMessageIds.add(entry.messageId)
+          emit(
+            entry.messageId,
+            message.timestamp,
+            canonicalStep
+              ? renderToolStep(canonicalStep)
+              : renderToolCount(message.toolKey, 1, false),
+          )
+          break
+        }
+        case "tool_summary": {
+          if (!terminalToolPhases.has(entry.summary.phase)) continue
+          if (
+            entry.messageIds.length === 0
+            || new Set(entry.messageIds).size !== entry.messageIds.length
+            || entry.summary.count !== entry.messageIds.length
+            || !entry.messageIds.every((messageId) =>
+              isAuthoritativeTool(messageId, entry.summary.toolKey)
+            )
+          ) continue
+          const canonicalPresentations = entry.messageIds.flatMap((messageId) => {
+            const message = messages[messageId]
+            return message?.type === "tool" && Option.isSome(message.presentation)
+              ? [message.presentation.value]
+              : []
+          })
+          const canonicalSummaryPhase = canonicalPresentations.some((presentation) =>
+            presentation.phase !== "completed"
+          ) ? "error" : "completed"
+          if (
+            canonicalPresentations.some((presentation) =>
+              presentation.toolKey !== entry.summary.toolKey
+              || !terminalToolPhases.has(presentation.phase)
+            )
+            || entry.summary.phase !== canonicalSummaryPhase
+          ) continue
+          const spansOtherMessages = messageIdsSpanOtherMessages(entry.messageIds, messagePositions)
+          const newMessageIds = entry.messageIds.filter((messageId) =>
+            !seenToolMessageIds.has(messageId)
+          )
+          if (newMessageIds.length === 0) continue
+          for (const messageId of newMessageIds) {
+            seenToolMessageIds.add(messageId)
+            countedToolMessageIds.add(messageId)
+          }
+
+          if (newMessageIds.length === entry.messageIds.length && !spansOtherMessages) {
+            const failed = entry.messageIds.some((messageId) => {
+              const message = messages[messageId]
+              return message?.type === "tool"
+                && Option.isSome(message.presentation)
+                && message.presentation.value.failed
+            })
+            emit(
+              newMessageIds[0] ?? entry.id,
+              entry.timestamp,
+              renderToolCount(entry.summary.toolKey, newMessageIds.length, failed),
+            )
+            break
+          }
+
+          const newSteps = newMessageIds.flatMap((messageId) => {
+            const message = messages[messageId]
+            if (message?.type !== "tool" || Option.isNone(message.presentation)) return []
+            return terminalToolPhases.has(message.presentation.value.phase)
+              ? [{ messageId, step: message.presentation.value }]
+              : []
+          })
+          if (newSteps.length === newMessageIds.length) {
+            for (const { messageId, step } of newSteps) {
+              emit(messageId, entry.timestamp, renderToolStep(step))
+            }
+          } else if (spansOtherMessages) {
+            for (const messageId of newMessageIds) {
+              emit(
+                messageId,
+                entry.timestamp,
+                renderToolCount(
+                  entry.summary.toolKey,
+                  1,
+                  authoritativeToolFailed(messageId),
+                  true,
+                ),
+              )
+            }
+          } else {
+            emit(
+              newMessageIds[0] ?? entry.id,
+              entry.timestamp,
+              renderToolCount(
+                entry.summary.toolKey,
+                newMessageIds.length,
+                newMessageIds.some(authoritativeToolFailed),
+                true,
+              ),
+            )
+          }
+          break
+        }
+      }
+    }
+
+    const lines = pendingLines
+      .sort((a, b) => a.position - b.position || a.timestamp - b.timestamp || a.order - b.order)
+      .map(({ line }) => line)
+    return { lines, toolCount: totalToolCount() }
   }
 
-  function getToolCount() {
-    return toolCount
+  return {
+    handleSnapshot,
+    getToolCount: totalToolCount,
   }
-
-  return { handleEvent, getToolCount }
 }
 
 export function renderUsageSummary(elapsedMs: number, totalTools: number, success: boolean): string {
-  const label = success ? 'Finished' : 'Failed'
-  const icon = success ? '✓' : '✗'
-  const color = success ? ok : err
-  return color(`${icon} ${label} · ${formatDuration(Math.floor(elapsedMs / 1000))} · ${totalTools} ${totalTools === 1 ? 'tool' : 'tools'}`)
+  const label = success ? "Finished" : "Failed"
+  const icon = success ? "✓" : "✗"
+  return `${icon} ${label} · ${formatDuration(Math.floor(elapsedMs / 1000))} · ${totalTools} ${
+    totalTools === 1 ? "tool" : "tools"
+  }`
+}
+
+export function renderInterruptedSummary(elapsedMs: number, totalTools: number): string {
+  return `■ Interrupted · ${formatDuration(Math.floor(elapsedMs / 1000))} · ${totalTools} ${
+    totalTools === 1 ? "tool" : "tools"
+  }`
 }
 
 export function renderErrorMessage(message: string): string {
-  return err(`✗ ${message}`)
+  return `✗ ${message}`
 }
 
 export function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return s > 0 ? `${m}m ${s}s` : `${m}m`
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = seconds % 60
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`
 }
 
-function handleToolEvent(
-  event: ToolEvent,
-  tools: Map<string, ToolRecord>,
-  completedTools: Set<string>,
-  agentsByFork: Map<string, AgentInfo>,
-  agentsById: Map<string, AgentInfo>,
-  announcedAgents: Set<string>,
-): string | null {
-  const inner = event.event
-  const key = event.toolCallId
-  let record = tools.get(key)
-
-  if (!record) {
-    record = {
-      toolCallId: key,
-      forkId: event.forkId,
-      toolKey: event.toolKey,
-      input: {},
-    }
-    tools.set(key, record)
-  }
-
-  if (inner._tag === 'ToolInputFieldChunk') {
-    const current = typeof record.input[inner.field] === 'string' ? String(record.input[inner.field]) : ''
-    record.input[inner.field] = current + inner.delta
-    return null
-  }
-
-  if (inner._tag === 'ToolInputFieldComplete') {
-    record.input[inner.field] = inner.value
-    return null
-  }
-
-  if (inner._tag === 'ToolExecutionStarted') {
-    Object.assign(record.input, inner.input)
-    return null
-  }
-
-  if (inner._tag !== 'ToolExecutionEnded') return null
-  if (completedTools.has(key)) return null
-  completedTools.add(key)
-  record.result = inner.result
-
-  if (hiddenTools.has(event.toolKey)) return null
-
-  if (event.toolKey === 'spawnWorker') {
-    const agentId = stringValue(record.input.agentId) ?? stringValue(outputObject(inner.result)?.agentId)
-    if (agentId && announcedAgents.has(agentId)) return null
-  }
-
-  const line = renderTool(record)
-
-  if (event.toolKey === 'spawnWorker') {
-    const agentId = stringValue(record.input.agentId) ?? stringValue(outputObject(inner.result)?.agentId)
-    if (agentId) {
-      announcedAgents.add(agentId)
-      const role = stringValue(record.input.role)
-      const title = stringValue(outputObject(inner.result)?.title) ?? stringValue(record.input.taskId) ?? stringValue(record.input.message)
-      agentsById.set(agentId, {
-        forkId: agentId,
-        agentId,
-        role: role ?? 'agent',
-        name: String(title ?? agentId),
-      })
-    }
-  }
-
-  return prefixed(record.forkId, line, agentsByFork)
+function rootEntries(snapshot: DisplayViewSnapshot): readonly DisplayTimelineEntry[] {
+  return rootTimeline(snapshot)?.presentation.entries ?? []
 }
 
-function renderTool(record: ToolRecord): string {
-  const { toolKey, input, result } = record
-  const status = resultTag(result)
-  const output = successOutput(result)
+function rootTimeline(snapshot: DisplayViewSnapshot) {
+  return snapshot.state.timelines[forkIdToKey(null)]
+}
 
-  if (status === 'Error') return `✗ ${toolKey} · ${toolErrorMessage(result)}`
-  if (status === 'Denied') return `■ ${toolKey} denied · ${stringify(toolField(result, 'denial'))}`
-  if (status === 'Interrupted') return `■ ${toolKey} interrupted`
-  if (status === 'InputRejected') return `✗ ${toolKey} rejected · ${toolIssueMessage(result)}`
+function messageIdsSpanOtherMessages(
+  messageIds: readonly string[],
+  messagePositions: ReadonlyMap<string, number>,
+): boolean {
+  const positions = messageIds.flatMap((messageId) => {
+    const position = messagePositions.get(messageId)
+    return position === undefined ? [] : [position]
+  })
+  if (positions.length < 2) return false
+  positions.sort((a, b) => a - b)
+  return positions.some((position, index) => index > 0 && position > positions[index - 1]! + 1)
+}
 
-  switch (toolKey) {
-    case 'fileRead': {
-      const path = stringValue(input.path)
-      const content = typeof output === 'string' ? output : ''
-      const lines = content ? content.split('\n').length : null
-      return `→ Read ${path ?? '(unknown)'}${lines != null ? ` · ${lines} ${lines === 1 ? 'line' : 'lines'}` : ''}`
+function totalForkTools(
+  counts: Extract<DisplayMessage, { readonly type: "fork_activity" }>["toolCounts"],
+): number {
+  return Object.values(counts).reduce((total, count) => total + count, 0)
+}
+
+function renderDisplayMessage(message: DisplayMessage): string | null {
+  switch (message.type) {
+    case "user_message":
+      return message.taskMode ? `▸ Task: ${message.content}` : `> ${message.content}`
+    case "queued_user_message":
+      return `> [queued] ${message.content}`
+    case "assistant_message": {
+      const text = sanitizeHeadlessText(message.content.trim())
+      if (text.length === 0) return null
+      return cliOwnedRecordPrefix.test(text) ? `assistant: ${text}` : text
     }
-    case 'fileWrite': {
-      const path = stringValue(input.path)
-      const content = stringValue(input.content)
-      const lines = content ? content.split('\n').length : null
-      return `→ Write ${path ?? '(unknown)'}${lines != null ? ` · ${lines} ${lines === 1 ? 'line' : 'lines'}` : ''}`
-    }
-    case 'fileEdit': {
-      const path = stringValue(input.path)
-      const detailText = stringValue(output)
-      const detail = detailText ? ` · ${detailText}` : ''
-      return `✎ Edit ${path ?? '(unknown)'}${detail}`
-    }
-    case 'fileSearch': {
-      const pattern = stringValue(input.pattern) ?? ''
-      const path = stringValue(input.path)
-      const glob = stringValue(input.glob)
-      const matches = Array.isArray(output) ? output : []
-      const files = new Set(matches
-        .map((match) => objectValue(match)?.file)
-        .filter((file): file is string => typeof file === 'string' && file.length > 0)).size
-      const scope = [path, glob].filter(Boolean).join(' ')
-      return `/ Search "${pattern}"${scope ? ` in ${scope}` : ''} · ${matches.length} ${matches.length === 1 ? 'match' : 'matches'} in ${files} ${files === 1 ? 'file' : 'files'}`
-    }
-    case 'fileTree': {
-      const path = stringValue(input.path) ?? '.'
-      const entries = Array.isArray(output) ? output : []
-      const files = entries.filter((entry) => objectValue(entry)?.type === 'file').length
-      const dirs = entries.filter((entry) => objectValue(entry)?.type === 'dir').length
-      return `◫ List ${path} · ${files} ${files === 1 ? 'file' : 'files'}${dirs ? `, ${dirs} ${dirs === 1 ? 'dir' : 'dirs'}` : ''}`
-    }
-    case 'shell': {
-      const command = stringValue(input.command) ?? '(unknown command)'
-      const output = outputObject(result)
-      const exitCode = typeof output?.exitCode === 'number' ? output.exitCode : null
-      return `$ ${command}${exitCode != null ? ` · exit ${exitCode}` : ''}`
-    }
-    case 'webSearch': {
-      const query = stringValue(input.query) ?? ''
-      const output = outputObject(result)
-      const sources = Array.isArray(output?.sources) ? output.sources.length : 0
-      return `⌕ Search web for "${query}"${sources ? ` · ${sources} ${sources === 1 ? 'source' : 'sources'}` : ''}`
-    }
-    case 'webFetch': {
-      return `↓ Fetch ${stringValue(input.url) ?? '(unknown url)'}`
-    }
-    case 'spawnWorker': {
-      const agentId = outputObject(result)?.agentId ?? stringValue(input.agentId) ?? 'worker'
-      const title = outputObject(result)?.title ?? stringValue(input.taskId) ?? ''
-      return `▶ Start worker ${agentId}${title ? ` · ${title}` : ''}`
-    }
-    case 'skill': {
-      return `▸ Activate skill ${stringValue(input.name) ?? '(unknown)'}`
-    }
-    default:
-      return `· ${toolKey}`
+    case "user_bash_command":
+      return `$ ${message.command} · exit ${message.exitCode}`
+    case "thinking":
+    case "tool":
+    case "work_summary":
+    case "agent_communication":
+      return null
+    case "status_indicator":
+      return message.message
+    case "goal_status":
+      return message.status === "started"
+        ? `▸ Goal: ${Option.getOrElse(message.objective, () => "started")}`
+        : `✓ Goal finished${Option.match(message.evidence, {
+            onNone: () => "",
+            onSome: (evidence) => ` · ${evidence}`,
+          })}`
+    case "worker_resumed":
+      return `▶ [${message.workerId}] (${message.workerRole}) resumed · ${message.title}`
+    case "worker_finished":
+      return `✓ [${message.workerId}] (${message.workerRole}) done · ${message.cumulativeTotalToolsUsed} ${
+        message.cumulativeTotalToolsUsed === 1 ? "tool" : "tools"
+      }`
+    case "worker_killed":
+      return `■ [${message.workerId}] (${message.workerRole}) killed · ${message.title}`
+    case "worker_user_killed":
+      return `■ [${message.workerId}] (${message.workerRole}) stopped by user`
+    case "interrupted":
+      return message.context === "root" ? "■ Interrupted" : "■ Worker interrupted"
+    case "error":
+      return renderErrorMessage(message.message)
+    case "fork_result":
+      return `✓ Worker result · ${message.task}`
+    case "fork_activity":
+      return message.status === "running" && isInitialForkActivity(message)
+        ? `▶ [${message.forkId}] (${message.role}) started · ${message.name}`
+        : null
   }
 }
 
-function renderRootOutcome(outcome: Extract<AppEvent, { type: 'turn_outcome' }>['outcome']): string | null {
-  if (outcome._tag === 'Completed') return null
-  return `✗ ${formatOutcome(outcome)}`
+function isInitialForkActivity(
+  message: Extract<DisplayMessage, { readonly type: "fork_activity" }>,
+): boolean {
+  return Option.getOrElse(message.resumeCount, () => 0) === 0
 }
 
-function renderWorkerOutcome(
-  agent: AgentInfo | null,
-  outcome: Extract<AppEvent, { type: 'turn_outcome' }>['outcome'],
-  forkId: string,
+function renderToolStep(step: ToolStepPresentation): string {
+  if (step.icon === "tool") {
+    const rendered = step.label
+    return step.failed
+      ? `✗ ${rendered}${step.errorText ? ` · ${step.errorText}` : ""}`
+      : `· ${rendered}`
+  }
+
+  const rendered = (() => {
+    switch (step.toolKey) {
+      case "shell":
+        return `$ ${step.command}${step.exitCode === null ? "" : ` · exit ${step.exitCode}`}`
+      case "fileRead":
+        return `→ Read ${step.path ?? "(unknown)"}${
+          step.lineCount === null ? "" : ` · ${step.lineCount} ${step.lineCount === 1 ? "line" : "lines"}`
+        }`
+      case "fileWrite":
+        return `→ Write ${step.displayPath ?? step.path ?? "(unknown)"} · ${step.lineCount} ${
+          step.lineCount === 1 ? "line" : "lines"
+        }`
+      case "fileEdit":
+        return `✎ Edit ${step.displayPath ?? step.path ?? "(unknown)"} · +${step.addedCount} -${step.removedCount}`
+      case "fileSearch":
+        return `/ Search "${step.pattern ?? ""}" · ${step.matchCount} ${
+          step.matchCount === 1 ? "match" : "matches"
+        } in ${step.fileCount} ${step.fileCount === 1 ? "file" : "files"}`
+      case "fileTree":
+        return `◫ List ${step.path} · ${step.fileCount} ${step.fileCount === 1 ? "file" : "files"}, ${
+          step.dirCount
+        } ${step.dirCount === 1 ? "dir" : "dirs"}`
+      case "fileView":
+        return `→ View ${step.path ?? "(unknown)"}`
+      case "webSearch":
+        return `⌕ Search web for "${step.query ?? ""}" · ${step.sourceCount} ${
+          step.sourceCount === 1 ? "source" : "sources"
+        }`
+      case "webFetch":
+        return `↓ Fetch ${step.url ?? "(unknown url)"}`
+      case "skill":
+        return `▸ Activate skill ${step.skillName ?? "(unknown)"}`
+      case "checkpointChanges":
+      case "checkpointRollback":
+        return `${step.isRollback ? "↶ Roll back" : "◇ Checkpoint"} · ${step.fileCount} ${
+          step.fileCount === 1 ? "file" : "files"
+        }`
+      case "spawnWorker":
+        return `▶ Start worker ${step.agentId ?? "worker"}${step.title ? ` · ${step.title}` : ""}`
+      case "queryImage":
+        return `◉ Inspect image ${step.path ?? "(unknown)"}`
+    }
+  })()
+
+  if (!step.failed) return rendered
+  const errorText = "errorText" in step ? step.errorText : null
+  return `✗ ${rendered}${errorText ? ` · ${errorText}` : ""}`
+}
+
+function renderToolCount(
+  toolKey: string,
+  count: number,
+  failed: boolean,
+  delta = false,
 ): string {
-  const label = agentLabel(agent, forkId)
-  if (outcome._tag === 'Completed') {
-    const count = outcome.completion.toolCallsCount
-    return `✓ ${label} done · ${count} ${count === 1 ? 'tool' : 'tools'}`
-  }
-  if (outcome._tag === 'Cancelled') return `■ ${label} cancelled`
-  return `✗ ${label} failed · ${formatOutcome(outcome)}`
-}
-
-function renderAgentStart(agent: AgentInfo): string {
-  return `▶ ${agentLabel(agent, agent.forkId)} started · ${agent.name}`
-}
-
-function renderUserMessage(content: string, taskMode: boolean): string {
-  return taskMode ? `▸ Task: ${content}` : `> ${content}`
-}
-
-function textFromParts(parts: readonly { readonly _tag: string; readonly text?: string }[]): string {
-  return parts
-    .filter((part) => part._tag === 'TextPart')
-    .map((part) => part.text ?? '')
-    .join('')
-}
-
-function agentForFork(forkId: string, agentsByFork: Map<string, AgentInfo>): AgentInfo | null {
-  return agentsByFork.get(forkId) ?? null
-}
-
-function agentLabel(agent: AgentInfo | null, fallback: string): string {
-  if (!agent) return `[${fallback}] (agent)`
-  return `[${agent.agentId}] (${agent.role})`
-}
-
-function prefixed(forkId: string | null, line: string, agentsByFork: Map<string, AgentInfo>): string {
-  if (forkId === null) return line
-  const agent = agentForFork(forkId, agentsByFork)
-  return agent ? `  ${agentLabel(agent, forkId)} ${line}` : `  ${line}`
-}
-
-function outputObject(result: ToolResult | undefined): Record<string, unknown> | null {
-  const output = successOutput(result)
-  return typeof output === 'object' && output !== null && !Array.isArray(output)
-    ? output as Record<string, unknown>
-    : null
-}
-
-function successOutput(result: ToolResult | undefined): unknown {
-  const like = toolResult(result)
-  return like?._tag === 'Success' ? like.output : undefined
-}
-
-function resultTag(result: ToolResult | undefined): ToolResultTag {
-  return toolResult(result)?._tag ?? 'Success'
-}
-
-function toolResult(result: ToolResult | undefined): ToolResultLike | null {
-  return result && typeof result === 'object' && '_tag' in result
-    ? result as ToolResultLike
-    : null
-}
-
-function toolField(result: ToolResult | undefined, field: string): unknown {
-  return toolResult(result)?.[field]
-}
-
-function toolErrorMessage(result: ToolResult | undefined): string {
-  const errorValue = toolField(result, 'error')
-  if (errorValue instanceof Error) return errorValue.message
-  const object = objectValue(errorValue)
-  return stringValue(object?.message) ?? stringify(errorValue ?? 'error')
-}
-
-function toolIssueMessage(result: ToolResult | undefined): string {
-  const issue = objectValue(toolField(result, 'issue'))
-  return stringValue(issue?.message) ?? 'invalid input'
-}
-
-function objectValue(value: unknown): Record<string, unknown> | null {
-  return typeof value === 'object' && value !== null
-    ? value as Record<string, unknown>
-    : null
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-function stringify(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (value instanceof Error) return value.message
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-
-function formatOutcome(outcome: Extract<AppEvent, { type: 'turn_outcome' }>['outcome']): string {
-  switch (outcome._tag) {
-    case 'ProviderNotReady':
-      return `provider not ready (${outcome.detail._tag})`
-    case 'ConnectionFailure':
-      return `connection failure (${outcome.detail._tag})`
-    case 'UnexpectedError':
-      return outcome.detail.message
-    case 'SafetyStop':
-      return outcome.reason._tag === 'Other' ? outcome.reason.message : `safety stop (${outcome.reason._tag})`
-    case 'ContextWindowExceeded':
-      return 'context window exceeded'
-    case 'OutputTruncated':
-      return 'output truncated'
-    case 'ParseFailure':
-      return `tool input parse failure: ${outcome.error.issue.message}`
-    case 'ToolInputValidationFailure':
-      return `tool input validation failed: ${outcome.issue.message}`
-    case 'ToolExecutionError':
-      return `tool execution failed: ${outcome.error.message}`
-    case 'GateRejected':
-      return `tool rejected: ${outcome.toolName}`
-    case 'Overthinking':
-      return `thinking exceeded ${outcome.limit} characters`
-    case 'Cancelled':
-      return `cancelled (${outcome.reason._tag})`
-    case 'Completed':
-      return 'completed'
-    default:
-      return `unknown outcome (${outcome._tag})`
-  }
-}
-
-function outcomeWillContinue(outcome: Extract<AppEvent, { type: 'turn_outcome' }>['outcome']): boolean {
-  if (outcome._tag === 'Completed' && outcome.completion.yieldTarget !== null) return false
-  return (
-    (outcome._tag === 'Completed' && outcome.completion.toolCallsCount > 0)
-    || outcome._tag === 'ParseFailure'
-    || outcome._tag === 'ToolInputValidationFailure'
-    || outcome._tag === 'ToolExecutionError'
-    || outcome._tag === 'GateRejected'
-    || outcome._tag === 'ConnectionFailure'
-    || outcome._tag === 'ContextWindowExceeded'
-    || outcome._tag === 'Overthinking'
-  )
+  const rendered = `${toolKey} × ${delta ? "+" : ""}${count}`
+  return failed ? `✗ ${rendered}` : `· ${rendered}`
 }

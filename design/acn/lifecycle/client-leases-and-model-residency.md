@@ -14,9 +14,9 @@ applies_to:
 
 # Client leases and local-model residency
 
-One interactive client lifetime owns one `ClientId` and one renewable `ClientLease`. Client
-presence is an explicit liveness system; RPC activity, subscriptions, inference, and UI state are
-not substitutes for it.
+One client runtime, whether interactive or bounded non-interactive, owns one `ClientId` and one
+renewable `ClientLease`. Client presence is an explicit liveness system; RPC activity,
+subscriptions, inference, and UI state are not substitutes for it.
 
 ## Client lifetime
 
@@ -30,6 +30,23 @@ share the runtime's endpoint-selection and recovery authority. A graceful close 
 explicitly and returns the connected count after removal. Abrupt close relies on expiry.
 Graceful release addresses only the exact ACN already selected by the runtime. Closing and scope
 finalization never use the recovering protocol to ensure or launch an ACN.
+
+A bounded headless CLI command owns the same runtime lifecycle. It validates arguments before
+creating the runtime and installs signal ownership before platform construction. A signal can win a
+stalled construction without waiting indefinitely. It waits only a short bounded grace for a late
+platform and closes one that arrives in that interval; a still-later platform has a bounded
+best-effort close owner. Daemon startup does not begin until normal construction completes. The
+command waits for authoritative `Ready`, scopes its application RPC client, and closes the platform
+under a fixed deadline after terminal display state, typed failure, or signal interruption. A
+stalled command fiber or close cannot retain the process, and signal exit status remains
+authoritative. Closing the observer does not cancel admitted session work: work remains ACN-owned
+and its session remains durable. Its display subscription requests one scoped materialization during
+admission, after ACN has installed subscriber cleanup;
+passive interactive subscriptions do not. Headless output does not keep a lease or display
+subscription alive after command exit. The CLI entrypoint records the returned status as the process
+exit code and defers any forced exit for one fixed, unreferenced grace interval. This preserves the
+opportunity for a just-resolved late platform's owned bounded shutdown continuation to run without
+allowing leaked runtime handles to retain the process indefinitely.
 
 The ACN accepts a renewal for 35 seconds. This tolerates one missed 15-second heartbeat plus
 scheduling and transport jitter, but not two full missed heartbeat intervals. Renewal is idempotent
@@ -86,6 +103,8 @@ count or deadline.
   the runtime's endpoint-selection and recovery authority.
 - Graceful close stops renewal and uses a non-recovering protocol bound to the selected exact ACN;
   abrupt scope finalization closes the runtime, stops renewal, and relies on lease expiry.
+- Bounded non-interactive clients close their RPC scope before closing their platform runtime, and
+  never treat an observer disconnect as domain-operation cancellation.
 - Heartbeat and release RPCs are lifecycle-neutral and do not count as work demand.
 - Lease expiry uses monotonic time and exact renewal generations.
 - First/final transitions alone change ICN residency policy.

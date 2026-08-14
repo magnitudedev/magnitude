@@ -251,6 +251,7 @@ const makeHarness = (options: {
       config: {
         getContextLimitPolicy: () => Effect.succeed(resolveContextLimitPolicy({
           providers: Option.none(),
+          checkForUpdateOnStartup: Option.none(),
         })),
       },
     } as unknown as MagnitudeStorageShape),

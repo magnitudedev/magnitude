@@ -1,12 +1,20 @@
 import type { Command } from "@commander-js/extra-typings"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect } from "effect"
+import { Effect, Exit, Option, Scope } from "effect"
 import type { AuthSource } from "../state/cli-atoms"
 import {
+  developmentLaunchCommand,
   runInteractiveCommand,
   type InteractiveLaunchOptions,
 } from "../runtime/interactive"
+import { runHeadless } from "./headless"
+import { makeTerminalPlatform } from "../platform/terminal"
+import { makeCliEffectLoggingLayer } from "../platform/effect-logger"
+import {
+  flushProcessOutput,
+  scheduleBoundedProcessExit,
+} from "../utils/flush-process-output"
 import { isDevelopmentBuild } from "../runtime/environment"
 
 const resolveEnvAuth = (): AuthSource => {
@@ -14,6 +22,30 @@ const resolveEnvAuth = (): AuthSource => {
   return envKey && envKey.trim()
     ? { source: "env", key: envKey, envVarName: "MAGNITUDE_API_KEY" }
     : { source: "none" }
+}
+
+const createHeadlessPlatform = (options: InteractiveLaunchOptions) => async () => {
+  const scope = await Effect.runPromise(Scope.make())
+  try {
+    const terminal = await Effect.runPromise(makeTerminalPlatform({
+      launchCommand: developmentLaunchCommand(options),
+      debug: options.debug,
+      effectLoggingLayer: Option.some(makeCliEffectLoggingLayer({ debug: options.debug })),
+    }).pipe(Scope.extend(scope)))
+    return {
+      ...terminal.platform,
+      async shutdown() {
+        try {
+          return await terminal.platform.shutdown()
+        } finally {
+          await Effect.runPromise(Scope.close(scope, Exit.void))
+        }
+      },
+    }
+  } catch (error) {
+    await Effect.runPromise(Scope.close(scope, Exit.void))
+    throw error
+  }
 }
 
 export const registerInteractiveCommand = (program: Command): void => {
@@ -43,13 +75,6 @@ export const registerInteractiveCommand = (program: Command): void => {
     )
     .option("--setup", "Rerun Local Models and Cloud Fallback setup")
     .action((opts) => {
-      if (opts.headless) {
-        process.stderr.write(
-          "Error: --headless is temporarily disabled. Use the TUI mode.\n",
-        )
-        process.exit(1)
-      }
-
       const options: InteractiveLaunchOptions = {
         debug: opts.debug === true,
         setup: opts.setup ?? false,
@@ -70,6 +95,30 @@ export const registerInteractiveCommand = (program: Command): void => {
           headless: false,
           systemPromptOverride: opts.systemOverride,
         },
+      }
+
+      if (opts.headless) {
+        return Effect.runPromise(runHeadless({
+          debug: options.debug,
+          autopilot: opts.autopilot ?? false,
+          ...(opts.prompt === undefined ? {} : { initialPrompt: opts.prompt }),
+          sessionStart: options.sessionStart,
+          disableShellSafeguards: options.sessionOptions.disableShellSafeguards ?? false,
+          disableCwdSafeguards: options.sessionOptions.disableCwdSafeguards ?? false,
+          ...(opts.atif === undefined ? {} : { atifPath: opts.atif }),
+          ...(opts.goal === undefined ? {} : { goal: opts.goal }),
+          solo: opts.solo ?? false,
+          ...(opts.systemOverride === undefined ? {} : { systemOverride: opts.systemOverride }),
+          setup: opts.setup ?? false,
+        }, {
+          createPlatform: createHeadlessPlatform(options),
+          onTerminationSignal: (exitCode) => {
+            Effect.runSync(scheduleBoundedProcessExit(exitCode))
+          },
+        })).then(async (exitCode) => {
+          await Effect.runPromise(flushProcessOutput())
+          Effect.runSync(scheduleBoundedProcessExit(exitCode))
+        })
       }
 
       return Effect.runPromise(runInteractiveCommand(options).pipe(

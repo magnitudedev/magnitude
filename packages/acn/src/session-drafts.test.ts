@@ -27,6 +27,7 @@ const unusedSession = {
     stream: () => Stream.never,
     snapshot: () => Effect.die("unused"),
     setShape: () => Effect.die("unused"),
+    setShapeAndSnapshot: () => Effect.die("unused"),
     close: () => Effect.void,
   },
   send: () => Effect.die("unused"),

@@ -72,6 +72,12 @@ const rootSmallShape: DisplayViewShape = {
   },
 }
 
+const rootLargeShape: DisplayViewShape = {
+  timelines: {
+    root: { kind: 'tail', limit: 50, live: true, presentation: 'default' },
+  },
+}
+
 const provideRuntime = (storeLayer: Layer.Layer<Addressed.AddressedEntryStore>) =>
   Layer.provideMerge(
     DisplayViewRuntimeLive,
@@ -158,6 +164,113 @@ describe('display view runtime', () => {
     expect(listMessages((snapshots[1] as any).state.timelines.root.messages)).toMatchObject([
       { type: 'assistant_message', content: 'updated' },
     ])
+  })
+
+  it('publishes replacement-generation updates after shape installation', async () => {
+    const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
+
+    const snapshot = await Effect.runPromise(Effect.gen(function* () {
+      const engine = (yield* EventEngine.Service) as EventEngine.Shape<AppEvent, unknown>
+      const runtime = yield* DisplayViewRuntime
+
+      yield* runtime.setShape('view-replacement', rootSmallShape)
+      yield* runtime.setShape('view-replacement', rootLargeShape)
+      yield* engine.send({ type: 'turn_started', forkId: null, turnId: 'turn-replacement', chainId: 'chain-replacement' })
+      yield* engine.send({ type: 'message_start', forkId: null, turnId: 'turn-replacement', id: 'msg-replacement', destination: { kind: 'user' } })
+      yield* engine.send({ type: 'message_chunk', forkId: null, turnId: 'turn-replacement', id: 'msg-replacement', text: 'replacement-fence' })
+      yield* engine.send({ type: 'message_end', forkId: null, turnId: 'turn-replacement', id: 'msg-replacement' })
+
+      while (true) {
+        const current = yield* runtime.snapshot('view-replacement')
+        if (listMessages(current.state.timelines.root.messages).some(
+          (message: any) => message.content === 'replacement-fence',
+        )) return current
+        yield* Effect.yieldNow()
+      }
+    }).pipe(
+      Effect.timeoutFail({
+        duration: Duration.millis(500),
+        onTimeout: () => 'replacement generation lost its update',
+      }),
+      Effect.scoped,
+      Effect.provide(provideRuntime(Layer.succeed(Addressed.AddressedEntryStore, fixture.store))),
+      Effect.orDie,
+    ))
+
+    expect(listMessages(snapshot.state.timelines.root.messages)).toMatchObject([
+      { type: 'assistant_message', content: 'replacement-fence' },
+    ])
+  })
+
+  it('does not lose an update between the initial snapshot and subscription', async () => {
+    const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
+
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const engine = (yield* EventEngine.Service) as EventEngine.Shape<AppEvent, unknown>
+      const runtime = yield* DisplayViewRuntime
+      const hasUpdatedMessage = (snapshot: any): boolean =>
+        listMessages(snapshot.state.timelines.root.messages).some(
+          (message: any) => message.content === 'subscription-fence',
+        )
+
+      yield* runtime.setShape('view-subscription-fence', rootSmallShape)
+      let triggered = false
+      return yield* runtime.stream('view-subscription-fence').pipe(
+        Stream.mapEffect((snapshot) => {
+          if (triggered) return Effect.succeed(snapshot)
+          triggered = true
+          return Effect.gen(function* () {
+            yield* engine.send({
+              type: 'turn_started',
+              forkId: null,
+              turnId: 'turn-fence',
+              chainId: 'chain-fence',
+            })
+            yield* engine.send({
+              type: 'message_start',
+              forkId: null,
+              turnId: 'turn-fence',
+              id: 'msg-fence',
+              destination: { kind: 'user' },
+            })
+            yield* engine.send({
+              type: 'message_chunk',
+              forkId: null,
+              turnId: 'turn-fence',
+              id: 'msg-fence',
+              text: 'subscription-fence',
+            })
+            yield* engine.send({
+              type: 'message_end',
+              forkId: null,
+              turnId: 'turn-fence',
+              id: 'msg-fence',
+            })
+            while (!hasUpdatedMessage(yield* runtime.snapshot('view-subscription-fence'))) {
+              yield* Effect.yieldNow()
+            }
+            return snapshot
+          })
+        }),
+        Stream.filter(hasUpdatedMessage),
+        Stream.runHead,
+        Effect.timeoutFail({
+          duration: Duration.millis(500),
+          onTimeout: () => 'display view stream lost the subscription-fence update',
+        }),
+      )
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(provideRuntime(Layer.succeed(Addressed.AddressedEntryStore, fixture.store))),
+      Effect.orDie,
+    ))
+
+    expect(result._tag).toBe('Some')
+    if (result._tag === 'Some') {
+      expect(listMessages(result.value.state.timelines.root.messages)).toMatchObject([
+        { type: 'assistant_message', content: 'subscription-fence' },
+      ])
+    }
   })
 
   it('streams transient model request activity without persisting an app event', async () => {

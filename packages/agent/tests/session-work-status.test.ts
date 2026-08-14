@@ -56,12 +56,14 @@ const status = (overrides: {
   turn?: ForkTurnState
   compaction?: CompactionIdle | Compacting | PendingInjection
   workingAgent?: boolean
+  pendingUserMessages?: number
   detached?: number
 }) =>
   deriveSessionWorkStatus({
     turns: new Map([[null, overrides.turn ?? idleTurn()]]),
     agents: agents(overrides.workingAgent ?? false),
     compactions: new Map([[null, overrides.compaction ?? idleCompaction()]]),
+    pendingUserMessageCount: overrides.pendingUserMessages ?? 0,
     detachedProcessCount: overrides.detached ?? 0,
   })
 
@@ -119,6 +121,7 @@ describe('deriveSessionWorkStatus', () => {
         }),
       })._tag
     ).toBe('Working')
+    expect(status({ pendingUserMessages: 1 })._tag).toBe('Working')
     expect(status({ detached: 1 })._tag).toBe('Working')
   })
 })

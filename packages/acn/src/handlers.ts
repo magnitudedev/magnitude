@@ -579,13 +579,13 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         ),
 
       // Streams
-      StreamDisplayView: ({ sessionId, viewId, shape }) =>
+      StreamDisplayView: ({ sessionId, viewId, shape, materialize }) =>
         observeRpcStreamDefects(
           "StreamDisplayView",
           observeDisplayViewStream(
             sessionId,
             viewId,
-            displayStreams.getDisplayViewStream(sessionId, viewId, shape)
+            displayStreams.getDisplayViewStream(sessionId, viewId, shape, materialize)
           )
         ),
 

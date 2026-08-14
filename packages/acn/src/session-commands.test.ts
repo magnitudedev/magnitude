@@ -62,6 +62,7 @@ const makeSession = (send: CodingAgentSession["send"]): CodingAgentSession => ({
     stream: () => Stream.die("unused test session displayView.stream"),
     snapshot: () => Effect.die("unused test session displayView.snapshot"),
     setShape: () => Effect.die("unused test session displayView.setShape"),
+    setShapeAndSnapshot: () => Effect.die("unused test session displayView.setShapeAndSnapshot"),
     close: () => Effect.void,
   },
   send,

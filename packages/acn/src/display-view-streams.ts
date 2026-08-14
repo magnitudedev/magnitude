@@ -1,6 +1,7 @@
-import { Context, Deferred, Effect, Fiber, Layer, Option, PubSub, Ref, Scope, Stream } from "effect"
+import { Context, Data, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import {
   DisplayViewNotOpen,
+  sameDisplayViewShape,
   SessionOperationFailed,
   type DisplayViewShape,
   type DisplayViewStateEvent,
@@ -17,6 +18,7 @@ export interface DisplayViewStreamsApi {
     sessionId: string,
     viewId: string,
     shape: DisplayViewShape,
+    materialize?: boolean,
   ) => Stream.Stream<StreamEvent, SessionError>
   readonly requestDisplayViewSnapshot: (
     sessionId: string,
@@ -34,26 +36,51 @@ export class DisplayViewStreams extends Context.Tag("DisplayViewStreams")<
   DisplayViewStreamsApi
 >() {}
 
+interface SequencedEvent<Event extends StreamEvent = StreamEvent> {
+  readonly sequence: number
+  readonly event: Event
+}
+
+type RegistrationEmission =
+  | { readonly _tag: "event"; readonly item: SequencedEvent }
+  | { readonly _tag: "failure"; readonly error: SessionError }
+
 interface Attachment {
   readonly token: string
   readonly generation: number
+  readonly shapeRevision: number
   readonly fiber: Fiber.RuntimeFiber<void, unknown>
-  readonly latest: Ref.Ref<DisplayViewStateEvent>
+  readonly latest: Ref.Ref<SequencedEvent<DisplayViewStateEvent>>
+  readonly ended: Ref.Ref<boolean>
 }
 
 interface RegistrationState {
   readonly shape: DisplayViewShape
+  readonly shapeRevision: number
   readonly attachment: Attachment | null
   readonly subscribers: number
+  readonly closing: Deferred.Deferred<void> | null
+}
+
+interface ShapeIntent {
+  readonly revision: number
+  readonly previousShape: DisplayViewShape
+  readonly previousRevision: number
 }
 
 interface Registration {
   readonly sessionId: string
   readonly viewId: string
-  readonly events: PubSub.PubSub<StreamEvent>
+  readonly events: PubSub.PubSub<RegistrationEmission>
+  readonly nextSequence: Ref.Ref<number>
   readonly state: Ref.Ref<RegistrationState>
   readonly serialize: Effect.Semaphore
+  readonly shapeAdmissions: Effect.Semaphore
 }
+
+class RegistrationRetry extends Data.TaggedError("RegistrationRetry")<{
+  readonly wait: Effect.Effect<void>
+}> {}
 
 const operationFailed =
   (sessionId: string, viewId: string, operation: string) =>
@@ -89,23 +116,48 @@ export const DisplayViewStreamsLive: Layer.Layer<
 
       const makeRegistration = (sessionId: string, viewId: string, shape: DisplayViewShape) =>
         Effect.gen(function* () {
-          const events = yield* PubSub.unbounded<StreamEvent>()
+          const events = yield* PubSub.unbounded<RegistrationEmission>()
+          const nextSequence = yield* Ref.make(0)
           const state = yield* Ref.make<RegistrationState>({
             shape,
+            shapeRevision: 0,
             attachment: null,
             subscribers: 0,
+            closing: null,
           })
           const serialize = yield* Effect.makeSemaphore(1)
-          return { sessionId, viewId, events, state, serialize } satisfies Registration
+          const shapeAdmissions = yield* Effect.makeSemaphore(1)
+          return {
+            sessionId,
+            viewId,
+            events,
+            nextSequence,
+            state,
+            serialize,
+            shapeAdmissions,
+          } satisfies Registration
         })
+
+      const publishEvent = <Event extends StreamEvent>(registration: Registration, event: Event) =>
+        Effect.gen(function* () {
+          const sequence = yield* Ref.getAndUpdate(registration.nextSequence, (value) => value + 1)
+          const sequenced = { sequence, event } satisfies SequencedEvent<Event>
+          yield* PubSub.publish(registration.events, { _tag: "event", item: sequenced })
+          return sequenced
+        })
+
+      const emissionEffect = (emission: RegistrationEmission) =>
+        emission._tag === "event"
+          ? Effect.succeed(emission.item.event)
+          : Effect.fail(emission.error)
 
       const getOrCreate = (sessionId: string, viewId: string, shape: DisplayViewShape) =>
         Effect.gen(function* () {
           const key = keyFor(sessionId, viewId)
           const current = (yield* Ref.get(registrations)).get(key)
-          // A stream subscription is observation. In particular, reconnecting
-          // an old stream must not mutate the materialized shape. Shape changes
-          // are admitted only by setDisplayViewShape below.
+          // A passive reconnect must not mutate an existing materialized shape.
+          // A new stream registration owns its initial requested shape; explicit
+          // materialization is handled only after subscriber cleanup is installed.
           if (current) return current
           const candidate = yield* makeRegistration(sessionId, viewId, shape)
           return yield* Ref.modify(registrations, (all) => {
@@ -114,6 +166,38 @@ export const DisplayViewStreamsLive: Layer.Layer<
             return [candidate, new Map(all).set(key, candidate)] as const
           })
         })
+
+      const setShapeIntentUnlocked = (
+        registration: Registration,
+        shape: DisplayViewShape,
+      ): Effect.Effect<ShapeIntent> =>
+        Ref.modify(registration.state, (state) => {
+          const intent = {
+            revision: state.shapeRevision + 1,
+            previousShape: state.shape,
+            previousRevision: state.shapeRevision,
+          } satisfies ShapeIntent
+          return [intent, { ...state, shape, shapeRevision: intent.revision }] as const
+        })
+
+      const rollbackShapeIntent = (registration: Registration, intent: ShapeIntent) =>
+        registration.serialize.withPermits(1)(
+          Effect.gen(function* () {
+            const key = keyFor(registration.sessionId, registration.viewId)
+            if ((yield* Ref.get(registrations)).get(key) !== registration) return
+            yield* Ref.update(registration.state, (state) => {
+              if (
+                state.shapeRevision !== intent.revision
+                || state.attachment?.shapeRevision === intent.revision
+              ) return state
+              return {
+                ...state,
+                shape: intent.previousShape,
+                shapeRevision: intent.previousRevision,
+              }
+            })
+          }),
+        )
 
       const detachUnlocked = (registration: Registration, generation?: number) =>
         Ref.modify(registration.state, (state) => {
@@ -140,57 +224,120 @@ export const DisplayViewStreamsLive: Layer.Layer<
       const detach = (registration: Registration, generation?: number) =>
         registration.serialize.withPermits(1)(detachUnlocked(registration, generation))
 
+      const removeIfUnused = (registration: Registration) =>
+        Effect.gen(function* () {
+          const completion = yield* registration.serialize.withPermits(1)(
+            Effect.gen(function* () {
+              const key = keyFor(registration.sessionId, registration.viewId)
+              const state = yield* Ref.get(registration.state)
+              const exact = (yield* Ref.get(registrations)).get(key)
+              if (
+                exact !== registration
+                || state.subscribers !== 0
+                || state.closing !== null
+              ) return null
+              const completion = yield* Deferred.make<void>()
+              yield* Ref.update(registration.state, (state) => ({
+                ...state,
+                closing: completion,
+              }))
+              yield* detachUnlocked(registration).pipe(Effect.catchAllCause(() => Effect.void))
+              return completion
+            }),
+          )
+          if (completion === null) return false
+
+          const finalize = registration.serialize.withPermits(1)(
+            Effect.gen(function* () {
+              const key = keyFor(registration.sessionId, registration.viewId)
+              yield* Ref.update(registrations, (current) => {
+                if (current.get(key) !== registration) return current
+                const next = new Map(current)
+                next.delete(key)
+                return next
+              })
+              yield* Deferred.succeed(completion, undefined)
+            }),
+          )
+
+          yield* runtime
+            .tryWithBusyResident(
+              registration.sessionId,
+              `display-close:${registration.viewId}`,
+              ({ session }) => session.displayView.close(registration.viewId),
+            )
+            .pipe(
+              Effect.catchAllCause(() => Effect.void),
+              Effect.ensuring(finalize),
+            )
+          return true
+        })
+
+      const releaseSubscriber = (registration: Registration) =>
+        registration.serialize.withPermits(1)(
+          Ref.update(registration.state, (state) => ({
+            ...state,
+            subscribers: Math.max(0, state.subscribers - 1),
+          })),
+        ).pipe(Effect.zipRight(removeIfUnused(registration)))
+
       const attachUnlocked = (
         registration: Registration,
         entry: RuntimeEntry,
         generation: number,
         refresh = false,
-      ): Effect.Effect<DisplayViewStateEvent, SessionError> =>
-        Effect.gen(function* () {
+      ): Effect.Effect<SequencedEvent<DisplayViewStateEvent>, SessionError> =>
+        Effect.uninterruptible(Effect.gen(function* () {
             const current = yield* Ref.get(registration.state)
             if (current.attachment?.generation === generation) {
               if (!refresh) return yield* Ref.get(current.attachment.latest)
-              yield* entry.session.displayView
-                .setShape(registration.viewId, current.shape)
-                .pipe(
-                  Effect.mapError(
-                    operationFailed(registration.sessionId, registration.viewId, "setShape"),
-                  ),
-                )
+              const attachment = current.attachment
               const snapshot = yield* entry.session.displayView
-                .snapshot(registration.viewId)
+                .setShapeAndSnapshot(registration.viewId, current.shape)
                 .pipe(
                   Effect.mapError(
-                    operationFailed(registration.sessionId, registration.viewId, "snapshot"),
+                    operationFailed(registration.sessionId, registration.viewId, "setShapeAndSnapshot"),
                   ),
                 )
-              const event = toStateEvent(snapshot)
-              yield* Ref.set(current.attachment.latest, event)
-              yield* PubSub.publish(registration.events, event)
-              return event
+              if (!(yield* Ref.get(attachment.ended))) {
+                const event = toStateEvent(snapshot)
+                yield* Ref.update(registration.state, (state) =>
+                  state.attachment?.token === attachment.token
+                    ? {
+                        ...state,
+                        attachment: { ...state.attachment, shapeRevision: current.shapeRevision },
+                      }
+                    : state,
+                )
+                const sequenced = yield* publishEvent(registration, event)
+                yield* Ref.set(attachment.latest, sequenced)
+                return sequenced
+              }
+              yield* Ref.update(registration.state, (state) =>
+                state.attachment?.token === attachment.token
+                  ? { ...state, attachment: null }
+                  : state,
+              )
             }
 
             if (current.attachment) {
-              yield* Fiber.interrupt(current.attachment.fiber)
+              yield* Fiber.interruptFork(current.attachment.fiber)
             }
-            yield* entry.session.displayView
-              .setShape(registration.viewId, current.shape)
-              .pipe(
-                Effect.mapError(
-                  operationFailed(registration.sessionId, registration.viewId, "setShape"),
-                ),
-              )
             const snapshot = yield* entry.session.displayView
-              .snapshot(registration.viewId)
+              .setShapeAndSnapshot(registration.viewId, current.shape)
               .pipe(
                 Effect.mapError(
-                  operationFailed(registration.sessionId, registration.viewId, "snapshot"),
+                  operationFailed(registration.sessionId, registration.viewId, "setShapeAndSnapshot"),
                 ),
               )
             const initial = toStateEvent(snapshot)
-            const latest = yield* Ref.make(initial)
+            const latest = yield* Ref.make<SequencedEvent<DisplayViewStateEvent>>({
+              sequence: -1,
+              event: initial,
+            })
             const ready = yield* Deferred.make<void>()
             const token = crypto.randomUUID()
+            const ended = yield* Ref.make(false)
 
             const display = entry.session.displayView
               .stream(registration.viewId)
@@ -215,32 +362,61 @@ export const DisplayViewStreamsLive: Layer.Layer<
                   Effect.zipRight(
                     registration.serialize.withPermits(1)(
                       Effect.gen(function* () {
-                        const observed = (yield* Ref.get(registration.state)).attachment
+                        const state = yield* Ref.get(registration.state)
+                        const observed = state.attachment
                         if (observed?.token !== token) return
-                        if (event._tag === "state") yield* Ref.set(latest, event)
-                        yield* PubSub.publish(registration.events, event)
+                        // A runtime stream may already have produced the old shape
+                        // while a new admission was being materialized. Never let
+                        // that stale state cross the committed shape fence.
+                        if (event._tag === "state" && !sameDisplayViewShape(event.shape, state.shape)) return
+                        if (event._tag === "state") {
+                          const sequenced = yield* publishEvent(registration, event)
+                          yield* Ref.set(latest, sequenced)
+                        } else {
+                          yield* publishEvent(registration, event)
+                        }
                       }),
                     ),
                   ),
                 ),
               ),
+              Effect.catchAll((error) =>
+                Deferred.await(ready).pipe(
+                  Effect.zipRight(PubSub.publish(registration.events, { _tag: "failure", error })),
+                  Effect.zipRight(Effect.fail(error)),
+                ),
+              ),
               Effect.ensuring(
-                Ref.update(registration.state, (state) =>
-                  state.attachment?.token === token
-                    ? { ...state, attachment: null }
-                    : state,
+                Ref.set(ended, true).pipe(
+                  Effect.zipRight(
+                    registration.serialize.withPermits(1)(
+                      Ref.update(registration.state, (state) =>
+                        state.attachment?.token === token
+                          ? { ...state, attachment: null }
+                          : state,
+                      ),
+                    ),
+                  ),
                 ),
               ),
             )
-            const fiber = yield* Effect.forkIn(forward, layerScope)
+            const fiber = yield* Effect.forkIn(Effect.interruptible(forward), layerScope)
             yield* Ref.set(registration.state, {
               ...current,
-              attachment: { token, generation, fiber, latest },
+              attachment: {
+                token,
+                generation,
+                shapeRevision: current.shapeRevision,
+                fiber,
+                latest,
+                ended,
+              },
             })
+            const sequenced = yield* publishEvent(registration, initial)
+            yield* Ref.set(latest, sequenced)
             yield* Deferred.succeed(ready, undefined)
-            yield* PubSub.publish(registration.events, initial)
-            return initial
-        })
+            return sequenced
+        }))
 
       const attach = (
         registration: Registration,
@@ -253,18 +429,47 @@ export const DisplayViewStreamsLive: Layer.Layer<
         )
 
       const attachIfBusy = (registration: Registration) =>
-        runtime
-          .tryWithBusyResident(
+        Effect.gen(function* () {
+          const eligible = yield* registration.serialize.withPermits(1)(
+            Effect.gen(function* () {
+              const exact = (yield* Ref.get(registrations)).get(
+                keyFor(registration.sessionId, registration.viewId),
+              )
+              const state = yield* Ref.get(registration.state)
+              return exact === registration
+                && state.subscribers > 0
+                && state.attachment === null
+                && state.closing === null
+            }),
+          )
+          if (!eligible) return
+          yield* runtime.tryWithBusyResident(
             registration.sessionId,
             `display-attach:${registration.viewId}`,
-            (entry, generation) => attach(registration, entry, generation),
+            (entry, generation) =>
+              registration.serialize.withPermits(1)(
+                Effect.gen(function* () {
+                  const exact = (yield* Ref.get(registrations)).get(
+                    keyFor(registration.sessionId, registration.viewId),
+                  )
+                  const state = yield* Ref.get(registration.state)
+                  if (
+                    exact !== registration
+                    || state.subscribers === 0
+                    || state.attachment !== null
+                    || state.closing !== null
+                  ) return Option.none<SequencedEvent<DisplayViewStateEvent>>()
+                  return Option.some(
+                    yield* attachUnlocked(registration, entry, generation),
+                  )
+                }),
+              ),
           )
-          .pipe(Effect.asVoid)
+        })
 
       const attachBusyRegistrations = Effect.gen(function* () {
         for (const registration of (yield* Ref.get(registrations)).values()) {
-          const state = yield* Ref.get(registration.state)
-          if (state.attachment === null) yield* attachIfBusy(registration)
+          yield* attachIfBusy(registration)
         }
       })
 
@@ -290,73 +495,11 @@ export const DisplayViewStreamsLive: Layer.Layer<
         Effect.forkScoped,
       )
 
-      const getDisplayViewStream = (
-        sessionId: string,
-        viewId: string,
-        shape: DisplayViewShape,
-      ): Stream.Stream<StreamEvent, SessionError> =>
-        Stream.unwrapScoped(
-          Effect.gen(function* () {
-            const registration = yield* getOrCreate(sessionId, viewId, shape)
-            const queue = yield* PubSub.subscribe(registration.events)
-            const admission = yield* registration.serialize.withPermits(1)(
-              Effect.gen(function* () {
-                const exact = (yield* Ref.get(registrations)).get(keyFor(sessionId, viewId))
-                if (exact !== registration) return { admitted: false as const }
-                const state = yield* Ref.get(registration.state)
-                yield* Ref.update(registration.state, (state) => ({
-                  ...state,
-                  subscribers: state.subscribers + 1,
-                }))
-                return {
-                  admitted: true as const,
-                  initial: state.attachment
-                    ? Option.some(yield* Ref.get(state.attachment.latest))
-                    : Option.none<DisplayViewStateEvent>(),
-                }
-              }),
-            )
-            if (!admission.admitted) return getDisplayViewStream(sessionId, viewId, shape)
-            yield* attachIfBusy(registration)
-            yield* Effect.addFinalizer(() =>
-              Effect.gen(function* () {
-                const shouldRemove = yield* registration.serialize.withPermits(1)(
-                  Effect.gen(function* () {
-                    const state = yield* Ref.get(registration.state)
-                    const subscribers = Math.max(0, state.subscribers - 1)
-                    yield* Ref.set(registration.state, { ...state, subscribers })
-                    if (subscribers !== 0) return false
-                    if ((yield* Ref.get(registrations)).get(keyFor(sessionId, viewId)) !== registration) {
-                      return false
-                    }
-                    yield* runtime.tryWithBusyResident(
-                      sessionId,
-                      `display-close:${viewId}`,
-                      (entry) => entry.session.displayView.close(viewId),
-                    )
-                    yield* detachUnlocked(registration)
-                    yield* Ref.update(registrations, (all) => {
-                      if (all.get(keyFor(sessionId, viewId)) !== registration) return all
-                      const next = new Map(all)
-                      next.delete(keyFor(sessionId, viewId))
-                      return next
-                    })
-                    return true
-                  }),
-                )
-                if (!shouldRemove) return
-              }).pipe(Effect.catchAll(() => Effect.void)),
-            )
-            const initial = Option.toArray(admission.initial)
-            return Stream.concat(Stream.fromIterable(initial), Stream.fromQueue(queue))
-          }),
-        )
-
       const materialize = (
         sessionId: string,
         viewId: string,
         shape?: DisplayViewShape,
-      ): Effect.Effect<DisplayViewStateEvent, SessionError> =>
+      ): Effect.Effect<SequencedEvent<DisplayViewStateEvent>, SessionError> =>
         Effect.suspend(() =>
           Effect.gen(function* () {
             const key = keyFor(sessionId, viewId)
@@ -365,31 +508,151 @@ export const DisplayViewStreamsLive: Layer.Layer<
               return yield* new DisplayViewNotOpen({ sessionId, viewId })
             }
             const registration = existing ?? (yield* getOrCreate(sessionId, viewId, shape!))
-            const result = yield* registration.serialize.withPermits(1)(
+            const outcome = yield* registration.shapeAdmissions.withPermits(1)(
               Effect.gen(function* () {
-                // The final subscriber may have removed this registration
-                // while materialization waited for its lock.
-                if ((yield* Ref.get(registrations)).get(key) !== registration) {
-                  return Option.none<DisplayViewStateEvent>()
-                }
-                if (shape) {
-                  yield* Ref.update(registration.state, (state) => ({ ...state, shape }))
-                }
-                return Option.some(
-                  yield* runtime.withSession(
-                    sessionId,
-                    `display-materialize:${viewId}`,
-                    (entry, generation) => attachUnlocked(registration, entry, generation, true),
+                const prepared = yield* registration.serialize.withPermits(1)(
+                  Effect.gen(function* () {
+                    if ((yield* Ref.get(registrations)).get(key) !== registration) {
+                      return { _tag: "Retry" as const, wait: Effect.void }
+                    }
+                    const state = yield* Ref.get(registration.state)
+                    if (state.closing !== null) {
+                      return {
+                        _tag: "Retry" as const,
+                        wait: Deferred.await(state.closing),
+                      }
+                    }
+                    return {
+                      _tag: "Ready" as const,
+                      shapeIntent: shape
+                        ? yield* setShapeIntentUnlocked(registration, shape)
+                        : undefined,
+                    }
+                  }),
+                )
+                if (prepared._tag === "Retry") return prepared
+
+                const result = yield* runtime.withSession(
+                  sessionId,
+                  `display-materialize:${viewId}`,
+                  (entry, generation) => registration.serialize.withPermits(1)(
+                    Effect.gen(function* () {
+                      // Runtime acquisition must not hold display serialization:
+                      // retirement needs the same lock to detach the old generation.
+                      const state = yield* Ref.get(registration.state)
+                      if (
+                        (yield* Ref.get(registrations)).get(key) !== registration
+                        || state.closing !== null
+                      ) {
+                        return Option.none<SequencedEvent<DisplayViewStateEvent>>()
+                      }
+                      return Option.some(
+                        yield* attachUnlocked(registration, entry, generation, true),
+                      )
+                    }),
+                  ),
+                ).pipe(
+                  Effect.onExit((exit) =>
+                    Exit.isFailure(exit) && prepared.shapeIntent !== undefined
+                      ? rollbackShapeIntent(registration, prepared.shapeIntent)
+                      : Effect.void,
                   ),
                 )
+                return Option.match(result, {
+                  onNone: () => ({ _tag: "Retry" as const, wait: Effect.void }),
+                  onSome: (event) => ({ _tag: "Done" as const, event }),
+                })
               }),
             )
-            return yield* Option.match(result, {
-              onNone: () => materialize(sessionId, viewId, shape),
-              onSome: Effect.succeed,
-            })
+            if (outcome._tag === "Retry") {
+              yield* outcome.wait
+              return yield* materialize(sessionId, viewId, shape)
+            }
+            return outcome.event
           }),
         )
+
+      const getDisplayViewStream = (
+        sessionId: string,
+        viewId: string,
+        shape: DisplayViewShape,
+        materializeShape = false,
+      ): Stream.Stream<StreamEvent, SessionError> => {
+        const attempt = Stream.unwrapScoped(
+          Effect.gen(function* () {
+            const registration = yield* Effect.acquireRelease(
+              getOrCreate(sessionId, viewId, shape),
+              removeIfUnused,
+            )
+            const admission = yield* Effect.acquireRelease(
+              registration.serialize.withPermits(1)(
+                Effect.gen(function* () {
+                  const exact = (yield* Ref.get(registrations)).get(keyFor(sessionId, viewId))
+                  if (exact !== registration) {
+                    return { admitted: false as const, wait: Effect.void }
+                  }
+                  const state = yield* Ref.get(registration.state)
+                  if (state.closing !== null) {
+                    return {
+                      admitted: false as const,
+                      wait: Deferred.await(state.closing),
+                    }
+                  }
+                  const queue = yield* PubSub.subscribe(registration.events)
+                  yield* Ref.update(registration.state, (state) => ({
+                    ...state,
+                    subscribers: state.subscribers + 1,
+                  }))
+                  return {
+                    admitted: true as const,
+                    initial: state.attachment
+                      ? Option.some((yield* Ref.get(state.attachment.latest)).event)
+                      : Option.none<DisplayViewStateEvent>(),
+                    queue,
+                  }
+                }),
+              ),
+              (admitted) => admitted.admitted ? releaseSubscriber(registration) : Effect.void,
+            )
+            if (!admission.admitted) {
+              return yield* new RegistrationRetry({ wait: admission.wait })
+            }
+            if (materializeShape) {
+              const committed = yield* materialize(sessionId, viewId, shape)
+              // The queue was subscribed before materialization so no live event
+              // is lost. Preserve records above the commit sequence while dropping
+              // only pre-commit data below the subscriber admission fence.
+              const buffered = yield* registration.serialize.withPermits(1)(
+                Queue.takeAll(admission.queue),
+              )
+              const postFence = Array.from(buffered).filter(
+                (emission) => emission._tag === "failure"
+                  || emission.item.sequence > committed.sequence,
+              )
+              return Stream.concat(
+                Stream.succeed(committed.event),
+                Stream.concat(
+                  Stream.fromIterable(postFence).pipe(Stream.mapEffect(emissionEffect)),
+                  Stream.fromQueue(admission.queue).pipe(Stream.mapEffect(emissionEffect)),
+                ),
+              )
+            }
+
+            yield* attachIfBusy(registration)
+            return Stream.concat(
+              Stream.fromIterable(Option.toArray(admission.initial)),
+              Stream.fromQueue(admission.queue).pipe(Stream.mapEffect(emissionEffect)),
+            )
+          }),
+        )
+        return attempt.pipe(
+          Stream.catchTag("RegistrationRetry", ({ wait }) =>
+            Stream.unwrap(
+              wait.pipe(Effect.as(getDisplayViewStream(sessionId, viewId, shape, materializeShape))),
+            ),
+          ),
+        )
+      }
 
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
@@ -402,8 +665,10 @@ export const DisplayViewStreamsLive: Layer.Layer<
 
       return {
         getDisplayViewStream,
-        requestDisplayViewSnapshot: (sessionId, viewId) => materialize(sessionId, viewId),
-        setDisplayViewShape: (sessionId, viewId, shape) => materialize(sessionId, viewId, shape),
+        requestDisplayViewSnapshot: (sessionId, viewId) =>
+          materialize(sessionId, viewId).pipe(Effect.map((item) => item.event)),
+        setDisplayViewShape: (sessionId, viewId, shape) =>
+          materialize(sessionId, viewId, shape).pipe(Effect.map((item) => item.event)),
       }
     }),
   )

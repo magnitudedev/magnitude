@@ -1,4 +1,4 @@
-import { Context, Data, Effect, Exit, Fiber, Layer, PubSub, Scope, Stream, SynchronizedRef } from 'effect'
+import { Context, Data, Deferred, Effect, Exit, Fiber, Layer, PubSub, Scope, Stream, SynchronizedRef } from 'effect'
 import { Addressed, AmbientServiceTag, Projection, ProjectionBusTag } from '@magnitudedev/event-core'
 import {
   sameDisplayViewShape,
@@ -19,6 +19,10 @@ export class DisplayViewRuntimeError extends Data.TaggedError('DisplayViewRuntim
 
 export interface DisplayViewRuntimeService {
   readonly setShape: (viewId: string, shape: DisplayViewShape) => Effect.Effect<void, DisplayViewRuntimeError>
+  readonly setShapeAndSnapshot: (
+    viewId: string,
+    shape: DisplayViewShape,
+  ) => Effect.Effect<DisplayViewSnapshot, DisplayViewRuntimeError>
   readonly stream: (viewId: string) => Stream.Stream<DisplayViewSnapshot, DisplayViewNotFoundError | DisplayViewRuntimeError>
   readonly snapshot: (viewId: string) => Effect.Effect<DisplayViewSnapshot, DisplayViewNotFoundError | DisplayViewRuntimeError>
   readonly close: (viewId: string) => Effect.Effect<void>
@@ -38,11 +42,20 @@ interface RuntimeDisplayViewEntry {
   readonly pubsub: PubSub.PubSub<RuntimeDisplayViewUpdate>
   readonly fiber: Fiber.RuntimeFiber<void, never>
   readonly generation: number
+  readonly sequence: number
 }
 
 type RuntimeDisplayViewUpdate =
-  | { readonly _tag: 'snapshot'; readonly snapshot: DisplayViewSnapshot }
-  | { readonly _tag: 'failure'; readonly error: DisplayViewRuntimeError }
+  | {
+      readonly _tag: 'snapshot'
+      readonly sequence: number
+      readonly snapshot: DisplayViewSnapshot
+    }
+  | {
+      readonly _tag: 'failure'
+      readonly sequence: number
+      readonly error: DisplayViewRuntimeError
+    }
 
 const closeEntry = (entry: RuntimeDisplayViewEntry): Effect.Effect<void> =>
   Fiber.interrupt(entry.fiber).pipe(
@@ -73,6 +86,7 @@ export const DisplayViewRuntimeLive =
       const projectionConsumerService = yield* Projection.consumer.Service
       const projectionBus = yield* ProjectionBusTag<any>()
       const views = yield* SynchronizedRef.make<ReadonlyMap<string, RuntimeDisplayViewEntry>>(new Map())
+      const mutations = yield* Effect.makeSemaphore(1)
 
       const provideRuntimeEffect = <A, E, R>(
         effect: Effect.Effect<A, E, R>
@@ -105,9 +119,10 @@ export const DisplayViewRuntimeLive =
               return Effect.succeed(currentViews)
             }
 
+            const sequence = current.sequence + 1
             const nextViews = new Map(currentViews)
-            nextViews.set(viewId, { ...current, snapshot, failure: null })
-            return PubSub.publish(current.pubsub, { _tag: 'snapshot', snapshot }).pipe(
+            nextViews.set(viewId, { ...current, snapshot, failure: null, sequence })
+            return PubSub.publish(current.pubsub, { _tag: 'snapshot', sequence, snapshot }).pipe(
               Effect.as(nextViews)
             )
           }
@@ -126,9 +141,10 @@ export const DisplayViewRuntimeLive =
               return Effect.succeed(currentViews)
             }
 
+            const sequence = current.sequence + 1
             const nextViews = new Map(currentViews)
-            nextViews.set(viewId, { ...current, failure: error })
-            return PubSub.publish(current.pubsub, { _tag: 'failure', error }).pipe(
+            nextViews.set(viewId, { ...current, failure: error, sequence })
+            return PubSub.publish(current.pubsub, { _tag: 'failure', sequence, error }).pipe(
               Effect.as(nextViews)
             )
           }
@@ -138,13 +154,23 @@ export const DisplayViewRuntimeLive =
         viewId: string,
         consumer: Projection.consumer.RuntimeConsumer,
         shape: DisplayViewShape,
-        generation: number
+        generation: number,
+        ready: Deferred.Deferred<void>
       ) =>
         Projection.consumer.stream(consumer)(buildDisplayViewSnapshot(shape)).pipe(
           provideRuntimeStream,
           Stream.mapError(displayViewRuntimeError(viewId, 'stream')),
-          Stream.runForEach((snapshot) => publishSnapshotIfCurrent(viewId, generation, snapshot)),
-          Effect.catchAll((error) => publishFailureIfCurrent(viewId, generation, error)),
+          Stream.runForEach((snapshot) =>
+            Deferred.await(ready).pipe(
+              Effect.zipRight(publishSnapshotIfCurrent(viewId, generation, snapshot))
+            )
+          ),
+          Effect.catchAll((error) =>
+            Deferred.await(ready).pipe(
+              Effect.zipRight(publishFailureIfCurrent(viewId, generation, error))
+            )
+          ),
+          Effect.interruptible,
           Effect.forkIn(runtimeScope)
         )
 
@@ -165,18 +191,23 @@ export const DisplayViewRuntimeLive =
               Projection.consumer.provide(consumer),
               provideRuntimeEffect
             )
-            const fiber = yield* startStream(viewId, consumer, shape, generation)
+            const ready = yield* Deferred.make<void>()
+            const fiber = yield* startStream(viewId, consumer, shape, generation, ready)
 
             return {
-              requestedShape: shape,
-              snapshot,
-              failure: null,
-              consumer,
-              scope,
-              pubsub,
-              fiber,
-              generation,
-            } satisfies RuntimeDisplayViewEntry
+              entry: {
+                requestedShape: shape,
+                snapshot,
+                failure: null,
+                consumer,
+                scope,
+                pubsub,
+                fiber,
+                generation,
+                sequence: 0,
+              } satisfies RuntimeDisplayViewEntry,
+              ready,
+            }
           }).pipe(
             Effect.tapError(() => Scope.close(scope, Exit.void)),
             Effect.mapError(displayViewRuntimeError(viewId, 'setShape'))
@@ -198,34 +229,46 @@ export const DisplayViewRuntimeLive =
         })
       )
 
+      const setShapeAndSnapshot = (viewId: string, shape: DisplayViewShape) =>
+        mutations.withPermits(1)(Effect.uninterruptible(Effect.gen(function* () {
+          const currentViews = yield* SynchronizedRef.get(views)
+          const existing = currentViews.get(viewId)
+          if (existing && existing.failure === null && sameDisplayViewShape(existing.requestedShape, shape)) {
+            return existing.snapshot
+          }
+
+          const pubsub = existing?.pubsub ?? (yield* PubSub.unbounded<RuntimeDisplayViewUpdate>())
+          const generation = (existing?.generation ?? 0) + 1
+          const replacement = yield* makeEntry(viewId, shape, pubsub, generation)
+
+          if (existing) yield* closeEntry(existing)
+
+          // Publishing and replacing cached authority share one synchronized sequence commit.
+          // The replacement stream is already subscribed, but its publications remain gated
+          // until this generation becomes current, so no update or failure can be discarded.
+          const committed = yield* SynchronizedRef.modifyEffect(views, (latest) => {
+            const sequence = (latest.get(viewId)?.sequence ?? -1) + 1
+            const entry = { ...replacement.entry, sequence }
+            const nextViews = new Map(latest)
+            nextViews.set(viewId, entry)
+            return PubSub.publish(pubsub, {
+              _tag: 'snapshot' as const,
+              sequence,
+              snapshot: entry.snapshot,
+            }).pipe(
+              Effect.as([entry, nextViews] as const)
+            )
+          })
+          yield* Deferred.succeed(replacement.ready, undefined)
+          return committed.snapshot
+        })))
+
       return {
-        setShape: (viewId, shape) =>
-          Effect.gen(function* () {
-            const currentViews = yield* SynchronizedRef.get(views)
-            const existing = currentViews.get(viewId)
-            if (existing && existing.failure === null && sameDisplayViewShape(existing.requestedShape, shape)) {
-              return
-            }
-
-            const pubsub = existing?.pubsub ?? (yield* PubSub.unbounded<RuntimeDisplayViewUpdate>())
-            const generation = (existing?.generation ?? 0) + 1
-            const nextEntry = yield* makeEntry(viewId, shape, pubsub, generation)
-
-            yield* SynchronizedRef.update(views, (latestViews) => {
-              const nextViews = new Map(latestViews)
-              nextViews.set(viewId, nextEntry)
-              return nextViews
-            })
-
-            yield* PubSub.publish(pubsub, { _tag: 'snapshot', snapshot: nextEntry.snapshot })
-
-            if (existing) {
-              yield* closeEntry(existing)
-            }
-          }),
+        setShape: (viewId, shape) => setShapeAndSnapshot(viewId, shape).pipe(Effect.asVoid),
+        setShapeAndSnapshot,
 
         stream: (viewId) =>
-          Stream.unwrap(
+          Stream.unwrapScoped(mutations.withPermits(1)(
             Effect.gen(function* () {
               const currentViews = yield* SynchronizedRef.get(views)
               const entry = currentViews.get(viewId)
@@ -233,18 +276,26 @@ export const DisplayViewRuntimeLive =
                 return yield* new DisplayViewNotFoundError({ viewId })
               }
 
-              const initial = Stream.succeed(entry.snapshot)
-              const changes = entry.failure
-                ? Stream.fail(entry.failure)
-                : Stream.fromPubSub(entry.pubsub).pipe(
+              const subscription = yield* PubSub.subscribe(entry.pubsub)
+              const sampledViews = yield* SynchronizedRef.get(views)
+              const sampled = sampledViews.get(viewId)
+              if (!sampled || sampled.generation !== entry.generation) {
+                return yield* new DisplayViewNotFoundError({ viewId })
+              }
+
+              const initial = Stream.succeed(sampled.snapshot)
+              const changes = sampled.failure
+                ? Stream.fail(sampled.failure)
+                : Stream.fromQueue(subscription).pipe(
+                    Stream.filter((update) => update.sequence > sampled.sequence),
                     Stream.mapEffect(displayViewUpdateEffect)
                   )
 
               return Stream.concat(initial, changes)
-            })
-          ),
+            }),
+          )),
 
-        snapshot: (viewId) =>
+        snapshot: (viewId) => mutations.withPermits(1)(
           Effect.gen(function* () {
             const currentViews = yield* SynchronizedRef.get(views)
             const entry = currentViews.get(viewId)
@@ -256,20 +307,22 @@ export const DisplayViewRuntimeLive =
             }
             return entry.snapshot
           }),
+        ),
 
-        close: (viewId) =>
+        close: (viewId) => mutations.withPermits(1)(Effect.uninterruptible(
           Effect.gen(function* () {
-            const entry = yield* SynchronizedRef.modify(views, (currentViews) => {
-              const current = currentViews.get(viewId)
-              if (!current) return [null, currentViews] as const
-              const nextViews = new Map(currentViews)
-              nextViews.delete(viewId)
-              return [current, nextViews] as const
-            })
+            const currentViews = yield* SynchronizedRef.get(views)
+            const entry = currentViews.get(viewId)
             if (!entry) return
             yield* closeEntry(entry)
             yield* PubSub.shutdown(entry.pubsub)
+            yield* SynchronizedRef.update(views, (latest) => {
+              const nextViews = new Map(latest)
+              nextViews.delete(viewId)
+              return nextViews
+            })
           }),
+        )),
       } satisfies DisplayViewRuntimeService
     })
   )
