@@ -60,6 +60,7 @@ const makeSession = (queue: Queue.Queue<AgentIntrospection>): CodingAgentSession
     stream: () => Stream.die("unused test session displayView.stream"),
     snapshot: () => Effect.die("unused test session displayView.snapshot"),
     setShape: () => Effect.die("unused test session displayView.setShape"),
+    setShapeAndSnapshot: () => Effect.die("unused test session displayView.setShapeAndSnapshot"),
     close: () => Effect.void,
   },
   send: () => Effect.die("unused test session send"),

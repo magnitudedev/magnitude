@@ -10,6 +10,7 @@ export const StreamDisplayView = makeAcnSubscriptionRpc("StreamDisplayView", {
     sessionId: Schema.String,
     viewId: Schema.String,
     shape: DisplayViewShape,
+    materialize: Schema.Boolean,
   }),
   success: StreamEvent,
   error: SessionError,

@@ -16,7 +16,9 @@ import {
   type Path,
 } from "@magnitudedev/utils/patch";
 
-type Mutable<T> = T extends (...args: any[]) => any
+type Mutable<T> = T extends string | number | boolean | bigint | symbol | null | undefined
+  ? T
+  : T extends (...args: any[]) => any
   ? T
   : T extends readonly (infer U)[]
   ? readonly Mutable<U>[]

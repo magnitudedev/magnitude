@@ -7,6 +7,7 @@ export {
   AcnRpcClientTag,
 } from "./protocol"
 export type { AcnClient, AcnRpcClient } from "./protocol"
+export { HeadlessRpcs } from "./headless-rpcs"
 
 export {
   AcnInstanceManager,
@@ -66,6 +67,7 @@ export {
   StreamEvent as StreamEventSchema,
   canonicalExtensionForImageMediaType,
   filenameWithImageExtension,
+  ForkIdSchema,
   forkIdToKey,
   imageMediaTypeFromFilename,
   imageMediaTypeFromMime,
@@ -158,6 +160,7 @@ export type {
   DisplayToolStepTimelineEntry,
   DirectoryCandidate,
   ErrorDisplayMessage,
+  ForkId,
   RawFileImageAttachment,
   RawImageAttachment,
   RawMentionOccurrence,

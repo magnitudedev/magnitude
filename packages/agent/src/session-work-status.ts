@@ -10,6 +10,7 @@ export interface SessionWorkSnapshot {
   readonly turns: ReadonlyMap<string | null, ForkTurnState>
   readonly agents: AgentLifecycleState
   readonly compactions: ReadonlyMap<string | null, CompactionState>
+  readonly pendingUserMessageCount: number
   readonly detachedProcessCount: number
 }
 
@@ -25,7 +26,11 @@ export function deriveSessionWorkStatus(snapshot: SessionWorkSnapshot): SessionW
   const compactionWork = [...snapshot.compactions.values()].some(
     (compaction) => compaction._tag !== 'idle' || compaction.shouldCompact === true
   )
-  const working = turnWork || workingAgents > 0 || compactionWork || snapshot.detachedProcessCount > 0
+  const working = turnWork
+    || workingAgents > 0
+    || compactionWork
+    || snapshot.pendingUserMessageCount > 0
+    || snapshot.detachedProcessCount > 0
 
   return working
     ? {

@@ -25,6 +25,9 @@ export * from './stores/system-message-store'
 // Sync layer
 export * from './sync/index'
 
+// Non-interactive clients
+export * from './headless/session-runner'
+
 // Types
 export * from './types/store'
 export type { KeyEvent } from './types/key-event'

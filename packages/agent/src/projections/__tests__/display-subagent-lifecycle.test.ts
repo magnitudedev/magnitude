@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { Effect, Layer } from 'effect'
+import { Effect, Layer, Option } from 'effect'
 import {
   Addressed,
   ProjectionBusTag,
@@ -16,6 +16,7 @@ import { GoalProjection } from '../goal'
 import { UserMessageResolutionProjection } from '../user-message-resolution'
 import { HarnessStateProjection } from '../harness-state'
 import { DisplayTimelineProjection, type DisplayTimeline, type DisplayMessage } from '../../display'
+import { ToolUniverseSourceLive } from '../../tools/tool-universe-live'
 
 // Materialize timeline messages for assertions — accepts the normalized
 // byId/order display form or a plain array (addressed readAll results).
@@ -34,7 +35,7 @@ const makeRootDisplay = async (events: AppEvent[]) => {
   )
   const baseLayer = Layer.provideMerge(
     makeAmbientServiceLayer<AppEvent>(),
-    projectionBusLayer,
+    Layer.merge(projectionBusLayer, ToolUniverseSourceLive),
   )
 
   const withGoal = Layer.provideMerge(GoalProjection.Layer, baseLayer)
@@ -65,6 +66,80 @@ const makeRootDisplay = async (events: AppEvent[]) => {
 }
 
 describe('display subagent lifecycle think steps', () => {
+  it('keeps equal-timestamp resumed worker completions occurrence-unique', async () => {
+    const turnOutcome = (turnId: string, chainId: string): AppEvent => ({
+      type: 'turn_outcome',
+      timestamp: ts(10),
+      forkId: 'fork-sub',
+      turnId,
+      chainId,
+      strategyId: 'native',
+      outcome: {
+        _tag: 'Completed',
+        completion: {
+          toolCallsCount: 0,
+          finishReason: 'stop',
+          feedback: [],
+          yieldTarget: null,
+        },
+        requestId: null,
+      },
+      commitPolicy: { _tag: 'commitCleanTurn' },
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      cost: null,
+      providerId: 'test',
+      modelId: 'role/worker',
+    } as any)
+    const rootDisplay = await makeRootDisplay([
+      {
+        type: 'turn_started',
+        timestamp: ts(1),
+        forkId: null,
+        turnId: 't-root',
+        chainId: 'c-root',
+      } as any,
+      {
+        type: 'agent_created',
+        timestamp: ts(2),
+        forkId: 'fork-sub',
+        parentForkId: null,
+        agentId: 'agent-sub',
+        role: 'engineer',
+        name: 'Builder',
+        context: 'ctx',
+        mode: 'spawn',
+        taskId: 'task-1',
+        message: null,
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(3),
+        forkId: 'fork-sub',
+        turnId: 't-sub-1',
+        chainId: 'c-sub-1',
+      } as any,
+      turnOutcome('t-sub-1', 'c-sub-1'),
+      {
+        type: 'turn_started',
+        timestamp: ts(10),
+        forkId: 'fork-sub',
+        turnId: 't-sub-2',
+        chainId: 'c-sub-2',
+      } as any,
+      turnOutcome('t-sub-2', 'c-sub-2'),
+    ])
+    const finished = listMessages(rootDisplay.messages).filter(
+      (message): message is Extract<DisplayMessage, { type: 'worker_finished' }> =>
+        message.type === 'worker_finished',
+    )
+
+    expect(finished).toHaveLength(2)
+    expect(new Set(finished.map((message) => message.id)).size).toBe(2)
+  })
+
   it('adds root turn-block started/finished steps with cumulative resumed semantics', async () => {
     const rootDisplay = await makeRootDisplay([
       {
@@ -190,18 +265,18 @@ describe('display subagent lifecycle think steps', () => {
       status: 'completed',
       createdAt: ts(2),
       activeSince: ts(2),
-      completedAt: ts(10),
+      completedAt: Option.some(ts(10)),
       accumulatedActiveMs: 8,
-      resumeCount: 0,
+      resumeCount: Option.some(0),
       toolCounts: { commands: 1 },
     })
     expect(forkActivity[1]).toMatchObject({
       status: 'completed',
       createdAt: ts(15),
       activeSince: ts(15),
-      completedAt: ts(20),
+      completedAt: Option.some(ts(20)),
       accumulatedActiveMs: 13,
-      resumeCount: 1,
+      resumeCount: Option.some(1),
       toolCounts: { commands: 1, reads: 1 },
     })
     expect(forkActivity[0].id).not.toBe(forkActivity[1].id)

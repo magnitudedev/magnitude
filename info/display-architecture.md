@@ -112,28 +112,34 @@ The protocol shape API is explicit:
 
 ```ts
 SetDisplayViewShape({ sessionId, viewId, shape })
-StreamDisplayView({ sessionId, viewId })
+StreamDisplayView({ sessionId, viewId, shape, materialize })
 ResyncDisplayView({ sessionId, viewId })
-CloseDisplayView({ sessionId, viewId })
 ```
 
-`SetDisplayViewShape` is the only shape writer. It creates or updates the
-runtime logical view and materializes a new accepted snapshot.
+`SetDisplayViewShape` explicitly creates or updates a runtime logical view and
+materializes a new accepted snapshot. Interactive controllers use this command
+for initial materialization and later shape changes.
 
-`StreamDisplayView` is read-only. It subscribes to accepted display events for
-an existing runtime view. It has no shape field and never changes shape.
+`StreamDisplayView` atomically admits a subscriber with its requested shape and
+materialization intent. A passive request (`materialize: false`) subscribes to
+an existing logical view without changing its shape; when no registration
+exists, its shape establishes the new passive registration. A materializing
+request (`materialize: true`) establishes subscriber cleanup before loading the
+runtime or attaching display state, then materializes the requested shape. It
+emits fresh authoritative state before any cached attachment snapshot.
 
 `ResyncDisplayView` emits the latest accepted snapshot as a full state event.
 It does not negotiate shape.
 
-`CloseDisplayView` closes the runtime view and releases the consumer.
+Closing the last stream subscriber removes the registration and closes the
+runtime view; there is no separate stream-close RPC.
 
 ## End-To-End Flow
 
 1. UI actions update display intent.
 2. The display controller derives the latest requested `DisplayViewShape`.
-3. The controller sends `SetDisplayViewShape`.
-4. The controller opens `StreamDisplayView`.
+3. The interactive controller sends `SetDisplayViewShape`.
+4. The controller opens passive `StreamDisplayView` observation.
 5. ACN resolves the session runtime and relays the command or stream request.
 6. `DisplayViewRuntime` starts or updates a `ProjectionConsumer.stream` for the
    requested shape.
@@ -146,10 +152,16 @@ It does not negotiate shape.
     preservation.
 12. UI derives rendering from intent plus accepted truth.
 
+A bounded non-interactive client instead opens one materializing
+`StreamDisplayView`. Stream admission owns registration, subscriber, and
+cleanup as one scoped operation, so cancellation or materialization failure
+cannot leave a zero-subscriber registration or attachment behind.
+
 ## Layer Roles
 
-The client controller owns display intent and the selected view lifecycle. It
-is the only client-side caller that changes display shape.
+The client controller owns interactive display intent and the selected view
+lifecycle. A bounded non-interactive client owns only its isolated view id and
+initial materializing admission.
 
 The client store owns accepted snapshots. Reference preservation reduces
 rerenders by reusing unchanged object identities. It does not preserve hidden
@@ -158,10 +170,11 @@ workers as truth and does not mutate requested shape.
 The SDK owns typed RPC access, daemon discovery, heartbeat filtering, and
 transport recovery. It does not decide worker visibility or synthesize shape.
 
-ACN is a relay and resource owner. It owns stream registrations,
-subscriber ref counts, stream sharing, snapshot/patch conversion, and
-introspection. It does not infer timeline availability and does not update
-shape from `StreamDisplayView`.
+ACN is a relay and resource owner. It owns stream registrations, atomic
+subscriber admission, subscriber ref counts, stream sharing, snapshot/patch
+conversion, and introspection. It does not infer timeline availability. A
+passive subscription never overwrites an existing shape; an explicitly
+materializing subscription owns its requested initial materialization.
 
 The agent owns accepted display truth through `DisplayViewRuntime`. It resolves
 requested shape against current projection state, materializes accepted
@@ -206,15 +219,16 @@ The UI treats desired-but-unaccepted timelines as pending.
 
 ## Race-Free Invariants
 
-There is exactly one semantic writer of client display intent: the display
-controller.
+There is exactly one semantic writer of interactive display intent: the
+display controller.
 
 There is exactly one semantic owner of accepted display truth:
 `DisplayViewRuntime`.
 
-Only `SetDisplayViewShape` mutates requested shape.
+Interactive shape changes use `SetDisplayViewShape`. A materializing stream may
+establish its own initial requested shape during atomic admission.
 
-`StreamDisplayView` never carries shape and never mutates requested shape.
+A passive `StreamDisplayView` never overwrites an existing requested shape.
 
 Display view open, shape change, resync, and close do not append app events.
 
@@ -254,11 +268,12 @@ Do not add display-view app events.
 
 Do not add a `DisplayViewProjection`.
 
-Do not put shape on `StreamDisplayView`.
+Do not separate materializing stream admission into an unowned shape mutation
+followed by subscription.
 
-Do not let SDK or ACN replay stale shape-bearing requests.
+Do not let passive recovery overwrite an accepted requested shape.
 
-Do not let ACN treat stream subscribe as shape update.
+Do not let passive stream subscribe or recovery act as a shape update.
 
 Do not add client-side worker retention caches.
 
@@ -274,8 +289,13 @@ Do not call `ProjectionBus.pinAddressedConsumer` from display runtime code.
 
 The clean path is:
 
-`UI intent -> display controller -> SetDisplayViewShape -> DisplayViewRuntime -> ProjectionConsumer -> accepted snapshot -> ACN stream -> SDK -> reference-preserving store -> UI derivation`
+`UI intent -> display controller -> SetDisplayViewShape -> passive StreamDisplayView -> DisplayViewRuntime -> ProjectionConsumer -> accepted snapshot -> SDK -> reference-preserving store -> UI derivation`
 
-Race freedom comes from keeping shape writes single-path and read streams
-read-only. Residency comes from event-core consumer tracking over the existing
-`Projection.addressed` semantic indexes.
+The bounded non-interactive path is:
+
+`requested shape -> materializing StreamDisplayView admission -> DisplayViewRuntime -> authoritative state stream`
+
+Race freedom comes from explicit materialization intent, passive reconnects,
+and atomic subscriber ownership before materialization. Residency comes from
+event-core consumer tracking over the existing `Projection.addressed` semantic
+indexes.

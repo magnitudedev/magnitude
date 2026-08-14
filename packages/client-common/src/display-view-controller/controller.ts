@@ -475,7 +475,7 @@ export class DisplayViewControllerCore {
       if (!this.isCurrent(generation, sessionId)) return
       yield* this.acceptMaterializedState(generation, sessionId, viewId, initial)
 
-      yield* client.StreamDisplayView({ sessionId, viewId, shape }).pipe(
+      yield* client.StreamDisplayView({ sessionId, viewId, shape, materialize: false }).pipe(
         Stream.tap((event) =>
           Effect.gen(this, function* () {
             if (!this.isCurrent(generation, sessionId)) return

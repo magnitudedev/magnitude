@@ -19,6 +19,10 @@ export class DisplayViewRuntimeError extends Data.TaggedError('DisplayViewRuntim
 
 export interface DisplayViewRuntimeService {
   readonly setShape: (viewId: string, shape: DisplayViewShape) => Effect.Effect<void, DisplayViewRuntimeError>
+  readonly setShapeAndSnapshot: (
+    viewId: string,
+    shape: DisplayViewShape,
+  ) => Effect.Effect<DisplayViewSnapshot, DisplayViewRuntimeError>
   readonly stream: (viewId: string) => Stream.Stream<DisplayViewSnapshot, DisplayViewNotFoundError | DisplayViewRuntimeError>
   readonly snapshot: (viewId: string) => Effect.Effect<DisplayViewSnapshot, DisplayViewNotFoundError | DisplayViewRuntimeError>
   readonly close: (viewId: string) => Effect.Effect<void>
@@ -73,6 +77,7 @@ export const DisplayViewRuntimeLive =
       const projectionConsumerService = yield* Projection.consumer.Service
       const projectionBus = yield* ProjectionBusTag<any>()
       const views = yield* SynchronizedRef.make<ReadonlyMap<string, RuntimeDisplayViewEntry>>(new Map())
+      const mutations = yield* Effect.makeSemaphore(1)
 
       const provideRuntimeEffect = <A, E, R>(
         effect: Effect.Effect<A, E, R>
@@ -145,6 +150,7 @@ export const DisplayViewRuntimeLive =
           Stream.mapError(displayViewRuntimeError(viewId, 'stream')),
           Stream.runForEach((snapshot) => publishSnapshotIfCurrent(viewId, generation, snapshot)),
           Effect.catchAll((error) => publishFailureIfCurrent(viewId, generation, error)),
+          Effect.interruptible,
           Effect.forkIn(runtimeScope)
         )
 
@@ -198,34 +204,36 @@ export const DisplayViewRuntimeLive =
         })
       )
 
+      const setShapeAndSnapshot = (viewId: string, shape: DisplayViewShape) =>
+        mutations.withPermits(1)(Effect.uninterruptible(Effect.gen(function* () {
+          const currentViews = yield* SynchronizedRef.get(views)
+          const existing = currentViews.get(viewId)
+          if (existing && existing.failure === null && sameDisplayViewShape(existing.requestedShape, shape)) {
+            return existing.snapshot
+          }
+
+          const pubsub = existing?.pubsub ?? (yield* PubSub.unbounded<RuntimeDisplayViewUpdate>())
+          const generation = (existing?.generation ?? 0) + 1
+          const nextEntry = yield* makeEntry(viewId, shape, pubsub, generation)
+
+          if (existing) yield* closeEntry(existing)
+          yield* PubSub.publish(pubsub, { _tag: 'snapshot', snapshot: nextEntry.snapshot })
+
+          // This non-failing map update is the transaction's final step.
+          yield* SynchronizedRef.update(views, (latest) => {
+            const nextViews = new Map(latest)
+            nextViews.set(viewId, nextEntry)
+            return nextViews
+          })
+          return nextEntry.snapshot
+        })))
+
       return {
-        setShape: (viewId, shape) =>
-          Effect.gen(function* () {
-            const currentViews = yield* SynchronizedRef.get(views)
-            const existing = currentViews.get(viewId)
-            if (existing && existing.failure === null && sameDisplayViewShape(existing.requestedShape, shape)) {
-              return
-            }
-
-            const pubsub = existing?.pubsub ?? (yield* PubSub.unbounded<RuntimeDisplayViewUpdate>())
-            const generation = (existing?.generation ?? 0) + 1
-            const nextEntry = yield* makeEntry(viewId, shape, pubsub, generation)
-
-            yield* SynchronizedRef.update(views, (latestViews) => {
-              const nextViews = new Map(latestViews)
-              nextViews.set(viewId, nextEntry)
-              return nextViews
-            })
-
-            yield* PubSub.publish(pubsub, { _tag: 'snapshot', snapshot: nextEntry.snapshot })
-
-            if (existing) {
-              yield* closeEntry(existing)
-            }
-          }),
+        setShape: (viewId, shape) => setShapeAndSnapshot(viewId, shape).pipe(Effect.asVoid),
+        setShapeAndSnapshot,
 
         stream: (viewId) =>
-          Stream.unwrap(
+          Stream.unwrap(mutations.withPermits(1)(
             Effect.gen(function* () {
               const currentViews = yield* SynchronizedRef.get(views)
               const entry = currentViews.get(viewId)
@@ -241,10 +249,10 @@ export const DisplayViewRuntimeLive =
                   )
 
               return Stream.concat(initial, changes)
-            })
-          ),
+            }),
+          )),
 
-        snapshot: (viewId) =>
+        snapshot: (viewId) => mutations.withPermits(1)(
           Effect.gen(function* () {
             const currentViews = yield* SynchronizedRef.get(views)
             const entry = currentViews.get(viewId)
@@ -256,20 +264,22 @@ export const DisplayViewRuntimeLive =
             }
             return entry.snapshot
           }),
+        ),
 
-        close: (viewId) =>
+        close: (viewId) => mutations.withPermits(1)(Effect.uninterruptible(
           Effect.gen(function* () {
-            const entry = yield* SynchronizedRef.modify(views, (currentViews) => {
-              const current = currentViews.get(viewId)
-              if (!current) return [null, currentViews] as const
-              const nextViews = new Map(currentViews)
-              nextViews.delete(viewId)
-              return [current, nextViews] as const
-            })
+            const currentViews = yield* SynchronizedRef.get(views)
+            const entry = currentViews.get(viewId)
             if (!entry) return
             yield* closeEntry(entry)
             yield* PubSub.shutdown(entry.pubsub)
+            yield* SynchronizedRef.update(views, (latest) => {
+              const nextViews = new Map(latest)
+              nextViews.delete(viewId)
+              return nextViews
+            })
           }),
+        )),
       } satisfies DisplayViewRuntimeService
     })
   )

@@ -24,8 +24,13 @@ import { CLI_VERSION } from "./version";
 import { installGracefulShutdownHandlers } from "./utils/graceful-shutdown";
 import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
+import { runHeadless } from "./commands/headless";
 import { Array as Arr, Effect, Option } from "effect";
 import { registerDocsCommand } from "./commands/docs";
+import {
+  flushProcessOutput,
+  scheduleBoundedProcessExit,
+} from "./utils/flush-process-output";
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
@@ -88,16 +93,6 @@ async function main() {
         ? { _tag: "latest" }
         : { _tag: "resume", sessionId: opts.resume };
 
-    // Headless mode is temporarily disabled while the CLI transitions to a
-    // pure SDK/RPC client architecture. It needs a daemon-backed persistence
-    // design before it can run again.
-    if (opts.headless) {
-      process.stderr.write(
-        "Error: --headless is temporarily disabled. Use the TUI mode.\n"
-      );
-      process.exit(1);
-    }
-
     const isDev =
       import.meta.url.endsWith(".tsx") ||
       (process.argv[1]?.endsWith(".tsx") ?? false);
@@ -129,12 +124,40 @@ async function main() {
         atomRegistry.set(pushNotificationAtom, notification);
       },
     });
-    Atom.runtime.addGlobalLayer(effectLoggingLayer);
-    const platform = await createTerminalPlatform({
+    const createPlatform = () => createTerminalPlatform({
       launchCommand,
       debug: opts.debug === true,
       effectLoggingLayer: Option.some(effectLoggingLayer),
     });
+
+    if (opts.headless) {
+      const exitCode = await Effect.runPromise(runHeadless({
+        debug: opts.debug === true,
+        autopilot: opts.autopilot ?? false,
+        ...(opts.prompt === undefined ? {} : { initialPrompt: opts.prompt }),
+        sessionStart,
+        disableShellSafeguards: opts.disableShellSafeguards ?? false,
+        disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
+        ...(opts.atif === undefined ? {} : { atifPath: opts.atif }),
+        ...(opts.goal === undefined ? {} : { goal: opts.goal }),
+        solo: opts.solo ?? false,
+        ...(opts.systemOverride === undefined ? {} : { systemOverride: opts.systemOverride }),
+        setup: opts.setup ?? false,
+      }, {
+        createPlatform,
+        onTerminationSignal: (exitCode) => {
+          Effect.runSync(scheduleBoundedProcessExit(exitCode));
+        },
+      }));
+      await Effect.runPromise(flushProcessOutput());
+      // Allow just-late platform cleanup to run, but never let leaked runtime
+      // handles make the bounded command retain the process indefinitely.
+      Effect.runSync(scheduleBoundedProcessExit(exitCode));
+      return;
+    }
+
+    Atom.runtime.addGlobalLayer(effectLoggingLayer);
+    const platform = await createPlatform();
     const initialAcnLifecycleState = await Effect.runPromise(
       platform.acnStartup.prepare
     );
@@ -200,7 +223,7 @@ async function main() {
     );
   });
 
-  program.parse();
+  await program.parseAsync();
 }
 
 main();

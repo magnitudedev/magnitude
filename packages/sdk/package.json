@@ -21,6 +21,10 @@
     "./sqlite-driver": {
       "types": "./src/sqlite-driver.ts",
       "import": "./src/sqlite-driver.ts"
+    },
+    "./testing": {
+      "types": "./src/testing/index.ts",
+      "import": "./src/testing/index.ts"
     }
   },
   "scripts": {
