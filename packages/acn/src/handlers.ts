@@ -162,7 +162,11 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           retryable: false,
         });
       }
-      const providerModelId = Option.match(configuration.value.catalogIdentity, {
+      const catalogIdentity = Option.map(
+        configuration.value.catalogModel,
+        ({ modelId, variantId }) => ({ modelId, variantId }),
+      );
+      const providerModelId = Option.match(catalogIdentity, {
         onNone: () => configuration.value.servingConfiguration.id,
         onSome: localCatalogProviderModelId,
       });
@@ -198,7 +202,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         configuration.value.servingConfiguration.bundle,
         referencedPackageIds,
       );
-      if (Option.isSome(configuration.value.catalogIdentity)) {
+      if (Option.isSome(catalogIdentity)) {
         const packageState = (yield* localModelPackages.snapshot).state;
         const activePackageIds = new Set(
           servableModelBundlePackageIds(configuration.value.servingConfiguration.bundle),
@@ -206,8 +210,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         for (const entry of packageState.entries) {
           if (entry.localState._tag !== "Installed"
             || entry.catalogAttribution._tag !== "Attributed"
-            || entry.catalogAttribution.modelId !== configuration.value.catalogIdentity.value.modelId
-            || entry.catalogAttribution.variantId !== configuration.value.catalogIdentity.value.variantId
+            || entry.catalogAttribution.modelId !== catalogIdentity.value.modelId
+            || entry.catalogAttribution.variantId !== catalogIdentity.value.variantId
             || activePackageIds.has(entry.package.id)) {
             continue;
           }

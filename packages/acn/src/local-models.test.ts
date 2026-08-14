@@ -285,10 +285,7 @@ describe("local model configuration resolution", () => {
       catalogAttributionByPackageId: attribution,
     }).values()][0]
     expect(before?.servingConfiguration).toEqual(prior)
-    expect(before?.catalogIdentity).toEqual(Option.some({
-      modelId: curated.modelId,
-      variantId: curated.variantId,
-    }))
+    expect(before?.catalogModel).toEqual(Option.some(curated))
 
     const after = [...resolveLocalModelConfigurations({
       catalog: [curated],
