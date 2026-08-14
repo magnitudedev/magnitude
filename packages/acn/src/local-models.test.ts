@@ -594,21 +594,19 @@ describe("local model presentation", () => {
   })
   const curated = {
     displayName: "Liquid LFM2.5 2.6B",
-    variantLabel: ModelVariantLabelSchema.make("Q4"),
+    variantLabel: ModelVariantLabelSchema.make("Q6"),
     description: "Curated model description.",
   }
 
-  it("preserves curated metadata for an exact installed bundle", () => {
+  it("preserves the catalog variant when artifact metadata disagrees", () => {
     expect(resolveBundlePresentation(
       huggingFaceBundle,
       curated,
     )).toEqual({
       displayName: "Liquid LFM2.5 2.6B",
-      variantLabel: "Q4",
+      variantLabel: "Q6",
       description: "Curated model description.",
       license: Option.none(),
-      quantization: "Q4_K - Medium",
-      precisionLabel: "4-bit",
     })
   })
 
@@ -621,8 +619,6 @@ describe("local model presentation", () => {
       variantLabel: "Q4_K - Medium",
       description: "",
       license: Option.none(),
-      quantization: "Q4_K - Medium",
-      precisionLabel: "4-bit",
     })
   })
 
@@ -635,12 +631,10 @@ describe("local model presentation", () => {
       variantLabel: "Q4_K - Medium",
       description: "",
       license: Option.none(),
-      quantization: "Q4_K - Medium",
-      precisionLabel: "4-bit",
     })
   })
 
-  it("presents only the target quantization for speculative bundles", () => {
+  it("derives an uncurated speculative variant from only the target", () => {
     const targetBundle = standaloneBundle(
       { _tag: "Local", path: "/models" },
       "target.gguf",
@@ -662,9 +656,8 @@ describe("local model presentation", () => {
       target: targetBundle.package,
       draftSource: { _tag: "Separate", draft: draftBundle.package },
       method: { _tag: "DSpark" },
-    }, curated)).toMatchObject({
-      quantization: "Q4_K - Medium",
-      precisionLabel: "4-bit",
+    }, undefined)).toMatchObject({
+      variantLabel: "Q4_K - Medium",
     })
   })
 })

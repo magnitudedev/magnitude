@@ -1047,8 +1047,6 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
           </text>
           {detailLocalModel && (
             <>
-              <text style={{ fg: theme.muted }}>Precision: {detailLocalModel.presentation.precisionLabel}</text>
-              <text style={{ fg: theme.muted }}>Quantization: {detailLocalModel.presentation.quantization}</text>
               {detailLocalModel.catalogMembershipState._tag === "InCatalog" && detailLocalModel.catalogMembershipState.catalogData.quantizationAware && (
                 <text style={{ fg: theme.muted }}>Training: Quantization-aware</text>
               )}
@@ -1691,8 +1689,7 @@ const CatalogMenu = memo(function CatalogMenu({
         }}>
           <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.presentation.displayName}</text>
           <text style={{ fg: theme.muted }} wrapMode="word">
-            {detail.presentation.quantization}
-            {detail.catalogMembershipState._tag === "InCatalog" && detail.catalogMembershipState.catalogData.quantizationAware && " · QAT"}
+            {detail.presentation.variantLabel}
             {` · Fidelity: ${qualityLabel(detail)}`}
           </text>
           <text style={{ fg: theme.muted }} wrapMode="word">

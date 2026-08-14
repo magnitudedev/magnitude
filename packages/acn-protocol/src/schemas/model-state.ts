@@ -713,8 +713,6 @@ export const LocalModelPresentationSchema = Schema.Struct({
   variantLabel: ModelVariantLabelSchema,
   description: Schema.String,
   license: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
-  quantization: NonEmptyString,
-  precisionLabel: NonEmptyString,
 })
 export type LocalModelPresentation = typeof LocalModelPresentationSchema.Type
 

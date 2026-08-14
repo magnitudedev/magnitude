@@ -35,9 +35,6 @@ export type LocalInferenceSelection = LocalModelOption
 
 const modelPackages = (model: LocalModel) => servableModelBundlePackages(model.bundle)
 
-export const localModelQuantization = (model: LocalModel): string =>
-  model.presentation.quantization
-
 export const localModelMaximumContextLength = (model: LocalModel): number =>
   Math.min(...modelPackages(model).map(({ properties }) => properties.maximumContextLength))
 
@@ -357,8 +354,6 @@ export const selectionMetadata = ({ model }: LocalInferenceSelection): string =>
   })
   const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
   return [
-    model.presentation.precisionLabel,
-    model.presentation.quantization,
     formatDownloadBytes(model.downloadBytes),
     `${formatContext(contextLength)} ctx`,
     speculativeMethod,
