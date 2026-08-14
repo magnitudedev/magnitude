@@ -74,6 +74,15 @@ Provider model IDs continue to distinguish exact configurations.
 A slot selection contains only provider ID, provider model ID, and reasoning effort. It references
 an offering rather than copying its configuration.
 
+Model-slot availability preserves incomplete authority as `Pending`. A configured slot remains
+pending while its provider-catalog identity is unresolved or, for a local selection, while local
+offerings or installed-package inventory are not yet authoritative. Agent configuration derives
+the same lifecycle from the slot instead of reconstructing dependency readiness. A turn waits
+interruptibly on its coherent configuration-and-toolkit projection without delaying message
+publication. Once the observation terminalizes, a ready slot runs normally and a genuinely
+unassigned or unavailable slot produces the typed `ModelNotReady` turn outcome; initialization is
+never reported as an agent defect.
+
 The ACN slot boundary normalizes reasoning effort before persistence: it preserves a supported
 requested effort and otherwise selects the provider model's default. Stored selections are
 normalized through the same operation when the catalog becomes available. The client and agent do
@@ -171,6 +180,8 @@ reports the selected method, effective parameters, and whether drafting actually
 ## Failure behavior
 
 - Selected identity absent from an authoritative offering projection: ACN clears the selection.
+- Incomplete catalog, local-offering, or installed-package-inventory authority: agent slot
+  resolution remains pending and turn execution waits without a timeout.
 - Missing package: the provider catalog entry and slot are unavailable; chat does not trigger a
   download.
 - Configuration no longer fits or is incompatible: the provider catalog entry is disabled and load

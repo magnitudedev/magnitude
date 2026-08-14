@@ -4,6 +4,7 @@ import {
   ModelServingConfigurationIdSchema,
   type ModelInstanceAllocation,
   type ModelLoadPlan,
+  type ModelPackagesState,
   type ModelCapabilities,
   type ModelSlotAction,
   type ModelSlotAvailability,
@@ -124,11 +125,23 @@ export const modelSlotActions = (
 }
 
 export const localModelSlotAvailability = (
-  catalogAvailability: ModelSlotAvailability,
-  offeringExists: boolean,
-  installed: boolean,
+  input: {
+    readonly catalogIdentityPending: boolean
+    readonly offeringsReady: boolean
+    readonly inventory: ModelPackagesState["inventory"]
+    readonly offeringExists: boolean
+    readonly installed: boolean
+  },
 ): ModelSlotAvailability => {
-  if (!offeringExists) {
+  if (input.catalogIdentityPending
+    || !input.offeringsReady
+    || input.inventory._tag === "Initializing") {
+    return { _tag: "Pending" }
+  }
+  if (input.inventory._tag === "Degraded") {
+    return { _tag: "Unavailable", failure: input.inventory.failure }
+  }
+  if (!input.offeringExists) {
     return {
       _tag: "Unavailable",
       failure: {
@@ -138,7 +151,7 @@ export const localModelSlotAvailability = (
       },
     }
   }
-  if (!installed) {
+  if (!input.installed) {
     return {
       _tag: "Unavailable",
       failure: {
@@ -148,7 +161,7 @@ export const localModelSlotAvailability = (
       },
     }
   }
-  return catalogAvailability
+  return { _tag: "Available" }
 }
 
 export interface LocalOfferingSelectionEvidence {

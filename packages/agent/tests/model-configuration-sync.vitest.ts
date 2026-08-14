@@ -14,7 +14,6 @@ import {
 } from '../src/coding-agent'
 
 const config = (providerModelId: string): ConfigState => ({
-  catalogLoaded: true,
   bySlot: {
     primary: {
       _tag: 'Ready',
@@ -32,7 +31,7 @@ const config = (providerModelId: string): ConfigState => ({
         isFallback: false,
       },
     },
-    secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'not_loaded' },
+    secondary: { _tag: 'Pending', slotId: 'secondary' },
   },
 })
 

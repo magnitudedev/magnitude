@@ -345,6 +345,8 @@ export const ModelSlotControllerLive: Layer.Layer<
     selection: SlotSelection,
     catalogState: ProviderModelCatalogState,
   ): ModelSlotAvailability => {
+    if (catalogState._tag === "Loading") return { _tag: "Pending" }
+    const refreshing = catalogState._tag === "Refreshing"
     const contents = catalogContents(catalogState)
     const providerFailure = contents.failures.find((item) =>
       item._tag === "ProviderFailure" && item.providerId === selection.providerId)
@@ -352,7 +354,10 @@ export const ModelSlotControllerLive: Layer.Layer<
       return unavailable("provider_unavailable", providerFailure.message)
     }
     const provider = contents.providers.find((item) => item.providerId === selection.providerId)
-    if (!provider) return unavailable("provider_unavailable", "The selected provider is unavailable")
+    if (!provider) {
+      if (refreshing) return { _tag: "Pending" }
+      return unavailable("provider_unavailable", "The selected provider is unavailable")
+    }
     if (provider.authentication === "NotConfigured") {
       return unavailable("provider_not_configured", "The selected provider is not configured", false)
     }
@@ -365,7 +370,11 @@ export const ModelSlotControllerLive: Layer.Layer<
     const model = contents.models.find((item) =>
       item.providerId === selection.providerId
       && item.providerModelId === selection.providerModelId)
-    if (!model || model.availability._tag !== "Available") {
+    if (!model) {
+      if (refreshing) return { _tag: "Pending" }
+      return unavailable("model_unavailable", "The selected model is unavailable")
+    }
+    if (model.availability._tag !== "Available") {
       return unavailable("model_unavailable", "The selected model is unavailable")
     }
     return { _tag: "Available" }
@@ -390,6 +399,8 @@ export const ModelSlotControllerLive: Layer.Layer<
     const configured = yield* modelSelection.get
     const catalogState = (yield* catalog.snapshot).state
     const contents = catalogContents(catalogState)
+    const localOfferingsReady = yield* localOfferings.ready
+    const packageState = (yield* localPackages.snapshot).state
     const packages = yield* localPackages.installedPackageIds
     const native = yield* observedInstances.get
     const previousAggregate = yield* SubscriptionRef.get(aggregate)
@@ -433,11 +444,13 @@ export const ModelSlotControllerLive: Layer.Layer<
           const downloaded = offering !== undefined
             && servableModelBundlePackageIds(offering.configuration.bundle)
               .every((packageId) => packages.has(packageId))
-          const availability = localModelSlotAvailability(
-            { _tag: "Available" },
-            offering !== undefined,
-            downloaded,
-          )
+          const availability = localModelSlotAvailability({
+            catalogIdentityPending: baseAvailability._tag === "Pending",
+            offeringsReady: localOfferingsReady,
+            inventory: packageState.inventory,
+            offeringExists: offering !== undefined,
+            installed: downloaded,
+          })
           const configurationId = offering?.configuration.id
           const binding = previousAggregate.instanceBindings[slotKey(slotId)]
           const exact = Option.flatMap(binding, ({ configurationId: boundConfigurationId, instanceId }) =>
@@ -886,6 +899,9 @@ export const ModelSlotControllerLive: Layer.Layer<
       if (slot._tag !== "ConfiguredLocal" || Option.isNone(target)
         || !sameSelection(slot.selection, target.value.selection)) {
         return yield* reject(slotId, "The slot does not contain a previewable local model")
+      }
+      if (slot.availability._tag === "Pending") {
+        return yield* reject(slotId, "The selected local model is still initializing")
       }
       if (slot.availability._tag === "Unavailable") {
         return yield* new LocalModelMutationFailed(slot.availability.failure)

@@ -2026,9 +2026,11 @@ const HardwareMenu = memo(function HardwareMenu() {
                 Option.exists(currentSlot.value.instance, (instance) =>
                   instance.lifecycle._tag === "Stopping")
                   ? <text style={{ fg: theme.muted }}>Stopping model…</text>
-                  : currentSlot.value.availability._tag === "Unavailable"
-                    ? <text style={{ fg: theme.muted }}>{currentSlot.value.availability.failure.message}</text>
-                    : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
+                  : currentSlot.value.availability._tag === "Pending"
+                    ? <text style={{ fg: theme.muted }}>Initializing model…</text>
+                    : currentSlot.value.availability._tag === "Unavailable"
+                      ? <text style={{ fg: theme.muted }}>{currentSlot.value.availability.failure.message}</text>
+                      : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
               onSome: (currentAction) => (
                 <MenuAction
                   label={currentAction === "load" ? "Load model" : "Stop model"}
