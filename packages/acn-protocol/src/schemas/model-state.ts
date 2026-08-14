@@ -958,6 +958,7 @@ export const ModelSlotDescriptorSchema = Schema.Struct({
 export type ModelSlotDescriptor = typeof ModelSlotDescriptorSchema.Type
 
 export const ModelSlotAvailabilitySchema = Schema.Union(
+  Schema.TaggedStruct("Pending", {}),
   Schema.TaggedStruct("Available", {}),
   Schema.TaggedStruct("Unavailable", { failure: ModelFailureSchema }),
 )

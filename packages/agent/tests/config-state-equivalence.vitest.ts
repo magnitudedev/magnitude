@@ -13,7 +13,6 @@ import {
 const configState = (
   overrides: Partial<SlotConfig> = {},
 ): ConfigState => ({
-  catalogLoaded: true,
   bySlot: {
     primary: {
       _tag: 'Ready',

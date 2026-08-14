@@ -106,18 +106,17 @@ describe("model slot projection", () => {
       _tag: "Unavailable",
       failure: { code: "offline", message: "offline", retryable: true },
     }, Option.none())).toEqual([])
+    expect(modelSlotActions({ _tag: "Pending" }, Option.none())).toEqual([])
   })
 
   it("keeps a durable local offering selected while its packages download", () => {
-    const catalogUnavailable = {
-      _tag: "Unavailable" as const,
-      failure: {
-        code: "model_unavailable",
-        message: "The catalog has not published the model yet",
-        retryable: true,
-      },
-    }
-    expect(localModelSlotAvailability(catalogUnavailable, true, false)).toEqual({
+    expect(localModelSlotAvailability({
+      catalogIdentityPending: false,
+      offeringsReady: true,
+      inventory: { _tag: "Ready" },
+      offeringExists: true,
+      installed: false,
+    })).toEqual({
       _tag: "Unavailable",
       failure: {
         code: "local_model_not_installed",
@@ -125,6 +124,22 @@ describe("model slot projection", () => {
         retryable: true,
       },
     })
+  })
+
+  it("keeps incomplete local authority pending", () => {
+    const input = {
+      catalogIdentityPending: false,
+      offeringsReady: true,
+      inventory: { _tag: "Initializing" },
+      offeringExists: true,
+      installed: false,
+    } as const
+    expect(localModelSlotAvailability(input)).toEqual({ _tag: "Pending" })
+    expect(localModelSlotAvailability({
+      ...input,
+      catalogIdentityPending: true,
+      inventory: { _tag: "Ready" },
+    })).toEqual({ _tag: "Pending" })
   })
 
   it("admits a durable offering before catalog publication", () => {

@@ -132,6 +132,7 @@ const makeHarness = (options: {
   readonly catalogAvailability?: ProviderModelCatalogEntry["availability"]
   readonly blockStop?: boolean
   readonly localOfferingsReady?: boolean
+  readonly packageInventoryInitializing?: boolean
 } = {}) => Effect.gen(function* () {
   const configuration = yield* SubscriptionRef.make({
     slots: {
@@ -237,10 +238,16 @@ const makeHarness = (options: {
       },
     } as unknown as MagnitudeStorageShape),
     Layer.succeed(LocalModelPackages, LocalModelPackages.of({
-      initialized: Effect.succeed(true),
+      initialized: Effect.succeed(options.packageInventoryInitializing !== true),
       snapshot: Effect.succeed({
         revision: 0,
-        state: { inventory: { _tag: "Ready" }, entries: [], downloads: [] },
+        state: {
+          inventory: options.packageInventoryInitializing === true
+            ? { _tag: "Initializing" }
+            : { _tag: "Ready" },
+          entries: [],
+          downloads: [],
+        },
       }),
       changes: Stream.empty,
       installedPackageIds: Effect.succeed(
@@ -377,9 +384,37 @@ describe("ModelSlotController load admission", () => {
         localOfferingsReady: false,
       })
       yield* Effect.gen(function* () {
-        yield* ModelSlotController
+        const controller = yield* ModelSlotController
         expect(Option.isSome((yield* SubscriptionRef.get(harness.configuration)).slots.primary))
           .toBe(true)
+        expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          availability: { _tag: "Pending" },
+        })
+        expect((yield* controller.agentModelConfiguration).bySlot.primary).toEqual({
+          _tag: "Pending",
+          slotId: "primary",
+        })
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("keeps agent configuration pending until installed-package inventory is authoritative", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        packageInventoryInitializing: true,
+        projectedInstalled: false,
+      })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          availability: { _tag: "Pending" },
+        })
+        expect((yield* controller.agentModelConfiguration).bySlot.primary).toEqual({
+          _tag: "Pending",
+          slotId: "primary",
+        })
       }).pipe(Effect.provide(harness.layer))
     })))
   })

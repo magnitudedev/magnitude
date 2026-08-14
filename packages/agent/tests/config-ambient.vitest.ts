@@ -21,6 +21,38 @@ import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 describe('agent model configuration boundary', () => {
   const instanceId = ModelInstanceIdSchema.make("test-instance")
   const configurationId = ModelServingConfigurationIdSchema.make("configuration")
+
+  it('preserves pending slot availability', () => {
+    const reasoningEffort = ReasoningEffortSchema.make('none')
+    const remoteSelection: SlotSelection = {
+      providerId: ProviderIdSchema.make('magnitude'),
+      providerModelId: ProviderModelIdSchema.make('remote:model'),
+      reasoningEffort,
+    }
+    const policy = { softCapRatio: 0.9, softCapMaxTokens: 200_000 }
+    const slots: ModelSlotsState['slots'] = {
+      primary: new ModelSlotConfiguredRemote({
+        slotId: PRIMARY_SLOT_ID,
+        selection: remoteSelection,
+        descriptor: {
+          providerId: remoteSelection.providerId,
+          providerModelId: remoteSelection.providerModelId,
+          displayName: 'Remote model',
+          variantLabel: Option.none(),
+        },
+        availability: { _tag: 'Pending' },
+        actions: [],
+      }),
+      secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
+    }
+
+    expect(buildConfigStateFromSlots(
+      [],
+      slots,
+      policy,
+    ).bySlot.primary).toEqual({ _tag: 'Pending', slotId: 'primary' })
+  })
+
   it.each([
     ['not loaded', Option.none()],
     ['loading', Option.some({
@@ -168,7 +200,11 @@ describe('agent model configuration boundary', () => {
     expect(state.bySlot.primary).toEqual({
       _tag: 'Unavailable',
       slotId: 'primary',
-      reason: 'provider_not_configured',
+      failure: {
+        code: 'provider_not_configured',
+        message: 'Set OPENROUTER_API_KEY and restart Magnitude',
+        retryable: false,
+      },
     })
     expect(state.bySlot.secondary).toEqual({
       _tag: 'Unassigned',

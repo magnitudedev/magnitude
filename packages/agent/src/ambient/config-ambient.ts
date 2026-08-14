@@ -2,7 +2,11 @@ import { Ambient } from '@magnitudedev/event-core'
 import { Effect, Schema } from 'effect'
 import { formatModelDisplayName } from '@magnitudedev/acn-protocol'
 
-import type { ModelSlotsState, ProviderModelCatalogEntry } from '@magnitudedev/sdk'
+import {
+  ModelFailureSchema,
+  type ModelSlotsState,
+  type ProviderModelCatalogEntry,
+} from '@magnitudedev/sdk'
 import { type SlotId } from '@magnitudedev/roles'
 import {
   ProviderIdSchema,
@@ -40,16 +44,20 @@ export const AgentSlotStateSchema = Schema.Union(
   Schema.TaggedStruct('Unassigned', {
     slotId: Schema.Literal('primary', 'secondary'),
   }),
+  Schema.TaggedStruct('Pending', {
+    slotId: Schema.Literal('primary', 'secondary'),
+  }),
   Schema.TaggedStruct('Ready', {
     config: SlotConfigSchema,
   }),
   Schema.TaggedStruct('Unavailable', {
     slotId: Schema.Literal('primary', 'secondary'),
-    reason: Schema.String,
+    failure: ModelFailureSchema,
   }),
 )
 export type AgentSlotState = typeof AgentSlotStateSchema.Type
 export type UnassignedAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unassigned' }>
+export type PendingAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Pending' }>
 export type ReadyAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Ready' }>
 export type UnavailableAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unavailable' }>
 
@@ -58,7 +66,6 @@ export const ConfigStateSchema = Schema.Struct({
     primary: AgentSlotStateSchema,
     secondary: AgentSlotStateSchema,
   }),
-  catalogLoaded: Schema.Boolean,
 })
 export type ConfigState = typeof ConfigStateSchema.Type
 
@@ -83,6 +90,10 @@ export function getSlotConfigForRole(state: ConfigState, roleId: RoleId): SlotCo
   return getSlotConfig(state, slotId)
 }
 
+export function getSlotStateForRole(state: ConfigState, roleId: RoleId): AgentSlotState {
+  return state.bySlot[ROLE_TO_SLOT[roleId]]
+}
+
 export class NoModelForSlotError extends Error {
   constructor(
     public readonly slotId: SlotId,
@@ -96,10 +107,9 @@ export const ConfigAmbient = Ambient.define<ConfigState, never>({
   name: 'Config',
   initial: Effect.succeed({
     bySlot: {
-      primary: { _tag: 'Unavailable', slotId: 'primary', reason: 'not_loaded' },
-      secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'not_loaded' },
+      primary: { _tag: 'Pending', slotId: 'primary' },
+      secondary: { _tag: 'Pending', slotId: 'secondary' },
     },
-    catalogLoaded: false,
   }),
 })
 
@@ -113,13 +123,24 @@ export function buildConfigStateFromSlots(
     if (slot._tag === 'Unassigned') {
       return { _tag: 'Unassigned', slotId }
     }
+    if (slot.availability._tag === 'Pending') {
+      return { _tag: 'Pending', slotId }
+    }
     if (slot.availability._tag === 'Unavailable') {
-      return { _tag: 'Unavailable', slotId, reason: slot.availability.failure.code }
+      return { _tag: 'Unavailable', slotId, failure: slot.availability.failure }
     }
     const selectedModel = catalogModels.find((model) => model.providerId === slot.selection.providerId
       && model.providerModelId === slot.selection.providerModelId)
     if (!selectedModel) {
-      return { _tag: 'Unavailable', slotId, reason: 'catalog_model_missing' }
+      return {
+        _tag: 'Unavailable',
+        slotId,
+        failure: {
+          code: 'catalog_model_missing',
+          message: 'The selected model is not available in the provider catalog.',
+          retryable: false,
+        },
+      }
     }
     const hardCap = selectedModel.contextWindow - OUTPUT_TOKEN_RESERVE
     const { softCap } = computeContextLimits(hardCap, policy)
@@ -151,6 +172,5 @@ export function buildConfigStateFromSlots(
       primary: buildSlot('primary'),
       secondary: buildSlot('secondary'),
     },
-    catalogLoaded: true,
   }
 }

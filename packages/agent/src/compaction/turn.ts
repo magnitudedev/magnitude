@@ -31,14 +31,12 @@ import { buildStandardHooks } from '../execution/harness-hooks'
 import type { RoleId } from '../agents/role-validation'
 import { COMPACTION_MAX_RETRIES } from '../constants'
 import type { AgentLifecycleState } from '../projections/agent-lifecycle'
-import { ConfigAmbient } from '../ambient/config-ambient'
-import { getSlotConfigForRole } from '../ambient/config-ambient'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
 import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
-import { readCoherentAgentToolkit } from '../projections/agent-toolkit'
+import { awaitSettledAgentToolkit } from '../projections/agent-toolkit'
 
 class CompactionTurnError extends Data.TaggedError('CompactionTurnError')<{
-  readonly reason: 'ForkLayerMissing' | 'EmptyResponse'
+  readonly reason: 'ForkLayerMissing' | 'ModelUnavailable' | 'EmptyResponse'
   readonly message: string
 }> {}
 import { createId } from '../util/id'
@@ -64,17 +62,21 @@ export function runCompactionTurn(
   return Effect.gen(function* () {
     const agentDef = getAgentDefinition(roleId)
 
-    // Resolve model (same as Cortex)
+    // Resolve the same projected tool/config state used by ordinary turns.
+    const { slot, toolkit: toolkitState } = yield* awaitSettledAgentToolkit(forkId, roleId)
+    if (slot._tag !== 'Ready') {
+      return yield* new CompactionTurnError({
+        reason: 'ModelUnavailable',
+        message: `No model is available for the ${slot.slotId} slot`,
+      })
+    }
     const modelResolver = yield* AgentModelResolver
     const agentId = forkId
       ? getAgentByForkId(agentStatus, forkId)?.agentId ?? '000000000000'
       : '000000000000'
-    // Resolve the same projected tool/config state used by ordinary turns.
-    const ambientService = yield* AmbientServiceTag
-    const { config: configState, toolkit: toolkitState } = yield* readCoherentAgentToolkit(read, forkId)
-    const activeSlot = getSlotConfigForRole(configState, roleId)
-    const agentModel = yield* modelResolver.resolveSlotConfig(activeSlot, agentId, roleId)
+    const agentModel = yield* modelResolver.resolveSlotConfig(slot.config, agentId, roleId)
 
+    const ambientService = yield* AmbientServiceTag
     const sessionOptions = ambientService.getValue(SessionOptionsAmbient)
     const toolkit = materializeAgentToolkit(ambientService.getValue(ToolUniverseAmbient), toolkitState.toolKeys)
     const execManager = yield* ExecutionManager
@@ -158,7 +160,7 @@ export function runCompactionTurn(
         formatter,
         autopilotEnabled: windowState.autopilotEnabled,
         leaderLastAutopilotKnowledge: windowState.consumerAutopilotKnowledge.leader,
-        includeImageData: activeSlot.vision === true,
+        includeImageData: slot.config.vision === true,
       })
       const compactionPrompt = buildCompactionPrompt(basePrompt)
 
