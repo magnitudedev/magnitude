@@ -27,7 +27,7 @@ import { localCatalogProviderModelId } from "./local-provider-model-id"
 
 export interface ResolvedLocalModelConfiguration {
   readonly servingConfiguration: ModelServingConfiguration
-  readonly catalogIdentity: Option.Option<CatalogIdentity>
+  readonly catalogModel: Option.Option<RecommendableModel>
   readonly assessment: Option.Option<CoordinatedLocalModelAssessment["assessment"]>
 }
 
@@ -123,10 +123,7 @@ export const resolveLocalModelConfigurations = (input: {
     const catalogModel = catalogByIdentity.get(identity)
     return [identity, {
       servingConfiguration,
-      catalogIdentity: Option.fromNullable(catalogModel).pipe(Option.map(({ modelId, variantId }) => ({
-        modelId,
-        variantId,
-      }))),
+      catalogModel: Option.fromNullable(catalogModel),
       assessment,
     }] as const
   }))

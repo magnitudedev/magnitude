@@ -8,9 +8,7 @@ import {
   type ServableModelBundle,
   type ModelServingConfiguration,
   type ModelPackageEntry,
-  type RecommendableModel,
   servableModelBundlePackageIds,
-  ServableModelBundleSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   ProviderModelCatalogEntrySchema,
@@ -18,12 +16,11 @@ import {
   type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/sdk"
-import { IcnCatalog, IcnInstalledModels } from "@magnitudedev/icn"
+import { IcnInstalledModels } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import {
   modelPackageFromIcn,
   packageInspectionFromIcn,
-  recommendableModelFromIcn,
 } from "./local-model-icn-adapter"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver"
@@ -91,12 +88,8 @@ const failure = (operation: string, error: unknown) =>
 
 const capabilitySet = (
   bundle: ServableModelBundle,
-  catalog: readonly RecommendableModel[],
   installed: readonly Pick<ModelPackageEntry, "package" | "inspection">[],
 ): ModelCapabilities => {
-  const sameBundle = Schema.equivalence(ServableModelBundleSchema)
-  const recommendation = catalog.find((model) => sameBundle(model.configuration.bundle, bundle))
-  if (recommendation) return recommendation.capabilities
   const primaryPackageId = bundle._tag === "Standalone" ? bundle.package.id : bundle.target.id
   const inspection = installed.find(({ package: modelPackage }) =>
     modelPackage.id === primaryPackageId)?.inspection
@@ -134,53 +127,41 @@ export class LocalProviderOfferings extends Context.Tag("LocalProviderOfferings"
 export const LocalProviderOfferingsLive: Layer.Layer<
   LocalProviderOfferings,
   never,
-  IcnCatalog | IcnInstalledModels | LocalModelConfigurationResolver | LocalModelPackages
+  IcnInstalledModels | LocalModelConfigurationResolver | LocalModelPackages
 > = Layer.scoped(LocalProviderOfferings, Effect.gen(function* () {
-  const catalog = yield* IcnCatalog
   const installed = yield* IcnInstalledModels
   const resolver = yield* LocalModelConfigurationResolver
   const packages = yield* LocalModelPackages
 
-  const capabilitySources = Effect.all({
-    catalog: catalog.get.pipe(
-      Effect.flatMap((snapshot) => Effect.forEach(
-        snapshot.state.models,
-        recommendableModelFromIcn,
-      ).pipe(Effect.map((models) => ({ revision: snapshot.revision, models })))),
-      Effect.mapError((error) => failure("read_recommendable_model_catalog_failed", error)),
-    ),
-    installed: installed.get.pipe(
-      Effect.flatMap((snapshot) => Effect.forEach(
-        snapshot.state.packages,
-        (entry) => Effect.all({
-          package: modelPackageFromIcn(entry.package),
-          inspection: packageInspectionFromIcn(entry.inspection),
-        }),
-      ).pipe(Effect.map((entries) => ({ revision: snapshot.revision, entries })))),
-      Effect.mapError((error) => failure("read_installed_model_capabilities_failed", error)),
-    ),
-  })
+  const installedCapabilities = installed.get.pipe(
+    Effect.flatMap((snapshot) => Effect.forEach(
+      snapshot.state.packages,
+      (entry) => Effect.all({
+        package: modelPackageFromIcn(entry.package),
+        inspection: packageInspectionFromIcn(entry.inspection),
+      }),
+    )),
+    Effect.mapError((error) => failure("read_installed_model_capabilities_failed", error)),
+  )
 
   const offeringsFrom = (
     resolved: readonly import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration[],
-    sources: Effect.Effect.Success<typeof capabilitySources>,
-  ): readonly LocalProviderOffering[] => resolved.map(({ servingConfiguration, catalogIdentity }) => ({
-    providerModelId: Option.match(catalogIdentity, {
+    installedEntries: Effect.Effect.Success<typeof installedCapabilities>,
+  ): readonly LocalProviderOffering[] => resolved.map(({ servingConfiguration, catalogModel }) => ({
+    providerModelId: Option.match(catalogModel, {
       onNone: () => localProviderModelId(servingConfiguration.id),
       onSome: localCatalogProviderModelId,
     }),
     configuration: servingConfiguration,
-    capabilities: capabilitySet(
-      servingConfiguration.bundle,
-      sources.catalog.models,
-      sources.installed.entries,
-    ),
+    capabilities: Option.match(catalogModel, {
+      onNone: () => capabilitySet(servingConfiguration.bundle, installedEntries),
+      onSome: (model) => model.capabilities,
+    }),
   }))
 
   const list: LocalProviderOfferingsApi["list"] = Effect.gen(function* () {
     const resolved = [...(yield* resolver.get).values()]
-    const sources = yield* capabilitySources
-    return offeringsFrom(resolved, sources)
+    return offeringsFrom(resolved, yield* installedCapabilities)
   }).pipe(
     Effect.mapError((error) => error instanceof LocalModelMutationFailed
       ? error
@@ -189,7 +170,6 @@ export const LocalProviderOfferingsLive: Layer.Layer<
 
   const changes = Stream.mergeAll([
     resolver.changes,
-    catalog.changes.pipe(Stream.map(() => undefined)),
     installed.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" })
 
@@ -211,14 +191,12 @@ export const LocalProviderOfferingsLive: Layer.Layer<
 
   const compute = Effect.gen(function* () {
     const resolved = [...(yield* resolver.get).values()]
-    const configurations = resolved.map(({ servingConfiguration }) => servingConfiguration)
-    const sources = yield* capabilitySources
-    const catalogModels = sources.catalog.models
+    const installedEntries = yield* installedCapabilities
     const packageSnapshot = yield* packages.snapshot
     const packageEntries = new Map(
       packageSnapshot.state.entries.map((entry) => [entry.package.id, entry]),
     )
-    const configured = offeringsFrom(resolved, sources)
+    const configured = offeringsFrom(resolved, installedEntries)
     const packageEvidence = providerOfferingPackageEvidence(configured, packageEntries)
     const bundleEntries = configured.map(({ configuration }) =>
       servableModelBundlePackageIds(configuration.bundle).map((id) => packageEntries.get(id)))
@@ -226,15 +204,13 @@ export const LocalProviderOfferingsLive: Layer.Layer<
       entries.every((entry) => entry?.localState._tag === "Installed"))
     const inspectable = bundleEntries.map((entries, index) => installedBundles[index]
       && entries.every((entry) => entry?.inspection._tag === "Inspected"))
-    const sameBundle = Schema.equivalence(ServableModelBundleSchema)
     const entries = configured.map((offering, index): ProviderModelCatalogEntry => {
       const { bundle, profile } = offering.configuration
       const installed = installedBundles[index] ?? false
       const assessment = inspectable[index]
         ? Option.getOrUndefined(resolved[index]?.assessment ?? Option.none())
         : undefined
-      const curated = catalogModels.find((model) =>
-        sameBundle(model.configuration.bundle, bundle))
+      const curated = Option.getOrUndefined(resolved[index]?.catalogModel ?? Option.none())
       const presentation = resolveBundlePresentation(bundle, curated && {
         displayName: curated.displayName,
         variantLabel: curated.variantLabel,

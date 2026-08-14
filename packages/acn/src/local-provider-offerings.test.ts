@@ -7,7 +7,6 @@ import {
   type ModelPackageEntry,
 } from "@magnitudedev/acn-protocol"
 import {
-  IcnCatalog,
   IcnHardware,
   IcnInstalledModels,
 } from "@magnitudedev/icn"
@@ -94,7 +93,7 @@ describe("local provider offering projection", () => {
             {
               servingConfiguration: configuration,
               assessment: Option.some({ _tag: "Assessing" }),
-              catalogIdentity: Option.none(),
+              catalogModel: Option.none(),
             },
           ]])),
           changes: Stream.never,
@@ -102,14 +101,8 @@ describe("local provider offering projection", () => {
           resolve: () => Effect.succeed(Option.some({
             servingConfiguration: configuration,
             assessment: Option.some({ _tag: "Assessing" }),
-            catalogIdentity: Option.none(),
+            catalogModel: Option.none(),
           })),
-        })),
-        Layer.succeed(IcnCatalog, IcnCatalog.of({
-          get: Effect.succeed({ revision: 1, state: { models: [], diagnostics: [] } }),
-          changes: Stream.never,
-          ready: Effect.succeed(true),
-          refresh: Effect.void,
         })),
         Layer.succeed(IcnInstalledModels, IcnInstalledModels.of({
           get: Effect.succeed({
