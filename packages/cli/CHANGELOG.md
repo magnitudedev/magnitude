@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.5
+
+### Patch Changes
+
+- [`e23e3f2`](https://github.com/magnitudedev/magnitude/commit/e23e3f2c5e42e86b348cb91b79cd30036721ed36) Thanks [@anerli](https://github.com/anerli)! - update drafters for deepseek v4 flash, nemotron lightning, muse glimmer
+
+- [`d319b12`](https://github.com/magnitudedev/magnitude/commit/d319b1221b39f4f9e36521367721e75b9a11c840) Thanks [@anerli](https://github.com/anerli)! - add qwen 3.8 27b support
+
 ## 0.0.4
 
 ### Patch Changes
