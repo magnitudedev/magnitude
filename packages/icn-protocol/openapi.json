@@ -5191,6 +5191,20 @@
         },
         "additionalProperties": false
       },
+      "PromptTokensDetails": {
+        "type": "object",
+        "required": [
+          "cached_tokens"
+        ],
+        "properties": {
+          "cached_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "PropsResponse": {
         "type": "object",
         "required": [
@@ -5906,7 +5920,8 @@
         "required": [
           "prompt_tokens",
           "completion_tokens",
-          "total_tokens"
+          "total_tokens",
+          "prompt_tokens_details"
         ],
         "properties": {
           "prompt_tokens": {
@@ -5923,6 +5938,9 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "prompt_tokens_details": {
+            "$ref": "#/components/schemas/PromptTokensDetails"
           }
         },
         "additionalProperties": false
