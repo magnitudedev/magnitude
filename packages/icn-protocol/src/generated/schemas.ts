@@ -1717,6 +1717,12 @@ export const PreviewModelLoadRequest = S.Struct({
 export type PreviewModelLoadRequest = S.Schema.Type<typeof PreviewModelLoadRequest>
 export type PreviewModelLoadRequestEncoded = S.Schema.Encoded<typeof PreviewModelLoadRequest>
 
+export const PromptTokensDetails = S.Struct({
+  cached_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type PromptTokensDetails = S.Schema.Type<typeof PromptTokensDetails>
+export type PromptTokensDetailsEncoded = S.Schema.Encoded<typeof PromptTokensDetails>
+
 export const PropsResponse = S.Struct({
   build_info: S.String,
   chat_template: S.String,
@@ -1994,6 +2000,9 @@ export type ToolChoiceRequestEncoded = S.Schema.Encoded<typeof ToolChoiceRequest
 export const Usage = S.Struct({
   completion_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   prompt_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  prompt_tokens_details: S.suspend(
+    (): S.Schema<PromptTokensDetails, PromptTokensDetailsEncoded> => PromptTokensDetails,
+  ),
   total_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type Usage = S.Schema.Type<typeof Usage>
