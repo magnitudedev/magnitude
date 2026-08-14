@@ -1,6 +1,7 @@
 import { Effect, Option, ParseResult, Schema } from "effect"
 import type {
   ModelBundleDownload,
+  CatalogIdentity,
   ServableModelBundle,
   ModelPackage,
   ModelPackageInspection,
@@ -10,6 +11,7 @@ import type {
 } from "@magnitudedev/acn-protocol"
 import {
   ModelBundleDownloadSchema,
+  CatalogIdentitySchema,
   ServableModelBundleSchema,
   ModelPackageInspectionSchema,
   ModelPackageSchema,
@@ -19,6 +21,7 @@ import {
 } from "@magnitudedev/acn-protocol"
 import type {
   ModelDownload as NativeModelDownload,
+  CatalogModel as NativeCatalogModel,
   ServableModelBundle as NativeServableModelBundle,
   ModelPackageInspection as NativeModelPackageInspection,
   ModelPackage as NativeModelPackage,
@@ -27,6 +30,32 @@ import type {
   RecommendableModel as NativeRecommendableModel,
   ServingProfile as NativeServingProfile,
 } from "@magnitudedev/icn-protocol/schemas"
+
+export const catalogIdentityFromIcn = (
+  model: Pick<NativeCatalogModel, "modelId" | "variantId">,
+): Effect.Effect<CatalogIdentity, ParseResult.ParseError> =>
+  Schema.decodeUnknown(CatalogIdentitySchema)({
+    modelId: model.modelId,
+    variantId: model.variantId,
+  })
+
+export const catalogModelDefinitionFromIcn = (
+  model: NativeCatalogModel,
+): Effect.Effect<RecommendableModel, ParseResult.ParseError> =>
+  recommendableModelFromIcn({
+    ...model,
+    configuration: model.desiredConfiguration,
+  })
+
+export const catalogModelEffectiveConfigurationFromIcn = (
+  model: NativeCatalogModel,
+): Effect.Effect<Option.Option<ModelServingConfiguration>, ParseResult.ParseError> =>
+  model.localState._tag === "Installed"
+    && model.localState.installation.effectiveConfiguration._tag === "Runnable"
+    ? modelServingConfigurationFromIcn(
+        model.localState.installation.effectiveConfiguration.configuration,
+      ).pipe(Effect.map(Option.some))
+    : Effect.succeed(Option.none())
 
 const normalizeModelPackageFromIcn = (
   modelPackage: NativeModelPackage,

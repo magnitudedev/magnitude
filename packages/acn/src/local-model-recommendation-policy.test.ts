@@ -8,7 +8,8 @@ import {
   ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
   ModelVariantLabelSchema,
-  RecommendableModelIdSchema,
+  CatalogModelIdSchema,
+  CatalogVariantIdSchema,
 } from "@magnitudedev/acn-protocol"
 import {
   assembleRecommendationCatalogCandidates,
@@ -39,8 +40,9 @@ const candidate = (input: {
   readonly capacityGiB?: number
   readonly architecture?: "dense" | "moe"
 }): RecommendationCandidate => {
-  const checkpointId = input.checkpoint ?? input.id
-  const artifactId = input.artifact ?? `${checkpointId}:q${input.fidelity ?? 60}`
+  const catalogModelId = input.checkpoint ?? input.id
+  const artifactId = input.artifact ?? `${catalogModelId}:q${input.fidelity ?? 60}`
+  const qualityTrack = artifactId.split(":").at(-1) ?? "q4"
   const context = input.context ?? 100_000
   const expected = input.expected ?? 30
   const fidelity = input.fidelity ?? 60
@@ -57,8 +59,8 @@ const candidate = (input: {
   ])].sort((left, right) => left - right)
   return {
     model: {
-      id: RecommendableModelIdSchema.make(artifactId),
-      checkpointId,
+      modelId: CatalogModelIdSchema.make(catalogModelId),
+      variantId: CatalogVariantIdSchema.make(`gguf:${qualityTrack}`),
       configuration: {
         id: configurationId,
         bundle: {
@@ -85,6 +87,8 @@ const candidate = (input: {
             quantizationName: `${fidelity}-bit`,
             architecture: input.architecture ?? "dense",
             maximumContextLength: context,
+            intrinsicModelId: Option.some(catalogModelId),
+            intrinsicQualityId: Option.some(`Q${fidelity}`),
           },
           },
         },
@@ -142,7 +146,7 @@ const candidate = (input: {
       }),
     },
     artifactId,
-    checkpointId,
+    catalogModelId,
     capability: input.score === undefined
       ? undefined
       : {
@@ -363,8 +367,8 @@ describe("local model multicriteria recommendation policy", () => {
     ])
     expect(recommendations.map(({ recommendableModelId, intent }) =>
       [recommendableModelId, intent])).toEqual([
-      ["same:q6", "balanced"],
-      ["same:q8", "best_quality"],
+      ["same:gguf:q6", "balanced"],
+      ["same:gguf:q8", "best_quality"],
     ])
   })
 

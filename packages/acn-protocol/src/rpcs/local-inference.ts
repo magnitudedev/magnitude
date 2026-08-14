@@ -3,9 +3,10 @@ import { Schema } from "effect"
 import { LocalInferenceError } from "../errors"
 import {
   ModelDownloadIdSchema,
+  CatalogIdentitySchema,
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
-  LocalModelInstallationAdmissionSchema,
+  CatalogModelReconciliationAdmissionSchema,
   ModelInstanceIdSchema,
   ModelLoadAdmissionSchema,
   ModelLoadPlanSchema,
@@ -25,9 +26,9 @@ export const LocalModelsMirror = defineMirroredState("GetLocalModels", {
   errorSchema: Schema.Never,
 })
 
-export const InstallModel = Rpc.make("InstallModel", {
-  payload: Schema.Struct({ configurationId: ModelServingConfigurationIdSchema }),
-  success: LocalModelInstallationAdmissionSchema,
+export const ReconcileCatalogModel = Rpc.make("ReconcileCatalogModel", {
+  payload: CatalogIdentitySchema,
+  success: CatalogModelReconciliationAdmissionSchema,
   error: LocalInferenceError,
 })
 

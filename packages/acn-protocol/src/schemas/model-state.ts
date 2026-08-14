@@ -159,9 +159,28 @@ export const ModelStoppingAllocationSchema = Schema.Union(
 )
 export type ModelStoppingAllocation = typeof ModelStoppingAllocationSchema.Type
 
-export const RecommendableModelIdSchema =
-  NonEmptyString.pipe(Schema.brand("RecommendableModelId"))
-export type RecommendableModelId = typeof RecommendableModelIdSchema.Type
+export const CatalogModelIdSchema = NonEmptyString.pipe(
+  Schema.filter((value) => !value.includes(":"), {
+    message: () => "catalog model ID must contain one identity component",
+  }),
+  Schema.brand("CatalogModelId"),
+)
+export type CatalogModelId = typeof CatalogModelIdSchema.Type
+
+export const CatalogVariantIdSchema = NonEmptyString.pipe(
+  Schema.filter((value) => {
+    const components = value.split(":")
+    return components.length === 2 && components.every((component) => component.length > 0)
+  }, { message: () => "catalog variant ID must be format:quality" }),
+  Schema.brand("CatalogVariantId"),
+)
+export type CatalogVariantId = typeof CatalogVariantIdSchema.Type
+
+export const CatalogIdentitySchema = Schema.Struct({
+  modelId: CatalogModelIdSchema,
+  variantId: CatalogVariantIdSchema,
+})
+export type CatalogIdentity = typeof CatalogIdentitySchema.Type
 
 export const RecommendationIdSchema = NonEmptyString.pipe(Schema.brand("RecommendationId"))
 export type RecommendationId = typeof RecommendationIdSchema.Type
@@ -239,6 +258,8 @@ export const ModelPackagePropertiesSchema = Schema.Struct({
   quantizationName: NonEmptyString,
   architecture: NonEmptyString,
   maximumContextLength: PositiveSafeInteger,
+  intrinsicModelId: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  intrinsicQualityId: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
 })
 export type ModelPackageProperties = typeof ModelPackagePropertiesSchema.Type
 
@@ -289,10 +310,18 @@ export const ModelPackageLocalStateSchema = Schema.Union(
 )
 export type ModelPackageLocalState = typeof ModelPackageLocalStateSchema.Type
 
+export const InstalledCatalogAttributionSchema = Schema.Union(
+  Schema.TaggedStruct("NotCatalogTarget", {}),
+  Schema.TaggedStruct("Attributed", CatalogIdentitySchema.fields),
+  Schema.TaggedStruct("Failed", { failure: ModelFailureSchema }),
+)
+export type InstalledCatalogAttribution = typeof InstalledCatalogAttributionSchema.Type
+
 export const ModelPackageEntrySchema = Schema.Struct({
   package: ModelPackageSchema,
   localState: ModelPackageLocalStateSchema,
   inspection: ModelPackageInspectionSchema,
+  catalogAttribution: InstalledCatalogAttributionSchema,
 })
 export type ModelPackageEntry = typeof ModelPackageEntrySchema.Type
 
@@ -399,8 +428,7 @@ export const RecommendableModelCapabilitiesSchema = ModelCapabilitiesSchema
 export type RecommendableModelCapabilities = typeof RecommendableModelCapabilitiesSchema.Type
 
 export const RecommendableModelSchema = Schema.Struct({
-  id: RecommendableModelIdSchema,
-  checkpointId: NonEmptyString,
+  ...CatalogIdentitySchema.fields,
   configuration: ModelServingConfigurationSchema,
   displayName: NonEmptyString,
   variantLabel: ModelVariantLabelSchema,
@@ -494,8 +522,8 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
 )
 export type LocalModelAcquisitionState = typeof LocalModelAcquisitionStateSchema.Type
 
-export const LocalModelInstallationAdmissionSchema = Schema.Union(
-  Schema.TaggedStruct("AlreadyInstalled", {
+export const CatalogModelReconciliationAdmissionSchema = Schema.Union(
+  Schema.TaggedStruct("Current", {
     providerModelId: ProviderModelIdSchema,
   }),
   Schema.TaggedStruct("DownloadAdmitted", {
@@ -503,7 +531,8 @@ export const LocalModelInstallationAdmissionSchema = Schema.Union(
     downloadId: ModelDownloadIdSchema,
   }),
 )
-export type LocalModelInstallationAdmission = typeof LocalModelInstallationAdmissionSchema.Type
+export type CatalogModelReconciliationAdmission =
+  typeof CatalogModelReconciliationAdmissionSchema.Type
 
 export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "insufficient_resources",
@@ -561,6 +590,7 @@ export type LocalModelConfigurationAssessment =
   typeof LocalModelConfigurationAssessmentSchema.Type
 
 export const LocalModelCatalogDataSchema = Schema.Struct({
+  ...CatalogIdentitySchema.fields,
   intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   intelligenceScoreSource: NonEmptyString,
   fidelityRank: NonNegativeSafeInteger,
@@ -571,6 +601,7 @@ export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
 
 export const LocalModelCatalogMembershipStateSchema = Schema.Union(
   Schema.TaggedStruct("NotInCatalog", {}),
+  Schema.TaggedStruct("AttributionFailed", { failure: ModelFailureSchema }),
   Schema.TaggedStruct("InCatalog", {
     catalogData: LocalModelCatalogDataSchema,
   }),
@@ -662,6 +693,21 @@ export const LocalModelAvailabilityStateSchema = Schema.Union(
 )
 export type LocalModelAvailabilityState = typeof LocalModelAvailabilityStateSchema.Type
 
+export const LocalModelUpgradeStateSchema = Schema.Union(
+  Schema.TaggedStruct("NotApplicable", {}),
+  Schema.TaggedStruct("Current", {}),
+  Schema.TaggedStruct("Available", {}),
+  Schema.TaggedStruct("Upgrading", {
+    downloadId: ModelDownloadIdSchema,
+    stage: ModelDownloadStageSchema,
+    completedBytes: NonNegativeSafeInteger,
+    totalBytes: NonNegativeSafeInteger,
+    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  }),
+  Schema.TaggedStruct("Failed", { failure: ModelDownloadFailureSchema }),
+)
+export type LocalModelUpgradeState = typeof LocalModelUpgradeStateSchema.Type
+
 export const LocalModelPresentationSchema = Schema.Struct({
   displayName: NonEmptyString,
   variantLabel: ModelVariantLabelSchema,
@@ -700,6 +746,7 @@ export const LocalModelSchema = Schema.Struct({
   downloadBytes: NonNegativeSafeInteger,
   catalogMembershipState: LocalModelCatalogMembershipStateSchema,
   acquisitionState: LocalModelAcquisitionStateSchema,
+  upgradeState: LocalModelUpgradeStateSchema,
   servingState: LocalModelServingStateSchema,
 })
 export type LocalModel = typeof LocalModelSchema.Type

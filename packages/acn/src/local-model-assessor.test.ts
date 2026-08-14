@@ -1,18 +1,19 @@
 import { Effect, Layer, Option, PubSub, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
+  AssessmentEnvironmentIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   type ModelPackageEntry,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
+import { IcnHardware, IcnModels } from "@magnitudedev/icn"
 import { LocalModelAssessments } from "./local-model-assessments"
 import { LocalModelAssessor, LocalModelAssessorLive } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 
 describe("LocalModelAssessor", () => {
-  it("does not reassess unchanged semantic evidence", async () => {
+  it("correlates native evidence to authored configuration without reassessing unchanged evidence", async () => {
     let assessmentCalls = 0
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -43,6 +44,8 @@ describe("LocalModelAssessor", () => {
           quantizationName: "4-bit",
           architecture: "test",
           maximumContextLength: 32_768,
+          intrinsicModelId: Option.none(),
+          intrinsicQualityId: Option.none(),
         },
       }
       const packageEntry: ModelPackageEntry = {
@@ -57,6 +60,7 @@ describe("LocalModelAssessor", () => {
             reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
           },
         },
+        catalogAttribution: { _tag: "NotCatalogTarget" },
       }
       const packageSnapshot = {
         revision: 1,
@@ -72,9 +76,10 @@ describe("LocalModelAssessor", () => {
         id: ModelServingConfigurationIdSchema.make("configuration-sibling"),
       }
       const catalogModel = (id: string, configuration: typeof siblingConfiguration) => ({
-        id,
-        checkpointId: "checkpoint-test",
-        configuration,
+        modelId: id,
+        variantId: "gguf:q4",
+        desiredConfiguration: configuration,
+        localState: { _tag: "NotInstalled" as const },
         displayName: "Test",
         variantLabel: "Q4",
         description: "Test",
@@ -89,20 +94,24 @@ describe("LocalModelAssessor", () => {
         qualityEvidence: [],
       })
       const dependencies = Layer.mergeAll(
-        Layer.succeed(IcnCatalog, IcnCatalog.of({
+        Layer.succeed(IcnModels, IcnModels.of({
           get: Effect.succeed({
             revision: 1,
             state: {
-              models: [
+              revision: 1,
+              reconciliationComplete: true,
+              catalogModels: [
                 catalogModel("recommendable-test", configuration),
                 catalogModel("recommendable-sibling", siblingConfiguration),
               ] as never,
+              uncataloguedPackages: [],
               diagnostics: [],
             },
           }),
           changes: Stream.never,
-          ready: Effect.succeed(true),
+          initialized: Effect.succeed(true),
           refresh: Effect.void,
+          reconcileCatalogModel: () => Effect.dieMessage("unused"),
         })),
         Layer.succeed(IcnHardware, IcnHardware.of({
           get: Effect.succeed({
@@ -134,15 +143,23 @@ describe("LocalModelAssessor", () => {
             assessmentCalls += 1
             return requests.map((_, index) => index === 0
               ? {
-                  _tag: "Failed" as const,
-                  failure: {
-                    code: "planning_worker_defect",
-                    message: "failed to create llama context",
-                    retryable: true,
-                  },
+                  _tag: "Assessed",
+                  environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
+                  assessments: [{
+                    _tag: "Incompatible",
+                    configuration: {
+                      ...configuration,
+                      id: ModelServingConfigurationIdSchema.make("native-generated-configuration"),
+                    },
+                    failure: {
+                      code: "unsupported_architecture",
+                      message: "Unsupported architecture",
+                      retryable: false,
+                    },
+                  }],
                 }
               : {
-                  _tag: "InvalidBundle" as const,
+                  _tag: "InvalidBundle",
                   message: "terminal test result",
                 })
           }),
@@ -156,14 +173,14 @@ describe("LocalModelAssessor", () => {
         expect(assessmentCalls).toBe(1)
         const initialState = yield* assessor.state
         expect([...initialState.keys()]).toEqual([configuration.id, siblingConfiguration.id])
-        expect([...initialState.values()].every(({ assessment }) =>
-          assessment._tag === "Failed")).toBe(true)
+        expect(initialState.get(configuration.id)?.configuration).toEqual(configuration)
         expect(initialState.get(configuration.id)?.assessment).toEqual({
-          _tag: "Failed",
+          _tag: "Incompatible",
+          environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
           failure: {
-            code: "planning_worker_defect",
-            message: "failed to create llama context",
-            retryable: true,
+            code: "unsupported_architecture",
+            message: "Unsupported architecture",
+            retryable: false,
           },
         })
         expect(initialState.get(siblingConfiguration.id)?.assessment).toEqual({
@@ -180,8 +197,8 @@ describe("LocalModelAssessor", () => {
         yield* Effect.sleep("100 millis")
 
         expect(assessmentCalls).toBe(1)
-        expect([...(yield* assessor.state).values()].every(({ assessment }) =>
-          assessment._tag === "Failed")).toBe(true)
+        expect((yield* assessor.state).get(configuration.id)?.assessment._tag)
+          .toBe("Incompatible")
       }).pipe(Effect.provide(testLayer))
     })))
   })

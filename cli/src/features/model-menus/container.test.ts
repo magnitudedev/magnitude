@@ -93,7 +93,14 @@ describe("unified models menu projection", () => {
   })
 
   it("shows download admission before mirrored acquisition begins", () => {
-    expect(catalogStatus(makeCatalogOnlyModel(), true)).toBe("Starting download…")
+    expect(catalogStatus(makeCatalogOnlyModel(), {
+      _tag: "Starting",
+      operation: "Install",
+    })).toBe("Starting download…")
+    expect(catalogStatus(makeModel({ upgradeState: { _tag: "Available" } }), {
+      _tag: "Starting",
+      operation: "Update",
+    })).toBe("Starting update…")
   })
 
   it("prefers authoritative download progress once it is visible", () => {
@@ -107,7 +114,22 @@ describe("unified models menu projection", () => {
         totalBytes: 4,
         bytesPerSecond: Option.none(),
       },
-    }, true)).toBe("Downloading 25%")
+    }, {
+      _tag: "Transferring",
+      operation: "Install",
+      downloadId: ModelDownloadIdSchema.make("download-a"),
+      stage: "downloading",
+      completedBytes: 1,
+      totalBytes: 4,
+      bytesPerSecond: Option.none(),
+    })).toBe("Downloading 25%")
+  })
+
+  it("shows exact catalog drift as an available update without hiding the installed model", () => {
+    expect(catalogStatus({
+      ...makeModel(),
+      upgradeState: { _tag: "Available" },
+    })).toBe("Update available")
   })
 
   it("lists target and separate-draft repositories without treating the draft source as a package", () => {
@@ -245,5 +267,31 @@ describe("unified models menu projection", () => {
     expect(localModelInstalledStatus(makeModel())).toContain("Installed")
     const model = withDoesNotFitAssessment(makeModel())
     expect(localModelReadinessStatus(model)).toBe("Doesn’t fit")
+  })
+
+  it("renders catalog upgrade state without inferring artifact differences", () => {
+    expect(localModelReadinessStatus(makeModel({
+      upgradeState: { _tag: "Available" },
+    }))).toBe("Update available")
+    const model = makeModel({
+      upgradeState: {
+        _tag: "Upgrading",
+        downloadId: ModelDownloadIdSchema.make("download-upgrade"),
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 4,
+        bytesPerSecond: Option.none(),
+      },
+    })
+    expect(localModelReadinessStatus(model)).toBe("Updating")
+    expect(catalogStatus(model, {
+      _tag: "Transferring",
+      operation: "Update",
+      downloadId: ModelDownloadIdSchema.make("download-upgrade"),
+      stage: "downloading",
+      completedBytes: 1,
+      totalBytes: 4,
+      bytesPerSecond: Option.none(),
+    })).toBe("Updating 25%")
   })
 })

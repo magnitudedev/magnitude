@@ -8,10 +8,10 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, ModelFailure, ModelPackage, ModelPackageSource, ModelServingConfiguration,
-    RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    RecommendableModelId, ResolvedServableModelBundle, ServableModelBundle, ServableModelBundleKey,
-    ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
+    CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelPackage,
+    ModelPackageSource, ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, ResolvedServableModelBundle, ServableModelBundle,
+    ServableModelBundleKey, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::ModelBlobKind;
 use crate::capabilities::model_capabilities;
-use crate::inventory::ModelManager;
+use crate::inventory::ManagedModelStore;
 use crate::package_service::{
     package_from_resolved, servable_model_bundle_key_for_bundle, serving_configuration_id,
     serving_configuration_identity_is_valid,
@@ -67,6 +67,7 @@ struct CatalogModel {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogVariant {
+    variant_id: String,
     format: String,
     variant_label: String,
     fidelity_rank: u32,
@@ -132,7 +133,8 @@ struct ReleasePlannerManifest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerInput {
-    model_id: RecommendableModelId,
+    model_id: CatalogModelId,
+    variant_id: CatalogVariantId,
     target: ReleasePlannerPackage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     draft: Option<ReleasePlannerPackage>,
@@ -198,6 +200,11 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
     for model in &source.models {
+        let variant_ids = model
+            .variants
+            .iter()
+            .map(|variant| variant.variant_id.as_str())
+            .collect::<BTreeSet<_>>();
         let formats = model
             .variants
             .iter()
@@ -208,15 +215,17 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             .iter()
             .map(|variant| variant.variant_label.as_str())
             .collect::<BTreeSet<_>>();
-        if model.id.is_empty()
+        if !valid_identity_component(&model.id)
             || model.display_name.is_empty()
             || model.description.is_empty()
             || model.repository.is_empty()
             || model.variants.is_empty()
+            || variant_ids.len() != model.variants.len()
             || formats.len() != model.variants.len()
             || variant_labels.len() != model.variants.len()
             || model.variants.iter().any(|variant| {
-                variant.format.is_empty()
+                !valid_variant_id(&variant.variant_id)
+                    || variant.format.is_empty()
                     || variant.format.trim() != variant.format.as_str()
                     || variant.variant_label.is_empty()
                     || variant.variant_label.trim() != variant.variant_label.as_str()
@@ -262,12 +271,25 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     Ok(source)
 }
 
+fn valid_identity_component(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.contains(':')
+}
+
+fn valid_variant_id(value: &str) -> bool {
+    let mut components = value.split(':');
+    matches!(
+        (components.next(), components.next(), components.next()),
+        (Some(format), Some(quality), None)
+            if valid_identity_component(format) && valid_identity_component(quality)
+    )
+}
+
 pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
     model_catalog_lock_from(CATALOG_LOCK.as_bytes(), &catalog_source()?)
 }
 
 pub async fn advance_model_catalog_lock(
-    models: Arc<ModelManager>,
+    models: Arc<ManagedModelStore>,
 ) -> Result<ModelCatalogLock, InventoryError> {
     let source = catalog_source()?;
     let resolved = stream::iter(source.models)
@@ -470,16 +492,36 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
     let model_ids = catalog
         .models
         .iter()
-        .map(|model| model.id.clone())
+        .map(|model| (model.model_id.clone(), model.variant_id.clone()))
         .collect::<BTreeSet<_>>();
     let configuration_ids = catalog
         .models
         .iter()
         .map(|model| model.configuration.id.clone())
         .collect::<BTreeSet<_>>();
+    let target_packages = catalog
+        .models
+        .iter()
+        .map(|model| match &model.configuration.bundle {
+            ServableModelBundle::Standalone { package } => package,
+            ServableModelBundle::SpeculativeDecoding { target, .. } => target,
+        })
+        .collect::<Vec<_>>();
+    let target_package_ids = target_packages
+        .iter()
+        .map(|package| package.id.clone())
+        .collect::<BTreeSet<_>>();
+    let complete_intrinsic_targets = target_packages
+        .iter()
+        .filter(|package| {
+            package.properties.intrinsic_model_id.is_some()
+                && package.properties.intrinsic_quality_id.is_some()
+        })
+        .count();
     if catalog.models.is_empty()
         || model_ids.len() != catalog.models.len()
         || configuration_ids.len() != catalog.models.len()
+        || target_package_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
             !serving_configuration_identity_is_valid(&model.configuration)
                 || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
@@ -494,9 +536,14 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                 })
         })
     {
-        return Err(InventoryError::Integrity(
-            "release catalog has missing or duplicate model identities".to_owned(),
-        ));
+        return Err(InventoryError::Integrity(format!(
+            "release catalog has missing or duplicate exact identities (models={}, model_ids={}, configurations={}, target_packages={}, complete_intrinsic_targets={})",
+            catalog.models.len(),
+            model_ids.len(),
+            configuration_ids.len(),
+            target_package_ids.len(),
+            complete_intrinsic_targets,
+        )));
     }
     Ok(())
 }
@@ -904,7 +951,7 @@ fn validate_resolved_catalog(
     let actual = catalog
         .models
         .iter()
-        .map(|model| model.id.0.as_str())
+        .map(|model| (model.model_id.0.as_str(), model.variant_id.0.as_str()))
         .collect::<BTreeSet<_>>();
     let expected = source
         .models
@@ -913,12 +960,12 @@ fn validate_resolved_catalog(
             model
                 .variants
                 .iter()
-                .map(|variant| format!("{}:{}", model.id, variant.format))
+                .map(|variant| (model.id.as_str(), variant.variant_id.as_str()))
         })
         .collect::<BTreeSet<_>>();
     if actual.len() != catalog.models.len()
         || actual.len() != expected.len()
-        || !expected.iter().all(|id| actual.contains(id.as_str()))
+        || !expected.iter().all(|identity| actual.contains(identity))
     {
         return Err(InventoryError::Integrity(
             "release catalog does not exactly cover its source declarations".to_owned(),
@@ -929,17 +976,17 @@ fn validate_resolved_catalog(
         let declaration = source
             .models
             .iter()
-            .find(|declaration| declaration.id == model.checkpoint_id)
+            .find(|declaration| declaration.id == model.model_id.0)
             .ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "release catalog bundle {} has no source declaration",
-                    model.id.0
+                    "release catalog model {} variant {} has no source declaration",
+                    model.model_id.0, model.variant_id.0
                 ))
             })?;
-        let expected_lock = lock.get(&model.checkpoint_id).ok_or_else(|| {
+        let expected_lock = lock.get(&model.model_id.0).ok_or_else(|| {
             InventoryError::Integrity(format!(
                 "model catalog lock is missing {}",
-                model.checkpoint_id
+                model.model_id.0
             ))
         })?;
         let (target, draft_source, method) = match &model.configuration.bundle {
@@ -971,7 +1018,7 @@ fn validate_resolved_catalog(
                 let Some(expected_draft_commit) = expected_lock.speculative_draft.as_deref() else {
                     return Err(InventoryError::Integrity(format!(
                         "model catalog lock is missing {} speculative draft",
-                        model.checkpoint_id
+                        model.model_id.0
                     )));
                 };
                 let Some((expected_repository, expected_path)) = declaration
@@ -1002,8 +1049,8 @@ fn validate_resolved_catalog(
             || !speculative_matches
         {
             return Err(InventoryError::Integrity(format!(
-                "release catalog bundle {} does not match models.json and models.lock.json",
-                model.id.0
+                "release catalog model {} variant {} does not match models.json and models.lock.json",
+                model.model_id.0, model.variant_id.0
             )));
         }
     }
@@ -1082,8 +1129,8 @@ fn recommendable_model(
         context_length: declaration.context_length,
     };
     Ok(RecommendableModel {
-        id: RecommendableModelId(format!("{}:{}", declaration.id, variant.format)),
-        checkpoint_id: declaration.id.clone(),
+        model_id: CatalogModelId(declaration.id.clone()),
+        variant_id: CatalogVariantId(variant.variant_id.clone()),
         configuration: ModelServingConfiguration {
             id: serving_configuration_id(&bundle_key, &profile),
             bundle,
@@ -1106,11 +1153,11 @@ fn catalog_from_planner_inputs(
     source: &CatalogSource,
     inputs: &BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 ) -> Result<RecommendableModelCatalog, InventoryError> {
-    let by_model_id = inputs
+    let by_identity = inputs
         .values()
-        .map(|input| (input.model_id.clone(), input))
+        .map(|input| ((input.model_id.clone(), input.variant_id.clone()), input))
         .collect::<BTreeMap<_, _>>();
-    if by_model_id.len() != inputs.len() {
+    if by_identity.len() != inputs.len() {
         return Err(InventoryError::Integrity(
             "planner bundle contains duplicate catalog model identities".to_owned(),
         ));
@@ -1118,11 +1165,14 @@ fn catalog_from_planner_inputs(
     let mut models = Vec::new();
     for declaration in &source.models {
         for variant in &declaration.variants {
-            let model_id = RecommendableModelId(format!("{}:{}", declaration.id, variant.format));
-            let input = by_model_id.get(&model_id).ok_or_else(|| {
+            let identity = (
+                CatalogModelId(declaration.id.clone()),
+                CatalogVariantId(variant.variant_id.clone()),
+            );
+            let input = by_identity.get(&identity).ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "planner bundle is missing catalog model {}",
-                    model_id.0
+                    "planner bundle is missing catalog model {} variant {}",
+                    declaration.id, variant.variant_id
                 ))
             })?;
             let model = recommendable_model(
@@ -1134,8 +1184,8 @@ fn catalog_from_planner_inputs(
             )?;
             if !inputs.contains_key(&recommendable_model_bundle_key(&model)) {
                 return Err(InventoryError::Integrity(format!(
-                    "planner bundle key does not match catalog model {}",
-                    model_id.0
+                    "planner bundle key does not match catalog model {} variant {}",
+                    declaration.id, variant.variant_id
                 )));
             }
             models.push(model);
@@ -1153,12 +1203,12 @@ fn catalog_from_planner_inputs(
 }
 
 pub struct ResolvingRecommendableCatalog {
-    models: Arc<ModelManager>,
+    models: Arc<ManagedModelStore>,
 }
 
 impl ResolvingRecommendableCatalog {
     #[must_use]
-    pub fn new(models: Arc<ModelManager>) -> Self {
+    pub fn new(models: Arc<ManagedModelStore>) -> Self {
         Self { models }
     }
 
@@ -1285,7 +1335,8 @@ impl ResolvingRecommendableCatalog {
             &target.properties,
         )?;
         let planner = ReleasePlannerInput {
-            model_id: model.id.clone(),
+            model_id: model.model_id.clone(),
+            variant_id: model.variant_id.clone(),
             target,
             draft,
         };
@@ -1653,10 +1704,8 @@ impl ResolvingRecommendableCatalog {
                     }
                 }
                 Err(error) => diagnostics.push(CatalogDiagnostic {
-                    entry_id: Some(RecommendableModelId(format!(
-                        "{}:{}",
-                        declaration.id, variant.format
-                    ))),
+                    model_id: CatalogModelId(declaration.id.clone()),
+                    variant_id: CatalogVariantId(variant.variant_id.clone()),
                     failure: ModelFailure {
                         code: "catalog_resolution_failed".to_owned(),
                         message: error.to_string(),

@@ -111,6 +111,9 @@ export {
   servableModelBundlePackages,
   OnboardingMirror,
   ModelPackageIdSchema,
+  CatalogModelIdSchema,
+  CatalogVariantIdSchema,
+  CatalogIdentitySchema,
   ModelDownloadIdSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
@@ -123,6 +126,9 @@ export {
 } from "@magnitudedev/acn-protocol"
 
 export type {
+  CatalogModelId,
+  CatalogVariantId,
+  CatalogIdentity,
   ModelDownloadId,
   RecommendationId,
   LocalModel,

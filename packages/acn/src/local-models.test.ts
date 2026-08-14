@@ -7,6 +7,8 @@ import {
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ModelVariantLabelSchema,
+  CatalogModelIdSchema,
+  CatalogVariantIdSchema,
   servableModelBundlePackageIds,
   type LocalInferenceHardware,
   type MemoryAssessment,
@@ -15,12 +17,14 @@ import {
   type ModelServingConfiguration,
   type ServableModelBundle,
   type ModelPackageSource,
+  type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
   availabilityFromProviderProjection,
   aggregateAcquisitionState,
+  deriveCatalogUpgradeState,
   projectLocalModelMemory,
   resolveBundlePresentation,
 } from "./local-models"
@@ -57,6 +61,8 @@ const standaloneBundle = (
       quantizationName,
       architecture: "test",
       maximumContextLength: 50_000,
+      intrinsicModelId: Option.none(),
+      intrinsicQualityId: Option.none(),
     },
   },
 })
@@ -69,6 +75,27 @@ const configuration = (
   id: ModelServingConfigurationIdSchema.make(id),
   bundle,
   profile: { contextLength },
+})
+
+const catalogModel = (configuration: ModelServingConfiguration): RecommendableModel => ({
+  modelId: CatalogModelIdSchema.make(configuration.id),
+  variantId: CatalogVariantIdSchema.make("gguf:q4"),
+  configuration,
+  displayName: configuration.id,
+  variantLabel: ModelVariantLabelSchema.make("Q4"),
+  description: "test",
+  license: "test",
+  capabilities: {
+    vision: false,
+    tools: false,
+    structuredOutput: false,
+    reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+  },
+  qualityScore: 1,
+  qualityScoreProvenance: "test",
+  fidelityRank: 1,
+  quantizationAware: false,
+  qualityEvidence: [],
 })
 
 describe("local model configuration resolution", () => {
@@ -103,17 +130,28 @@ describe("local model configuration resolution", () => {
     const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
     const standard = configuration("configuration-standard", bundle, 50_000)
     const catalog = configuration("configuration-catalog", bundle, 32_000)
+    const curated = catalogModel(catalog)
     expect([...resolveLocalModelConfigurations({
       catalog: [],
+      effectiveCatalogConfigurations: [],
       installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
       assessed: new Map([[standard.id, {
         configuration: standard,
         origin: "Standard",
         assessment: { _tag: "Assessing" },
       }]]),
-    }).values()].map(({ configuration }) => configuration)).toEqual([standard])
+    }).values()].map(({ servingConfiguration }) => servingConfiguration)).toEqual([standard])
     expect([...resolveLocalModelConfigurations({
-      catalog: [catalog],
+      catalog: [curated],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: curated.modelId, variantId: curated.variantId },
+        configuration: catalog,
+      }],
+      catalogAttributionByPackageId: new Map([[bundle.package.id, {
+        _tag: "Attributed",
+        modelId: curated.modelId,
+        variantId: curated.variantId,
+      }]]),
       installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
       assessed: new Map([
         [standard.id, {
@@ -127,7 +165,7 @@ describe("local model configuration resolution", () => {
           assessment: { _tag: "Assessing" },
         }],
       ]),
-    }).values()].map(({ configuration }) => configuration)).toEqual([catalog])
+    }).values()].map(({ servingConfiguration }) => servingConfiguration)).toEqual([catalog])
   })
 
   it("replaces generated standalone serving with the current catalog configuration for its target", () => {
@@ -155,21 +193,41 @@ describe("local model configuration resolution", () => {
       assessment: { _tag: "Assessing" as const },
     }]])
 
+    const embeddedCatalog = catalogModel(embedded)
     const embeddedResolution = resolveLocalModelConfigurations({
-      catalog: [embedded],
+      catalog: [embeddedCatalog],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: embeddedCatalog.modelId, variantId: embeddedCatalog.variantId },
+        configuration: embedded,
+      }],
+      catalogAttributionByPackageId: new Map([[standalone.package.id, {
+        _tag: "Attributed",
+        modelId: embeddedCatalog.modelId,
+        variantId: embeddedCatalog.variantId,
+      }]]),
       installedPackageIds: new Set([standalone.package.id]),
       assessed,
     })
     expect(embeddedResolution.size).toBe(1)
-    expect([...embeddedResolution.values()][0]?.configuration).toEqual(embedded)
+    expect([...embeddedResolution.values()][0]?.servingConfiguration).toEqual(embedded)
 
+    const separateCatalog = catalogModel(separate)
     const separateResolution = resolveLocalModelConfigurations({
-      catalog: [separate],
+      catalog: [separateCatalog],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: separateCatalog.modelId, variantId: separateCatalog.variantId },
+        configuration: standard,
+      }],
+      catalogAttributionByPackageId: new Map([[standalone.package.id, {
+        _tag: "Attributed",
+        modelId: separateCatalog.modelId,
+        variantId: separateCatalog.variantId,
+      }]]),
       installedPackageIds: new Set([standalone.package.id]),
       assessed,
     })
     expect(separateResolution.size).toBe(1)
-    expect([...separateResolution.values()][0]?.configuration).toEqual(separate)
+    expect([...separateResolution.values()][0]?.servingConfiguration).toEqual(standard)
   })
 
   it("does not reinterpret removed authored configurations as standard resolutions", () => {
@@ -178,6 +236,7 @@ describe("local model configuration resolution", () => {
 
     expect(resolveLocalModelConfigurations({
       catalog: [],
+      effectiveCatalogConfigurations: [],
       installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
       assessed: new Map([[staleCatalog.id, {
         configuration: staleCatalog,
@@ -187,12 +246,70 @@ describe("local model configuration resolution", () => {
     }).size).toBe(0)
   })
 
+  it("keeps an attributed prior target active until the current catalog bundle is complete", () => {
+    const priorBundle = standaloneBundle({ _tag: "Local", path: "/models/prior.gguf" })
+    const desiredBase = standaloneBundle({ _tag: "Local", path: "/models/current.gguf" })
+    const desiredBundle = {
+      ...desiredBase,
+      package: { ...desiredBase.package, id: ModelPackageIdSchema.make("package-current") },
+    }
+    const prior = configuration("configuration-prior", priorBundle, 50_000)
+    const desired = configuration("configuration-current", desiredBundle, 50_000)
+    const curated = catalogModel(desired)
+    const assessed = new Map([
+      [prior.id, {
+        configuration: prior,
+        origin: "Standard" as const,
+        assessment: { _tag: "Assessing" as const },
+      }],
+      [desired.id, {
+        configuration: desired,
+        origin: "Authored" as const,
+        assessment: { _tag: "Assessing" as const },
+      }],
+    ])
+    const attribution = new Map([[priorBundle.package.id, {
+      _tag: "Attributed" as const,
+      modelId: curated.modelId,
+      variantId: curated.variantId,
+    }]])
+
+    const before = [...resolveLocalModelConfigurations({
+      catalog: [curated],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: curated.modelId, variantId: curated.variantId },
+        configuration: prior,
+      }],
+      assessed,
+      installedPackageIds: new Set([priorBundle.package.id]),
+      catalogAttributionByPackageId: attribution,
+    }).values()][0]
+    expect(before?.servingConfiguration).toEqual(prior)
+    expect(before?.catalogIdentity).toEqual(Option.some({
+      modelId: curated.modelId,
+      variantId: curated.variantId,
+    }))
+
+    const after = [...resolveLocalModelConfigurations({
+      catalog: [curated],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: curated.modelId, variantId: curated.variantId },
+        configuration: desired,
+      }],
+      assessed,
+      installedPackageIds: new Set([priorBundle.package.id, desiredBundle.package.id]),
+      catalogAttributionByPackageId: attribution,
+    }).values()][0]
+    expect(after?.servingConfiguration).toEqual(desired)
+  })
+
   it("drops a generated resolution when its installed package disappears", () => {
     const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
     const standard = configuration("configuration-standard", bundle, 50_000)
 
     expect(resolveLocalModelConfigurations({
       catalog: [],
+      effectiveCatalogConfigurations: [],
       installedPackageIds: new Set(),
       assessed: new Map([[standard.id, {
         configuration: standard,
@@ -204,6 +321,39 @@ describe("local model configuration resolution", () => {
 })
 
 describe("bundle download projection", () => {
+  it("derives upgrade state only for an installed superseded catalog target", () => {
+    const notInstalled = { _tag: "NotInstalled" as const, completedBytes: 0, totalBytes: 10 }
+    expect(deriveCatalogUpgradeState({
+      inCatalog: true,
+      nativeUpdateAvailable: true,
+      currentAcquisitionState: notInstalled,
+      desiredAcquisitionState: notInstalled,
+      hasPriorCatalogTarget: true,
+    })).toEqual({ _tag: "Available" })
+    const downloading = {
+      _tag: "Downloading" as const,
+      downloadId: ModelDownloadIdSchema.make("upgrade"),
+      stage: "downloading" as const,
+      completedBytes: 1,
+      totalBytes: 10,
+      bytesPerSecond: Option.none(),
+    }
+    expect(deriveCatalogUpgradeState({
+      inCatalog: true,
+      nativeUpdateAvailable: true,
+      currentAcquisitionState: notInstalled,
+      desiredAcquisitionState: downloading,
+      hasPriorCatalogTarget: true,
+    })).toEqual({
+      _tag: "Upgrading",
+      downloadId: "upgrade",
+      stage: "downloading",
+      completedBytes: 1,
+      totalBytes: 10,
+      bytesPerSecond: Option.none(),
+    })
+  })
+
   it("retains one stable identity as packages in a speculative bundle complete", () => {
     const target = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" }).package
     const draft = {
@@ -221,11 +371,13 @@ describe("bundle download projection", () => {
         package: target,
         localState: { _tag: "Installed", path: "/models/target.gguf", origin: "Magnitude" },
         inspection: { _tag: "Pending" },
+        catalogAttribution: { _tag: "NotCatalogTarget" },
       }],
       [draft.id, {
         package: draft,
         localState: { _tag: "NotInstalled" },
         inspection: { _tag: "Pending" },
+        catalogAttribution: { _tag: "NotCatalogTarget" },
       }],
     ])
     const id = ModelDownloadIdSchema.make("bundle-download")

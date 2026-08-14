@@ -11,7 +11,7 @@ use icn_contracts::models::{
 };
 use icn_contracts::{DownloadFailure, DownloadStage, InventoryError, ModelDownloadEvent};
 
-use crate::inventory::ModelManager;
+use crate::inventory::ManagedModelStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DownloadAttemptId(String);
@@ -51,7 +51,7 @@ enum DownloadAttempt {
 
 #[derive(Clone)]
 pub struct ManagedModelDownloads {
-    manager: Arc<ModelManager>,
+    manager: Arc<ManagedModelStore>,
     records: Arc<RwLock<BTreeMap<DownloadAttemptId, AttemptRecord>>>,
     downloads: Arc<RwLock<BTreeMap<ModelDownloadId, DownloadRecord>>>,
     starts: Arc<tokio::sync::Mutex<()>>,
@@ -69,14 +69,13 @@ struct DownloadRecord {
     id: ModelDownloadId,
     bundle: ServableModelBundle,
     attempt_ids: Vec<DownloadAttemptId>,
-    installed_package_ids_at_admission: Vec<ModelPackageId>,
     cancelled: bool,
     failure_acknowledged: bool,
     sequence: u64,
 }
 
 impl ManagedModelDownloads {
-    pub async fn open(manager: Arc<ModelManager>) -> Result<Self, InventoryError> {
+    pub async fn open(manager: Arc<ManagedModelStore>) -> Result<Self, InventoryError> {
         Ok(Self {
             manager,
             records: Arc::new(RwLock::new(BTreeMap::new())),
@@ -236,21 +235,19 @@ fn model_download(
     record: &DownloadRecord,
     attempts: &BTreeMap<DownloadAttemptId, AttemptRecord>,
 ) -> ModelDownload {
-    let packages = bundle_packages(&record.bundle);
-    let total_bytes = packages.iter().map(|package| package_bytes(package)).sum();
     let admitted = record
         .attempt_ids
         .iter()
-        .filter_map(|id| attempts.get(id).map(|attempt| &attempt.attempt))
+        .filter_map(|id| attempts.get(id))
         .collect::<Vec<_>>();
+    let total_bytes = admitted
+        .iter()
+        .map(|attempt| package_bytes(&attempt.package))
+        .sum();
     let attempted_bytes = admitted
         .iter()
-        .map(|attempt| match attempt {
-            DownloadAttempt::Completed { package_id, .. } => packages
-                .iter()
-                .find(|package| package.id == *package_id)
-                .map(|package| package_bytes(package))
-                .unwrap_or(0),
+        .map(|record| match &record.attempt {
+            DownloadAttempt::Completed { .. } => package_bytes(&record.package),
             DownloadAttempt::Downloading {
                 completed_bytes, ..
             }
@@ -263,18 +260,7 @@ fn model_download(
             DownloadAttempt::Pending { .. } => 0,
         })
         .sum::<u64>();
-    let installed_bytes = packages
-        .iter()
-        .filter(|package| {
-            record
-                .installed_package_ids_at_admission
-                .contains(&package.id)
-        })
-        .map(|package| package_bytes(package))
-        .sum::<u64>();
-    let completed_bytes = installed_bytes
-        .saturating_add(attempted_bytes)
-        .min(total_bytes);
+    let completed_bytes = attempted_bytes.min(total_bytes);
     let missing_attempt = admitted.len() != record.attempt_ids.len();
     let state = if record.cancelled {
         ModelDownloadState::Cancelled {
@@ -290,7 +276,7 @@ fn model_download(
             },
             acknowledged: record.failure_acknowledged,
         }
-    } else if let Some(failure) = admitted.iter().find_map(|attempt| match attempt {
+    } else if let Some(failure) = admitted.iter().find_map(|record| match &record.attempt {
         DownloadAttempt::Failed { failure, .. } => Some(failure),
         _ => None,
     }) {
@@ -302,7 +288,7 @@ fn model_download(
         }
     } else if admitted
         .iter()
-        .any(|attempt| matches!(attempt, DownloadAttempt::Cancelled { .. }))
+        .any(|record| matches!(&record.attempt, DownloadAttempt::Cancelled { .. }))
     {
         ModelDownloadState::Cancelled {
             completed_bytes,
@@ -310,11 +296,11 @@ fn model_download(
         }
     } else if admitted
         .iter()
-        .any(|attempt| matches!(attempt, DownloadAttempt::Downloading { .. }))
+        .any(|record| matches!(&record.attempt, DownloadAttempt::Downloading { .. }))
     {
         let active = admitted
             .iter()
-            .filter_map(|attempt| match attempt {
+            .filter_map(|record| match &record.attempt {
                 DownloadAttempt::Downloading {
                     stage,
                     bytes_per_second,
@@ -337,7 +323,7 @@ fn model_download(
         }
     } else if admitted
         .iter()
-        .any(|attempt| matches!(attempt, DownloadAttempt::Pending { .. }))
+        .any(|record| matches!(&record.attempt, DownloadAttempt::Pending { .. }))
     {
         ModelDownloadState::Pending {
             completed_bytes,
@@ -477,10 +463,9 @@ impl ModelDownloads for ManagedModelDownloads {
                 .filter_map(|(package, attempt)| attempt.is_none().then_some(package.clone()))
                 .collect::<Vec<_>>();
             let mut missing = Vec::new();
-            let mut installed_package_ids_at_admission = Vec::new();
             for package in candidates {
                 match self.manager.installed_package(&package.id).await {
-                    Ok(_) => installed_package_ids_at_admission.push(package.id),
+                    Ok(_) => {}
                     Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {
                         missing.push(package);
                     }
@@ -546,7 +531,6 @@ impl ModelDownloads for ManagedModelDownloads {
                         .iter()
                         .map(|attempt| attempt_identity(attempt).0)
                         .collect(),
-                    installed_package_ids_at_admission,
                     cancelled: false,
                     failure_acknowledged: false,
                     sequence: 0,
@@ -745,6 +729,8 @@ mod tests {
                 quantization_name: "4-bit".to_owned(),
                 architecture: "test".to_owned(),
                 maximum_context_length: 4096,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             },
         }
     }
@@ -773,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_progress_counts_installed_packages_without_changing_download_identity() {
+    fn bundle_progress_measures_only_the_admitted_change() {
         let target = package("package_target", 10);
         let draft = package("package_draft", 20);
         let attempt_id = DownloadAttemptId("attempt_draft".to_owned());
@@ -797,7 +783,6 @@ mod tests {
             id: id.clone(),
             bundle: paired_bundle(target, draft),
             attempt_ids: vec![attempt_id],
-            installed_package_ids_at_admission: vec![ModelPackageId("package_target".to_owned())],
             cancelled: false,
             failure_acknowledged: false,
             sequence: 1,
@@ -809,8 +794,8 @@ mod tests {
             projected.state,
             ModelDownloadState::Downloading {
                 stage: DownloadStage::Downloading,
-                completed_bytes: 15,
-                total_bytes: 30,
+                completed_bytes: 5,
+                total_bytes: 20,
                 bytes_per_second: Some(4),
             }
         );
@@ -841,7 +826,6 @@ mod tests {
             id: ModelDownloadId("model_download_test".to_owned()),
             bundle: ServableModelBundle::Standalone { package },
             attempt_ids: vec![attempt_id],
-            installed_package_ids_at_admission: Vec::new(),
             cancelled: false,
             failure_acknowledged: false,
             sequence: 1,
@@ -868,7 +852,6 @@ mod tests {
                 package: package("package_test", 10),
             },
             attempt_ids: vec![DownloadAttemptId("attempt_missing".to_owned())],
-            installed_package_ids_at_admission: Vec::new(),
             cancelled: false,
             failure_acknowledged: false,
             sequence: 1,
@@ -906,7 +889,6 @@ mod tests {
                 package: package.clone(),
             },
             attempt_ids: vec![attempt_id.clone()],
-            installed_package_ids_at_admission: Vec::new(),
             cancelled: false,
             failure_acknowledged: false,
             sequence: 1,
@@ -955,7 +937,6 @@ mod tests {
             id: ModelDownloadId("model_download_test".to_owned()),
             bundle: ServableModelBundle::Standalone { package },
             attempt_ids: vec![attempt_id],
-            installed_package_ids_at_admission: Vec::new(),
             cancelled: true,
             failure_acknowledged: false,
             sequence: 1,

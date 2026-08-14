@@ -16,6 +16,7 @@ import {
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
+  ModelSlotUnassigned,
   ModelVariantLabelSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
@@ -77,6 +78,8 @@ const modelPackage = {
     quantizationName: "4-bit",
     architecture: "dense",
     maximumContextLength: 8_192,
+    intrinsicModelId: Option.none(),
+    intrinsicQualityId: Option.none(),
   },
 }
 const selection: SlotSelection = {
@@ -128,6 +131,7 @@ const makeHarness = (options: {
   readonly projectedInstalled?: boolean
   readonly catalogAvailability?: ProviderModelCatalogEntry["availability"]
   readonly blockStop?: boolean
+  readonly localOfferingsReady?: boolean
 } = {}) => Effect.gen(function* () {
   const configuration = yield* SubscriptionRef.make({
     slots: {
@@ -263,6 +267,7 @@ const makeHarness = (options: {
       changes: Stream.empty,
     })),
     Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
+      ready: Effect.succeed(options.localOfferingsReady ?? true),
       list: Ref.get(offerings),
       changes: Stream.empty,
       catalog: Effect.succeed([]),
@@ -303,6 +308,7 @@ const makeHarness = (options: {
 
   return {
     layer: ModelSlotControllerLive.pipe(Layer.provide(dependencies)),
+    configuration,
     loadCalls,
     previewCalls,
     stopCalls,
@@ -352,6 +358,32 @@ const releaseLoadAsReady = (
 })
 
 describe("ModelSlotController load admission", () => {
+  it("clears a persisted selection that has no authoritative offering", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({ initialOfferings: [] })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        expect((yield* controller.snapshot).state.slots.primary).toEqual(
+          new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
+        )
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("retains a persisted local selection until local offerings are authoritative", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        initialOfferings: [],
+        localOfferingsReady: false,
+      })
+      yield* Effect.gen(function* () {
+        yield* ModelSlotController
+        expect(Option.isSome((yield* SubscriptionRef.get(harness.configuration)).slots.primary))
+          .toBe(true)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("records a local selection without using installed presentation as authorization", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness({

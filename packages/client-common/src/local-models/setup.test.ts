@@ -5,6 +5,8 @@ import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
   AssessmentEnvironmentIdSchema,
+  CatalogModelIdSchema,
+  CatalogVariantIdSchema,
   ModelDownloadIdSchema,
   ModelAssessmentIdSchema,
   ModelInstanceIdSchema,
@@ -31,7 +33,7 @@ import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
 
 const configurationId = ModelServingConfigurationIdSchema.make("setup-configuration")
-const providerModelId = ProviderModelIdSchema.make("setup-model")
+const providerModelId = ProviderModelIdSchema.make("setup-model:gguf:q4")
 const instanceId = ModelInstanceIdSchema.make("setup-instance")
 const downloadId = ModelDownloadIdSchema.make("setup-attempt")
 const reasoningEffort = ReasoningEffortSchema.make("none")
@@ -57,6 +59,8 @@ const makeModel = (installed: boolean): LocalModel => {
         quantizationName: "4-bit",
         architecture: "test",
         maximumContextLength: 32_768,
+        intrinsicModelId: Option.none(),
+        intrinsicQualityId: Option.none(),
       },
     },
   }
@@ -71,7 +75,19 @@ const makeModel = (installed: boolean): LocalModel => {
       precisionLabel: "4-bit",
     },
     downloadBytes: 1,
-    catalogMembershipState: { _tag: "NotInCatalog" },
+    catalogMembershipState: {
+      _tag: "InCatalog",
+      catalogData: {
+        modelId: CatalogModelIdSchema.make("setup-model"),
+        variantId: CatalogVariantIdSchema.make("gguf:q4"),
+        intelligenceScore: 1,
+        intelligenceScoreSource: "test",
+        fidelityRank: 1,
+        quantizationAware: false,
+        qualityNotes: [],
+      },
+    },
+    upgradeState: installed ? { _tag: "Current" } : { _tag: "NotApplicable" },
     acquisitionState: installed
       ? { _tag: "Installed", installedBytes: 1, origins: ["Magnitude"] }
       : { _tag: "NotInstalled", completedBytes: 0, totalBytes: 1 },
@@ -214,7 +230,7 @@ describe("installationAdmissionIsVisible", () => {
     })).toBe(false)
   })
 
-  it("accepts the exact installed configuration while provider publication is pending", () => {
+  it("accepts a current installed configuration while provider publication is pending", () => {
     const installed = makeModel(true)
     const publishing = installed.servingState._tag === "Assessed" ? {
       ...installed,
@@ -229,10 +245,41 @@ describe("installationAdmissionIsVisible", () => {
       models: [publishing],
       discoveryState: { _tag: "Ready", progress: [] },
     }, configurationId, {
-      _tag: "DownloadAdmitted",
+      _tag: "Current",
       providerModelId,
-      downloadId,
     })).toBe(true)
+  })
+
+  it("does not complete update admission until the exact occurrence is visible", () => {
+    const installed = {
+      ...makeModel(true),
+      upgradeState: {
+        _tag: "Available" as const,
+        missingPackageIds: [],
+        supersededPackageIds: [],
+      },
+    }
+    const state = {
+      inventoryState: { _tag: "Ready" as const },
+      models: [installed],
+      discoveryState: { _tag: "Ready" as const, progress: [] },
+    }
+    const admission = { _tag: "DownloadAdmitted" as const, providerModelId, downloadId }
+    expect(installationAdmissionIsVisible(state, configurationId, admission)).toBe(false)
+    expect(installationAdmissionIsVisible({
+      ...state,
+      models: [{
+        ...installed,
+        upgradeState: {
+          _tag: "Upgrading",
+          downloadId,
+          stage: "downloading",
+          completedBytes: 0,
+          totalBytes: 1,
+          bytesPerSecond: Option.none(),
+        },
+      }],
+    }, configurationId, admission)).toBe(true)
   })
 })
 
@@ -289,7 +336,7 @@ const makeHarness = (options: HarnessOptions) => {
         revision: revision++,
         state: { completed: onboardingCompleted },
       })
-      case "InstallModel": {
+      case "ReconcileCatalogModel": {
         model = options.downloadFailure !== undefined
           ? (() => {
               const uninstalled = makeModel(false)
@@ -452,7 +499,7 @@ describe("OnboardingModelSetupService", () => {
     secondUnmount()
 
     expect(harness.calls.filter((call) => [
-      "InstallModel",
+      "ReconcileCatalogModel",
       "AssignSlot",
       "LoadModel",
       "StopModel",
@@ -471,7 +518,7 @@ describe("OnboardingModelSetupService", () => {
     ))
 
     expect(harness.onboardingCompleted()).toBe(true)
-    expect(harness.calls).not.toContain("InstallModel")
+    expect(harness.calls).not.toContain("ReconcileCatalogModel")
     expect(harness.calls).not.toContain("AssignSlot")
     expect(harness.calls).not.toContain("LoadModel")
     harness.registry.dispose()
@@ -504,7 +551,7 @@ describe("OnboardingModelSetupService", () => {
     await Effect.runPromise(execute(harness.registry, harness.service.start, configurationId))
 
     const mutations = harness.calls.filter((call) => [
-      "InstallModel",
+      "ReconcileCatalogModel",
       "AssignSlot",
       "LoadModel",
       "UpdateOnboardingState",
@@ -518,13 +565,13 @@ describe("OnboardingModelSetupService", () => {
     await Effect.runPromise(execute(harness.registry, harness.service.start, configurationId))
 
     const mutations = harness.calls.filter((call) => [
-      "InstallModel",
+      "ReconcileCatalogModel",
       "AssignSlot",
       "LoadModel",
       "UpdateOnboardingState",
     ].includes(call))
     expect(mutations).toEqual([
-      "InstallModel",
+      "ReconcileCatalogModel",
       "AssignSlot",
       "LoadModel",
       "UpdateOnboardingState",
@@ -560,8 +607,8 @@ describe("OnboardingModelSetupService", () => {
     const harness = makeHarness({ installed: false, initiallyDownloading: true })
     await Effect.runPromise(execute(harness.registry, harness.service.start, configurationId))
 
-    expect(harness.calls.indexOf("InstallModel")).toBeGreaterThanOrEqual(0)
-    expect(harness.calls.indexOf("InstallModel")).toBeLessThan(harness.calls.indexOf("AssignSlot"))
+    expect(harness.calls.indexOf("ReconcileCatalogModel")).toBeGreaterThanOrEqual(0)
+    expect(harness.calls.indexOf("ReconcileCatalogModel")).toBeLessThan(harness.calls.indexOf("AssignSlot"))
     harness.registry.dispose()
   })
 
@@ -602,7 +649,7 @@ describe("OnboardingModelSetupService", () => {
       harness.service.start,
       configurationId,
     ))
-    await Effect.runPromise(waitForCall(harness.calls, "InstallModel"))
+    await Effect.runPromise(waitForCall(harness.calls, "ReconcileCatalogModel"))
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
     await Effect.runPromise(Fiber.join(start))
@@ -618,7 +665,7 @@ describe("OnboardingModelSetupService", () => {
 
     expect(harness.onboardingCompleted()).toBe(true)
     expect(harness.calls.filter((call) => [
-      "InstallModel",
+      "ReconcileCatalogModel",
       "AssignSlot",
       "LoadModel",
       "StopModel",

@@ -81,7 +81,6 @@ import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelAssessorLive } from "./local-model-assessor"
 import { LocalModelConfigurationResolverLive } from "./local-model-configuration-resolver"
 import { LocalModelPackagesLive } from "./local-model-packages"
-import { LocalModelInstallerLive } from "./local-model-installer"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
@@ -418,13 +417,9 @@ const addLocalInferenceServices = <A, E, R>(
     LocalModelConfigurationResolverLive,
     withAssessor,
   )
-  const withInstaller = Layer.provideMerge(
-    LocalModelInstallerLive,
-    withConfigurationResolver,
-  )
   const withOfferings = Layer.provideMerge(
     LocalProviderOfferingsLive,
-    withInstaller
+    withConfigurationResolver
   )
   const withRecommendations = Layer.provideMerge(
     makeLocalModelRecommendationsLive(),

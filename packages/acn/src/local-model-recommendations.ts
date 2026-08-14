@@ -317,8 +317,9 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               Schema.parseJson(Schema.Unknown)
             )({
               catalog: catalogModels.map((model) => ({
-                id: model.id,
-                checkpointId: model.checkpointId,
+                modelId: model.modelId,
+                variantId: model.variantId,
+                catalogModelId: model.modelId,
                 configuration: model.configuration,
                 displayName: model.displayName,
                 variantLabel: model.variantLabel,
@@ -448,8 +449,8 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                         model,
                         profile,
                         assessment: result.assessment,
-                        artifactId: model.id,
-                        checkpointId: model.checkpointId,
+                        artifactId: model.configuration.id,
+                        catalogModelId: model.modelId,
                         capability: {
                           score: model.qualityScore,
                           provenance: model.qualityScoreProvenance,

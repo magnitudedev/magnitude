@@ -5,6 +5,7 @@ import {
   type RecommendableModel,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
+import { localCatalogProviderModelId } from "./local-provider-model-id"
 
 const MAX_RECOMMENDATIONS = 4
 const COMPARISON_CONTEXT_LENGTH = 50_000
@@ -19,7 +20,7 @@ export interface RecommendationCandidate {
   readonly profile: ServingProfile
   readonly assessment: FitsModelAssessment
   readonly artifactId: string
-  readonly checkpointId: string
+  readonly catalogModelId: string
   readonly capability:
     | {
         readonly score: number
@@ -36,7 +37,7 @@ export interface RecommendationCandidate {
 export interface RecommendationSelection {
   readonly id: ReturnType<typeof RecommendationIdSchema.make>
   readonly configurationId: FitsModelAssessment["configurationId"]
-  readonly recommendableModelId: RecommendableModel["id"]
+  readonly recommendableModelId: string
   readonly displayName: string
   readonly intent: "balanced" | "best_quality" | "fastest" | "lightweight"
   readonly explanation: string
@@ -337,7 +338,7 @@ const toRecommendation = (
 ): RecommendationSelection => ({
   id: RecommendationIdSchema.make(`${candidate.assessment.configurationId}:${intent}`),
   configurationId: candidate.assessment.configurationId,
-  recommendableModelId: candidate.model.id,
+  recommendableModelId: localCatalogProviderModelId(candidate.model),
   displayName: candidate.model.displayName,
   intent,
   explanation: intent === "balanced" ? describeBalanced(candidate)
@@ -346,11 +347,11 @@ const toRecommendation = (
     : describeLightweight(candidate, balanced),
 })
 
-const preferNewCheckpointWithin = (
+const preferNewCatalogModelWithin = (
   candidates: readonly RecommendationCandidate[],
-  usedCheckpointIds: ReadonlySet<string>,
+  usedCatalogModelIds: ReadonlySet<string>,
 ): RecommendationCandidate | undefined => candidates.find((candidate) =>
-  !usedCheckpointIds.has(candidate.checkpointId)) ?? candidates.at(0)
+  !usedCatalogModelIds.has(candidate.catalogModelId)) ?? candidates.at(0)
 
 export const selectRecommendationPortfolio = (
   input: readonly RecommendationCandidate[],
@@ -370,14 +371,14 @@ export const selectRecommendationPortfolio = (
   if (!balanced) return []
 
   if (sameConfiguration(balanced, bestQuality)) {
-    const lighterSameCheckpoint = balancedCandidates
-      .filter((candidate) => candidate.checkpointId === bestQuality.checkpointId
+    const lighterSameCatalogModel = balancedCandidates
+      .filter((candidate) => candidate.catalogModelId === bestQuality.catalogModelId
         && !sameConfiguration(candidate, bestQuality)
         && candidate.fidelityRank >= bestQuality.fidelityRank - 20
         && materiallyLighterThan(candidate, bestQuality, 0.9))
       .sort(compareBalanced)
       .at(0)
-    if (lighterSameCheckpoint) balanced = lighterSameCheckpoint
+    if (lighterSameCatalogModel) balanced = lighterSameCatalogModel
   }
 
   const selected: Array<{
@@ -385,7 +386,7 @@ export const selectRecommendationPortfolio = (
     readonly intent: RecommendationSelection["intent"]
   }> = [{ candidate: balanced, intent: "balanced" }]
   const selectedConfigurations = new Set([balanced.assessment.configurationId])
-  const usedCheckpointIds = new Set([balanced.checkpointId])
+  const usedCatalogModelIds = new Set([balanced.catalogModelId])
 
   const bestQualityCapabilityGain = (capabilityScore(bestQuality) ?? 0)
     - (capabilityScore(balanced) ?? 0)
@@ -394,7 +395,7 @@ export const selectRecommendationPortfolio = (
     && (bestQualityCapabilityGain >= 5 || bestQualityFidelityGain >= 10)) {
     selected.push({ candidate: bestQuality, intent: "best_quality" })
     selectedConfigurations.add(bestQuality.assessment.configurationId)
-    usedCheckpointIds.add(bestQuality.checkpointId)
+    usedCatalogModelIds.add(bestQuality.catalogModelId)
   }
 
   const fastestCapable = withinCapabilityGuard(feasible, 35, 0.5)
@@ -408,13 +409,13 @@ export const selectRecommendationPortfolio = (
     : 0
   const nearFastest = fastestCapable.filter((candidate) =>
     conservativeGenerationSpeed(candidate) >= fastestRate * 0.9)
-  const fastest = preferNewCheckpointWithin(nearFastest, usedCheckpointIds)
+  const fastest = preferNewCatalogModelWithin(nearFastest, usedCatalogModelIds)
   if (fastest
     && conservativeGenerationSpeed(fastest)
       >= conservativeGenerationSpeed(balanced) * 1.15) {
     selected.push({ candidate: fastest, intent: "fastest" })
     selectedConfigurations.add(fastest.assessment.configurationId)
-    usedCheckpointIds.add(fastest.checkpointId)
+    usedCatalogModelIds.add(fastest.catalogModelId)
   }
 
   const lightweightCapable = feasible

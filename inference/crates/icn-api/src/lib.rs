@@ -21,14 +21,15 @@ use icn_contracts::bootstrap_protocol::{
     VulkanEligibility,
 };
 use icn_contracts::models::{
-    AssessModelsRequest, AssessModelsResponse, InstalledModelPackages,
+    AssessModelsRequest, AssessModelsResponse, CatalogModels, InstalledModelPackages,
     InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor, ModelDownload,
     ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance,
     ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
     ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelPackageId,
-    ModelServingConfigurationId, PreviewModelLoadRequest, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RemoveInstalledModelPackageResponse,
-    StartModelDownloadRequest, StartModelDownloadResponse,
+    ModelServingConfigurationId, ModelsResponse, PreviewModelLoadRequest,
+    RecommendableModelCatalog, RecommendableModelCatalogProvider, ReconcileCatalogModelRequest,
+    ReconcileCatalogModelResponse, RemoveInstalledModelPackageResponse, StartModelDownloadRequest,
+    StartModelDownloadResponse,
 };
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
@@ -72,6 +73,7 @@ const fn default_true() -> bool {
 
 #[derive(Clone)]
 pub struct AppState {
+    catalog_models: Option<Arc<dyn CatalogModels>>,
     installed_packages: Option<Arc<dyn InstalledModelPackages>>,
     recommendable_catalog: Option<Arc<dyn RecommendableModelCatalogProvider>>,
     model_assessor: Option<Arc<dyn ModelAssessor>>,
@@ -163,6 +165,7 @@ impl AppState {
     /// Construct API state from a backend shared with another server-owned service.
     pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
         Self {
+            catalog_models: None,
             installed_packages: None,
             recommendable_catalog: None,
             model_assessor: None,
@@ -178,6 +181,7 @@ impl AppState {
 
     pub fn model_free() -> Self {
         Self {
+            catalog_models: None,
             installed_packages: None,
             recommendable_catalog: None,
             model_assessor: None,
@@ -206,6 +210,11 @@ impl AppState {
         installed_packages: Arc<dyn InstalledModelPackages>,
     ) -> Self {
         self.installed_packages = Some(installed_packages);
+        self
+    }
+
+    pub fn with_catalog_models(mut self, catalog_models: Arc<dyn CatalogModels>) -> Self {
+        self.catalog_models = Some(catalog_models);
         self
     }
 
@@ -256,6 +265,11 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut protected = Router::new()
         .route("/v1/hardware", get(hardware))
+        .route("/v1/models", get(models))
+        .route(
+            "/v1/models/catalog/reconcile",
+            post(reconcile_catalog_model),
+        )
         .route("/v1/models/installed", get(installed_models))
         .route(
             "/v1/models/installed/{package_id}",
@@ -1443,6 +1457,49 @@ async fn installed_models(
         .ok_or_else(|| ApiError::server("installed model packages are not configured"))?;
     installed
         .list_installed()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models",
+    responses(
+        (status = 200, description = "Catalog models joined with current local artifact state", body = ModelsResponse),
+        (status = 500, description = "Model discovery failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.list", skip_all, err(Debug))]
+async fn models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, ApiError> {
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
+    models
+        .list()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/catalog/reconcile", operation_id = "reconcileCatalogModel", tag = "models",
+    request_body(content = ReconcileCatalogModelRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Catalog model reconciliation admission", body = ReconcileCatalogModelResponse),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 500, description = "Catalog model reconciliation failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.catalog.reconcile", skip_all, err(Debug))]
+async fn reconcile_catalog_model(
+    State(state): State<AppState>,
+    Json(request): Json<ReconcileCatalogModelRequest>,
+) -> Result<Json<ReconcileCatalogModelResponse>, ApiError> {
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
+    models
+        .reconcile(request)
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -2734,6 +2791,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
     paths(
         health,
         hardware,
+        models,
+        reconcile_catalog_model,
         search_hugging_face_models,
         resolve_hugging_face_repository,
         installed_models,
@@ -2758,6 +2817,9 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         HealthResponse,
         SetModelResidencyPolicyRequest,
         HardwareSnapshot,
+        ModelsResponse,
+        ReconcileCatalogModelRequest,
+        ReconcileCatalogModelResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
         HuggingFaceRepositoryRequest,

@@ -158,6 +158,16 @@ export const listModelDownloads = HttpApiEndpoint.get("listModelDownloads", "/v1
     { status: 500 },
   )
 
+export const listModels = HttpApiEndpoint.get("listModels", "/v1/models")
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.ModelsResponse, Schemas.ModelsResponseEncoded> => Schemas.ModelsResponse),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/v1/models/load/preview")
   .setPayload(
     S.suspend(
@@ -176,6 +186,29 @@ export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/v1/mo
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const reconcileCatalogModel = HttpApiEndpoint.post("reconcileCatalogModel", "/v1/models/catalog/reconcile")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.ReconcileCatalogModelRequest, Schemas.ReconcileCatalogModelRequestEncoded> =>
+        Schemas.ReconcileCatalogModelRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.ReconcileCatalogModelResponse, Schemas.ReconcileCatalogModelResponseEncoded> =>
+        Schemas.ReconcileCatalogModelResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -308,7 +341,9 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(getRecommendableModelCatalog)
   .add(listInstalledModels)
   .add(listModelDownloads)
+  .add(listModels)
   .add(previewModelLoad)
+  .add(reconcileCatalogModel)
   .add(removeInstalledModel)
   .add(setModelResidencyPolicy)
   .add(startModelDownload)

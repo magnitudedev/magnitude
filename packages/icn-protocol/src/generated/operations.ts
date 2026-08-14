@@ -330,6 +330,28 @@ export const listModelDownloadsOperation = {
   ],
 } as const
 
+export const listModelsOperation = {
+  operationId: "listModels",
+  transport: "http",
+  method: "GET",
+  path: "/v1/models",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend((): S.Schema<Schemas.ModelsResponse, Schemas.ModelsResponseEncoded> => Schemas.ModelsResponse),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
 export const loadModelInstanceOperation = {
   operationId: "loadModelInstance",
   transport: "sse",
@@ -388,6 +410,42 @@ export const previewModelLoadOperation = {
   payload: S.suspend(
     (): S.Schema<Schemas.PreviewModelLoadRequest, Schemas.PreviewModelLoadRequestEncoded> =>
       Schemas.PreviewModelLoadRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const reconcileCatalogModelOperation = {
+  operationId: "reconcileCatalogModel",
+  transport: "http",
+  method: "POST",
+  path: "/v1/models/catalog/reconcile",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ReconcileCatalogModelResponse, Schemas.ReconcileCatalogModelResponseEncoded> =>
+          Schemas.ReconcileCatalogModelResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.ReconcileCatalogModelRequest, Schemas.ReconcileCatalogModelRequestEncoded> =>
+      Schemas.ReconcileCatalogModelRequest,
   ),
   payloadMediaType: "application/json",
   payloadRequired: true,

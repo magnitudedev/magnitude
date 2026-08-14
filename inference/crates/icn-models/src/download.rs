@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use getrandom::fill;
 use hf_hub::HFError;
@@ -24,7 +23,11 @@ use tokio::sync::watch;
 
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, model_id};
-use crate::inventory::{ModelManager, build_model, hf_repo_dir, now, repository_lock_path};
+use crate::inventory::{ManagedModelStore, build_model, hf_repo_dir, now, repository_lock_path};
+use crate::store_fs::{
+    acquire_exclusive_lock, ensure_owned_directory as ensure_store_directory,
+    quarantine_owned_path_sync,
+};
 use crate::validation::ValidatedDownloadPackage;
 
 const MAX_ATTEMPTS: usize = 5;
@@ -293,11 +296,14 @@ impl DownloadError {
     }
 }
 
-impl ModelManager {
+impl ManagedModelStore {
     pub(crate) async fn start_target_downloads(
         &self,
         packages: Vec<ModelPackage>,
     ) -> Result<Vec<DownloadEventStream>, InventoryError> {
+        // Admission is a mutation boundary. Re-observe the store before deciding that any exact
+        // package is already present; the query snapshot is deliberately not mutation authority.
+        self.ensure_installed_model_inventory().await?;
         let packages = packages
             .into_iter()
             .map(|package| {
@@ -608,9 +614,8 @@ impl ModelManager {
                 retryable: false,
                 resumable: true,
             })?;
-        tokio::fs::create_dir_all(repo_root.join("blobs"))
-            .await
-            .map_err(download_io)?;
+        ensure_owned_directory(&repo_root).await?;
+        ensure_owned_directory(&repo_root.join("blobs")).await?;
         let started = Instant::now();
         let mut resumed_by_component = Vec::with_capacity(components.len());
         for component in &components {
@@ -706,13 +711,7 @@ impl ModelManager {
         }
 
         operation.ensure_active()?;
-        replace_other_snapshots(&repo_root, &commit).await?;
-        tokio::fs::create_dir_all(&snapshot)
-            .await
-            .map_err(download_io)?;
-        for component in &components {
-            publish_snapshot_link(&repo_root, &snapshot, component).await?;
-        }
+        publish_package_snapshot(&repo_root, &snapshot, &commit, &components).await?;
         let ready_at = now();
         let primary = components
             .iter()
@@ -777,25 +776,45 @@ impl ModelManager {
     }
 }
 
-async fn replace_other_snapshots(repo_root: &Path, commit: &str) -> Result<(), DownloadError> {
+async fn publish_package_snapshot(
+    repo_root: &Path,
+    snapshot: &Path,
+    commit: &str,
+    components: &[ModelComponent],
+) -> Result<(), DownloadError> {
+    let incomplete = repo_root.join(".incomplete");
     let snapshots = repo_root.join("snapshots");
-    tokio::fs::create_dir_all(&snapshots)
+    ensure_owned_directory(&incomplete).await?;
+    ensure_owned_directory(&snapshots).await?;
+
+    match tokio::fs::symlink_metadata(snapshot).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            for component in components {
+                publish_snapshot_link(repo_root, snapshot, component).await?;
+            }
+            return sync_directory(snapshot).await;
+        }
+        Ok(_) => quarantine(snapshot).await?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(download_io(error)),
+    }
+
+    let staged_snapshot = incomplete.join(format!("snapshot-{commit}"));
+    quarantine(&staged_snapshot).await?;
+    ensure_owned_directory(&staged_snapshot).await?;
+    for component in components {
+        publish_snapshot_link(repo_root, &staged_snapshot, component).await?;
+    }
+    tokio::fs::rename(staged_snapshot, snapshot)
         .await
         .map_err(download_io)?;
-    let mut entries = tokio::fs::read_dir(&snapshots).await.map_err(download_io)?;
-    while let Some(entry) = entries.next_entry().await.map_err(download_io)? {
-        if entry.file_name().to_string_lossy() == commit {
-            continue;
-        }
-        let path = entry.path();
-        let kind = entry.file_type().await.map_err(download_io)?;
-        if kind.is_dir() && !kind.is_symlink() {
-            tokio::fs::remove_dir_all(path).await.map_err(download_io)?;
-        } else {
-            tokio::fs::remove_file(path).await.map_err(download_io)?;
-        }
-    }
-    Ok(())
+    sync_parent(snapshot).await
+}
+
+async fn ensure_owned_directory(path: &Path) -> Result<(), DownloadError> {
+    ensure_store_directory(path)
+        .await
+        .map_err(inventory_download_error)
 }
 
 async fn download_component_with_retry(
@@ -1110,27 +1129,41 @@ async fn publish_snapshot_link(
 ) -> Result<(), DownloadError> {
     let destination = snapshot.join(&component.path);
     if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(download_io)?;
+        let relative = parent.strip_prefix(snapshot).map_err(download_io)?;
+        let mut current = snapshot.to_path_buf();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            ensure_owned_directory(&current).await?;
+        }
     }
     let blob = repo_root.join("blobs").join(blob_key(&component.content));
+    let blob_metadata = tokio::fs::symlink_metadata(&blob)
+        .await
+        .map_err(download_io)?;
+    if !blob_metadata.is_file() || blob_metadata.file_type().is_symlink() {
+        return Err(DownloadError {
+            kind: DownloadErrorKind::FileSystem,
+            message: format!("verified blob is not a regular file: {}", blob.display()),
+            retryable: true,
+            resumable: true,
+        });
+    }
     let destination_clone = destination.clone();
     tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
-        if destination_clone.exists() {
-            let canonical = destination_clone.canonicalize().map_err(download_io)?;
-            if canonical == blob.canonicalize().map_err(download_io)? {
-                return Ok(());
+        match destination_clone.symlink_metadata() {
+            Ok(_) => {
+                let matching = destination_clone
+                    .canonicalize()
+                    .ok()
+                    .zip(blob.canonicalize().ok())
+                    .is_some_and(|(existing, expected)| existing == expected);
+                if matching {
+                    return Ok(());
+                }
+                quarantine_owned_path_sync(&destination_clone).map_err(inventory_download_error)?;
             }
-            return Err(DownloadError {
-                kind: DownloadErrorKind::FileSystem,
-                message: format!(
-                    "snapshot path already exists: {}",
-                    destination_clone.display()
-                ),
-                retryable: false,
-                resumable: true,
-            });
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(download_io(error)),
         }
         #[cfg(unix)]
         {
@@ -1206,6 +1239,11 @@ async fn sync_parent(path: &Path) -> Result<(), DownloadError> {
     directory.sync_all().await.map_err(download_io)
 }
 
+async fn sync_directory(path: &Path) -> Result<(), DownloadError> {
+    let directory = tokio::fs::File::open(path).await.map_err(download_io)?;
+    directory.sync_all().await.map_err(download_io)
+}
+
 async fn resumable_bytes(repo_root: &Path, components: &[ModelComponent]) -> u64 {
     let mut total = 0_u64;
     for component in components {
@@ -1245,8 +1283,10 @@ async fn recoverable_download_bytes(
 }
 
 async fn quarantine(path: &Path) -> Result<(), DownloadError> {
-    if !path.exists() {
-        return Ok(());
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(download_io(error)),
     }
     let destination = path.with_extension(format!(
         "invalid-{}",
@@ -1259,15 +1299,7 @@ async fn quarantine(path: &Path) -> Result<(), DownloadError> {
 
 async fn acquire_lock(path: PathBuf) -> Result<File, DownloadError> {
     tokio::task::spawn_blocking(move || {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(download_io)?;
-        FileExt::lock_exclusive(&file).map_err(download_io)?;
-        Ok(file)
+        acquire_exclusive_lock(&path).map_err(inventory_download_error)
     })
     .await
     .map_err(|error| DownloadError {
@@ -1726,8 +1758,46 @@ mod tests {
         ModelPackageProperties, ModelPackageSource,
     };
     use icn_contracts::{
-        ComponentRelationship, ComponentRole, ModelId, ResolvedComponent, ResolvedModel,
+        CapabilityEvidence, ComponentRelationship, ComponentRole, EffectiveTemplateInputs,
+        ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
+        ResolvedModel, TemplateAssessment, TemplateAssessor, TemplateCapabilities,
     };
+
+    struct DownloadTestTemplateAssessor;
+
+    impl TemplateAssessor for DownloadTestTemplateAssessor {
+        fn cache_identity(&self) -> &str {
+            "download-test-template-assessor"
+        }
+
+        fn assess(&self, _: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
+            Ok(TemplateAssessment {
+                capabilities: TemplateCapabilities {
+                    string_content: true,
+                    typed_content: false,
+                    tools: false,
+                    tool_calls: false,
+                    parallel_tool_calls: false,
+                    system_role: true,
+                    preserve_reasoning: false,
+                    object_arguments: false,
+                    enable_thinking: false,
+                },
+                reasoning: ReasoningCapability::Supported {
+                    control: ReasoningControlDomain::Effort {
+                        levels: vec!["none".to_owned()],
+                        default: Some("none".to_owned()),
+                    },
+                    visibility: ReasoningVisibility::Hidden,
+                    delimiters: ReasoningDelimiters::Unavailable,
+                    evidence: CapabilityEvidence::BoundedTemplateProbe {
+                        fingerprint: "download-test".to_owned(),
+                    },
+                },
+                fingerprint: "download-test".to_owned(),
+            })
+        }
+    }
 
     fn model_component(contents: &[u8]) -> ModelComponent {
         let digest = format!("{:x}", Sha256::digest(contents));
@@ -1764,12 +1834,14 @@ mod tests {
                 quantization_name: "test".to_owned(),
                 architecture: "test".to_owned(),
                 maximum_context_length: 1,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             },
         }
     }
 
     #[tokio::test]
-    async fn publishing_a_revision_removes_other_snapshots_but_retains_blobs() {
+    async fn publishing_a_revision_retains_other_snapshots_and_blobs() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let repository = directory.path().join("repository");
         tokio::fs::create_dir_all(repository.join("snapshots/old"))
@@ -1785,13 +1857,103 @@ mod tests {
             .await
             .expect("blob");
 
-        replace_other_snapshots(&repository, "current")
+        let component = model_component(b"current");
+        let paths =
+            DownloadComponentPaths::new(&repository.join("blobs"), &blob_key(&component.content));
+        tokio::fs::write(&paths.blob, b"current")
             .await
-            .expect("single managed revision");
+            .expect("current blob");
+        publish_package_snapshot(
+            &repository,
+            &repository.join("snapshots/current"),
+            "current",
+            &[component],
+        )
+        .await
+        .expect("additive snapshot publication");
 
-        assert!(!repository.join("snapshots/old").exists());
+        assert!(repository.join("snapshots/old").is_dir());
         assert!(repository.join("snapshots/current").is_dir());
         assert!(repository.join("blobs/model").is_file());
+    }
+
+    #[tokio::test]
+    async fn publishing_the_first_revision_creates_the_snapshot_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("repository");
+        let staged = repository.join(".incomplete/snapshot-current");
+        let published = repository.join("snapshots/current");
+        tokio::fs::create_dir_all(&staged)
+            .await
+            .expect("staged snapshot");
+        tokio::fs::write(staged.join("model.gguf"), b"verified")
+            .await
+            .expect("staged model");
+
+        let component = model_component(b"verified");
+        let paths =
+            DownloadComponentPaths::new(&repository.join("blobs"), &blob_key(&component.content));
+        tokio::fs::create_dir_all(repository.join("blobs"))
+            .await
+            .expect("blob directory");
+        tokio::fs::write(&paths.blob, b"verified")
+            .await
+            .expect("verified blob");
+
+        publish_package_snapshot(&repository, &published, "current", &[component])
+            .await
+            .expect("first snapshot publication");
+
+        assert!(!staged.exists());
+        assert_eq!(
+            tokio::fs::read(published.join("model.gguf"))
+                .await
+                .expect("published model"),
+            b"verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_another_package_into_the_same_revision_is_additive() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("repository");
+        let snapshot = repository.join("snapshots/current");
+
+        let mut target = model_component(b"target");
+        target.path = PathBuf::from("target.gguf");
+        let mut draft = model_component(b"draft");
+        draft.path = PathBuf::from("draft.gguf");
+        for (component, contents) in [
+            (&target, b"target".as_slice()),
+            (&draft, b"draft".as_slice()),
+        ] {
+            let paths = DownloadComponentPaths::new(
+                &repository.join("blobs"),
+                &blob_key(&component.content),
+            );
+            tokio::fs::create_dir_all(repository.join("blobs"))
+                .await
+                .expect("blob directory");
+            tokio::fs::write(paths.blob, contents)
+                .await
+                .expect("verified blob");
+        }
+
+        publish_package_snapshot(&repository, &snapshot, "current", &[target])
+            .await
+            .expect("target publication");
+        publish_package_snapshot(&repository, &snapshot, "current", &[draft])
+            .await
+            .expect("draft publication");
+
+        assert_eq!(
+            tokio::fs::read(snapshot.join("target.gguf")).await.unwrap(),
+            b"target"
+        );
+        assert_eq!(
+            tokio::fs::read(snapshot.join("draft.gguf")).await.unwrap(),
+            b"draft"
+        );
     }
 
     #[tokio::test]
@@ -1799,8 +1961,28 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().join("models");
         let cache_root = directory.path().join("cache");
-        let manager = ModelManager::open(
-            InventoryConfig::with_roots(root, cache_root).expect("inventory config"),
+        let hf_cache = directory.path().join("hugging-face");
+        let snapshot = hf_cache
+            .join("models--owner--repository")
+            .join("snapshots")
+            .join("a".repeat(40));
+        tokio::fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        let mut gguf = Vec::new();
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3_u32.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.resize(32, 0);
+        tokio::fs::write(snapshot.join("model.gguf"), gguf)
+            .await
+            .expect("installed model");
+        let mut config = InventoryConfig::with_roots(root, cache_root).expect("inventory config");
+        config.hf_cache_dirs.push(hf_cache);
+        let manager = ManagedModelStore::open_with_template_assessor(
+            config,
+            Some(Arc::new(DownloadTestTemplateAssessor)),
         )
         .await
         .expect("model manager");
@@ -1808,59 +1990,20 @@ mod tests {
             .ensure_installed_model_inventory()
             .await
             .expect("initial inventory");
-
-        let contents = b"installed model contents";
-        let path = directory.path().join("model.gguf");
-        tokio::fs::write(&path, contents)
-            .await
-            .expect("installed model");
-        let component = model_component(contents);
-        let model = InventoryModel {
-            id: ModelId("model_installed".to_owned()),
-            content_id: content_id(std::slice::from_ref(&component)),
-            created: 1,
-            name: "installed".to_owned(),
-            supported_parameters: Vec::new(),
-            availability: ModelAvailability::Available { ready_at: 1 },
-            source: ModelSource::HuggingFace {
-                repository: "owner/repository".to_owned(),
-                requested_revision: "a".repeat(40),
-                commit: "a".repeat(40),
-                metadata: None,
-            },
-            location: ModelLocation::File {
-                path: path.clone(),
-                component: component.clone(),
-                integrity: Integrity::Verified {
-                    method: "sha256".to_owned(),
-                },
-            },
-            properties: InventoryProperties::Pending,
-            operations: Vec::new(),
-            updated_at: 1,
-        };
+        let model = manager
+            .models
+            .read()
+            .expect("inventory lock")
+            .values()
+            .next()
+            .cloned()
+            .expect("installed inventory model");
         let resolved = ResolvedModel {
+            components: crate::service::resolve_components(manager.root(), &model)
+                .expect("resolved components"),
             model: model.clone(),
-            components: vec![ResolvedComponent {
-                path,
-                role: ComponentRole::Weights,
-                shard_index: None,
-                relationship: None,
-            }],
         };
         let package = package_from_resolved(&resolved).expect("installed package");
-        manager
-            .models
-            .write()
-            .expect("inventory lock")
-            .insert(model.id.clone(), model.clone());
-        let installed = manager
-            .build_installed_package_snapshot(&manager.models.read().expect("inventory lock"))
-            .expect("installed package snapshot");
-        *manager
-            .installed_packages
-            .write()
-            .expect("installed package snapshot lock") = installed;
 
         let mut streams = manager
             .start_target_downloads(vec![package])

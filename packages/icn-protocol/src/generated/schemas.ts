@@ -181,17 +181,102 @@ export type CacheTypeResponse = S.Schema.Type<typeof CacheTypeResponse>
 export type CacheTypeResponseEncoded = S.Schema.Encoded<typeof CacheTypeResponse>
 
 export const CatalogDiagnostic = S.Struct({
-  entryId: S.optionalWith(
-    S.Union(
-      S.Null,
-      S.suspend((): S.Schema<RecommendableModelId, RecommendableModelIdEncoded> => RecommendableModelId),
-    ),
-    { exact: true, as: "Option" },
-  ),
   failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+  modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
+  variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
 })
 export type CatalogDiagnostic = S.Schema.Type<typeof CatalogDiagnostic>
 export type CatalogDiagnosticEncoded = S.Schema.Encoded<typeof CatalogDiagnostic>
+
+export const CatalogModel = S.Struct({
+  capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
+  description: S.String,
+  desiredConfiguration: S.suspend(
+    (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
+  ),
+  displayName: S.String,
+  fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  license: S.String,
+  localState: S.suspend((): S.Schema<CatalogModelLocalState, CatalogModelLocalStateEncoded> => CatalogModelLocalState),
+  modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
+  qualityEvidence: S.Array(S.String),
+  qualityScore: S.Number,
+  qualityScoreProvenance: S.String,
+  quantizationAware: S.Boolean,
+  variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
+  variantLabel: S.String,
+})
+export type CatalogModel = S.Schema.Type<typeof CatalogModel>
+export type CatalogModelEncoded = S.Schema.Encoded<typeof CatalogModel>
+
+export const CatalogModelEffectiveConfiguration = S.Union(
+  S.extend(
+    S.TaggedStruct("Runnable", {
+      configuration: S.suspend(
+        (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Unavailable", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CatalogModelEffectiveConfiguration = S.Schema.Type<typeof CatalogModelEffectiveConfiguration>
+export type CatalogModelEffectiveConfigurationEncoded = S.Schema.Encoded<typeof CatalogModelEffectiveConfiguration>
+
+export const CatalogModelId = S.String
+export type CatalogModelId = S.Schema.Type<typeof CatalogModelId>
+export type CatalogModelIdEncoded = S.Schema.Encoded<typeof CatalogModelId>
+
+export const CatalogModelInstallation = S.Struct({
+  effectiveConfiguration: S.suspend(
+    (): S.Schema<CatalogModelEffectiveConfiguration, CatalogModelEffectiveConfigurationEncoded> =>
+      CatalogModelEffectiveConfiguration,
+  ),
+  packages: S.Array(
+    S.suspend((): S.Schema<InstalledModelPackage, InstalledModelPackageEncoded> => InstalledModelPackage),
+  ),
+})
+export type CatalogModelInstallation = S.Schema.Type<typeof CatalogModelInstallation>
+export type CatalogModelInstallationEncoded = S.Schema.Encoded<typeof CatalogModelInstallation>
+
+export const CatalogModelLocalState = S.Union(
+  S.extend(S.TaggedStruct("NotInstalled", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Installed", {
+      installation: S.suspend(
+        (): S.Schema<CatalogModelInstallation, CatalogModelInstallationEncoded> => CatalogModelInstallation,
+      ),
+      updateState: S.suspend(
+        (): S.Schema<CatalogModelUpdateState, CatalogModelUpdateStateEncoded> => CatalogModelUpdateState,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CatalogModelLocalState = S.Schema.Type<typeof CatalogModelLocalState>
+export type CatalogModelLocalStateEncoded = S.Schema.Encoded<typeof CatalogModelLocalState>
+
+export const CatalogModelUpdateState = S.Union(
+  S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Available", {
+      missingPackageIds: S.Array(S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId)),
+      supersededPackageIds: S.Array(S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CatalogModelUpdateState = S.Schema.Type<typeof CatalogModelUpdateState>
+export type CatalogModelUpdateStateEncoded = S.Schema.Encoded<typeof CatalogModelUpdateState>
+
+export const CatalogVariantId = S.String
+export type CatalogVariantId = S.Schema.Type<typeof CatalogVariantId>
+export type CatalogVariantIdEncoded = S.Schema.Encoded<typeof CatalogVariantId>
 
 export const ChatCompletionChunk = S.Struct({
   choices: S.Array(S.suspend((): S.Schema<ChunkChoice, ChunkChoiceEncoded> => ChunkChoice)),
@@ -939,7 +1024,29 @@ export const ImageUrlRequest = S.Struct({
 export type ImageUrlRequest = S.Schema.Type<typeof ImageUrlRequest>
 export type ImageUrlRequestEncoded = S.Schema.Encoded<typeof ImageUrlRequest>
 
+export const InstalledCatalogAttribution = S.Union(
+  S.extend(S.TaggedStruct("NotCatalogTarget", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Attributed", {
+      modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
+      variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type InstalledCatalogAttribution = S.Schema.Type<typeof InstalledCatalogAttribution>
+export type InstalledCatalogAttributionEncoded = S.Schema.Encoded<typeof InstalledCatalogAttribution>
+
 export const InstalledModelPackage = S.Struct({
+  catalogAttribution: S.suspend(
+    (): S.Schema<InstalledCatalogAttribution, InstalledCatalogAttributionEncoded> => InstalledCatalogAttribution,
+  ),
   inspection: S.suspend((): S.Schema<ModelPackageInspection, ModelPackageInspectionEncoded> => ModelPackageInspection),
   origin: S.suspend(
     (): S.Schema<ModelPackageInstallationOrigin, ModelPackageInstallationOriginEncoded> =>
@@ -1489,6 +1596,8 @@ export type ModelPackageOperandEncoded = S.Schema.Encoded<typeof ModelPackageOpe
 export const ModelPackageProperties = S.Struct({
   architecture: S.String,
   format: S.String,
+  intrinsicModelId: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  intrinsicQualityId: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   maximumContextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   quantization: S.String,
   quantizationName: S.String,
@@ -1544,6 +1653,18 @@ export type ModelServingConfigurationEncoded = S.Schema.Encoded<typeof ModelServ
 export const ModelServingConfigurationId = S.String
 export type ModelServingConfigurationId = S.Schema.Type<typeof ModelServingConfigurationId>
 export type ModelServingConfigurationIdEncoded = S.Schema.Encoded<typeof ModelServingConfigurationId>
+
+export const ModelsResponse = S.Struct({
+  catalogModels: S.Array(S.suspend((): S.Schema<CatalogModel, CatalogModelEncoded> => CatalogModel)),
+  diagnostics: S.Array(S.suspend((): S.Schema<CatalogDiagnostic, CatalogDiagnosticEncoded> => CatalogDiagnostic)),
+  reconciliationComplete: S.Boolean,
+  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  uncataloguedPackages: S.Array(
+    S.suspend((): S.Schema<InstalledModelPackage, InstalledModelPackageEncoded> => InstalledModelPackage),
+  ),
+})
+export type ModelsResponse = S.Schema.Type<typeof ModelsResponse>
+export type ModelsResponseEncoded = S.Schema.Encoded<typeof ModelsResponse>
 
 export const ModelStoppingAllocation = S.Union(
   S.extend(
@@ -1636,19 +1757,19 @@ export type ReasoningProfileResponseEncoded = S.Schema.Encoded<typeof ReasoningP
 
 export const RecommendableModel = S.Struct({
   capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
-  checkpointId: S.String,
   configuration: S.suspend(
     (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
   ),
   description: S.String,
   displayName: S.String,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  id: S.suspend((): S.Schema<RecommendableModelId, RecommendableModelIdEncoded> => RecommendableModelId),
   license: S.String,
+  modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
   qualityEvidence: S.Array(S.String),
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,
   quantizationAware: S.Boolean,
+  variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
   variantLabel: S.String,
 })
 export type RecommendableModel = S.Schema.Type<typeof RecommendableModel>
@@ -1664,9 +1785,24 @@ export const RecommendableModelCatalog = S.extend(
 export type RecommendableModelCatalog = S.Schema.Type<typeof RecommendableModelCatalog>
 export type RecommendableModelCatalogEncoded = S.Schema.Encoded<typeof RecommendableModelCatalog>
 
-export const RecommendableModelId = S.String
-export type RecommendableModelId = S.Schema.Type<typeof RecommendableModelId>
-export type RecommendableModelIdEncoded = S.Schema.Encoded<typeof RecommendableModelId>
+export const ReconcileCatalogModelRequest = S.Struct({
+  modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
+  variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
+})
+export type ReconcileCatalogModelRequest = S.Schema.Type<typeof ReconcileCatalogModelRequest>
+export type ReconcileCatalogModelRequestEncoded = S.Schema.Encoded<typeof ReconcileCatalogModelRequest>
+
+export const ReconcileCatalogModelResponse = S.Union(
+  S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("DownloadAdmitted", {
+      downloadId: S.suspend((): S.Schema<ModelDownloadId, ModelDownloadIdEncoded> => ModelDownloadId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ReconcileCatalogModelResponse = S.Schema.Type<typeof ReconcileCatalogModelResponse>
+export type ReconcileCatalogModelResponseEncoded = S.Schema.Encoded<typeof ReconcileCatalogModelResponse>
 
 export const RemoveInstalledModelPackageResponse = S.extend(
   S.Struct({

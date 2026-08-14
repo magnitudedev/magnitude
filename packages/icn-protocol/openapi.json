@@ -308,6 +308,36 @@
         }
       }
     },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "listModels",
+        "responses": {
+          "200": {
+            "description": "Catalog models joined with current local artifact state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models/assess": {
       "post": {
         "tags": [
@@ -377,6 +407,56 @@
           },
           "500": {
             "description": "Catalog publication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/catalog/reconcile": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "reconcileCatalogModel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconcileCatalogModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Catalog model reconciliation admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileCatalogModelResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog model reconciliation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1301,24 +1381,243 @@
       "CatalogDiagnostic": {
         "type": "object",
         "required": [
+          "modelId",
+          "variantId",
           "failure"
         ],
         "properties": {
-          "entryId": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/RecommendableModelId"
-              }
-            ]
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
           },
           "failure": {
             "$ref": "#/components/schemas/ModelFailure"
           }
         },
         "additionalProperties": false
+      },
+      "CatalogModel": {
+        "type": "object",
+        "required": [
+          "modelId",
+          "variantId",
+          "desiredConfiguration",
+          "displayName",
+          "variantLabel",
+          "description",
+          "license",
+          "capabilities",
+          "qualityScore",
+          "qualityScoreProvenance",
+          "fidelityRank",
+          "quantizationAware",
+          "qualityEvidence",
+          "localState"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
+          },
+          "desiredConfiguration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "license": {
+            "type": "string"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "qualityScore": {
+            "type": "number",
+            "format": "double"
+          },
+          "qualityScoreProvenance": {
+            "type": "string"
+          },
+          "fidelityRank": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "quantizationAware": {
+            "type": "boolean"
+          },
+          "qualityEvidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "localState": {
+            "$ref": "#/components/schemas/CatalogModelLocalState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogModelEffectiveConfiguration": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "configuration",
+              "_tag"
+            ],
+            "properties": {
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Runnable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogModelId": {
+        "type": "string"
+      },
+      "CatalogModelInstallation": {
+        "type": "object",
+        "required": [
+          "effectiveConfiguration",
+          "packages"
+        ],
+        "properties": {
+          "effectiveConfiguration": {
+            "$ref": "#/components/schemas/CatalogModelEffectiveConfiguration"
+          },
+          "packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledModelPackage"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogModelLocalState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotInstalled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "installation",
+              "updateState",
+              "_tag"
+            ],
+            "properties": {
+              "installation": {
+                "$ref": "#/components/schemas/CatalogModelInstallation"
+              },
+              "updateState": {
+                "$ref": "#/components/schemas/CatalogModelUpdateState"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Installed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogModelUpdateState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Current"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "missingPackageIds",
+              "supersededPackageIds",
+              "_tag"
+            ],
+            "properties": {
+              "missingPackageIds": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelPackageId"
+                }
+              },
+              "supersededPackageIds": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelPackageId"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Available"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogVariantId": {
+        "type": "string"
       },
       "ChatCompletionChunk": {
         "type": "object",
@@ -3171,13 +3470,72 @@
         },
         "additionalProperties": false
       },
+      "InstalledCatalogAttribution": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotCatalogTarget"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "modelId",
+              "variantId",
+              "_tag"
+            ],
+            "properties": {
+              "modelId": {
+                "$ref": "#/components/schemas/CatalogModelId"
+              },
+              "variantId": {
+                "$ref": "#/components/schemas/CatalogVariantId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Attributed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "InstalledModelPackage": {
         "type": "object",
         "required": [
           "package",
           "path",
           "origin",
-          "inspection"
+          "inspection",
+          "catalogAttribution"
         ],
         "properties": {
           "package": {
@@ -3191,6 +3549,9 @@
           },
           "inspection": {
             "$ref": "#/components/schemas/ModelPackageInspection"
+          },
+          "catalogAttribution": {
+            "$ref": "#/components/schemas/InstalledCatalogAttribution"
           }
         },
         "additionalProperties": false
@@ -4566,6 +4927,18 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "intrinsicModelId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "intrinsicQualityId": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false
@@ -4709,6 +5082,45 @@
             }
           }
         ]
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "required": [
+          "revision",
+          "reconciliationComplete",
+          "catalogModels",
+          "uncataloguedPackages",
+          "diagnostics"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
+          "catalogModels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogModel"
+            }
+          },
+          "uncataloguedPackages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledModelPackage"
+            }
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogDiagnostic"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "NamedFunctionCallRequest": {
         "type": "object",
@@ -4871,8 +5283,8 @@
       "RecommendableModel": {
         "type": "object",
         "required": [
-          "id",
-          "checkpointId",
+          "modelId",
+          "variantId",
           "configuration",
           "displayName",
           "variantLabel",
@@ -4886,11 +5298,11 @@
           "qualityEvidence"
         ],
         "properties": {
-          "id": {
-            "$ref": "#/components/schemas/RecommendableModelId"
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
           },
-          "checkpointId": {
-            "type": "string"
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
           },
           "configuration": {
             "$ref": "#/components/schemas/ModelServingConfiguration"
@@ -4955,8 +5367,57 @@
           }
         }
       },
-      "RecommendableModelId": {
-        "type": "string"
+      "ReconcileCatalogModelRequest": {
+        "type": "object",
+        "required": [
+          "modelId",
+          "variantId"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReconcileCatalogModelResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Current"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "downloadId",
+              "_tag"
+            ],
+            "properties": {
+              "downloadId": {
+                "$ref": "#/components/schemas/ModelDownloadId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DownloadAdmitted"
+                ]
+              }
+            }
+          }
+        ]
       },
       "RemoveInstalledModelPackageResponse": {
         "type": "object",

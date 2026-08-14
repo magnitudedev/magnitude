@@ -96,6 +96,7 @@ describe("provider model catalog", () => {
       const dependencies = Layer.mergeAll(
         Layer.succeed(ProviderClient, ProviderClient.of(client)),
         Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
+          ready: Effect.succeed(true),
           list: Effect.succeed([]),
           catalog: Effect.gen(function* () {
             const signal = yield* Ref.get(localReadSignal)

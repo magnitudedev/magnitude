@@ -17,10 +17,7 @@ import {
   type ProviderModelCatalogEntry,
   type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
-import {
-  ProviderModelIdSchema,
-  type ProviderModelId,
-} from "@magnitudedev/sdk"
+import type { ProviderModelId } from "@magnitudedev/sdk"
 import { IcnCatalog, IcnInstalledModels } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import {
@@ -32,10 +29,8 @@ import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver"
 import { makeObservedState } from "./mirrored-state"
 import { resolveBundlePresentation } from "./local-model-presentation"
-
-export const localProviderModelId = (
-  configurationId: ModelServingConfigurationId,
-): ProviderModelId => ProviderModelIdSchema.make(configurationId)
+export { localProviderModelId, localCatalogProviderModelId } from "./local-provider-model-id"
+import { localCatalogProviderModelId, localProviderModelId } from "./local-provider-model-id"
 
 export type ProviderOfferingPackageEvidence = readonly {
   readonly providerModelId: LocalProviderOffering["providerModelId"]
@@ -120,6 +115,7 @@ const capabilitySet = (
 }
 
 export interface LocalProviderOfferingsApi {
+  readonly ready: Effect.Effect<boolean>
   readonly list: Effect.Effect<readonly LocalProviderOffering[], LocalInferenceError>
   readonly changes: Stream.Stream<void>
   readonly catalog: Effect.Effect<readonly ProviderModelCatalogEntry[], LocalInferenceError>
@@ -166,23 +162,25 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   })
 
   const offeringsFrom = (
-    configurations: readonly ModelServingConfiguration[],
+    resolved: readonly import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration[],
     sources: Effect.Effect.Success<typeof capabilitySources>,
-  ): readonly LocalProviderOffering[] => configurations.map((configuration) => ({
-    providerModelId: localProviderModelId(configuration.id),
-    configuration,
+  ): readonly LocalProviderOffering[] => resolved.map(({ servingConfiguration, catalogIdentity }) => ({
+    providerModelId: Option.match(catalogIdentity, {
+      onNone: () => localProviderModelId(servingConfiguration.id),
+      onSome: localCatalogProviderModelId,
+    }),
+    configuration: servingConfiguration,
     capabilities: capabilitySet(
-      configuration.bundle,
+      servingConfiguration.bundle,
       sources.catalog.models,
       sources.installed.entries,
     ),
   }))
 
   const list: LocalProviderOfferingsApi["list"] = Effect.gen(function* () {
-    const configurations = [...(yield* resolver.get).values()].map(({ configuration }) =>
-      configuration)
+    const resolved = [...(yield* resolver.get).values()]
     const sources = yield* capabilitySources
-    return offeringsFrom(configurations, sources)
+    return offeringsFrom(resolved, sources)
   }).pipe(
     Effect.mapError((error) => error instanceof LocalModelMutationFailed
       ? error
@@ -213,14 +211,14 @@ export const LocalProviderOfferingsLive: Layer.Layer<
 
   const compute = Effect.gen(function* () {
     const resolved = [...(yield* resolver.get).values()]
-    const configurations = resolved.map(({ configuration }) => configuration)
+    const configurations = resolved.map(({ servingConfiguration }) => servingConfiguration)
     const sources = yield* capabilitySources
     const catalogModels = sources.catalog.models
     const packageSnapshot = yield* packages.snapshot
     const packageEntries = new Map(
       packageSnapshot.state.entries.map((entry) => [entry.package.id, entry]),
     )
-    const configured = offeringsFrom(configurations, sources)
+    const configured = offeringsFrom(resolved, sources)
     const packageEvidence = providerOfferingPackageEvidence(configured, packageEntries)
     const bundleEntries = configured.map(({ configuration }) =>
       servableModelBundlePackageIds(configuration.bundle).map((id) => packageEntries.get(id)))
@@ -302,6 +300,7 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   )
 
   return LocalProviderOfferings.of({
+    ready: resolver.catalogReady,
     list,
     changes,
     catalog: observed.get.pipe(Effect.flatMap(({ state }) => Option.match(state.failure, {

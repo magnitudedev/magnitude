@@ -132,8 +132,9 @@ human-readable message or learning which platform-specific mechanism limited the
 
 After restart, ACN restores slot selections, resolves their current configurations and provider
 offerings from catalog or standard-profile authorities, and does not reconstruct prior instance
-identity or residency. An unresolved selection remains unavailable without substitution. New demand
-creates a new admitted occurrence.
+identity or residency. A selection proven absent by a complete authoritative offering projection
+is cleared; temporary authority failure retains it without substitution. New demand creates a new
+admitted occurrence.
 
 ## Conformance
 

@@ -27,10 +27,13 @@ or completion from cached projections.
 Catalog membership, artifact presence, download activity, inspection, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
 
+Catalog attribution across exact artifact or drafter changes follows
+[Intrinsic catalog target mapping](./intrinsic-target-mapping.md).
+
 ## Release catalog
 
 The release catalog is immutable release data. Human-reviewed declarations identify each artifact
-variant by its exact upstream format selector, short variant label, fidelity rank, and
+variant by its stable format-qualified variant ID, exact upstream format selector, short variant label, fidelity rank, and
 quantization-aware-training fact. Each entry publishes one exact default
 `ModelServingConfiguration`, required package components, presentation, and recommendation
 evidence. Speculative decoding is explicit as either capability embedded in the target GGUF or an
@@ -69,31 +72,32 @@ files required by that package are currently present and valid. A bundle is inst
 its required packages are installed. No registry, configuration, download record, cache entry, or
 historical success can make files present or absent.
 
-Magnitude-owned artifacts live in the configured `MagnitudeStore`. Explicit Hugging Face roots are
+Magnitude-owned artifacts live in the configured `ManagedModelStore`. Explicit Hugging Face roots are
 read-only external sources with origin `HuggingFaceCache`; they are never moved, deleted, or adopted.
 Origin affects ownership-sensitive operations, not package identity or runtime eligibility.
 
-Each repository in the Magnitude-owned store has zero or one installed revision. Its sole snapshot
-directory names that revision and contains links to the installed content-addressed blobs. Adding a
-package from the same revision extends that snapshot. Publishing a different revision replaces the
-old snapshot, so packages not present in the replacement become uninstalled. A bundle may not
-require two revisions of the same repository.
+Each repository in the Magnitude-owned store may contain any number of complete revision snapshots.
+Each snapshot directory names its immutable revision and contains links to installed
+content-addressed blobs. Publishing a package is additive: it adds that package's exact components
+to its revision snapshot and does not infer that other components or revisions are obsolete.
 
-ICN derives managed inventory by bounded, containment-safe enumeration of that sole snapshot.
-Inventory never creates, repairs, or removes artifact links. Component paths, sizes, content
+ICN derives managed inventory by bounded, containment-safe enumeration of every complete snapshot.
+The observation path never creates, repairs, or removes artifact links. Component paths, sizes, content
 identities, roles, shards, and relationships come from existing validated files, exact catalog
-matches, and artifact inspection. Unsafe links, special files, escaping paths, multiple managed
-snapshots, and invalid entries make only the affected repository unavailable until acquisition
-re-establishes the invariant. Explicit external Hugging Face roots retain their ordinary
+matches, and artifact inspection. Unsafe links, special files, escaping paths, and invalid entries
+make only the affected package unavailable. Store mutations reconcile owned path topology by
+quarantining conflicting nodes before writing; they never follow a conflicting link or overwrite an
+unclassified node. Explicit external Hugging Face roots retain their ordinary
 multi-revision layout and remain read-only.
 
 Temporary and `.incomplete` files never contribute presence. A partial multi-file package is not
 installed. A complete independently servable weights package may remain installed while an
 optional companion or a larger bundle is incomplete.
 
-Inventory reconciliation owns filesystem discovery, hashing, inspection, tensor-storage
-derivation, and package construction. It publishes complete snapshots and retains the previous
-complete snapshot while a refresh is in flight. Queries return the current materialized snapshot
+Inventory reconciliation owns filesystem discovery, hashing, GGUF inspection, tensor-storage
+derivation, and package construction. One cached GGUF inspection supplies every derived property
+for an immutable component. Reconciliation publishes complete inventory snapshots and retains the
+previous complete inventory snapshot while a refresh is in flight. Queries return the current materialized snapshot
 and perform no filesystem work. Discovery is hardware-independent and performs no network access,
 assessment, calibration, profile choice, or recommendation.
 
@@ -116,6 +120,12 @@ shared package work only when no other live occurrence depends on it. A retry cr
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 
+Progress is relative to the work admitted by that download occurrence. Its total is the byte size
+of missing packages whose attempts it owns or joins, and completed bytes come only from those
+attempts. Packages already installed at admission contribute neither baseline progress nor total.
+Consequently a first installation measures the whole missing bundle, while an update measures only
+its actual artifact delta.
+
 Expected failures distinguish insufficient disk space, interruption, unavailable source content,
 unavailable network, local storage failure, and corrupt content. Cancellation is a separate
 terminal result. Structured facts, including required and available byte counts, cross boundaries
@@ -127,10 +137,12 @@ It does not alter the terminal result and does not survive restart.
 Downloads write only to temporary `.incomplete` paths until a component matches its expected size
 and digest. A completed component is then exposed as an ordinary content-addressed blob and snapshot
 entry. Download and deletion operations for one managed repository serialize through one
-repository-scoped lock. Before publishing a different revision, acquisition removes the previous
-snapshot. A crash may therefore leave no installed revision, while verified blobs remain reusable
-by a retry. No metadata commit follows file publication, and failure to write derived state cannot
-fail a successfully published component.
+repository-scoped lock. The first package for a revision is published from a staged directory;
+later packages for that revision add only their missing exact links. Publishing one revision never
+removes another revision. A failed or cancelled acquisition therefore leaves every previously
+complete package available.
+No metadata commit follows file publication, and failure to write derived state cannot fail a
+successfully published component.
 
 A partial component may carry a narrowly scoped integrity checkpoint containing only the expected
 content identity and size, committed offset, and serializable digest state. The retry command
@@ -143,14 +155,24 @@ Catalog and acquisition contribute catalog configurations, current package obser
 process-local download state to the [local-model product projection](./local-model-product-projection.md).
 They do not persist provider offerings or serving configurations.
 
-Every independently servable installed package contributes a standalone row. An exact catalog
-bundle retains curated presentation and configuration whether active or deprecated. Repository and
-filename presentation is used only when no catalog entry describes the exact bundle.
+Every independently servable installed non-catalog package contributes a standalone row. Installed
+catalog targets are attributed to `CatalogIdentity` by the exact mapping defined in
+[Intrinsic catalog target mapping](./intrinsic-target-mapping.md). One catalog product row retains
+curated presentation across target, repository, and drafter changes. Repository and filename
+presentation is used only for a non-catalog row.
 
-Installation addresses a currently resolvable `ModelServingConfigurationId`, validates its current
-assessment, and admits its bundle. It does not materialize configuration state. The response carries
-the deterministic local provider-model identity and, when work was admitted, the process-local
-download identity used for observation and cancellation.
+Catalog reconciliation addresses a `CatalogIdentity`. ICN compares desired package IDs with current
+filesystem presence and exact package affiliations, acquires missing desired packages, and removes
+affiliated superseded packages after the desired bundle is complete. It does not materialize or
+persist configuration state. The response carries the deterministic local provider-model identity
+and, when work was admitted, the process-local download identity used for observation and
+cancellation.
+
+Superseded cleanup is an invariant of the authoritative installed set, not a task owned by the
+request that admitted a download. After an installed-set change is committed, one coalesced catalog
+maintenance pass removes exact affiliated superseded package IDs only for catalog models whose
+entire desired package set is present. Cleanup failure is logged and may be retried after a later
+authoritative change. There is no request poller and no package-attempt completion trigger.
 
 Download state determines neither configuration, offering, slot identity, nor physical presence.
 On completion ACN refreshes inventory before presenting the occurrence as complete. The filesystem
@@ -159,8 +181,8 @@ observation remains authoritative.
 ## Deletion and garbage collection
 
 Deletion plans derive exclusively from current managed files and the addressed package or bundle.
-ICN validates containment, scans the repository's sole snapshot, removes the addressed entries,
-and removes a blob only when no remaining snapshot entry references its proven content identity.
+ICN validates containment, scans every repository snapshot, removes only the addressed package's
+entries, and removes a blob only when no remaining snapshot entry references its proven content identity.
 Bytes reclaimed are measured from blobs actually removed. Inventory cannot recreate deleted links
 from catalog declarations or retained blobs.
 
@@ -196,7 +218,8 @@ already issued provider-model identity.
 - Standard configuration identity remains stable for a given package identity.
 - Installed inventory is derived without network access or hardware assessment.
 - Partial, unsafe, invalid, or digest-mismatched content is not installed.
-- A managed repository exposes at most one installed revision.
+- Complete packages from multiple repository revisions may coexist until exact catalog affiliation
+  state identifies a package as superseded and eligible for removal.
 - Inventory reconciliation never mutates managed artifacts.
 - One artifact failure cannot hide unrelated valid artifacts.
 - Download identities and terminal history do not survive ICN restart.

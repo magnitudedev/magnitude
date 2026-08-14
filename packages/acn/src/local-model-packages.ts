@@ -9,6 +9,7 @@ import {
 } from "effect"
 import {
   LocalModelMutationFailed,
+  InstalledCatalogAttributionSchema,
   ModelDownloadIdSchema,
   ModelPackageIdSchema,
   ModelPackagesStateSchema,
@@ -156,6 +157,9 @@ export const LocalModelPackagesLive: Layer.Layer<
         path: Effect.succeed(entry.path),
         origin: Effect.succeed(entry.origin),
         inspection: packageInspectionFromIcn(entry.inspection),
+        catalogAttribution: Schema.validate(InstalledCatalogAttributionSchema)(
+          entry.catalogAttribution,
+        ),
       }),
     )
     const bundleDownloads = yield* Effect.forEach(
@@ -188,6 +192,8 @@ export const LocalModelPackagesLive: Layer.Layer<
           package: modelPackage,
           localState,
           inspection: installedEntry?.inspection ?? { _tag: "Pending" },
+          catalogAttribution: installedEntry?.catalogAttribution
+            ?? { _tag: "NotCatalogTarget" },
         }
       })
     yield* mirror.setIfChanged({

@@ -1,6 +1,8 @@
 import { Option } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
+  CatalogModelIdSchema,
+  CatalogVariantIdSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelPackageIdSchema,
@@ -49,6 +51,8 @@ export const makeStandaloneBundle = (id: string = TEST_PACKAGE_ID): ServableMode
       quantizationName: "4-bit",
       architecture: "test",
       maximumContextLength: 32_768,
+      intrinsicModelId: Option.none(),
+      intrinsicQualityId: Option.none(),
     },
   },
 })
@@ -133,6 +137,7 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
       installedBytes: 16 * GIB,
       origins: ["Magnitude"],
     },
+    upgradeState: { _tag: "NotApplicable" },
     servingState: {
       _tag: "Assessed",
       capabilities,
@@ -177,6 +182,8 @@ export const makeCatalogOnlyModel = (
     catalogMembershipState: {
       _tag: "InCatalog",
       catalogData: {
+        modelId: CatalogModelIdSchema.make("qwen-test"),
+        variantId: CatalogVariantIdSchema.make("gguf:q4"),
         intelligenceScore: 75,
         intelligenceScoreSource: "Test catalog score",
         fidelityRank: 75,
@@ -185,6 +192,7 @@ export const makeCatalogOnlyModel = (
       },
     },
     acquisitionState: { _tag: "NotInstalled", completedBytes: 0, totalBytes: model.downloadBytes },
+    upgradeState: { _tag: "NotApplicable" },
     servingState: {
       ...model.servingState,
       configuration: { ...model.servingState.configuration, id: configurationId },
