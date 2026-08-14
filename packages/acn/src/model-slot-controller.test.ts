@@ -77,7 +77,7 @@ const modelPackage = {
     quantization: "Q4",
     quantizationName: "4-bit",
     architecture: "dense",
-    maximumContextLength: 8_192,
+    maximumContextLength: Option.some(8_192),
     intrinsicModelId: Option.none(),
     intrinsicQualityId: Option.none(),
   },

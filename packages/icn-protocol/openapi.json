@@ -4907,8 +4907,7 @@
           "format",
           "quantization",
           "quantizationName",
-          "architecture",
-          "maximumContextLength"
+          "architecture"
         ],
         "properties": {
           "format": {
@@ -4924,7 +4923,10 @@
             "type": "string"
           },
           "maximumContextLength": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
             "minimum": 0
           },
@@ -5278,7 +5280,6 @@
       "ReasoningProfileResponse": {
         "type": "object",
         "required": [
-          "default_reasoning_effort",
           "reasoning_efforts"
         ],
         "properties": {

@@ -257,7 +257,7 @@ export const ModelPackagePropertiesSchema = Schema.Struct({
   quantization: NonEmptyString,
   quantizationName: NonEmptyString,
   architecture: NonEmptyString,
-  maximumContextLength: PositiveSafeInteger,
+  maximumContextLength: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
   intrinsicModelId: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   intrinsicQualityId: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
 })

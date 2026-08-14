@@ -60,7 +60,7 @@ const standaloneBundle = (
       quantization,
       quantizationName,
       architecture: "test",
-      maximumContextLength: 50_000,
+      maximumContextLength: Option.some(50_000),
       intrinsicModelId: Option.none(),
       intrinsicQualityId: Option.none(),
     },

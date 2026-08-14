@@ -275,13 +275,21 @@ const modelsMenuDisplayName = (entry: ModelsMenuEntry): string => entry._tag ===
     ? formatLocalModelDisplayName(entry.model)
     : formatModelDisplayName(entry.model.displayName, entry.model.variantLabel)
 
-const modelsMenuContextLength = (entry: ModelsMenuEntry): number => entry._tag === "Local"
+const modelsMenuContextLength = (entry: ModelsMenuEntry): Option.Option<number> => entry._tag === "Local"
   ? entry.model.servingState._tag === "Assessed"
-    ? entry.model.servingState.configuration.profile.contextLength
+    ? Option.some(entry.model.servingState.configuration.profile.contextLength)
     : localModelMaximumContextLength(entry.model)
   : entry._tag === "Provider"
-    ? entry.model.contextWindow
+    ? Option.some(entry.model.contextWindow)
     : localModelMaximumContextLength(entry.model)
+
+const modelsMenuContextLabel = (entry: ModelsMenuEntry): string => Option.match(
+  modelsMenuContextLength(entry),
+  {
+    onNone: () => "Unknown",
+    onSome: formatContextWindow,
+  },
+)
 
 const modelsMenuOfferingKey = (entry: ModelsMenuEntry): Option.Option<string> => {
   const providerModel = modelsMenuProviderModel(entry)
@@ -1043,7 +1051,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
             {detailFavorite ? "★ " : ""}{modelsMenuDisplayName(detail)}
           </text>
           <text style={{ fg: theme.muted }}>
-            {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {formatContextWindow(modelsMenuContextLength(detail))} context · {statusFor(detail)}
+            {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {modelsMenuContextLabel(detail)} context · {statusFor(detail)}
           </text>
           {detailLocalModel && (
             <>
@@ -1151,7 +1159,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
               <text style={{ fg: active ? theme.menuBg : theme.warning, width: 2 }}>{favorite ? "★" : " "}</text>
               <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{modelsMenuDisplayName(entry)}</text>
               <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(entry)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{formatContextWindow(modelsMenuContextLength(entry))}</text>
+              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{modelsMenuContextLabel(entry)}</text>
               <text
                 style={{
                   fg: active

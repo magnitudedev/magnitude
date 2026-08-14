@@ -393,7 +393,7 @@ pub struct ReasoningEffortMapping {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningProfile {
-    pub default_effort: NormalizedReasoningEffort,
+    pub default_effort: Option<NormalizedReasoningEffort>,
     pub mappings: Vec<ReasoningEffortMapping>,
     pub template_fingerprint: String,
 }

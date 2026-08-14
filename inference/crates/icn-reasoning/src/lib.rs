@@ -95,11 +95,21 @@ pub fn inspect_templates(
     };
 
     let shapes = probe_shapes();
-    let profile = inspect_profile(templates, &shapes, &fingerprint, &capabilities)?;
-    let default_mapping = profile
-        .mapping(&profile.default_effort)
-        .expect("inspected profile contains its default");
-    let prepared = render_outcomes(templates, &shapes, &default_mapping.controls);
+    let profile = inspect_profile(templates, &shapes, &fingerprint, &capabilities).unwrap_or_else(
+        |_| ReasoningProfile {
+            default_effort: None,
+            mappings: Vec::new(),
+            template_fingerprint: fingerprint.clone(),
+        },
+    );
+    let default_controls = profile
+        .default_effort
+        .as_ref()
+        .and_then(|effort| profile.mapping(effort))
+        .map_or_else(NativeReasoningControls::default, |mapping| {
+            mapping.controls.clone()
+        });
+    let prepared = render_outcomes(templates, &shapes, &default_controls);
     let delimiters = prepared
         .iter()
         .find_map(|outcome| match outcome {
@@ -123,7 +133,10 @@ pub fn inspect_templates(
     let reasoning = ReasoningCapability::Supported {
         control: ReasoningControlDomain::Effort {
             levels,
-            default: Some(profile.default_effort.0.clone()),
+            default: profile
+                .default_effort
+                .as_ref()
+                .map(|effort| effort.0.clone()),
         },
         visibility: if capabilities.preserve_reasoning {
             ReasoningVisibility::Preserved
@@ -164,19 +177,6 @@ fn inspect_profile(
             })
             .unwrap_or_else(|| "template rejected every probe shape".to_owned());
         return Err(InspectionError::Native(reason));
-    }
-
-    if let Some(profile) = declared_profile(fingerprint) {
-        for mapping in &profile.mappings {
-            let outcomes = render_outcomes(templates, shapes, &mapping.controls);
-            if !comparable(&baseline, &outcomes) {
-                return Err(InspectionError::Native(format!(
-                    "declared reasoning recipe {} is rejected by template {fingerprint}",
-                    mapping.effort.as_str()
-                )));
-            }
-        }
-        return Ok(profile);
     }
 
     let toggle_candidates = [
@@ -340,7 +340,7 @@ fn inspect_profile(
         });
     }
 
-    let default_effort = detect_default_effort(&baseline, &options)?;
+    let default_effort = detect_default_effort(&baseline, &options);
     let mappings = options.into_iter().map(|option| option.mapping).collect();
 
     Ok(ReasoningProfile {
@@ -357,13 +357,20 @@ enum BoundedEffortDomain {
 }
 
 impl BoundedEffortDomain {
-    fn accepts(&self, baseline: &[RenderOutcome], candidate: &[RenderOutcome]) -> bool {
+    fn accepts(
+        &self,
+        baseline: &[RenderOutcome],
+        candidate: &[RenderOutcome],
+        normalized: &str,
+    ) -> bool {
         if !comparable(baseline, candidate) {
             return false;
         }
         match self {
             Self::RejectsUnknown => true,
-            Self::SharedUnknownFallback(fallback) => !equivalent(candidate, fallback),
+            Self::SharedUnknownFallback(fallback) => {
+                !equivalent(candidate, fallback) || render_names_effort(candidate, normalized)
+            }
         }
     }
 }
@@ -441,7 +448,7 @@ fn probe_normalized_effort(
     for native_value in native_values {
         let controls = effort_controls(base_controls, native_value);
         let outcomes = render_outcomes(templates, shapes, &controls);
-        if !domain.accepts(baseline, &outcomes) {
+        if !domain.accepts(baseline, &outcomes, normalized) {
             continue;
         }
         if let Some(existing) = &selected {
@@ -517,108 +524,15 @@ fn is_effort_name_character(character: char) -> bool {
 fn detect_default_effort(
     baseline: &[RenderOutcome],
     options: &[ObservedOption],
-) -> Result<NormalizedReasoningEffort, InspectionError> {
+) -> Option<NormalizedReasoningEffort> {
     let matches = options
         .iter()
         .filter(|option| equivalent(baseline, &option.outcomes))
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [option] => Ok(option.mapping.effort.clone()),
-        [] => Err(InspectionError::Native(
-            "no supported reasoning option matches omitted template behavior".to_owned(),
-        )),
-        _ => Err(InspectionError::Native(format!(
-            "multiple reasoning options match omitted template behavior: {}",
-            matches
-                .iter()
-                .map(|option| option.mapping.effort.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
+        [option] => Some(option.mapping.effort.clone()),
+        [] | [_, _, ..] => None,
     }
-}
-
-fn declared_profile(fingerprint: &str) -> Option<ReasoningProfile> {
-    let definitions: Vec<(&str, NativeReasoningControls)>;
-    let default;
-    match fingerprint {
-        // zai-org/GLM-5.2, revision b4734de4facf877f85769a911abafc5283eab3d9.
-        "sha256:172dc74a35e1752df75ecfb2b2cf9326d2852bb1379868ebeec9571654489679" => {
-            definitions = vec![
-                (
-                    "none",
-                    NativeReasoningControls {
-                        enable_thinking: Some(false),
-                        template_args: BTreeMap::new(),
-                    },
-                ),
-                (
-                    "high",
-                    NativeReasoningControls {
-                        enable_thinking: Some(true),
-                        template_args: BTreeMap::from([(
-                            "reasoning_effort".into(),
-                            serde_json::Value::String("high".into()),
-                        )]),
-                    },
-                ),
-                (
-                    "max",
-                    NativeReasoningControls {
-                        enable_thinking: Some(true),
-                        template_args: BTreeMap::from([(
-                            "reasoning_effort".into(),
-                            serde_json::Value::String("max".into()),
-                        )]),
-                    },
-                ),
-            ];
-            default = "max";
-        }
-        // openai/gpt-oss-120b, revision b5c939de8f754692c1647ca79fbf85e8c1e70f8a.
-        "sha256:a4c9919cbbd4acdd51ccffe22da049264b1b73e59055fa58811a99efbd7c8146" => {
-            definitions = vec![
-                ("low", string_kwarg_controls("reasoning_effort", "low")),
-                (
-                    "medium",
-                    string_kwarg_controls("reasoning_effort", "medium"),
-                ),
-                ("high", string_kwarg_controls("reasoning_effort", "high")),
-            ];
-            default = "medium";
-        }
-        // deepseek-ai/DeepSeek-V4-Pro Jinja, revision 83adbd0b1e5f49ced28cbb6cb3bcc89a7360ed3d.
-        "sha256:31ae9909c6818e5a7fe82c538ea31cd330b25c06cf6b65e11f532a8d389e1cbc" => {
-            definitions = vec![
-                ("none", string_kwarg_controls("thinking_mode", "chat")),
-                (
-                    "high",
-                    controls_with_strings(&[
-                        ("thinking_mode", "thinking"),
-                        ("reasoning_effort", "high"),
-                    ]),
-                ),
-                (
-                    "max",
-                    controls_with_strings(&[
-                        ("thinking_mode", "thinking"),
-                        ("reasoning_effort", "max"),
-                    ]),
-                ),
-            ];
-            default = "high";
-        }
-        _ => return None,
-    }
-    Some(ReasoningProfile {
-        default_effort: NormalizedReasoningEffort::parse(default)
-            .expect("declared default is normalized"),
-        mappings: definitions
-            .iter()
-            .map(|(effort, controls)| mapping(effort, controls.clone()))
-            .collect(),
-        template_fingerprint: fingerprint.to_owned(),
-    })
 }
 
 fn mapping(effort: &str, controls: NativeReasoningControls) -> ReasoningEffortMapping {
@@ -652,21 +566,6 @@ fn string_kwarg_controls(key: &str, value: &str) -> NativeReasoningControls {
             key.to_owned(),
             serde_json::Value::String(value.to_owned()),
         )]),
-    }
-}
-
-fn controls_with_strings(values: &[(&str, &str)]) -> NativeReasoningControls {
-    NativeReasoningControls {
-        enable_thinking: None,
-        template_args: values
-            .iter()
-            .map(|(key, value)| {
-                (
-                    (*key).to_owned(),
-                    serde_json::Value::String((*value).to_owned()),
-                )
-            })
-            .collect(),
     }
 }
 
@@ -846,6 +745,7 @@ mod tests {
     const CLOSED_EFFORT: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort not in ('low', 'medium', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if effort == 'low' %}[low]{% elif effort == 'medium' %}[medium]{% elif effort == 'high' %}[high]{% endif %}assistant:"#;
     const ONE_ENABLED_EFFORT_BEHAVIOR: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort not in ('low', 'medium', 'high', 'xhigh', 'max') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking is undefined or enable_thinking is true %}<think>{% endif %}assistant:"#;
     const SHARED_FALLBACK_EFFORT: &str = r#"{% set effort = reasoning_effort|default('high') %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if effort == 'low' %}[low]{% elif effort == 'high' %}[high]{% else %}[fallback]{% endif %}assistant:"#;
+    const NAMED_SHARED_FALLBACK_EFFORT: &str = r#"{% set effort = 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking is undefined or enable_thinking %}[Reasoning Effort: {{ effort }}]<think>{% endif %}assistant:"#;
     const QWEN_3_8_EFFORT: &str = r#"{% if enable_thinking is undefined or enable_thinking is true %}{% set effort = reasoning_effort|default('xhigh') %}{% if effort == 'high' %}{% set effort = 'xhigh' %}{% endif %}{% if effort not in ('xhigh', 'medium', 'low') %}{{ raise_exception('unsupported effort') }}{% endif %}{% if effort == 'xhigh' %}[xhigh]{% elif effort == 'low' %}[low]{% endif %}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}assistant:"#;
     const REVERSE_EFFORT_ALIAS: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort == 'xhigh' %}{% set effort = 'high' %}{% endif %}{% if effort not in ('low', 'medium', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% if effort == 'low' %}[low]{% elif effort == 'medium' %}[medium]{% elif effort == 'high' %}[high]{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}assistant:"#;
     const UNNAMED_DEFAULT_EFFORT: &str = r#"{% if reasoning_effort is defined and reasoning_effort not in ('low', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if reasoning_effort == 'low' %}[low]{% elif reasoning_effort == 'high' %}[high]{% else %}[unnamed]{% endif %}assistant:"#;
@@ -859,6 +759,14 @@ mod tests {
             .into_iter()
             .map(|mapping| mapping.effort.0)
             .collect()
+    }
+
+    fn default_effort(template: &str) -> Option<String> {
+        inspect_template(template, None, None)
+            .unwrap()
+            .profile
+            .default_effort
+            .map(|effort| effort.0)
     }
 
     #[test]
@@ -878,7 +786,7 @@ mod tests {
     fn native_toggle_normalizes_to_none_and_high() {
         let result = inspect_template(TOGGLE, None, None).unwrap();
         assert_eq!(efforts(TOGGLE), ["none", "high"]);
-        assert_eq!(result.profile.default_effort.as_str(), "high");
+        assert_eq!(default_effort(TOGGLE).as_deref(), Some("high"));
         assert_eq!(
             result.profile.mappings[1].controls.enable_thinking,
             Some(true)
@@ -904,7 +812,7 @@ mod tests {
     fn effort_only_toggle_normalizes_to_none_and_high() {
         let result = inspect_template(EFFORT_TOGGLE, None, None).unwrap();
         assert_eq!(efforts(EFFORT_TOGGLE), ["none", "high"]);
-        assert_eq!(result.profile.default_effort.as_str(), "high");
+        assert_eq!(default_effort(EFFORT_TOGGLE).as_deref(), Some("high"));
         assert!(
             result.profile.mappings[0]
                 .controls
@@ -915,21 +823,16 @@ mod tests {
 
     #[test]
     fn verified_none_is_retained_when_it_renders_like_low() {
-        let result = inspect_template(EFFORT_NONE_MATCHES_LOW, None, None).unwrap();
         assert_eq!(efforts(EFFORT_NONE_MATCHES_LOW), ["none", "low", "high"]);
-        assert_eq!(result.profile.default_effort.as_str(), "high");
+        assert_eq!(default_effort(EFFORT_NONE_MATCHES_LOW).as_deref(), Some("high"));
     }
 
     #[test]
     fn bounded_probe_reports_only_a_closed_effort_domain() {
         assert_eq!(efforts(CLOSED_EFFORT), ["none", "low", "medium", "high"]);
         assert_eq!(
-            inspect_template(CLOSED_EFFORT, None, None)
-                .unwrap()
-                .profile
-                .default_effort
-                .as_str(),
-            "high"
+            default_effort(CLOSED_EFFORT).as_deref(),
+            Some("high")
         );
     }
 
@@ -945,11 +848,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["none", "low", "medium", "xhigh"]
         );
-        assert_eq!(result.profile.default_effort.as_str(), "xhigh");
+        assert_eq!(default_effort(QWEN_3_8_EFFORT).as_deref(), Some("xhigh"));
         assert_eq!(
             result
                 .profile
-                .mapping(&result.profile.default_effort)
+                .mapping(result.profile.default_effort.as_ref().unwrap())
                 .unwrap()
                 .controls,
             NativeReasoningControls {
@@ -991,7 +894,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["low", "medium", "high"]
         );
-        assert_eq!(result.profile.default_effort.as_str(), "high");
+        assert_eq!(default_effort(REVERSE_EFFORT_ALIAS).as_deref(), Some("high"));
     }
 
     #[test]
@@ -1006,7 +909,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["none", "max"]
         );
-        assert_eq!(result.profile.default_effort.as_str(), "max");
+        assert_eq!(
+            default_effort(ONE_ENABLED_EFFORT_BEHAVIOR).as_deref(),
+            Some("max")
+        );
     }
 
     #[test]
@@ -1021,17 +927,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["none", "low", "high"]
         );
-        assert_eq!(result.profile.default_effort.as_str(), "high");
+        assert_eq!(
+            default_effort(SHARED_FALLBACK_EFFORT).as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
-    fn unnamed_default_is_not_guessed() {
-        let error = inspect_template(UNNAMED_DEFAULT_EFFORT, None, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no supported reasoning option matches omitted template behavior")
+    fn rendered_name_identifies_a_shared_unknown_fallback() {
+        assert_eq!(
+            efforts(NAMED_SHARED_FALLBACK_EFFORT),
+            ["none", "high", "max"]
         );
+        assert_eq!(
+            default_effort(NAMED_SHARED_FALLBACK_EFFORT).as_deref(),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn unnamed_default_preserves_model_default() {
+        let result = inspect_template(UNNAMED_DEFAULT_EFFORT, None, None).unwrap();
+        assert_eq!(result.profile.default_effort, None);
+        assert_eq!(efforts(UNNAMED_DEFAULT_EFFORT), ["none", "low", "high"]);
     }
 
     #[test]
@@ -1050,40 +968,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn declared_ambiguous_domains_have_exact_normalized_options() {
-        let cases = [
-            (
-                "sha256:172dc74a35e1752df75ecfb2b2cf9326d2852bb1379868ebeec9571654489679",
-                &["none", "high", "max"][..],
-                "max",
-            ),
-            (
-                "sha256:a4c9919cbbd4acdd51ccffe22da049264b1b73e59055fa58811a99efbd7c8146",
-                &["low", "medium", "high"][..],
-                "medium",
-            ),
-            (
-                "sha256:31ae9909c6818e5a7fe82c538ea31cd330b25c06cf6b65e11f532a8d389e1cbc",
-                &["none", "high", "max"][..],
-                "high",
-            ),
-        ];
-        for (fingerprint, expected, default) in cases {
-            let profile = declared_profile(fingerprint).unwrap();
-            assert_eq!(
-                profile
-                    .mappings
-                    .iter()
-                    .map(|mapping| mapping.effort.as_str())
-                    .collect::<Vec<_>>(),
-                expected
-            );
-            assert_eq!(profile.default_effort.as_str(), default);
-            assert!(profile.mappings.iter().all(|mapping| matches!(
-                mapping.automatic_budget,
-                AutomaticReasoningBudget::Disabled
-            )));
-        }
-    }
 }

@@ -126,7 +126,10 @@ describe("unified local inference projection", () => {
           _tag: "Separate",
           draft: {
             ...draft.package,
-            properties: { ...draft.package.properties, maximumContextLength: 16_384 },
+            properties: {
+              ...draft.package.properties,
+              maximumContextLength: Option.some(16_384),
+            },
           },
         },
         method: { _tag: "DSpark" },
@@ -134,11 +137,11 @@ describe("unified local inference projection", () => {
     })
 
     expect(localModelBundleKey(embedded)).toContain("speculative:Mtp:Embedded:package_target")
-    expect(localModelMaximumContextLength(embedded)).toBe(32_768)
+    expect(localModelMaximumContextLength(embedded)).toEqual(Option.some(32_768))
     expect(localModelBundleKey(separate)).toContain(
       "speculative:DSpark:Separate:package_target:package_draft",
     )
-    expect(localModelMaximumContextLength(separate)).toBe(16_384)
+    expect(localModelMaximumContextLength(separate)).toEqual(Option.some(16_384))
   })
 
   it("shows the configured speculative method in selection metadata", () => {

@@ -305,11 +305,11 @@
       "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 100000,
       "speculativeDecoding": {
-        "method": "dspark",
+        "method": "dflash",
         "draft": {
           "type": "file",
-          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF",
-          "path": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark.gguf"
+          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF",
+          "path": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf"
         }
       },
       "license": "openmdw-1.1",

@@ -272,7 +272,8 @@ pub struct ModelPackageProperties {
     pub quantization: String,
     pub quantization_name: String,
     pub architecture: String,
-    pub maximum_context_length: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_context_length: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intrinsic_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
