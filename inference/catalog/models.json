@@ -103,6 +103,7 @@
       "repository": "unsloth/Muse-Glimmer-30B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 100000,
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "path": "dflash-kquant.gguf" } },
       "license": "apache-2.0",
       "qualityScore": 51.7,
       "qualityScoreProvenance": "measured_terminal_bench_2.1",
@@ -303,7 +304,14 @@
       "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
       "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 100000,
-      "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
+      "speculativeDecoding": {
+        "method": "dspark",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF",
+          "path": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark.gguf"
+        }
+      },
       "license": "openmdw-1.1",
       "qualityScore": 24.0,
       "qualityScoreProvenance": "measured_terminal_bench_2.1",
@@ -321,6 +329,7 @@
       "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 100000,
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "path": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" } },
       "license": "mit",
       "qualityScore": 82.7,
       "qualityScoreProvenance": "measured_terminal_bench_2.1",
