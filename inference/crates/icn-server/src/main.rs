@@ -1463,8 +1463,15 @@ impl NativeResolvedModelAssessor {
         profiles: Vec<ModelPreviewProfile>,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         let hardware = HardwareProvider::snapshot(self).await?;
-        self.assess_resolved_capacity_plans_with_hardware(resolved, profiles, hardware)
-            .await
+        self.assess_resolved_capacity_plans_with_hardware(
+            resolved,
+            SpeculativeDecodingConfig::Disabled {
+                reason: "standalone_artifact_preview".to_owned(),
+            },
+            profiles,
+            hardware,
+        )
+        .await
     }
 
     async fn assess_resolved_execution_profiles(
@@ -1473,20 +1480,33 @@ impl NativeResolvedModelAssessor {
         profiles: Vec<ModelPreviewProfile>,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         let hardware = HardwareProvider::snapshot(self).await?;
-        self.assess_resolved_execution_plans_with_hardware(resolved, profiles, hardware)
-            .await
+        self.assess_resolved_execution_plans_with_hardware(
+            resolved,
+            SpeculativeDecodingConfig::Disabled {
+                reason: "standalone_artifact_preview".to_owned(),
+            },
+            profiles,
+            hardware,
+        )
+        .await
     }
 
     async fn assess_resolved_plans_cached(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
         configuration_id: &ModelServingConfigurationId,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         let Some(cache) = self.cache.clone() else {
             return self
-                .assess_resolved_capacity_plans_with_hardware(resolved, profiles, snapshot.clone())
+                .assess_resolved_capacity_plans_with_hardware(
+                    resolved,
+                    speculative,
+                    profiles,
+                    snapshot.clone(),
+                )
                 .await;
         };
         let topology = icn_contracts::MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
@@ -1498,8 +1518,11 @@ impl NativeResolvedModelAssessor {
             .map(|profile| {
                 let planner_evidence =
                     self.capacity_assessment_cache_key(Some(&profile), snapshot)?;
-                let evidence = serde_json::to_string(&(&configuration_id.0, planner_evidence))
-                    .map_err(|error| InventoryError::Internal(error.to_string()))?;
+                let evidence = load_candidate_assessment_evidence(
+                    configuration_id,
+                    &speculative,
+                    &planner_evidence,
+                )?;
                 let assessment = cache.read_hardware_assessment(&content_id, &evidence, &topology);
                 Ok((profile, evidence, assessment))
             })
@@ -1540,6 +1563,7 @@ impl NativeResolvedModelAssessor {
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 let assessor = self.clone();
+                let task_speculative = speculative.clone();
                 let task_cache = cache.clone();
                 let task_content_id = content_id.clone();
                 let task_hardware = snapshot.clone();
@@ -1548,6 +1572,7 @@ impl NativeResolvedModelAssessor {
                     let measured = assessor
                         .assess_resolved_capacity_plans_with_hardware(
                             resolved,
+                            task_speculative,
                             missing
                                 .iter()
                                 .map(|(_, profile, _)| profile.clone())
@@ -1693,13 +1718,14 @@ impl NativeResolvedModelAssessor {
     async fn assess_resolved_capacity_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         hardware: HardwareSnapshot,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         match self
             .run_resolved_plans_with_hardware(
                 resolved,
-                SpeculativeDecodingConfig::default(),
+                speculative,
                 profiles,
                 false,
                 hardware,
@@ -1717,18 +1743,12 @@ impl NativeResolvedModelAssessor {
     async fn assess_resolved_execution_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         hardware: HardwareSnapshot,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         match self
-            .run_resolved_plans_with_hardware(
-                resolved,
-                SpeculativeDecodingConfig::default(),
-                profiles,
-                true,
-                hardware,
-                None,
-            )
+            .run_resolved_plans_with_hardware(resolved, speculative, profiles, true, hardware, None)
             .await?
         {
             PlanningWorkerResponse::Execution { assessments, .. } => Ok(assessments),
@@ -1805,6 +1825,15 @@ impl NativeResolvedModelAssessor {
         let snapshot = icn_hardware::with_capacity_policy(snapshot.clone(), capacity_policy);
         self.capacity_assessment_cache_key(profile, &snapshot)
     }
+}
+
+fn load_candidate_assessment_evidence(
+    configuration_id: &ModelServingConfigurationId,
+    speculative: &SpeculativeDecodingConfig,
+    planner_evidence: &str,
+) -> Result<String, InventoryError> {
+    serde_json::to_string(&(&configuration_id.0, speculative, planner_evidence))
+        .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
 struct NativeModelAssessor {
@@ -3844,6 +3873,7 @@ impl NativeModelInstanceController {
     async fn assess_load_candidates(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profile: &ModelExecutionProfile,
         configuration_id: &ModelServingConfigurationId,
     ) -> Result<(Vec<(u32, u64)>, u64, HardwareSnapshot), ModelTransitionFailure> {
@@ -3897,7 +3927,13 @@ impl NativeModelInstanceController {
         let hardware = icn_hardware::with_capacity_policy(hardware, capacity_policy);
         let assessments = self
             .assessor
-            .assess_resolved_plans_cached(resolved, profiles, &hardware, configuration_id)
+            .assess_resolved_plans_cached(
+                resolved,
+                speculative,
+                profiles,
+                &hardware,
+                configuration_id,
+            )
             .await
             .map_err(ModelTransitionFailure::from)?;
         let mut candidates = Vec::new();
@@ -4195,6 +4231,7 @@ impl NativeModelInstanceController {
     async fn select_load_allocation(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profile: &ModelExecutionProfile,
         configuration_id: &ModelServingConfigurationId,
     ) -> Result<(u32, u64, HardwareSnapshot), ModelTransitionFailure> {
@@ -4212,7 +4249,7 @@ impl NativeModelInstanceController {
             )));
         }
         let (candidates, releasable_system_memory_bytes, hardware) = self
-            .assess_load_candidates(resolved, profile, configuration_id)
+            .assess_load_candidates(resolved, speculative, profile, configuration_id)
             .await?;
         // Selection uses a fresh observation immediately after planning. Both preview and load
         // call this exact function; neither reconstructs parallelism from persisted assessments.
@@ -4334,7 +4371,12 @@ impl NativeModelInstanceController {
         }
 
         let (parallel_sequences, required_system_memory_bytes, hardware) = self
-            .select_load_allocation(resolved.clone(), &profile, &configuration_id)
+            .select_load_allocation(
+                resolved.clone(),
+                speculative.clone(),
+                &profile,
+                &configuration_id,
+            )
             .await?;
         if stop_requested.load(Ordering::Acquire) {
             return Err(ModelTransitionFailure::stopped());
@@ -4867,11 +4909,11 @@ impl ModelInstanceController for NativeModelInstanceController {
             let profile = ModelExecutionProfile {
                 context_length: request.configuration.profile.context_length,
             };
-            let (resolved, plan, _, _) = self
+            let (resolved, plan, speculative, _) = self
                 .resolved_configuration_load(&request.configuration)
                 .await?;
             let (parallel_sequences, required_system_memory_bytes, _) = self
-                .select_load_allocation(resolved, &profile, &request.configuration.id)
+                .select_load_allocation(resolved, speculative, &profile, &request.configuration.id)
                 .await
                 .map_err(|failure| InventoryError::ModelOperation {
                     code: failure.event.code().to_owned(),
@@ -5988,6 +6030,35 @@ mod tests {
         assert_eq!(defaults.physical_context_size, 131_072);
         assert_eq!(defaults.max_sequences, 4);
         assert!(!defaults.execution.kv_unified);
+    }
+
+    #[test]
+    fn load_candidate_cache_identity_requires_exact_speculative_configuration() {
+        let configuration_id = ModelServingConfigurationId("configuration-test".to_owned());
+        let disabled = SpeculativeDecodingConfig::Disabled {
+            reason: "standalone".to_owned(),
+        };
+        let enabled = SpeculativeDecodingConfig::Enabled {
+            source: icn_contracts::SpeculativeDraftSource::Embedded,
+            method: icn_contracts::SpeculativeMethodConfig::Mtp {
+                min_draft_probability: 0.0,
+            },
+            n_max: 3,
+            n_min: 0,
+            cache_type_k: icn_contracts::CacheType::F16,
+            cache_type_v: icn_contracts::CacheType::F16,
+        };
+
+        let disabled =
+            load_candidate_assessment_evidence(&configuration_id, &disabled, "planner-evidence")
+                .unwrap();
+        let enabled =
+            load_candidate_assessment_evidence(&configuration_id, &enabled, "planner-evidence")
+                .unwrap();
+
+        assert_ne!(disabled, enabled);
+        assert!(enabled.contains("embedded"));
+        assert!(enabled.contains("\"n_max\":3"));
     }
 
     #[test]
