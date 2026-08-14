@@ -29,13 +29,11 @@ export const resolveBundlePresentation = (
   curated: CuratedModelPresentation | undefined,
 ): LocalModelPresentation => {
   const target = bundle._tag === "Standalone" ? bundle.package : bundle.target
-  const quantization = target.properties.quantization
   return {
     displayName: curated?.displayName ?? sourceName(bundle),
-    variantLabel: curated?.variantLabel ?? ModelVariantLabelSchema.make(quantization),
+    variantLabel: curated?.variantLabel
+      ?? ModelVariantLabelSchema.make(target.properties.quantization),
     description: curated?.description ?? "",
     license: Option.fromNullable(curated?.license),
-    quantization,
-    precisionLabel: target.properties.quantizationName,
   }
 }

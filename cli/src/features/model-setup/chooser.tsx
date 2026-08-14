@@ -76,9 +76,7 @@ const onboardingSelection = (
 
 export const onboardingModelRowName = (
   selection: LocalInferenceSelection,
-): string => selection.kind === "recommendation"
-  ? selection.model.presentation.displayName
-  : formatLocalModelDisplayName(selection.model)
+): string => formatLocalModelDisplayName(selection.model)
 
 const matchesOnboardingSelection = (
   selection: LocalInferenceSelection,
@@ -500,7 +498,7 @@ export function OnboardingModelChooser({
           attributes={TextAttributes.BOLD}
           wrapMode="none"
         >
-          {truncateToDisplayWidth(selected.model.presentation.displayName, titleNameWidth)}
+          {truncateToDisplayWidth(onboardingModelRowName(selected), titleNameWidth)}
           {recommendationIntent && <span fg={theme.primary}>{`   ${recommendationIntent}`}</span>}
         </text>
       </DetailRow>

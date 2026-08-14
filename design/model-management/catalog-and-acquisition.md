@@ -158,8 +158,9 @@ They do not persist provider offerings or serving configurations.
 Every independently servable installed non-catalog package contributes a standalone row. Installed
 catalog targets are attributed to `CatalogIdentity` by the exact mapping defined in
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md). One catalog product row retains
-curated presentation across target, repository, and drafter changes. Repository and filename
-presentation is used only for a non-catalog row.
+curated presentation, including its reviewed variant label, across target, repository, and drafter
+changes. A non-catalog row derives its variant label from inspected target-package quantization.
+Artifact format and inspection evidence are not copied into parallel product-presentation fields.
 
 Catalog reconciliation addresses a `CatalogIdentity`. ICN compares desired package IDs with current
 filesystem presence and exact package affiliations, acquires missing desired packages, and removes

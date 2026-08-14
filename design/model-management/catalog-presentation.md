@@ -35,11 +35,12 @@ authoritative slot query. Rejection reveals the prior query value; successful qu
 replaces the projection without an intermediate stale selection.
 
 The catalog detail view owns the complete descriptive, recommendation, model-quality,
-machine-assessment, exact quantization, quantization-aware-training status, license,
+machine-assessment, reviewed variant, quantization-aware-training status, license,
 source repository, and actions for one eligible catalog configuration. Its breadcrumb retains the
 parenthesized variant label so the selected catalog entry remains explicit. Its content title uses
-the base model name; exact quantization, concise QAT status when applicable, and fidelity appear on
-one line immediately below instead of repeating the variant in that title. Intelligence appears on
+the base model name; the reviewed variant label and fidelity appear on one line immediately below.
+Quantization-aware training may be explained separately without duplicating `QAT` already present
+in the reviewed label. Intelligence appears on
 its own line, followed by a visual break before the description. These model-intrinsic facts remain
 separate from machine-specific data. Memory, calibrated speed, and
 local installation status are grouped under `On this computer`. Hugging Face
@@ -75,11 +76,13 @@ open interaction. Independent source membership and availability changes remain 
 The client derives presentation solely from its measured local content width. Width changes do not
 create or copy catalog, recommendation, download, offering, or slot state.
 
-The target quantization and speculative-decoding method are distinct presentation facts. The model
-label shows only the target package quantization; it never appends the draft/speculator package
-quantization. Table layouts show `MTP`, `DFlash`, or `DSpark` in a dedicated `SPECULATIVE` column,
-and show an em dash for standalone bundles. Stacked layouts retain the method in their metadata
-line when speculative decoding is configured.
+The product-facing variant label and speculative-decoding method are distinct presentation facts.
+Catalog models use the reviewed catalog label. Standalone models derive their label from inspected
+target-package quantization; they never append draft/speculator package quantization. Exact format,
+inspected quantization, and derived precision are not copied into parallel local-model presentation
+fields. Table layouts show `MTP`, `DFlash`, or `DSpark` in a dedicated `SPECULATIVE` column, and show
+an em dash for standalone bundles. Stacked layouts retain the method in their metadata line when
+speculative decoding is configured.
 
 The list preserves information in this order:
 
@@ -134,3 +137,5 @@ failure may present an unavailable state.
 - Keyboard cursor movement keeps the focused candidate inside the visible scrollbox viewport.
 - Narrow detail views retain every fact by reflowing content vertically.
 - Table rows do not wrap, overlap, or render beyond their allocated width.
+- Every local-model identity surface uses the catalog-reviewed or standalone-inspected variant label
+  and never chooses between parallel quantization presentation values.

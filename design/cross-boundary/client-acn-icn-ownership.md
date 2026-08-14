@@ -45,11 +45,13 @@ contract, but it must not independently recreate the decision or redefine the lo
 shape.
 
 For model presentation, ICN publishes reviewed variant facts with each recommendable configuration.
-ACN owns the unified local presentation projection and carries the variant label independently from
-the base display name, exact quantization, and precision. The ACN protocol exports the canonical
-`Name (Variant)` composition over those structured fields so agent attribution and clients cannot
-diverge; client-common exposes it to clients. Individual clients own width-aware layout and
-truncation. No boundary parses a display string or infers a label from fidelity rank.
+ACN owns the unified local presentation projection and carries one variant label independently from
+the base display name. Catalog products use the reviewed catalog label; standalone products use
+the inspected target-package quantization as their fallback label. Exact artifact format and
+inspection evidence do not become parallel product-presentation fields. The ACN protocol exports
+the canonical `Name (Variant)` composition so agent attribution and clients cannot diverge;
+client-common exposes it to clients. Individual clients own width-aware layout and truncation. No
+boundary parses a display string or infers a label from fidelity rank.
 
 ## ICN
 

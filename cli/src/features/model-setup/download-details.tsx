@@ -61,7 +61,7 @@ export function OnboardingModelDownloadDetails({
   const percentage = Math.round(Math.max(0, Math.min(1, fraction)) * 100)
   const percentageLabel = `${percentage}%`
   const barWidth = Math.max(8, contentWidth - percentageLabel.length - 2)
-  const heading = `Downloading ${formatLocalModelDisplayName(model)} · ${model.presentation.quantization}`
+  const heading = `Downloading ${formatLocalModelDisplayName(model)}`
   const rate = downloading ? Option.getOrNull(download.bytesPerSecond) : null
   const detail = useMemo(() => {
     if (!downloading) return null

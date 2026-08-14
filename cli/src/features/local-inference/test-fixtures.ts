@@ -127,8 +127,6 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
       variantLabel: ModelVariantLabelSchema.make("Q4"),
       description: "Test model",
       license: Option.none(),
-      quantization: "Q4_K_M",
-      precisionLabel: "4-bit",
     },
     downloadBytes: 16 * GIB,
     catalogMembershipState: { _tag: "NotInCatalog" },

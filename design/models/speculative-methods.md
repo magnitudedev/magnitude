@@ -16,6 +16,7 @@ configured artifact; `Best known method` intentionally contains no links.
 | Qwen3.5 4B | MTP | MTP | Embedded | [Target model](https://huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF) |
 | Qwen3.5 9B | MTP | MTP | Embedded | [Target model](https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF) |
 | Qwen3.6 27B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-27B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-27B-DFlash-GGUF/blob/main/Qwen3.6-27B-DFlash-Q8_0.gguf) |
+| Qwen3.8 27B | DSpark | DSpark | Separate file, draft repo | [Qwen3.8-27B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.8-27B-DSpark-GGUF/blob/main/Qwen3.8-27B-DSpark-Q8_0.gguf) |
 | Qwen3.6 35B-A3B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-35B-A3B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF/blob/main/Qwen3.6-35B-A3B-DFlash-Q8_0.gguf) |
 | Muse Glimmer 30B | DFlash | None | — | — |
 | Gemma 4 E2B | MTP | MTP | Separate file, target repo | [mtp-gemma-4-E2B-it.gguf](https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/blob/main/mtp-gemma-4-E2B-it.gguf) |

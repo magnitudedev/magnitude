@@ -43,8 +43,6 @@ const model = makeAcquiringModel(
       variantLabel: ModelVariantLabelSchema.make("Q6"),
       description: "Test model",
       license: Option.none(),
-      quantization: "Q6_K",
-      precisionLabel: "6-bit",
     },
   },
 )
@@ -84,7 +82,7 @@ test("shows compact download details with progress, rate, and ETA", async () => 
   try {
     await act(view.renderOnce)
     const frame = view.captureCharFrame()
-    expect(frame).toContain("Downloading Qwen Test (Q6) · Q6_K")
+    expect(frame).toContain("Downloading Qwen Test (Q6)")
     expect(frame).toContain("63%")
     expect(frame).toContain("20.4 GB / 32.2 GB")
     expect(frame).toContain("48 MB/s · about 4 minutes remaining")

@@ -16,7 +16,7 @@ import {
 import { buildLocalInferenceSelections } from "../local-inference/view-model"
 
 describe("onboarding model chooser identity", () => {
-  it("keeps variants out of downloadable model names", () => {
+  it("keeps variants in downloadable model names", () => {
     const base = makeCatalogModel()
     if (base.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
     const model = {
@@ -31,7 +31,7 @@ describe("onboarding model chooser identity", () => {
 
     expect(selection).toBeDefined()
     if (!selection) return
-    expect(onboardingModelRowName(selection)).toBe(model.presentation.displayName)
+    expect(onboardingModelRowName(selection)).toBe("Qwen Test (Q4)")
   })
 
   it("keeps variants in installed model names", () => {

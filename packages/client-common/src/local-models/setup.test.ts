@@ -71,8 +71,6 @@ const makeModel = (installed: boolean): LocalModel => {
       variantLabel: ModelVariantLabelSchema.make("Q4"),
       description: "",
       license: Option.none(),
-      quantization: "Q4_K_M",
-      precisionLabel: "4-bit",
     },
     downloadBytes: 1,
     catalogMembershipState: {
