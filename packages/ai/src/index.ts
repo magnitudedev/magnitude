@@ -130,7 +130,15 @@ export {
   ChatCompletionsStreamChunk,
   chatCompletionsStreamChunkFields,
 } from "./wire/chat-completions"
-export type { ChatCompletionsRequest, ChatToolChoice, ChatNamedFunctionToolChoice, ChatAllowedToolsToolChoice } from "./wire/chat-completions"
+export type {
+  ChatCompletionsRequest,
+  ChatMessage,
+  ChatTool,
+  ChatToolCall,
+  ChatToolChoice,
+  ChatNamedFunctionToolChoice,
+  ChatAllowedToolsToolChoice,
+} from "./wire/chat-completions"
 
 // Codec
 export type { Codec } from "./codec/codec"

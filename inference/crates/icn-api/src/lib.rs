@@ -1010,6 +1010,13 @@ pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1873,6 +1880,9 @@ fn usage_chunk(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: generation.cached_prompt_tokens as u64,
+            },
         }),
         timings: Some(generation_timings(generation)),
         error: None,
