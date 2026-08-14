@@ -17,8 +17,9 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use sha2::{Digest, Sha256};
 
+const DISABLED_EFFORT_SPELLINGS: &[&str] = &["none", "off", "no_think", "disabled"];
+
 const EFFORT_DEFINITIONS: &[(&str, &[&str])] = &[
-    ("none", &["none", "off", "no_think"]),
     ("minimal", &["minimal"]),
     ("low", &["low"]),
     ("medium", &["medium"]),
@@ -28,7 +29,7 @@ const EFFORT_DEFINITIONS: &[(&str, &[&str])] = &[
 ];
 
 /// Version of the complete template-inspection semantics stored in model inspection caches.
-pub const TEMPLATE_INSPECTION_CACHE_IDENTITY: &str = "template-inspection-v1";
+pub const TEMPLATE_INSPECTION_CACHE_IDENTITY: &str = "template-inspection-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateInspection {
@@ -248,61 +249,75 @@ fn inspect_profile(
         shapes,
         &effort_controls(&effort_baseline_controls, &invalid_b),
     );
-    let invalids_reject = rejected_where_baseline_renders(&effort_baseline, &invalid_a_outcomes)
-        && rejected_where_baseline_renders(&effort_baseline, &invalid_b_outcomes);
-    let invalids_share_fallback = comparable(&effort_baseline, &invalid_a_outcomes)
-        && comparable(&effort_baseline, &invalid_b_outcomes)
-        && equivalent(&invalid_a_outcomes, &invalid_b_outcomes);
-    let open_pass_through = comparable(&effort_baseline, &invalid_a_outcomes)
-        && comparable(&effort_baseline, &invalid_b_outcomes)
-        && !equivalent(&invalid_a_outcomes, &invalid_b_outcomes);
+    let bounded_domain =
+        bounded_effort_domain(&effort_baseline, invalid_a_outcomes, invalid_b_outcomes);
+    let (mut disabled_effort, effort_options) = if let Some(domain) = &bounded_domain {
+        let disabled = probe_normalized_effort(
+            templates,
+            shapes,
+            &effort_baseline_controls,
+            &effort_baseline,
+            domain,
+            "none",
+            DISABLED_EFFORT_SPELLINGS,
+        )?;
+        let efforts = collapse_equivalent_efforts(probe_effort_options(
+            templates,
+            shapes,
+            &effort_baseline_controls,
+            &effort_baseline,
+            domain,
+        )?);
+        (disabled, efforts)
+    } else {
+        (None, Vec::new())
+    };
 
-    let mut mappings = Vec::new();
-    if !open_pass_through && (invalids_reject || invalids_share_fallback) {
-        for (normalized, native_values) in EFFORT_DEFINITIONS {
-            let mut selected: Option<(NativeReasoningControls, Vec<RenderOutcome>)> = None;
-            for native_value in *native_values {
-                let controls = effort_controls(&effort_baseline_controls, native_value);
-                let outcomes = render_outcomes(templates, shapes, &controls);
-                if !comparable(&effort_baseline, &outcomes) {
-                    continue;
-                }
-                if invalids_share_fallback && equivalent(&outcomes, &invalid_a_outcomes) {
-                    continue;
-                }
-                if equivalent(&outcomes, &effort_baseline) {
-                    continue;
-                }
-                if let Some((_, existing)) = &selected {
-                    if !equivalent(existing, &outcomes) {
-                        return Err(InspectionError::Native(format!(
-                            "native aliases for normalized effort {normalized} render differently"
-                        )));
-                    }
-                } else {
-                    selected = Some((controls, outcomes));
-                }
-            }
-            if let Some((controls, _)) = selected {
-                mappings.push(mapping(normalized, controls));
-            }
+    let mut options = effort_options;
+
+    if options.is_empty() && adaptive_toggle {
+        options.push(observed_mapping(
+            "none",
+            disabled_controls.clone(),
+            disabled.clone(),
+        ));
+        options.push(observed_mapping(
+            "adaptive",
+            adaptive_controls,
+            adaptive_outcomes,
+        ));
+        options.push(observed_mapping(
+            "high",
+            enabled_controls.clone(),
+            enabled.clone(),
+        ));
+    } else if options.is_empty() && toggle.is_some() {
+        options.push(observed_mapping(
+            "none",
+            disabled_controls,
+            disabled.clone(),
+        ));
+        options.push(observed_mapping("high", enabled_controls, enabled.clone()));
+    } else if options.is_empty()
+        && disabled_effort
+            .as_ref()
+            .is_some_and(|option| !equivalent(&option.outcomes, &effort_baseline))
+    {
+        options.push(disabled_effort.take().expect("checked as present"));
+        options.push(observed_mapping(
+            "high",
+            effort_baseline_controls,
+            effort_baseline,
+        ));
+    } else if !options.is_empty() {
+        if toggle.is_some() {
+            options.insert(
+                0,
+                observed_mapping("none", disabled_controls, disabled.clone()),
+            );
+        } else if let Some(disabled_option) = disabled_effort.take() {
+            options.insert(0, disabled_option);
         }
-    }
-
-    if mappings.is_empty() && adaptive_toggle {
-        mappings.push(mapping("none", disabled_controls.clone()));
-        mappings.push(mapping("adaptive", adaptive_controls));
-        mappings.push(mapping("high", enabled_controls.clone()));
-    }
-
-    let has_none = mappings
-        .iter()
-        .any(|mapping| mapping.effort.as_str() == "none");
-    if mappings.is_empty() && toggle.is_some() {
-        mappings.push(mapping("none", disabled_controls));
-        mappings.push(mapping("high", enabled_controls));
-    } else if toggle.is_some() && !has_none {
-        mappings.insert(0, mapping("none", disabled_controls));
     }
 
     let observed_thinking = baseline
@@ -317,34 +332,210 @@ fn inspect_profile(
             RenderOutcome::Rejected(_) => false,
         })
         || capabilities.preserve_reasoning;
-    if mappings.is_empty() {
-        mappings.push(if observed_thinking {
-            mapping("high", omitted.clone())
+    if options.is_empty() {
+        options.push(if observed_thinking {
+            observed_mapping("high", omitted.clone(), baseline.clone())
         } else {
-            mapping("none", omitted.clone())
+            observed_mapping("none", omitted.clone(), baseline.clone())
         });
     }
 
-    let default_effort = mappings
-        .iter()
-        .find(|mapping| {
-            let outcomes = render_outcomes(templates, shapes, &mapping.controls);
-            comparable(&baseline, &outcomes) && equivalent(&baseline, &outcomes)
-        })
-        .or_else(|| {
-            mappings
-                .iter()
-                .find(|mapping| mapping.effort.as_str() == "high")
-        })
-        .unwrap_or(&mappings[0])
-        .effort
-        .clone();
+    let default_effort = detect_default_effort(&baseline, &options)?;
+    let mappings = options.into_iter().map(|option| option.mapping).collect();
 
     Ok(ReasoningProfile {
         default_effort,
         mappings,
         template_fingerprint: fingerprint.to_owned(),
     })
+}
+
+#[derive(Debug, Clone)]
+enum BoundedEffortDomain {
+    RejectsUnknown,
+    SharedUnknownFallback(Vec<RenderOutcome>),
+}
+
+impl BoundedEffortDomain {
+    fn accepts(&self, baseline: &[RenderOutcome], candidate: &[RenderOutcome]) -> bool {
+        if !comparable(baseline, candidate) {
+            return false;
+        }
+        match self {
+            Self::RejectsUnknown => true,
+            Self::SharedUnknownFallback(fallback) => !equivalent(candidate, fallback),
+        }
+    }
+}
+
+fn bounded_effort_domain(
+    baseline: &[RenderOutcome],
+    invalid_a: Vec<RenderOutcome>,
+    invalid_b: Vec<RenderOutcome>,
+) -> Option<BoundedEffortDomain> {
+    if rejected_where_baseline_renders(baseline, &invalid_a)
+        && rejected_where_baseline_renders(baseline, &invalid_b)
+    {
+        return Some(BoundedEffortDomain::RejectsUnknown);
+    }
+    if comparable(baseline, &invalid_a)
+        && comparable(baseline, &invalid_b)
+        && equivalent(&invalid_a, &invalid_b)
+    {
+        return Some(BoundedEffortDomain::SharedUnknownFallback(invalid_a));
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct ObservedOption {
+    mapping: ReasoningEffortMapping,
+    outcomes: Vec<RenderOutcome>,
+}
+
+fn observed_mapping(
+    effort: &str,
+    controls: NativeReasoningControls,
+    outcomes: Vec<RenderOutcome>,
+) -> ObservedOption {
+    ObservedOption {
+        mapping: mapping(effort, controls),
+        outcomes,
+    }
+}
+
+fn probe_effort_options(
+    templates: &CommonChatTemplates,
+    shapes: &[ProbeShape],
+    base_controls: &NativeReasoningControls,
+    baseline: &[RenderOutcome],
+    domain: &BoundedEffortDomain,
+) -> Result<Vec<ObservedOption>, InspectionError> {
+    EFFORT_DEFINITIONS
+        .iter()
+        .filter_map(|(normalized, native_values)| {
+            probe_normalized_effort(
+                templates,
+                shapes,
+                base_controls,
+                baseline,
+                domain,
+                normalized,
+                native_values,
+            )
+            .transpose()
+        })
+        .collect()
+}
+
+fn probe_normalized_effort(
+    templates: &CommonChatTemplates,
+    shapes: &[ProbeShape],
+    base_controls: &NativeReasoningControls,
+    baseline: &[RenderOutcome],
+    domain: &BoundedEffortDomain,
+    normalized: &str,
+    native_values: &[&str],
+) -> Result<Option<ObservedOption>, InspectionError> {
+    let mut selected: Option<ObservedOption> = None;
+    for native_value in native_values {
+        let controls = effort_controls(base_controls, native_value);
+        let outcomes = render_outcomes(templates, shapes, &controls);
+        if !domain.accepts(baseline, &outcomes) {
+            continue;
+        }
+        if let Some(existing) = &selected {
+            if !equivalent(&existing.outcomes, &outcomes) {
+                return Err(InspectionError::Native(format!(
+                    "native spellings for normalized effort {normalized} render differently"
+                )));
+            }
+        } else {
+            selected = Some(observed_mapping(normalized, controls, outcomes));
+        }
+    }
+    Ok(selected)
+}
+
+fn collapse_equivalent_efforts(options: Vec<ObservedOption>) -> Vec<ObservedOption> {
+    let mut distinct: Vec<ObservedOption> = Vec::new();
+    for option in options {
+        if let Some(index) = distinct
+            .iter()
+            .position(|existing| equivalent(&existing.outcomes, &option.outcomes))
+        {
+            let existing_is_named =
+                render_names_effort(&option.outcomes, distinct[index].mapping.effort.as_str());
+            let option_is_named =
+                render_names_effort(&option.outcomes, option.mapping.effort.as_str());
+            if existing_is_named && !option_is_named {
+                continue;
+            }
+            distinct.remove(index);
+        }
+        distinct.push(option);
+    }
+    distinct
+}
+
+fn render_names_effort(outcomes: &[RenderOutcome], effort: &str) -> bool {
+    let Some((_, affiliations)) = EFFORT_DEFINITIONS
+        .iter()
+        .find(|(normalized, _)| *normalized == effort)
+    else {
+        return false;
+    };
+    outcomes.iter().any(|outcome| match outcome {
+        RenderOutcome::Rendered(signature) => affiliations.iter().any(|affiliation| {
+            contains_effort_name(&signature.prompt, affiliation)
+                || contains_effort_name(&signature.generation_prompt, affiliation)
+        }),
+        RenderOutcome::Rejected(_) => false,
+    })
+}
+
+fn contains_effort_name(text: &str, effort: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.match_indices(effort).any(|(start, matched)| {
+        let end = start + matched.len();
+        let bounded_before = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_effort_name_character(character));
+        let bounded_after = text[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !is_effort_name_character(character));
+        bounded_before && bounded_after
+    })
+}
+
+fn is_effort_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+}
+
+fn detect_default_effort(
+    baseline: &[RenderOutcome],
+    options: &[ObservedOption],
+) -> Result<NormalizedReasoningEffort, InspectionError> {
+    let matches = options
+        .iter()
+        .filter(|option| equivalent(baseline, &option.outcomes))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [option] => Ok(option.mapping.effort.clone()),
+        [] => Err(InspectionError::Native(
+            "no supported reasoning option matches omitted template behavior".to_owned(),
+        )),
+        _ => Err(InspectionError::Native(format!(
+            "multiple reasoning options match omitted template behavior: {}",
+            matches
+                .iter()
+                .map(|option| option.mapping.effort.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 fn declared_profile(fingerprint: &str) -> Option<ReasoningProfile> {
@@ -649,8 +840,15 @@ mod tests {
     const TOGGLE: &str = r#"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}assistant:"#;
     const FIXED: &str = r#"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}<think>assistant:"#;
     const THINKING_BOOL: &str = r#"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if thinking %}<think>{% endif %}assistant:"#;
-    const THINKING_MODE: &str = r#"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}[{{ thinking_mode }}]assistant:"#;
-    const CLOSED_EFFORT: &str = r#"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if reasoning_effort == 'low' %}[low]{% elif reasoning_effort == 'medium' %}[medium]{% elif reasoning_effort == 'high' %}[high]{% endif %}assistant:"#;
+    const THINKING_MODE: &str = r#"{% set mode = thinking_mode|default('adaptive') %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}[{{ mode }}]assistant:"#;
+    const EFFORT_TOGGLE: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort not in ('none', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if effort == 'high' %}<think>{% endif %}assistant:"#;
+    const EFFORT_NONE_MATCHES_LOW: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort not in ('none', 'low', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if effort == 'high' %}[high]{% else %}[shared]{% endif %}assistant:"#;
+    const CLOSED_EFFORT: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort not in ('low', 'medium', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if effort == 'low' %}[low]{% elif effort == 'medium' %}[medium]{% elif effort == 'high' %}[high]{% endif %}assistant:"#;
+    const ONE_ENABLED_EFFORT_BEHAVIOR: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort not in ('low', 'medium', 'high', 'xhigh', 'max') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking is undefined or enable_thinking is true %}<think>{% endif %}assistant:"#;
+    const SHARED_FALLBACK_EFFORT: &str = r#"{% set effort = reasoning_effort|default('high') %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if effort == 'low' %}[low]{% elif effort == 'high' %}[high]{% else %}[fallback]{% endif %}assistant:"#;
+    const QWEN_3_8_EFFORT: &str = r#"{% if enable_thinking is undefined or enable_thinking is true %}{% set effort = reasoning_effort|default('xhigh') %}{% if effort == 'high' %}{% set effort = 'xhigh' %}{% endif %}{% if effort not in ('xhigh', 'medium', 'low') %}{{ raise_exception('unsupported effort') }}{% endif %}{% if effort == 'xhigh' %}[xhigh]{% elif effort == 'low' %}[low]{% endif %}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}assistant:"#;
+    const REVERSE_EFFORT_ALIAS: &str = r#"{% set effort = reasoning_effort|default('high') %}{% if effort == 'xhigh' %}{% set effort = 'high' %}{% endif %}{% if effort not in ('low', 'medium', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% if effort == 'low' %}[low]{% elif effort == 'medium' %}[medium]{% elif effort == 'high' %}[high]{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}assistant:"#;
+    const UNNAMED_DEFAULT_EFFORT: &str = r#"{% if reasoning_effort is defined and reasoning_effort not in ('low', 'high') %}{{ raise_exception('unsupported effort') }}{% endif %}{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if reasoning_effort == 'low' %}[low]{% elif reasoning_effort == 'high' %}[high]{% else %}[unnamed]{% endif %}assistant:"#;
     const OPEN_EFFORT: &str = r#"{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}{% if reasoning_effort %}[{{ reasoning_effort }}]{% endif %}assistant:"#;
 
     fn efforts(template: &str) -> Vec<String> {
@@ -703,8 +901,137 @@ mod tests {
     }
 
     #[test]
+    fn effort_only_toggle_normalizes_to_none_and_high() {
+        let result = inspect_template(EFFORT_TOGGLE, None, None).unwrap();
+        assert_eq!(efforts(EFFORT_TOGGLE), ["none", "high"]);
+        assert_eq!(result.profile.default_effort.as_str(), "high");
+        assert!(
+            result.profile.mappings[0]
+                .controls
+                .template_args
+                .contains_key("reasoning_effort")
+        );
+    }
+
+    #[test]
+    fn verified_none_is_retained_when_it_renders_like_low() {
+        let result = inspect_template(EFFORT_NONE_MATCHES_LOW, None, None).unwrap();
+        assert_eq!(efforts(EFFORT_NONE_MATCHES_LOW), ["none", "low", "high"]);
+        assert_eq!(result.profile.default_effort.as_str(), "high");
+    }
+
+    #[test]
     fn bounded_probe_reports_only_a_closed_effort_domain() {
         assert_eq!(efforts(CLOSED_EFFORT), ["none", "low", "medium", "high"]);
+        assert_eq!(
+            inspect_template(CLOSED_EFFORT, None, None)
+                .unwrap()
+                .profile
+                .default_effort
+                .as_str(),
+            "high"
+        );
+    }
+
+    #[test]
+    fn accepted_baseline_equivalent_effort_is_the_default() {
+        let result = inspect_template(QWEN_3_8_EFFORT, None, None).unwrap();
+        assert_eq!(
+            result
+                .profile
+                .mappings
+                .iter()
+                .map(|mapping| mapping.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["none", "low", "medium", "xhigh"]
+        );
+        assert_eq!(result.profile.default_effort.as_str(), "xhigh");
+        assert_eq!(
+            result
+                .profile
+                .mapping(&result.profile.default_effort)
+                .unwrap()
+                .controls,
+            NativeReasoningControls {
+                enable_thinking: Some(true),
+                template_args: BTreeMap::from([(
+                    "reasoning_effort".to_owned(),
+                    serde_json::Value::String("xhigh".to_owned()),
+                )]),
+            }
+        );
+    }
+
+    #[test]
+    fn rendered_affiliation_selects_xhigh_over_its_high_alias() {
+        let result = inspect_template(QWEN_3_8_EFFORT, None, None).unwrap();
+        assert!(
+            result
+                .profile
+                .mapping(&NormalizedReasoningEffort("high".to_owned()))
+                .is_none()
+        );
+        assert!(
+            result
+                .profile
+                .mapping(&NormalizedReasoningEffort("xhigh".to_owned()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rendered_affiliation_selects_high_over_its_xhigh_alias() {
+        let result = inspect_template(REVERSE_EFFORT_ALIAS, None, None).unwrap();
+        assert_eq!(
+            result
+                .profile
+                .mappings
+                .iter()
+                .map(|mapping| mapping.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(result.profile.default_effort.as_str(), "high");
+    }
+
+    #[test]
+    fn rank_selects_the_representative_when_render_has_no_affiliated_name() {
+        let result = inspect_template(ONE_ENABLED_EFFORT_BEHAVIOR, None, None).unwrap();
+        assert_eq!(
+            result
+                .profile
+                .mappings
+                .iter()
+                .map(|mapping| mapping.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["none", "max"]
+        );
+        assert_eq!(result.profile.default_effort.as_str(), "max");
+    }
+
+    #[test]
+    fn shared_unknown_fallback_does_not_hide_a_distinct_named_default() {
+        let result = inspect_template(SHARED_FALLBACK_EFFORT, None, None).unwrap();
+        assert_eq!(
+            result
+                .profile
+                .mappings
+                .iter()
+                .map(|mapping| mapping.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["none", "low", "high"]
+        );
+        assert_eq!(result.profile.default_effort.as_str(), "high");
+    }
+
+    #[test]
+    fn unnamed_default_is_not_guessed() {
+        let error = inspect_template(UNNAMED_DEFAULT_EFFORT, None, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no supported reasoning option matches omitted template behavior")
+        );
     }
 
     #[test]

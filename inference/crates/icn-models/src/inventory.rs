@@ -35,6 +35,7 @@ const MODEL_INSPECTION_SCHEMA_VERSION: u32 = 2;
 struct CacheEvidence {
     content_id: String,
     observation_key: String,
+    inspection_key: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -416,6 +417,16 @@ impl ManagedModelStore {
                                 model.id.0
                             ))
                         })?,
+                    inspection_key: scan_result
+                        .inspection_keys
+                        .get(&model.id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            InventoryError::Internal(format!(
+                                "ready model {} has no inspection evidence",
+                                model.id.0
+                            ))
+                        })?,
                 };
                 next_evidence.insert(model.id.clone(), evidence);
             }
@@ -558,6 +569,17 @@ impl ManagedModelStore {
                 Ok::<_, InventoryError>(CacheEvidence {
                     content_id: model.content_id.0.clone(),
                     observation_key: model_observation_key(&self.config.root, &model)?,
+                    inspection_key: model_inspection_evidence_for_model(
+                        &model,
+                        self.template_assessor
+                            .as_deref()
+                            .ok_or_else(|| {
+                                InventoryError::Internal(
+                                    "ready model has no template assessor".to_owned(),
+                                )
+                            })?
+                            .cache_identity(),
+                    )?,
                 })
             })
             .transpose()?;
@@ -793,6 +815,7 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
 struct InventoryScan {
     models: BTreeMap<ModelId, InventoryModel>,
     observations: BTreeMap<ModelId, String>,
+    inspection_keys: BTreeMap<ModelId, String>,
 }
 
 fn scan(
@@ -858,6 +881,7 @@ fn scan(
     let mut seen_paths = BTreeSet::new();
     let mut models = BTreeMap::new();
     let mut observations = BTreeMap::new();
+    let mut inspection_keys = BTreeMap::new();
     let mut stale = Vec::new();
     for candidate in discovered {
         let path = candidate.primary_path().to_path_buf();
@@ -883,10 +907,32 @@ fn scan(
                         &candidate.source,
                         &candidate.location,
                     )?;
+                    let inspection_key = model_inspection_evidence(
+                        &candidate.content_id,
+                        assessor
+                            .ok_or_else(|| {
+                                InventoryError::Internal(
+                                    "model inventory has no template assessor".to_owned(),
+                                )
+                            })?
+                            .cache_identity(),
+                        candidate
+                            .primary
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("local model"),
+                        candidate
+                            .location
+                            .components()
+                            .iter()
+                            .any(|component| component.role == ComponentRole::Projector),
+                    )?;
                     observations.insert(candidate.id.clone(), observation_key.clone());
+                    inspection_keys.insert(candidate.id.clone(), inspection_key.clone());
                     if let Some(model) = reuse_inspection(
                         &candidate,
                         &observation_key,
+                        &inspection_key,
                         &cached_models,
                         &cached_evidence,
                     ) {
@@ -921,6 +967,7 @@ fn scan(
     Ok(InventoryScan {
         models,
         observations,
+        inspection_keys,
     })
 }
 
@@ -1249,6 +1296,7 @@ impl DiscoveryCandidate {
 fn reuse_inspection(
     candidate: &ArtifactCandidate,
     observation_key: &str,
+    inspection_key: &str,
     cached_models: &BTreeMap<ModelId, InventoryModel>,
     cached_evidence: &BTreeMap<ModelId, CacheEvidence>,
 ) -> Option<InventoryModel> {
@@ -1256,6 +1304,7 @@ fn reuse_inspection(
         .get(&candidate.id)
         .filter(|evidence| evidence.content_id == candidate.content_id.0)
         .filter(|evidence| evidence.observation_key == observation_key)
+        .filter(|evidence| evidence.inspection_key == inspection_key)
         .and_then(|_| cached_models.get(&candidate.id))
         .filter(|model| {
             matches!(
@@ -1500,6 +1549,36 @@ fn model_inspection_evidence(
         has_projector,
     ))
     .map_err(|error| InventoryError::Internal(error.to_string()))
+}
+
+fn model_inspection_evidence_for_model(
+    model: &InventoryModel,
+    assessor_identity: &str,
+) -> Result<String, InventoryError> {
+    let primary_name = model
+        .location
+        .components()
+        .iter()
+        .find(|component| {
+            matches!(
+                component.role,
+                ComponentRole::Weights | ComponentRole::Shard
+            )
+        })
+        .and_then(|component| Path::new(&component.path).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("local model");
+    let has_projector = model
+        .location
+        .components()
+        .iter()
+        .any(|component| component.role == ComponentRole::Projector);
+    model_inspection_evidence(
+        &model.content_id,
+        assessor_identity,
+        primary_name,
+        has_projector,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2177,11 +2256,12 @@ mod tests {
         max_active: AtomicUsize,
         delay: bool,
         reject_name: Option<&'static str>,
+        identity: Option<&'static str>,
     }
 
     impl TemplateAssessor for CompleteTemplateAssessor {
         fn cache_identity(&self) -> &str {
-            "complete-template-assessor:test"
+            self.identity.unwrap_or("complete-template-assessor:test")
         }
 
         fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
@@ -2532,6 +2612,40 @@ mod tests {
         let changed = reopened.list().await.unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn changed_template_assessor_identity_invalidates_inventory_reuse() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache_root = temporary.path().join("cache");
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
+        write_minimal_gguf(&source.join("model.gguf"));
+
+        let mut config = InventoryConfig::with_roots(store, cache_root).unwrap();
+        config.hf_cache_dirs.push(hf_cache);
+        let original = Arc::new(CompleteTemplateAssessor {
+            identity: Some("template-inspection-v1"),
+            ..CompleteTemplateAssessor::default()
+        });
+        let manager =
+            ManagedModelStore::open_with_template_assessor(config.clone(), Some(original.clone()))
+                .await
+                .unwrap();
+        manager.ensure_model_inventory().await.unwrap();
+        assert_eq!(original.calls.load(AtomicOrdering::SeqCst), 1);
+
+        let updated = Arc::new(CompleteTemplateAssessor {
+            identity: Some("template-inspection-v2"),
+            ..CompleteTemplateAssessor::default()
+        });
+        let restarted =
+            ManagedModelStore::open_with_template_assessor(config, Some(updated.clone()))
+                .await
+                .unwrap();
+        restarted.ensure_model_inventory().await.unwrap();
+
+        assert_eq!(updated.calls.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]

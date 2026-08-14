@@ -4,8 +4,6 @@ import {
   type LocalInferenceError,
   ModelCapabilitiesSchema,
   type LocalProviderOffering,
-  type ModelCapabilities,
-  type ServableModelBundle,
   type ModelServingConfiguration,
   type ModelPackageEntry,
   servableModelBundlePackageIds,
@@ -86,26 +84,16 @@ const failure = (operation: string, error: unknown) =>
     retryable: true,
   })
 
-const capabilitySet = (
-  bundle: ServableModelBundle,
-  installed: readonly Pick<ModelPackageEntry, "package" | "inspection">[],
-): ModelCapabilities => {
-  const primaryPackageId = bundle._tag === "Standalone" ? bundle.package.id : bundle.target.id
-  const inspection = installed.find(({ package: modelPackage }) =>
-    modelPackage.id === primaryPackageId)?.inspection
-  return inspection?._tag === "Inspected"
-    ? inspection.capabilities
-    : ModelCapabilitiesSchema.make({
-        vision: false,
-        tools: false,
-        structuredOutput: false,
-        reasoning: {
-          supported: false,
-          efforts: [],
-          defaultEffort: Option.none(),
-        },
-      })
-}
+const CONSERVATIVE_CAPABILITIES = ModelCapabilitiesSchema.make({
+  vision: false,
+  tools: false,
+  structuredOutput: false,
+  reasoning: {
+    supported: false,
+    efforts: [],
+    defaultEffort: Option.none(),
+  },
+})
 
 export interface LocalProviderOfferingsApi {
   readonly ready: Effect.Effect<boolean>
@@ -147,17 +135,28 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   const offeringsFrom = (
     resolved: readonly import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration[],
     installedEntries: Effect.Effect.Success<typeof installedCapabilities>,
-  ): readonly LocalProviderOffering[] => resolved.map(({ servingConfiguration, catalogModel }) => ({
-    providerModelId: Option.match(catalogModel, {
-      onNone: () => localProviderModelId(servingConfiguration.id),
-      onSome: localCatalogProviderModelId,
-    }),
-    configuration: servingConfiguration,
-    capabilities: Option.match(catalogModel, {
-      onNone: () => capabilitySet(servingConfiguration.bundle, installedEntries),
-      onSome: (model) => model.capabilities,
-    }),
-  }))
+  ): readonly LocalProviderOffering[] => resolved.map(({ servingConfiguration, catalogModel }) => {
+    const targetPackageId = servingConfiguration.bundle._tag === "Standalone"
+      ? servingConfiguration.bundle.package.id
+      : servingConfiguration.bundle.target.id
+    const inspection = installedEntries.find(({ package: modelPackage }) =>
+      modelPackage.id === targetPackageId)?.inspection
+    const capabilities = inspection?._tag === "Inspected"
+      ? inspection.capabilities
+      : Option.match(catalogModel, {
+          onNone: () => CONSERVATIVE_CAPABILITIES,
+          onSome: (model) => model.capabilities,
+        })
+
+    return {
+      providerModelId: Option.match(catalogModel, {
+        onNone: () => localProviderModelId(servingConfiguration.id),
+        onSome: localCatalogProviderModelId,
+      }),
+      configuration: servingConfiguration,
+      capabilities,
+    }
+  })
 
   const list: LocalProviderOfferingsApi["list"] = Effect.gen(function* () {
     const resolved = [...(yield* resolver.get).values()]

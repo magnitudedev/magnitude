@@ -154,6 +154,16 @@ describe("model slot projection", () => {
         defaultEffort: Option.some(effort),
       },
     }
+    const catalogCapabilities = {
+      vision: false,
+      tools: false,
+      structuredOutput: false,
+      reasoning: {
+        supported: false,
+        efforts: [],
+        defaultEffort: Option.none(),
+      },
+    }
     expect(selectableModelCapabilities(
       PRIMARY_SLOT_ID,
       undefined,
@@ -169,7 +179,7 @@ describe("model slot projection", () => {
       supportedSlots: [SECONDARY_SLOT_ID],
       contextWindow: 4096,
       maxOutputTokens: 1024,
-      capabilities,
+      capabilities: catalogCapabilities,
       availability: { _tag: "Available" },
       memory: Option.none(),
       pricing: Option.none(),

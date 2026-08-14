@@ -25,8 +25,11 @@ offering containing a stable local provider model ID and that exact configuratio
 configuration and offering are derived rather than persisted.
 
 ACN resolves configurations and capabilities from issued catalog entries or installed package
-inspection plus the canonical standard-profile rule. When current evidence cannot establish capabilities, the
-offering remains disabled with conservative metadata rather than claiming support.
+inspection plus the canonical standard-profile rule. Catalog capabilities describe an uninstalled
+offering. Once the effective target package has a completed inspection, that inspection is
+authoritative because it describes the artifact inference will actually execute. When neither
+source can establish capabilities, the offering remains disabled with conservative metadata rather
+than claiming support.
 
 Within the separate `local` provider namespace, the provider model ID is exactly the serving
 configuration ID. ACN never prefixes or hashes package or profile data to create another identity.
