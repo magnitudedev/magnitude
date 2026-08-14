@@ -97,6 +97,9 @@ widths speed also moves to the detail view.
 
 Entry identity and status never disappear. Text is display-width truncated or deliberately wrapped;
 layout-engine column compression must not create accidental multi-line table cells.
+Every visible table column is separated from the next by at least one terminal cell, and the status
+column fits stable acquisition labels such as `Update available`. The table is not rendered until
+its local width has been measured, so its first visible frame uses the final responsive mode.
 The terminal's width-aware label formatter preserves the parenthesized variant suffix whenever the
 available width can contain it, truncating the base name first. Parentheses are presentation, not
 stored catalog data.

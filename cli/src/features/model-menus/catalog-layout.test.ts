@@ -38,8 +38,10 @@ describe("catalog responsive layout", () => {
     for (const width of [82, 90, 94, 95, 100, 109, 110, 120, 160]) {
       const layout = deriveCatalogLayout(width)
       const columns = layout.columns
-      const allocated = 2
+      const visibleDataColumns = Object.values(columns).filter((columnWidth) => columnWidth > 0).length
+      const allocated = 1
         + layout.modelWidth
+        + layout.columnGap * (visibleDataColumns + 1)
         + columns.recommendation
         + columns.memory
         + columns.speculative
@@ -49,6 +51,14 @@ describe("catalog responsive layout", () => {
         + columns.status
 
       expect(allocated).toBe(layout.contentWidth)
+    }
+  })
+
+  test("reserves a separator cell between columns and fits stable status labels", () => {
+    for (const width of [82, 95, 110, 160]) {
+      const layout = deriveCatalogLayout(width)
+      expect(layout.columnGap).toBeGreaterThanOrEqual(1)
+      expect(layout.columns.status).toBeGreaterThanOrEqual(getDisplayWidth("Update available"))
     }
   })
 
