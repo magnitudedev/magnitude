@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.4
+
+### Patch Changes
+
+- [`228d2c3`](https://github.com/magnitudedev/magnitude/commit/228d2c33a9ed60e3fc4bc163d84b043baed1d252) Thanks [@anerli](https://github.com/anerli)! - feat: dflash and dspark support
+
+- [`228d2c3`](https://github.com/magnitudedev/magnitude/commit/228d2c33a9ed60e3fc4bc163d84b043baed1d252) Thanks [@anerli](https://github.com/anerli)! - fix: simplify stored installations
+
 ## 0.0.3
 
 ### Patch Changes
