@@ -56,6 +56,24 @@
       ]
     },
     {
+      "id": "qwen3.8-27b",
+      "displayName": "Qwen3.8 27B",
+      "description": "Large dense multimodal model with frontier-class agentic coding capability for its size.",
+      "repository": "unsloth/Qwen3.8-27B-GGUF",
+      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "contextLength": 100000,
+      "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
+      "license": "apache-2.0",
+      "qualityScore": 73.0,
+      "qualityScoreProvenance": "measured_terminal_bench_2.1",
+      "qualityEvidence": [
+        "Publisher-measured Terminal-Bench v2.1 result using the Terminus harness; not an exact GGUF quantization measurement.",
+        "Quantization fidelity is curated independently from hardware fit.",
+        "https://huggingface.co/Qwen/Qwen3.8-27B",
+        "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
+      ]
+    },
+    {
       "id": "qwen3.6-35b-a3b",
       "displayName": "Qwen3.6 35B-A3B",
       "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
@@ -170,7 +188,7 @@
       "displayName": "Bonsai 8B 1-bit",
       "description": "Extremely compact 1-bit model for machines that cannot fit conventional small-model quantizations.",
       "repository": "prism-ml/Bonsai-8B-gguf",
-      "variants": [{"variantId": "gguf:q1", "format": "Q1_0", "variantLabel": "Q1", "fidelityRank": 10, "quantizationAware": false}],
+      "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "fidelityRank": 20, "quantizationAware": true}],
       "contextLength": 50000,
       "license": "apache-2.0",
       "qualityScore": 1.9,
@@ -283,7 +301,7 @@
       "displayName": "Nemotron 3.5 Lightning 30B-A3B",
       "description": "Efficient hybrid MoE model for local reasoning, coding, and agentic workflows.",
       "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
-      "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "variantLabel": "NVFP4", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 100000,
       "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
       "license": "openmdw-1.1",

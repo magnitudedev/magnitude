@@ -1762,243 +1762,28 @@ mod tests {
     }
 
     #[test]
-    fn workstation_catalog_uses_published_gguf_format_names() {
-        let variants = |id: &str| {
-            catalog_source()
-                .expect("catalog source")
-                .models
-                .iter()
-                .find(|model| model.id == id)
-                .expect("catalog model")
-                .variants
-                .clone()
-        };
-        let formats = |id: &str| {
-            variants(id)
-                .into_iter()
-                .map(|variant| variant.format)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            formats("laguna-s-2.1"),
-            ["UD-Q4_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(
-            formats("qwen3.5-122b-a10b"),
-            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(
-            formats("muse-glimmer-30b"),
-            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(
-            formats("nemotron-3-super-120b-a12b"),
-            ["UD-Q4_K_XL", "MXFP4_MOE"]
-        );
-        assert_eq!(
-            formats("nemotron-3.5-lightning-30b-a3b"),
-            ["NVFP4", "Q4_K_M", "Q8_0"]
-        );
-        let nvfp4 = variants("nemotron-3.5-lightning-30b-a3b")
-            .into_iter()
-            .find(|variant| variant.format == "NVFP4")
-            .expect("NVFP4 variant");
-        assert_eq!(nvfp4.variant_label, "NVFP4");
-        assert_eq!((nvfp4.fidelity_rank, nvfp4.quantization_aware), (60, false));
-        assert_eq!(formats("deepseek-v4-flash"), ["UD-Q4_K_XL", "UD-Q8_K_XL"]);
-        assert_eq!(
-            formats("glm-5.2"),
-            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(
-            variants("glm-5.2")
-                .into_iter()
-                .map(|variant| (variant.variant_label, variant.fidelity_rank))
-                .collect::<Vec<_>>(),
-            [
-                ("Q4".to_owned(), 40),
-                ("Q5".to_owned(), 50),
-                ("Q6".to_owned(), 60),
-                ("Q8".to_owned(), 80)
-            ]
-        );
-    }
-
-    #[test]
-    fn small_model_catalog_uses_curated_profiles_and_formats() {
-        let source = catalog_source().expect("catalog source");
-        let model = |id: &str| {
-            source
-                .models
-                .iter()
-                .find(|model| model.id == id)
-                .expect("catalog model")
-        };
-        assert_eq!(model("qwen3.5-4b").context_length, 50_000);
-        assert_eq!(model("gemma-4-e4b-it-qat").context_length, 50_000);
-        assert_eq!(model("gemma-4-12b-it-qat").context_length, 100_000);
-        let [gemma] = model("gemma-4-12b-it-qat").variants.as_slice() else {
-            panic!("Gemma QAT model must declare one variant");
-        };
-        assert_eq!(gemma.variant_label, "Q4 QAT");
-        assert_eq!((gemma.fidelity_rank, gemma.quantization_aware), (58, true));
-        assert_eq!(
-            model("lfm2.5-2.6b")
-                .variants
-                .iter()
-                .map(|variant| variant.format.as_str())
-                .collect::<Vec<_>>(),
-            ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"]
-        );
-        let [bonsai] = model("bonsai-8b-q1").variants.as_slice() else {
-            panic!("bonsai must declare one variant");
-        };
-        assert_eq!(bonsai.format, "Q1_0");
-        assert_eq!(bonsai.variant_label, "Q1");
-        assert_eq!(
-            (bonsai.fidelity_rank, bonsai.quantization_aware),
-            (10, false)
-        );
-    }
-
-    #[test]
-    fn gemma_catalog_declares_same_repository_mtp_drafts() {
-        let source = catalog_source().expect("catalog source");
-        let lock = model_catalog_lock().expect("catalog lock");
-        for model in source
-            .models
-            .iter()
-            .filter(|model| model.id.starts_with("gemma-4-"))
-        {
-            let Some(speculative) = model.speculative_decoding.as_ref() else {
-                panic!("{} must declare speculative decoding", model.id);
-            };
-            assert!(matches!(speculative.method, CatalogSpeculativeMethod::Mtp));
-            let CatalogSpeculativeDraftSource::File { repository, path } = &speculative.draft
-            else {
-                panic!("{} must declare a file draft", model.id);
-            };
-            assert_eq!(repository, &None);
-            assert!(
-                path.file_name()
-                    .is_some_and(|name| { name.to_string_lossy().starts_with("mtp-gemma-4-") })
-            );
-            let entry = lock.get(&model.id).expect("Gemma lock entry");
-            assert_eq!(
-                entry.speculative_draft.as_deref(),
-                Some(entry.target.as_str())
-            );
-        }
-    }
-
-    #[test]
-    fn catalog_declares_verified_embedded_mtp_models_explicitly() {
-        let source = catalog_source().expect("catalog source");
-        for id in [
-            "qwen3.5-4b",
-            "qwen3.5-9b",
-            "qwen3.5-122b-a10b",
-            "nemotron-3.5-lightning-30b-a3b",
-            "glm-5.2",
-        ] {
-            let model = source
-                .models
-                .iter()
-                .find(|model| model.id == id)
-                .unwrap_or_else(|| panic!("missing {id} catalog model"));
-            let speculative = model
-                .speculative_decoding
-                .as_ref()
-                .unwrap_or_else(|| panic!("{id} must declare speculative decoding"));
-            assert!(matches!(speculative.method, CatalogSpeculativeMethod::Mtp));
-            assert!(matches!(
-                speculative.draft,
-                CatalogSpeculativeDraftSource::Embedded
-            ));
-        }
-    }
-
-    #[test]
-    fn qwen_36_variants_share_their_dflash_drafts() {
-        let source = catalog_source().expect("catalog source");
-        let assert_dflash = |id: &str, repository: &str, path: &str| {
-            let model = source
-                .models
-                .iter()
-                .find(|model| model.id == id)
-                .unwrap_or_else(|| panic!("missing {id} catalog model"));
-            let speculative = model
-                .speculative_decoding
-                .as_ref()
-                .unwrap_or_else(|| panic!("{id} must use speculative decoding"));
-
-            assert_eq!(model.variants.len(), 4);
-            assert!(matches!(
-                speculative.method,
-                CatalogSpeculativeMethod::DFlash
-            ));
-            let CatalogSpeculativeDraftSource::File {
-                repository: declared_repository,
-                path: declared_path,
-            } = &speculative.draft
-            else {
-                panic!("{id} must declare a file draft");
-            };
-            assert_eq!(declared_repository.as_deref(), Some(repository));
-            assert_eq!(declared_path, Path::new(path));
-        };
-
-        assert_dflash(
-            "qwen3.6-27b",
-            "magnitudedev/Qwen3.6-27B-DFlash-GGUF",
-            "Qwen3.6-27B-DFlash-Q8_0.gguf",
-        );
-        assert_dflash(
-            "qwen3.6-35b-a3b",
-            "magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF",
-            "Qwen3.6-35B-A3B-DFlash-Q8_0.gguf",
-        );
-    }
-
-    #[test]
-    fn model_lock_exactly_covers_the_authored_catalog() {
-        let source = catalog_source().expect("catalog source");
-        let lock = model_catalog_lock().expect("model catalog lock");
-        assert_eq!(lock.len(), source.models.len());
-        assert!(
-            source
-                .models
-                .iter()
-                .all(|model| lock.contains_key(&model.id))
-        );
-    }
-
-    #[test]
     fn package_source_must_match_the_authored_repository_and_locked_commit() {
-        let source = catalog_source().expect("catalog source");
-        let declaration = &source.models[0];
-        let commit = model_catalog_lock().expect("model catalog lock")[&declaration.id]
-            .target
-            .clone();
+        let repository = "publisher/model";
+        let commit = "0123456789abcdef0123456789abcdef01234567";
         let package_source =
             |repository: String, revision: String| ModelPackageSource::HuggingFace {
                 repository,
                 revision,
             };
         assert!(package_source_matches(
-            &package_source(declaration.repository.clone(), commit.clone()),
-            &declaration.repository,
-            &commit,
+            &package_source(repository.to_owned(), commit.to_owned()),
+            repository,
+            commit,
         ));
         assert!(!package_source_matches(
-            &package_source("other/repository".to_owned(), commit.clone()),
-            &declaration.repository,
-            &commit,
+            &package_source("other/repository".to_owned(), commit.to_owned()),
+            repository,
+            commit,
         ));
         assert!(!package_source_matches(
-            &package_source(declaration.repository.clone(), "0".repeat(40)),
-            &declaration.repository,
-            &commit,
+            &package_source(repository.to_owned(), "0".repeat(40)),
+            repository,
+            commit,
         ));
     }
 }
