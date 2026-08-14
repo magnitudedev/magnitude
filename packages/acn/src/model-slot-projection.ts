@@ -177,7 +177,7 @@ export const selectableModelCapabilities = (
     if (catalogModel && !catalogModel.supportedSlots.includes(slotId)) {
       return undefined
     }
-    return catalogModel?.capabilities ?? localOffering.capabilities
+    return localOffering.capabilities
   }
   return catalogModel?.availability._tag === "Available"
     && catalogModel.supportedSlots.includes(slotId)

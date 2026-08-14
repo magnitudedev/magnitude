@@ -43,6 +43,7 @@ import type {
   RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { createId } from "@magnitudedev/generate-id"
+import { formatReasoningEffort } from "../utils/model-properties"
 import { isDisplayRootStatusActive } from "../utils/actor-status"
 
 export interface UseComposerStateResult {
@@ -109,7 +110,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const { rootRoleLabel, rootProfile } = useSlotProfiles()
   const model = rootProfile?.modelDisplayName ?? ""
   const thinkingLevel = rootProfile?.reasoningEffort
-    ? rootProfile.reasoningEffort.charAt(0).toUpperCase() + rootProfile.reasoningEffort.slice(1)
+    ? formatReasoningEffort(rootProfile.reasoningEffort)
     : ""
 
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)

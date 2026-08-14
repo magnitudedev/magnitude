@@ -172,6 +172,11 @@ all recomputable caches. Completed artifact files and immutable release catalog 
 authorities. Removing or corrupting any such cache cannot change which artifacts are present,
 create or remove a serving configuration, or change durable user intent.
 
+An inventory entry may reuse an enriched model only when both its filesystem observation and the
+exact artifact-inspection evidence still match. That inspection evidence includes the template
+assessor's semantic-policy identity. Changing template-inspection behavior therefore invalidates
+the affected durable inventory entries even when the underlying GGUF files are unchanged.
+
 ## Durable user-state behavior
 
 Durable-state recovery is intentionally more conservative because the valid portions express user

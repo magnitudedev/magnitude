@@ -25,6 +25,7 @@ import {
   useDisplayViewController,
   type CommandContext,
   reasoningEffortControl,
+  formatReasoningEffort,
   selectedSlotModel,
   useModelConfig,
   useLocalModels,
@@ -198,7 +199,7 @@ export function ComposerContainer({
         role: rootRoleLabel,
         model: composer.model || '-',
         thinkingLevel: rootProfile?.reasoningEffort
-          ? rootProfile.reasoningEffort.charAt(0).toUpperCase() + rootProfile.reasoningEffort.slice(1)
+          ? formatReasoningEffort(rootProfile.reasoningEffort)
           : '-',
       }}
       localModels={localModelsState}
