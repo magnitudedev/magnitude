@@ -98,7 +98,7 @@ describe("local provider offering projection", () => {
             },
           ]])),
           changes: Stream.never,
-          catalogReady: Effect.succeed(true),
+          settled: Effect.succeed(true),
           resolve: () => Effect.succeed(Option.some({
             servingConfiguration: configuration,
             assessment: Option.some({ _tag: "Assessing" }),

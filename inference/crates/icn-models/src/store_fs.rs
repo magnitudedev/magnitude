@@ -23,7 +23,7 @@ pub(crate) async fn ensure_store_layout(root: &Path) -> Result<(), InventoryErro
         Err(error) => return Err(io_error(error)),
     }
 
-    for relative in ["hub", "locks", "quarantine"] {
+    for relative in ["hub", "locks"] {
         ensure_owned_directory(&root.join(relative)).await?;
     }
     Ok(())
@@ -138,7 +138,6 @@ mod tests {
 
         assert!(root.join("hub").is_dir());
         assert!(root.join("locks").is_dir());
-        assert!(root.join("quarantine").is_dir());
         assert_eq!(
             fs::read(outside).expect("outside file retained"),
             b"outside"

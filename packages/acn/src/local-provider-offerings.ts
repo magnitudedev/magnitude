@@ -300,7 +300,7 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   )
 
   return LocalProviderOfferings.of({
-    ready: resolver.catalogReady,
+    ready: resolver.settled,
     list,
     changes,
     catalog: observed.get.pipe(Effect.flatMap(({ state }) => Option.match(state.failure, {

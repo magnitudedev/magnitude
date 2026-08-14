@@ -46,6 +46,7 @@ export interface CoordinatedLocalModelAssessment {
 export interface LocalModelAssessorApi {
   readonly state: Effect.Effect<ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>>
   readonly changes: Stream.Stream<ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>>
+  readonly settled: Effect.Effect<boolean>
 }
 
 export class LocalModelAssessor extends Context.Tag(
@@ -427,5 +428,11 @@ export const LocalModelAssessorLive: Layer.Layer<
   return LocalModelAssessor.of({
     state: observed.get.pipe(Effect.map(({ state }) => publicState(state.published))),
     changes: observed.changes.pipe(Stream.map(({ state }) => publicState(state.published))),
+    settled: Effect.gen(function* () {
+      const desired = yield* readDesired
+      const { completedKeys } = (yield* observed.get).state
+      return [...desired].every(([demandKey, { semanticKey }]) =>
+        completedKeys.get(demandKey) === semanticKey)
+    }).pipe(Effect.orElseSucceed(() => false)),
   })
 }))
