@@ -3,6 +3,7 @@ import {
   truncateToDisplayWidth,
 } from "@magnitudedev/client-common"
 import type { ModelVariantLabel } from "@magnitudedev/sdk"
+import { PENTAGON_RADAR_ROWS } from "../../components/pentagon-radar"
 
 export type CatalogLayoutMode = "list" | "split"
 
@@ -39,7 +40,7 @@ export const CATALOG_SPLIT_MIN_WIDTH = CATALOG_INSPECTOR_WIDTH
   + CATALOG_MIN_LIST_WIDTH
 export const CATALOG_SPLIT_INSPECTOR_HEIGHTS = {
   identity: 4,
-  metrics: 15,
+  metrics: PENTAGON_RADAR_ROWS,
   info: 3,
   actions: 4,
 } as const
