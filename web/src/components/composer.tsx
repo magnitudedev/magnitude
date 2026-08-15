@@ -574,6 +574,8 @@ function SlashCommandMenu({
                 color: "var(--fg-tertiary)",
                 fontSize: 11,
                 marginLeft: "auto",
+                minWidth: 0,
+                flex: "1 1 0",
                 overflow: "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
