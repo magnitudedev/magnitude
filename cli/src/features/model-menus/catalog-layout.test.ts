@@ -51,13 +51,12 @@ describe("catalog responsive layout", () => {
   })
 
   test("keeps every split inspector region inside the available content area", () => {
-    expect(CATALOG_SPLIT_INSPECTOR_HEIGHT).toBe(25)
+    expect(CATALOG_SPLIT_INSPECTOR_HEIGHT).toBe(26)
     expect(CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics).toBe(CATALOG_RADAR_ROWS)
     expect(CATALOG_SPLIT_INSPECTOR_HEIGHTS).toEqual({
       identity: 4,
-      metrics: 9,
+      metrics: 15,
       info: 3,
-      recommendation: 5,
       actions: 4,
     })
   })

@@ -39,9 +39,8 @@ export const CATALOG_SPLIT_MIN_WIDTH = CATALOG_INSPECTOR_WIDTH
   + CATALOG_MIN_LIST_WIDTH
 export const CATALOG_SPLIT_INSPECTOR_HEIGHTS = {
   identity: 4,
-  metrics: 9,
+  metrics: 15,
   info: 3,
-  recommendation: 5,
   actions: 4,
 } as const
 export const CATALOG_SPLIT_INSPECTOR_HEIGHT = Object.values(

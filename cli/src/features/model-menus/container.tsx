@@ -44,7 +44,6 @@ import {
   ReasoningEffortSchema,
   servableModelBundlePackages,
   type LocalModel,
-  type LocalModelRecommendation,
   type ModelSlotsState,
   type ProviderCatalogEntry,
   type ProviderModelDisabledReason,
@@ -1211,30 +1210,6 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   )
 })
 
-const recommendationLabel = (recommendation: Option.Option<LocalModelRecommendation>): string =>
-  Option.match(recommendation, {
-    onNone: () => "",
-    onSome: ({ intent }) => ({
-      balanced: "Balanced",
-      best_quality: "Best quality",
-      fastest: "Fastest",
-      lightweight: "Lightweight",
-    })[intent],
-  })
-
-const intelligenceLabel = (model: LocalModel): string =>
-  model.catalogMembershipState._tag === "InCatalog"
-    ? `${Math.round(model.catalogMembershipState.catalogData.intelligenceScore)}/100`
-    : "—"
-
-const qualityLabel = (model: LocalModel): string =>
-  model.catalogMembershipState._tag !== "InCatalog" ? "—"
-    : model.catalogMembershipState.catalogData.fidelityRank >= 75
-      ? "Near original"
-      : model.catalogMembershipState.catalogData.fidelityRank >= 55
-        ? "Very high"
-        : model.catalogMembershipState.catalogData.fidelityRank >= 45 ? "High" : "Reduced"
-
 export const huggingFaceRepositoryUrls = (
   model: LocalModel,
 ): readonly string[] => [...new Set(servableModelBundlePackages(model.bundle).flatMap(({ source }) =>
@@ -1503,8 +1478,6 @@ const catalogInspectorStatus = (
 
 const CatalogInspector = memo(function CatalogInspector({
   model,
-  recommendation,
-  memoryBytes,
   reconciliationState,
   selected,
   selectedSlot,
@@ -1518,8 +1491,6 @@ const CatalogInspector = memo(function CatalogInspector({
   onActionHover,
 }: {
   readonly model: LocalModel
-  readonly recommendation: Option.Option<LocalModelRecommendation>
-  readonly memoryBytes: number | undefined
   readonly reconciliationState: CatalogModelReconciliationState
   readonly selected: boolean
   readonly selectedSlot: CatalogPrimarySlot | null
@@ -1536,22 +1507,11 @@ const CatalogInspector = memo(function CatalogInspector({
   const platform = usePlatform()
   const [sourceHovered, setSourceHovered] = useState(false)
   const profile = catalogRadarProfile(model)
-  const speculativeMethod = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const status = catalogInspectorStatus(model, reconciliationState, selected, selectedSlot)
   const contentWidth = CATALOG_INSPECTOR_CONTENT_WIDTH
-  const recommendationTitle = Option.isSome(recommendation)
-    ? recommendationLabel(recommendation)
-    : "No recommendation"
   const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
   const repository = repositoryUrl?.replace("https://", "")
   const license = Option.getOrElse(model.presentation.license, () => "Unknown license")
-  const quantization = model.bundle._tag === "Standalone"
-    ? model.bundle.package.properties.quantization
-    : model.bundle.target.properties.quantization
-  const quantizationLabel = model.catalogMembershipState._tag === "InCatalog"
-    && model.catalogMembershipState.catalogData.quantizationAware
-    ? `${quantization} QAT`
-    : quantization
   const description = twoLineText(model.presentation.description, contentWidth)
 
   return (
@@ -1568,18 +1528,8 @@ const CatalogInspector = memo(function CatalogInspector({
         <text style={{ fg: theme.muted }} wrapMode="none">{description}</text>
         <text> </text>
       </box>
-      <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0, flexDirection: "row", columnGap: 2 }}>
-        <box style={{ flexGrow: 1, minWidth: 0, flexDirection: "column" }}>
-          <text wrapMode="none"><span fg={theme.muted}>Intelligence </span><span fg={theme.foreground}>{intelligenceLabel(model)}</span></text>
-          <text wrapMode="none"><span fg={theme.muted}>Accuracy </span><span fg={theme.foreground}>{qualityLabel(model)}</span></text>
-          <text wrapMode="none"><span fg={theme.muted}>Speed </span><span fg={theme.foreground}>{performanceRangeSpeedLabel(model, "tokens/sec")}</span></text>
-          <text wrapMode="none"><span fg={theme.muted}>Quantization </span><span fg={theme.foreground}>{quantizationLabel}</span></text>
-          <text wrapMode="none"><span fg={theme.muted}>Speculation </span><span fg={theme.foreground}>{speculativeMethod}</span></text>
-          <text wrapMode="none"><span fg={theme.muted}>Memory </span><span fg={theme.foreground}>{memoryBytes === undefined ? "—" : formatBytes(memoryBytes)}</span></text>
-        </box>
-        <box style={{ width: 26, minWidth: 26, flexShrink: 0, height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics }}>
-          <CatalogRadarView profile={profile} transition={transition} />
-        </box>
+      <box style={{ width: "100%", height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0 }}>
+        <CatalogRadarView profile={profile} transition={transition} />
       </box>
       <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, flexShrink: 0, flexDirection: "column" }}>
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
@@ -1603,16 +1553,6 @@ const CatalogInspector = memo(function CatalogInspector({
           </Button>
         )}
       </box>
-      {Option.isSome(recommendation) && (
-        <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.recommendation, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.recommendation, flexShrink: 0, flexDirection: "column" }}>
-          <text> </text>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">RECOMMENDATION</text>
-          <text style={{ fg: theme.foreground }} wrapMode="none">{truncateToDisplayWidth(recommendationTitle, contentWidth)}</text>
-          <text style={{ fg: theme.muted }} wrapMode="none">
-            {twoLineText(recommendation.value.explanation, contentWidth)}
-          </text>
-        </box>
-      )}
       <box style={{ flexGrow: 1, minHeight: 1 }} />
       <box style={{
         height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.actions,
@@ -1676,10 +1616,6 @@ const CatalogMenu = memo(function CatalogMenu({
     catalogView,
     (models) => models.discoveryState._tag === "Ready",
   )
-  const recommendationFor = useCallback((model: LocalModel) =>
-    model.servingState._tag === "Assessed"
-      ? Option.fromNullable(model.servingState.recommendations[0])
-      : Option.none<LocalModelRecommendation>(), [])
   const memoryBytesFor = (model: LocalModel): number | undefined =>
     model.servingState._tag === "Assessed"
       && model.servingState.assessment._tag === "Fits"
@@ -1941,8 +1877,6 @@ const CatalogMenu = memo(function CatalogMenu({
       <CatalogInspector
         key={inspectedConfigurationId}
         model={inspected}
-        recommendation={recommendationFor(inspected)}
-        memoryBytes={memoryBytesFor(inspected)}
         reconciliationState={inspectedReconciliationState}
         selected={inspectedSelected}
         selectedSlot={inspectedSlot}
