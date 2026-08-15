@@ -5,15 +5,12 @@ import type { DisplayRootStatus, InterruptedMessage, SlotId } from '@magnitudede
 import {
   displayRootStatusElapsedMs,
   animationPulse,
-  interpolateHexColor,
   modelReleaseReasonLabel,
   rootDetailSegments,
-  slate,
   useStabilizedRootDetail,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
 import { useTheme } from '../../hooks/use-theme'
-import { red } from '../../utils/theme'
 import { spinnerFrameForStep } from '../../hooks/use-spinner-frame'
 import { useAnimationStep, useAnimationTime } from '../../hooks/use-animation-time'
 import { Button } from '../../components/button'
@@ -55,18 +52,18 @@ export const ActivityRail = memo(function ActivityRail({
     || (active && modelResidency?._tag !== 'Loading')
   const animationTime = useAnimationTime(pulseAnimated)
   const loadingSpinnerStep = useAnimationStep(modelResidency?._tag === 'Loading', 80)
-  const pulseColor = interpolateHexColor(
-    slate[500],
-    slate[200],
-    animationPulse(animationTime, ACTIVE_PULSE_DURATION_MS),
-  )
+  const pulseProgress = animationPulse(animationTime, ACTIVE_PULSE_DURATION_MS)
+  const pulseColor = theme.neutralPulse[Math.min(
+    theme.neutralPulse.length - 1,
+    Math.floor(pulseProgress * theme.neutralPulse.length),
+  )]!
 
   if (modelLoadActivity !== null && modelResidency !== null) {
     if (modelResidency._tag === 'Failed') {
       return (
         <box style={{ height: 1, flexShrink: 0 }}>
-          <text style={{ fg: theme.warning }}>
-            <span style={{ fg: red[400] }}>■</span>
+          <text style={{ fg: theme.status.warning }}>
+            <span style={{ fg: theme.status.failure }}>■</span>
             {` ${LOW_MEMORY_MODEL_STOPPED_MESSAGE}`}
           </text>
         </box>
@@ -78,8 +75,8 @@ export const ActivityRail = memo(function ActivityRail({
           <text>
             <span style={{ fg: pulseColor }}>■</span>
             {' '}
-            <span style={{ fg: theme.foreground }}>Stopping model</span>
-            <span style={{ fg: theme.muted }}>{` · ${modelReleaseReasonLabel(modelResidency.reason)}`}</span>
+            <span style={{ fg: theme.text.body }}>Stopping model</span>
+            <span style={{ fg: theme.text.metadata }}>{` · ${modelReleaseReasonLabel(modelResidency.reason)}`}</span>
           </text>
         </box>
       )
@@ -91,13 +88,13 @@ export const ActivityRail = memo(function ActivityRail({
       return (
         <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
           <text>
-            <span style={{ fg: theme.primary }}>{spinnerFrameForStep(loadingSpinnerStep)}</span>
+            <span style={{ fg: theme.accent }}>{spinnerFrameForStep(loadingSpinnerStep)}</span>
             {' '}
-            <span style={{ fg: theme.foreground }}>Loading model</span>
-            <span style={{ fg: theme.muted }}>{` · ${percentage}%`}</span>
+            <span style={{ fg: theme.text.body }}>Loading model</span>
+            <span style={{ fg: theme.text.metadata }}>{` · ${percentage}%`}</span>
           </text>
           <Button onClick={() => onStopModel(modelLoadActivity.slotId)}>
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{' · Stop'}</text>
+            <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>{' · Stop'}</text>
           </Button>
         </box>
       )
@@ -112,19 +109,19 @@ export const ActivityRail = memo(function ActivityRail({
         <text>
           <span style={{ fg: pulseColor }}>●</span>
           {' '}
-          <span style={{ fg: theme.foreground }}>Working</span>
-          <span style={{ fg: theme.muted }}>{` · ${elapsed}`}</span>
+          <span style={{ fg: theme.text.body }}>Working</span>
+          <span style={{ fg: theme.text.metadata }}>{` · ${elapsed}`}</span>
           {detail.keyword !== null && (
             <>
-              <span style={{ fg: theme.muted }}>{' · '}</span>
+              <span style={{ fg: theme.text.metadata }}>{' · '}</span>
               <span style={{ fg: pulseColor }}>{detail.keyword}</span>
             </>
           )}
           {detail.detail !== null && (
-            <span style={{ fg: theme.muted }}>{` · ${detail.detail}`}</span>
+            <span style={{ fg: theme.text.metadata }}>{` · ${detail.detail}`}</span>
           )}
           {detail.trailing !== null && width >= 72 && (
-            <span style={{ fg: theme.muted }}>{` · ${detail.trailing}`}</span>
+            <span style={{ fg: theme.text.metadata }}>{` · ${detail.trailing}`}</span>
           )}
         </text>
       </box>
@@ -139,7 +136,7 @@ export const ActivityRail = memo(function ActivityRail({
         : '■ Lead interrupted. What would you like to do?'
     return (
       <box style={{ height: 1, flexShrink: 0 }}>
-        <text style={{ fg: red[400] }}>{interruptText}</text>
+        <text style={{ fg: theme.status.interrupted }}>{interruptText}</text>
       </box>
     )
   }

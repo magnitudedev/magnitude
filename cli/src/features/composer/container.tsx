@@ -228,7 +228,7 @@ export function ComposerContainer({
       isCompacting={isCompacting}
       displayMode={displayMode}
       theme={theme}
-      modeColor={theme.modeDefault}
+      modeColor={theme.accent}
       chatColumnWidth={chatColumnWidth}
       attachmentsMaxWidth={attachmentsMaxWidth}
       composerCanFocus={composerCanFocus}

@@ -24,10 +24,10 @@ export const AutopilotPreviewMessage = memo(function AutopilotPreviewMessage({
 
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1, paddingLeft: 1 }}>
-      <text style={{ fg: theme.muted }} attributes={attributes}>
+      <text style={{ fg: theme.text.supporting }} attributes={attributes}>
         {'↑ '}
       </text>
-      <text style={{ fg: theme.muted }} attributes={attributes}>
+      <text style={{ fg: theme.text.supporting }} attributes={attributes}>
         {content}
       </text>
     </box>

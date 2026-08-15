@@ -32,7 +32,6 @@ import { useStableCallback } from '../../hooks/use-stable-callback'
 import { useTheme } from '../../hooks/use-theme'
 
 import { safeRenderableAccess, safeRenderableCall } from '../../utils/safe-renderable-access'
-import { terminalSupportsRgb24 } from '../../utils/theme'
 import { stepCursorVertical } from './multiline-input.helpers'
 
 import type {
@@ -2063,13 +2062,13 @@ export const MultilineInput = forwardRef<
   })()
 
   const inputColor = isPlaceholder
-    ? theme.muted
+    ? theme.text.placeholder
     : focused
-      ? theme.inputFocusedFg
-      : theme.inputFg
+      ? theme.text.emphasized
+      : theme.text.body
 
   // Use theme's info color for selection highlight background (or custom override)
-  const highlightBg = highlightColor ?? theme.info
+  const highlightBg = highlightColor ?? theme.status.information
 
   return (
     <scrollbox
@@ -2094,7 +2093,7 @@ export const MultilineInput = forwardRef<
         rootOptions: {
           width: '100%',
           height: layoutMetrics.heightLines,
-          backgroundColor: 'transparent',
+          backgroundColor: theme.background.canvas,
           flexGrow: 0,
           flexShrink: 0,
         },
@@ -2110,7 +2109,7 @@ export const MultilineInput = forwardRef<
     >
       <text
         ref={setTextRenderable}
-        style={{ bg: 'transparent', fg: inputColor, wrapMode: 'word' }}
+        style={{ bg: theme.background.canvas, fg: inputColor, wrapMode: 'word' }}
       >
         {isPlaceholder ? (
           <>
@@ -2120,7 +2119,7 @@ export const MultilineInput = forwardRef<
                 focused={focused}
                 shouldBlink={effectiveShouldBlinkCursor}
                 char={'▍'}
-                color={terminalSupportsRgb24() ? (highlightColor ?? theme.info) : 'cyan'}
+                color={highlightColor ?? theme.status.information}
                 activeChar={' '}
                 key={`placeholder-cursor-${lastActivity}`}
               />
@@ -2137,7 +2136,7 @@ export const MultilineInput = forwardRef<
 
               const pushCursor = (activeChar?: string) => {
                 if (!showRenderableCursor || cursorRendered) return
-                const cursorColor = terminalSupportsRgb24() ? (highlightColor ?? theme.info) : 'cyan'
+                const cursorColor = highlightColor ?? theme.status.information
                 const isBlockCursor =
         activeChar !== undefined &&
         activeChar !== ' ' &&
@@ -2200,7 +2199,7 @@ export const MultilineInput = forwardRef<
                   out.push(
                     <span
                       key={`p-${item.segment.id}`}
-                      fg={selectedPasteSegmentId === item.segment.id ? theme.link : theme.primary}
+                      fg={selectedPasteSegmentId === item.segment.id ? theme.link : theme.accent}
                       attributes={
                         selectedPasteSegmentId === item.segment.id
                           ? TextAttributes.BOLD
@@ -2214,7 +2213,7 @@ export const MultilineInput = forwardRef<
                   out.push(
                     <span
                       key={`m-${item.segment.id}`}
-                      fg={selectedMentionSegmentId === item.segment.id ? theme.link : theme.info}
+                      fg={selectedMentionSegmentId === item.segment.id ? theme.link : theme.status.information}
                       attributes={
                         selectedMentionSegmentId === item.segment.id
                           ? TextAttributes.BOLD

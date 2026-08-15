@@ -103,27 +103,27 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
       <box style={{
         width: '100%',
         borderStyle: 'single',
-        borderColor: theme.error,
+        borderColor: theme.status.failure,
         customBorderChars: BOX_CHARS,
         paddingLeft: 1,
         paddingRight: 1,
         flexDirection: 'column',
       }}>
-        <text style={{ fg: theme.error }}>
+        <text style={{ fg: theme.status.failure }}>
           {fullError}
         </text>
 
         {cta && cta.kind === 'url' && (
           <box style={{ flexDirection: 'row' }}>
-            <text style={{ fg: theme.muted }}>{`${cta.label} → `}</text>
-            <text style={{ fg: theme.primary }} attributes={TextAttributes.UNDERLINE}>{cta.url}</text>
-            <text style={{ fg: theme.muted }}>{' '}</text>
+            <text style={{ fg: theme.text.supporting }}>{`${cta.label} → `}</text>
+            <text style={{ fg: theme.accent }} attributes={TextAttributes.UNDERLINE}>{cta.url}</text>
+            <text style={{ fg: theme.text.supporting }}>{' '}</text>
             <Button
               onClick={handleCopyLink}
               onMouseOver={() => setLinkHovered(true)}
               onMouseOut={() => setLinkHovered(false)}
             >
-              <text style={{ fg: linkCopied ? theme.success : (linkHovered ? theme.foreground : theme.muted) }}>
+              <text style={{ fg: linkCopied ? theme.status.success : (linkHovered ? theme.text.body : theme.text.supporting) }}>
                 {linkCopied ? '[Copied ✓]' : '[Copy link]'}
               </text>
             </Button>
@@ -137,7 +137,7 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
             onMouseOver={() => setActionHovered(true)}
             onMouseOut={() => setActionHovered(false)}
           >
-            <text style={{ fg: actionHovered ? theme.foreground : theme.primary }}>
+            <text style={{ fg: actionHovered ? theme.text.body : theme.accent }}>
               {`[${cta.label} (${formatChord(cta.chord)})]`}
             </text>
           </Button>
@@ -146,11 +146,11 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
 
       {/* Only show copy overlay when there's no CTA */}
       {!cta && (isHovered || isCopied) && (
-        <box style={{ position: 'absolute', bottom: 0, right: 0, flexDirection: 'row', backgroundColor: theme.terminalDetectedBg ?? 'transparent',  }}>
-          <text style={{ fg: isCopied ? 'green' : theme.muted }} attributes={TextAttributes.DIM}>
+        <box style={{ position: 'absolute', bottom: 0, right: 0, flexDirection: 'row', backgroundColor: theme.background.terminal }}>
+          <text style={{ fg: isCopied ? theme.status.success : theme.text.metadata }} attributes={TextAttributes.DIM}>
             {isCopied ? '[Copied ✔] ' : '[Copy ⧉ ] '}
           </text>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>
             {formatShortTimestamp(timestamp)}
           </text>
         </box>

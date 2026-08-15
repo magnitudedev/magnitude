@@ -67,16 +67,16 @@ export const SlashCommandMenu = memo(function SlashCommandMenu({
               overflow: 'hidden',
               paddingLeft: 1,
               paddingRight: 1,
-              backgroundColor: isSelected ? theme.surface : undefined,
+              backgroundColor: isSelected ? theme.background.selected : undefined,
             }}
           >
-            <text style={{ fg: theme.primary, flexShrink: 0 }}>
+            <text style={{ fg: theme.accent, flexShrink: 0 }}>
               <span attributes={TextAttributes.BOLD}>{label}</span>
             </text>
             {description && (
               <>
                 <text style={{ width: 1, flexShrink: 0 }}> </text>
-                <text style={{ fg: theme.muted, width: descriptionWidth, flexShrink: 0 }}>
+                <text style={{ fg: theme.text.metadata, width: descriptionWidth, flexShrink: 0 }}>
                   {description}
                 </text>
               </>

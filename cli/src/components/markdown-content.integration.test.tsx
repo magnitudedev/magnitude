@@ -1,18 +1,9 @@
 import React from 'react'
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { chatThemes } from '../utils/theme'
+import { defaultCliThemes } from '../utils/theme'
 
-const theme = {
-  ...chatThemes.dark,
-  border: chatThemes.dark.border ?? chatThemes.dark.muted,
-  success: chatThemes.dark.success ?? 'green',
-  error: chatThemes.dark.error ?? 'red',
-  info: chatThemes.dark.info ?? 'blue',
-  warning: chatThemes.dark.warning ?? 'yellow',
-  foreground: chatThemes.dark.foreground ?? 'white',
-  muted: chatThemes.dark.muted ?? 'gray',
-}
+const theme = defaultCliThemes.dark
 
 let rendererWidth = 80
 const renderDocumentCalls: Array<any> = []

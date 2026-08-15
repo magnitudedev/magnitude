@@ -13,7 +13,7 @@ export const SystemMessageRow = memo(function SystemMessageRow({ message }: { me
   return (
     <box style={{ marginBottom: 1 }}>
       <text attributes={TextAttributes.DIM}>
-        <span style={{ fg: theme.muted }}>{message.text}</span>
+        <span style={{ fg: theme.text.supporting }}>{message.text}</span>
       </text>
     </box>
   )

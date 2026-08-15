@@ -42,23 +42,23 @@ export const FileMentionMenu = memo(function FileMentionMenu({
     <box style={{ flexDirection: 'column', paddingBottom: 1, maxHeight: 16, overflow: 'hidden' }}>
       {!hasQuery && (
         <>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>
             Recent
           </text>
           {recentItems.length === 0 ? (
-            <text style={{ fg: theme.muted, paddingLeft: 1 }} attributes={TextAttributes.DIM}>
+            <text style={{ fg: theme.text.metadata, paddingLeft: 1 }} attributes={TextAttributes.DIM}>
               (none yet)
             </text>
           ) : null}
         </>
       )}
 
-      <text style={{ fg: theme.muted, paddingTop: hasQuery ? 0 : 1 }} attributes={TextAttributes.DIM}>
+      <text style={{ fg: theme.text.metadata, paddingTop: hasQuery ? 0 : 1 }} attributes={TextAttributes.DIM}>
         Files & directories
       </text>
 
       {items.length === 0 ? (
-        <text style={{ fg: theme.muted, paddingLeft: 1 }} attributes={TextAttributes.DIM}>
+        <text style={{ fg: theme.text.metadata, paddingLeft: 1 }} attributes={TextAttributes.DIM}>
           No matching files
         </text>
       ) : (
@@ -74,24 +74,24 @@ export const FileMentionMenu = memo(function FileMentionMenu({
                   flexDirection: 'row',
                   paddingLeft: 1,
                   paddingRight: 1,
-                  backgroundColor: isSelected ? theme.surface : undefined,
+                  backgroundColor: isSelected ? theme.background.selected : undefined,
                 }}
               >
-                <text style={{ fg: theme.primary }}>
+                <text style={{ fg: theme.accent }}>
                   <span attributes={TextAttributes.BOLD}>@{item.path}</span>
                 </text>
                 {item.kind === 'directory' && (
-                  <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+                  <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>
                     {' '}{'[dir]'}
                   </text>
                 )}
                 {item.lineRange && item.kind !== 'directory' && (
-                  <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+                  <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>
                     {`:${item.lineRange.start}-${item.lineRange.end}`}
                   </text>
                 )}
                 {item.warning && (
-                  <text style={{ fg: theme.warning }}>
+                  <text style={{ fg: theme.status.warning }}>
                     {' '}{'[>500KB]'}
                   </text>
                 )}
@@ -99,7 +99,7 @@ export const FileMentionMenu = memo(function FileMentionMenu({
             )
           })}
           {overflowCount > 0 && (
-            <text style={{ fg: theme.muted, paddingLeft: 1 }} attributes={TextAttributes.DIM}>
+            <text style={{ fg: theme.text.metadata, paddingLeft: 1 }} attributes={TextAttributes.DIM}>
               … and {overflowCount} more
             </text>
           )}

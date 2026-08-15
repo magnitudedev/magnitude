@@ -12,9 +12,10 @@ import {
   ReasoningEffortSchema,
   type DisplayRootStatus,
 } from '@magnitudedev/sdk'
+import { defaultCliThemes } from '../../utils/theme'
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({ primary: 'cyan', foreground: 'white', muted: 'gray', warning: 'yellow' }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 vi.mock('@opentui/react', async () => ({
   ...await vi.importActual<typeof import('@opentui/react')>('@opentui/react'),

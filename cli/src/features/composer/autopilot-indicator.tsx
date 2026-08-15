@@ -4,13 +4,6 @@ import { Button } from '../../components/button'
 import { spinnerFrameForStep } from '../../hooks/use-spinner-frame'
 import { useAnimationStep } from '../../hooks/use-animation-time'
 import { useTheme } from '../../hooks/use-theme'
-import { blue, slate } from '@magnitudedev/client-common'
-
-// Same pulse animation as subagent working state in task-list.tsx
-const PULSE_BLUE_SHADES = [
-  blue[50], blue[100], blue[200], blue[300], blue[400], blue[500], blue[600], blue[700], blue[800], blue[900],
-  blue[800], blue[700], blue[600], blue[500], blue[400], blue[300], blue[200], blue[100], blue[50],
-] as const
 
 interface AutopilotIndicatorProps {
   enabled: boolean
@@ -32,12 +25,12 @@ export const AutopilotIndicator = memo(function AutopilotIndicator({
     : '●'
 
   const iconColor = generating
-    ? theme.foreground
+    ? theme.text.body
     : enabled
-      ? PULSE_BLUE_SHADES[animationStep % PULSE_BLUE_SHADES.length]
-      : slate[600]
+      ? theme.activityPulse[animationStep % theme.activityPulse.length]!
+      : theme.status.inactive
 
-  const textColor = hovered ? theme.foreground : enabled ? theme.foreground : theme.muted
+  const textColor = hovered ? theme.text.body : enabled ? theme.text.body : theme.text.supporting
   const textAttributes = (!enabled && !hovered) ? TextAttributes.DIM : TextAttributes.NONE
 
   return (

@@ -1,12 +1,10 @@
 import { memo } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../../../hooks/use-theme'
-import { orange } from '../../../utils/theme'
 
 import { BOX_CHARS } from '../../../utils/ui-constants'
 import type { UserBashCommandMessage } from '@magnitudedev/sdk'
 
-const BASH_ACCENT = orange[400]
 const BASH_BOX_CHARS = { ...BOX_CHARS, vertical: '▎' }
 
 interface BashOutputProps {
@@ -15,14 +13,15 @@ interface BashOutputProps {
 
 export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) {
   const theme = useTheme()
+  const bashAccent = theme.bashAccent
 
   // Combine all output lines
   const outputParts: Array<{ text: string; color: string }> = []
   if (result.stdout.length > 0) {
-    outputParts.push({ text: result.stdout, color: theme.foreground })
+    outputParts.push({ text: result.stdout, color: theme.text.body })
   }
   if (result.stderr.length > 0) {
-    outputParts.push({ text: result.stderr, color: theme.error })
+    outputParts.push({ text: result.stderr, color: theme.status.failure })
   }
 
   const allLines: Array<{ line: string; color: string }> = []
@@ -39,7 +38,7 @@ export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) 
           flexDirection: 'column',
           borderStyle: 'single',
           border: ['left'],
-          borderColor: BASH_ACCENT,
+          borderColor: bashAccent,
           customBorderChars: BASH_BOX_CHARS,
           paddingLeft: 1,
           paddingRight: 1,
@@ -48,17 +47,17 @@ export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) 
         }}
       >
         {/* Command line */}
-        <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
-          <span fg={BASH_ACCENT} attributes={TextAttributes.BOLD}>$ </span>
+        <text style={{ fg: theme.text.body, wrapMode: 'word' }}>
+          <span fg={bashAccent} attributes={TextAttributes.BOLD}>$ </span>
           <span attributes={TextAttributes.BOLD}>{result.command}</span>
-          <span fg={result.exitCode === 0 ? theme.success : theme.error}>
+          <span fg={result.exitCode === 0 ? theme.status.success : theme.status.failure}>
             {result.exitCode === 0 ? ' ✓' : ` ✗ Exit ${result.exitCode}`}
           </span>
         </text>
 
         {/* Output lines */}
         {allLines.length > 0 && (
-          <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
+          <text style={{ fg: theme.text.body, wrapMode: 'word' }}>
             {allLines.map((entry, i) => (
               <span key={i} fg={entry.color}>
                 {entry.line}{i < allLines.length - 1 ? '\n' : ''}

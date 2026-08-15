@@ -4,8 +4,7 @@ import { create, type ReactTestInstance } from 'react-test-renderer'
 import { act, type ReactNode } from 'react'
 import { Option } from 'effect'
 import { TextAttributes } from '@opentui/core'
-import type { ChatTheme } from '../../types/theme-system'
-import { violet } from '../../utils/theme'
+import { defaultCliThemes } from '../../utils/theme'
 import type { ComposerProps } from './types'
 import {
   ModelDownloadIdSchema,
@@ -145,62 +144,14 @@ vi.mock('./multiline-input', () => ({
 }))
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => theme,
+  useTheme: () => defaultCliThemes.dark,
 }))
-
-const { Composer, COMPOSER_BORDER_CHARS } = await import('./composer')
 
 const noop = () => {}
 
-const theme: ChatTheme = {
-  name: 'dark',
-  primary: '#55aaff',
-  secondary: '#ffaa00',
-  success: '#00ff00',
-  error: '#ff3333',
-  warning: '#ffaa00',
-  info: '#00aaff',
-  link: '#55aaff',
-  directory: '#55aaff',
-  foreground: '#ffffff',
-  background: '#000000',
-  muted: '#888888',
-  border: '#444444',
-  surface: '#222222',
-  surfaceHover: '#2a2a2a',
-  aiLine: '#55aaff',
-  userLine: '#ffaa00',
-  userMessageBg: '#111111',
-  userMessageHoverBg: '#1a1a1a',
-  inputBg: '#111111',
-  menuBg: '#111111',
-  menuAltBg: '#181818',
-  agentToggleExpandedBg: '#1a1a1a',
-  agentFocusedBg: '#1a1a1a',
-  agentContentBg: '#111111',
-  terminalBg: '#000000',
-  diffGreenBg: '#122b22',
-  diffRedBg: '#2c1919',
-  inputFg: '#cccccc',
-  inputFocusedFg: '#ffffff',
-  modeDefault: '#00aaff',
-  modePlan: '#ffaa00',
-  imageCardBorder: '#444444',
-  syntax: {
-    keyword: '#c084fc',
-    string: '#86efac',
-    number: '#93c5fd',
-    comment: '#64748b',
-    function: '#60a5fa',
-    variable: '#e2e8f0',
-    type: '#86efac',
-    operator: '#94a3b8',
-    property: '#e2e8f0',
-    punctuation: '#64748b',
-    literal: '#93c5fd',
-    default: '#f1f5f9',
-  },
-}
+const theme = defaultCliThemes.dark
+
+const { Composer, COMPOSER_BORDER_CHARS } = await import('./composer')
 
 function render(node: ReactNode) {
   return renderToStaticMarkup(<>{node}</>)
@@ -284,7 +235,7 @@ function makeProps(): ComposerProps {
 test('composer shell renders without an embedded task list (task list is the AgentStatus feature)', () => {
   const html = render(<Composer {...makeProps()} clientWorkingDirectory="/tmp/magnitude" />)
 
-  expect(html).toContain('background-color:#111111;padding-top:1px;padding-bottom:1px;padding-left:1px;padding-right:2px')
+  expect(html).toContain(`background-color:${theme.background.input};padding-top:1px;padding-bottom:1px;padding-left:1px;padding-right:2px`)
   expect(html).toContain('border-style:single;border:left')
   expect(COMPOSER_BORDER_CHARS.vertical).toBe('┃')
   expect(html).toContain('>model<')
@@ -337,7 +288,7 @@ test('shows resident memory three spaces after context and links it to hardware'
   )
 
   expect(html).toContain(
-    '5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:#888888"><span attributes="0">16 GB mem',
+    `5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:${theme.text.supporting}"><span attributes="0">16 GB mem`,
   )
 
   let view!: ReturnType<typeof create>
@@ -363,7 +314,7 @@ test('shows resident memory three spaces after context and links it to hardware'
   const hoveredMemory = view.root.findAll(
     (node) => node.type === 'text' && textOf(node) === '16 GB mem',
   )[0]!
-  expect(hoveredMemory.props.style).toEqual({ fg: theme.primary })
+  expect(hoveredMemory.props.style).toEqual({ fg: theme.accent })
   expect(hoveredMemory.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
   act(() => { (memoryButton!.props.onMouseOut as () => void)() })
   act(() => {
@@ -437,7 +388,7 @@ test('shows active model downloads in the persistent footer and links to the cat
   const downloadText = view.root.findAll(
     (node) => node.type === 'text' && textOf(node) === '1 model downloading',
   )[0]!
-  expect(downloadText.props.style).toEqual({ fg: theme.primary })
+  expect(downloadText.props.style).toEqual({ fg: theme.accent })
 
   act(() => { (downloadButton!.props.onMouseOver as () => void)() })
   expect(downloadText.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
@@ -593,9 +544,9 @@ test('disables footer settings controls while onboarding downloads a model', () 
     .map((child) => typeof child === 'string' ? child : textOf(child))
     .join('')
   const expectedColors = new Map([
-    ['model', theme.foreground],
-    ['high', violet[300]],
-    ['16 GB mem', theme.muted],
+    ['model', theme.text.body],
+    ['high', defaultCliThemes.dark.planAccent],
+    ['16 GB mem', theme.text.supporting],
   ])
   for (const label of expectedColors.keys()) {
     const control = view.root.findAll((node) => textOf(node) === label)

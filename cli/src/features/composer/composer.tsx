@@ -6,7 +6,6 @@ import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommo
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { filenameWithImageExtension, useAgentClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
 import { createId } from '@magnitudedev/generate-id'
-import { orange, violet } from '../../utils/theme'
 import { Button } from '../../components/button'
 import { ChatSurfaceKeyboard } from './chat-surface-keyboard'
 import { FileMentionMenu } from './mention-menu'
@@ -678,22 +677,22 @@ export function Composer(props: ComposerProps) {
   const footerStatus = (
     <box style={{ flexDirection: 'row', alignItems: 'center' }}>
       {bashMode ? (
-        <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+        <text style={{ fg: theme.bashAccent }} attributes={TextAttributes.BOLD}>Bash Mode</text>
       ) : !modelsConfigured ? (
         <>
-          <text style={{ fg: theme.foreground }}>No model configured · </text>
+          <text style={{ fg: theme.text.body }}>No model configured · </text>
           <Button
             onClick={openSettings}
             onMouseOver={() => setModelLabelHovered(true)}
             onMouseOut={() => setModelLabelHovered(false)}
           >
-            <text style={{ fg: modelLabelHovered ? theme.primary : theme.foreground }}>
+            <text style={{ fg: modelLabelHovered ? theme.accent : theme.text.body }}>
               <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 /models
               </span>
             </text>
           </Button>
-          <text style={{ fg: theme.foreground }}> to see available models</text>
+          <text style={{ fg: theme.text.body }}> to see available models</text>
         </>
       ) : (
         <>
@@ -709,7 +708,7 @@ export function Composer(props: ComposerProps) {
             cursor={footerControlsDisabled ? 'default' : undefined}
           >
             <text
-              style={{ fg: !footerControlsDisabled && modelLabelHovered ? theme.primary : theme.foreground }}
+              style={{ fg: !footerControlsDisabled && modelLabelHovered ? theme.accent : theme.text.body }}
             >
               <span attributes={!footerControlsDisabled && modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {modelNameLabel}
@@ -723,7 +722,7 @@ export function Composer(props: ComposerProps) {
             onMouseOut={footerControlsDisabled ? undefined : () => setThinkingLabelHovered(false)}
             cursor={footerControlsDisabled ? 'default' : undefined}
           >
-            <text style={{ fg: !footerControlsDisabled && (thinkingLabelHovered || thinkingOpen) ? violet[200] : violet[300] }}>
+            <text style={{ fg: !footerControlsDisabled && (thinkingLabelHovered || thinkingOpen) ? theme.highlightAccent : theme.planAccent }}>
               <span attributes={!footerControlsDisabled && thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {thinkingLevelLabel}
               </span>
@@ -753,7 +752,7 @@ export function Composer(props: ComposerProps) {
                     onMouseOut={footerControlsDisabled ? undefined : () => setMemoryLabelHovered(false)}
                     cursor={footerControlsDisabled ? 'default' : undefined}
                   >
-                    <text style={{ fg: !footerControlsDisabled && memoryLabelHovered ? theme.primary : theme.muted }}>
+                    <text style={{ fg: !footerControlsDisabled && memoryLabelHovered ? theme.accent : theme.text.supporting }}>
                       <span attributes={!footerControlsDisabled && memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                         {modelFooter.memoryLabel}
                       </span>
@@ -774,7 +773,7 @@ export function Composer(props: ComposerProps) {
       {displayMode === 'transcript' && (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          <text style={{ fg: theme.info }}>Transcript Mode</text>
+          <text style={{ fg: theme.status.information }}>Transcript Mode</text>
         </>
       )}
       {enableAutopilot && (
@@ -787,12 +786,12 @@ export function Composer(props: ComposerProps) {
       {nextEscWillKillAll ? (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all workers</text>
+          <text style={{ fg: theme.text.supporting }}>Press Esc again to interrupt all workers</text>
         </>
       ) : bashMode ? (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
+          <text style={{ fg: theme.text.supporting }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
         </>
       ) : null}
     </box>
@@ -800,7 +799,7 @@ export function Composer(props: ComposerProps) {
 
   const footerEnvironment = (
     <box style={{ flexDirection: 'row', alignItems: 'center' }}>
-      <text style={{ fg: theme.muted }}>{workingDirectoryLabel}</text>
+      <text style={{ fg: theme.text.supporting }}>{workingDirectoryLabel}</text>
     </box>
   )
 
@@ -835,11 +834,11 @@ export function Composer(props: ComposerProps) {
         <box style={{
           borderStyle: 'single',
           border: ['left'],
-          borderColor: bashMode ? orange[400] : modeColor,
+          borderColor: bashMode ? theme.bashAccent : modeColor,
           customBorderChars: COMPOSER_BORDER_CHARS,
         }}>
           <box style={{
-            backgroundColor: theme.inputBg,
+            backgroundColor: theme.background.input,
             paddingTop: 1,
             paddingBottom: 1,
             paddingLeft: 1,
@@ -889,7 +888,7 @@ export function Composer(props: ComposerProps) {
                   onPaste={handlePaste}
                   onKeyIntercept={handleKeyIntercept}
                   focused={composerCanFocus && !thinkingOpen}
-                  highlightColor={bashMode ? orange[400] : undefined}
+                  highlightColor={bashMode ? theme.bashAccent : undefined}
                   placeholder={thinkingOpen
                     ? 'Select reasoning level...'
                     : modelSetupInProgress

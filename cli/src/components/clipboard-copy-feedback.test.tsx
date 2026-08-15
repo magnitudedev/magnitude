@@ -22,24 +22,14 @@ mock.module('../utils/clipboard', () => ({
   readClipboardText: () => null,
 }))
 
-mock.module('../hooks/use-theme', () => ({
-  useTheme: () => ({
-    foreground: '#fff',
-    muted: '#888',
-    primary: '#4af',
-    success: '#6f6',
-    border: '#444',
-    error: '#f66',
-    info: '#4af',
-    surface: '#111',
-    link: '#4af',
-    syntax: {},
-  }),
-}))
+mock.module('../hooks/use-theme', async () => {
+  const { defaultCliThemes } = await import('../utils/theme')
+  return { useTheme: () => defaultCliThemes.dark }
+})
 
 mock.module('@opentui/react', () => ({
   useKeyboard: () => {},
-  useRenderer: () => ({ clearSelection() {} }),
+  useRenderer: () => ({ clearSelection() {}, setMousePointer() {} }),
   useTerminalDimensions: () => ({ width: 80, height: 24 }),
 }))
 
@@ -56,7 +46,7 @@ mock.module('../hooks/use-safe-event', () => ({
 }))
 
 const { CopyButton } = await import('../features/file-viewer/panel-buttons')
-const { chatThemes } = await import('../utils/theme')
+const { defaultCliThemes } = await import('../utils/theme')
 const { BlockRenderer } = await import('../markdown/block-renderer')
 
 function flattenText(node: any): string {
@@ -97,7 +87,11 @@ describe('copy feedback timing', () => {
     await act(async () => {
       renderer = create(React.createElement(CopyButton, {
         content: 'hello',
-        theme: { ...chatThemes.dark, success: 'g', foreground: 'w', muted: 'm' },
+        theme: {
+          ...defaultCliThemes.dark,
+          text: { ...defaultCliThemes.dark.text, body: 'w', supporting: 'm' },
+          status: { ...defaultCliThemes.dark.status, success: 'g' },
+        },
       }))
     })
 

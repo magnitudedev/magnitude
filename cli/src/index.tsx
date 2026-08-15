@@ -24,8 +24,13 @@ import { CLI_VERSION } from "./version";
 import { installGracefulShutdownHandlers } from "./utils/graceful-shutdown";
 import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
-import { Array as Arr, Effect, Option } from "effect";
+import { Array as Arr, Effect, Exit, Option, Scope } from "effect";
 import { registerDocsCommand } from "./commands/docs";
+import {
+  detectTerminalAppearance,
+  installTerminalAppearanceRuntime,
+} from "./platform/terminal-appearance";
+import { terminalAppearanceAtom } from "./hooks/use-theme";
 
 /** One-time env-var auth resolution (spec §2.9) — not reactive. */
 function resolveEnvAuth(): AuthSource {
@@ -142,10 +147,20 @@ async function main() {
     const renderer = await createCliRenderer({
       exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
     });
+    const terminalAppearance = await Effect.runPromise(
+      detectTerminalAppearance(renderer)
+    );
+    atomRegistry.set(terminalAppearanceAtom, terminalAppearance);
+    const terminalAppearanceScope = await Effect.runPromise(Scope.make());
+    await Effect.runPromise(
+      installTerminalAppearanceRuntime(renderer, atomRegistry).pipe(
+        Effect.provideService(Scope.Scope, terminalAppearanceScope)
+      )
+    );
+    renderer.once("destroy", () => {
+      Effect.runFork(Scope.close(terminalAppearanceScope, Exit.void));
+    });
     let modelExitNotice: string | undefined;
-
-    // Terminal background detection is handled by useTerminalBgDetection
-    // inside the React tree (needs atom registry to write to themeAtom)
 
     installGracefulShutdownHandlers(
       renderer,

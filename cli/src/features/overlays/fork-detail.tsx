@@ -111,9 +111,9 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
         flexShrink: 0,
       }}>
         <text style={{ flexGrow: 1 }}>
-          <span fg={theme.muted} attributes={TextAttributes.BOLD}>{capitalize(forkRole)}:</span>
+          <span fg={theme.text.metadata} attributes={TextAttributes.BOLD}>{capitalize(forkRole)}:</span>
           {' '}
-          <span fg={theme.primary} attributes={TextAttributes.BOLD}>{forkName}</span>
+          <span fg={theme.accent} attributes={TextAttributes.BOLD}>{forkName}</span>
         </text>
         <box style={{ flexDirection: 'row' }}>
           <Button
@@ -121,9 +121,9 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
             onMouseOver={() => setCloseHover(true)}
             onMouseOut={() => setCloseHover(false)}
           >
-            <text style={{ fg: closeHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
+            <text style={{ fg: closeHover ? theme.text.body : theme.text.metadata }} attributes={TextAttributes.UNDERLINE}>Close</text>
           </Button>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.metadata }}>
             <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>
           </text>
         </box>
@@ -131,7 +131,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
 
       {/* Divider */}
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>
+        <text style={{ fg: theme.border.standard }}>
           {'─'.repeat(80)}
         </text>
       </box>
@@ -158,11 +158,11 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
               flexGrow: 1,
               rootOptions: {
                 flexGrow: 1,
-                backgroundColor: 'transparent',
+                backgroundColor: theme.background.canvas,
               },
               wrapperOptions: {
                 border: false,
-                backgroundColor: 'transparent',
+                backgroundColor: theme.background.canvas,
               },
               contentOptions: {
                 paddingLeft: 1,
@@ -173,17 +173,17 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
           >
             {timelineStatus === 'pending' ? (
               <box style={{ paddingLeft: 1 }}>
-                <text style={{ fg: theme.muted }}>Loading activity...</text>
+                <text style={{ fg: theme.text.metadata }}>Loading activity...</text>
               </box>
             ) : timelineStatus === 'empty' || !timeline || timeline.presentation.entries.length === 0 ? (
               <box style={{ paddingLeft: 1 }}>
-                <text style={{ fg: theme.muted }}>No activity yet.</text>
+                <text style={{ fg: theme.text.metadata }}>No activity yet.</text>
               </box>
             ) : (
               <ChatTimeline
                 timeline={timeline}
                 chatColumnWidth={scrollboxWidth.width ?? 80}
-                themeErrorColor={theme.error}
+                themeErrorColor={theme.status.failure}
                 onFileClick={openFile}
                 onForkExpand={onForkExpand ?? (() => {})}
                 onErrorAction={onErrorAction ?? (() => {})}
@@ -210,17 +210,17 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
         <box style={{ flexDirection: 'row', alignItems: 'center' }}>
           {displayMode === 'transcript' && (
             <>
-              <text style={{ fg: theme.info }}>Transcript Mode</text>
-              <text style={{ fg: theme.muted }}>{' · '}</text>
+              <text style={{ fg: theme.status.information }}>Transcript Mode</text>
+              <text style={{ fg: theme.text.metadata }}>{' · '}</text>
             </>
           )}
           <text>
-            <span fg={theme.muted}>{modelSummary?.role ?? '—'}</span>
-            <span fg={theme.muted}> {'\u00b7'} </span>
-            <span fg={theme.foreground}>{modelSummary?.model ?? '—'}</span>
+            <span fg={theme.text.metadata}>{modelSummary?.role ?? '—'}</span>
+            <span fg={theme.text.metadata}> {'\u00b7'} </span>
+            <span fg={theme.text.body}>{modelSummary?.model ?? '—'}</span>
           </text>
           <box style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <text style={{ fg: theme.muted }}> | </text>
+            <text style={{ fg: theme.text.metadata }}> | </text>
             <ContextUsage
               tokenUsage={tokenUsage}
               hardCap={contextHardCap}

@@ -3,14 +3,10 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactElement } from 'react'
 import type { DisplayMessage, DisplayTimeline } from '@magnitudedev/sdk'
 
-mock.module('../../hooks/use-theme', () => ({
-  useTheme: () => ({
-    muted: '#888888',
-    primary: '#5e81ac',
-    foreground: '#ffffff',
-    border: '#4c566a',
-  }),
-}))
+mock.module('../../hooks/use-theme', async () => {
+  const { defaultCliThemes } = await import('../../utils/theme')
+  return { useTheme: () => defaultCliThemes.dark }
+})
 
 // useCollapsedBlocks was deleted — no mock needed
 

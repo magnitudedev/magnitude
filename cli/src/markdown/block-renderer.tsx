@@ -83,7 +83,7 @@ const SpanRenderer = memo(function SpanRenderer({
       const isHovered = hoveredZone === zoneIdx
       const baseAttrs = attrs ?? 0
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
+        <span key={i} fg={isHovered ? theme.link : theme.accent} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
           {span.text}
         </span>,
       )
@@ -104,7 +104,7 @@ const SpanRenderer = memo(function SpanRenderer({
       const isHovered = hoveredZone === zoneIdx
       const baseAttrs = attrs ?? 0
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
+        <span key={i} fg={isHovered ? theme.link : theme.accent} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
           {displayText}
         </span>,
       )
@@ -127,7 +127,7 @@ const SpanRenderer = memo(function SpanRenderer({
 
       const isHovered = hoveredZone === zoneIdx
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.UNDERLINE}>
+        <span key={i} fg={isHovered ? theme.link : theme.accent} attributes={TextAttributes.UNDERLINE}>
           {displayText}
         </span>,
       )
@@ -317,7 +317,7 @@ function CodeBlockView({
           </text>
         </box>
       </box>
-      <text style={{ fg: copied ? theme.success : foreground }}>
+      <text style={{ fg: copied ? theme.status.success : foreground }}>
         <span fg={palette.codeBorderColor}>└</span>
         {isHovered && (copied ? ' [Copied ✔]' : ' [Copy ⧉ ]')}
       </text>

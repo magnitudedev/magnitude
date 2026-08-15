@@ -312,10 +312,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     <box style={{ position: 'relative', flexDirection: 'column', height: '100%' }}>
       {/* Header */}
       <box style={{ flexDirection: 'row', paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.primary, flexGrow: 1 }}>
+        <text style={{ fg: theme.accent, flexGrow: 1 }}>
           <span attributes={TextAttributes.BOLD}>Settings</span>
         </text>
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.supporting }}>
           <span attributes={TextAttributes.DIM}>Esc to close</span>
         </text>
       </box>
@@ -326,9 +326,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }}
         style={{
           flexGrow: 1,
-          rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
-          wrapperOptions: { border: false, backgroundColor: 'transparent' },
-          viewportOptions: { backgroundColor: 'transparent' },
+          rootOptions: { flexGrow: 1, backgroundColor: theme.background.canvas },
+          wrapperOptions: { border: false, backgroundColor: theme.background.canvas },
+          viewportOptions: { backgroundColor: theme.background.canvas },
           contentOptions: { flexDirection: 'column' },
         }}
       >
@@ -337,12 +337,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       {/* Detected hardware */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
         <box style={{ flexDirection: 'row', paddingBottom: 1, width: '100%', maxWidth: SETTINGS_SECTION_WIDTH }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>DETECTED HARDWARE</text>
-          <text style={{ fg: theme.border }}>  {settingsSectionRule('DETECTED HARDWARE')}</text>
+          <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>DETECTED HARDWARE</text>
+          <text style={{ fg: theme.border.standard }}>  {settingsSectionRule('DETECTED HARDWARE')}</text>
         </box>
         {Option.match(hardware, {
           onNone: () => (
-            <text style={{ fg: Result.isFailure(hardwareResult) ? theme.warning : theme.muted }}>
+            <text style={{ fg: Result.isFailure(hardwareResult) ? theme.status.warning : theme.text.supporting }}>
               {Result.isFailure(hardwareResult) ? 'Hardware detection unavailable' : 'Detecting hardware…'}
             </text>
           ),
@@ -354,20 +354,20 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               width: '100%',
               maxWidth: SETTINGS_SECTION_WIDTH,
             }}>
-              <text style={{ fg: theme.foreground }}><span attributes={TextAttributes.BOLD}>{detected.system.name}</span></text>
-              <text style={{ fg: theme.muted }}>{detected.system.details[0]}</text>
+              <text style={{ fg: theme.text.body }}><span attributes={TextAttributes.BOLD}>{detected.system.name}</span></text>
+              <text style={{ fg: theme.text.supporting }}>{detected.system.details[0]}</text>
               {Option.getOrNull(Option.map(hardwareState, (profile) => {
                 const backends = [...new Set(profile.accelerators.map((accelerator) => accelerator.backend))]
                 const gpuCount = profile.memoryDomains.filter((domain) => domain.kind === 'PhysicalDevice').length
                 return backends.length > 0
-                  ? <text style={{ fg: theme.muted }}>{backends.join(' + ')} acceleration{gpuCount > 1 ? ` · ${gpuCount} GPUs` : ''}</text>
+                  ? <text style={{ fg: theme.text.supporting }}>{backends.join(' + ')} acceleration{gpuCount > 1 ? ` · ${gpuCount} GPUs` : ''}</text>
                   : null
               }))}
               {Option.getOrNull(Option.map(hardwareMemory, (memory) => memory.domains.map((domain) => (
                 <HardwareMemoryDomain key={domain.id} domain={domain} />
               ))))}
               {detected.accelerators.length === 0 && Option.exists(hardwareState, (profile) => !profile.memoryDomains.some((domain) => domain.kind === 'UnifiedMemory')) && (
-                <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
+                <text style={{ fg: theme.text.supporting }}>CPU inference · No GPU detected</text>
               )}
             </box>
           ),
@@ -376,12 +376,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
       {/* Divider */}
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
+        <text style={{ fg: theme.border.standard }}>{'─'.repeat(60)}</text>
       </box>
 
       {/* Magnitude Cloud section */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.foreground }}>
+        <text style={{ fg: theme.text.body }}>
           <span attributes={TextAttributes.BOLD}>Magnitude Cloud</span>
         </text>
       </box>
@@ -389,20 +389,20 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       {/* Status / inline controls */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexShrink: 0, flexDirection: 'column' }}>
         {auth.source === 'none' && (
-          <text style={{ fg: theme.muted }}>○ Not connected</text>
+          <text style={{ fg: theme.text.supporting }}>○ Not connected</text>
         )}
 
         {mode === 'view' && auth.source === 'env' && (
           <>
             <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{`● Connected via ${auth.envVarName} `}</text>
+              <text style={{ fg: theme.status.success }}>{`● Connected via ${auth.envVarName} `}</text>
               {auth.key && (
-                <text style={{ fg: theme.foreground }}>
+                <text style={{ fg: theme.text.body }}>
                   <span attributes={TextAttributes.DIM}>{`(${maskApiKey(auth.key)})`}</span>
                 </text>
               )}
             </box>
-            <text style={{ fg: theme.muted }}>
+            <text style={{ fg: theme.text.supporting }}>
               <span attributes={TextAttributes.DIM}>To change this key, update the env var and relaunch.</span>
             </text>
           </>
@@ -411,20 +411,20 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         {mode === 'view' && auth.source === 'config' && (
           <box style={{ flexDirection: 'column' }}>
             <box style={{ flexDirection: 'row' }}>
-              <text style={{ fg: theme.success }}>{'● Connected via API key '}</text>
+              <text style={{ fg: theme.status.success }}>{'● Connected via API key '}</text>
               {auth.maskedKey && (
-                <text style={{ fg: theme.foreground }}>
+                <text style={{ fg: theme.text.body }}>
                   <span attributes={TextAttributes.DIM}>{`(${auth.maskedKey})`}</span>
                 </text>
               )}
             </box>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <Button onClick={beginEdit} onMouseOver={() => setUpdateHovered(true)} onMouseOut={() => setUpdateHovered(false)}>
-                <text style={{ fg: updateHovered ? theme.foreground : theme.muted }}>{'[Update API key]'}</text>
+                <text style={{ fg: updateHovered ? theme.text.body : theme.text.supporting }}>{'[Update API key]'}</text>
               </Button>
               <text> </text>
               <Button onClick={beginDisconnect} onMouseOver={() => setDisconnectHovered(true)} onMouseOut={() => setDisconnectHovered(false)}>
-                <text style={{ fg: disconnectHovered ? theme.foreground : theme.muted }}>{'[Disconnect]'}</text>
+                <text style={{ fg: disconnectHovered ? theme.text.body : theme.text.supporting }}>{'[Disconnect]'}</text>
               </Button>
             </box>
           </box>
@@ -440,25 +440,25 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                 style={{
                   borderStyle: 'single',
                   customBorderChars: BOX_CHARS,
-                  borderColor: updateHovered ? theme.primary : theme.border,
+                  borderColor: updateHovered ? theme.accent : theme.border.standard,
                   paddingLeft: 1,
                   paddingRight: 1,
                   width: 15,
                 }}
               >
-                <text style={{ fg: updateHovered ? theme.primary : theme.foreground }}>Add API Key</text>
+                <text style={{ fg: updateHovered ? theme.accent : theme.text.body }}>Add API Key</text>
               </Button>
             </box>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
-              <text style={{ fg: theme.muted }}>Get an API key → </text>
-              <text style={{ fg: theme.primary }}>{MAGNITUDE_CLOUD_URL}</text>
+              <text style={{ fg: theme.text.supporting }}>Get an API key → </text>
+              <text style={{ fg: theme.accent }}>{MAGNITUDE_CLOUD_URL}</text>
               <text> </text>
               <Button
                 onClick={copyCloudLink}
                 onMouseOver={() => setCopyCloudLinkHovered(true)}
                 onMouseOut={() => setCopyCloudLinkHovered(false)}
               >
-                <text style={{ fg: cloudLinkCopied ? theme.success : copyCloudLinkHovered ? theme.foreground : theme.muted }}>
+                <text style={{ fg: cloudLinkCopied ? theme.status.success : copyCloudLinkHovered ? theme.text.body : theme.text.supporting }}>
                   {cloudLinkCopied ? '[Copied ✓]' : '[Copy link]'}
                 </text>
               </Button>
@@ -468,30 +468,30 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
         {mode === 'edit' && (
           <box style={{ flexDirection: 'column' }}>
-            <box style={{ borderStyle: 'single', borderColor: displayedAuthError ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
+            <box style={{ borderStyle: 'single', borderColor: displayedAuthError ? theme.status.failure : theme.accent, paddingLeft: 1, paddingRight: 1, flexShrink: 0, width: 80 }}>
               <SingleLineInput value={inputValue} onChange={(v) => { setInputValue(v); setError(null) }} placeholder="Paste Magnitude Cloud API key" focused={true} />
             </box>
             <box style={{ flexDirection: 'row' }}>
               <Button onClick={handleSave} onMouseOver={() => setSaveHovered(true)} onMouseOut={() => setSaveHovered(false)}>
-                <text style={{ fg: saveHovered ? theme.primary : theme.foreground }}>{auth.saving ? '[Saving...]' : '[Save (Enter)]'}</text>
+                <text style={{ fg: saveHovered ? theme.accent : theme.text.body }}>{auth.saving ? '[Saving...]' : '[Save (Enter)]'}</text>
               </Button>
               <text> </text>
               <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
-                <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel (Esc)]'}</text>
+                <text style={{ fg: cancelHovered ? theme.text.body : theme.text.supporting }}>{'[Cancel (Esc)]'}</text>
               </Button>
             </box>
-            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
+            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.status.failure }}>{displayedAuthError}</text></box>}
             {auth.source === 'none' && (
               <box style={{ flexDirection: 'row', paddingTop: 1 }}>
-                <text style={{ fg: theme.muted }}>Get an API key → </text>
-                <text style={{ fg: theme.primary }}>{MAGNITUDE_CLOUD_URL}</text>
+                <text style={{ fg: theme.text.supporting }}>Get an API key → </text>
+                <text style={{ fg: theme.accent }}>{MAGNITUDE_CLOUD_URL}</text>
                 <text> </text>
                 <Button
                   onClick={copyCloudLink}
                   onMouseOver={() => setCopyCloudLinkHovered(true)}
                   onMouseOut={() => setCopyCloudLinkHovered(false)}
                 >
-                  <text style={{ fg: cloudLinkCopied ? theme.success : copyCloudLinkHovered ? theme.foreground : theme.muted }}>
+                  <text style={{ fg: cloudLinkCopied ? theme.status.success : copyCloudLinkHovered ? theme.text.body : theme.text.supporting }}>
                     {cloudLinkCopied ? '[Copied ✓]' : '[Copy link]'}
                   </text>
                 </Button>
@@ -502,56 +502,56 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
         {mode === 'confirm-disconnect' && (
           <box style={{ flexDirection: 'column' }}>
-            <text style={{ fg: theme.foreground }}>Disconnect Magnitude Cloud? Cloud models will no longer be available.</text>
+            <text style={{ fg: theme.text.body }}>Disconnect Magnitude Cloud? Cloud models will no longer be available.</text>
             <box style={{ flexDirection: 'row', paddingTop: 1 }}>
               <Button onClick={handleConfirmDisconnect} onMouseOver={() => setConfirmHovered(true)} onMouseOut={() => setConfirmHovered(false)}>
-                <text style={{ fg: confirmHovered ? theme.error : theme.foreground }}>{auth.saving ? '[Disconnecting...]' : '[Yes, disconnect]'}</text>
+                <text style={{ fg: confirmHovered ? theme.status.failure : theme.text.body }}>{auth.saving ? '[Disconnecting...]' : '[Yes, disconnect]'}</text>
               </Button>
               <text> </text>
               <Button onClick={cancelInline} onMouseOver={() => setCancelHovered(true)} onMouseOut={() => setCancelHovered(false)}>
-                <text style={{ fg: cancelHovered ? theme.foreground : theme.muted }}>{'[Cancel]'}</text>
+                <text style={{ fg: cancelHovered ? theme.text.body : theme.text.supporting }}>{'[Cancel]'}</text>
               </Button>
             </box>
-            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.error }}>{displayedAuthError}</text></box>}
+            {displayedAuthError && <box style={{ paddingTop: 1 }}><text style={{ fg: theme.status.failure }}>{displayedAuthError}</text></box>}
           </box>
         )}
       </box>
 
       {/* Divider */}
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
+        <text style={{ fg: theme.border.standard }}>{'─'.repeat(60)}</text>
       </box>
 
       {/* Inference source setup */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
-        <text style={{ fg: theme.foreground }}>
+        <text style={{ fg: theme.text.body }}>
           <span attributes={TextAttributes.BOLD}>Inference sources</span>
         </text>
-        <text style={{ fg: theme.muted }}>Download or manage local models.</text>
+        <text style={{ fg: theme.text.supporting }}>Download or manage local models.</text>
         <box style={{ flexDirection: 'row', paddingTop: 1 }}>
           <Button
             onClick={onManageLocalModels}
             onMouseOver={() => setLocalSetupHovered(true)}
             onMouseOut={() => setLocalSetupHovered(false)}
           >
-            <text style={{ fg: localSetupHovered ? theme.primary : theme.muted }}>{`[${INFERENCE_SOURCE_ACTIONS.local.label} · ${INFERENCE_SOURCE_ACTIONS.local.key.toUpperCase()}]`}</text>
+            <text style={{ fg: localSetupHovered ? theme.accent : theme.text.supporting }}>{`[${INFERENCE_SOURCE_ACTIONS.local.label} · ${INFERENCE_SOURCE_ACTIONS.local.key.toUpperCase()}]`}</text>
           </Button>
         </box>
       </box>
 
       {/* Divider */}
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
+        <text style={{ fg: theme.border.standard }}>{'─'.repeat(60)}</text>
       </box>
 
       {/* Model Selection */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0, flexDirection: 'row' }}>
-        <text style={{ fg: theme.foreground, flexGrow: 1 }}>
+        <text style={{ fg: theme.text.body, flexGrow: 1 }}>
           <span attributes={TextAttributes.BOLD}>Model Selection</span>
         </text>
         {modelConfig && (
           <Button onClick={() => { void modelConfig.refreshModels() }} onMouseOver={() => setRefreshHovered(true)} onMouseOut={() => setRefreshHovered(false)}>
-            <text style={{ fg: refreshHovered ? theme.primary : theme.muted }}>{catalogRefreshing ? '[Refreshing...]' : '[Refresh models]'}</text>
+            <text style={{ fg: refreshHovered ? theme.accent : theme.text.supporting }}>{catalogRefreshing ? '[Refreshing...]' : '[Refresh models]'}</text>
           </Button>
         )}
       </box>
@@ -560,7 +560,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexDirection: 'column', flexShrink: 0 }}>
         {unavailableProviders.map((provider) => (
           <box key={provider.providerId} style={{ paddingBottom: 1 }}>
-            <text style={{ fg: provider.availability._tag === 'Failed' ? theme.error : theme.warning }}>
+            <text style={{ fg: provider.availability._tag === 'Failed' ? theme.status.failure : theme.status.warning }}>
               {provider.availability._tag === 'NotFound'
                 ? `${provider.displayName} not detected.${Option.match(provider.availability.hint, { onNone: () => '', onSome: (hint) => ` ${hint}` })}`
                 : provider.availability._tag === 'Loading'
@@ -573,7 +573,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         ))}
         {modelConfig && Result.isFailure(modelConfig.catalog) && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.error }}>
+            <text style={{ fg: theme.status.failure }}>
               {Option.isSome(catalogSnapshot)
                 ? 'Lost contact with the model catalog; showing the last received state.'
                 : 'Unable to read the model catalog from the daemon.'}
@@ -582,13 +582,13 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         )}
         {noModelsConfigured && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.foreground }}>Warning: No providers connected (local or cloud)</text>
+            <text style={{ fg: theme.text.body }}>Warning: No providers connected (local or cloud)</text>
           </box>
         )}
         {catalogFailureNotice && (
           <box style={{ paddingBottom: 1 }}>
             <text style={{
-              fg: catalogFailureNotice.tone === 'error' ? theme.error : theme.warning,
+              fg: catalogFailureNotice.tone === 'error' ? theme.status.failure : theme.status.warning,
             }}>
               {catalogFailureNotice.message}
             </text>
@@ -596,12 +596,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         )}
         {modelConfig && Result.isFailure(modelConfig.catalogRefresh) && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.error }}>Failed to request a model catalog refresh.</text>
+            <text style={{ fg: theme.status.failure }}>Failed to request a model catalog refresh.</text>
           </box>
         )}
         {modelConfig && Result.isFailure(modelConfig.slotUpdate) && (
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.error }}>Failed to update model configuration.</text>
+            <text style={{ fg: theme.status.failure }}>Failed to update model configuration.</text>
           </box>
         )}
         {([
@@ -628,7 +628,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
           return (
             <box key={slotId} style={{ flexDirection: 'column', paddingBottom: 1, position: 'relative', ...(isThisDropdownOpen ? { zIndex: 200 } : {}) }}>
-              <text style={{ fg: theme.primary }}>
+              <text style={{ fg: theme.accent }}>
                 <span attributes={TextAttributes.BOLD}>{label}</span>
               </text>
 
@@ -649,12 +649,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                         onMouseOut={() => setModelHovered(prev => ({ ...prev, [slotId]: false }))}
                         style={{
                           borderStyle: 'rounded',
-                          borderColor: isOpen || modelHovered[slotId] ? theme.primary : theme.border,
+                          borderColor: isOpen || modelHovered[slotId] ? theme.accent : theme.border.standard,
                           paddingLeft: 1, paddingRight: 1, width: w, flexDirection: 'row',
                         }}
                       >
-                        <text style={{ fg: isOpen || modelHovered[slotId] ? theme.primary : theme.foreground, flexGrow: 1 }}>{padded}</text>
-                        <text style={{ fg: isOpen || modelHovered[slotId] ? theme.primary : theme.muted }}>{arrow}</text>
+                        <text style={{ fg: isOpen || modelHovered[slotId] ? theme.accent : theme.text.body, flexGrow: 1 }}>{padded}</text>
+                        <text style={{ fg: isOpen || modelHovered[slotId] ? theme.accent : theme.text.supporting }}>{arrow}</text>
                       </Button>
                       {isOpen && (
                         <box style={{
@@ -664,12 +664,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                           zIndex: 200,
                           flexDirection: 'column',
                           borderStyle: 'rounded',
-                          borderColor: theme.primary,
+                          borderColor: theme.accent,
                           width: w,
-                          backgroundColor: theme.terminalDetectedBg,
+                          backgroundColor: theme.background.terminal,
                         }}>
                           {dropdownItems.length === 0 ? (
-                            <text style={{ fg: catalogFailureNotice?.tone === 'error' ? theme.error : theme.muted }}>
+                            <text style={{ fg: catalogFailureNotice?.tone === 'error' ? theme.status.failure : theme.text.supporting }}>
                               <span attributes={TextAttributes.DIM}>{catalogFailureNotice?.tone === 'error' ? 'Catalog unavailable' : 'No models configured'}</span>
                             </text>
                           ) : dropdownItems.map((item, index) => {
@@ -677,8 +677,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                             const itemDisabled = item.kind === 'model' && item.disabled
                             return (
                               <Button key={`${item.kind === 'model' ? item.providerId : 'reasoning'}:${item.id}`} onClick={() => { if (!itemDisabled) selectDropdownItem(index) }} onMouseOver={() => setDropdownIndex(index)}
-                                style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
-                                <text style={{ fg: itemDisabled ? theme.muted : sel ? theme.primary : theme.foreground, overflow: 'hidden' }}>
+                                style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.background.terminal }}>
+                                <text style={{ fg: itemDisabled ? theme.text.disabled : sel ? theme.accent : theme.text.body, overflow: 'hidden' }}>
                                   {sel ? '▸ ' : '  '}{item.label.length > maxLen - 2 ? item.label.slice(0, maxLen - 3) + '…' : item.label}
                                 </text>
                               </Button>
@@ -710,12 +710,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                         onMouseOut={() => setThinkingHovered(prev => ({ ...prev, [slotId]: false }))}
                         style={{
                           borderStyle: 'rounded',
-                          borderColor: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.primary : theme.border,
+                          borderColor: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.accent : theme.border.standard,
                           paddingLeft: 1, paddingRight: 1, width: w, flexDirection: 'row',
                         }}
                       >
-                        <text style={{ fg: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.primary : thinkingAvailable ? theme.foreground : theme.muted, flexGrow: 1 }}>{padded}</text>
-                        <text style={{ fg: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.primary : theme.muted }}>{arrow}</text>
+                        <text style={{ fg: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.accent : thinkingAvailable ? theme.text.body : theme.text.disabled, flexGrow: 1 }}>{padded}</text>
+                        <text style={{ fg: thinkingAvailable && (isOpen || thinkingHovered[slotId]) ? theme.accent : theme.text.supporting }}>{arrow}</text>
                       </Button>
                       {isOpen && (
                         <box style={{
@@ -725,16 +725,16 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                           zIndex: 200,
                           flexDirection: 'column',
                           borderStyle: 'rounded',
-                          borderColor: theme.primary,
+                          borderColor: theme.accent,
                           width: w,
-                          backgroundColor: theme.terminalDetectedBg,
+                          backgroundColor: theme.background.terminal,
                         }}>
                           {dropdownItems.map((item, index) => {
                             const sel = index === dropdownIndex
                             return (
                               <Button key={item.id} onClick={() => selectDropdownItem(index)} onMouseOver={() => setDropdownIndex(index)}
-                                style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.terminalDetectedBg }}>
-                                <text style={{ fg: sel ? theme.primary : theme.foreground }}>
+                                style={{ flexDirection: 'row', width: w - 2, backgroundColor: theme.background.terminal }}>
+                                <text style={{ fg: sel ? theme.accent : theme.text.body }}>
                                   {sel ? '▸ ' : '  '}{item.label}
                                 </text>
                               </Button>
@@ -748,12 +748,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               </box>
 
               {Option.isSome(selected) && (
-                <text style={{ fg: theme.muted }}>
+                <text style={{ fg: theme.text.supporting }}>
                   <span attributes={TextAttributes.DIM}>{visionPropertyLabel(selected.value.model)} · {reasoningPropertyLabel(selected.value.model)}</span>
                 </text>
               )}
 
-              <text style={{ fg: theme.muted }}>
+              <text style={{ fg: theme.text.supporting }}>
                 <span attributes={TextAttributes.DIM}>{description}</span>
               </text>
             </box>
@@ -767,7 +767,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               onMouseOver={() => setResetHovered(true)}
               onMouseOut={() => setResetHovered(false)}
             >
-              <text style={{ fg: resetHovered ? theme.foreground : theme.muted }}>
+              <text style={{ fg: resetHovered ? theme.text.body : theme.text.supporting }}>
                 {'[Reset to defaults]'}
               </text>
             </Button>

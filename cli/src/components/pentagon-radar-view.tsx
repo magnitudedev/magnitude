@@ -49,12 +49,12 @@ export const PentagonRadarView = memo(function PentagonRadarView({
             <span
               key={runIndex}
               fg={run.tone === "profile"
-                ? theme.primary
+                ? theme.accent
                 : run.tone === "label"
-                  ? theme.foreground
+                  ? theme.text.body
                   : run.tone === "detail"
-                    ? theme.muted
-                    : theme.border}
+                    ? theme.text.supporting
+                    : theme.border.standard}
             >
               {run.text}
             </span>

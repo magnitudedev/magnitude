@@ -59,7 +59,6 @@ import {
   useSessionStartup,
   type SessionStart,
 } from "./hooks/use-session-startup";
-import { useTerminalBgDetection } from "./hooks/use-terminal-bg-detection";
 import { useTerminalKeyboard } from "./hooks/use-terminal-keyboard";
 import { useTheme } from "./hooks/use-theme";
 import { useLocalWidth } from "./hooks/use-local-width";
@@ -159,8 +158,6 @@ function CliEnvironmentGate({
 }): ReactNode {
   const connectionError = useDisplayConnectionError();
   const controller = useDisplayViewController();
-  useTerminalBgDetection();
-
   const exitApp = useCallback(() => {
     process.kill(process.pid, "SIGINT");
   }, []);
@@ -582,8 +579,8 @@ function CliAppContent(
 
           {clipboardToast && (
             <Toast
-              color={theme.success}
-              background={theme.surface}
+              color={theme.status.success}
+              background={theme.background.surface}
               text="Copied to clipboard"
             />
           )}

@@ -44,7 +44,6 @@ import {
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
 import { localModelRadarAxes } from "../local-inference/model-radar"
-import { slate } from "../../utils/theme"
 import { discoveredModelLocation } from "./discovered-model"
 import {
   OnboardingModelStatusSection,
@@ -135,17 +134,17 @@ const ModelRow = ({
       style={{ width: "100%", flexDirection: "row" }}
     >
       <text
-        style={{ fg: selected ? theme.primary : enabled ? theme.foreground : theme.muted }}
+        style={{ fg: selected ? theme.accent : enabled ? theme.text.body : theme.text.disabled }}
         attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
         wrapMode="none"
       >
         {selected ? "› " : "  "}{truncateToDisplayWidth(onboardingModelRowName(selection), nameWidth).padEnd(nameWidth)}
         {"  "}
         <span fg={selection.kind === "running"
-          ? theme.success
+          ? theme.status.success
           : selection.recommendations.length > 0 || selected
-            ? theme.primary
-            : theme.muted}>
+            ? theme.accent
+            : theme.text.supporting}>
           {action}
         </span>
       </text>
@@ -225,17 +224,17 @@ const OnboardingHardwareContext = ({
   const theme = useTheme()
   if (Result.isSuccess(hardware)) return describeLocalHardwareSummary(hardware.value).map((row) => (
     <text key={`${row.name}:${row.details.join(":")}`} style={{ width }} wrapMode="word">
-      <span fg={slate[300]}>{row.name}</span>
-      <span fg={slate[400]}>{` · ${row.details.join(" · ")}`}</span>
+      <span fg={theme.text.detail}>{row.name}</span>
+      <span fg={theme.text.supporting}>{` · ${row.details.join(" · ")}`}</span>
     </text>
   ))
   if (Result.isFailure(hardware)) {
-    return <text style={{ fg: theme.error, width }}>! Hardware detection failed</text>
+    return <text style={{ fg: theme.status.failure, width }}>! Hardware detection failed</text>
   }
   return (
     <text style={{ width }}>
-      <span fg={theme.primary}>{spinnerFrame} </span>
-      <span fg={slate[300]}>Detecting hardware…</span>
+      <span fg={theme.accent}>{spinnerFrame} </span>
+      <span fg={theme.text.detail}>Detecting hardware…</span>
     </text>
   )
 }
@@ -259,13 +258,13 @@ const OnboardingSetupCard = ({
       <box style={{
         width: cardWidth,
         borderStyle: "single",
-        borderColor: theme.border,
+        borderColor: theme.border.standard,
         customBorderChars: BOX_CHARS,
         paddingLeft: 2,
         paddingRight: 2,
         flexDirection: "column",
       }}>
-        <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{title}</text>
+        <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{title}</text>
         <OnboardingHardwareContext
           hardware={hardware}
           width={Math.max(1, cardWidth - 6)}
@@ -500,7 +499,7 @@ export function OnboardingModelChooser({
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
       {downloads.length > 0 && (
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>
+        <text style={{ fg: theme.text.supporting }} attributes={TextAttributes.BOLD}>
           AVAILABLE TO DOWNLOAD
         </text>
       )}
@@ -521,7 +520,7 @@ export function OnboardingModelChooser({
         </ModelSectionViewport>
       )}
       {local.length > 0 && (
-        <text style={{ fg: theme.muted, marginTop: downloads.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
+        <text style={{ fg: theme.text.supporting, marginTop: downloads.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
           ON THIS COMPUTER
         </text>
       )}
@@ -598,11 +597,11 @@ export function OnboardingModelChooser({
   const regularDetails = selected ? (
     <>
       <DetailRow width={detailWidth}>
-        <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
+        <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
           {truncateToDisplayWidth(onboardingModelRowName(selected), titleNameWidth)}
         </text>
         {titleMetadata && (
-          <text style={{ fg: theme.muted }} wrapMode="none">
+          <text style={{ fg: theme.text.supporting }} wrapMode="none">
             {titleMetadata}
           </text>
         )}
@@ -617,15 +616,15 @@ export function OnboardingModelChooser({
         overflow: "hidden",
       }}>
         {discovered === null ? (
-          <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
+          <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
             {description}
           </text>
         ) : (
           <>
-            <text style={{ fg: theme.muted, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
+            <text style={{ fg: theme.text.supporting, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
               DISCOVERED MODEL
             </text>
-            <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
+            <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
               {truncateToDisplayWidth(discovered.location, detailWidth)}
             </text>
           </>
@@ -651,7 +650,7 @@ export function OnboardingModelChooser({
           flexShrink: 0,
           overflow: "hidden",
         }}>
-            <text style={{ fg: theme.muted, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
+            <text style={{ fg: theme.text.supporting, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
               WHY THIS MODEL
             </text>
             <box style={{
@@ -662,17 +661,17 @@ export function OnboardingModelChooser({
               flexShrink: 0,
               overflow: "hidden",
             }}>
-              <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
+              <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
                 {recommendationExplanation}
               </text>
             </box>
             {memoryWarning && (
-              <text style={{ fg: theme.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
+              <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
             )}
         </box>
       )}
       {!showRecommendationExplanation && memoryWarning && (
-        <text style={{ fg: theme.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
+        <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
       )}
       <box style={{ flexGrow: 1, minHeight: STATUS_GAP_ROWS }} />
       <OnboardingModelStatusSection
@@ -683,7 +682,7 @@ export function OnboardingModelChooser({
       />
     </>
   ) : (
-    <text style={{ fg: theme.muted }}>{emptySelectionMessage}</text>
+    <text style={{ fg: theme.text.supporting }}>{emptySelectionMessage}</text>
   )
   const detailsContent = operation?._tag === "Activating" ? (
     <OnboardingModelLoadingDetails
@@ -708,7 +707,7 @@ export function OnboardingModelChooser({
       paddingLeft: wide ? 2 : 0,
       borderStyle: "single",
       border: wide ? ["left"] : ["top"],
-      borderColor: theme.border,
+      borderColor: theme.border.standard,
       customBorderChars: BOX_CHARS,
     }}>
       {detailsContent}
@@ -756,10 +755,10 @@ export function OnboardingModelChooser({
         {list}
         {details}
       </box>
-      {error && <text style={{ fg: theme.error, marginTop: 1 }} wrapMode="none">{error}</text>}
+      {error && <text style={{ fg: theme.status.failure, marginTop: 1 }} wrapMode="none">{error}</text>}
       <box style={{ height: 1 }} />
-      <text style={{ fg: slate[200] }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
-      <text style={{ fg: theme.muted }} wrapMode="none">{interactionHint}</text>
+      <text style={{ fg: theme.text.guidance }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
+      <text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>
     </OnboardingSetupCard>
   )
 }
@@ -799,16 +798,16 @@ export function OnboardingModelPreparation({
       spinnerFrame={spinner}
     >
       {lines.map((line) => (
-        <text key={line.id} style={{ fg: line.state === "pending" ? theme.muted : theme.foreground }}>
-          <span fg={line.state === "completed" ? theme.success : line.state === "failed" ? theme.error : line.state === "running" ? theme.primary : theme.muted}>
+        <text key={line.id} style={{ fg: line.state === "pending" ? theme.text.supporting : theme.text.body }}>
+          <span fg={line.state === "completed" ? theme.status.success : line.state === "failed" ? theme.status.failure : line.state === "running" ? theme.accent : theme.text.supporting}>
             {line.state === "completed" ? "✓ " : line.state === "failed" ? "! " : line.state === "running" ? `${spinner} ` : "○ "}
           </span>
-          {line.label}<span fg={line.state === "failed" ? theme.error : theme.muted}>{line.metadata}</span>
+          {line.label}<span fg={line.state === "failed" ? theme.status.failure : theme.text.supporting}>{line.metadata}</span>
         </text>
       ))}
-      {error && <text style={{ fg: theme.error }}>{error}</text>}
+      {error && <text style={{ fg: theme.status.failure }}>{error}</text>}
       <box style={{ height: 1 }} />
-      <text style={{ fg: theme.muted }}>Esc skip for now</text>
+      <text style={{ fg: theme.text.supporting }}>Esc skip for now</text>
     </OnboardingSetupCard>
   )
 }
@@ -844,7 +843,7 @@ function OnboardingModelLoadingDetails({
       overflow: "hidden",
     }}>
       <DetailRow width={width}>
-        <text style={{ fg: theme.foreground, width }} attributes={TextAttributes.BOLD} wrapMode="none">
+        <text style={{ fg: theme.text.body, width }} attributes={TextAttributes.BOLD} wrapMode="none">
           {truncateToDisplayWidth(
             failed
               ? `Couldn’t load ${displayName}`
@@ -862,45 +861,45 @@ function OnboardingModelLoadingDetails({
         <>
           {"_tag" in failed && failed._tag === "LowMemory" ? (
             <box style={{ width, flexShrink: 0, flexDirection: "column" }}>
-              <text style={{ fg: theme.warning, width }} attributes={TextAttributes.BOLD}>
+              <text style={{ fg: theme.status.warning, width }} attributes={TextAttributes.BOLD}>
                 ! Not enough memory available
               </text>
               <box style={{ height: 1 }} />
-              <text style={{ fg: theme.foreground, width }} wrapMode="word">
+              <text style={{ fg: theme.text.body, width }} wrapMode="word">
                 {`Free at least ${minimumBytesLabel(failed.minimumAdditionalAvailableBytes)} and try again.`}
               </text>
-              <text style={{ fg: theme.muted, width }} wrapMode="word">
+              <text style={{ fg: theme.text.supporting, width }} wrapMode="word">
                 Close memory-intensive applications or choose a smaller model.
               </text>
               <box style={{ height: 1 }} />
-              <text style={{ fg: theme.muted, width }}>
+              <text style={{ fg: theme.text.supporting, width }}>
                 {`Needed at attempt    ${formatBytes(failed.loadBoundaryBytes)}`}
               </text>
-              <text style={{ fg: theme.muted, width }}>
+              <text style={{ fg: theme.text.supporting, width }}>
                 {`Available at attempt ${formatBytes(failed.allocationHeadroomBytes)}`}
               </text>
               <box style={{ height: 1 }} />
             </box>
           ) : (
             <box style={{ width, height: 5, flexShrink: 0, flexDirection: "column", overflow: "hidden" }}>
-              <text style={{ fg: theme.error, width }} wrapMode="word">{failed.message}</text>
+              <text style={{ fg: theme.status.failure, width }} wrapMode="word">{failed.message}</text>
             </box>
           )}
           <box style={{ flexDirection: "row", gap: 2 }}>
             <Button onClick={onRetry} onMouseOver={() => setHovered("retry")} onMouseOut={() => setHovered(null)}>
-              <text style={{ fg: hovered === "retry" ? theme.primary : theme.foreground }}>Retry loading</text>
+              <text style={{ fg: hovered === "retry" ? theme.accent : theme.text.body }}>Retry loading</text>
             </Button>
             <Button onClick={onChooseAnother} onMouseOver={() => setHovered("choose")} onMouseOut={() => setHovered(null)}>
-              <text style={{ fg: hovered === "choose" ? theme.primary : theme.foreground }}>Choose another model</text>
+              <text style={{ fg: hovered === "choose" ? theme.accent : theme.text.body }}>Choose another model</text>
             </Button>
           </box>
         </>
       ) : (
         <box style={{ width, flexDirection: "row" }}>
-          <text style={{ fg: theme.primary, width: 2, flexShrink: 0 }} wrapMode="none">
+          <text style={{ fg: theme.accent, width: 2, flexShrink: 0 }} wrapMode="none">
             {spinner}
           </text>
-          <text style={{ fg: theme.muted, width: Math.max(1, width - 2) }} wrapMode="none">
+          <text style={{ fg: theme.text.supporting, width: Math.max(1, width - 2) }} wrapMode="none">
             {phase === "Loading"
               ? "Loading model weights…"
               : phase === "Stopping"
