@@ -132,8 +132,8 @@ export function OnboardingModelStatusSection({
     >
       <text style={{
         fg: value === "yes"
-          ? choice === value || hovered === value ? theme.error : theme.foreground
-          : choice === value || hovered === value ? theme.primary : theme.foreground,
+          ? choice === value || hovered === value ? theme.status.failure : theme.text.body
+          : choice === value || hovered === value ? theme.accent : theme.text.body,
       }} attributes={choice === value ? TextAttributes.BOLD : TextAttributes.NONE}>
         {choice === value ? "› " : "  "}{label}
       </text>
@@ -150,20 +150,20 @@ export function OnboardingModelStatusSection({
       flexShrink: 0,
       overflow: "hidden",
     }}>
-      <text style={{ fg: theme.muted, width }} attributes={TextAttributes.BOLD} wrapMode="none">
+      <text style={{ fg: theme.text.supporting, width }} attributes={TextAttributes.BOLD} wrapMode="none">
         STATUS
       </text>
-      <text style={{ fg: active ? theme.foreground : theme.muted, width }} wrapMode="none">
+      <text style={{ fg: active ? theme.text.body : theme.text.supporting, width }} wrapMode="none">
         {status}
       </text>
       {active && (
         <text style={{ width }} wrapMode="none">
-          <span style={{ fg: theme.primary }}>{progressBar(fraction, barWidth)}</span>
-          <span style={{ fg: theme.muted }}>{`  ${percentageLabel}`}</span>
+          <span style={{ fg: theme.accent }}>{progressBar(fraction, barWidth)}</span>
+          <span style={{ fg: theme.text.supporting }}>{`  ${percentageLabel}`}</span>
         </text>
       )}
       {active && (
-        <text style={{ fg: theme.muted, width }} wrapMode="none">
+        <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
           {transferDetail ?? ""}
         </text>
       )}
@@ -179,7 +179,7 @@ export function OnboardingModelStatusSection({
         }}>
           {confirming ? (
             <>
-              <text style={{ fg: theme.foreground, flexShrink: 0 }} wrapMode="none">
+              <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
                 Are you sure you want to cancel?
               </text>
               <box style={{ width: 2, flexShrink: 0 }} />
@@ -190,7 +190,7 @@ export function OnboardingModelStatusSection({
           ) : (
             <>
               {operation?.cancelError && (
-                <text style={{ fg: theme.error, flexGrow: 1, minWidth: 0 }} wrapMode="none">
+                <text style={{ fg: theme.status.failure, flexGrow: 1, minWidth: 0 }} wrapMode="none">
                   {operation.cancelError}
                 </text>
               )}
@@ -203,7 +203,7 @@ export function OnboardingModelStatusSection({
                   onMouseOver={() => setHovered("cancel")}
                   onMouseOut={() => setHovered((current) => current === "cancel" ? null : current)}
                 >
-                  <text style={{ fg: hovered === "cancel" ? theme.error : theme.muted }}>
+                  <text style={{ fg: hovered === "cancel" ? theme.status.failure : theme.text.supporting }}>
                     Cancel (Esc)
                   </text>
                 </Button>

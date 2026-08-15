@@ -28,18 +28,18 @@ export function StartupHeader({
 
   const details = (
     <box style={{ flexDirection: 'column', minWidth: 0, flexShrink: 1 }}>
-      <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Magnitude</text>
-      <text style={{ fg: theme.muted }}>Your actually local agent</text>
+      <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>Magnitude</text>
+      <text style={{ fg: theme.text.metadata }}>Your actually local agent</text>
       <box style={{ height: 1, flexShrink: 0 }} />
       <text wrapMode="none">
-        <span style={{ fg: theme.muted }}>Current directory: </span>
-        <span style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>{displayedDirectory}</span>
+        <span style={{ fg: theme.text.metadata }}>Current directory: </span>
+        <span style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD}>{displayedDirectory}</span>
       </text>
       <text wrapMode="none">
-        <span style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Tip: </span>
-        <span style={{ fg: theme.muted }}>Use </span>
-        <span style={{ fg: theme.foreground }}>/settings</span>
-        <span style={{ fg: theme.muted }}> to manage models.</span>
+        <span style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>Tip: </span>
+        <span style={{ fg: theme.text.metadata }}>Use </span>
+        <span style={{ fg: theme.text.body }}>/settings</span>
+        <span style={{ fg: theme.text.metadata }}> to manage models.</span>
       </text>
     </box>
   )

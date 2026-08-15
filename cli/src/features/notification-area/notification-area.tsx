@@ -6,7 +6,7 @@ import type {
   NotificationAction,
   NotificationState,
 } from "@magnitudedev/client-common"
-import type { ChatTheme } from "../../types/theme-system"
+import type { CliTheme } from "../../types/theme-system"
 import { Button } from "../../components/button"
 
 export const notificationAreaLabel = (
@@ -34,13 +34,13 @@ export const notificationAreaWidth = (
 
 const notificationColor = (
   notificationState: NotificationState,
-  theme: ChatTheme,
+  theme: CliTheme,
 ): string => {
   switch (notificationState.priority) {
-    case "activity": return theme.primary
-    case "notice": return theme.foreground
-    case "warning": return theme.warning
-    case "error": return theme.error
+    case "activity": return theme.accent
+    case "notice": return theme.text.body
+    case "warning": return theme.status.warning
+    case "error": return theme.status.failure
   }
 }
 
@@ -51,7 +51,7 @@ export function NotificationArea({
   compact = false,
 }: {
   readonly notificationState: NotificationState
-  readonly theme: ChatTheme
+  readonly theme: CliTheme
   readonly onAction: (action: NotificationAction) => void
   readonly compact?: boolean
 }): ReactNode {

@@ -157,7 +157,7 @@ export function ChatTimelineContainer({
         // toggling never shifts the content.
         <box style={{ height: 2, alignItems: 'center' }}>
           {isLoadingMore && (
-            <text style={{ fg: theme.muted }}>
+            <text style={{ fg: theme.text.supporting }}>
               <span attributes={TextAttributes.DIM}>Loading earlier messages…</span>
             </text>
           )}
@@ -170,7 +170,7 @@ export function ChatTimelineContainer({
         <ChatTimeline
           timeline={rootTimeline}
           chatColumnWidth={chatColumnWidth}
-          themeErrorColor={theme.error}
+          themeErrorColor={theme.status.failure}
           systemMessages={systemMessages}
           onFileClick={openFile}
           onForkExpand={pushFork}

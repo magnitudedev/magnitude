@@ -9,11 +9,11 @@ export function AnimatedLogo() {
   return (
     <box style={{ flexDirection: 'column' }}>
       {LOGO_LINES.map((line, i) => (
-        <text key={i} style={{ fg: theme.primary }}>{line}</text>
+        <text key={i} style={{ fg: theme.accent }}>{line}</text>
       ))}
       <text>{' '}</text>
-      <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Magnitude</text>
-      <text style={{ fg: theme.muted }}>Your actually local agent</text>
+      <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>Magnitude</text>
+      <text style={{ fg: theme.text.supporting }}>Your actually local agent</text>
     </box>
   )
 }

@@ -3,6 +3,7 @@ import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { expect, test, vi } from "vitest"
+import { defaultCliThemes } from "../../utils/theme"
 
 const keyboard = vi.hoisted(
   (): { handler: ((key: KeyEvent) => void) | undefined } => ({
@@ -18,13 +19,7 @@ vi.mock("@opentui/react", async (importOriginal) => ({
 }))
 
 vi.mock("../../hooks/use-theme", () => ({
-  useTheme: () => ({
-    primary: "blue",
-    foreground: "white",
-    muted: "gray",
-    error: "red",
-    background: "black",
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { AcnBootstrapScreen } = await import("./acn-bootstrap")

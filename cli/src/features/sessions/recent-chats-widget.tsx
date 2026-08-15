@@ -29,7 +29,7 @@ export const RecentChatsWidget = memo(function RecentChatsWidget({
   if (chats.length === 0 && loading) {
     return (
       <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.metadata }}>
           <span attributes={TextAttributes.DIM}>Loading recent chats...</span>
         </text>
       </box>
@@ -41,13 +41,13 @@ export const RecentChatsWidget = memo(function RecentChatsWidget({
   return (
     <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
       <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.metadata }}>
           <span attributes={TextAttributes.DIM}>Recent conversations · </span>
         </text>
         <Button onClick={onOpenAll}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>See all</text>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.UNDERLINE}>See all</text>
         </Button>
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.metadata }}>
           <span attributes={TextAttributes.DIM}>{' '}(Ctrl+R)</span>
         </text>
       </box>

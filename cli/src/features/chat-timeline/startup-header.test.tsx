@@ -8,9 +8,10 @@ import {
   COMPACT_MAGNITUDE_LOGO_WIDTH,
 } from '../../components/compact-magnitude-logo'
 import { StartupHeader } from './startup-header'
+import { defaultCliThemes } from '../../utils/theme'
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({ primary: 'cyan', foreground: 'white', muted: 'gray' }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 describe('startup header', () => {

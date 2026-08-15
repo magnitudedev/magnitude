@@ -9,7 +9,6 @@ import { AgentCommunicationCard } from './messages/agent-communication-card'
 import { ErrorMessage } from './messages/error-message'
 import { BashOutput } from './messages/bash-output'
 import { useTheme } from '../../hooks/use-theme'
-import { green, red, slate, violet } from '../../utils/theme'
 import { TextAttributes } from '@opentui/core'
 
 interface MessageViewProps {
@@ -28,10 +27,10 @@ const WorkerResumedRow = ({ message }: { message: Extract<DisplayMessage, { type
   return (
     <box style={{ marginBottom: 1 }}>
       <text>
-        <span style={{ fg: violet[300] }}>▶ </span>
-        <span style={{ fg: theme.muted }}>Worker </span>
-        <span style={{ fg: theme.foreground }}>{message.workerRole ? `${message.workerRole.charAt(0).toUpperCase()}${message.workerRole.slice(1)}` : message.workerId}</span>
-        <span style={{ fg: theme.muted }}> resumed</span>
+        <span style={{ fg: theme.planAccent }}>▶ </span>
+        <span style={{ fg: theme.text.supporting }}>Worker </span>
+        <span style={{ fg: theme.text.body }}>{message.workerRole ? `${message.workerRole.charAt(0).toUpperCase()}${message.workerRole.slice(1)}` : message.workerId}</span>
+        <span style={{ fg: theme.text.supporting }}> resumed</span>
       </text>
     </box>
   )
@@ -42,7 +41,7 @@ const StatusIndicatorRow = ({ message }: { message: Extract<DisplayMessage, { ty
   return (
     <box style={{ marginBottom: 1 }}>
       <text attributes={TextAttributes.DIM}>
-        <span style={{ fg: theme.muted }}>{message.message}</span>
+        <span style={{ fg: theme.text.supporting }}>{message.message}</span>
       </text>
     </box>
   )
@@ -71,8 +70,8 @@ const WorkSummaryRow = ({ message }: { message: Extract<DisplayMessage, { type: 
   })
   return (
     <box style={{ height: 1, flexShrink: 0, marginBottom: 1 }}>
-      <text style={{ fg: theme.muted }}>
-        <span style={{ fg: slate[600] }}>{'●'}</span>
+      <text style={{ fg: theme.text.supporting }}>
+        <span style={{ fg: theme.status.inactive }}>{'●'}</span>
         {' '}
         {label}
       </text>
@@ -90,8 +89,8 @@ const GoalStatusRow = ({ message }: { message: Extract<DisplayMessage, { type: '
   return (
     <box style={{ marginBottom: 1 }}>
       <text>
-        <span style={{ fg: green[300] }}>{label}</span>
-        {detail ? <span style={{ fg: theme.muted }}> · {detail}</span> : null}
+        <span style={{ fg: theme.status.achievement }}>{label}</span>
+        {detail ? <span style={{ fg: theme.text.supporting }}> · {detail}</span> : null}
       </text>
     </box>
   )
@@ -140,7 +139,7 @@ export const MessageView = memo(function MessageView({
         return (
           <box style={{ marginBottom: 1 }}>
             <text attributes={TextAttributes.ITALIC}>
-              <span style={{ fg: theme.muted }}>{message.content}</span>
+              <span style={{ fg: theme.text.supporting }}>{message.content}</span>
             </text>
           </box>
         )
@@ -181,7 +180,7 @@ export const MessageView = memo(function MessageView({
         const noBottomGap = nextMessageInterrupted
         return (
           <box style={{ marginBottom: noBottomGap ? 0 : 1 }}>
-            <text style={{ fg: red[400] }}>{interruptText}</text>
+            <text style={{ fg: theme.status.interrupted }}>{interruptText}</text>
           </box>
         )
       }

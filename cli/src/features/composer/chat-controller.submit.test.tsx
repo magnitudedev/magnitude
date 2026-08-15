@@ -3,7 +3,7 @@ import React, { type ReactNode } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { slashCommandUnhandled, type InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
-import { chatThemes } from '../../utils/theme'
+import { defaultCliThemes } from '../../utils/theme'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 
 let latestMultilineProps: {
@@ -83,7 +83,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       tokenUsage: null,
       contextHardCap: null,
       isCompacting: false,
-      theme: chatThemes.dark,
+      theme: defaultCliThemes.dark,
       modeColor: '#00aaff',
       chatColumnWidth: 100,
       attachmentsMaxWidth: 80,

@@ -509,10 +509,10 @@ export const ModelMenusContainer = memo(function ModelMenusContainer({
         width: "100%",
         flexShrink: 0,
         flexDirection: "column",
-        backgroundColor: "transparent",
+        backgroundColor: theme.background.canvas,
       }}
     >
-      <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", backgroundColor: theme.menuBg }}>
+      <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", backgroundColor: theme.background.menu }}>
         {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "catalog" && <CatalogMenu initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "hardware" && <HardwareMenu />}
@@ -525,7 +525,7 @@ export const ModelMenusContainer = memo(function ModelMenusContainer({
           flexShrink: 0,
           borderStyle: "single",
           border: ["bottom"],
-          borderColor: theme.menuBg,
+          borderColor: theme.background.menu,
           customBorderChars: {
             topLeft: "",
             bottomLeft: "",
@@ -546,7 +546,7 @@ export const ModelMenusContainer = memo(function ModelMenusContainer({
           flexShrink: 0,
           flexDirection: "row",
           alignItems: "center",
-          backgroundColor: "transparent",
+          backgroundColor: theme.background.canvas,
           paddingLeft: 1,
           paddingRight: 1,
           height: 1,
@@ -564,8 +564,8 @@ export const ModelMenusContainer = memo(function ModelMenusContainer({
             >
               <text
                 style={{
-                  fg: active ? theme.menuBg : theme.foreground,
-                  ...(active ? { bg: theme.foreground } : {}),
+                  fg: active ? theme.background.menu : theme.text.body,
+                  ...(active ? { bg: theme.text.body } : {}),
                 }}
                 attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}
               >
@@ -588,7 +588,7 @@ export const ModelMenusContainer = memo(function ModelMenusContainer({
           />
         )}
         <box style={{ flexGrow: 1 }} />
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.metadata }}>
           {atRootLevel ? "←/→ switch menus" : "←/→ switch menus · Esc back"}
         </text>
       </box>
@@ -619,7 +619,7 @@ const MenuHeader = memo(function MenuHeader({
   const [sectionHovered, setSectionHovered] = useState(false)
   const sectionTitle = (
     <text
-      style={{ fg: theme.foreground }}
+      style={{ fg: theme.text.body }}
       attributes={TextAttributes.BOLD | (sectionHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE)}
     >
       {title.toUpperCase()}
@@ -641,17 +641,17 @@ const MenuHeader = memo(function MenuHeader({
             {sectionTitle}
           </Button>
         ) : sectionTitle}
-        {!compact && subtitle && <text style={{ fg: theme.muted }}> · {subtitle}</text>}
-        {!compact && selection && <text style={{ fg: theme.foreground }}> → {selection}</text>}
+        {!compact && subtitle && <text style={{ fg: theme.text.metadata }}> · {subtitle}</text>}
+        {!compact && selection && <text style={{ fg: theme.text.body }}> → {selection}</text>}
         <box style={{ flexGrow: 1 }} />
-        {summary && <text style={{ fg: theme.muted }}>{summary}</text>}
+        {summary && <text style={{ fg: theme.text.metadata }}>{summary}</text>}
       </box>
       {compact && selection && (
-        <text style={{ fg: theme.foreground }} wrapMode="none">
+        <text style={{ fg: theme.text.body }} wrapMode="none">
           {truncateToDisplayWidth(selection, compactSelectionWidth)}
         </text>
       )}
-      {displayedHints && <text style={{ fg: theme.muted }} wrapMode="none">{displayedHints}</text>}
+      {displayedHints && <text style={{ fg: theme.text.metadata }} wrapMode="none">{displayedHints}</text>}
     </box>
   )
 })
@@ -675,16 +675,16 @@ const MenuAction = memo(function MenuAction({
 }) {
   const theme = useTheme()
   const color = focused
-    ? theme.primary
+    ? theme.accent
     : tone === "primary"
-      ? theme.primary
+      ? theme.accent
       : tone === "link"
         ? theme.link
         : tone === "warning"
-          ? theme.warning
+          ? theme.status.warning
           : tone === "error"
-            ? theme.error
-            : theme.foreground
+            ? theme.status.failure
+            : theme.text.body
   return (
     <Button onClick={onClick} onMouseOver={onMouseOver} onMouseOut={onMouseOut}>
       <text style={{ fg: color }}>{focused ? "› " : "  "}{label}</text>
@@ -712,7 +712,7 @@ const ModelsMenu = memo(function ModelsMenu(props: ModelsMenuProps) {
   const ordering = modelsMenuOrderingAtOpen(catalogReady, slotsReady, slots, selected)
 
   return Option.match(ordering, {
-    onNone: () => <text style={{ fg: theme.muted }}>Loading models…</text>,
+    onNone: () => <text style={{ fg: theme.status.progress }}>Loading models…</text>,
     onSome: (initialOrdering) => (
       <ReadyModelsMenu {...props} config={config} initialOrdering={initialOrdering} />
     ),
@@ -1057,22 +1057,22 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
             : !detailHasProviderIdentity ? "Esc back" : "F favorite · Esc back"}
         />
         <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
+          <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>
             {detailFavorite ? "★ " : ""}{modelsMenuDisplayName(detail)}
           </text>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.metadata }}>
             {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {modelsMenuContextLabel(detail)} context · {statusFor(detail)}
           </text>
           {detailLocalModel && (
             <>
               {detailLocalModel.catalogMembershipState._tag === "InCatalog" && detailLocalModel.catalogMembershipState.catalogData.quantizationAware && (
-                <text style={{ fg: theme.muted }}>Training: Quantization-aware</text>
+                <text style={{ fg: theme.text.metadata }}>Training: Quantization-aware</text>
               )}
             </>
           )}
           {detailIsLocal && Option.exists(detailMemory, ({ currentHeadroomState, systemUseState }) =>
             currentHeadroomState._tag === "Insufficient" || systemUseState._tag === "High") && (
-            <text style={{ fg: theme.warning }}>
+            <text style={{ fg: theme.status.warning }}>
               {Option.exists(detailMemory, ({ currentHeadroomState }) =>
                 currentHeadroomState._tag === "Insufficient")
                 ? "Not enough free memory right now"
@@ -1080,12 +1080,12 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
             </text>
           )}
           {detailCapabilities && (
-            <text style={{ fg: theme.muted }}>
+            <text style={{ fg: theme.text.metadata }}>
               {detailCapabilities.vision ? "Vision" : "No vision"} · Tools · {detailCapabilities.reasoning.supported ? "Reasoning" : "No reasoning"}
             </text>
           )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
-            {detailIsSelected && <text style={{ fg: theme.success }}>● Current model</text>}
+            {detailIsSelected && <text style={{ fg: theme.status.success }}>● Current model</text>}
             {detailActions.map((action, index) => (
               <MenuAction
                 key={action}
@@ -1117,23 +1117,23 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
         style={{
           flexGrow: 1,
           minHeight: 0,
-          rootOptions: { backgroundColor: theme.menuBg },
-          wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-          viewportOptions: { backgroundColor: theme.menuBg },
+          rootOptions: { backgroundColor: theme.background.menu },
+          wrapperOptions: { border: false, backgroundColor: theme.background.menu },
+          viewportOptions: { backgroundColor: theme.background.menu },
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}
       >
         <box style={{ flexDirection: "row", width: "100%" }}>
-          <text style={{ fg: theme.muted, width: 2 }}> </text>
-          <text style={{ fg: theme.muted, width: 2 }}> </text>
-          <text style={{ fg: theme.muted, flexGrow: 1 }}>MODEL</text>
-          <text style={{ fg: theme.muted, width: 14 }}>REQUIREMENTS</text>
-          <text style={{ fg: theme.muted, width: 9 }}>CONTEXT</text>
-          <text style={{ fg: theme.muted, width: 23 }}>STATUS</text>
+          <text style={{ fg: theme.text.metadata, width: 2 }}> </text>
+          <text style={{ fg: theme.text.metadata, width: 2 }}> </text>
+          <text style={{ fg: theme.text.metadata, flexGrow: 1 }}>MODEL</text>
+          <text style={{ fg: theme.text.metadata, width: 14 }}>REQUIREMENTS</text>
+          <text style={{ fg: theme.text.metadata, width: 9 }}>CONTEXT</text>
+          <text style={{ fg: theme.text.metadata, width: 23 }}>STATUS</text>
         </box>
         {eligible.length === 0 ? (
           <box style={{ flexDirection: "column", paddingLeft: 2 }}>
-            <text style={{ fg: theme.warning, marginLeft: 2 }}>No model is currently available.</text>
+            <text style={{ fg: theme.status.warning, marginLeft: 2 }}>No model is currently available.</text>
             {EMPTY_MODEL_ACTIONS.map((action, index) => (
               <MenuAction
                 key={action.root}
@@ -1159,22 +1159,22 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
                 flexDirection: "row",
                 width: "100%",
                 backgroundColor: active
-                  ? focused ? theme.foreground : theme.primary
+                  ? focused ? theme.text.body : theme.accent
                   : focused
-                  ? theme.surfaceHover
-                  : rowIndex % 2 === 0 ? theme.menuBg : theme.menuAltBg,
+                  ? theme.background.focused
+                  : rowIndex % 2 === 0 ? theme.background.menu : theme.background.alternateRow,
               }}
             >
-              <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, width: 2 }}>{active ? "●" : focused ? "›" : " "}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.warning, width: 2 }}>{favorite ? "★" : " "}</text>
-              <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{modelsMenuDisplayName(entry)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(entry)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{modelsMenuContextLabel(entry)}</text>
+              <text style={{ fg: active ? theme.background.menu : focused ? theme.accent : theme.text.body, width: 2 }}>{active ? "●" : focused ? "›" : " "}</text>
+              <text style={{ fg: active ? theme.background.menu : theme.status.warning, width: 2 }}>{favorite ? "★" : " "}</text>
+              <text style={{ fg: active ? theme.background.menu : focused ? theme.accent : theme.text.body, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{modelsMenuDisplayName(entry)}</text>
+              <text style={{ fg: active ? theme.background.menu : theme.text.metadata, width: 14 }}>{requirementFor(entry)}</text>
+              <text style={{ fg: active ? theme.background.menu : theme.text.metadata, width: 9 }}>{modelsMenuContextLabel(entry)}</text>
               <text
                 style={{
                   fg: active
-                    ? theme.menuBg
-                    : status.tone === "warning" ? theme.warning : theme.muted,
+                    ? theme.background.menu
+                    : status.tone === "warning" ? theme.status.warning : theme.text.metadata,
                   width: 23,
                 }}
                 attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}
@@ -1186,16 +1186,16 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
           )
         })}
         {Result.isFailure(config.catalog) && (
-          <text style={{ fg: theme.error }}>Unable to refresh the provider model catalog; showing the last usable state when available.</text>
+          <text style={{ fg: theme.status.failure }}>Unable to refresh the provider model catalog; showing the last usable state when available.</text>
         )}
         {Result.isFailure(slotActions.assignResult) && (
-          <text style={{ fg: theme.error }}>Failed to update model selection.</text>
+          <text style={{ fg: theme.status.failure }}>Failed to update model selection.</text>
         )}
         {installationFailed && (
-          <text style={{ fg: theme.error }}>Failed to install the local model.</text>
+          <text style={{ fg: theme.status.failure }}>Failed to install the local model.</text>
         )}
         {Result.isFailure(config.favoriteUpdate) && (
-          <text style={{ fg: theme.error }}>Failed to update model favorite.</text>
+          <text style={{ fg: theme.status.failure }}>Failed to update model favorite.</text>
         )}
       </scrollbox>
     </>
@@ -1272,25 +1272,25 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
     ? "Remove? ↵/Esc"
     : catalogStatus(model, reconciliationState)
   const statusColor = pendingDelete
-    ? theme.warning
+    ? theme.status.warning
     : model.acquisitionState._tag === "Failed"
       || reconciliationState._tag === "Failed"
       || reconciliationState._tag === "RemoveFailed"
-      ? theme.error
+      ? theme.status.failure
       : reconciliationState._tag === "Starting"
         || reconciliationState._tag === "Transferring"
         || reconciliationState._tag === "Removing"
         || model.acquisitionState._tag === "Downloading"
         || model.acquisitionState._tag === "Installed"
-        ? theme.primary
-        : theme.muted
+        ? theme.accent
+        : theme.text.metadata
   const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
   const speculativeMethod = localModelSpeculativeMethodLabel(model)
   const speculativeText = Option.getOrElse(speculativeMethod, () => "—")
   const backgroundColor = highlighted
-    ? theme.surfaceHover
-    : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
+    ? theme.background.focused
+    : index % 2 === 0 ? theme.background.menu : theme.background.alternateRow
 
   return (
     <Button
@@ -1307,24 +1307,24 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         backgroundColor,
       }}
     >
-      <text style={{ fg: focused ? theme.primary : theme.foreground, width: 1 }} wrapMode="none">
+      <text style={{ fg: focused ? theme.accent : theme.text.body, width: 1 }} wrapMode="none">
         {selected ? "●" : focused ? "›" : " "}
       </text>
-      <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
+      <text style={{ fg: focused ? theme.accent : theme.text.body, width: layout.modelWidth }} wrapMode="none">
         {formatCatalogModelLabel(model.presentation.displayName, model.presentation.variantLabel, layout.modelWidth)}
       </text>
       {layout.showMemory && (
-        <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">
+        <text style={{ fg: theme.text.metadata, width: layout.columns.memory }} wrapMode="none">
           {truncateToDisplayWidth(memoryText, layout.columns.memory)}
         </text>
       )}
       {layout.showSpeed && (
-        <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">
+        <text style={{ fg: theme.text.metadata, width: layout.columns.speed }} wrapMode="none">
           {truncateToDisplayWidth(speedText, layout.columns.speed)}
         </text>
       )}
       {layout.showSpeculative && (
-        <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">
+        <text style={{ fg: theme.text.metadata, width: layout.columns.speculative }} wrapMode="none">
           {truncateToDisplayWidth(speculativeText, layout.columns.speculative)}
         </text>
       )}
@@ -1512,24 +1512,24 @@ const CatalogInspector = memo(function CatalogInspector({
     <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
       <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.identity, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.identity, flexShrink: 0, flexDirection: "column" }}>
         <box style={{ flexDirection: "row", width: "100%" }}>
-          <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
+          <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
             {truncateToDisplayWidth(formatLocalModelDisplayName(model), Math.max(1, contentWidth - status.length - 1))}
           </text>
           <text style={{ fg: reconciliationState._tag === "Failed"
             || reconciliationState._tag === "RemoveFailed"
-            || model.upgradeState._tag === "Failed" ? theme.error : theme.primary }} wrapMode="none">{status}</text>
+            || model.upgradeState._tag === "Failed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
         </box>
-        <text style={{ fg: theme.muted }} wrapMode="none">{description}</text>
+        <text style={{ fg: theme.text.supporting }} wrapMode="none">{description}</text>
         <text> </text>
       </box>
       <box style={{ width: "100%", height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0 }}>
         <CatalogRadarView axes={radarAxes} transition={transition} />
       </box>
       <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, flexShrink: 0, flexDirection: "column" }}>
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
-        <text style={{ fg: theme.muted }} wrapMode="none">{truncateToDisplayWidth(`License ${license}`, contentWidth)}</text>
+        <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
+        <text style={{ fg: theme.text.metadata }} wrapMode="none">{truncateToDisplayWidth(`License ${license}`, contentWidth)}</text>
         {repositoryUrl === undefined ? (
-          <text style={{ fg: theme.muted }} wrapMode="none">Repository unavailable</text>
+          <text style={{ fg: theme.text.metadata }} wrapMode="none">Repository unavailable</text>
         ) : (
           <Button
             onClick={() => { void platform.openLink(repositoryUrl) }}
@@ -1538,7 +1538,7 @@ const CatalogInspector = memo(function CatalogInspector({
           >
             <text wrapMode="none">
               <span
-                fg={sourceHovered ? theme.link : theme.muted}
+                fg={sourceHovered ? theme.link : theme.text.metadata}
                 attributes={sourceHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}
               >
                 {truncateToDisplayWidth(repository, contentWidth - (sourceHovered ? 1 : 0))}{sourceHovered ? "↗" : ""}
@@ -1554,18 +1554,18 @@ const CatalogInspector = memo(function CatalogInspector({
         flexShrink: 0,
         flexDirection: "column",
       }}>
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">ACTIONS</text>
+        <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD} wrapMode="none">ACTIONS</text>
         <box style={{ flexDirection: "column" }}>
           {actions.length === 0 ? (
-            <text style={{ fg: theme.muted }}>
+            <text style={{ fg: theme.text.disabled }}>
               {reconciliationState._tag === "Removing" ? "Removing…" : "No actions available"}
             </text>
           ) : actions.map((action, index) => {
             const focused = hoveredAction === action || (actionsFocused && index === actionCursor)
             return action === "uninstall" && confirmingUninstall ? (
               <text key={action} wrapMode="none">
-                <span fg={focused ? theme.primary : theme.foreground}>{focused ? "› " : "  "}Remove model? </span>
-                <span fg={theme.muted}>[Enter] confirm · [Esc] cancel</span>
+                <span fg={focused ? theme.accent : theme.text.body}>{focused ? "› " : "  "}Remove model? </span>
+                <span fg={theme.text.metadata}>[Enter] confirm · [Esc] cancel</span>
               </text>
             ) : (
               <MenuAction
@@ -1885,7 +1885,7 @@ const CatalogMenu = memo(function CatalogMenu({
         }}
       />
       {Result.isFailure(slotActions.assignResult) && (
-        <text style={{ fg: theme.error }}>Failed to update model selection.</text>
+        <text style={{ fg: theme.status.failure }}>Failed to update model selection.</text>
       )}
     </>
   )
@@ -1921,9 +1921,9 @@ const CatalogMenu = memo(function CatalogMenu({
       width: layout.mode === "split" ? layout.listWidth : "100%",
       flexGrow: layout.mode === "split" ? 0 : 1,
       minHeight: 0,
-      rootOptions: { backgroundColor: theme.menuBg },
-      wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-      viewportOptions: { backgroundColor: theme.menuBg },
+      rootOptions: { backgroundColor: theme.background.menu },
+      wrapperOptions: { border: false, backgroundColor: theme.background.menu },
+      viewportOptions: { backgroundColor: theme.background.menu },
       contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2 },
     }}>
       <box style={{
@@ -1934,20 +1934,20 @@ const CatalogMenu = memo(function CatalogMenu({
         minHeight: 1,
         flexShrink: 0,
       }}>
-        <text style={{ fg: theme.muted, width: 1 }} wrapMode="none"> </text>
-        <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
-        {layout.showMemory && <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>}
-        {layout.showSpeed && <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">SPEED</text>}
-        {layout.showSpeculative && <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">SPECULATIVE</text>}
-        <text style={{ fg: theme.muted, width: layout.columns.status }} wrapMode="none">STATUS</text>
+        <text style={{ fg: theme.text.metadata, width: 1 }} wrapMode="none"> </text>
+        <text style={{ fg: theme.text.metadata, width: layout.modelWidth }} wrapMode="none">MODEL</text>
+        {layout.showMemory && <text style={{ fg: theme.text.metadata, width: layout.columns.memory }} wrapMode="none">MEMORY</text>}
+        {layout.showSpeed && <text style={{ fg: theme.text.metadata, width: layout.columns.speed }} wrapMode="none">SPEED</text>}
+        {layout.showSpeculative && <text style={{ fg: theme.text.metadata, width: layout.columns.speculative }} wrapMode="none">SPECULATIVE</text>}
+        <text style={{ fg: theme.text.metadata, width: layout.columns.status }} wrapMode="none">STATUS</text>
       </box>
       {runningProgress && (
-        <text style={{ fg: theme.primary, marginLeft: 2 }}>
+        <text style={{ fg: theme.accent, marginLeft: 2 }}>
           {spinner} {runningProgress.label}{runningProgress.metadata}
         </text>
       )}
       {candidates.length === 0 && recommendationsReady ? (
-        <text style={{ fg: theme.warning, marginLeft: 2 }}>
+        <text style={{ fg: theme.status.warning, marginLeft: 2 }}>
           No compatible recommended models are currently available.
         </text>
       ) : candidates.map((candidate, index) => {
@@ -2018,7 +2018,7 @@ const CatalogMenu = memo(function CatalogMenu({
         {list}
         {layout.mode === "split" && inspected !== null && (
           <>
-            <box style={{ width: layout.dividerWidth, backgroundColor: theme.border }} />
+            <box style={{ width: layout.dividerWidth, backgroundColor: theme.border.standard }} />
             <box style={{ width: layout.inspectorWidth, minWidth: layout.inspectorWidth, flexDirection: "column" }}>
               {inspectorView}
             </box>
@@ -2086,15 +2086,15 @@ const HardwareMenu = memo(function HardwareMenu() {
         style={{
           flexGrow: 1,
           minHeight: 0,
-          rootOptions: { backgroundColor: theme.menuBg },
-          wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-          viewportOptions: { backgroundColor: theme.menuBg },
+          rootOptions: { backgroundColor: theme.background.menu },
+          wrapperOptions: { border: false, backgroundColor: theme.background.menu },
+          viewportOptions: { backgroundColor: theme.background.menu },
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}
       >
         {Option.match(hardwareSnapshot, {
           onNone: () => (
-            <text style={{ fg: Result.isFailure(hardwareState) ? theme.error : theme.muted }}>
+            <text style={{ fg: Result.isFailure(hardwareState) ? theme.status.failure : theme.text.metadata }}>
               {Result.isFailure(hardwareState) ? "Hardware detection is unavailable." : "Detecting local-inference hardware…"}
             </text>
           ),
@@ -2102,22 +2102,22 @@ const HardwareMenu = memo(function HardwareMenu() {
             const hardware = describeLocalHardware(detectedHardware)
             return (
               <>
-                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
-                {hardware.system.details.map((line) => <text key={line} style={{ fg: theme.muted }}>{line}</text>)}
+                <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
+                {hardware.system.details.map((line) => <text key={line} style={{ fg: theme.text.metadata }}>{line}</text>)}
                 {hardware.accelerators.map((accelerator) => (
-                  <text key={`${accelerator.name}:${accelerator.details}`} style={{ fg: theme.muted }}>{accelerator.name} · {accelerator.details}</text>
+                  <text key={`${accelerator.name}:${accelerator.details}`} style={{ fg: theme.text.metadata }}>{accelerator.name} · {accelerator.details}</text>
                 ))}
                 {hardware.accelerators.length === 0 && !detectedHardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory") && (
-                  <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
+                  <text style={{ fg: theme.text.metadata }}>CPU inference · No GPU detected</text>
                 )}
               </>
             )
           },
         })}
         <box style={{ flexDirection: "column", marginTop: 1 }}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>CURRENT MODEL</text>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD}>CURRENT MODEL</text>
           {currentModel._tag === "NoSelection"
-            ? <text style={{ fg: theme.muted }}>No local model selected</text>
+            ? <text style={{ fg: theme.text.metadata }}>No local model selected</text>
             : (() => {
               const actualAllocation = currentModel._tag === "Running"
                 ? Option.some(currentModel.allocation)
@@ -2136,22 +2136,22 @@ const HardwareMenu = memo(function HardwareMenu() {
               return (
                 <>
                   <box style={{ flexDirection: "row" }}>
-                    <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD}>{currentModel.displayName}</text>
-                    <text style={{ fg: currentModel._tag === "Running" ? theme.primary : theme.muted }}>{status}</text>
+                    <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD}>{currentModel.displayName}</text>
+                    <text style={{ fg: currentModel._tag === "Running" ? theme.accent : theme.text.metadata }}>{status}</text>
                   </box>
                   {currentModel._tag === "NotLoaded" || currentModel._tag === "Failed"
                     ? <ModelLoadPlanDetails />
                     : (
                         <box style={{ flexDirection: "row" }}>
-                          <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
-                          <text style={{ fg: theme.foreground, width: 16 }}>
+                          <text style={{ fg: theme.text.metadata, width: 20 }}>Context window</text>
+                          <text style={{ fg: theme.text.body, width: 16 }}>
                             {Option.match(currentModel.contextWindow, {
                               onNone: () => "—",
                               onSome: (tokens) => `${formatContextWindow(tokens)} tokens`,
                             })}
                           </text>
-                          <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
-                          <text style={{ fg: theme.foreground }}>
+                          <text style={{ fg: theme.text.metadata, width: 16 }}>Parallelism</text>
+                          <text style={{ fg: theme.text.body }}>
                             {Option.match(actualAllocation, {
                               onNone: () => "—",
                               onSome: (allocation) => String(allocation.parallelSequences),
@@ -2174,16 +2174,16 @@ const HardwareMenu = memo(function HardwareMenu() {
         })}
         {Option.isSome(currentSlot) && (
           <box style={{ flexDirection: "column", marginTop: 1 }}>
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>ACTIONS</text>
+            <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD}>ACTIONS</text>
             {Option.match(action, {
               onNone: () =>
                 currentSlot.value.residency._tag === "Stopping"
-                  ? <text style={{ fg: theme.muted }}>Stopping model…</text>
+                  ? <text style={{ fg: theme.text.metadata }}>Stopping model…</text>
                   : currentSlot.value.availability._tag === "Pending"
-                    ? <text style={{ fg: theme.muted }}>Initializing model…</text>
+                    ? <text style={{ fg: theme.text.metadata }}>Initializing model…</text>
                     : currentSlot.value.availability._tag === "Unavailable"
-                      ? <text style={{ fg: theme.muted }}>{currentSlot.value.availability.failure.message}</text>
-                      : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
+                      ? <text style={{ fg: theme.text.metadata }}>{currentSlot.value.availability.failure.message}</text>
+                      : <text style={{ fg: theme.text.metadata }}>{"  "}Load model</text>,
               onSome: (currentAction) => (
                 <MenuAction
                   label={currentAction === "load" ? "Load model" : "Stop model"}
@@ -2207,16 +2207,16 @@ const ModelLoadPlanDetails = memo(function ModelLoadPlanDetails() {
   const plan = Result.value(preview)
   return (
     <box style={{ flexDirection: "row" }}>
-      <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
-      <text style={{ fg: theme.foreground, width: 16 }}>
+      <text style={{ fg: theme.text.metadata, width: 20 }}>Context window</text>
+      <text style={{ fg: theme.text.body, width: 16 }}>
         {Option.match(plan, {
           onNone: () => "—",
           onSome: ({ contextWindowTokens }) =>
             `${formatContextWindow(contextWindowTokens)} tokens`,
         })}
       </text>
-      <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
-      <text style={{ fg: theme.foreground }}>
+      <text style={{ fg: theme.text.metadata, width: 16 }}>Parallelism</text>
+      <text style={{ fg: theme.text.body }}>
         {Option.match(plan, {
           onNone: () => Result.isFailure(preview) ? "Unable to load now" : "—",
           onSome: ({ parallelSequences }) => `${parallelSequences} if loaded now`,
@@ -2354,8 +2354,8 @@ const CloudMenu = memo(function CloudMenu({
           hints="Enter save · Esc cancel"
         />
         <box style={{ flexGrow: 1, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
-          <text style={{ fg: theme.foreground }}>API key</text>
-          <box style={{ borderStyle: "single", borderColor: error ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, width: "100%" }}>
+          <text style={{ fg: theme.text.body }}>API key</text>
+          <box style={{ borderStyle: "single", borderColor: error ? theme.status.failure : theme.accent, paddingLeft: 1, paddingRight: 1, width: "100%" }}>
             <SingleLineInput
               value={keyValue}
               onChange={(value) => {
@@ -2366,8 +2366,8 @@ const CloudMenu = memo(function CloudMenu({
               focused
             />
           </box>
-          {error && <text style={{ fg: theme.error }}>{error}</text>}
-          <text style={{ fg: theme.muted }}>{auth.saving ? "Saving…" : "Enter to save"}</text>
+          {error && <text style={{ fg: theme.status.failure }}>{error}</text>}
+          <text style={{ fg: theme.text.metadata }}>{auth.saving ? "Saving…" : "Enter to save"}</text>
         </box>
       </>
     )
@@ -2386,8 +2386,8 @@ const CloudMenu = memo(function CloudMenu({
           hints="↑↓ navigate · Enter choose · Esc back"
         />
         <box style={{ flexGrow: 1, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
-          <text style={{ fg: theme.foreground }}>Disconnect Magnitude Cloud?</text>
-          <text style={{ fg: theme.muted }}>Cloud models will no longer be available in Models.</text>
+          <text style={{ fg: theme.text.body }}>Disconnect Magnitude Cloud?</text>
+          <text style={{ fg: theme.text.supporting }}>Cloud models will no longer be available in Models.</text>
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             <MenuAction
               label="Cancel"
@@ -2420,15 +2420,15 @@ const CloudMenu = memo(function CloudMenu({
       <MenuHeader title="Cloud" subtitle="Manage Magnitude Cloud connection" summary={connected ? "Connected" : "Not connected"} hints="↑↓ navigate" />
       <box style={{ flexGrow: 1, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
         {auth.source === "none" && (
-          <text style={{ fg: theme.muted }}>Magnitude Cloud provides hosted models and hosted research features.</text>
+          <text style={{ fg: theme.text.supporting }}>Magnitude Cloud provides hosted models and hosted research features.</text>
         )}
         {auth.source === "config" && (
-          <text style={{ fg: theme.success }}>● Connected via API key {auth.maskedKey ? `(${auth.maskedKey})` : ""}</text>
+          <text style={{ fg: theme.status.success }}>● Connected via API key {auth.maskedKey ? `(${auth.maskedKey})` : ""}</text>
         )}
         {auth.source === "env" && (
           <>
-            <text style={{ fg: theme.success }}>● Connected via {auth.envVarName}</text>
-            <text style={{ fg: theme.muted }}>This key is managed by the environment. Update it and relaunch to change it.</text>
+            <text style={{ fg: theme.status.success }}>● Connected via {auth.envVarName}</text>
+            <text style={{ fg: theme.text.supporting }}>This key is managed by the environment. Update it and relaunch to change it.</text>
           </>
         )}
         <box style={{ flexDirection: "column", paddingTop: 1 }}>
@@ -2437,7 +2437,7 @@ const CloudMenu = memo(function CloudMenu({
               onClick={() => runAction("add")}
               onMouseOver={() => actionCursor.select(actionIds.indexOf("add"))}
             >
-              <text style={{ fg: theme.primary }}>{selectedAction === "add" ? "› " : "  "}Add API key</text>
+              <text style={{ fg: theme.accent }}>{selectedAction === "add" ? "› " : "  "}Add API key</text>
             </Button>
           )}
           {auth.source === "config" && (
@@ -2446,7 +2446,7 @@ const CloudMenu = memo(function CloudMenu({
                 onClick={() => runAction("update")}
                 onMouseOver={() => actionCursor.select(actionIds.indexOf("update"))}
               >
-                <text style={{ fg: selectedAction === "update" ? theme.primary : theme.foreground }}>
+                <text style={{ fg: selectedAction === "update" ? theme.accent : theme.text.body }}>
                   {selectedAction === "update" ? "› " : "  "}Update API key
                 </text>
               </Button>
@@ -2454,22 +2454,22 @@ const CloudMenu = memo(function CloudMenu({
                 onClick={() => runAction("disconnect")}
                 onMouseOver={() => actionCursor.select(actionIds.indexOf("disconnect"))}
               >
-                <text style={{ fg: selectedAction === "disconnect" ? theme.primary : theme.foreground }}>
+                <text style={{ fg: selectedAction === "disconnect" ? theme.accent : theme.text.body }}>
                   {selectedAction === "disconnect" ? "› " : "  "}Disconnect
                 </text>
               </Button>
             </>
           )}
           <box style={{ flexDirection: "row" }}>
-            <text style={{ fg: theme.primary }}>{selectedAction === "link" ? "› " : "  "}</text>
+            <text style={{ fg: theme.accent }}>{selectedAction === "link" ? "› " : "  "}</text>
             <Button
               onClick={() => runAction("link")}
               onMouseOver={() => actionCursor.select(actionIds.indexOf("link"))}
             >
-              <text style={{ fg: theme.foreground }}>
+              <text style={{ fg: theme.text.body }}>
                 View dashboard{" "}
                 <span
-                  style={{ fg: selectedAction === "link" ? theme.link : theme.primary }}
+                  style={{ fg: selectedAction === "link" ? theme.link : theme.accent }}
                   attributes={TextAttributes.UNDERLINE}
                 >
                   {MAGNITUDE_CLOUD_URL}↗
@@ -2478,13 +2478,13 @@ const CloudMenu = memo(function CloudMenu({
             </Button>
           </box>
         </box>
-        {auth.error && <text style={{ fg: theme.error }}>{auth.error}</text>}
+        {auth.error && <text style={{ fg: theme.status.failure }}>{auth.error}</text>}
         {connected && cloudModels.length > 0 && (
           <box style={{ flexDirection: "column", paddingTop: 1 }}>
-            <text style={{ fg: theme.muted }}>AVAILABLE MODELS</text>
+            <text style={{ fg: theme.text.metadata }}>AVAILABLE MODELS</text>
             {cloudModels.map((model) => (
-              <text key={providerModelKey(model)} style={{ fg: theme.foreground }}>
-                {formatModelDisplayName(model.displayName, model.variantLabel)}<span style={{ fg: theme.muted }}> · {formatContextWindow(model.contextWindow)} context</span>
+              <text key={providerModelKey(model)} style={{ fg: theme.text.body }}>
+                {formatModelDisplayName(model.displayName, model.variantLabel)}<span style={{ fg: theme.text.metadata }}> · {formatContextWindow(model.contextWindow)} context</span>
               </text>
             ))}
           </box>

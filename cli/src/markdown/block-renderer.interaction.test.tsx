@@ -2,9 +2,10 @@ import { act } from 'react'
 import { expect, test, vi } from 'vitest'
 import { testRender } from '@opentui/react/test-utils'
 import type { Block } from './blocks'
+import { defaultCliThemes } from '../utils/theme'
 
 vi.mock('../hooks/use-theme', () => ({
-  useTheme: () => ({ primary: '#0000ff', link: '#00ff00' }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { BlockRenderer } = await import('./block-renderer')

@@ -6,9 +6,9 @@ import {
   type RenderOptions,
   type Span,
 } from '../markdown/blocks'
-import { buildMarkdownColorPalette, chatThemes } from './theme'
+import { buildMarkdownColorPalette, defaultCliThemes } from './theme'
 
-export const theme = chatThemes.dark
+export const theme = defaultCliThemes.dark
 export const palette = buildMarkdownColorPalette(theme)
 export const baseOptions: RenderOptions = { palette, codeBlockWidth: 80 }
 

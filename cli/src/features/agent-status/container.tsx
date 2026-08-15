@@ -58,7 +58,7 @@ export function ActivityRailContainer({
   }
 
   return (
-    <ActivityRailSlot width={slotWidth} color={theme.modeDefault}>
+    <ActivityRailSlot width={slotWidth} color={theme.accent}>
       <ActivityRail
         status={agentActivityEnabled ? rootStatus : null}
         width={activityWidth}

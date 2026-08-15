@@ -2,6 +2,7 @@ import { act, useState } from 'react'
 import { testRender } from '@opentui/react/test-utils'
 import type { InputValue } from '@magnitudedev/client-common'
 import { describe, expect, test, vi } from 'vitest'
+import { defaultCliThemes } from '../../utils/theme'
 
 vi.hoisted(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -9,12 +10,7 @@ vi.hoisted(() => {
 })
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({
-    muted: '#888888',
-    inputFocusedFg: '#ffffff',
-    inputFg: '#ffffff',
-    info: '#00aaff',
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { MultilineInput } = await import('./multiline-input')

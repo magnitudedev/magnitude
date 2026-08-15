@@ -110,7 +110,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
         paddingBottom: 1,
         flexShrink: 0,
       }}>
-        <text style={{ fg: theme.primary, flexGrow: 1 }}>
+        <text style={{ fg: theme.accent, flexGrow: 1 }}>
           <span attributes={TextAttributes.BOLD}>Recent Conversations</span>
         </text>
         <box style={{ flexDirection: 'row' }}>
@@ -119,16 +119,16 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
             onMouseOver={() => setCloseHover(true)}
             onMouseOut={() => setCloseHover(false)}
           >
-            <text style={{ fg: closeHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
+            <text style={{ fg: closeHover ? theme.text.body : theme.text.supporting }} attributes={TextAttributes.UNDERLINE}>Close</text>
           </Button>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.supporting }}>
             <span attributes={TextAttributes.DIM}>{' '}(Esc or Ctrl+R)  |  Arrow keys to navigate  |  Enter to select</span>
           </text>
         </box>
       </box>
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>
+        <text style={{ fg: theme.border.standard }}>
           {'─'.repeat(80)}
         </text>
       </box>
@@ -145,11 +145,11 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
           flexGrow: 1,
           rootOptions: {
             flexGrow: 1,
-            backgroundColor: 'transparent',
+            backgroundColor: theme.background.canvas,
           },
           wrapperOptions: {
             border: false,
-            backgroundColor: 'transparent',
+            backgroundColor: theme.background.canvas,
           },
           contentOptions: {
             paddingLeft: 1,
@@ -160,11 +160,11 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       >
         {error ? (
           <box style={{ paddingLeft: 1 }}>
-            <text style={{ fg: theme.error }}>{error}</text>
+            <text style={{ fg: theme.status.failure }}>{error}</text>
           </box>
         ) : chats.length === 0 && !isLoading ? (
           <box style={{ paddingLeft: 1 }}>
-            <text style={{ fg: theme.muted }}>No recent conversations found.</text>
+            <text style={{ fg: theme.text.supporting }}>No recent conversations found.</text>
           </box>
         ) : (
           <>
@@ -182,7 +182,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
                 Also serves as a visual hint that more content exists below. */}
             {hasMore && (
               <box style={{ paddingTop: 1, paddingBottom: 1, paddingLeft: 1 }}>
-                <text style={{ fg: theme.muted }}>
+                <text style={{ fg: theme.text.supporting }}>
                   <span attributes={TextAttributes.DIM}>
                     {isLoading ? '  Loading more...' : '  ↓ Scroll for more'}
                   </span>
@@ -194,7 +194,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       </scrollbox>
 
       <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.supporting }}>
           <span attributes={TextAttributes.DIM}>
             {isLoading
               ? 'Loading...'

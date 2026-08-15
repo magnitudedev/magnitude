@@ -103,16 +103,16 @@ export const ShimmerText = ({
     }
     if (primaryColor) {
       const paletteSize = Math.max(8, Math.min(20, Math.ceil(numChars * 1.5)))
-      return buildPaletteFromPrimaryColor(primaryColor, paletteSize, theme.muted)
+      return buildPaletteFromPrimaryColor(primaryColor, paletteSize, theme.text.supporting)
     }
     // Use theme shimmer color as default
     const paletteSize = Math.max(8, Math.min(20, Math.ceil(numChars * 1.5)))
-    return buildPaletteFromPrimaryColor(theme.info, paletteSize, theme.muted)
-  }, [colors, primaryColor, numChars, theme.info, theme.muted])
+    return buildPaletteFromPrimaryColor(theme.status.information, paletteSize, theme.text.supporting)
+  }, [colors, primaryColor, numChars, theme.status.information, theme.text.supporting])
 
   const generatedColors = useMemo(
-    () => buildGradientColors(numChars, palette, theme.muted),
-    [numChars, palette, theme.muted],
+    () => buildGradientColors(numChars, palette, theme.text.supporting),
+    [numChars, palette, theme.text.supporting],
   )
   const attributes = useMemo(() => buildGradientAttributes(numChars), [numChars])
 

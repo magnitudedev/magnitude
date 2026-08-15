@@ -1,6 +1,6 @@
 import type { DisplayMessage, DisplayTimeline, LocalModelsState, ModelSlotsState, ProviderId, RawImageAttachment, RawMentionOccurrence, ReasoningEffort, SlotId } from '@magnitudedev/sdk'
 import type { KeyEvent } from '@opentui/core'
-import type { ChatTheme } from '../../types/theme-system'
+import type { CliTheme } from '../../types/theme-system'
 import type { NotificationState, SlashCommandOutcome } from '@magnitudedev/client-common'
 
 /**
@@ -31,7 +31,7 @@ export type ComposerProps = {
   displayMode: 'default' | 'transcript'
 
   // Presentation
-  theme: ChatTheme
+  theme: CliTheme
   modeColor: string
   chatColumnWidth: number
   attachmentsMaxWidth: number

@@ -85,21 +85,21 @@ export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
         flexShrink: 0,
       }}>
         <box style={{ flexDirection: 'column' }}>
-          <text style={{ fg: theme.primary }}>
+          <text style={{ fg: theme.accent }}>
             <span attributes={TextAttributes.BOLD}>CLOUD MODELS</span>
           </text>
-          <text style={{ fg: theme.foreground }}>
+          <text style={{ fg: theme.text.body }}>
             <span attributes={TextAttributes.BOLD}>Connect hosted models with Magnitude Pro</span>
           </text>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.supporting }}>
             Magnitude Pro lets you:
           </text>
           <box style={{ flexDirection: 'column', paddingTop: 1, paddingLeft: 2 }}>
-            <text style={{ fg: theme.foreground }}>• Connect cloud models too large to run on this machine</text>
-            <text style={{ fg: theme.foreground }}>• Use Exa web search for external research</text>
+            <text style={{ fg: theme.text.body }}>• Connect cloud models too large to run on this machine</text>
+            <text style={{ fg: theme.text.body }}>• Use Exa web search for external research</text>
           </box>
           <box style={{ paddingTop: 1 }}>
-            <text style={{ fg: theme.muted }}>
+            <text style={{ fg: theme.text.supporting }}>
               Magnitude Pro is $10 for the first month, then $20/month.
             </text>
           </box>
@@ -115,8 +115,8 @@ export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
         flexDirection: 'column',
       }}>
         <box style={{ paddingBottom: 1, flexDirection: 'row' }}>
-          <text style={{ fg: theme.muted }}>Subscribe to Pro and copy your API key → </text>
-          <text style={{ fg: theme.primary }}>{MAGNITUDE_URL}</text>
+          <text style={{ fg: theme.text.supporting }}>Subscribe to Pro and copy your API key → </text>
+          <text style={{ fg: theme.accent }}>{MAGNITUDE_URL}</text>
           <text> </text>
           <Button
             onClick={async () => {
@@ -128,20 +128,20 @@ export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
             onMouseOver={() => setCopyHovered(true)}
             onMouseOut={() => setCopyHovered(false)}
           >
-            <text style={{ fg: urlCopy.copied ? theme.success : (copyHovered ? theme.foreground : theme.muted) }}>
+            <text style={{ fg: urlCopy.copied ? theme.status.success : (copyHovered ? theme.text.body : theme.text.supporting) }}>
               {urlCopy.copied ? '[Copied ✓]' : '[Copy link]'}
             </text>
           </Button>
         </box>
 
         <box style={{ paddingBottom: 1 }}>
-          <text style={{ fg: theme.foreground }}>Paste your API key:</text>
+          <text style={{ fg: theme.text.body }}>Paste your API key:</text>
         </box>
 
         {/* Input field */}
         <box style={{
           borderStyle: 'single',
-          borderColor: error ? theme.error : theme.primary,
+          borderColor: error ? theme.status.failure : theme.accent,
           paddingLeft: 1,
           paddingRight: 1,
           flexShrink: 0,
@@ -160,7 +160,7 @@ export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
 
         {error && (
           <box style={{ paddingTop: 1 }}>
-            <text style={{ fg: theme.error }}>{error}</text>
+            <text style={{ fg: theme.status.failure }}>{error}</text>
           </box>
         )}
 
@@ -173,12 +173,12 @@ export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
           >
             <box style={{
               borderStyle: 'single',
-              borderColor: continueHovered ? theme.primary : theme.border,
+              borderColor: continueHovered ? theme.accent : theme.border.standard,
               customBorderChars: BOX_CHARS,
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: continueHovered ? theme.primary : theme.foreground }}>
+              <text style={{ fg: continueHovered ? theme.accent : theme.text.body }}>
                 {busy ? 'Saving...' : 'Connect cloud models (Enter)'}
               </text>
             </box>
@@ -187,7 +187,7 @@ export const CloudModelsConnectScreen = memo(function CloudModelsConnectScreen({
 
         {/* Env-var hint */}
         <box style={{ paddingTop: 2 }}>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.supporting }}>
             <span attributes={TextAttributes.DIM}>
               Prefer environment variables? Press Esc to exit, set MAGNITUDE_API_KEY, then relaunch.
             </span>
