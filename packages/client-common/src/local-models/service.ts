@@ -22,7 +22,7 @@ import {
 
 export class LocalModelSynchronizationFailed extends Data.TaggedError(
   "LocalModelSynchronizationFailed",
-)<{ readonly operation: "install" | "cancel"; readonly message: string }> {}
+)<{ readonly operation: "install" | "cancel" | "delete"; readonly message: string }> {}
 
 interface InstallationInput {
   readonly configurationId: ModelServingConfigurationId
@@ -44,6 +44,8 @@ export type CatalogModelReconciliationState =
   | ({ readonly _tag: "Transferring"; readonly operation: CatalogModelReconciliationKind }
     & Omit<Extract<LocalModel["acquisitionState"], { readonly _tag: "Downloading" }>, "_tag">)
   | { readonly _tag: "Failed"; readonly operation: CatalogModelReconciliationKind }
+  | { readonly _tag: "Removing" }
+  | { readonly _tag: "RemoveFailed" }
 
 export interface CatalogModelView {
   readonly model: LocalModel
@@ -61,12 +63,21 @@ interface ReconciliationInvocationState {
   readonly failed: boolean
 }
 
+interface DeletionInvocationState {
+  readonly configurationId: ModelServingConfigurationId
+  readonly waiting: boolean
+  readonly failed: boolean
+}
+
 export const projectCatalogModelsView = (
   state: LocalModelsState,
   invocations: readonly ReconciliationInvocationState[],
+  deletions: readonly DeletionInvocationState[] = [],
 ): CatalogModelsView => {
   const latestByConfigurationId = new Map(invocations.map((invocation) =>
     [invocation.configurationId, invocation] as const))
+  const latestDeletionByConfigurationId = new Map(deletions.map((deletion) =>
+    [deletion.configurationId, deletion] as const))
   return {
     discoveryState: state.discoveryState,
     models: state.models.flatMap((model): readonly CatalogModelView[] => {
@@ -77,7 +88,12 @@ export const projectCatalogModelsView = (
       const invocation = configurationId === undefined
         ? undefined
         : latestByConfigurationId.get(configurationId)
-      const reconciliationState: CatalogModelReconciliationState = acquisition._tag === "Downloading"
+      const deletion = configurationId === undefined
+        ? undefined
+        : latestDeletionByConfigurationId.get(configurationId)
+      const reconciliationState: CatalogModelReconciliationState = deletion?.waiting
+        ? { _tag: "Removing" }
+        : acquisition._tag === "Downloading"
         ? { ...acquisition, _tag: "Transferring", operation: "Install" }
         : upgrade._tag === "Upgrading"
           ? { ...upgrade, _tag: "Transferring", operation: "Update" }
@@ -95,7 +111,9 @@ export const projectCatalogModelsView = (
                       _tag: "Failed",
                       operation: acquisition._tag === "Installed" ? "Update" : "Install",
                     }
-                  : { _tag: "Idle" }
+                  : deletion?.failed
+                    ? { _tag: "RemoveFailed" }
+                    : { _tag: "Idle" }
       return [{ model, reconciliationState }]
     }),
   }
@@ -215,7 +233,19 @@ const deleteModelMutation = Mutation.make("DeleteLocalModel", {
   scope: ({ configurationId }: DeletionInput) => installationScope(configurationId),
   effect: ({ configurationId }: DeletionInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DeleteLocalModel", { configurationId })),
-  synchronize: () => synchronizeLocalModels().pipe(Effect.asVoid),
+  synchronize: (_, { configurationId }) => synchronizeLocalModelsUntil(
+    (state) => Option.match(
+      findLocalModelByConfigurationId(state.models, configurationId),
+      {
+        onNone: () => true,
+        onSome: (model) => model.acquisitionState._tag !== "Installed",
+      },
+    ),
+    () => new LocalModelSynchronizationFailed({
+      operation: "delete",
+      message: "The deleted local model remained installed in LocalModels.",
+    }),
+  ).pipe(Effect.asVoid),
 })
 
 const makeLocalModels = Effect.gen(function* () {
@@ -236,6 +266,14 @@ const makeLocalModels = Effect.gen(function* () {
       failed: Result.isFailure(result),
     }),
   })
+  const deletionInvocations = Mutation.state({
+    filters: { mutation: deleteModelMutation },
+    select: ({ input, result }): DeletionInvocationState => ({
+      configurationId: input.configurationId,
+      waiting: Result.isWaiting(result),
+      failed: Result.isFailure(result),
+    }),
+  })
   const latestInstallationFailed = Atom.make((get) =>
     get(installationInvocations).at(-1)?.failed ?? false)
   const invalidate = () => queryClient.invalidate(localModelsQuery.match())
@@ -243,7 +281,11 @@ const makeLocalModels = Effect.gen(function* () {
   const state = Atom.make((get) => get(query).result)
   const catalog = Atom.make((get) => Result.map(
     get(state),
-    (models) => projectCatalogModelsView(models, get(installationInvocations)),
+    (models) => projectCatalogModelsView(
+      models,
+      get(installationInvocations),
+      get(deletionInvocations),
+    ),
   ))
 
   return {
