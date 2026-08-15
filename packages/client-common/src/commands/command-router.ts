@@ -54,6 +54,8 @@ export interface CommandContext {
   openSettings: () => void
   /** Open the usage overlay */
   openUsage: () => void
+  /** Reopen the onboarding setup flow. */
+  openSetup?: () => void
   /** Open the client-owned cloud model setup surface, when available. */
   openCloud?: () => void
   /** Open a client-owned model menu root, when available. */
@@ -179,6 +181,11 @@ export function routeSlashCommand(input: string, ctx: CommandContext): SlashComm
 
     case 'usage':
       ctx.openUsage()
+      return slashCommandHandled
+
+    case 'setup':
+      if (!ctx.openSetup) return slashCommandUnhandled
+      ctx.openSetup()
       return slashCommandHandled
 
     case 'transcript':

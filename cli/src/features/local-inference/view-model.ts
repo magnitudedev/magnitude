@@ -348,20 +348,24 @@ export const describeLocalHardware = (
 export const selectionTitle = ({ model }: LocalInferenceSelection): string =>
   formatLocalModelDisplayName(model)
 
-export const selectionMetadata = ({ model }: LocalInferenceSelection): string => {
+export const selectionContextLabel = ({ model }: LocalInferenceSelection): Option.Option<string> => {
   const configuration = model.servingState._tag === "Resolving"
     ? Option.none()
     : model.servingState._tag === "Failed"
       ? model.servingState.configuration
       : Option.some(model.servingState.configuration)
-  const contextLength = Option.match(configuration, {
+  return Option.match(configuration, {
     onNone: () => localModelMaximumContextLength(model),
     onSome: ({ profile }) => Option.some(profile.contextLength),
-  })
+  }).pipe(Option.map(formatContext))
+}
+
+export const selectionMetadata = (selection: LocalInferenceSelection): string => {
+  const { model } = selection
   const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
   return [
     formatDownloadBytes(model.downloadBytes),
-    Option.map(contextLength, (context) => `${formatContext(context)} ctx`).pipe(Option.getOrNull),
+    Option.map(selectionContextLabel(selection), (context) => `${context} ctx`).pipe(Option.getOrNull),
     speculativeMethod,
   ].filter((value): value is string => value !== null).join(" · ")
 }

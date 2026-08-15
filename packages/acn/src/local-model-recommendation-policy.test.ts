@@ -246,7 +246,7 @@ describe("local model multicriteria recommendation policy", () => {
     ])
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
       ["qwen35-q6", "balanced"],
-      ["qwen27", "best_quality"],
+      ["qwen27", "smartest"],
       ["gemma26-100", "fastest"],
       ["qwen4", "lightweight"],
     ])
@@ -265,7 +265,7 @@ describe("local model multicriteria recommendation policy", () => {
 
     expect(recommendations.map(({ displayName, intent }) => [displayName, intent])).toEqual([
       ["laguna-q4-100", "balanced"],
-      ["laguna-q6", "best_quality"],
+      ["laguna-q6", "smartest"],
       ["gemma26", "fastest"],
       ["qwen9", "lightweight"],
     ])
@@ -368,7 +368,7 @@ describe("local model multicriteria recommendation policy", () => {
     expect(recommendations.map(({ recommendableModelId, intent }) =>
       [recommendableModelId, intent])).toEqual([
       ["same:gguf:q6", "balanced"],
-      ["same:gguf:q8", "best_quality"],
+      ["same:gguf:q8", "smartest"],
     ])
   })
 
@@ -436,8 +436,8 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "light", score: 32, fidelity: 40, expected: 35, runtimeGiB: 8, downloadGiB: 3 }),
     ])
     expect(byIntent(recommendations, "balanced")?.explanation).toContain("Best overall mix")
-    expect(byIntent(recommendations, "best_quality")?.explanation).toContain("more memory than Balanced")
-    expect(byIntent(recommendations, "best_quality")?.explanation).toContain("slower than Balanced")
+    expect(byIntent(recommendations, "smartest")?.explanation).toContain("more memory than Balanced")
+    expect(byIntent(recommendations, "smartest")?.explanation).toContain("slower than Balanced")
     expect(byIntent(recommendations, "fastest")?.explanation)
       .toContain("Retains good quality with some possible loss")
     expect(byIntent(recommendations, "lightweight")?.explanation)

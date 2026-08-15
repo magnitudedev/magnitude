@@ -3,7 +3,7 @@ export const PENTAGON_RADAR_COLUMNS = 56
 export const PENTAGON_RADAR_ROWS = 15
 
 export interface PentagonRadarAxis {
-  readonly value: number
+  readonly value: Option.Option<number>
   readonly label: string
   readonly detail: string
 }
@@ -17,7 +17,13 @@ export type PentagonRadarAxes = readonly [
   PentagonRadarAxis,
 ]
 
-export type PentagonRadarValues = readonly [number, number, number, number, number]
+export type PentagonRadarValues = readonly [
+  Option.Option<number>,
+  Option.Option<number>,
+  Option.Option<number>,
+  Option.Option<number>,
+  Option.Option<number>,
+]
 
 export interface PentagonRadarTransition {
   readonly from: PentagonRadarValues
@@ -56,7 +62,7 @@ const BRAILLE_BITS = [
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
 
 export const pentagonRadarValues = (axes: PentagonRadarAxes): PentagonRadarValues =>
-  axes.map(({ value }) => clamp01(value)) as unknown as PentagonRadarValues
+  axes.map(({ value }) => Option.map(value, clamp01)) as unknown as PentagonRadarValues
 
 export const pentagonRadarEase = (progress: number): number =>
   1 - (1 - clamp01(progress)) ** 3
@@ -67,7 +73,11 @@ export const interpolatePentagonRadar = (
   progress: number,
 ): PentagonRadarValues => {
   const eased = pentagonRadarEase(progress)
-  return from.map((value, index) => value + (to[index]! - value) * eased) as unknown as PentagonRadarValues
+  return from.map((value, index) => {
+    const next = to[index]!
+    if (Option.isNone(next) || Option.isNone(value)) return next
+    return Option.some(value.value + (next.value - value.value) * eased)
+  }) as unknown as PentagonRadarValues
 }
 
 export const pentagonRadarTransitionValues = (
@@ -234,13 +244,18 @@ export const renderPentagonRadar = (
       drawLine(grid, dotWidth, dotHeight, points[axis]!, points[(axis + 1) % axes.length]!)
     }
   }
-  const profilePoints = values.map((value, axis) => pointOnAxis(center, {
-    x: radii.x * clamp01(value),
-    y: radii.y * clamp01(value),
-  }, axis))
+  const profilePoints = values.map((value, axis) => Option.map(value, (measurement) =>
+    pointOnAxis(center, {
+      x: radii.x * clamp01(measurement),
+      y: radii.y * clamp01(measurement),
+    }, axis)))
   for (let axis = 0; axis < axes.length; axis += 1) {
-    drawLine(profile, dotWidth, dotHeight, profilePoints[axis]!, profilePoints[(axis + 1) % axes.length]!)
-    setDot(profile, dotWidth, dotHeight, profilePoints[axis]!.x, profilePoints[axis]!.y)
+    const point = profilePoints[axis]
+    const next = profilePoints[(axis + 1) % axes.length]
+    if (Option.isSome(point) && Option.isSome(next)) {
+      drawLine(profile, dotWidth, dotHeight, point.value, next.value)
+    }
+    if (Option.isSome(point)) setDot(profile, dotWidth, dotHeight, point.value.x, point.value.y)
   }
 
   const characters = Array.from({ length: safeRows }, () => Array<string>(safeColumns).fill(" "))
@@ -297,3 +312,4 @@ export const renderPentagonRadar = (
     return runs
   })
 }
+import { Option } from "effect"

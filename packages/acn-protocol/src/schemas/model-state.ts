@@ -508,10 +508,19 @@ const LocalModelDownloadCancelledSchema = Schema.TaggedStruct("Cancelled", {
   completedBytes: NonNegativeSafeInteger,
   totalBytes: NonNegativeSafeInteger,
 })
+export const LocalModelInstalledPackageSchema = Schema.Struct({
+  packageId: ModelPackageIdSchema,
+  path: NonEmptyString,
+  origin: ModelPackageInstallationOriginSchema,
+})
+export type LocalModelInstalledPackage = typeof LocalModelInstalledPackageSchema.Type
+
 const LocalModelInstalledSchema = Schema.TaggedStruct("Installed", {
   installedBytes: NonNegativeSafeInteger,
-  origins: Schema.NonEmptyArray(ModelPackageInstallationOriginSchema),
-})
+  packages: Schema.NonEmptyArray(LocalModelInstalledPackageSchema),
+}).pipe(Schema.filter(({ packages }) =>
+  new Set(packages.map(({ packageId }) => packageId)).size === packages.length,
+{ message: () => "installed local model packages must have unique package identities" }))
 
 export const LocalModelAcquisitionStateSchema = Schema.Union(
   LocalModelNotInstalledSchema,
@@ -611,7 +620,7 @@ export type LocalModelCatalogMembershipState =
 
 export const LocalModelRecommendationSchema = Schema.Struct({
   id: RecommendationIdSchema,
-  intent: Schema.Literal("balanced", "best_quality", "fastest", "lightweight"),
+  intent: Schema.Literal("balanced", "smartest", "fastest", "lightweight"),
   explanation: Schema.String,
 })
 export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Type
@@ -746,7 +755,13 @@ export const LocalModelSchema = Schema.Struct({
   acquisitionState: LocalModelAcquisitionStateSchema,
   upgradeState: LocalModelUpgradeStateSchema,
   servingState: LocalModelServingStateSchema,
-})
+}).pipe(Schema.filter((model) => {
+  if (model.acquisitionState._tag !== "Installed") return true
+  const bundlePackageIds = servableModelBundlePackageIds(model.bundle)
+  const installedPackageIds = model.acquisitionState.packages.map(({ packageId }) => packageId)
+  return bundlePackageIds.length === installedPackageIds.length
+    && bundlePackageIds.every((packageId) => installedPackageIds.includes(packageId))
+}, { message: () => "installed local models must carry the exact location of every bundle package" }))
 export type LocalModel = typeof LocalModelSchema.Type
 
 export const LocalModelRecommendationProgressStepIdSchema = Schema.Literal(

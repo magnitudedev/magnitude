@@ -128,7 +128,7 @@ normalized allocation headroom with the assessment's system-domain requirement. 
 replaces the singleton worker before admission, ACN credits the current resident worker's
 system-domain allocation once, capped by ICN's normalized allocation capacity.
 
-## Product behavior
+## Published state and ownership
 
 ICN owns and publishes the assessment and abort thresholds. ACN owns the recommended-headroom
 formula and publishes derived application guidance; clients consume that guidance rather than
@@ -146,67 +146,23 @@ a later manual retry may succeed. These facts stay on the model-instance boundar
 local-inference concepts in the provider contract, and clients own their presentation rather than
 parsing server prose.
 
-The Models menu keeps `REQUIREMENTS` and uses `STATUS` for:
+Model-instance allocation evidence is the sum of the server-published model, context, compute, and
+auxiliary allocations across participating memory domains. It is not whole-system used memory and
+has no capacity denominator. Running and resident stopping retain allocation evidence, while
+aborting a pre-residency load retains the tagged planned-allocation form. The hardware mirror
+supplies only topology, capacity, and live availability.
 
-- `Tight fit` — detail: `High memory use`
-- `Too large` — detail: `Requires more memory than this system has`
-- `Free memory` — detail: `Not enough memory available - close memory-intensive apps`
-
-`Too large` is stable. `Free memory` is reactive and clears when availability changes. A
-low-memory rejection during load or termination during serving appears in the activity rail as:
-
-`Model stopped · Low memory - close memory-intensive apps and try again`
-
-The CLI footer notification area also projects insufficient current headroom for the selected
-local model as `! Low memory: close memory-intensive apps (need X.Y GB) to load model`, using the
-published minimum additional availability. In the composer's two-row footer layout, it is presented
-compactly as `! Low memory: Free X.Y GB to load`. This warning persists while the authoritative
-current-headroom state remains insufficient and takes precedence over download activity; it is not
-an ephemeral response to the selection event.
-
-Onboarding keeps its recommendation and action labels unchanged in the model list. The selected
-model's right-hand detail pane preserves the recommendation explanation and independently presents
-stable fit and current loadability. The metadata, explanation, and memory guidance are separated by
-one blank row each. When current headroom is insufficient, the compact memory block tells the user
-the published minimum additional availability to free before loading, explains that the model fits
-stable total capacity while current system use prevents loading, and suggests closing
-memory-intensive applications. This live guidance is advisory: it neither changes recommendation
-rank nor authorizes loading. If authoritative admission still rejects the attempt, the same pane
-presents the structured low-memory facts and a retry action without exposing the raw diagnostic as
-primary copy.
-
-While the selected local model is ready, the composer footer shows its correlated model-instance allocation
-after context: the sum of the server-published model, context, compute, and auxiliary allocations
-across participating memory domains. It is compactly labeled, for example `24 GB mem`; it is not
-whole-system used memory and has no capacity denominator. Memory disappears outside ready
-residency and has no placeholder or transitional state. The Hardware menu owns whole-system,
-application, free-memory, and per-allocation detail.
-
-The Hardware menu places a flat `CURRENT MODEL` section below hardware identity and above memory.
-It always shows the selected local model, including while unloaded, and derives loading, running,
-stopping, unloaded, and failed state from `ModelSlots`. Running and resident stopping use
-allocation evidence carried by the same model-instance slot state, while aborting a pre-residency
-load retains the tagged planned-allocation form. The hardware mirror supplies only
-topology, capacity, and live availability. While unloaded, an authoritative ICN preview runs the
-same exact configuration planner,
-one-through-four candidate assessment, and fresh admission policy as a real load, and displays the
-parallelism it would select now. Clients never estimate this value. Preview evidence is advisory
-and never gates assignment or load; ICN repeats authoritative admission when the actual load is
-submitted. The mounted Hardware view requests this plan through one observational ACN query.
-Neither ACN nor the client stores it in canonical model state or evaluates it in the background.
+An authoritative ICN preview runs the same exact configuration planner, one-through-four candidate
+assessment, and fresh admission policy as a real load. Clients never estimate preview values.
+Preview evidence is advisory and never gates assignment or load; ICN repeats authoritative
+admission when the actual load is submitted. Preview is requested through one observational ACN
+query and is not stored in canonical model state or evaluated in the background.
 
 Frozen-topology candidate assessments are cached as disposable derived evidence and shared by
 preview and load. Live hardware polling therefore reruns only the fresh admission selection when
 stable assessment evidence is unchanged. Catalog assessment and recommendation work does not rerun for
 availability-only hardware changes.
 
-The menu's state-appropriate Actions load or Stop the selected model without destructive
-confirmation. Stop carries only the exact model-instance identity. The activity rail exposes the
-same Stop while loading; both actions converge through the single slot lifecycle and operation
-owner.
-
 While current hardware or system-domain evidence is unavailable, clients do not infer either
-compatibility or available headroom and present memory status as unavailable. Model selection
-remains a durable configuration action; current load admission remains server-authoritative and
-fails closed without complete evidence. This transient unknown state is not mislabeled as
-`Free memory`.
+compatibility or available headroom. Model selection remains durable; current load admission
+remains server-authoritative and fails closed without complete evidence.

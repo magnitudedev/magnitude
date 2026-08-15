@@ -86,6 +86,7 @@ export {
   LocalModelsMirror,
   OnboardingMirror,
   ModelDownloadIdSchema,
+  LocalModelInstalledPackageSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelVariantLabelSchema,
@@ -106,6 +107,7 @@ export {
 
 export type {
   ModelDownloadId,
+  LocalModelInstalledPackage,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,

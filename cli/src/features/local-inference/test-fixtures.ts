@@ -19,6 +19,7 @@ import {
   ReasoningEffortSchema,
   RecommendationIdSchema,
   SECONDARY_SLOT_ID,
+  servableModelBundlePackages,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
@@ -120,6 +121,15 @@ export const makeRecommendation = (
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
   const bundle = overrides.bundle ?? makeStandaloneBundle()
   const contextLength = 32_768
+  const [firstInstalledPackage, ...remainingInstalledPackages] = servableModelBundlePackages(bundle)
+    .map((modelPackage) => ({
+      packageId: modelPackage.id,
+      path: modelPackage.source._tag === "Local"
+        ? modelPackage.source.path
+        : `/models/${modelPackage.id}`,
+      origin: "Magnitude" as const,
+    }))
+  if (firstInstalledPackage === undefined) throw new Error("Test model bundle must contain a package")
   return {
     bundle,
     presentation: {
@@ -133,7 +143,7 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
     acquisitionState: {
       _tag: "Installed",
       installedBytes: 16 * GIB,
-      origins: ["Magnitude"],
+      packages: [firstInstalledPackage, ...remainingInstalledPackages],
     },
     upgradeState: { _tag: "NotApplicable" },
     servingState: {

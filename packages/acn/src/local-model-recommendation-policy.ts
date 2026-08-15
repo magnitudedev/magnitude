@@ -39,7 +39,7 @@ export interface RecommendationSelection {
   readonly configurationId: FitsModelAssessment["configurationId"]
   readonly recommendableModelId: string
   readonly displayName: string
-  readonly intent: "balanced" | "best_quality" | "fastest" | "lightweight"
+  readonly intent: "balanced" | "smartest" | "fastest" | "lightweight"
   readonly explanation: string
 }
 
@@ -182,7 +182,7 @@ export const assembleRecommendationCatalogCandidates = (
   ]
 }
 
-const compareBestQuality = (
+const compareSmartest = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,
 ): number => (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
@@ -263,7 +263,7 @@ const describeBalanced = (candidate: RecommendationCandidate): string => {
   return `Best overall mix of coding ability, speed, and memory use. Runs at ~${wholeSpeed(generation.estimatedTokensPerSecond)} tok/s at ${Math.round(generation.contextTokens / 1_000)}K context, supports up to ${Math.round(candidate.profile.contextLength / 1_000)}K context, and ${qualitySummary(candidate)}.`
 }
 
-const describeBestQuality = (
+const describeSmartest = (
   candidate: RecommendationCandidate,
   balanced: RecommendationCandidate,
 ): string => {
@@ -342,7 +342,7 @@ const toRecommendation = (
   displayName: candidate.model.displayName,
   intent,
   explanation: intent === "balanced" ? describeBalanced(candidate)
-    : intent === "best_quality" ? describeBestQuality(candidate, balanced)
+    : intent === "smartest" ? describeSmartest(candidate, balanced)
     : intent === "fastest" ? describeFastest(candidate, balanced)
     : describeLightweight(candidate, balanced),
 })
@@ -359,8 +359,8 @@ export const selectRecommendationPortfolio = (
   const feasible = preferScoredCandidates(input.filter(usable))
   if (feasible.length === 0) return []
 
-  const bestQuality = [...feasible].sort(compareBestQuality).at(0)
-  if (!bestQuality) return []
+  const smartest = [...feasible].sort(compareSmartest).at(0)
+  if (!smartest) return []
 
   const balancedCapable = withinCapabilityGuard(feasible, 20, 0.7)
   const bestFidelity = Math.max(...balancedCapable.map(({ fidelityRank }) => fidelityRank))
@@ -370,12 +370,12 @@ export const selectRecommendationPortfolio = (
   let balanced = balancedCandidates.at(0)
   if (!balanced) return []
 
-  if (sameConfiguration(balanced, bestQuality)) {
+  if (sameConfiguration(balanced, smartest)) {
     const lighterSameCatalogModel = balancedCandidates
-      .filter((candidate) => candidate.catalogModelId === bestQuality.catalogModelId
-        && !sameConfiguration(candidate, bestQuality)
-        && candidate.fidelityRank >= bestQuality.fidelityRank - 20
-        && materiallyLighterThan(candidate, bestQuality, 0.9))
+      .filter((candidate) => candidate.catalogModelId === smartest.catalogModelId
+        && !sameConfiguration(candidate, smartest)
+        && candidate.fidelityRank >= smartest.fidelityRank - 20
+        && materiallyLighterThan(candidate, smartest, 0.9))
       .sort(compareBalanced)
       .at(0)
     if (lighterSameCatalogModel) balanced = lighterSameCatalogModel
@@ -388,14 +388,14 @@ export const selectRecommendationPortfolio = (
   const selectedConfigurations = new Set([balanced.assessment.configurationId])
   const usedCatalogModelIds = new Set([balanced.catalogModelId])
 
-  const bestQualityCapabilityGain = (capabilityScore(bestQuality) ?? 0)
+  const smartestCapabilityGain = (capabilityScore(smartest) ?? 0)
     - (capabilityScore(balanced) ?? 0)
-  const bestQualityFidelityGain = bestQuality.fidelityRank - balanced.fidelityRank
-  if (!selectedConfigurations.has(bestQuality.assessment.configurationId)
-    && (bestQualityCapabilityGain >= 5 || bestQualityFidelityGain >= 10)) {
-    selected.push({ candidate: bestQuality, intent: "best_quality" })
-    selectedConfigurations.add(bestQuality.assessment.configurationId)
-    usedCatalogModelIds.add(bestQuality.catalogModelId)
+  const smartestFidelityGain = smartest.fidelityRank - balanced.fidelityRank
+  if (!selectedConfigurations.has(smartest.assessment.configurationId)
+    && (smartestCapabilityGain >= 5 || smartestFidelityGain >= 10)) {
+    selected.push({ candidate: smartest, intent: "smartest" })
+    selectedConfigurations.add(smartest.assessment.configurationId)
+    usedCatalogModelIds.add(smartest.catalogModelId)
   }
 
   const fastestCapable = withinCapabilityGuard(feasible, 35, 0.5)

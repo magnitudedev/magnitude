@@ -23,8 +23,8 @@ import {
   localModelProviderModelId,
   localModelCapabilities,
   localModelSpeculativeMethodLabel,
+  clampTextToVisualLines,
   truncateToDisplayWidth,
-  wrapTextToVisualLines,
   type NotificationState,
   usePlatform,
   useLocalInferenceHardware,
@@ -88,7 +88,7 @@ import {
   retargetPentagonRadar,
   type PentagonRadarTransition,
 } from "../../components/pentagon-radar"
-import { catalogRadarAxes } from "./catalog-radar"
+import { localModelRadarAxes } from "../local-inference/model-radar"
 import { CatalogRadarView } from "./catalog-radar-view"
 import {
   modelMenusLocalModelsStateEquivalent,
@@ -166,13 +166,6 @@ const formatContextWindow = (tokens: number): string =>
       ? `${Math.round(tokens / 1_000)}K`
       : String(tokens)
 
-const twoLineText = (value: string, width: number): string => {
-  const lines = wrapTextToVisualLines(value, width)
-  return lines.length <= 2
-    ? lines.join("\n")
-    : `${lines[0]}\n${truncateToDisplayWidth(`${lines[1]}…`, width)}`
-}
-
 const providerModelKey = (model: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">): string =>
   `${model.providerId}:${model.providerModelId}`
 
@@ -230,7 +223,7 @@ const installedOriginStatus = (
 export const localModelInstalledStatus = (
   model: LocalModel,
 ): string => model.acquisitionState._tag === "Installed"
-  ? installedOriginStatus(model.acquisitionState.origins)
+  ? installedOriginStatus(model.acquisitionState.packages.map(({ origin }) => origin))
   : "Installed"
 
 export const localModelReadinessStatus = (
@@ -1507,13 +1500,13 @@ const CatalogInspector = memo(function CatalogInspector({
   const theme = useTheme()
   const platform = usePlatform()
   const [sourceHovered, setSourceHovered] = useState(false)
-  const radarAxes = catalogRadarAxes(model)
+  const radarAxes = localModelRadarAxes(model)
   const status = catalogInspectorStatus(model, reconciliationState, selected, selectedSlot)
   const contentWidth = CATALOG_INSPECTOR_CONTENT_WIDTH
   const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
   const repository = repositoryUrl?.replace("https://", "")
   const license = Option.getOrElse(model.presentation.license, () => "Unknown license")
-  const description = twoLineText(model.presentation.description, contentWidth)
+  const description = clampTextToVisualLines(model.presentation.description, contentWidth, 2)
 
   return (
     <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
@@ -1682,8 +1675,8 @@ const CatalogMenu = memo(function CatalogMenu({
     const configurationId = model && configurationIdFor(model)
     if (!model || configurationId === undefined) return
     setActionHoverTarget(null)
-    const fromAxes = cursor === undefined ? Option.none() : catalogRadarAxes(cursor)
-    const toAxes = catalogRadarAxes(model)
+    const fromAxes = cursor === undefined ? Option.none() : localModelRadarAxes(cursor)
+    const toAxes = localModelRadarAxes(model)
     if (Option.isSome(fromAxes) && Option.isSome(toAxes)
       && configurationIdFor(cursor!) !== configurationId) {
       const now = getAnimationTimeSnapshot()

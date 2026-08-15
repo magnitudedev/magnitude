@@ -28,7 +28,7 @@ const kindOrder: Record<LocalModelOption["kind"], number> = {
 
 const intentOrder = {
   balanced: 0,
-  best_quality: 1,
+  smartest: 1,
   fastest: 2,
   lightweight: 3,
 } as const

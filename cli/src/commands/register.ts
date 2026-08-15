@@ -3,6 +3,11 @@ import { registerClientCommands } from "@magnitudedev/client-common"
 export function registerCliCommands(): void {
   registerClientCommands([
     {
+      id: "setup",
+      label: "setup",
+      description: "Open the onboarding setup screen",
+    },
+    {
       id: "models",
       label: "models",
       description: "Choose a ready model",
