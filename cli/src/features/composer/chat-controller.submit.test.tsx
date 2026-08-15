@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test'
 import React, { type ReactNode } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
-import type { InputValue } from '@magnitudedev/client-common'
+import { slashCommandUnhandled, type InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { chatThemes } from '../../utils/theme'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
@@ -96,7 +96,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       autopilotGenerating: false,
       displayMode: 'default' as const,
       submitUserMessage: mock(() => {}),
-      runSlashCommand: mock(() => false),
+      runSlashCommand: mock(() => slashCommandUnhandled),
       executeBash: mock((_command: string) => true),
       clearSystemBanners: mock(() => {}),
       interruptFork: mock(() => {}),

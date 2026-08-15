@@ -470,15 +470,18 @@ export function Composer(props: ComposerProps) {
   }, [setComposerHasContent])
 
   const executeSlashCommand = useCallback((commandText: string) => {
-    const handled = runSlashCommand(commandText)
-    if (handled) {
+    const outcome = runSlashCommand(commandText)
+    if (outcome._tag === 'Handled') {
       setInputValue(EMPTY_INPUT)
       setComposerText('')
       setComposerAttachments([])
       setAttachments([])
       setComposerHasContent(false)
+      setComposerHistoryIndex(-1)
+      setSavedDraft('')
     }
-  }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent])
+    return outcome
+  }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
 
   const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }) => {
     setInputValue(prev => {

@@ -4,6 +4,13 @@ import { getAllCommands, type SlashCommandDefinition } from './slash-commands'
 export type GetFeatureFlag = (key: string) => boolean | undefined
 export type ModelMenuId = "models" | "catalog" | "hardware" | "cloud"
 
+export type SlashCommandOutcome =
+  | { readonly _tag: "Handled" }
+  | { readonly _tag: "Unhandled" }
+
+export const slashCommandHandled = { _tag: "Handled" } as const satisfies SlashCommandOutcome
+export const slashCommandUnhandled = { _tag: "Unhandled" } as const satisfies SlashCommandOutcome
+
 const defaultGetFeatureFlag: GetFeatureFlag = (key) => {
   if (typeof process !== 'undefined' && process.env) {
     return !!process.env[key]
@@ -124,43 +131,43 @@ export function filterSlashCommands(query: string): SlashCommandDefinition[] {
 /**
  * Route user input through slash command handlers.
  *
- * @returns true if the input was handled as a slash command, false if it
- *          should be passed through to the agent as a normal message.
+ * @returns Handled if the input was consumed as a slash command, Unhandled if
+ *          it should be passed through to the agent as a normal message.
  */
-export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
+export function routeSlashCommand(input: string, ctx: CommandContext): SlashCommandOutcome {
   const trimmed = input.trim()
-  if (!trimmed.startsWith('/')) return false
+  if (!trimmed.startsWith('/')) return slashCommandUnhandled
 
   const parsed = parseSlashCommand(trimmed)
-  if (!parsed) return false
+  if (!parsed) return slashCommandUnhandled
 
   // Check if this is a skill command
   const cmd = getAvailableCommands().find(c => c.id === parsed.commandId)
   if (cmd?.source === 'skill') {
     ctx.activateSkill(cmd.id, cmd.skillPath, parsed.args)
-    return true
+    return slashCommandHandled
   }
 
   switch (parsed.commandId) {
     case 'new':
       ctx.resetConversation()
-      return true
+      return slashCommandHandled
 
     case 'resume':
       ctx.openRecentChats()
-      return true
+      return slashCommandHandled
 
     case 'exit':
       ctx.exitApp()
-      return true
+      return slashCommandHandled
 
     case 'bash':
       ctx.enterBashMode()
-      return true
+      return slashCommandHandled
 
     case 'init':
       ctx.initProject()
-      return true
+      return slashCommandHandled
 
     case 'settings':
       if (ctx.openModelMenu) {
@@ -168,31 +175,31 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
       } else {
         ctx.openSettings()
       }
-      return true
+      return slashCommandHandled
 
     case 'usage':
       ctx.openUsage()
-      return true
+      return slashCommandHandled
 
     case 'transcript':
-      if (!ctx.toggleTranscript) return false
+      if (!ctx.toggleTranscript) return slashCommandUnhandled
       ctx.toggleTranscript()
-      return true
+      return slashCommandHandled
 
     case 'models':
     case 'catalog':
     case 'hardware':
     case 'cloud':
-      if (!ctx.openModelMenu) return false
+      if (!ctx.openModelMenu) return slashCommandUnhandled
       ctx.openModelMenu(parsed.commandId)
-      return true
+      return slashCommandHandled
 
     case 'autopilot':
       ctx.toggleAutopilot()
-      return true
+      return slashCommandHandled
 
     default:
       ctx.showSystemMessage(`Unknown command: /${parsed.commandId}`)
-      return true
+      return slashCommandHandled
   }
 }
