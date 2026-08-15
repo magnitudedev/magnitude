@@ -1,15 +1,33 @@
 import { Option } from "effect"
+import { localModelSpeculativeMethodLabel } from "@magnitudedev/client-common"
 import type { LocalModel } from "@magnitudedev/sdk"
+import {
+  performanceRangeSpeedLabel,
+} from "../local-inference/view-model"
 
 export const CATALOG_RADAR_DURATION_MS = 220
-export const CATALOG_RADAR_COLUMNS = 26
-export const CATALOG_RADAR_ROWS = 9
+export const CATALOG_RADAR_COLUMNS = 56
+export const CATALOG_RADAR_ROWS = 15
 
-// Axis order follows the triangle clockwise: intelligence, speed, accuracy.
-export type CatalogRadarValues = readonly [number, number, number]
+// Axis order follows the pentagon clockwise from its top vertex.
+export type CatalogRadarValues = readonly [number, number, number, number, number]
+
+export interface CatalogRadarMetric {
+  readonly name: string
+  readonly value: string
+}
+
+export type CatalogRadarMetrics = readonly [
+  CatalogRadarMetric,
+  CatalogRadarMetric,
+  CatalogRadarMetric,
+  CatalogRadarMetric,
+  CatalogRadarMetric,
+]
 
 export interface CatalogRadarProfile {
   readonly values: CatalogRadarValues
+  readonly metrics: CatalogRadarMetrics
 }
 
 export interface CatalogRadarTransition {
@@ -18,7 +36,7 @@ export interface CatalogRadarTransition {
   readonly startedAt: number
 }
 
-export type CatalogRadarTone = "empty" | "grid" | "profile" | "label"
+export type CatalogRadarTone = "empty" | "grid" | "profile" | "label" | "detail"
 
 export interface CatalogRadarRun {
   readonly text: string
@@ -29,8 +47,69 @@ export type CatalogRadarFrame = readonly (readonly CatalogRadarRun[])[]
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
 
-export const normalizeCatalogRadarSpeed = (tokensPerSecond: number): number =>
-  clamp01(Math.log(tokensPerSecond / 5) / Math.log(60 / 5))
+export const normalizeCatalogRadarSpeed = (tokensPerSecond: number): number => {
+  if (tokensPerSecond <= 30) return clamp01(tokensPerSecond / 30) * 0.5
+  if (tokensPerSecond <= 100) return 0.5 + ((tokensPerSecond - 30) / 70) * 0.4
+  if (tokensPerSecond >= 1_000) return 1
+  return 0.9 + 0.1 * Math.log(tokensPerSecond / 100) / Math.log(10)
+}
+
+const GIB = 1024 ** 3
+
+const compactMemorySize = (bytes: number): string => {
+  const gigabytes = bytes / GIB
+  return `${gigabytes.toFixed(gigabytes >= 10 ? 0 : 1)} GB`
+}
+
+const catalogRadarMemoryUseRatio = (
+  assessment: Extract<LocalModel["servingState"], { readonly _tag: "Assessed" }>["assessment"],
+): number => {
+  if (assessment._tag !== "Fits") return 1
+  return assessment.memory.domains.reduce((highestUse, domain) => {
+    const usableCapacityBytes = domain.capacityBytes - domain.compatibilityReserveBytes
+    const use = usableCapacityBytes <= 0
+      ? (domain.requiredBytes > 0 ? 1 : 0)
+      : domain.requiredBytes / usableCapacityBytes
+    return Math.max(highestUse, clamp01(use))
+  }, 0)
+}
+
+export const normalizeCatalogRadarMemoryEfficiency = (
+  assessment: Extract<LocalModel["servingState"], { readonly _tag: "Assessed" }>["assessment"],
+): number => 1 - catalogRadarMemoryUseRatio(assessment)
+
+const catalogRadarSpeculationValue = (model: LocalModel): number => {
+  if (model.bundle._tag !== "SpeculativeDecoding") return 0
+  switch (model.bundle.method._tag) {
+    case "Mtp": return 1 / 3
+    case "DFlash": return 2 / 3
+    case "DSpark": return 1
+  }
+}
+
+const accuracyLabel = (model: LocalModel): string => {
+  if (model.catalogMembershipState._tag !== "InCatalog") return "—"
+  const rank = model.catalogMembershipState.catalogData.fidelityRank
+  return rank >= 75 ? "Native"
+    : rank >= 55 ? "Very high"
+      : rank >= 45 ? "High" : "Reduced"
+}
+
+const shortVariantLabel = (model: LocalModel): string =>
+  String(model.presentation.variantLabel).match(/\b(?:IQ|Q)\d+(?:\.\d+)?\b/i)?.[0]
+    ?? String(model.presentation.variantLabel).split(/[ _-]/, 1)[0]
+    ?? String(model.presentation.variantLabel)
+
+const memoryFootprintLabel = (
+  assessment: Extract<LocalModel["servingState"], { readonly _tag: "Assessed" }>["assessment"],
+): string => {
+  const use = catalogRadarMemoryUseRatio(assessment)
+  if (use <= 0.2) return "Light"
+  if (use <= 0.4) return "Moderate"
+  if (use <= 0.6) return "Substantial"
+  if (use <= 0.8) return "Heavy"
+  return "Near capacity"
+}
 
 export const catalogRadarProfile = (model: LocalModel): Option.Option<CatalogRadarProfile> => {
   if (model.catalogMembershipState._tag !== "InCatalog"
@@ -47,12 +126,29 @@ export const catalogRadarProfile = (model: LocalModel): Option.Option<CatalogRad
   const values: CatalogRadarValues = [
     clamp01(catalog.intelligenceScore / 100),
     normalizeCatalogRadarSpeed(performance.estimatedTokensPerSecond),
+    catalogRadarSpeculationValue(model),
+    normalizeCatalogRadarMemoryEfficiency(assessment),
     clamp01(catalog.fidelityRank / 100),
   ]
   if (values.some((value) => !Number.isFinite(value))) return Option.none()
 
+  const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
+
   return Option.some({
     values,
+    metrics: [
+      { name: "INTELLIGENCE", value: `${Math.round(catalog.intelligenceScore)}%` },
+      { name: "SPEED", value: performanceRangeSpeedLabel(model, "tok/s") },
+      { name: "SPECULATION", value: speculation },
+      {
+        name: "MEMORY",
+        value: `${memoryFootprintLabel(assessment)} (${compactMemorySize(assessment.memory.totalRequiredBytes)})`,
+      },
+      {
+        name: "ACCURACY",
+        value: `${accuracyLabel(model)} (${shortVariantLabel(model)})`,
+      },
+    ],
   })
 }
 
@@ -93,6 +189,11 @@ interface Point {
   readonly y: number
 }
 
+interface Radii {
+  readonly x: number
+  readonly y: number
+}
+
 const BRAILLE_BITS = [
   [0x01, 0x08],
   [0x02, 0x10],
@@ -100,11 +201,11 @@ const BRAILLE_BITS = [
   [0x40, 0x80],
 ] as const
 
-const pointOnAxis = (center: Point, radius: number, axis: number): Point => {
-  const angle = -Math.PI / 2 + axis * Math.PI * 2 / 3
+const pointOnAxis = (center: Point, radii: Radii, axis: number): Point => {
+  const angle = -Math.PI / 2 + axis * Math.PI * 2 / 5
   return {
-    x: center.x + Math.cos(angle) * radius,
-    y: center.y + Math.sin(angle) * radius,
+    x: center.x + Math.cos(angle) * radii.x,
+    y: center.y + Math.sin(angle) * radii.y,
   }
 }
 
@@ -169,50 +270,93 @@ const writeLabel = (
   text: string,
   startX: number,
   y: number,
+  tone: Extract<CatalogRadarTone, "label" | "detail">,
 ): void => {
   if (y < 0 || y >= characters.length) return
   for (let index = 0; index < text.length; index += 1) {
     const x = startX + index
     if (x < 0 || x >= characters[y]!.length) continue
     characters[y]![x] = text[index]!
-    tones[y]![x] = "label"
+    tones[y]![x] = tone
   }
+}
+
+type MetricAlignment = "left" | "center" | "right"
+
+const metricStartX = (
+  text: string,
+  anchorX: number,
+  alignment: MetricAlignment,
+): number => alignment === "left"
+  ? anchorX
+  : alignment === "right"
+    ? anchorX - text.length + 1
+    : Math.round(anchorX - text.length / 2)
+
+const writeMetric = (
+  characters: string[][],
+  tones: CatalogRadarTone[][],
+  metric: CatalogRadarMetric,
+  anchorX: number,
+  y: number,
+  alignment: MetricAlignment,
+): void => {
+  writeLabel(
+    characters,
+    tones,
+    metric.name,
+    metricStartX(metric.name, anchorX, alignment),
+    y,
+    "label",
+  )
+  writeLabel(
+    characters,
+    tones,
+    metric.value,
+    metricStartX(metric.value, anchorX, alignment),
+    y + 1,
+    "detail",
+  )
 }
 
 export const renderCatalogRadar = (
   values: CatalogRadarValues,
+  metrics: CatalogRadarMetrics,
   columns = CATALOG_RADAR_COLUMNS,
   rows = CATALOG_RADAR_ROWS,
 ): CatalogRadarFrame => {
-  const safeColumns = Math.max(22, Math.floor(columns))
-  const safeRows = Math.max(7, Math.floor(rows))
+  const safeColumns = Math.max(44, Math.floor(columns))
+  const safeRows = Math.max(13, Math.floor(rows))
   const dotWidth = safeColumns * 2
   const dotHeight = safeRows * 4
-  const chartTop = 4
-  const chartBottom = (safeRows - 1) * 4 - 1
-  const verticalRadius = (chartBottom - chartTop) * 2 / 3
-  const radius = Math.max(7, Math.min(verticalRadius, dotWidth / 2 - 4))
-  // Anchor the base to the bottom Braille dots of the final chart row.
+  const chartTop = 8
+  const radius = 24
+  const upperLabelGap = 2
+  const lowerLabelGap = 3
+  const radii = { x: radius, y: radius }
   const center = {
     x: dotWidth / 2,
-    y: chartBottom - radius / 2,
+    y: chartTop + radius,
   }
   const grid = new Uint8Array(dotWidth * dotHeight)
   const profile = new Uint8Array(dotWidth * dotHeight)
 
-  for (let axis = 0; axis < 3; axis += 1) {
-    drawLine(grid, dotWidth, dotHeight, center, pointOnAxis(center, radius, axis))
+  for (let axis = 0; axis < 5; axis += 1) {
+    drawLine(grid, dotWidth, dotHeight, center, pointOnAxis(center, radii, axis))
   }
-  for (const scale of [1 / 2, 1]) {
-    const points = values.map((_, axis) => pointOnAxis(center, radius * scale, axis))
-    for (let axis = 0; axis < 3; axis += 1) {
-      drawLine(grid, dotWidth, dotHeight, points[axis]!, points[(axis + 1) % 3]!)
+  for (const scale of [1 / 3, 2 / 3, 1]) {
+    const scaledRadii = { x: radii.x * scale, y: radii.y * scale }
+    const points = values.map((_, axis) => pointOnAxis(center, scaledRadii, axis))
+    for (let axis = 0; axis < 5; axis += 1) {
+      drawLine(grid, dotWidth, dotHeight, points[axis]!, points[(axis + 1) % 5]!)
     }
   }
-  const profilePoints = values.map((value, axis) =>
-    pointOnAxis(center, radius * clamp01(value), axis))
-  for (let axis = 0; axis < 3; axis += 1) {
-    drawLine(profile, dotWidth, dotHeight, profilePoints[axis]!, profilePoints[(axis + 1) % 3]!)
+  const profilePoints = values.map((value, axis) => pointOnAxis(center, {
+    x: radii.x * clamp01(value),
+    y: radii.y * clamp01(value),
+  }, axis))
+  for (let axis = 0; axis < 5; axis += 1) {
+    drawLine(profile, dotWidth, dotHeight, profilePoints[axis]!, profilePoints[(axis + 1) % 5]!)
     setDot(profile, dotWidth, dotHeight, profilePoints[axis]!.x, profilePoints[axis]!.y)
   }
 
@@ -229,12 +373,30 @@ export const renderCatalogRadar = (
     }
   }
 
-  const labels = ["INT", "SPD", "ACC"] as const
-  const centerColumn = safeColumns / 2
-  const lowerVertexOffset = Math.cos(Math.PI / 6) * radius / 2
-  writeLabel(characters, tones, labels[0], Math.round(safeColumns / 2 - labels[0].length / 2), 0)
-  writeLabel(characters, tones, labels[1], Math.round(centerColumn + lowerVertexOffset - labels[1].length / 2) + 2, safeRows - 1)
-  writeLabel(characters, tones, labels[2], Math.round(centerColumn - lowerVertexOffset - labels[2].length / 2) - 2, safeRows - 1)
+  const vertices = values.map((_, axis) => pointOnAxis(center, radii, axis))
+  writeMetric(characters, tones, metrics[0], safeColumns / 2, 0, "center")
+  for (const axis of [1, 2] as const) {
+    const vertex = vertices[axis]
+    writeMetric(
+      characters,
+      tones,
+      metrics[axis],
+      Math.floor(vertex.x / 2) + (axis === 1 ? upperLabelGap : lowerLabelGap),
+      Math.max(2, Math.floor(vertex.y / 4) + (axis === 1 ? -2 : 0)),
+      "left",
+    )
+  }
+  for (const axis of [3, 4] as const) {
+    const vertex = vertices[axis]
+    writeMetric(
+      characters,
+      tones,
+      metrics[axis],
+      Math.ceil(vertex.x / 2) - (axis === 4 ? upperLabelGap : lowerLabelGap),
+      Math.max(2, Math.floor(vertex.y / 4) + (axis === 4 ? -2 : 0)),
+      "right",
+    )
+  }
 
   return characters.map((row, y) => {
     const runs: CatalogRadarRun[] = []

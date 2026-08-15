@@ -47,7 +47,7 @@ export const CatalogRadarView = memo(function CatalogRadarView({
   const values = transition !== null && now < transition.startedAt + CATALOG_RADAR_DURATION_MS
     ? catalogRadarTransitionValues(transition, now)
     : profile.value.values
-  const frame = renderCatalogRadar(values)
+  const frame = renderCatalogRadar(values, profile.value.metrics)
   return (
     <box style={{ flexDirection: "column", height: frame.length, minHeight: frame.length, flexShrink: 0 }}>
       {frame.map((row, rowIndex) => (
@@ -59,7 +59,9 @@ export const CatalogRadarView = memo(function CatalogRadarView({
                 ? theme.primary
                 : run.tone === "label"
                   ? theme.foreground
-                  : theme.border}
+                  : run.tone === "detail"
+                    ? theme.muted
+                    : theme.border}
             >
               {run.text}
             </span>
