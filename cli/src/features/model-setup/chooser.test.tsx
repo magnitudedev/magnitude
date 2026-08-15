@@ -11,6 +11,7 @@ import {
 import {
   ONBOARDING_MODEL_DETAIL_ROWS,
   onboardingLocalModelViewportRows,
+  onboardingModelActionLabel,
   onboardingModelDetailRows,
   onboardingSelectionEnterAction,
   onboardingModelRowName,
@@ -65,7 +66,10 @@ describe("onboarding model chooser identity", () => {
       ...base,
       servingState: {
         ...base.servingState,
-        recommendations: [makeRecommendation()],
+        recommendations: [
+          makeRecommendation(),
+          makeRecommendation({ intent: "fastest" }),
+        ],
       },
     }
     const view = makeView({ models: [model], ready: false })
@@ -78,12 +82,35 @@ describe("onboarding model chooser identity", () => {
 
   it("keeps variants in installed model names", () => {
     const model = makeModel()
-    const view = makeView({ models: [model] })
+    const view = makeView({ models: [model], ready: false })
     const [selection] = buildLocalInferenceSelections(view.models, view.slots)
 
     expect(selection).toBeDefined()
     if (!selection) return
     expect(onboardingModelRowName(selection)).toBe("Qwen Test (Q4)")
+  })
+
+  it("shows an installed recommendation instead of the generic load label", () => {
+    const installed = makeModel()
+    const catalog = makeCatalogModel()
+    if (catalog.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    const recommendedCatalogModel = {
+      ...catalog,
+      servingState: {
+        ...catalog.servingState,
+        recommendations: [
+          makeRecommendation(),
+          makeRecommendation({ intent: "fastest" }),
+        ],
+      },
+    }
+    const view = makeView({ models: [installed, recommendedCatalogModel], ready: false })
+    const selections = buildLocalInferenceSelections(view.models, view.slots)
+    const installedSelection = selections.find(({ kind }) => kind === "stored")
+
+    expect(selections).toHaveLength(1)
+    expect(installedSelection && onboardingModelActionLabel(installedSelection))
+      .toBe("Balanced / Fastest")
   })
 
   it("scrolls by presentation identity without copying model fields", () => {
