@@ -9,6 +9,8 @@ import {
 } from "@magnitudedev/sdk"
 import {
   buildModelsMenuEntries,
+  catalogInspectorActionLabel,
+  catalogInspectorActions,
   catalogStatus,
   catalogLocalModels,
   huggingFaceRepositoryUrls,
@@ -130,6 +132,39 @@ describe("unified models menu projection", () => {
       ...makeModel(),
       upgradeState: { _tag: "Available" },
     })).toBe("Update available")
+  })
+
+  it("preserves the established detail actions and labels", () => {
+    const available = makeCatalogOnlyModel()
+    const installed = makeModel()
+    const update = makeModel({ upgradeState: { _tag: "Available" } })
+    const selectedSlot = makeView().slots.slots.primary
+    const downloading = makeCatalogOnlyModel({
+      acquisitionState: {
+        _tag: "Downloading",
+        downloadId: ModelDownloadIdSchema.make("download-a"),
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 4,
+        bytesPerSecond: Option.none(),
+      },
+    })
+
+    expect(catalogInspectorActions(available, { _tag: "Idle" })).toEqual(["primary"])
+    expect(catalogInspectorActions(installed, { _tag: "Idle" })).toEqual(["select", "uninstall"])
+    expect(catalogInspectorActions(update, { _tag: "Idle" })).toEqual(["select", "primary", "uninstall"])
+    expect(catalogInspectorActions(installed, { _tag: "Idle" }, true, selectedSlot)).toEqual(["stop", "uninstall"])
+    expect(catalogInspectorActions(update, { _tag: "Idle" }, true, selectedSlot)).toEqual(["stop", "primary", "uninstall"])
+    expect(catalogInspectorActions(downloading, { _tag: "Idle" })).toEqual(["cancel"])
+    expect(catalogInspectorActions(available, {
+      _tag: "Starting",
+      operation: "Install",
+    })).toEqual([])
+    expect(catalogInspectorActionLabel("primary", available)).toBe("Download (16.0 GiB)")
+    expect(catalogInspectorActionLabel("primary", update)).toBe("Update")
+    expect(catalogInspectorActionLabel("select", installed)).toBe("Select model")
+    expect(catalogInspectorActionLabel("cancel", downloading)).toBe("Cancel download")
+    expect(catalogInspectorActionLabel("stop", installed, selectedSlot)).toBe("Stop model")
   })
 
   it("lists target and separate-draft repositories without treating the draft source as a package", () => {
