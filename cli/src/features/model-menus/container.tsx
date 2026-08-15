@@ -1247,6 +1247,8 @@ export const catalogStatus = (
   model: LocalModel,
   reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
 ): string => {
+  if (reconciliationState._tag === "Removing") return "Removing…"
+  if (reconciliationState._tag === "RemoveFailed") return "Remove failed"
   if (reconciliationState._tag === "Transferring") {
     const verb = reconciliationState.operation === "Update" ? "Updating" : "Downloading"
     return `${verb} ${Math.round(reconciliationState.completedBytes
@@ -1304,9 +1306,13 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
     : catalogStatus(model, reconciliationState)
   const statusColor = pendingDelete
     ? theme.warning
-    : model.acquisitionState._tag === "Failed" || reconciliationState._tag === "Failed"
+    : model.acquisitionState._tag === "Failed"
+      || reconciliationState._tag === "Failed"
+      || reconciliationState._tag === "RemoveFailed"
       ? theme.error
-      : reconciliationState._tag === "Starting" || reconciliationState._tag === "Transferring"
+      : reconciliationState._tag === "Starting"
+        || reconciliationState._tag === "Transferring"
+        || reconciliationState._tag === "Removing"
         || model.acquisitionState._tag === "Downloading"
         || model.acquisitionState._tag === "Installed"
         ? theme.primary
@@ -1399,6 +1405,7 @@ export const catalogInspectorActions = (
   selected = false,
   selectedSlot: CatalogPrimarySlot | null = null,
 ): readonly CatalogInspectorActionId[] => {
+  if (reconciliationState._tag === "Removing") return []
   if (reconciliationState._tag === "Transferring"
     || model.acquisitionState._tag === "Downloading"
     || model.upgradeState._tag === "Upgrading") return ["cancel"]
@@ -1449,7 +1456,9 @@ export const catalogInspectorActionLabel = (
     case "stop": return selectedSlot?._tag === "ConfiguredLocal"
       && Option.exists(selectedSlot.instance, ({ lifecycle }) => lifecycle._tag === "Loading")
       ? "Cancel loading" : "Stop model"
-    case "uninstall": return "Uninstall"
+    case "uninstall": return reconciliationState._tag === "RemoveFailed"
+      ? "Retry uninstall"
+      : "Uninstall"
   }
 }
 
@@ -1459,6 +1468,8 @@ const catalogInspectorStatus = (
   selected: boolean,
   selectedSlot: CatalogPrimarySlot | null,
 ): string => {
+  if (reconciliationState._tag === "Removing") return "REMOVING…"
+  if (reconciliationState._tag === "RemoveFailed") return "REMOVE FAILED"
   if (reconciliationState._tag === "Transferring") {
     const label = reconciliationState.operation === "Update" ? "UPDATING" : "DOWNLOADING"
     return `${label} ${Math.round(reconciliationState.completedBytes / Math.max(1, reconciliationState.totalBytes) * 100)}%`
@@ -1550,7 +1561,9 @@ const CatalogInspector = memo(function CatalogInspector({
           <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
             {truncateToDisplayWidth(formatLocalModelDisplayName(model), Math.max(1, contentWidth - status.length - 1))}
           </text>
-          <text style={{ fg: reconciliationState._tag === "Failed" || model.upgradeState._tag === "Failed" ? theme.error : theme.primary }} wrapMode="none">{status}</text>
+          <text style={{ fg: reconciliationState._tag === "Failed"
+            || reconciliationState._tag === "RemoveFailed"
+            || model.upgradeState._tag === "Failed" ? theme.error : theme.primary }} wrapMode="none">{status}</text>
         </box>
         <text style={{ fg: theme.muted }} wrapMode="none">{description}</text>
         <text> </text>
@@ -1610,7 +1623,9 @@ const CatalogInspector = memo(function CatalogInspector({
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">ACTIONS</text>
         <box style={{ flexDirection: "column" }}>
           {actions.length === 0 ? (
-            <text style={{ fg: theme.muted }}>No actions available</text>
+            <text style={{ fg: theme.muted }}>
+              {reconciliationState._tag === "Removing" ? "Removing…" : "No actions available"}
+            </text>
           ) : actions.map((action, index) => {
             const focused = hoveredAction === action || (actionsFocused && index === actionCursor)
             return action === "uninstall" && confirmingUninstall ? (

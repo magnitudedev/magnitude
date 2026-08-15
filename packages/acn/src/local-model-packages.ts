@@ -292,6 +292,7 @@ export const LocalModelPackagesLive: Layer.Layer<
         Effect.mapError((error) =>
           localModelPackageMutationFailure("refresh_installed_models_failed", error)),
       )
+      yield* project
     }),
   })
 }))
