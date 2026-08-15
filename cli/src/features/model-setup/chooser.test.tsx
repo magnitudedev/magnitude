@@ -9,6 +9,10 @@ import {
   makeView,
 } from "../local-inference/test-fixtures"
 import {
+  ONBOARDING_MODEL_DETAIL_ROWS,
+  onboardingLocalModelViewportRows,
+  onboardingModelDetailRows,
+  onboardingSelectionEnterAction,
   onboardingModelRowName,
   scrollOnboardingModelIntoView,
   type OnboardingModelChooserOperation,
@@ -16,6 +20,44 @@ import {
 import { buildLocalInferenceSelections } from "../local-inference/view-model"
 
 describe("onboarding model chooser identity", () => {
+  it("describes the Enter action from the selected model state", () => {
+    expect(onboardingSelectionEnterAction("recommendation")).toBe("download")
+    expect(onboardingSelectionEnterAction("stored")).toBe("load")
+    expect(onboardingSelectionEnterAction("running")).toBe("select")
+    expect(onboardingSelectionEnterAction(undefined)).toBeNull()
+  })
+
+  it("derives detail height from explicit row regions", () => {
+    expect(onboardingModelDetailRows({
+      recommendation: false,
+      memoryWarning: false,
+      statusRows: 2,
+    })).toBe(22)
+    expect(onboardingModelDetailRows({
+      recommendation: false,
+      memoryWarning: true,
+      statusRows: 5,
+    })).toBe(26)
+    expect(ONBOARDING_MODEL_DETAIL_ROWS).toBe(26)
+  })
+
+  it("lets local models fill the remaining wide-layout rows", () => {
+    expect(onboardingLocalModelViewportRows({
+      wide: true,
+      localCount: 12,
+      detailPanelRows: ONBOARDING_MODEL_DETAIL_ROWS,
+      downloadRows: 5,
+      sectionGap: 1,
+    })).toBe(19)
+    expect(onboardingLocalModelViewportRows({
+      wide: false,
+      localCount: 12,
+      detailPanelRows: ONBOARDING_MODEL_DETAIL_ROWS,
+      downloadRows: 5,
+      sectionGap: 1,
+    })).toBe(4)
+  })
+
   it("keeps variants in downloadable model names", () => {
     const base = makeCatalogModel()
     if (base.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")

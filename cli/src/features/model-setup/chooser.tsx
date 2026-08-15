@@ -4,6 +4,8 @@ import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
+  getAnimationTimeSnapshot,
+  clampTextToVisualLines,
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
   localModelConfigurationId,
@@ -19,27 +21,45 @@ import type {
   ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
+import {
+  PENTAGON_RADAR_COLUMNS,
+  PENTAGON_RADAR_ROWS,
+  pentagonRadarValues,
+  retargetPentagonRadar,
+  type PentagonRadarTransition,
+} from "../../components/pentagon-radar"
+import { PentagonRadarView } from "../../components/pentagon-radar-view"
 import { spinnerFrameAt, useSpinnerFrame } from "../../hooks/use-spinner-frame"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   describeLocalHardwareSummary,
   formatBytes,
+  formatDownloadBytes,
   localInferenceProgressLines,
-  performanceRangeSpeedLabel,
   selectedInferenceIndex,
+  selectionContextLabel,
   selectionConfigurationId,
-  selectionMetadata,
   selectionProviderModelId,
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
+import { localModelRadarAxes } from "../local-inference/model-radar"
 import { slate } from "../../utils/theme"
-import { OnboardingModelDownloadDetails } from "./download-details"
+import { discoveredModelLocation } from "./discovered-model"
+import {
+  OnboardingModelStatusSection,
+  ONBOARDING_MODEL_STATUS_MAX_ROWS,
+} from "./model-status"
 
 const SECTION_VIEWPORT_ROWS = 4
-const DESCRIPTION_ROWS = 5
-const DETAIL_BASE_ROWS = 9
-const WIDE_LIST_WIDTH = 42
+const MODEL_TITLE_ROWS = 1
+const DESCRIPTION_ROWS = 2
+const DESCRIPTION_RADAR_GAP_ROWS = 1
+const RECOMMENDATION_HEADING_ROWS = 1
+const RECOMMENDATION_ROWS = 3
+const STATUS_GAP_ROWS = 1
+const WIDE_LIST_WIDTH = 40
+const WIDE_CHOOSER_MIN_WIDTH = 105
 
 const onboardingModelRowId = (selectionId: string): string =>
   `onboarding-model:${selectionId}`
@@ -51,10 +71,10 @@ export const scrollOnboardingModelIntoView = (
   scrollbox?.scrollChildIntoView(onboardingModelRowId(selectionId))
 }
 
-const setupCardWidth = (width: number): number => Math.max(1, Math.min(96, width - 2))
+const setupCardWidth = (width: number): number => Math.max(1, Math.min(110, width - 2))
 
-const intentLabel = (intent: "balanced" | "best_quality" | "fastest" | "lightweight"): string => {
-  if (intent === "best_quality") return "Best Quality"
+const intentLabel = (intent: "balanced" | "smartest" | "fastest" | "lightweight"): string => {
+  if (intent === "smartest") return "Smartest"
   if (intent === "fastest") return "Fastest"
   if (intent === "lightweight") return "Lightweight"
   return "Balanced"
@@ -136,9 +156,11 @@ const ModelRow = ({
 
 const ModelSectionViewport = ({
   scrollRef,
+  rows,
   children,
 }: {
   readonly scrollRef: Ref<ScrollBoxRenderable | null>
+  readonly rows: number
   readonly children: ReactNode
 }): ReactNode => (
   <scrollbox
@@ -148,9 +170,9 @@ const ModelSectionViewport = ({
     style={{
       flexShrink: 0,
       rootOptions: {
-        height: SECTION_VIEWPORT_ROWS,
-        minHeight: SECTION_VIEWPORT_ROWS,
-        maxHeight: SECTION_VIEWPORT_ROWS,
+        height: rows,
+        minHeight: rows,
+        maxHeight: rows,
         flexShrink: 0,
         backgroundColor: "transparent",
       },
@@ -191,55 +213,6 @@ const minimumBytesLabel = (bytes: number): string => {
 
 const compactMemoryLabel = (bytes: number): string =>
   `${Math.max(0.1, bytes / 1024 ** 3).toFixed(1)} GB`
-
-const memoryGuidanceRows = (memory: LocalModelMemory): number =>
-  memory.currentHeadroomState._tag === "Insufficient" ? 7 : 3
-
-const ModelMemoryGuidanceDetails = ({
-  memory,
-  systemUsedBytes,
-  width,
-}: {
-  readonly memory: LocalModelMemory
-  readonly systemUsedBytes: number | null
-  readonly width: number
-}): ReactNode => {
-  const theme = useTheme()
-  const current = memory.currentHeadroomState
-  if (current._tag === "Insufficient") {
-    return (
-      <box style={{ width, flexDirection: "column", flexShrink: 0 }}>
-        <text style={{ fg: theme.muted, width }} attributes={TextAttributes.BOLD}>MEMORY</text>
-        <text style={{ fg: theme.warning, width }} wrapMode="none">
-          {`! Low memory: Free ${compactMemoryLabel(current.minimumAdditionalAvailableBytes)} to load`}
-        </text>
-        <text style={{ fg: theme.muted, width }} wrapMode="word">
-          {systemUsedBytes === null
-            ? "This model fits on total memory but system memory is currently heavily used."
-            : `This model fits on total memory but system is currently using ${compactMemoryLabel(systemUsedBytes)}.`}
-        </text>
-        <text style={{ fg: theme.muted, width }} wrapMode="word">
-          Close other memory-intensive apps to run this model.
-        </text>
-      </box>
-    )
-  }
-  const guidance = memory.systemUseState._tag === "High"
-      ? {
-          color: theme.warning,
-          text: "! Tight fit: Limited memory remains for other apps",
-        }
-      : {
-          color: theme.muted,
-          text: `Model allocation ${formatBytes(memory.totalRequiredBytes)}`,
-        }
-  return (
-    <box style={{ width, flexDirection: "column", flexShrink: 0 }}>
-      <text style={{ fg: theme.muted, width }} attributes={TextAttributes.BOLD}>MEMORY</text>
-      <text style={{ fg: guidance.color, width }} wrapMode="none">{guidance.text}</text>
-    </box>
-  )
-}
 
 const OnboardingHardwareContext = ({
   hardware,
@@ -289,8 +262,6 @@ const OnboardingSetupCard = ({
         borderStyle: "single",
         borderColor: theme.border,
         customBorderChars: BOX_CHARS,
-        paddingTop: 1,
-        paddingBottom: 1,
         paddingLeft: 2,
         paddingRight: 2,
         flexDirection: "column",
@@ -331,6 +302,69 @@ export type OnboardingModelChooserOperation =
       readonly onChooseAnother: () => void
     }
 
+export const onboardingSelectionEnterAction = (
+  kind: LocalInferenceSelection["kind"] | undefined,
+): "download" | "load" | "select" | null => {
+  if (kind === "recommendation") return "download"
+  if (kind === "stored") return "load"
+  if (kind === "running") return "select"
+  return null
+}
+
+export const onboardingModelDetailRows = ({
+  recommendation,
+  memoryWarning,
+  statusRows,
+}: {
+  readonly recommendation: boolean
+  readonly memoryWarning: boolean
+  readonly statusRows: number
+}): number => MODEL_TITLE_ROWS
+  + DESCRIPTION_ROWS
+  + DESCRIPTION_RADAR_GAP_ROWS
+  + PENTAGON_RADAR_ROWS
+  + (recommendation
+    ? RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS
+    : memoryWarning ? 1 : 0)
+  + STATUS_GAP_ROWS
+  + statusRows
+
+const ONBOARDING_IDLE_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
+  recommendation: true,
+  memoryWarning: false,
+  statusRows: 2,
+})
+
+const ONBOARDING_DOWNLOADING_DETAIL_ROWS = onboardingModelDetailRows({
+  recommendation: false,
+  memoryWarning: true,
+  statusRows: ONBOARDING_MODEL_STATUS_MAX_ROWS,
+})
+
+export const ONBOARDING_MODEL_DETAIL_ROWS = Math.max(
+  ONBOARDING_IDLE_MODEL_DETAIL_ROWS,
+  ONBOARDING_DOWNLOADING_DETAIL_ROWS,
+)
+
+export const onboardingLocalModelViewportRows = ({
+  wide,
+  localCount,
+  detailPanelRows,
+  downloadRows,
+  sectionGap,
+}: {
+  readonly wide: boolean
+  readonly localCount: number
+  readonly detailPanelRows: number
+  readonly downloadRows: number
+  readonly sectionGap: number
+}): number => {
+  if (localCount === 0) return 0
+  if (!wide) return Math.min(SECTION_VIEWPORT_ROWS, localCount)
+  const localHeadingRows = 1
+  return Math.max(1, detailPanelRows - downloadRows - sectionGap - localHeadingRows)
+}
+
 export function OnboardingModelChooser({
   hardware,
   options,
@@ -349,12 +383,16 @@ export function OnboardingModelChooser({
   readonly onSkip: () => void
 }): ReactNode {
   const theme = useTheme()
-  const selections = useMemo(() =>
-    options.filter((selection) =>
+  const { selections, downloads, local } = useMemo(() => {
+    const eligible = options.filter((selection) =>
       selection.kind !== "recommendation"
-        || Option.isSome(selection.recommendation)),
-  [options])
+        || Option.isSome(selection.recommendation))
+    const downloads = eligible.filter(({ kind }) => kind === "recommendation")
+    const local = eligible.filter(({ kind }) => kind === "running" || kind === "stored")
+    return { selections: [...downloads, ...local], downloads, local }
+  }, [options])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
+  const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
   const localScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const downloadScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const activeSelectionId = operation === null
@@ -373,28 +411,40 @@ export function OnboardingModelChooser({
     && selected.model.servingState.assessment._tag === "Fits"
     ? Option.some(selected.model.servingState.assessment.memory)
     : Option.none<LocalModelMemory>()
+  const selectedRadarAxes = selected === undefined
+    ? Option.none()
+    : localModelRadarAxes(selected.model)
   const locked = operation !== null
-  const local = selections.filter(({ kind }) => kind === "running" || kind === "stored")
-  const downloads = selections.filter(({ kind }) => kind === "recommendation")
   const cardWidth = setupCardWidth(width)
-  const wide = cardWidth >= 82
+  const wide = cardWidth >= WIDE_CHOOSER_MIN_WIDTH
   const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
   const detailWidth = wide ? Math.max(1, cardWidth - leftWidth - 9) : leftWidth
-  const localRows = local.length > 0 ? SECTION_VIEWPORT_ROWS + 1 : 0
-  const downloadRows = downloads.length > 0 ? SECTION_VIEWPORT_ROWS + 1 : 0
-  const sectionGap = local.length > 0 && downloads.length > 0 ? 1 : 0
-  const selectedMemoryRows = Option.match(selectedMemory, {
-    onNone: () => 0,
-    onSome: memoryGuidanceRows,
-  })
-  const systemUsedBytes = Result.isSuccess(hardware)
-    ? Math.max(0, hardware.value.totalSystemMemoryBytes - hardware.value.availableSystemMemoryBytes)
+  const statusModel = operation?._tag === "Downloading" ? operation.model : selected?.model
+  const statusOperation = operation?._tag === "Downloading"
+    ? {
+        starting: operation.starting,
+        cancelling: operation.cancelling,
+        cancelError: operation.cancelError,
+        onCancel: operation.onCancel,
+      }
     : null
-  const contentHeight = Math.max(
-    DETAIL_BASE_ROWS + selectedMemoryRows,
-    localRows + sectionGap + downloadRows,
-  )
-  const detailContentHeight = Math.max(1, contentHeight - (wide ? 0 : 1))
+  const detailContentRows = ONBOARDING_MODEL_DETAIL_ROWS
+  const detailPanelRows = detailContentRows + (wide ? 0 : 1)
+  const downloadViewportRows = Math.min(SECTION_VIEWPORT_ROWS, downloads.length)
+  const downloadRows = downloads.length > 0 ? downloadViewportRows + 1 : 0
+  const sectionGap = local.length > 0 && downloads.length > 0 ? 1 : 0
+  const localViewportRows = onboardingLocalModelViewportRows({
+    wide,
+    localCount: local.length,
+    detailPanelRows,
+    downloadRows,
+    sectionGap,
+  })
+  const localRows = local.length > 0 ? localViewportRows + 1 : 0
+  const listRows = downloadRows + sectionGap + localRows
+  const chooserHeight = wide
+    ? Math.max(listRows, detailPanelRows)
+    : listRows + detailPanelRows
   const choose = useCallback((selection: LocalInferenceSelection) => {
     const configurationId = selectionConfigurationId(selection)
     if (Option.isSome(configurationId)) onSelect(configurationId.value)
@@ -403,18 +453,27 @@ export function OnboardingModelChooser({
   const moveSelectionTo = useCallback((index: number) => {
     const selection = selections[index]
     if (!selection) return
+    const fromAxes = selected === undefined ? Option.none() : localModelRadarAxes(selected.model)
+    const toAxes = localModelRadarAxes(selection.model)
+    if (selection.id !== selected?.id && Option.isSome(fromAxes) && Option.isSome(toAxes)) {
+      setRadarTransition(retargetPentagonRadar(
+        pentagonRadarValues(fromAxes.value),
+        pentagonRadarValues(toAxes.value),
+        radarTransition,
+        getAnimationTimeSnapshot(),
+      ))
+    } else {
+      setRadarTransition(null)
+    }
     setSelectedId(Option.some(selection.id))
     scrollOnboardingModelIntoView(
       selection.kind === "recommendation" ? downloadScrollRef.current : localScrollRef.current,
       selection.id,
     )
-  }, [selections])
+  }, [radarTransition, selected, selections])
 
   useKeyboard(useCallback((key: KeyEvent) => {
-    if (locked) {
-      key.preventDefault()
-      return
-    }
+    if (locked) return
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
       moveSelectionTo(Math.max(0, selectedIndex - 1))
@@ -441,30 +500,13 @@ export function OnboardingModelChooser({
 
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
-      {local.length > 0 && <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>ON THIS COMPUTER</text>}
-      {local.length > 0 && (
-        <ModelSectionViewport scrollRef={localScrollRef}>
-          {local.map((selection) => (
-            <ModelRow
-              key={selection.id}
-              selection={selection}
-              selected={selection.id === selected?.id}
-              disabled={locked}
-              width={leftWidth}
-              rowId={onboardingModelRowId(selection.id)}
-              onHover={() => setSelectedId(Option.some(selection.id))}
-              onChoose={() => choose(selection)}
-            />
-          ))}
-        </ModelSectionViewport>
-      )}
       {downloads.length > 0 && (
-        <text style={{ fg: theme.muted, marginTop: local.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
+        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>
           AVAILABLE TO DOWNLOAD
         </text>
       )}
       {downloads.length > 0 && (
-        <ModelSectionViewport scrollRef={downloadScrollRef}>
+        <ModelSectionViewport scrollRef={downloadScrollRef} rows={downloadViewportRows}>
           {downloads.map((selection) => (
             <ModelRow
               key={selection.id}
@@ -473,7 +515,28 @@ export function OnboardingModelChooser({
               disabled={locked}
               width={leftWidth}
               rowId={onboardingModelRowId(selection.id)}
-              onHover={() => setSelectedId(Option.some(selection.id))}
+              onHover={() => moveSelectionTo(selections.indexOf(selection))}
+              onChoose={() => choose(selection)}
+            />
+          ))}
+        </ModelSectionViewport>
+      )}
+      {local.length > 0 && (
+        <text style={{ fg: theme.muted, marginTop: downloads.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
+          ON THIS COMPUTER
+        </text>
+      )}
+      {local.length > 0 && (
+        <ModelSectionViewport scrollRef={localScrollRef} rows={localViewportRows}>
+          {local.map((selection) => (
+            <ModelRow
+              key={selection.id}
+              selection={selection}
+              selected={selection.id === selected?.id}
+              disabled={locked}
+              width={leftWidth}
+              rowId={onboardingModelRowId(selection.id)}
+              onHover={() => moveSelectionTo(selections.indexOf(selection))}
               onChoose={() => choose(selection)}
             />
           ))}
@@ -482,85 +545,152 @@ export function OnboardingModelChooser({
     </box>
   )
 
-  const recommendationIntent = selected && Option.isSome(selected.recommendation)
-    ? intentLabel(selected.recommendation.value.intent)
-    : null
+  const contextLabel = selected === undefined
+    ? null
+    : Option.getOrNull(selectionContextLabel(selected))
+  const titleMetadata = contextLabel === null ? null : `${contextLabel} CONTEXT`
   const titleNameWidth = Math.max(
     1,
-    detailWidth - (recommendationIntent ? recommendationIntent.length + 3 : 0),
+    detailWidth - (titleMetadata === null ? 0 : titleMetadata.length + 1),
   )
+  const memoryWarning = Option.match(selectedMemory, {
+    onNone: () => null,
+    onSome: ({ currentHeadroomState, systemUseState }) =>
+      currentHeadroomState._tag === "Insufficient"
+        ? `! Low memory: Free ${compactMemoryLabel(currentHeadroomState.minimumAdditionalAvailableBytes)} to load`
+        : systemUseState._tag === "High"
+          ? "! Heavy memory use: Limited memory remains for other apps"
+          : null,
+  })
+  const description = selected === undefined
+    ? ""
+    : clampTextToVisualLines(selected.model.presentation.description, detailWidth, DESCRIPTION_ROWS)
+  const discovered = selected?.model.catalogMembershipState._tag !== "InCatalog"
+    ? {
+        location: discoveredModelLocation(selected.model),
+      }
+    : null
+  const recommendationBodyRows = Math.max(
+    1,
+    RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
+  )
+  const recommendationExplanation = selected !== undefined && Option.isSome(selected.recommendation)
+    ? clampTextToVisualLines(
+        selected.recommendation.value.explanation,
+        detailWidth,
+        recommendationBodyRows,
+      )
+    : ""
+  const showRecommendationExplanation = selected !== undefined
+    && Option.isSome(selected.recommendation)
+    && operation?._tag !== "Downloading"
+  const selectedMemoryLabel = Option.match(selectedMemory, {
+    onNone: () => null,
+    onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+  })
+  const idleStatus = selected?.kind === "recommendation"
+    ? `Ready to download (${formatDownloadBytes(selected.model.downloadBytes)})`
+    : selected?.kind === "stored"
+      ? `Ready to load${selectedMemoryLabel === null ? "" : ` (${selectedMemoryLabel} memory)`}`
+      : selected?.kind === "running"
+        ? `Ready to use${selectedMemoryLabel === null ? "" : ` (${selectedMemoryLabel} memory)`}`
+        : "Unavailable"
   const emptySelectionMessage = "No compatible models found."
   const regularDetails = selected ? (
     <>
       <DetailRow width={detailWidth}>
-        <text
-          style={{ fg: theme.foreground, width: detailWidth }}
-          attributes={TextAttributes.BOLD}
-          wrapMode="none"
-        >
+        <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
           {truncateToDisplayWidth(onboardingModelRowName(selected), titleNameWidth)}
-          {recommendationIntent && <span fg={theme.primary}>{`   ${recommendationIntent}`}</span>}
         </text>
-      </DetailRow>
-      <DetailRow width={detailWidth}>
-        <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
-          {selectionMetadata(selected)}
-        </text>
-      </DetailRow>
-      {Option.isSome(selected.recommendation) && (
-        <DetailRow width={detailWidth}>
-          <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
-            {performanceRangeSpeedLabel(selected.model)}
+        {titleMetadata && (
+          <text style={{ fg: theme.muted }} wrapMode="none">
+            {titleMetadata}
           </text>
-        </DetailRow>
-      )}
-      <box style={{ height: 1, flexShrink: 0 }} />
+        )}
+      </DetailRow>
       <box style={{
         width: detailWidth,
+        height: DESCRIPTION_ROWS,
+        minHeight: DESCRIPTION_ROWS,
         maxHeight: DESCRIPTION_ROWS,
         flexShrink: 0,
         flexDirection: "column",
         overflow: "hidden",
       }}>
-        <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="word">
-          {Option.isSome(selected.recommendation)
-            ? selected.recommendation.value.explanation
-            : selected.kind === "running"
-              ? "Loaded in memory and ready to use."
-              : "Downloaded on this computer and ready to load."}
-        </text>
+        {discovered === null ? (
+          <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
+            {description}
+          </text>
+        ) : (
+          <>
+            <text style={{ fg: theme.muted, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
+              DISCOVERED MODEL
+            </text>
+            <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
+              {truncateToDisplayWidth(discovered.location, detailWidth)}
+            </text>
+          </>
+        )}
       </box>
-      {Option.isSome(selectedMemory) && (
-        <>
-          <box style={{ height: 1, flexShrink: 0 }} />
-          <ModelMemoryGuidanceDetails
-            memory={selectedMemory.value}
-            systemUsedBytes={systemUsedBytes}
-            width={detailWidth}
+      <box style={{ height: 1, flexShrink: 0 }} />
+      {Option.match(selectedRadarAxes, {
+        onNone: () => <box style={{ height: PENTAGON_RADAR_ROWS, minHeight: PENTAGON_RADAR_ROWS, flexShrink: 0 }} />,
+        onSome: (axes) => (
+          <PentagonRadarView
+            axes={axes}
+            transition={radarTransition}
+            columns={Math.min(PENTAGON_RADAR_COLUMNS, detailWidth)}
           />
-        </>
+        ),
+      })}
+      {showRecommendationExplanation && (
+        <box style={{
+          height: RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS,
+          minHeight: RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS,
+          maxHeight: RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS,
+          flexDirection: "column",
+          flexShrink: 0,
+          overflow: "hidden",
+        }}>
+            <text style={{ fg: theme.muted, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
+              WHY THIS MODEL
+            </text>
+            <box style={{
+              height: recommendationBodyRows,
+              minHeight: recommendationBodyRows,
+              maxHeight: recommendationBodyRows,
+              flexDirection: "column",
+              flexShrink: 0,
+              overflow: "hidden",
+            }}>
+              <text style={{ fg: theme.muted, width: detailWidth }} wrapMode="none">
+                {recommendationExplanation}
+              </text>
+            </box>
+            {memoryWarning && (
+              <text style={{ fg: theme.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
+            )}
+        </box>
       )}
+      {!showRecommendationExplanation && memoryWarning && (
+        <text style={{ fg: theme.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
+      )}
+      <box style={{ flexGrow: 1, minHeight: STATUS_GAP_ROWS }} />
+      <OnboardingModelStatusSection
+        model={statusModel ?? selected.model}
+        width={detailWidth}
+        idleStatus={idleStatus}
+        operation={statusOperation}
+      />
     </>
   ) : (
     <text style={{ fg: theme.muted }}>{emptySelectionMessage}</text>
   )
-  const detailsContent = operation?._tag === "Downloading" ? (
-    <OnboardingModelDownloadDetails
-      model={operation.model}
-      width={detailWidth}
-      height={detailContentHeight}
-      operation={{
-        starting: operation.starting,
-        cancelling: operation.cancelling,
-        cancelError: operation.cancelError,
-        onCancel: operation.onCancel,
-      }}
-    />
-  ) : operation?._tag === "Activating" ? (
+  const detailsContent = operation?._tag === "Activating" ? (
     <OnboardingModelLoadingDetails
       displayName={operation.displayName}
       width={detailWidth}
-      height={detailContentHeight}
+      height={detailContentRows}
       phase={operation.phase}
       failed={operation.failure}
       onRetry={operation.onRetry}
@@ -572,12 +702,11 @@ export function OnboardingModelChooser({
       flexDirection: "column",
       flexGrow: wide ? 1 : 0,
       minWidth: 0,
-      height: contentHeight,
-      minHeight: contentHeight,
-      maxHeight: contentHeight,
+      height: detailPanelRows,
+      minHeight: detailPanelRows,
+      maxHeight: detailPanelRows,
       overflow: "hidden",
       paddingLeft: wide ? 2 : 0,
-      paddingTop: wide ? 0 : 1,
       borderStyle: "single",
       border: wide ? ["left"] : ["top"],
       borderColor: theme.border,
@@ -586,6 +715,10 @@ export function OnboardingModelChooser({
       {detailsContent}
     </box>
   )
+  const enterAction = onboardingSelectionEnterAction(selected?.kind)
+  const selectionHint = enterAction === null
+    ? "Esc skip for now"
+    : `↑/↓ choose · Enter to ${enterAction} · Esc skip for now`
   const interactionHint = operation?._tag === "Downloading"
       ? "Download in progress · Esc cancel"
       : operation?._tag === "Configuring"
@@ -603,9 +736,9 @@ export function OnboardingModelChooser({
         ({ currentHeadroomState }) => currentHeadroomState._tag === "Insufficient",
       )
       ? selected?.kind === "stored"
-        ? "Close memory-intensive apps, then Enter to retry · Esc choose another"
-        : "Close memory-intensive apps before loading · Enter select · Esc skip for now"
-      : "↑/↓ choose · Enter select · Esc skip for now"
+        ? "Close memory-intensive apps, then Enter to load · Esc choose another"
+        : selectionHint
+      : selectionHint
 
   return (
     <OnboardingSetupCard
@@ -616,18 +749,18 @@ export function OnboardingModelChooser({
       <box style={{
         flexDirection: wide ? "row" : "column",
         width: "100%",
-        height: wide ? contentHeight : contentHeight * 2,
-        minHeight: wide ? contentHeight : contentHeight * 2,
-        maxHeight: wide ? contentHeight : contentHeight * 2,
+        height: chooserHeight,
+        minHeight: chooserHeight,
+        maxHeight: chooserHeight,
         overflow: "hidden",
       }}>
         {list}
         {details}
       </box>
-      {error && <text style={{ fg: theme.error, marginTop: 1 }}>{error}</text>}
+      {error && <text style={{ fg: theme.error, marginTop: 1 }} wrapMode="none">{error}</text>}
       <box style={{ height: 1 }} />
-      <text style={{ fg: slate[200] }}>You can switch models or download more anytime from /settings.</text>
-      <text style={{ fg: theme.muted }}>{interactionHint}</text>
+      <text style={{ fg: slate[200] }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
+      <text style={{ fg: theme.muted }} wrapMode="none">{interactionHint}</text>
     </OnboardingSetupCard>
   )
 }

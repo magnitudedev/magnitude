@@ -51,6 +51,7 @@ export function ComposerContainer({
   modelSetupInProgress,
   modelSetupPlaceholder,
   notificationState,
+  openSetup,
 }: {
   chatColumnWidth: number
   clientWorkingDirectory: string
@@ -60,6 +61,7 @@ export function ComposerContainer({
   modelSetupInProgress: boolean
   modelSetupPlaceholder: string | null
   notificationState: NotificationState | null
+  openSetup: () => void
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
@@ -107,9 +109,10 @@ export function ComposerContainer({
     openModelMenu: (root) => setMenu({ open: true, root }),
     toggleTranscript: togglePresentationMode,
     openUsage: () => setUsageOpen(true),
+    openSetup,
     openCloud: () => setMenu({ open: true, root: 'cloud' }),
     toggleAutopilot: () => { /* disabled */ },
-  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, togglePresentationMode])
+  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, openSetup, togglePresentationMode])
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {

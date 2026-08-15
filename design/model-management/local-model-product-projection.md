@@ -67,7 +67,9 @@ collections.
 
 `acquisitionState` describes first acquisition. `upgradeState` is `NotApplicable`, `Current`,
 `Available`, `Upgrading`, or `Failed`. An installed model may remain selectable while its upgrade
-state is `Available` or `Upgrading`.
+state is `Available` or `Upgrading`. Installed acquisition carries the exact package identity,
+filesystem path, and installation origin for every package in the effective bundle. An installed
+product row without a complete, non-empty set of package locations is invalid.
 
 Catalog membership carries structured branded identity components. Only the local provider adapter
 serializes them into a provider-model identity. Configurations, product rows, and upgrade state are
@@ -82,3 +84,4 @@ derived and never persisted.
 - Completed files, not download history or cached state, determine presence.
 - Catalog or attribution failure cannot hide an installed target.
 - Clients consume acquisition, reconciliation, serving, and recommendation state from one row.
+- Every installed row carries the exact current filesystem location of every bundle package.

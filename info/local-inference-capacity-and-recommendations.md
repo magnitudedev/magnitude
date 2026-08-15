@@ -30,14 +30,14 @@ full context, and Balanced speed utility uses 5 tokens per second as its zero po
 relative speed comparisons use the 50K estimate, bounded by the configured context. The UI shows
 the expected-speed range between the bounded 25K and 75K points.
 The service ranks
-eligible candidates into material Balanced, Best Quality, Fastest, and Lightweight intents using
+eligible candidates into material Balanced, Smartest, Fastest, and Lightweight intents using
 common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
 fidelity, and download size. Multiple quantizations of one checkpoint may appear when they explain
 a real quality trade-off; duplicate filler cards are omitted. Lightweight chooses the most capable
 usable configuration in a low-memory tier derived from the configuration's stable post-reserve
 physical memory domains, and is omitted when no distinct configuration is materially lighter than
 Balanced. The UI always presents these intents as
-Balanced, Best Quality, Fastest, then Lightweight, and explains each specialized option by comparing
+Balanced, Smartest, Fastest, then Lightweight, and explains each specialized option by comparing
 its capability, speed, context, footprint, and possible quality loss with Balanced. The UI continues
 to show recommendations, exact artifact details, hardware, download progress, downloaded models,
 activation, restart, unload, and deletion. Download and load progress update the ICN inventory

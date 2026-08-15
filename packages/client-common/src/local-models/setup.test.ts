@@ -87,7 +87,11 @@ const makeModel = (installed: boolean): LocalModel => {
     },
     upgradeState: installed ? { _tag: "Current" } : { _tag: "NotApplicable" },
     acquisitionState: installed
-      ? { _tag: "Installed", installedBytes: 1, origins: ["Magnitude"] }
+      ? {
+          _tag: "Installed",
+          installedBytes: 1,
+          packages: [{ packageId: bundle.package.id, path: "/models/setup.gguf", origin: "Magnitude" }],
+        }
       : { _tag: "NotInstalled", completedBytes: 0, totalBytes: 1 },
     servingState: {
       _tag: "Assessed",

@@ -29,16 +29,18 @@ const useRadarAnimationTime = (transition: PentagonRadarTransition | null): numb
 export const PentagonRadarView = memo(function PentagonRadarView({
   axes,
   transition,
+  columns,
 }: {
   readonly axes: PentagonRadarAxes
   readonly transition: PentagonRadarTransition | null
+  readonly columns?: number
 }) {
   const theme = useTheme()
   const now = useRadarAnimationTime(transition)
   const values = transition !== null && now < transition.startedAt + PENTAGON_RADAR_DURATION_MS
     ? pentagonRadarTransitionValues(transition, now)
     : undefined
-  const frame = renderPentagonRadar(axes, values)
+  const frame = renderPentagonRadar(axes, values, columns)
   return (
     <box style={{ flexDirection: "column", height: frame.length, minHeight: frame.length, flexShrink: 0 }}>
       {frame.map((row, rowIndex) => (

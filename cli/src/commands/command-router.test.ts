@@ -15,6 +15,7 @@ function createContext(overrides: Partial<CommandContext> = {}): CommandContext 
     initProject: vi.fn(),
     openSettings: vi.fn(),
     openUsage: vi.fn(),
+    openSetup: vi.fn(),
     openCloud: vi.fn(),
     openModelMenu: vi.fn(),
     toggleTranscript: vi.fn(),
@@ -57,6 +58,19 @@ describe('routeSlashCommand', () => {
     const ctx = createContext()
     expect(routeSlashCommand('/transcript', ctx)._tag).toBe('Handled')
     expect(ctx.toggleTranscript).toHaveBeenCalledTimes(1)
+  })
+
+  test('/setup reopens onboarding setup', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/setup', ctx)._tag).toBe('Handled')
+    expect(ctx.openSetup).toHaveBeenCalledTimes(1)
+  })
+
+  test('leaves /setup unhandled when the client has no onboarding surface', () => {
+    const ctx = createContext()
+    delete ctx.openSetup
+
+    expect(routeSlashCommand('/setup', ctx)._tag).toBe('Unhandled')
   })
 
   test('unknown command is not handled', () => {

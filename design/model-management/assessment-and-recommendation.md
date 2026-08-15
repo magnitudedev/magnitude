@@ -181,7 +181,7 @@ ACN selects at most one configuration for each intent:
 | Intent | Objective |
 |---|---|
 | `balanced` | Overall capability, speed, memory, fidelity, and download utility |
-| `best_quality` | Highest useful capability and fidelity within resource guards |
+| `smartest` | Highest useful capability and fidelity within resource guards |
 | `fastest` | Highest useful generation speed within capability guards |
 | `lightweight` | Highest useful capability within a low-memory tier relative to stable hardware capacity |
 

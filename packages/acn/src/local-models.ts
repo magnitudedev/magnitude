@@ -64,12 +64,22 @@ const installedBundle = (
     return undefined
   }
   const installedBytes = bundleDownloadBytes(bundle)
-  const [origin, ...remainingOrigins] = [...new Set(packageEntries.flatMap((entry) =>
-    entry?.localState._tag === "Installed" ? [entry.localState.origin] : []))]
-  if (origin === undefined) {
-    throw new Error("Installed servable model bundle has no installation origin")
+  const installedPackages = packages.map((modelPackage, index) => {
+    const entry = packageEntries[index]
+    if (entry?.localState._tag !== "Installed") {
+      throw new Error(`Installed bundle package ${modelPackage.id} has no installed location`)
+    }
+    return {
+      packageId: modelPackage.id,
+      path: entry.localState.path,
+      origin: entry.localState.origin,
+    }
+  })
+  const [firstPackage, ...remainingPackages] = installedPackages
+  if (firstPackage === undefined) {
+    throw new Error("Installed servable model bundle has no installed package location")
   }
-  return { _tag: "Installed", installedBytes, origins: [origin, ...remainingOrigins] }
+  return { _tag: "Installed", installedBytes, packages: [firstPackage, ...remainingPackages] }
 }
 
 export const aggregateAcquisitionState = (

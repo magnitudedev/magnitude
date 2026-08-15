@@ -196,6 +196,7 @@ function OnboardingGate(
   const onboarding = useOnboardingState();
   const { slots, retry: retryProfiles } = useSlotProfiles();
   const controller = useDisplayViewController();
+  const openSetup = useCallback(() => onboarding.update(false), [onboarding.update]);
 
   if (Result.isFailure(onboarding.state)) {
     return (
@@ -247,6 +248,7 @@ function OnboardingGate(
       modelsReadyForInitialWork={modelsReadyForInitialWork}
       modelSetupActive={modelSetupActive}
       updateOnboardingResult={onboarding.updateResult}
+      openSetup={openSetup}
     />
   );
 }
@@ -259,6 +261,7 @@ function CliAppContent(
     readonly updateOnboardingResult: ReturnType<
       typeof useOnboardingState
     >["updateResult"];
+    readonly openSetup: () => void;
   }
 ): ReactNode {
   useSessionPreload(!props.modelSetupActive);
@@ -570,6 +573,7 @@ function CliAppContent(
                     props.modelSetupActive ? modelSetupPlaceholder : null
                   }
                   notificationState={notificationState}
+                  openSetup={props.openSetup}
                 />
               )}
             </box>
