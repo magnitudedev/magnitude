@@ -258,7 +258,7 @@ function makeProps(): ComposerProps {
     autopilotEnabled: false,
     autopilotGenerating: false,
     submitUserMessage: () => {},
-    runSlashCommand: () => false,
+    runSlashCommand: () => ({ _tag: 'Unhandled' }),
     executeBash: () => true,
     clearSystemBanners: noop,
     interruptFork: noop,

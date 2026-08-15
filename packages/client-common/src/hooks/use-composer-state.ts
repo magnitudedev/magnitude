@@ -15,7 +15,7 @@ import { useAgentClient } from "../state/agent-client-context"
 import { useDisplayState } from "../state/display-state-store"
 import { useSlotProfiles } from "./use-slot-profiles"
 import { getDraftSessionOwnerId } from "./draft-session-owner"
-import { routeSlashCommand, type CommandContext } from "../commands/command-router"
+import { routeSlashCommand, type CommandContext, type SlashCommandOutcome } from "../commands/command-router"
 import type { MentionSearchClient } from "./use-file-mentions"
 import {
   selectedCwdAtom,
@@ -73,7 +73,7 @@ export interface UseComposerStateResult {
   /** Run a bash command. The persisted event is the display source of truth. */
   handleRunBash: (command: string) => Promise<boolean>
   /** Handle a slash command string */
-  handleSlashCommand: (cmdText: string) => void
+  handleSlashCommand: (cmdText: string) => SlashCommandOutcome
   /** Mention search client (null if runtime not ready) */
   mentionClient: MentionSearchClient | null
   /** Currently selected session ID */
@@ -331,9 +331,10 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     }
   }, [selectedSessionId, runBashMutation, commandContext])
 
-  const handleSlashCommand = useCallback((cmdText: string) => {
-    routeSlashCommand(cmdText, commandContext)
-  }, [commandContext])
+  const handleSlashCommand = useCallback(
+    (cmdText: string): SlashCommandOutcome => routeSlashCommand(cmdText, commandContext),
+    [commandContext],
+  )
 
   return {
     roleLabel: rootRoleLabel,

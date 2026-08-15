@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { filterSlashCommands } from '../commands/command-router'
+import { filterSlashCommands, type SlashCommandOutcome } from '../commands/command-router'
 import type { SlashCommandDefinition } from '../commands/slash-commands'
 import type { KeyEvent } from '../types/key-event'
 
@@ -63,7 +63,7 @@ export function getSlashCommandMenuAction(
  */
 export function useSlashCommands(
   inputText: string,
-  onExecute: (commandText: string) => void,
+  onExecute: (commandText: string) => SlashCommandOutcome,
 ): SlashCommandsState {
   const [selection, setSelection] = useState({ signature: '', index: 0 })
 
@@ -92,7 +92,7 @@ export function useSlashCommands(
     if (!action) return false
 
     if (action._tag === 'Select') setSelectedIndex(action.index)
-    if (action._tag === 'Execute') onExecute(action.commandText)
+    if (action._tag === 'Execute') return onExecute(action.commandText)._tag === 'Handled'
     return true
   }, [isSlashMenuOpen, filteredCommands, selectedIndex, onExecute, setSelectedIndex])
 
