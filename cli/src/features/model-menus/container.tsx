@@ -18,11 +18,13 @@ import {
   modelSlotInstanceId,
   modelSlotResidentAllocation,
   getDisplayWidth,
+  getAnimationTimeSnapshot,
   localModelConfigurationId,
   localModelProviderModelId,
   localModelCapabilities,
   localModelSpeculativeMethodLabel,
   truncateToDisplayWidth,
+  wrapTextToVisualLines,
   type NotificationState,
   usePlatform,
   useLocalInferenceHardware,
@@ -76,10 +78,18 @@ import { deriveSettingsAuthInfo } from "../overlays/auth-display"
 import {
   catalogDetailHints,
   catalogListHints,
+  CATALOG_INSPECTOR_CONTENT_WIDTH,
+  CATALOG_SPLIT_INSPECTOR_HEIGHTS,
   deriveCatalogLayout,
   formatCatalogModelLabel,
   type CatalogLayout,
 } from "./catalog-layout"
+import {
+  catalogRadarProfile,
+  retargetCatalogRadar,
+  type CatalogRadarTransition,
+} from "./catalog-radar"
+import { CatalogRadarView } from "./catalog-radar-view"
 import {
   modelMenusLocalModelsStateEquivalent,
   selectModelMenusLocalModelsState,
@@ -155,6 +165,13 @@ const formatContextWindow = (tokens: number): string =>
     : tokens >= 1_000
       ? `${Math.round(tokens / 1_000)}K`
       : String(tokens)
+
+const twoLineText = (value: string, width: number): string => {
+  const lines = wrapTextToVisualLines(value, width)
+  return lines.length <= 2
+    ? lines.join("\n")
+    : `${lines[0]}\n${truncateToDisplayWidth(`${lines[1]}…`, width)}`
+}
 
 const providerModelKey = (model: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">): string =>
   `${model.providerId}:${model.providerModelId}`
@@ -655,12 +672,14 @@ const MenuAction = memo(function MenuAction({
   tone = "normal",
   onClick,
   onMouseOver,
+  onMouseOut,
 }: {
   readonly label: string
   readonly focused: boolean
   readonly tone?: MenuActionTone
   readonly onClick: () => void
   readonly onMouseOver: () => void
+  readonly onMouseOut?: () => void
 }) {
   const theme = useTheme()
   const color = focused
@@ -675,7 +694,7 @@ const MenuAction = memo(function MenuAction({
             ? theme.error
             : theme.foreground
   return (
-    <Button onClick={onClick} onMouseOver={onMouseOver}>
+    <Button onClick={onClick} onMouseOver={onMouseOver} onMouseOut={onMouseOut}>
       <text style={{ fg: color }}>{focused ? "› " : "  "}{label}</text>
     </Button>
   )
@@ -1255,8 +1274,9 @@ export const catalogStatus = (
 const CatalogCandidateRow = memo(function CatalogCandidateRow({
   model,
   memoryBytes,
-  recommendation,
+  highlighted,
   focused,
+  selected,
   pendingDelete,
   reconciliationState,
   index,
@@ -1267,8 +1287,9 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
 }: {
   readonly model: LocalModel
   readonly memoryBytes: number | undefined
-  readonly recommendation: Option.Option<LocalModelRecommendation>
+  readonly highlighted: boolean
   readonly focused: boolean
+  readonly selected: boolean
   readonly pendingDelete: boolean
   readonly reconciliationState: CatalogModelReconciliationState
   readonly index: number
@@ -1279,7 +1300,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
 }) {
   const theme = useTheme()
   const status = pendingDelete
-    ? "Delete [y/n]"
+    ? "Remove? ↵/Esc"
     : catalogStatus(model, reconciliationState)
   const statusColor = pendingDelete
     ? theme.warning
@@ -1290,80 +1311,13 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         || model.acquisitionState._tag === "Installed"
         ? theme.primary
         : theme.muted
-  const recommendationText = recommendationLabel(recommendation)
   const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
   const speculativeMethod = localModelSpeculativeMethodLabel(model)
   const speculativeText = Option.getOrElse(speculativeMethod, () => "—")
-  const backgroundColor = focused
+  const backgroundColor = highlighted
     ? theme.surfaceHover
     : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
-
-  if (layout.stackedRows) {
-    const cursorWidth = 2
-    const primaryStatusWidth = layout.mode === "minimal"
-      ? 0
-      : Math.min(getDisplayWidth(status), Math.max(1, layout.contentWidth - cursorWidth - 1))
-    const secondaryStatusWidth = layout.mode === "minimal"
-      ? Math.min(getDisplayWidth(`${status} · `), Math.max(1, layout.contentWidth - cursorWidth - 1))
-      : 0
-    const modelWidth = Math.max(1, layout.contentWidth - cursorWidth - primaryStatusWidth)
-    const modelLabel = formatCatalogModelLabel(
-      model.presentation.displayName,
-      model.presentation.variantLabel,
-      modelWidth,
-    )
-    const metadata = [
-      recommendationText,
-      memoryText,
-      ...Option.match(speculativeMethod, { onNone: () => [], onSome: (method) => [method] }),
-      ...(layout.showSpeed ? [speedText] : []),
-    ]
-      .filter((value) => value !== "")
-      .join(" · ")
-    const metadataWidth = Math.max(1, layout.contentWidth - cursorWidth - secondaryStatusWidth)
-
-    return (
-      <Button
-        id={rowId}
-        onClick={onClick}
-        onMouseOver={onMouseOver}
-        style={{
-          flexDirection: "column",
-          width: "100%",
-          height: 2,
-          minHeight: 2,
-          flexShrink: 0,
-          backgroundColor,
-        }}
-      >
-        <box style={{ flexDirection: "row", width: "100%", height: 1, flexShrink: 0 }}>
-          <text style={{ fg: focused ? theme.primary : theme.foreground, width: cursorWidth }} wrapMode="none">
-            {focused ? "›" : " "}
-          </text>
-          <text style={{ fg: focused ? theme.primary : theme.foreground, width: modelWidth }} wrapMode="none">
-            {modelLabel}
-          </text>
-          {layout.mode !== "minimal" && (
-            <text style={{ fg: statusColor, width: primaryStatusWidth }} wrapMode="none">
-              {truncateToDisplayWidth(status, primaryStatusWidth)}
-            </text>
-          )}
-        </box>
-        <box style={{ flexDirection: "row", width: "100%", height: 1, flexShrink: 0 }}>
-          <text style={{ width: cursorWidth }}> </text>
-          {layout.mode === "minimal" && (
-            <text style={{ fg: statusColor, width: secondaryStatusWidth }} wrapMode="none">
-              {truncateToDisplayWidth(`${status} · `, secondaryStatusWidth)}
-            </text>
-          )}
-          <text style={{ fg: theme.muted, width: metadataWidth }} wrapMode="none">
-            {truncateToDisplayWidth(metadata, metadataWidth)}
-          </text>
-        </box>
-      </Button>
-    )
-  }
 
   return (
     <Button
@@ -1381,33 +1335,24 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
       }}
     >
       <text style={{ fg: focused ? theme.primary : theme.foreground, width: 1 }} wrapMode="none">
-        {focused ? "›" : " "}
+        {selected ? "●" : focused ? "›" : " "}
       </text>
       <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
         {formatCatalogModelLabel(model.presentation.displayName, model.presentation.variantLabel, layout.modelWidth)}
       </text>
-      <text style={{ fg: theme.primary, width: layout.columns.recommendation }} wrapMode="none">
-        {truncateToDisplayWidth(recommendationText, layout.columns.recommendation)}
-      </text>
-      <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">
-        {truncateToDisplayWidth(memoryText, layout.columns.memory)}
-      </text>
-      <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">
-        {truncateToDisplayWidth(speculativeText, layout.columns.speculative)}
-      </text>
-      {layout.showIntelligence && (
-        <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">
-          {truncateToDisplayWidth(intelligenceLabel(model), layout.columns.intelligence)}
-        </text>
-      )}
-      {layout.showQuality && (
-        <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">
-          {truncateToDisplayWidth(qualityLabel(model), layout.columns.quality)}
+      {layout.showMemory && (
+        <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">
+          {truncateToDisplayWidth(memoryText, layout.columns.memory)}
         </text>
       )}
       {layout.showSpeed && (
         <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">
           {truncateToDisplayWidth(speedText, layout.columns.speed)}
+        </text>
+      )}
+      {layout.showSpeculative && (
+        <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">
+          {truncateToDisplayWidth(speculativeText, layout.columns.speculative)}
         </text>
       )}
       <text style={{ fg: statusColor, width: layout.columns.status }} wrapMode="none">
@@ -1417,12 +1362,288 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   )
 })
 
+export type CatalogInspectorActionId =
+  | "primary"
+  | "select"
+  | "cancel"
+  | "load"
+  | "stop"
+  | "uninstall"
+
+type CatalogPrimarySlot = ModelSlotsState["slots"]["primary"]
+
+interface CatalogActionHoverTarget {
+  readonly configurationId: string
+  readonly action: CatalogInspectorActionId
+}
+
+const catalogModelIsSelected = (
+  model: LocalModel,
+  selected: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): boolean => Option.exists(selected, (selection) =>
+  selection.providerId === LOCAL_PROVIDER_ID
+  && Option.contains(localModelProviderModelId(model), selection.providerModelId))
+
+const catalogSlotForModel = (
+  model: LocalModel,
+  slot: CatalogPrimarySlot | null,
+): CatalogPrimarySlot | null => slot?._tag === "ConfiguredLocal"
+  && slot.selection.providerId === LOCAL_PROVIDER_ID
+  && Option.contains(localModelProviderModelId(model), slot.selection.providerModelId)
+  ? slot
+  : null
+
+export const catalogInspectorActions = (
+  model: LocalModel,
+  reconciliationState: CatalogModelReconciliationState,
+  selected = false,
+  selectedSlot: CatalogPrimarySlot | null = null,
+): readonly CatalogInspectorActionId[] => {
+  if (reconciliationState._tag === "Transferring"
+    || model.acquisitionState._tag === "Downloading"
+    || model.upgradeState._tag === "Upgrading") return ["cancel"]
+  if (reconciliationState._tag === "Starting") return []
+  if (model.acquisitionState._tag !== "Installed") return ["primary"]
+
+  const actions: CatalogInspectorActionId[] = []
+  if (!selected) {
+    if (model.servingState._tag === "Assessed"
+      && model.servingState.availabilityState._tag === "Selectable") actions.push("select")
+  } else if (selectedSlot?._tag === "ConfiguredLocal") {
+    if (selectedSlot.actions.some((action) => action === "Load" || action === "RetryLoad")) actions.push("load")
+    else if (selectedSlot.actions.includes("Stop")) actions.push("stop")
+  }
+  if (model.upgradeState._tag === "Available"
+    || model.upgradeState._tag === "Failed") actions.push("primary")
+  actions.push("uninstall")
+  return actions
+}
+
+export const catalogInspectorActionLabel = (
+  action: CatalogInspectorActionId,
+  model: LocalModel,
+  selectedSlot: CatalogPrimarySlot | null = null,
+  reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
+): string => {
+  switch (action) {
+    case "select": return "Select model"
+    case "primary": {
+      if (reconciliationState._tag === "Failed" && reconciliationState.operation === "Update") {
+        return "Retry update"
+      }
+      if (model.upgradeState._tag === "Available") return "Update"
+      if (model.upgradeState._tag === "Failed") return "Retry update"
+      const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "Failed"
+        ? "Retry download"
+        : "Download"
+      const totalBytes = model.acquisitionState._tag === "Installed"
+        ? model.downloadBytes
+        : model.acquisitionState.totalBytes
+      return `${verb} (${formatBytes(totalBytes)})`
+    }
+    case "cancel": return reconciliationState._tag === "Transferring"
+      ? reconciliationState.operation === "Update" ? "Cancel update" : "Cancel download"
+      : model.upgradeState._tag === "Upgrading" ? "Cancel update" : "Cancel download"
+    case "load": return selectedSlot?._tag === "ConfiguredLocal"
+      && selectedSlot.actions.includes("RetryLoad") ? "Retry loading" : "Load model"
+    case "stop": return selectedSlot?._tag === "ConfiguredLocal"
+      && Option.exists(selectedSlot.instance, ({ lifecycle }) => lifecycle._tag === "Loading")
+      ? "Cancel loading" : "Stop model"
+    case "uninstall": return "Uninstall"
+  }
+}
+
+const catalogInspectorStatus = (
+  model: LocalModel,
+  reconciliationState: CatalogModelReconciliationState,
+  selected: boolean,
+  selectedSlot: CatalogPrimarySlot | null,
+): string => {
+  if (reconciliationState._tag === "Transferring") {
+    const label = reconciliationState.operation === "Update" ? "UPDATING" : "DOWNLOADING"
+    return `${label} ${Math.round(reconciliationState.completedBytes / Math.max(1, reconciliationState.totalBytes) * 100)}%`
+  }
+  if (reconciliationState._tag === "Starting") return reconciliationState.operation === "Update"
+    ? "STARTING UPDATE…" : "STARTING DOWNLOAD…"
+  if (reconciliationState._tag === "Failed") return reconciliationState.operation === "Update"
+    ? "UPDATE FAILED" : "DOWNLOAD FAILED"
+  if (model.acquisitionState._tag === "Downloading") {
+    return `DOWNLOADING ${Math.round(model.acquisitionState.completedBytes / Math.max(1, model.acquisitionState.totalBytes) * 100)}%`
+  }
+  if (model.upgradeState._tag === "Upgrading") {
+    return `UPDATING ${Math.round(model.upgradeState.completedBytes / Math.max(1, model.upgradeState.totalBytes) * 100)}%`
+  }
+  if (model.acquisitionState._tag === "Failed") return "DOWNLOAD FAILED"
+  if (selected) {
+    const updateSuffix = model.upgradeState._tag === "Available"
+      ? " · UPDATE AVAILABLE"
+      : model.upgradeState._tag === "Failed" ? " · UPDATE FAILED" : ""
+    if (selectedSlot?._tag === "ConfiguredLocal" && Option.isSome(selectedSlot.instance)) {
+      const lifecycle = selectedSlot.instance.value.lifecycle
+      if (lifecycle._tag === "Loading") return `LOADING ${Math.round(Option.getOrElse(lifecycle.progress, () => 0) * 100)}%${updateSuffix}`
+      if (lifecycle._tag === "Ready") return `SELECTED · READY${updateSuffix}`
+      if (lifecycle._tag === "Stopping") return "STOPPING…"
+      if (lifecycle._tag === "Failed") return "LOAD FAILED"
+    }
+    return `SELECTED${updateSuffix}`
+  }
+  return catalogStatus(model, reconciliationState).toUpperCase()
+}
+
+const CatalogInspector = memo(function CatalogInspector({
+  model,
+  recommendation,
+  memoryBytes,
+  reconciliationState,
+  selected,
+  selectedSlot,
+  transition,
+  actions,
+  actionCursor,
+  actionsFocused,
+  hoveredAction,
+  confirmingUninstall,
+  onAction,
+  onActionHover,
+}: {
+  readonly model: LocalModel
+  readonly recommendation: Option.Option<LocalModelRecommendation>
+  readonly memoryBytes: number | undefined
+  readonly reconciliationState: CatalogModelReconciliationState
+  readonly selected: boolean
+  readonly selectedSlot: CatalogPrimarySlot | null
+  readonly transition: CatalogRadarTransition | null
+  readonly actions: readonly CatalogInspectorActionId[]
+  readonly actionCursor: number
+  readonly actionsFocused: boolean
+  readonly hoveredAction: CatalogInspectorActionId | null
+  readonly confirmingUninstall: boolean
+  readonly onAction: (action: CatalogInspectorActionId) => void
+  readonly onActionHover: (action: CatalogInspectorActionId | null) => void
+}) {
+  const theme = useTheme()
+  const platform = usePlatform()
+  const [sourceHovered, setSourceHovered] = useState(false)
+  const profile = catalogRadarProfile(model)
+  const speculativeMethod = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
+  const status = catalogInspectorStatus(model, reconciliationState, selected, selectedSlot)
+  const contentWidth = CATALOG_INSPECTOR_CONTENT_WIDTH
+  const recommendationTitle = Option.isSome(recommendation)
+    ? recommendationLabel(recommendation)
+    : "No recommendation"
+  const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
+  const repository = repositoryUrl?.replace("https://", "")
+  const license = Option.getOrElse(model.presentation.license, () => "Unknown license")
+  const quantization = model.bundle._tag === "Standalone"
+    ? model.bundle.package.properties.quantization
+    : model.bundle.target.properties.quantization
+  const quantizationLabel = model.catalogMembershipState._tag === "InCatalog"
+    && model.catalogMembershipState.catalogData.quantizationAware
+    ? `${quantization} QAT`
+    : quantization
+  const description = twoLineText(model.presentation.description, contentWidth)
+
+  return (
+    <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
+      <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.identity, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.identity, flexShrink: 0, flexDirection: "column" }}>
+        <box style={{ flexDirection: "row", width: "100%" }}>
+          <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
+            {truncateToDisplayWidth(formatLocalModelDisplayName(model), Math.max(1, contentWidth - status.length - 1))}
+          </text>
+          <text style={{ fg: reconciliationState._tag === "Failed" || model.upgradeState._tag === "Failed" ? theme.error : theme.primary }} wrapMode="none">{status}</text>
+        </box>
+        <text style={{ fg: theme.muted }} wrapMode="none">{description}</text>
+        <text> </text>
+      </box>
+      <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0, flexDirection: "row", columnGap: 2 }}>
+        <box style={{ flexGrow: 1, minWidth: 0, flexDirection: "column" }}>
+          <text wrapMode="none"><span fg={theme.muted}>Intelligence </span><span fg={theme.foreground}>{intelligenceLabel(model)}</span></text>
+          <text wrapMode="none"><span fg={theme.muted}>Accuracy </span><span fg={theme.foreground}>{qualityLabel(model)}</span></text>
+          <text wrapMode="none"><span fg={theme.muted}>Speed </span><span fg={theme.foreground}>{performanceRangeSpeedLabel(model, "tokens/sec")}</span></text>
+          <text wrapMode="none"><span fg={theme.muted}>Quantization </span><span fg={theme.foreground}>{quantizationLabel}</span></text>
+          <text wrapMode="none"><span fg={theme.muted}>Speculation </span><span fg={theme.foreground}>{speculativeMethod}</span></text>
+          <text wrapMode="none"><span fg={theme.muted}>Memory </span><span fg={theme.foreground}>{memoryBytes === undefined ? "—" : formatBytes(memoryBytes)}</span></text>
+        </box>
+        <box style={{ width: 26, minWidth: 26, flexShrink: 0, height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics }}>
+          <CatalogRadarView profile={profile} transition={transition} />
+        </box>
+      </box>
+      <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, flexShrink: 0, flexDirection: "column" }}>
+        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
+        <text style={{ fg: theme.muted }} wrapMode="none">{truncateToDisplayWidth(`License ${license}`, contentWidth)}</text>
+        {repositoryUrl === undefined ? (
+          <text style={{ fg: theme.muted }} wrapMode="none">Repository unavailable</text>
+        ) : (
+          <Button
+            onClick={() => { void platform.openLink(repositoryUrl) }}
+            onMouseOver={() => setSourceHovered(true)}
+            onMouseOut={() => setSourceHovered(false)}
+          >
+            <text wrapMode="none">
+              <span
+                fg={sourceHovered ? theme.link : theme.muted}
+                attributes={sourceHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}
+              >
+                {truncateToDisplayWidth(repository, contentWidth - (sourceHovered ? 1 : 0))}{sourceHovered ? "↗" : ""}
+              </span>
+            </text>
+          </Button>
+        )}
+      </box>
+      {Option.isSome(recommendation) && (
+        <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.recommendation, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.recommendation, flexShrink: 0, flexDirection: "column" }}>
+          <text> </text>
+          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">RECOMMENDATION</text>
+          <text style={{ fg: theme.foreground }} wrapMode="none">{truncateToDisplayWidth(recommendationTitle, contentWidth)}</text>
+          <text style={{ fg: theme.muted }} wrapMode="none">
+            {twoLineText(recommendation.value.explanation, contentWidth)}
+          </text>
+        </box>
+      )}
+      <box style={{ flexGrow: 1, minHeight: 1 }} />
+      <box style={{
+        height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.actions,
+        minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.actions,
+        flexShrink: 0,
+        flexDirection: "column",
+      }}>
+        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">ACTIONS</text>
+        <box style={{ flexDirection: "column" }}>
+          {actions.length === 0 ? (
+            <text style={{ fg: theme.muted }}>No actions available</text>
+          ) : actions.map((action, index) => {
+            const focused = hoveredAction === action || (actionsFocused && index === actionCursor)
+            return action === "uninstall" && confirmingUninstall ? (
+              <text key={action} wrapMode="none">
+                <span fg={focused ? theme.primary : theme.foreground}>{focused ? "› " : "  "}Remove model? </span>
+                <span fg={theme.muted}>[Enter] confirm · [Esc] cancel</span>
+              </text>
+            ) : (
+              <MenuAction
+                key={action}
+                label={catalogInspectorActionLabel(action, model, selectedSlot, reconciliationState)}
+                focused={focused}
+                tone="normal"
+                onClick={() => onAction(action)}
+                onMouseOver={() => {
+                  onActionHover(action)
+                }}
+                onMouseOut={() => onActionHover(null)}
+              />
+            )
+          })}
+        </box>
+      </box>
+    </box>
+  )
+})
+
 const CatalogMenu = memo(function CatalogMenu({
   initialCatalogDetailId,
   setRootSwitchingEnabled,
 }: CatalogMenuProps) {
   const theme = useTheme()
-  const platform = usePlatform()
+  const config = useModelConfig()
   const menuSize = useLocalWidth()
   const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const menuWidth = menuSize.width ?? 80
@@ -1461,7 +1682,8 @@ const CatalogMenu = memo(function CatalogMenu({
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
-  const [hoveredRepositoryUrl, setHoveredRepositoryUrl] = useState<string | null>(null)
+  const [radarTransition, setRadarTransition] = useState<CatalogRadarTransition | null>(null)
+  const [actionHoverTarget, setActionHoverTarget] = useState<CatalogActionHoverTarget | null>(null)
   const configurationIdFor = (model: LocalModel) => Option.getOrUndefined(
     localModelConfigurationId(model),
   )
@@ -1475,43 +1697,56 @@ const CatalogMenu = memo(function CatalogMenu({
     configurationIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
   const detail = candidates.find((model) => configurationIdFor(model) === detailId) ?? null
-  const detailConfigurationId = detail === null ? undefined : configurationIdFor(detail)
-  const detailMemoryBytes = detail === null ? undefined : memoryBytesFor(detail)
-  const detailReconciliationState: CatalogModelReconciliationState = detail === null
-    ? { _tag: "Idle" }
-    : reconciliationStateFor(detail)
+  const inspected = detail ?? cursor ?? null
+  const inspectedConfigurationId = inspected === null ? undefined : configurationIdFor(inspected)
+  const confirmingUninstall = inspectedConfigurationId !== undefined
+    && pendingDeleteId === inspectedConfigurationId
+  const hoveredInspectorAction = inspectedConfigurationId !== undefined
+    && actionHoverTarget?.configurationId === inspectedConfigurationId
+    ? actionHoverTarget.action
+    : null
+  const selectedModel = Option.flatMap(config.selections, ({ primary }) => primary)
+  const primarySlot = Option.match(Result.value(config.slots), {
+    onNone: () => null,
+    onSome: ({ state }) => state.slots.primary,
+  })
+  const inspectedSelected = inspected !== null && catalogModelIsSelected(inspected, selectedModel)
+  const inspectedSlot = inspected === null ? null : catalogSlotForModel(inspected, primarySlot)
+  const inspectedReconciliationState = inspected === null
+    ? { _tag: "Idle" } as const
+    : reconciliationStateFor(inspected)
   const progress = Option.match(catalogView, {
     onNone: () => [],
     onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
   })
   const runningProgress = progress.find((line) => line.state === "running")
   const spinner = useSpinnerFrame(runningProgress !== undefined)
-  const detailActions = useMemo(() => {
-    if (!detail) return [] as readonly ("primary" | "cancel" | "select")[]
-    const actions: ("primary" | "cancel" | "select")[] = []
-    if (detail.acquisitionState._tag === "Downloading"
-      || detail.upgradeState._tag === "Upgrading") actions.push("cancel")
-    else if (detailReconciliationState._tag === "Starting") return actions
-    else if (detail.acquisitionState._tag === "Installed") {
-      if (detail.upgradeState._tag === "Available"
-        || detail.upgradeState._tag === "Failed") actions.push("primary")
-      if (detail.servingState._tag === "Assessed"
-        && (detail.servingState.availabilityState._tag === "Selectable"
-          || detail.servingState.availabilityState._tag === "Installable")) actions.push("select")
-    }
-    else actions.push("primary")
-    return actions
-  }, [detail, detailReconciliationState])
-  const detailActionCursor = useBoundedCursor(detailActions.length)
-  const focusedDetailAction = detailActions[detailActionCursor.index]
-
+  const inspectorActions = inspected === null
+    ? []
+    : catalogInspectorActions(inspected, inspectedReconciliationState, inspectedSelected, inspectedSlot)
+  const inspectorActionCursor = useBoundedCursor(inspectorActions.length)
   const moveCursorTo = useCallback((index: number) => {
     const model = candidates[index]
     const configurationId = model && configurationIdFor(model)
     if (!model || configurationId === undefined) return
+    setActionHoverTarget(null)
+    const fromProfile = cursor === undefined ? Option.none() : catalogRadarProfile(cursor)
+    const toProfile = catalogRadarProfile(model)
+    if (Option.isSome(fromProfile) && Option.isSome(toProfile)
+      && configurationIdFor(cursor!) !== configurationId) {
+      const now = getAnimationTimeSnapshot()
+      setRadarTransition(retargetCatalogRadar(
+        fromProfile.value.values,
+        toProfile.value.values,
+        radarTransition,
+        now,
+      ))
+    } else {
+      setRadarTransition(null)
+    }
     setCursorId(configurationId)
     scrollCatalogCandidateIntoView(catalogScrollRef.current, configurationId)
-  }, [candidates])
+  }, [candidates, cursor, radarTransition])
 
   const primaryAction = useCallback((model: LocalModel) => {
     const configurationId = configurationIdFor(model)
@@ -1526,8 +1761,8 @@ const CatalogMenu = memo(function CatalogMenu({
 
   const selectCandidate = useCallback((model: LocalModel) => {
     if (model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits") return
-    const configurationId = model.servingState.configuration.id
+      || model.servingState.assessment._tag !== "Fits"
+      || model.servingState.availabilityState._tag !== "Selectable") return
     const reasoningEffort = model.servingState.capabilities.reasoning.defaultEffort
     const providerModelId = localModelProviderModelId(model)
     const assign = (id: ProviderModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
@@ -1540,59 +1775,93 @@ const CatalogMenu = memo(function CatalogMenu({
     })
     if (Option.isSome(providerModelId)) {
       void assign(providerModelId.value)
-      return
     }
-    modelActions.installAndAssign(
-      configurationId,
-      PRIMARY_SLOT_ID,
-      Option.getOrElse(reasoningEffort, () => ReasoningEffortSchema.make("none")),
-    )
-  }, [modelActions, slotActions])
+  }, [slotActions])
 
-  const runDetailAction = useCallback((action: typeof detailActions[number]) => {
-    if (!detail) return
+  const runInspectorAction = useCallback((action: CatalogInspectorActionId) => {
+    if (inspected === null) return
+    if (action !== "uninstall") setPendingDeleteId(null)
     if (action === "primary") {
-      primaryAction(detail)
-      return
-    }
-    if (action === "cancel") {
-      if (detail.acquisitionState._tag === "Downloading") {
-        modelActions.cancel(detail.acquisitionState.downloadId)
-      } else if (detail.upgradeState._tag === "Upgrading") {
-        modelActions.cancel(detail.upgradeState.downloadId)
-      }
+      primaryAction(inspected)
       return
     }
     if (action === "select") {
-      selectCandidate(detail)
+      selectCandidate(inspected)
       return
     }
-  }, [detail, modelActions, primaryAction, selectCandidate])
+    if (action === "cancel") {
+      if (inspectedReconciliationState._tag === "Transferring") {
+        modelActions.cancel(inspectedReconciliationState.downloadId)
+      } else if (inspected.acquisitionState._tag === "Downloading") {
+        modelActions.cancel(inspected.acquisitionState.downloadId)
+      } else if (inspected.upgradeState._tag === "Upgrading") {
+        modelActions.cancel(inspected.upgradeState.downloadId)
+      }
+      return
+    }
+    if (action === "load" && inspectedSlot?._tag === "ConfiguredLocal") {
+      void slotActions.load(PRIMARY_SLOT_ID, inspectedSlot.selection)
+      return
+    }
+    if (action === "stop" && inspectedSlot !== null) {
+      Option.match(modelSlotInstanceId(inspectedSlot), {
+        onNone: () => {},
+        onSome: slotActions.stop,
+      })
+      return
+    }
+    if (action === "uninstall" && inspected.acquisitionState._tag === "Installed") {
+      const configurationId = configurationIdFor(inspected)
+      if (configurationId !== undefined) setPendingDeleteId(configurationId)
+    }
+  }, [inspected, inspectedReconciliationState, inspectedSlot, modelActions, primaryAction, selectCandidate, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
+    if (confirmingUninstall && pendingDeleteId !== null) {
+      if (key.name === "return" || key.name === "enter") {
+        const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
+        const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
+        if (model?.acquisitionState._tag === "Installed" && configurationId !== undefined) {
+          modelActions.delete(configurationId)
+        }
+        setPendingDeleteId(null)
+        key.preventDefault()
+        return
+      } else if (key.name === "escape") {
+        setPendingDeleteId(null)
+        key.preventDefault()
+        return
+      } else if (key.name === "up" || key.name === "down" || key.name === "k" || key.name === "j") {
+        setPendingDeleteId(null)
+      } else {
+        return
+      }
+    }
     if (detail) {
       if (key.name === "escape") {
         key.preventDefault()
         setDetailId(null)
+        setRadarTransition(null)
         setRootSwitchingEnabled(true)
-      } else if (key.name === "up" && detailActions.length > 0) {
+      } else if (key.name === "up" && inspectorActions.length > 0) {
         key.preventDefault()
-        detailActionCursor.previous()
-      } else if (key.name === "down" && detailActions.length > 0) {
+        inspectorActionCursor.previous()
+      } else if (key.name === "down" && inspectorActions.length > 0) {
         key.preventDefault()
-        detailActionCursor.next()
-      } else if ((key.name === "return" || key.name === "enter") && focusedDetailAction) {
-        key.preventDefault()
-        runDetailAction(focusedDetailAction)
+        inspectorActionCursor.next()
+      } else if (key.name === "return" || key.name === "enter") {
+        const action = inspectorActions[inspectorActionCursor.index]
+        if (action !== undefined) {
+          key.preventDefault()
+          runInspectorAction(action)
+        }
       }
       return
     }
+    setActionHoverTarget(null)
     if (pendingDeleteId !== null) {
-      const confirmsDelete = key.name === "y"
-        && !key.ctrl
-        && !key.meta
-        && !key.option
+      const confirmsDelete = key.name === "return" || key.name === "enter"
       if (confirmsDelete) {
         const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
         const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
@@ -1604,7 +1873,7 @@ const CatalogMenu = memo(function CatalogMenu({
         return
       }
       setPendingDeleteId(null)
-      if (key.name === "escape" || key.name === "backspace" || key.name === "y" || key.name === "n") {
+      if (key.name === "escape" || key.name === "backspace") {
         key.preventDefault()
         return
       }
@@ -1617,15 +1886,15 @@ const CatalogMenu = memo(function CatalogMenu({
       moveCursorTo(Math.min(candidates.length - 1, cursorIndex + 1))
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
-      detailActionCursor.reset()
+      setRadarTransition(null)
+      inspectorActionCursor.reset()
       setDetailId(configurationIdFor(cursor) ?? null)
       setRootSwitchingEnabled(false)
     } else if (key.name === "d" && cursor) {
       key.preventDefault()
       primaryAction(cursor)
     } else if (key.name === "s" && cursor && cursor.servingState._tag === "Assessed"
-      && (cursor.servingState.availabilityState._tag === "Selectable"
-        || cursor.servingState.availabilityState._tag === "Installable")) {
+      && cursor.servingState.availabilityState._tag === "Selectable") {
       key.preventDefault()
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
@@ -1640,7 +1909,7 @@ const CatalogMenu = memo(function CatalogMenu({
         key.preventDefault()
       }
     }
-  }, [candidates, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, focusedDetailAction, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
+  }, [candidates, confirmingUninstall, cursor, cursorIndex, detail, inspectorActionCursor, inspectorActions, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runInspectorAction, selectCandidate, setRootSwitchingEnabled]))
 
   if (menuSize.width === null) {
     return (
@@ -1652,24 +1921,36 @@ const CatalogMenu = memo(function CatalogMenu({
     )
   }
 
-  if (detail) {
-    const recommendation = recommendationFor(detail)
-    const downloading = detail.acquisitionState._tag === "Downloading"
-    const downloaded = detail.acquisitionState._tag === "Installed"
-    const downloadFailure = detail.acquisitionState._tag === "Failed"
-      ? detail.acquisitionState.failure
-      : detail.upgradeState._tag === "Failed"
-        ? detail.upgradeState.failure
-        : undefined
-    const failed = downloadFailure !== undefined
-    const updateAvailable = detail.upgradeState._tag === "Available"
-      || detail.upgradeState._tag === "Failed"
-    const detailActionLabel = {
-      primary: updateAvailable ? (failed ? "Retry update" : "Update")
-        : failed ? "Retry download" : "Download",
-      cancel: detail.upgradeState._tag === "Upgrading" ? "Cancel update" : "Cancel download",
-      select: "Select this model",
-    } as const
+  const inspectorView = inspected === null ? null : (
+    <>
+      <CatalogInspector
+        key={inspectedConfigurationId}
+        model={inspected}
+        recommendation={recommendationFor(inspected)}
+        memoryBytes={memoryBytesFor(inspected)}
+        reconciliationState={inspectedReconciliationState}
+        selected={inspectedSelected}
+        selectedSlot={inspectedSlot}
+        transition={detail === null ? radarTransition : null}
+        actions={inspectorActions}
+        actionCursor={inspectorActionCursor.index}
+        actionsFocused={detail !== null}
+        hoveredAction={hoveredInspectorAction}
+        confirmingUninstall={confirmingUninstall}
+        onAction={runInspectorAction}
+        onActionHover={(action) => {
+          setActionHoverTarget(action === null || inspectedConfigurationId === undefined
+            ? null
+            : { configurationId: inspectedConfigurationId, action })
+        }}
+      />
+      {Result.isFailure(slotActions.assignResult) && (
+        <text style={{ fg: theme.error }}>Failed to update model selection.</text>
+      )}
+    </>
+  )
+
+  if (detail && layout.mode !== "split") {
     return (
       <box
         ref={menuSize.ref}
@@ -1681,100 +1962,94 @@ const CatalogMenu = memo(function CatalogMenu({
           selection={formatLocalModelDisplayName(detail)}
           onSectionClick={() => {
             setDetailId(null)
+            setRadarTransition(null)
             setRootSwitchingEnabled(true)
           }}
           hints={catalogDetailHints(layout.compactHeader)}
           compact={layout.compactHeader}
           width={menuWidth}
         />
-        <scrollbox scrollX={false} style={{
-          flexGrow: 1,
-          minHeight: 0,
-          rootOptions: { backgroundColor: theme.menuBg },
-          wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-          viewportOptions: { backgroundColor: theme.menuBg },
-          contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
-        }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.presentation.displayName}</text>
-          <text style={{ fg: theme.muted }} wrapMode="word">
-            {detail.presentation.variantLabel}
-            {` · Fidelity: ${qualityLabel(detail)}`}
-          </text>
-          <text style={{ fg: theme.muted }} wrapMode="word">
-            Intelligence {intelligenceLabel(detail)}
-          </text>
-          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">{detail.presentation.description}</text>
-          {Option.isSome(recommendation) && (
-            <>
-              <text style={{ fg: theme.primary }}>{recommendationLabel(recommendation)}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">{recommendation.value.explanation}</text>
-            </>
-          )}
-          <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>On this computer</text>
-          <text style={{ fg: theme.muted }} wrapMode="word">
-            Memory: {detailMemoryBytes === undefined ? "—" : formatBytes(detailMemoryBytes)}
-          </text>
-          <text style={{ fg: theme.muted }} wrapMode="word">
-            Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}
-          </text>
-          <text style={{ fg: theme.muted }}>
-            Status: <span fg={failed ? theme.error
-              : detailReconciliationState._tag === "Starting"
-                || detailReconciliationState._tag === "Transferring"
-                || downloading || downloaded ? theme.primary : theme.muted}>
-              {catalogStatus(detail, detailReconciliationState)}
-            </span>
-          </text>
-          {downloadFailure !== undefined && (
-            <text style={{ fg: theme.error }}>
-              {modelDownloadFailureMessage(downloadFailure)}
-            </text>
-          )}
-          {detailReconciliationState._tag === "Failed" && (
-            <text style={{ fg: theme.error }}>
-              {detailReconciliationState.operation === "Update"
-                ? "Failed to update the local model."
-                : "Failed to install the local model."}
-            </text>
-          )}
-          {Result.isFailure(slotActions.assignResult) && (
-            <text style={{ fg: theme.error }}>Failed to update model selection.</text>
-          )}
-          <box style={{ paddingTop: 1, flexDirection: "column" }}>
-            {detailActions.map((action, index) => (
-              <MenuAction
-                key={action}
-                label={detailActionLabel[action]}
-                focused={index === detailActionCursor.index}
-                tone={action === "primary" || action === "select" ? "primary" : "warning"}
-                onClick={() => runDetailAction(action)}
-                onMouseOver={() => detailActionCursor.select(index)}
-              />
-            ))}
-          </box>
-          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {Option.getOrElse(detail.presentation.license, () => "Unknown")}</text>
-          {huggingFaceRepositoryUrls(detail).map((url) => (
-            <box key={url} style={{ flexDirection: "row", alignSelf: "flex-start" }}>
-              <text style={{ fg: theme.muted }}>Hugging Face: </text>
-              <Button
-                onClick={() => { void platform.openLink(url) }}
-                onMouseOver={() => setHoveredRepositoryUrl(url)}
-                onMouseOut={() => setHoveredRepositoryUrl((hovered) => hovered === url ? null : hovered)}
-              >
-                <text
-                  style={{ fg: hoveredRepositoryUrl === url ? theme.primary : theme.link }}
-                  attributes={TextAttributes.UNDERLINE}
-                  wrapMode="word"
-                >
-                  {url}
-                </text>
-              </Button>
-            </box>
-          ))}
-        </scrollbox>
+        <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", paddingTop: 1 }}>
+          {inspectorView}
+        </box>
       </box>
     )
   }
+
+  const list = (
+    <scrollbox ref={catalogScrollRef} scrollX={false} onMouseOver={() => setActionHoverTarget(null)} style={{
+      width: layout.mode === "split" ? layout.listWidth : "100%",
+      flexGrow: layout.mode === "split" ? 0 : 1,
+      minHeight: 0,
+      rootOptions: { backgroundColor: theme.menuBg },
+      wrapperOptions: { border: false, backgroundColor: theme.menuBg },
+      viewportOptions: { backgroundColor: theme.menuBg },
+      contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2 },
+    }}>
+      <box style={{
+        flexDirection: "row",
+        columnGap: layout.columnGap,
+        width: "100%",
+        height: 1,
+        minHeight: 1,
+        flexShrink: 0,
+      }}>
+        <text style={{ fg: theme.muted, width: 1 }} wrapMode="none"> </text>
+        <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
+        {layout.showMemory && <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>}
+        {layout.showSpeed && <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">SPEED</text>}
+        {layout.showSpeculative && <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">SPECULATIVE</text>}
+        <text style={{ fg: theme.muted, width: layout.columns.status }} wrapMode="none">STATUS</text>
+      </box>
+      {runningProgress && (
+        <text style={{ fg: theme.primary, marginLeft: 2 }}>
+          {spinner} {runningProgress.label}{runningProgress.metadata}
+        </text>
+      )}
+      {candidates.length === 0 && recommendationsReady ? (
+        <text style={{ fg: theme.warning, marginLeft: 2 }}>
+          No compatible recommended models are currently available.
+        </text>
+      ) : candidates.map((candidate, index) => {
+        const configurationId = configurationIdFor(candidate)
+        if (configurationId === undefined) return null
+        const highlighted = index === cursorIndex
+        return (
+          <CatalogCandidateRow
+            key={configurationId}
+            model={candidate}
+            memoryBytes={memoryBytesFor(candidate)}
+            highlighted={highlighted}
+            focused={highlighted && detail === null}
+            selected={catalogModelIsSelected(candidate, selectedModel)}
+            pendingDelete={pendingDeleteId === configurationId}
+            reconciliationState={reconciliationStateFor(candidate)}
+            index={index}
+            layout={layout}
+            rowId={catalogCandidateRowId(configurationId)}
+            onClick={() => {
+              setPendingDeleteId(null)
+              moveCursorTo(index)
+              setRadarTransition(null)
+              inspectorActionCursor.reset()
+              setDetailId(configurationId)
+              setRootSwitchingEnabled(false)
+            }}
+            onMouseOver={() => {
+              if (detail !== null && detailId === configurationId) return
+              if (detail !== null) {
+                setDetailId(null)
+                setRootSwitchingEnabled(true)
+                inspectorActionCursor.reset()
+              }
+              moveCursorTo(index)
+              if (pendingDeleteId !== configurationId) setPendingDeleteId(null)
+            }}
+          />
+        )
+      })}
+    </scrollbox>
+  )
 
   return (
     <box
@@ -1784,90 +2059,32 @@ const CatalogMenu = memo(function CatalogMenu({
     >
       <MenuHeader
         title="Catalog"
-        subtitle={layout.stackedRows
-          ? undefined
-          : layout.mode === "full" ? "Find and download local models" : "Local models"}
-        summary={layout.mode === "minimal"
-          ? String(candidates.length)
-          : layout.compactHeader ? `${candidates.length} models` : `${candidates.length} compatible`}
-        hints={catalogListHints(layout.mode)}
+        selection={detail === null ? undefined : formatLocalModelDisplayName(detail)}
+        onSectionClick={detail === null ? undefined : () => {
+          setDetailId(null)
+          setRadarTransition(null)
+          setRootSwitchingEnabled(true)
+        }}
+        subtitle={detail !== null || layout.compactHeader ? undefined : "Find and download local models"}
+        summary={detail !== null ? undefined
+          : layout.compactHeader ? String(candidates.length) : `${candidates.length} compatible`}
+        hints={detail === null
+          ? catalogListHints(menuWidth)
+          : catalogDetailHints(layout.compactHeader)}
         compact={layout.compactHeader}
         width={menuWidth}
       />
-      <scrollbox ref={catalogScrollRef} scrollX={false} style={{
-        flexGrow: 1,
-        minHeight: 0,
-        rootOptions: { backgroundColor: theme.menuBg },
-        wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-        viewportOptions: { backgroundColor: theme.menuBg },
-        contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
-      }}>
-        {!layout.stackedRows && (
-          <box style={{
-            flexDirection: "row",
-            columnGap: layout.columnGap,
-            width: "100%",
-            height: 1,
-            minHeight: 1,
-            flexShrink: 0,
-          }}>
-            <text style={{ fg: theme.muted, width: 1 }} wrapMode="none"> </text>
-            <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
-            <text style={{ fg: theme.muted, width: layout.columns.recommendation }} wrapMode="none">RECOMMENDATION</text>
-            <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>
-            <text style={{ fg: theme.muted, width: layout.columns.speculative }} wrapMode="none">SPECULATIVE</text>
-            {layout.showIntelligence && (
-              <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">INTELLIGENCE</text>
-            )}
-            {layout.showQuality && (
-              <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">QUALITY</text>
-            )}
-            {layout.showSpeed && (
-              <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">SPEED</text>
-            )}
-            <text style={{ fg: theme.muted, width: layout.columns.status }} wrapMode="none">STATUS</text>
-          </box>
+      <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "row", paddingTop: 1 }}>
+        {list}
+        {layout.mode === "split" && inspected !== null && (
+          <>
+            <box style={{ width: layout.dividerWidth, backgroundColor: theme.border }} />
+            <box style={{ width: layout.inspectorWidth, minWidth: layout.inspectorWidth, flexDirection: "column" }}>
+              {inspectorView}
+            </box>
+          </>
         )}
-        {runningProgress && (
-          <text style={{ fg: theme.primary, marginLeft: 2 }}>
-            {spinner} {runningProgress.label}{runningProgress.metadata}
-          </text>
-        )}
-        {candidates.length === 0 && recommendationsReady ? (
-          <text style={{ fg: theme.warning, marginLeft: 2 }}>
-            No compatible recommended models are currently available.
-          </text>
-        ) : candidates.map((candidate, index) => {
-          const configurationId = configurationIdFor(candidate)
-          if (configurationId === undefined) return null
-          const focused = index === cursorIndex
-          const pendingDelete = pendingDeleteId === configurationId
-          return (
-            <CatalogCandidateRow
-              key={configurationId}
-              model={candidate}
-              memoryBytes={memoryBytesFor(candidate)}
-              recommendation={recommendationFor(candidate)}
-              focused={focused}
-              pendingDelete={pendingDelete}
-              reconciliationState={reconciliationStateFor(candidate)}
-              index={index}
-              layout={layout}
-              rowId={catalogCandidateRowId(configurationId)}
-              onClick={() => {
-                setPendingDeleteId(null)
-                detailActionCursor.reset()
-                setDetailId(configurationId)
-                setRootSwitchingEnabled(false)
-              }}
-              onMouseOver={() => {
-                setCursorId(configurationId)
-                if (pendingDeleteId !== configurationId) setPendingDeleteId(null)
-              }}
-            />
-          )
-        })}
-      </scrollbox>
+      </box>
     </box>
   )
 })

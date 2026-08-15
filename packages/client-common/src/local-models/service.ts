@@ -7,8 +7,6 @@ import {
   LocalModelsMirror,
   type ModelDownloadId,
   type CatalogModelReconciliationAdmission,
-  type CatalogModelId,
-  type CatalogVariantId,
   type LocalModelsState,
   type LocalModel,
   type ModelServingConfigurationId,
@@ -28,8 +26,6 @@ export class LocalModelSynchronizationFailed extends Data.TaggedError(
 
 interface InstallationInput {
   readonly configurationId: ModelServingConfigurationId
-  readonly modelId: CatalogModelId
-  readonly variantId: CatalogVariantId
 }
 
 interface DownloadInput {
@@ -157,8 +153,24 @@ export const installationAdmissionIsVisible = (
 
 const installMutation = Mutation.make("ReconcileCatalogModel", {
   scope: ({ configurationId }: InstallationInput) => installationScope(configurationId),
-  effect: ({ modelId, variantId }: InstallationInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("ReconcileCatalogModel", { modelId, variantId })),
+  effect: ({ configurationId }: InstallationInput) => synchronizeLocalModels().pipe(
+    Effect.flatMap((state) => findLocalModelByConfigurationId(state.models, configurationId)),
+    Effect.filterOrFail(
+      (model) => model.catalogMembershipState._tag === "InCatalog",
+      () => new LocalModelSynchronizationFailed({
+        operation: "install",
+        message: "Only catalog models can be reconciled.",
+      }),
+    ),
+    Effect.flatMap((model) => {
+      const catalog = model.catalogMembershipState
+      if (catalog._tag !== "InCatalog") return Effect.die("Catalog membership changed")
+      return Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("ReconcileCatalogModel", {
+        modelId: catalog.catalogData.modelId,
+        variantId: catalog.catalogData.variantId,
+      }))
+    }),
+  ),
   synchronize: (admission, { configurationId }) => synchronizeLocalModelsUntil(
       (state) => installationAdmissionIsVisible(state, configurationId, admission),
       () => new LocalModelSynchronizationFailed({
@@ -239,24 +251,7 @@ const makeLocalModels = Effect.gen(function* () {
     catalog,
     latestInstallationFailed,
     install: (configurationId: ModelServingConfigurationId) =>
-      synchronizeLocalModels().pipe(
-        Effect.flatMap((state) => findLocalModelByConfigurationId(state.models, configurationId)),
-        Effect.filterOrFail(
-          (model) => model.catalogMembershipState._tag === "InCatalog",
-          () => new LocalModelSynchronizationFailed({
-            operation: "install",
-            message: "Only catalog models can be reconciled.",
-          }),
-        ),
-        Effect.flatMap((model) => {
-          const catalog = model.catalogMembershipState
-          if (catalog._tag !== "InCatalog") return Effect.die("Catalog membership changed")
-          return Mutation.execute(install, {
-            configurationId,
-            modelId: catalog.catalogData.modelId,
-            variantId: catalog.catalogData.variantId,
-          })
-        }),
+      Mutation.execute(install, { configurationId }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),
       ),
     cancelDownload: (downloadId: ModelDownloadId) =>

@@ -4,146 +4,91 @@ import {
 } from "@magnitudedev/client-common"
 import type { ModelVariantLabel } from "@magnitudedev/sdk"
 
-export type CatalogLayoutMode = "full" | "quality" | "compact" | "stacked" | "minimal"
+export type CatalogLayoutMode = "list" | "split"
 
 export interface CatalogColumnWidths {
-  readonly recommendation: number
   readonly memory: number
-  readonly speculative: number
-  readonly intelligence: number
-  readonly quality: number
   readonly speed: number
+  readonly speculative: number
   readonly status: number
 }
 
 export interface CatalogLayout {
   readonly mode: CatalogLayoutMode
+  readonly measuredWidth: number
+  readonly listWidth: number
+  readonly inspectorWidth: number
+  readonly dividerWidth: number
   readonly contentWidth: number
   readonly modelWidth: number
   readonly columnGap: number
   readonly columns: CatalogColumnWidths
-  readonly showIntelligence: boolean
-  readonly showQuality: boolean
+  readonly showMemory: boolean
   readonly showSpeed: boolean
-  readonly stackedRows: boolean
+  readonly showSpeculative: boolean
   readonly compactHeader: boolean
 }
 
 const HORIZONTAL_PADDING = 4
+export const CATALOG_INSPECTOR_WIDTH = 60
+export const CATALOG_INSPECTOR_CONTENT_WIDTH = CATALOG_INSPECTOR_WIDTH - HORIZONTAL_PADDING
+export const CATALOG_DIVIDER_WIDTH = 1
+export const CATALOG_MIN_LIST_WIDTH = 42
+export const CATALOG_SPLIT_MIN_WIDTH = CATALOG_INSPECTOR_WIDTH
+  + CATALOG_DIVIDER_WIDTH
+  + CATALOG_MIN_LIST_WIDTH
+export const CATALOG_SPLIT_INSPECTOR_HEIGHTS = {
+  identity: 4,
+  metrics: 9,
+  info: 3,
+  recommendation: 5,
+  actions: 4,
+} as const
+export const CATALOG_SPLIT_INSPECTOR_HEIGHT = Object.values(
+  CATALOG_SPLIT_INSPECTOR_HEIGHTS,
+).reduce((total, height) => total + height, 0)
+
 const CURSOR_WIDTH = 1
 const COLUMN_GAP = 1
+const STATUS_WIDTH = 16
+const MEMORY_WIDTH = 9
+const SPEED_WIDTH = 10
+const SPECULATIVE_WIDTH = 12
 
-const FULL_COLUMNS: CatalogColumnWidths = {
-  recommendation: 14,
-  memory: 9,
-  speculative: 12,
-  intelligence: 12,
-  quality: 10,
-  speed: 10,
-  status: 16,
-}
-
-const COMPACT_COLUMNS: CatalogColumnWidths = {
-  recommendation: 12,
-  memory: 9,
-  speculative: 12,
-  intelligence: 0,
-  quality: 0,
-  speed: 10,
-  status: 16,
-}
-
-const QUALITY_COLUMNS: CatalogColumnWidths = {
-  ...COMPACT_COLUMNS,
-  quality: 13,
-}
-
-const EMPTY_COLUMNS: CatalogColumnWidths = {
-  recommendation: 0,
-  memory: 0,
-  speculative: 0,
-  intelligence: 0,
-  quality: 0,
-  speed: 0,
-  status: 0,
-}
-
-const columnTotal = (columns: CatalogColumnWidths): number =>
-  columns.recommendation
-  + columns.memory
-  + columns.speculative
-  + columns.intelligence
-  + columns.quality
-  + columns.speed
-  + columns.status
-
-const tableGapTotal = (columns: CatalogColumnWidths): number =>
-  COLUMN_GAP * (1 + Object.values(columns).filter((columnWidth) => columnWidth > 0).length)
-
-const tableModelWidth = (contentWidth: number, columns: CatalogColumnWidths): number =>
-  Math.max(1, contentWidth - CURSOR_WIDTH - columnTotal(columns) - tableGapTotal(columns))
+const columnsForListWidth = (listWidth: number): CatalogColumnWidths => ({
+  memory: listWidth >= 52 ? MEMORY_WIDTH : 0,
+  speed: listWidth >= 63 ? SPEED_WIDTH : 0,
+  speculative: listWidth >= 74 ? SPECULATIVE_WIDTH : 0,
+  status: STATUS_WIDTH,
+})
 
 export const deriveCatalogLayout = (measuredWidth: number): CatalogLayout => {
   const width = Math.max(1, Math.floor(measuredWidth))
-  const contentWidth = Math.max(1, width - HORIZONTAL_PADDING)
+  const split = width >= CATALOG_SPLIT_MIN_WIDTH
+  const inspectorWidth = split ? CATALOG_INSPECTOR_WIDTH : 0
+  const dividerWidth = split ? CATALOG_DIVIDER_WIDTH : 0
+  const listWidth = Math.max(1, width - inspectorWidth - dividerWidth)
+  const contentWidth = Math.max(1, listWidth - HORIZONTAL_PADDING)
+  const columns = columnsForListWidth(listWidth)
+  const visibleColumns = Object.values(columns).filter((columnWidth) => columnWidth > 0).length
+  const fixedWidth = CURSOR_WIDTH
+    + Object.values(columns).reduce((total, columnWidth) => total + columnWidth, 0)
+    + COLUMN_GAP * visibleColumns
 
-  if (width >= 110) {
-    return {
-      mode: "full",
-      contentWidth,
-      modelWidth: tableModelWidth(contentWidth, FULL_COLUMNS),
-      columnGap: COLUMN_GAP,
-      columns: FULL_COLUMNS,
-      showIntelligence: true,
-      showQuality: true,
-      showSpeed: true,
-      stackedRows: false,
-      compactHeader: false,
-    }
-  }
-
-  if (width >= 95) {
-    return {
-      mode: "quality",
-      contentWidth,
-      modelWidth: tableModelWidth(contentWidth, QUALITY_COLUMNS),
-      columnGap: COLUMN_GAP,
-      columns: QUALITY_COLUMNS,
-      showIntelligence: false,
-      showQuality: true,
-      showSpeed: true,
-      stackedRows: false,
-      compactHeader: false,
-    }
-  }
-
-  if (width >= 82) {
-    return {
-      mode: "compact",
-      contentWidth,
-      modelWidth: tableModelWidth(contentWidth, COMPACT_COLUMNS),
-      columnGap: COLUMN_GAP,
-      columns: COMPACT_COLUMNS,
-      showIntelligence: false,
-      showQuality: false,
-      showSpeed: true,
-      stackedRows: false,
-      compactHeader: false,
-    }
-  }
-
-  const minimal = width < 56
   return {
-    mode: minimal ? "minimal" : "stacked",
+    mode: split ? "split" : "list",
+    measuredWidth: width,
+    listWidth,
+    inspectorWidth,
+    dividerWidth,
     contentWidth,
-    modelWidth: Math.max(1, contentWidth - CURSOR_WIDTH),
+    modelWidth: Math.max(1, contentWidth - fixedWidth),
     columnGap: COLUMN_GAP,
-    columns: EMPTY_COLUMNS,
-    showIntelligence: false,
-    showQuality: false,
-    showSpeed: !minimal,
-    stackedRows: true,
-    compactHeader: true,
+    columns,
+    showMemory: columns.memory > 0,
+    showSpeed: columns.speed > 0,
+    showSpeculative: columns.speculative > 0,
+    compactHeader: width < 82,
   }
 }
 
@@ -164,11 +109,11 @@ export const formatCatalogModelLabel = (
   return `${truncateToDisplayWidth(displayName, safeWidth - suffixWidth)}${suffix}`
 }
 
-export const catalogListHints = (mode: CatalogLayoutMode): string => {
-  if (mode === "full") {
+export const catalogListHints = (measuredWidth: number): string => {
+  if (measuredWidth >= 110) {
     return "↑↓ navigate · Enter details · D download · S select · Backspace cancel/remove · Esc close"
   }
-  if (mode === "quality" || mode === "compact") {
+  if (measuredWidth >= 82) {
     return "↑↓ move · Enter details · D download · S select · Esc close"
   }
   return "↑↓ move · Enter details · Esc close"
