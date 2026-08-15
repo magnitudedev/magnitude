@@ -474,11 +474,13 @@ durable product intent --command--> physical admitted occurrence
 hardware query ----> fit/load advice ----> fresh validation at mutation admission
 ```
 
-- Slot selection, instance lifecycle, hardware topology, downloads, and catalog state remain
+- Slot selection, model residency, hardware topology, downloads, and catalog state remain
   independent authorities.
-- ACN projects exact ICN instance state; it never authors `Loading`, `Ready`, or `Stopping`.
-- Load/stop addresses the retained exact instance identity.
-- Mutation pending and response progress never substitute for instance lifecycle.
+- ACN authors `Requested` residency and otherwise projects current ICN instance truth into the
+  slot's single residency lifecycle.
+- Client load and stop address a slot; ACN resolves physical commands to the retained exact
+  instance identity.
+- Client mutation pending and response progress never substitute for authoritative residency.
 - Loading repeats current hardware and package validation at ICN admission.
 
 ### Providers, files, skills, and external systems

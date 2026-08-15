@@ -69,7 +69,9 @@ const localActivity = (lifecycle: {
     variantLabel: Option.none(),
   },
   availability: { _tag: 'Available' },
-  instance: Option.some({ id: instanceId, configurationId, lifecycle }),
+  residency: lifecycle._tag === 'Loading'
+    ? { ...lifecycle, instanceId, configurationId }
+    : lifecycle,
   actions: lifecycle._tag === 'Loading' ? ['Stop'] : [],
 })
 

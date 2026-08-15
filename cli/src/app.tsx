@@ -32,6 +32,7 @@ import {
   deriveLocalModelLoadActivity,
   notificationAreaStateAtom,
   deriveLocalModelPersistentNotificationStates,
+  deriveSelectedModelResidencyNotificationState,
   notificationStatesEquivalent,
   resolveActiveNotificationState,
   useLocalModelsSelector,
@@ -235,10 +236,7 @@ function OnboardingGate(
     if (slot._tag === "Unassigned" || slot.availability._tag !== "Available")
       return false;
     if (slot._tag === "ConfiguredRemote") return true;
-    return Option.exists(
-      slot.instance,
-      (instance) => instance.lifecycle._tag === "Ready"
-    );
+    return slot.residency._tag === "Ready";
   });
 
   return (
@@ -295,6 +293,7 @@ function CliAppContent(
   const onboardingSetup = useOnboardingModelSetup();
   const setupState = Option.getOrNull(Result.value(onboardingSetup.state));
   const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
+  const { rootSlotId } = useSlotProfiles();
   const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
     === "ConfiguredLocal"
     ? modelSlotsState.slots.primary.selection.providerModelId
@@ -313,9 +312,11 @@ function CliAppContent(
   );
   const notificationState = resolveActiveNotificationState(
     notificationAreaState,
-    Option.getOrElse(persistentNotificationStates, () => []),
+    [
+      ...Option.getOrElse(persistentNotificationStates, () => []),
+      deriveSelectedModelResidencyNotificationState(modelSlotsState, rootSlotId),
+    ],
   );
-  const { rootSlotId } = useSlotProfiles();
   const localModelLoadActivity = modelSlotsState === null
     ? null
     : deriveLocalModelLoadActivity(modelSlotsState, rootSlotId);

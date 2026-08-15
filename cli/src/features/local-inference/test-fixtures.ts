@@ -359,19 +359,17 @@ export const makeView = (options: {
                 variantLabel: Option.some(ModelVariantLabelSchema.make("Q4")),
               },
               availability: { _tag: "Available" },
-              instance: Option.some({
-                id: ModelInstanceIdSchema.make("test-instance"),
+              residency: {
+                _tag: "Ready",
+                instanceId: ModelInstanceIdSchema.make("test-instance"),
                 configurationId: TEST_CONFIGURATION_ID,
-                lifecycle: {
-                  _tag: "Ready",
-                  allocation: options.allocation ?? {
-                    contextWindowTokens: 32_768,
-                    parallelSequences: 1,
-                    physicalContextTokens: 32_768,
-                    memoryDomains: [],
-                  },
+                allocation: options.allocation ?? {
+                  contextWindowTokens: 32_768,
+                  parallelSequences: 1,
+                  physicalContextTokens: 32_768,
+                  memoryDomains: [],
                 },
-              }),
+              },
               actions: ["Stop"],
             }),
         secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),

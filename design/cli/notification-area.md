@@ -20,8 +20,9 @@ notification state or reset client-owned notifications.
 
 A persistent notification is a pure projection of authoritative state. Download activity is
 derived from local-model acquisition state, and selected-model memory guidance is derived from the
-selected local model's current-headroom state. Neither fact is copied into writable client state,
-started by a UI event, or cleared by a timer.
+selected local model's current-headroom state. Selected-model `Requested` residency is likewise
+projected as activity, and `Failed` residency is projected as an error. None of these facts is
+copied into writable client state, started by a UI event, or cleared by a timer.
 
 An ephemeral notification represents a transient client event. Shared client state owns its exact
 identity and lifetime in a retained Effect Atom. Publishing adds one identified occurrence;
@@ -62,6 +63,7 @@ insufficient headroom.
 - The composer and model menu render the same resolved notification.
 - Model downloads have one derived count and no client-retained download state.
 - Low-memory guidance has one derived condition and no selection-handler side channel.
+- Requested and failed residency are derived from the authoritative selected-slot state.
 - Only ephemeral client events enter writable notification state.
 - Warning and error occurrences take precedence over ongoing downloads.
 - No notification producer writes directly to a terminal component or a parallel toast store.

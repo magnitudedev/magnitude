@@ -14,7 +14,6 @@ import {
 import {
   deriveLocalModelLoadActivity,
   isModelSlotConfigured,
-  modelSlotInstanceId,
   modelSlotResidentAllocation,
 } from "./model-slots"
 
@@ -50,7 +49,7 @@ const configured = (lifecycle: {
   selection,
   descriptor,
   availability: { _tag: "Available" },
-  instance: Option.some({ id: instanceId, configurationId, lifecycle }),
+  residency: { ...lifecycle, instanceId, configurationId },
   actions: lifecycle._tag === "Ready" || lifecycle._tag === "Loading" ? ["Stop"] : [],
 })
 
@@ -65,7 +64,7 @@ describe("canonical model-slot helpers", () => {
     }))).toBe(true)
   })
 
-  it("derives activity and identity from the same embedded instance", () => {
+  it("derives activity from the selected slot's embedded instance", () => {
     const primary = configured({
       _tag: "Loading",
       stage: "loading",
@@ -81,7 +80,6 @@ describe("canonical model-slot helpers", () => {
       favoriteModels: [],
     }
     expect(deriveLocalModelLoadActivity(state, PRIMARY_SLOT_ID)).toBe(primary)
-    expect(Option.getOrThrow(modelSlotInstanceId(primary))).toBe(instanceId)
   })
 
   it("reports resident memory only from a ready or resident-stopping instance", () => {

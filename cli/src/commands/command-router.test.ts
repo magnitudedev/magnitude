@@ -19,6 +19,7 @@ function createContext(overrides: Partial<CommandContext> = {}): CommandContext 
     openCloud: vi.fn(),
     openModelMenu: vi.fn(),
     toggleTranscript: vi.fn(),
+    controlSelectedModel: vi.fn(),
     toggleAutopilot: vi.fn(),
     ...overrides,
   }
@@ -64,6 +65,21 @@ describe('routeSlashCommand', () => {
     const ctx = createContext()
     expect(routeSlashCommand('/setup', ctx)._tag).toBe('Handled')
     expect(ctx.openSetup).toHaveBeenCalledTimes(1)
+  })
+
+  test('routes selected-model control commands through one capability', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/load', ctx)._tag).toBe('Handled')
+    expect(routeSlashCommand('/stop', ctx)._tag).toBe('Handled')
+    expect(ctx.controlSelectedModel).toHaveBeenNthCalledWith(1, 'load')
+    expect(ctx.controlSelectedModel).toHaveBeenNthCalledWith(2, 'stop')
+  })
+
+  test('leaves model control commands unhandled without a control surface', () => {
+    const ctx = createContext()
+    delete ctx.controlSelectedModel
+
+    expect(routeSlashCommand('/load', ctx)._tag).toBe('Unhandled')
   })
 
   test('leaves /setup unhandled when the client has no onboarding surface', () => {

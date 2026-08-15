@@ -69,7 +69,8 @@ run now. Cached assessment never authorizes loading.
 | **Local model** | One client-facing product row: stable catalog product or exact non-catalog target, with acquisition, upgrade, and serving state. |
 | **Provider offering** | A provider-facing projection of one currently resolved serving configuration. |
 | **Slot selection** | The user's durable provider-qualified choice and reasoning effort for one product role. |
-| **Model slot** | Durable role intent joined with current availability, actions, and optional instance state. |
+| **Model slot** | Durable role intent joined with current availability, actions, and one current residency state. |
+| **Model residency** | Current slot runtime state: unloaded, requested, loading, ready, stopping, or failed. |
 | **Model instance** | One physical admitted occurrence of a serving configuration in ICN. |
 
 Catalog membership contributes configuration and metadata. It implies no package presence,

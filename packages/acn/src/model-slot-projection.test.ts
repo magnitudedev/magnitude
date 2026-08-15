@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   ModelInstanceIdSchema,
   ModelServingConfigurationIdSchema,
+  modelSlotActions,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   type ProviderModelCatalogEntry,
@@ -14,8 +15,7 @@ import {
 } from "@magnitudedev/sdk"
 import {
   localModelSlotAvailability,
-  modelSlotActions,
-  projectModelInstance,
+  projectModelResidency,
   selectableModelCapabilities,
 } from "./model-slot-projection"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
@@ -32,19 +32,20 @@ describe("model slot projection", () => {
         plannedAllocation: Option.none(),
       },
     } as unknown as Generated.ModelInstance
-    const projected = projectModelInstance(instance)
-    expect(projected.id).toBe(ModelInstanceIdSchema.make("instance"))
+    const projected = projectModelResidency(instance)
+    expect(projected._tag).toBe("Loading")
+    if (projected._tag !== "Loading") return
+    expect(projected.instanceId).toBe(ModelInstanceIdSchema.make("instance"))
     expect(projected.configurationId).toBe(
       ModelServingConfigurationIdSchema.make("configuration"),
     )
-    expect(projected.lifecycle).toMatchObject({
-      _tag: "Loading",
+    expect(projected).toMatchObject({
       progress: Option.some(0.5),
     })
   })
 
   it("preserves structured low-memory failure facts", () => {
-    const projected = projectModelInstance({
+    const projected = projectModelResidency({
       id: "instance",
       configurationId: "configuration",
       lifecycle: {
@@ -64,7 +65,7 @@ describe("model slot projection", () => {
       },
     } as Generated.ModelInstance)
 
-    expect(projected.lifecycle).toEqual({
+    expect(projected).toEqual({
       _tag: "Failed",
       failure: {
         _tag: "LowMemory",
@@ -81,32 +82,45 @@ describe("model slot projection", () => {
     })
   })
 
-  it("derives every physical action from canonical instance lifecycle", () => {
+  it("projects terminal instance history into current residency", () => {
+    const stopped = (reason: "user_stop" | "memory_pressure") => projectModelResidency({
+      id: "instance",
+      configurationId: "configuration",
+      lifecycle: { _tag: "Stopped", reason },
+    } as Generated.ModelInstance)
+
+    expect(stopped("user_stop")).toEqual({ _tag: "Unloaded" })
+    expect(stopped("memory_pressure")).toMatchObject({
+      _tag: "Failed",
+      failure: { code: "low_memory", retryable: true },
+    })
+  })
+
+  it("derives every model action from canonical residency", () => {
     const available = { _tag: "Available" as const }
-    expect(modelSlotActions(available, Option.none())).toEqual(["Load"])
-    expect(modelSlotActions(available, Option.some({
-      id: ModelInstanceIdSchema.make("instance"),
+    expect(modelSlotActions(available, { _tag: "Unloaded" })).toEqual(["Load"])
+    expect(modelSlotActions(available, {
+      _tag: "Loading",
+      instanceId: ModelInstanceIdSchema.make("instance"),
       configurationId: ModelServingConfigurationIdSchema.make("configuration"),
-      lifecycle: {
-        _tag: "Loading",
-        stage: "loading",
-        progress: Option.none(),
-        plannedAllocation: Option.none(),
-      },
-    }))).toEqual(["Stop"])
-    expect(modelSlotActions(available, Option.some({
-      id: ModelInstanceIdSchema.make("instance"),
-      configurationId: ModelServingConfigurationIdSchema.make("configuration"),
-      lifecycle: {
-        _tag: "Failed",
-        failure: { code: "failed", message: "failed", retryable: true },
-      },
-    }))).toEqual(["RetryLoad"])
+      stage: "loading",
+      progress: Option.none(),
+      plannedAllocation: Option.none(),
+    })).toEqual(["Stop"])
+    expect(modelSlotActions(available, {
+      _tag: "Failed",
+      failure: { code: "failed", message: "failed", retryable: true },
+    })).toEqual(["RetryLoad"])
     expect(modelSlotActions({
       _tag: "Unavailable",
       failure: { code: "offline", message: "offline", retryable: true },
-    }, Option.none())).toEqual([])
-    expect(modelSlotActions({ _tag: "Pending" }, Option.none())).toEqual([])
+    }, { _tag: "Unloaded" })).toEqual([])
+    expect(modelSlotActions({ _tag: "Pending" }, { _tag: "Unloaded" })).toEqual([])
+    expect(modelSlotActions(available, { _tag: "Requested" })).toEqual(["Stop"])
+    expect(modelSlotActions(available, {
+      _tag: "Failed",
+      failure: { code: "failed", message: "failed", retryable: true },
+    })).toEqual(["RetryLoad"])
   })
 
   it("keeps a durable local offering selected while its packages download", () => {

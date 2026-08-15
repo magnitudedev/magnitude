@@ -4,6 +4,7 @@ import type {
   LocalModelsState,
   ModelSlotsState,
   ProviderModelId,
+  SlotId,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { localModelProviderModelId } from "../local-models/projection"
@@ -150,6 +151,34 @@ export const deriveSelectedModelLowMemoryNotificationState = (
     ? slotsState.slots.primary.selection.providerModelId
     : null,
 )
+
+export const deriveSelectedModelResidencyNotificationState = (
+  slotsState: ModelSlotsState | null,
+  slotId: SlotId,
+): NotificationState | null => {
+  if (slotsState === null) return null
+  const slot = slotsState.slots[slotId === "primary" ? "primary" : "secondary"]
+  if (slot._tag !== "ConfiguredLocal") return null
+  switch (slot.residency._tag) {
+    case "Requested":
+      return persistentNotificationState(
+        `model-residency-${slotId}`,
+        "Waiting to load the selected model",
+        "activity",
+      )
+    case "Failed":
+      return persistentNotificationState(
+        `model-residency-${slotId}`,
+        slot.residency.failure.message,
+        "error",
+      )
+    case "Unloaded":
+    case "Loading":
+    case "Ready":
+    case "Stopping":
+      return null
+  }
+}
 
 export const deriveSelectedModelLowMemoryNotificationStateByProviderModelId = (
   modelsState: LocalModelsState | null,

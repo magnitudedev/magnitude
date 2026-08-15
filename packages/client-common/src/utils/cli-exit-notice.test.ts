@@ -19,21 +19,24 @@ const state = (lifecycle: "Ready" | "Loading" | "Stopped", duplicate = false): M
       variantLabel: Option.none(),
     },
     availability: { _tag: "Available" },
-    instance: Option.some({
-      id: "instance-1",
-      configurationId: "configuration-1",
-      lifecycle:
-        lifecycle === "Ready"
-          ? { _tag: "Ready", allocation: {} }
-          : lifecycle === "Loading"
-          ? {
-              _tag: "Loading",
-              stage: "loading",
-              progress: Option.none(),
-              plannedAllocation: Option.none(),
-            }
-          : { _tag: "Stopped", reason: "user_stop" },
-    }),
+    residency:
+      lifecycle === "Ready"
+        ? {
+            _tag: "Ready",
+            instanceId: "instance-1",
+            configurationId: "configuration-1",
+            allocation: {},
+          }
+        : lifecycle === "Loading"
+        ? {
+            _tag: "Loading",
+            instanceId: "instance-1",
+            configurationId: "configuration-1",
+            stage: "loading",
+            progress: Option.none(),
+            plannedAllocation: Option.none(),
+          }
+        : { _tag: "Unloaded" },
     actions: lifecycle === "Stopped" ? ["Load"] : ["Stop"],
   }
   return {
@@ -61,16 +64,14 @@ const withDistinctSecondary = (modelSlots: ModelSlotsState): ModelSlotsState => 
           providerModelId: "local:second",
           displayName: "Llama Test",
         },
-        instance: Option.some({
-          id: "instance-2",
+        residency: {
+          _tag: "Loading",
+          instanceId: "instance-2",
           configurationId: "configuration-2",
-          lifecycle: {
-            _tag: "Loading",
-            stage: "loading",
-            progress: Option.none(),
-            plannedAllocation: Option.none(),
-          },
-        }),
+          stage: "loading",
+          progress: Option.none(),
+          plannedAllocation: Option.none(),
+        },
       },
     },
   } as ModelSlotsState

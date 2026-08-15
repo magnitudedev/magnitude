@@ -15,7 +15,6 @@ import {
   deriveCurrentLocalModel,
   formatLocalModelDisplayName,
   formatModelDisplayName,
-  modelSlotInstanceId,
   modelSlotResidentAllocation,
   getDisplayWidth,
   getAnimationTimeSnapshot,
@@ -870,7 +869,9 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
       const memory = memoryFor(entry)
       if (selectedEntry
         && primarySlot?._tag === "ConfiguredLocal"
-        && Option.isSome(primarySlot.instance)
+        && (primarySlot.residency._tag === "Loading"
+          || primarySlot.residency._tag === "Ready"
+          || primarySlot.residency._tag === "Stopping")
         && Option.exists(memory, ({ currentHeadroomState }) =>
           currentHeadroomState._tag === "Insufficient")) return "Selected"
       if (Option.exists(memory, ({ currentHeadroomState }) =>
@@ -932,13 +933,10 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
     if (!detail) return
     if (action === "select") choose(detail)
     else if (action === "load" && primarySlot?._tag === "ConfiguredLocal") {
-      void slotActions.load(PRIMARY_SLOT_ID, primarySlot.selection)
+      void slotActions.load(PRIMARY_SLOT_ID)
     }
-    else if (action === "stop" && primarySlot) {
-      Option.match(modelSlotInstanceId(primarySlot), {
-        onNone: () => {},
-        onSome: slotActions.stop,
-      })
+    else if (action === "stop" && primarySlot?._tag === "ConfiguredLocal") {
+      void slotActions.stop(PRIMARY_SLOT_ID)
     }
     else if (detailCatalogConfigurationId) openCatalogDetail(detailCatalogConfigurationId)
   }, [choose, detail, detailCatalogConfigurationId, openCatalogDetail, primarySlot, slotActions])
@@ -1423,7 +1421,8 @@ export const catalogInspectorActionLabel = (
     case "load": return selectedSlot?._tag === "ConfiguredLocal"
       && selectedSlot.actions.includes("RetryLoad") ? "Retry loading" : "Load model"
     case "stop": return selectedSlot?._tag === "ConfiguredLocal"
-      && Option.exists(selectedSlot.instance, ({ lifecycle }) => lifecycle._tag === "Loading")
+      && (selectedSlot.residency._tag === "Requested"
+        || selectedSlot.residency._tag === "Loading")
       ? "Cancel loading" : "Stop model"
     case "uninstall": return reconciliationState._tag === "RemoveFailed"
       ? "Retry uninstall"
@@ -1458,12 +1457,13 @@ const catalogInspectorStatus = (
     const updateSuffix = model.upgradeState._tag === "Available"
       ? " · UPDATE AVAILABLE"
       : model.upgradeState._tag === "Failed" ? " · UPDATE FAILED" : ""
-    if (selectedSlot?._tag === "ConfiguredLocal" && Option.isSome(selectedSlot.instance)) {
-      const lifecycle = selectedSlot.instance.value.lifecycle
-      if (lifecycle._tag === "Loading") return `LOADING ${Math.round(Option.getOrElse(lifecycle.progress, () => 0) * 100)}%${updateSuffix}`
-      if (lifecycle._tag === "Ready") return `SELECTED · READY${updateSuffix}`
-      if (lifecycle._tag === "Stopping") return "STOPPING…"
-      if (lifecycle._tag === "Failed") return "LOAD FAILED"
+    if (selectedSlot?._tag === "ConfiguredLocal") {
+      const residency = selectedSlot.residency
+      if (residency._tag === "Requested") return `LOADING 0%${updateSuffix}`
+      if (residency._tag === "Loading") return `LOADING ${Math.round(Option.getOrElse(residency.progress, () => 0) * 100)}%${updateSuffix}`
+      if (residency._tag === "Ready") return `SELECTED · READY${updateSuffix}`
+      if (residency._tag === "Stopping") return "STOPPING…"
+      if (residency._tag === "Failed") return "LOAD FAILED"
     }
     return `SELECTED${updateSuffix}`
   }
@@ -1745,14 +1745,11 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "load" && inspectedSlot?._tag === "ConfiguredLocal") {
-      void slotActions.load(PRIMARY_SLOT_ID, inspectedSlot.selection)
+      void slotActions.load(PRIMARY_SLOT_ID)
       return
     }
-    if (action === "stop" && inspectedSlot !== null) {
-      Option.match(modelSlotInstanceId(inspectedSlot), {
-        onNone: () => {},
-        onSome: slotActions.stop,
-      })
+    if (action === "stop" && inspectedSlot?._tag === "ConfiguredLocal") {
+      void slotActions.stop(PRIMARY_SLOT_ID)
       return
     }
     if (action === "uninstall" && inspected.acquisitionState._tag === "Installed") {
@@ -2063,19 +2060,11 @@ const HardwareMenu = memo(function HardwareMenu() {
   const runAction = useCallback(() => {
     if (Option.isNone(action)) return
     if (action.value === "load") {
-      Option.match(currentSlot, {
-        onNone: () => {},
-        onSome: (slot) => slotActions.load(PRIMARY_SLOT_ID, slot.selection),
-      })
+      void slotActions.load(PRIMARY_SLOT_ID)
       return
     }
-    Option.flatMap(currentSlot, modelSlotInstanceId).pipe(
-      Option.match({
-        onNone: () => {},
-        onSome: slotActions.stop,
-      }),
-    )
-  }, [action, currentSlot, slotActions])
+    void slotActions.stop(PRIMARY_SLOT_ID)
+  }, [action, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -2188,8 +2177,7 @@ const HardwareMenu = memo(function HardwareMenu() {
             <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>ACTIONS</text>
             {Option.match(action, {
               onNone: () =>
-                Option.exists(currentSlot.value.instance, (instance) =>
-                  instance.lifecycle._tag === "Stopping")
+                currentSlot.value.residency._tag === "Stopping"
                   ? <text style={{ fg: theme.muted }}>Stopping model…</text>
                   : currentSlot.value.availability._tag === "Pending"
                     ? <text style={{ fg: theme.muted }}>Initializing model…</text>

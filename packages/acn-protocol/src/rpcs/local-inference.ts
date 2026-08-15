@@ -7,12 +7,9 @@ import {
   LocalInferenceHardwareSchema,
   LocalModelsStateSchema,
   CatalogModelReconciliationAdmissionSchema,
-  ModelInstanceIdSchema,
-  ModelLoadAdmissionSchema,
   ModelLoadPlanSchema,
   ModelServingConfigurationIdSchema,
   SlotIdSchema,
-  SlotSelectionSchema,
 } from "../schemas/model-state"
 import { defineMirroredState } from "./mirrored-state"
 
@@ -51,8 +48,8 @@ export const DeleteLocalModel = Rpc.make("DeleteLocalModel", {
 })
 
 export const LoadModel = Rpc.make("LoadModel", {
-  payload: Schema.Struct({ slotId: SlotIdSchema, selection: SlotSelectionSchema }),
-  success: ModelLoadAdmissionSchema,
+  payload: Schema.Struct({ slotId: SlotIdSchema }),
+  success: Schema.Struct({}),
   error: LocalInferenceError,
 })
 
@@ -63,7 +60,7 @@ export const PreviewModelLoad = Rpc.make("PreviewModelLoad", {
 })
 
 export const StopModel = Rpc.make("StopModel", {
-  payload: Schema.Struct({ instanceId: ModelInstanceIdSchema }),
+  payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 })

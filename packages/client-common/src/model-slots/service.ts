@@ -7,7 +7,6 @@ import {
   ModelSlotsMirror,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
-  type ModelInstanceId,
   type ModelSlotsState,
   type ProviderModelIdentity,
   type SlotId,
@@ -33,14 +32,6 @@ interface SlotInput {
   readonly slotId: SlotId
 }
 
-interface LoadInput extends SlotInput {
-  readonly selection: SlotSelection
-}
-
-interface InstanceInput {
-  readonly instanceId: ModelInstanceId
-}
-
 interface FavoriteInput {
   readonly model: ProviderModelIdentity
   readonly favorite: boolean
@@ -48,9 +39,6 @@ interface FavoriteInput {
 
 const slotScope = (slotId: SlotId): Mutation.MutationScope =>
   Mutation.MutationScope(`model-slot:${slotId}`)
-
-const instanceScope = (instanceId: ModelInstanceId): Mutation.MutationScope =>
-  Mutation.MutationScope(`model-instance:${instanceId}`)
 
 const favoriteScope = ({ providerId, providerModelId }: ProviderModelIdentity) =>
   Mutation.MutationScope(`model-favorite:${providerId}:${providerModelId}`)
@@ -86,14 +74,24 @@ export const slotAssignmentIsVisible = (
 ): boolean => Option.exists(authoritativeSlotSelection(state, slotId), (current) =>
   sameSlotSelection(current, selection))
 
-export const admittedInstanceIsVisible = (
+export const modelLoadIsVisible = (
   state: ModelSlotsState,
   slotId: SlotId,
-  instanceId: ModelInstanceId,
 ): boolean => {
   const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
   return slot._tag === "ConfiguredLocal"
-    && Option.exists(slot.instance, (instance) => instance.id === instanceId)
+    && slot.residency._tag !== "Unloaded"
+}
+
+export const selectedModelStopIsVisible = (
+  state: ModelSlotsState,
+  slotId: SlotId,
+): boolean => {
+  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
+  return slot._tag !== "ConfiguredLocal"
+    || slot.residency._tag !== "Requested"
+      && slot.residency._tag !== "Loading"
+      && slot.residency._tag !== "Ready"
 }
 
 const assignMutation = Mutation.make("AssignSlot", {
@@ -120,16 +118,15 @@ const clearMutation = Mutation.make("ClearSlot", {
 })
 
 const loadMutation = Mutation.make("LoadModel", {
-  scope: ({ slotId }: LoadInput) => slotScope(slotId),
-  effect: ({ slotId, selection }: LoadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("LoadModel", { slotId, selection })),
-  synchronize: ({ instanceId }, { slotId, selection }) => synchronizeModelSlots().pipe(
+  scope: ({ slotId }: SlotInput) => slotScope(slotId),
+  effect: ({ slotId }: SlotInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("LoadModel", { slotId })),
+  synchronize: (_, { slotId }) => synchronizeModelSlots().pipe(
     Effect.filterOrFail(
-      ({ state }) => slotAssignmentIsVisible(state, slotId, selection)
-        && admittedInstanceIsVisible(state, slotId, instanceId),
+      ({ state }) => modelLoadIsVisible(state, slotId),
       () => new ModelSlotSynchronizationFailed({
         operation: "load",
-        message: "The admitted model instance was absent from ModelSlots.",
+        message: "The model load request was absent from ModelSlots.",
       }),
     ),
     Effect.asVoid,
@@ -137,20 +134,15 @@ const loadMutation = Mutation.make("LoadModel", {
 })
 
 const stopMutation = Mutation.make("StopModel", {
-  scope: ({ instanceId }: InstanceInput) => instanceScope(instanceId),
-  effect: ({ instanceId }: InstanceInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("StopModel", { instanceId })),
-  synchronize: (_, { instanceId }) => synchronizeModelSlots().pipe(
+  scope: ({ slotId }: SlotInput) => slotScope(slotId),
+  effect: ({ slotId }: SlotInput) =>
+    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("StopModel", { slotId })),
+  synchronize: (_, { slotId }) => synchronizeModelSlots().pipe(
     Effect.filterOrFail(
-      ({ state }) => [state.slots.primary, state.slots.secondary].every((slot) =>
-        slot._tag !== "ConfiguredLocal"
-        || Option.isNone(slot.instance)
-        || slot.instance.value.id !== instanceId
-        || slot.instance.value.lifecycle._tag === "Stopped"
-        || slot.instance.value.lifecycle._tag === "Failed"),
+      ({ state }) => selectedModelStopIsVisible(state, slotId),
       () => new ModelSlotSynchronizationFailed({
         operation: "stop",
-        message: "The stopped model instance remained active in ModelSlots.",
+        message: "The selected model remained active in ModelSlots.",
       }),
     ),
     Effect.asVoid,
@@ -229,11 +221,11 @@ const makeModelSlots = Effect.gen(function* () {
     clear: (slotId: SlotId) => Mutation.execute(clear, { slotId }).pipe(
       Effect.provideService(Registry.AtomRegistry, registry),
     ),
-    load: (slotId: SlotId, selection: SlotSelection) =>
-      Mutation.execute(load, { slotId, selection }).pipe(
+    load: (slotId: SlotId) =>
+      Mutation.execute(load, { slotId }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),
       ),
-    stop: (instanceId: ModelInstanceId) => Mutation.execute(stop, { instanceId }).pipe(
+    stop: (slotId: SlotId) => Mutation.execute(stop, { slotId }).pipe(
       Effect.provideService(Registry.AtomRegistry, registry),
     ),
     setFavorite: (model: ProviderModelIdentity, favoriteValue: boolean) =>
@@ -264,20 +256,22 @@ export function useModelSlotMutations() {
   const action = useMemo(() => client.effectQuery.runtime.fn<
     | { readonly _tag: "Assign"; readonly slotId: SlotId; readonly selection: SlotSelection }
     | { readonly _tag: "Clear"; readonly slotId: SlotId }
-    | { readonly _tag: "Load"; readonly slotId: SlotId; readonly selection: SlotSelection }
-    | { readonly _tag: "Stop"; readonly instanceId: ModelInstanceId }
     | { readonly _tag: "Favorite"; readonly model: ProviderModelIdentity; readonly favorite: boolean }
   >()((input) => Effect.flatMap(ModelSlots, (slots): Effect.Effect<unknown, unknown> => {
     switch (input._tag) {
       case "Assign": return slots.assign(input.slotId, input.selection)
       case "Clear": return slots.clear(input.slotId)
-      case "Load": return slots.load(input.slotId, input.selection)
-      case "Stop": return slots.stop(input.instanceId)
       case "Favorite": return slots.setFavorite(input.model, input.favorite)
     }
   })), [client])
+  const controlAction = useMemo(() => client.effectQuery.runtime.fn<
+    | { readonly _tag: "Load"; readonly slotId: SlotId }
+    | { readonly _tag: "Stop"; readonly slotId: SlotId }
+  >()((input) => Effect.flatMap(ModelSlots, (slots): Effect.Effect<unknown, unknown> =>
+    input._tag === "Load" ? slots.load(input.slotId) : slots.stop(input.slotId))), [client])
   const results = useAtomValue(resultAtom)
   const invoke = useAtomSet(action)
+  const control = useAtomSet(controlAction, { mode: "promiseExit" })
 
   return {
     assignResult: Result.flatMap(results, ({ assign }) => assign),
@@ -289,12 +283,14 @@ export function useModelSlotMutations() {
     clear: useCallback((slotId: SlotId) => {
       invoke({ _tag: "Clear", slotId })
     }, [invoke]),
-    load: useCallback((slotId: SlotId, selection: SlotSelection) => {
-      invoke({ _tag: "Load", slotId, selection })
-    }, [invoke]),
-    stop: useCallback((instanceId: ModelInstanceId) => {
-      invoke({ _tag: "Stop", instanceId })
-    }, [invoke]),
+    load: useCallback(
+      (slotId: SlotId) => control({ _tag: "Load", slotId }),
+      [control],
+    ),
+    stop: useCallback(
+      (slotId: SlotId) => control({ _tag: "Stop", slotId }),
+      [control],
+    ),
     setFavorite: useCallback((model: ProviderModelIdentity, favoriteValue: boolean) => {
       invoke({ _tag: "Favorite", model, favorite: favoriteValue })
     }, [invoke]),

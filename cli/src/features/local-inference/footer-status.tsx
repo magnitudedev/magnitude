@@ -62,12 +62,14 @@ export const deriveLocalInferenceFooterView = (
     : undefined
   const download = models?.models.find(({ acquisitionState }) =>
     acquisitionState._tag === "Downloading" || acquisitionState._tag === "Failed")
-  const lifecycle = slot?._tag === "ConfiguredLocal"
-    ? Option.getOrNull(slot.instance)?.lifecycle
+  const currentResidency = slot?._tag === "ConfiguredLocal"
+    ? slot.residency
     : undefined
-  const residency = lifecycle?._tag === "Ready"
+  const residency = currentResidency?._tag === "Ready"
     ? "loaded" as const
-    : lifecycle?._tag === "Loading" || lifecycle?._tag === "Stopping"
+    : currentResidency?._tag === "Requested"
+      || currentResidency?._tag === "Loading"
+      || currentResidency?._tag === "Stopping"
       ? "loading" as const
       : "not_loaded" as const
   return {

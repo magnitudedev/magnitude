@@ -1,7 +1,7 @@
 import { memo } from 'react'
 import { Option } from 'effect'
 import { TextAttributes } from '@opentui/core'
-import type { DisplayRootStatus, InterruptedMessage, ModelInstanceId } from '@magnitudedev/sdk'
+import type { DisplayRootStatus, InterruptedMessage, SlotId } from '@magnitudedev/sdk'
 import {
   displayRootStatusElapsedMs,
   animationPulse,
@@ -27,7 +27,7 @@ interface ActivityRailProps {
   status: DisplayRootStatus | null
   width: number
   modelLoadActivity: LocalModelLoadActivity | null
-  onStopModel: (instanceId: ModelInstanceId) => void
+  onStopModel: (slotId: SlotId) => void
   interruptedMessage?: InterruptedMessage | null
 }
 
@@ -46,27 +46,23 @@ export const ActivityRail = memo(function ActivityRail({
   interruptedMessage,
 }: ActivityRailProps) {
   const theme = useTheme()
-  const modelLifecycle = modelLoadActivity === null
+  const modelResidency = modelLoadActivity === null
     ? null
-    : Option.getOrThrow(modelLoadActivity.instance).lifecycle
+    : modelLoadActivity.residency
   const active = status?._tag === 'Working'
   const stabilizedDetail = useStabilizedRootDetail(status)
-  const pulseAnimated = modelLifecycle?._tag === 'Stopping'
-    || (active && modelLifecycle?._tag !== 'Loading')
+  const pulseAnimated = modelResidency?._tag === 'Stopping'
+    || (active && modelResidency?._tag !== 'Loading')
   const animationTime = useAnimationTime(pulseAnimated)
-  const loadingSpinnerStep = useAnimationStep(modelLifecycle?._tag === 'Loading', 80)
+  const loadingSpinnerStep = useAnimationStep(modelResidency?._tag === 'Loading', 80)
   const pulseColor = interpolateHexColor(
     slate[500],
     slate[200],
     animationPulse(animationTime, ACTIVE_PULSE_DURATION_MS),
   )
 
-  if (modelLoadActivity !== null && modelLifecycle !== null) {
-    const instance = Option.getOrThrow(modelLoadActivity.instance)
-    if (
-      modelLifecycle._tag === 'Failed'
-      || modelLifecycle._tag === 'Stopped' && modelLifecycle.reason === 'memory_pressure'
-    ) {
+  if (modelLoadActivity !== null && modelResidency !== null) {
+    if (modelResidency._tag === 'Failed') {
       return (
         <box style={{ height: 1, flexShrink: 0 }}>
           <text style={{ fg: theme.warning }}>
@@ -76,21 +72,21 @@ export const ActivityRail = memo(function ActivityRail({
         </box>
       )
     }
-    if (modelLifecycle._tag === 'Stopping') {
+    if (modelResidency._tag === 'Stopping') {
       return (
         <box style={{ height: 1, flexShrink: 0 }}>
           <text>
             <span style={{ fg: pulseColor }}>■</span>
             {' '}
             <span style={{ fg: theme.foreground }}>Stopping model</span>
-            <span style={{ fg: theme.muted }}>{` · ${modelReleaseReasonLabel(modelLifecycle.reason)}`}</span>
+            <span style={{ fg: theme.muted }}>{` · ${modelReleaseReasonLabel(modelResidency.reason)}`}</span>
           </text>
         </box>
       )
     }
-    if (modelLifecycle._tag === 'Loading') {
+    if (modelResidency._tag === 'Loading') {
       const percentage = Math.min(100, Math.max(0, Math.round(
-        Option.getOrElse(modelLifecycle.progress, () => 0) * 100,
+        Option.getOrElse(modelResidency.progress, () => 0) * 100,
       )))
       return (
         <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
@@ -100,7 +96,7 @@ export const ActivityRail = memo(function ActivityRail({
             <span style={{ fg: theme.foreground }}>Loading model</span>
             <span style={{ fg: theme.muted }}>{` · ${percentage}%`}</span>
           </text>
-          <Button onClick={() => onStopModel(instance.id)}>
+          <Button onClick={() => onStopModel(modelLoadActivity.slotId)}>
             <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{' · Stop'}</text>
           </Button>
         </box>

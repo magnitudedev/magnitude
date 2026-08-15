@@ -174,9 +174,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       for (const slot of [slots.primary, slots.secondary]) {
         if (slot._tag === "ConfiguredLocal"
           && String(slot.selection.providerModelId) === String(providerModelId)
-          && Option.isSome(slot.instance)
-          && (slot.instance.value.lifecycle._tag === "Loading"
-            || slot.instance.value.lifecycle._tag === "Stopping")) {
+          && (slot.residency._tag === "Loading"
+            || slot.residency._tag === "Stopping")) {
           return yield* new ModelSlotMutationRejected({
             slotId: slot.slotId,
             message: "The local model cannot be deleted while loading or unloading",
@@ -184,9 +183,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         }
         if (slot._tag === "ConfiguredLocal"
           && String(slot.selection.providerModelId) === String(providerModelId)
-          && Option.isSome(slot.instance)
-          && slot.instance.value.lifecycle._tag === "Ready") {
-          yield* modelSlots.stopModel(slot.instance.value.id);
+          && slot.residency._tag === "Ready") {
+          yield* modelSlots.stopModel(slot.slotId);
         }
       }
       const installedPackageIds = yield* localModelPackages.installedPackageIds;
@@ -468,10 +466,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           ),
         ),
 
-      LoadModel: ({ slotId, selection }) =>
+      LoadModel: ({ slotId }) =>
         observeRpcDefects(
           "LoadModel",
-          modelSlots.admitModelLoad(slotId, selection),
+          modelSlots.loadModel(slotId).pipe(Effect.as({})),
         ),
 
       PreviewModelLoad: ({ slotId }) =>
@@ -480,10 +478,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           modelSlots.previewModelLoad(slotId),
         ),
 
-      StopModel: ({ instanceId }) =>
+      StopModel: ({ slotId }) =>
         observeRpcDefects(
           "StopModel",
-          modelSlots.stopModel(instanceId).pipe(Effect.as({})),
+          modelSlots.stopModel(slotId).pipe(Effect.as({})),
         ),
 
       GetOnboardingState: () =>
