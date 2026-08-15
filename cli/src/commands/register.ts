@@ -22,6 +22,16 @@ export function registerCliCommands(): void {
       label: "hardware",
       description: "Inspect local inference hardware",
     },
+    {
+      id: "load",
+      label: "load",
+      description: "Load the selected model when it is ready",
+    },
+    {
+      id: "stop",
+      label: "stop",
+      description: "Cancel or stop the selected model",
+    },
     // Cloud is disabled.
     // {
     //   id: "cloud",

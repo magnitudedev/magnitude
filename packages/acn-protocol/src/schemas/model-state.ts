@@ -985,8 +985,16 @@ export const ModelReleaseReasonSchema = Schema.Literal(
 )
 export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 
-export const ModelSlotInstanceLifecycleSchema = Schema.Union(
+const ModelResidencyIdentityFields = {
+  instanceId: ModelInstanceIdSchema,
+  configurationId: ModelServingConfigurationIdSchema,
+} as const
+
+export const ModelResidencySchema = Schema.Union(
+  Schema.TaggedStruct("Unloaded", {}),
+  Schema.TaggedStruct("Requested", {}),
   Schema.TaggedStruct("Loading", {
+    ...ModelResidencyIdentityFields,
     stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
     progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
       as: "Option",
@@ -994,44 +1002,39 @@ export const ModelSlotInstanceLifecycleSchema = Schema.Union(
     }),
     plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
   }),
-  Schema.TaggedStruct("Ready", { allocation: ModelInstanceAllocationSchema }),
+  Schema.TaggedStruct("Ready", {
+    ...ModelResidencyIdentityFields,
+    allocation: ModelInstanceAllocationSchema,
+  }),
   Schema.TaggedStruct("Stopping", {
+    ...ModelResidencyIdentityFields,
     reason: ModelReleaseReasonSchema,
     allocation: ModelStoppingAllocationSchema,
   }),
-  Schema.TaggedStruct("Stopped", {
-    reason: ModelReleaseReasonSchema,
-  }),
   Schema.TaggedStruct("Failed", { failure: ModelInstanceFailureSchema }),
 )
-export type ModelSlotInstanceLifecycle = typeof ModelSlotInstanceLifecycleSchema.Type
-
-export const ModelSlotInstanceSchema = Schema.Struct({
-  id: ModelInstanceIdSchema,
-  configurationId: ModelServingConfigurationIdSchema,
-  lifecycle: ModelSlotInstanceLifecycleSchema,
-})
-export type ModelSlotInstance = typeof ModelSlotInstanceSchema.Type
-
-export const ModelLoadResultSchema = Schema.Union(
-  Schema.TaggedStruct("Ready", {
-    instanceId: ModelInstanceIdSchema,
-    configurationId: ModelServingConfigurationIdSchema,
-  }),
-  Schema.TaggedStruct("Cancelled", {
-    instanceId: ModelInstanceIdSchema,
-    reason: ModelReleaseReasonSchema,
-  }),
-)
-export type ModelLoadResult = typeof ModelLoadResultSchema.Type
-
-export const ModelLoadAdmissionSchema = Schema.Struct({
-  instanceId: ModelInstanceIdSchema,
-})
-export type ModelLoadAdmission = typeof ModelLoadAdmissionSchema.Type
+export type ModelResidency = typeof ModelResidencySchema.Type
 
 export const ModelSlotActionSchema = Schema.Literal("Load", "Stop", "RetryLoad")
 export type ModelSlotAction = typeof ModelSlotActionSchema.Type
+
+export const modelSlotActions = (
+  availability: ModelSlotAvailability,
+  residency: ModelResidency,
+): readonly ModelSlotAction[] => {
+  switch (residency._tag) {
+    case "Requested":
+    case "Loading":
+    case "Ready":
+      return ["Stop"]
+    case "Stopping":
+      return []
+    case "Failed":
+      return residency.failure.retryable ? ["RetryLoad"] : []
+    case "Unloaded":
+      return availability._tag === "Available" ? ["Load"] : []
+  }
+}
 
 export class ModelSlotConfiguredRemote extends Schema.TaggedClass<ModelSlotConfiguredRemote>()("ConfiguredRemote", {
   slotId: SlotIdSchema,
@@ -1046,7 +1049,7 @@ export class ModelSlotConfiguredLocal extends Schema.TaggedClass<ModelSlotConfig
   selection: SlotSelectionSchema,
   descriptor: ModelSlotDescriptorSchema,
   availability: ModelSlotAvailabilitySchema,
-  instance: Schema.optionalWith(ModelSlotInstanceSchema, { as: "Option", exact: true }),
+  residency: ModelResidencySchema,
   actions: Schema.Array(ModelSlotActionSchema),
 }) {}
 
@@ -1075,24 +1078,7 @@ export const ModelSlotSchema = Schema.Union(
     return slot.selection.providerId !== "local" && slot.actions.length === 0
   }
   if (slot.selection.providerId !== "local") return false
-  const expectedActions: readonly ModelSlotAction[] = slot.availability._tag === "Available"
-    ? Option.match(slot.instance, {
-        onNone: () => ["Load"],
-        onSome: (instance) => {
-          switch (instance.lifecycle._tag) {
-            case "Loading":
-            case "Ready":
-              return ["Stop"]
-            case "Failed":
-              return instance.lifecycle.failure.retryable ? ["RetryLoad"] : []
-            case "Stopping":
-              return []
-            case "Stopped":
-              return ["Load"]
-          }
-        },
-      })
-    : []
+  const expectedActions = modelSlotActions(slot.availability, slot.residency)
   return expectedActions.length === slot.actions.length
     && expectedActions.every((action, index) => action === slot.actions[index])
 }, { message: () => "slot identity, provider kind, and actions must agree with canonical slot state" }))
@@ -1118,11 +1104,14 @@ export const ModelSlotsStateSchema = Schema.Struct({
     )
     const instanceIdsByConfiguration = new Map<string, Set<ModelInstanceId>>()
     for (const slot of local) {
-      if (Option.isNone(slot.instance)) continue
-      const instance = slot.instance.value
-      const ids = instanceIdsByConfiguration.get(instance.configurationId) ?? new Set<ModelInstanceId>()
-      ids.add(instance.id)
-      instanceIdsByConfiguration.set(instance.configurationId, ids)
+      const residency = slot.residency
+      if (residency._tag !== "Loading"
+        && residency._tag !== "Ready"
+        && residency._tag !== "Stopping") continue
+      const ids = instanceIdsByConfiguration.get(residency.configurationId)
+        ?? new Set<ModelInstanceId>()
+      ids.add(residency.instanceId)
+      instanceIdsByConfiguration.set(residency.configurationId, ids)
     }
     return [...instanceIdsByConfiguration.values()].every((ids) => ids.size === 1)
   }, {

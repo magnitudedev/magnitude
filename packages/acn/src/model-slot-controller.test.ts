@@ -170,6 +170,20 @@ const makeHarness = (options: {
   const offerings = yield* Ref.make<readonly LocalProviderOffering[]>(
     options.initialOfferings ?? [offering],
   )
+  const packageSnapshot = yield* SubscriptionRef.make({
+    revision: 0,
+    state: {
+      inventory: options.packageInventoryInitializing === true
+        ? { _tag: "Initializing" as const }
+        : { _tag: "Ready" as const },
+      entries: [],
+      downloads: [],
+    },
+  })
+  const installedPackageIds = yield* Ref.make<ReadonlySet<string>>(
+    new Set((options.projectedInstalled ?? options.installed) === false ? [] : [packageId]),
+  )
+  const nativeInstalled = yield* Ref.make(options.installed !== false)
   const loadEntered = yield* Deferred.make<void>()
   const releaseLoad = yield* Deferred.make<void>()
   const stopEntered = yield* Deferred.make<void>()
@@ -192,6 +206,9 @@ const makeHarness = (options: {
           readonly configuration: { readonly id: string }
         }
       }) => Effect.gen(function* () {
+        if (!(yield* Ref.get(nativeInstalled))) {
+          return yield* Effect.fail("The model package is not installed")
+        }
         yield* Ref.update(loadCalls, (count) => count + 1)
         yield* Deferred.succeed(loadEntered, undefined)
         yield* Deferred.await(releaseLoad)
@@ -238,21 +255,12 @@ const makeHarness = (options: {
       },
     } as unknown as MagnitudeStorageShape),
     Layer.succeed(LocalModelPackages, LocalModelPackages.of({
-      initialized: Effect.succeed(options.packageInventoryInitializing !== true),
-      snapshot: Effect.succeed({
-        revision: 0,
-        state: {
-          inventory: options.packageInventoryInitializing === true
-            ? { _tag: "Initializing" }
-            : { _tag: "Ready" },
-          entries: [],
-          downloads: [],
-        },
-      }),
-      changes: Stream.empty,
-      installedPackageIds: Effect.succeed(
-        new Set((options.projectedInstalled ?? options.installed) === false ? [] : [packageId]),
+      initialized: SubscriptionRef.get(packageSnapshot).pipe(
+        Effect.map(({ state }) => state.inventory._tag === "Ready"),
       ),
+      snapshot: SubscriptionRef.get(packageSnapshot),
+      changes: packageSnapshot.changes,
+      installedPackageIds: Ref.get(installedPackageIds),
       admitBundle: () => Effect.succeed({
         _tag: "DownloadAdmitted",
         downloadId: ModelDownloadIdSchema.make("test-download"),
@@ -320,6 +328,9 @@ const makeHarness = (options: {
     previewCalls,
     stopCalls,
     offerings,
+    packageSnapshot,
+    installedPackageIds,
+    nativeInstalled,
     instances,
     catalogSnapshot,
     loadEntered,
@@ -479,55 +490,29 @@ describe("ModelSlotController load admission", () => {
           actions: ["Load"],
         })
 
-        const loading = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
         yield* Deferred.await(harness.loadEntered)
         yield* releaseLoadAsReady(harness)
-        yield* Fiber.join(loading)
         expect(yield* Ref.get(harness.loadCalls)).toBe(1)
         expect(yield* Ref.get(harness.previewCalls)).toBe(0)
       }).pipe(Effect.provide(harness.layer))
     })))
   })
 
-  it("rejects load admission when the slot no longer has the expected selection", async () => {
+  it("acknowledges the authoritative load request before instance admission completes", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness()
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const replacedSelection = {
-          ...selection,
-          reasoningEffort: ReasoningEffortSchema.make("high"),
-        }
-
-        const error = yield* Effect.flip(controller.admitModelLoad(
-          PRIMARY_SLOT_ID,
-          replacedSelection,
-        ))
-
-        expect(error._tag).toBe("ModelSlotMutationRejected")
-        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
-      }).pipe(Effect.provide(harness.layer))
-    })))
-  })
-
-  it("acknowledges the exact published instance before it becomes Ready", async () => {
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const harness = yield* makeHarness()
-      yield* Effect.gen(function* () {
-        const controller = yield* ModelSlotController
-        const admitting = yield* controller.admitModelLoad(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
         yield* Deferred.await(harness.loadEntered)
-        yield* Deferred.succeed(harness.releaseLoad, undefined)
 
-        const admission = yield* Fiber.join(admitting)
         const snapshot = yield* controller.snapshot
         expect(snapshot.state.slots.primary).toMatchObject({
           _tag: "ConfiguredLocal",
-          instance: Option.some({
-            id: admission.instanceId,
-            lifecycle: { _tag: "Loading" },
-          }),
+          residency: { _tag: "Requested" },
         })
+        yield* Deferred.succeed(harness.releaseLoad, undefined)
       }).pipe(Effect.provide(harness.layer))
     })))
   })
@@ -572,10 +557,9 @@ describe("ModelSlotController load admission", () => {
         )
         expect((yield* controller.snapshot).state.slots.primary._tag).toBe("ConfiguredLocal")
 
-        const loading = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
         yield* Deferred.await(harness.loadEntered)
         yield* releaseLoadAsReady(harness)
-        yield* Fiber.join(loading)
         expect(yield* Ref.get(harness.loadCalls)).toBe(1)
       }).pipe(Effect.provide(harness.layer))
     })))
@@ -596,48 +580,134 @@ describe("ModelSlotController load admission", () => {
     })))
   })
 
-  it("submits one native instance for concurrent equivalent load commands", async () => {
+  it("keeps a selected-model load request pending until its package becomes available", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const harness = yield* makeHarness()
+      const harness = yield* makeHarness({ installed: false })
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
+
         expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
           _tag: "ConfiguredLocal",
-          actions: ["Load"],
+          residency: { _tag: "Requested" },
+          actions: ["Stop"],
         })
-        const first = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
-        const second = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
-        const admission = yield* Effect.race(
-          Deferred.await(harness.loadEntered).pipe(Effect.as({ _tag: "Entered" as const })),
-          Fiber.await(first).pipe(Effect.map((exit) => ({ _tag: "Finished" as const, exit }))),
+        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
+
+        yield* Ref.set(harness.installedPackageIds, new Set([packageId]))
+        yield* Ref.set(harness.nativeInstalled, true)
+        yield* SubscriptionRef.update(harness.packageSnapshot, (current) => ({
+          ...current,
+          revision: current.revision + 1,
+        }))
+        yield* Deferred.await(harness.loadEntered)
+        expect(yield* Ref.get(harness.loadCalls)).toBe(1)
+
+        yield* Deferred.succeed(harness.releaseLoad, undefined)
+        const completed = yield* controller.changes.pipe(
+          Stream.filter(({ state }) => {
+            const slot = state.slots.primary
+            return slot._tag === "ConfiguredLocal"
+              && slot.residency._tag === "Loading"
+          }),
+          Stream.runHead,
         )
-        expect(admission._tag).toBe("Entered")
-        if (admission._tag !== "Entered") return
-        expect(yield* Ref.get(harness.loadCalls)).toBe(1)
-        yield* releaseLoadAsReady(harness)
-        yield* Fiber.join(first)
-        yield* Fiber.join(second)
-        expect(yield* Ref.get(harness.loadCalls)).toBe(1)
-        expect(yield* Ref.get(harness.previewCalls)).toBe(0)
+        expect(Option.isSome(completed)).toBe(true)
       }).pipe(Effect.provide(harness.layer))
     })))
   })
 
-  it("does not hold command admission across transport and stops a superseded exact instance", async () => {
+  it("deduplicates equivalent selected-model load requests", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness()
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const loading = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
+        yield* Deferred.await(harness.loadEntered)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
+
+        expect(yield* Ref.get(harness.loadCalls)).toBe(1)
+        yield* Deferred.succeed(harness.releaseLoad, undefined)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("cancels a pending selected-model load request without loading later", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({ installed: false })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
+        yield* controller.stopModel(PRIMARY_SLOT_ID)
+
+        const slot = (yield* controller.snapshot).state.slots.primary
+        expect(slot._tag).toBe("ConfiguredLocal")
+        if (slot._tag !== "ConfiguredLocal") return
+        expect(slot.residency._tag).toBe("Unloaded")
+
+        yield* Ref.set(harness.installedPackageIds, new Set([packageId]))
+        yield* Ref.set(harness.nativeInstalled, true)
+        yield* SubscriptionRef.update(harness.packageSnapshot, (current) => ({
+          ...current,
+          revision: current.revision + 1,
+        }))
+        yield* Effect.yieldNow()
+        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("rejects stop when the selected local model has no active load", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness()
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        const error = yield* Effect.flip(controller.stopModel(PRIMARY_SLOT_ID))
+
+        expect(error).toMatchObject({
+          _tag: "ModelSlotMutationRejected",
+          message: "No selected model load is active",
+        })
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("never follows a replacement selection after a load request is captured", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({ installed: false })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
+        yield* controller.updateModelSlot(PRIMARY_SLOT_ID, Option.none())
+
+        yield* Ref.set(harness.installedPackageIds, new Set([packageId]))
+        yield* Ref.set(harness.nativeInstalled, true)
+        yield* SubscriptionRef.update(harness.packageSnapshot, (current) => ({
+          ...current,
+          revision: current.revision + 1,
+        }))
+        yield* Effect.yieldNow()
+
+        expect((yield* controller.snapshot).state.slots.primary._tag).toBe("Unassigned")
+        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
+  it("stops the exact instance when cancellation races native admission", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness()
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
         yield* Deferred.await(harness.loadEntered)
 
-        yield* controller.updateModelSlot(PRIMARY_SLOT_ID, Option.none())
-        expect((yield* controller.snapshot).state.slots.primary._tag).toBe("Unassigned")
-
+        yield* controller.stopModel(PRIMARY_SLOT_ID)
         yield* Deferred.succeed(harness.releaseLoad, undefined)
-        const outcome = yield* Fiber.await(loading)
-        expect(outcome._tag).toBe("Failure")
+        yield* Deferred.await(harness.stopEntered)
+
         expect(yield* Ref.get(harness.stopCalls)).toHaveLength(1)
+        expect((yield* controller.snapshot).state.slots.primary._tag).toBe("ConfiguredLocal")
       }).pipe(Effect.provide(harness.layer))
     })))
   })
@@ -647,10 +717,9 @@ describe("ModelSlotController load admission", () => {
       const harness = yield* makeHarness({ blockStop: true })
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const loading = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
         yield* Deferred.await(harness.loadEntered)
         yield* releaseLoadAsReady(harness)
-        yield* Fiber.join(loading)
 
         const clearing = yield* controller.updateModelSlot(PRIMARY_SLOT_ID, Option.none()).pipe(Effect.fork)
         yield* Deferred.await(harness.stopEntered)
@@ -675,14 +744,12 @@ describe("ModelSlotController load admission", () => {
           actions: ["Load"],
         })
 
-        const primary = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
-        const secondary = yield* controller.loadModel(SECONDARY_SLOT_ID).pipe(Effect.fork)
+        yield* controller.loadModel(PRIMARY_SLOT_ID)
+        yield* controller.loadModel(SECONDARY_SLOT_ID)
         yield* Deferred.await(harness.loadEntered)
         expect(yield* Ref.get(harness.loadCalls)).toBe(1)
 
         yield* releaseLoadAsReady(harness)
-        yield* Fiber.join(primary)
-        yield* Fiber.join(secondary)
         expect(yield* Ref.get(harness.loadCalls)).toBe(1)
       }).pipe(Effect.provide(harness.layer))
     })))
@@ -693,7 +760,7 @@ describe("ModelSlotController load admission", () => {
       const harness = yield* makeHarness()
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const ready = yield* controller.ensureLocalModelReady(
+        const ready = yield* controller.acquireLocalModel(
           PRIMARY_SLOT_ID,
           providerModelId,
         ).pipe(Effect.fork)
@@ -734,12 +801,53 @@ describe("ModelSlotController load admission", () => {
     })))
   })
 
+  it("uses requested residency while agent acquisition waits for admission", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({ installed: false })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+        const pending = yield* controller.changes.pipe(
+          Stream.filter(({ state }) => {
+            const slot = state.slots.primary
+            return slot._tag === "ConfiguredLocal"
+              && slot.residency._tag === "Requested"
+          }),
+          Stream.runHead,
+          Effect.fork,
+        )
+        const acquisition = yield* controller.acquireLocalModel(
+          PRIMARY_SLOT_ID,
+          providerModelId,
+        ).pipe(Effect.fork)
+
+        const pendingSnapshot = yield* Fiber.join(pending)
+        expect(Option.isSome(pendingSnapshot)).toBe(true)
+        if (Option.isNone(pendingSnapshot)) return
+        expect(pendingSnapshot.value.state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          residency: { _tag: "Requested" },
+        })
+        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
+
+        yield* controller.stopModel(PRIMARY_SLOT_ID)
+        expect(yield* Fiber.join(acquisition)).toEqual({
+          _tag: "Cancelled",
+          reason: "user_stop",
+        })
+        expect(yield* Ref.get(harness.loadCalls)).toBe(0)
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("returns cancellation for an explicit stop and binds retry to the replacement instance", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness()
       yield* Effect.gen(function* () {
         const controller = yield* ModelSlotController
-        const firstLoad = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        const firstLoad = yield* controller.acquireLocalModel(
+          PRIMARY_SLOT_ID,
+          providerModelId,
+        ).pipe(Effect.fork)
         yield* Deferred.await(harness.loadEntered)
         const firstLoading = yield* harness.instances.changes.pipe(
           Stream.filter((snapshot) =>
@@ -764,7 +872,6 @@ describe("ModelSlotController load admission", () => {
         })
         expect(yield* Fiber.join(firstLoad)).toEqual({
           _tag: "Cancelled",
-          instanceId: firstInstance.id,
           reason: "user_stop",
         })
 
@@ -774,7 +881,10 @@ describe("ModelSlotController load admission", () => {
           Stream.runHead,
           Effect.fork,
         )
-        const retry = yield* controller.loadModel(PRIMARY_SLOT_ID).pipe(Effect.fork)
+        const retry = yield* controller.acquireLocalModel(
+          PRIMARY_SLOT_ID,
+          providerModelId,
+        ).pipe(Effect.fork)
         const replacementSnapshot = yield* Fiber.join(replacementLoading)
         expect(Option.isSome(replacementSnapshot)).toBe(true)
         if (Option.isNone(replacementSnapshot)) return

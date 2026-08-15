@@ -31,6 +31,7 @@ import { clientServicesLayer, type ClientServices } from "../state/client-servic
 import { localModelProviderModelId } from "./projection"
 import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
+import { projectOnboardingModelSetup } from "./setup-state"
 
 const configurationId = ModelServingConfigurationIdSchema.make("setup-configuration")
 const providerModelId = ProviderModelIdSchema.make("setup-model:gguf:q4")
@@ -146,6 +147,7 @@ const unassignedSlots = (): ModelSlotsState => ({
 const configuredSlots = (
   lifecycle: "None" | "Loading" | "Ready" | "Stopped",
   id = instanceId,
+  activeConfigurationId = configurationId,
 ): ModelSlotsState => ({
   ...unassignedSlots(),
   slots: {
@@ -160,23 +162,41 @@ const configuredSlots = (
         variantLabel: Option.some(ModelVariantLabelSchema.make("Q4")),
       },
       availability: { _tag: "Available" },
-      instance: lifecycle === "None" ? Option.none() : Option.some({
-        id,
-        configurationId,
-        lifecycle: lifecycle === "Ready"
-          ? { _tag: "Ready", allocation }
-          : lifecycle === "Stopped"
-            ? { _tag: "Stopped", reason: "user_stop" }
-            : {
-                _tag: "Loading",
-                stage: "loading",
-                progress: Option.none(),
-                plannedAllocation: Option.none(),
-              },
-      }),
+      residency: lifecycle === "None" || lifecycle === "Stopped"
+        ? { _tag: "Unloaded" }
+        : lifecycle === "Ready"
+          ? { _tag: "Ready", instanceId: id, configurationId: activeConfigurationId, allocation }
+          : {
+              _tag: "Loading",
+              instanceId: id,
+              configurationId: activeConfigurationId,
+              stage: "loading",
+              progress: Option.none(),
+              plannedAllocation: Option.none(),
+            },
       actions: lifecycle === "None" || lifecycle === "Stopped" ? ["Load"] : ["Stop"],
     }),
   },
+})
+
+describe("projectOnboardingModelSetup", () => {
+  it("does not report a different serving configuration as ready", () => {
+    const state = projectOnboardingModelSetup(
+      { _tag: "Loading", configurationId, cancelling: false },
+      {
+        inventoryState: { _tag: "Ready" },
+        models: [makeModel(true)],
+        discoveryState: { _tag: "Ready", progress: [] },
+      },
+      configuredSlots(
+        "Ready",
+        instanceId,
+        ModelServingConfigurationIdSchema.make("replacement-configuration"),
+      ),
+    )
+
+    expect(state).toMatchObject({ _tag: "Loading", phase: "Loading" })
+  })
 })
 
 describe("installationAdmissionIsVisible", () => {
@@ -292,7 +312,6 @@ interface HarnessOptions {
   readonly keepLoading?: boolean
   readonly keepDownloading?: boolean
   readonly failAssign?: boolean
-  readonly replaceLoadInstance?: boolean
   readonly keepCompleting?: boolean
   readonly replaceSelectionBeforeLoad?: boolean
   readonly downloadFailure?: ModelDownloadFailure
@@ -400,14 +419,12 @@ const makeHarness = (options: HarnessOptions) => {
         }
         slots = configuredSlots(
           options.keepLoading ? "Loading" : "Ready",
-          options.replaceLoadInstance
-            ? ModelInstanceIdSchema.make("replacement-instance")
-            : instanceId,
+          instanceId,
         )
-        return Effect.succeed({ instanceId })
+        return Effect.succeed({})
       case "StopModel":
-        stoppedInstances.push(payload.instanceId)
-        slots = configuredSlots("Stopped", payload.instanceId)
+        stoppedInstances.push(instanceId)
+        slots = configuredSlots("Stopped", instanceId)
         return Effect.succeed({})
       case "CancelModelDownload":
         cancelledDownloads.push(payload.downloadId)
@@ -690,16 +707,4 @@ describe("OnboardingModelSetupService", () => {
     harness.registry.dispose()
   })
 
-  it("never accepts a replacement instance as the admitted instance", async () => {
-    const harness = makeHarness({ installed: true, replaceLoadInstance: true })
-    const exit = await Effect.runPromiseExit(execute(
-      harness.registry,
-      harness.service.start,
-      configurationId,
-    ))
-    expect(exit._tag).toBe("Failure")
-    expect(harness.onboardingCompleted()).toBe(false)
-    expect(harness.calls).not.toContain("UpdateOnboardingState")
-    harness.registry.dispose()
-  })
 })

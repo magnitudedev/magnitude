@@ -3,6 +3,7 @@ import { getAllCommands, type SlashCommandDefinition } from './slash-commands'
 /** Optional feature-flag lookup function. Defaults to checking process.env. */
 export type GetFeatureFlag = (key: string) => boolean | undefined
 export type ModelMenuId = "models" | "catalog" | "hardware" | "cloud"
+export type ModelControlCommand = "load" | "stop"
 
 export type SlashCommandOutcome =
   | { readonly _tag: "Handled" }
@@ -60,6 +61,8 @@ export interface CommandContext {
   openCloud?: () => void
   /** Open a client-owned model menu root, when available. */
   openModelMenu?: (menu: ModelMenuId) => void
+  /** Control the selected model through the client's notification-backed surface. */
+  controlSelectedModel?: (command: ModelControlCommand) => void
   /** Toggle between the default and transcript timeline presentations. */
   toggleTranscript?: () => void
   /** Toggle autopilot mode */
@@ -199,6 +202,12 @@ export function routeSlashCommand(input: string, ctx: CommandContext): SlashComm
     case 'cloud':
       if (!ctx.openModelMenu) return slashCommandUnhandled
       ctx.openModelMenu(parsed.commandId)
+      return slashCommandHandled
+
+    case 'load':
+    case 'stop':
+      if (!ctx.controlSelectedModel) return slashCommandUnhandled
+      ctx.controlSelectedModel(parsed.commandId)
       return slashCommandHandled
 
     case 'autopilot':

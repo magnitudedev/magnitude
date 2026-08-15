@@ -5,8 +5,6 @@ import type {
   LocalModelRecommendationProgressStep,
   LocalModelsState,
   ModelInstanceFailure,
-  ModelInstanceId,
-  ModelSlotInstanceLifecycle,
   ModelServingConfigurationId,
   ModelSlotsState,
   ProviderModelId,
@@ -116,7 +114,6 @@ export type OnboardingModelSetupExecution =
   | {
       readonly _tag: "Loading"
       readonly configurationId: ModelServingConfigurationId
-      readonly instanceId: ModelInstanceId
       readonly cancelling: boolean
     }
   | {
@@ -186,21 +183,32 @@ export const projectOnboardingModelSetup = (
     }
   }
   const slot = slots.slots.primary
-  const lifecycle = slot._tag === "ConfiguredLocal"
-    ? Option.flatMap(slot.instance, (instance) =>
-        instance.id === execution.instanceId
-          && instance.configurationId === execution.configurationId
-          ? Option.some(instance.lifecycle)
-          : Option.none())
-    : Option.none<ModelSlotInstanceLifecycle>()
+  const residency = slot._tag === "ConfiguredLocal"
+    && slot.selection.providerModelId === providerModelId.value
+    && (slot.residency._tag !== "Loading"
+      && slot.residency._tag !== "Ready"
+      && slot.residency._tag !== "Stopping"
+      || slot.residency.configurationId === execution.configurationId)
+    ? Option.some(slot.residency)
+    : Option.none()
+  const failure = Option.getOrNull(Option.flatMap(
+    residency,
+    (value) => value._tag === "Failed" ? Option.some(value.failure) : Option.none(),
+  ))
   const phase = execution.cancelling
     ? "Stopping" as const
-    : Option.match(lifecycle, {
+    : Option.match(residency, {
         onNone: () => "Loading" as const,
-        onSome: (value) => value._tag === "Failed" ? "Failed" as const
-          : value._tag === "Stopping" || value._tag === "Stopped" ? "Stopping" as const
-          : value._tag === "Ready" ? "Ready" as const
-          : "Loading" as const,
+        onSome: (value) => {
+          switch (value._tag) {
+            case "Failed": return "Failed" as const
+            case "Stopping":
+            case "Unloaded": return "Stopping" as const
+            case "Ready": return "Ready" as const
+            case "Requested":
+            case "Loading": return "Loading" as const
+          }
+        },
       })
   return {
     _tag: "Loading",
@@ -208,10 +216,7 @@ export const projectOnboardingModelSetup = (
     providerModelId: providerModelId.value,
     model: model.value,
     phase,
-    failure: Option.match(lifecycle, {
-      onNone: () => null,
-      onSome: (value) => value._tag === "Failed" ? value.failure : null,
-    }),
+    failure,
     options,
   }
 }

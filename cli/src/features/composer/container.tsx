@@ -30,11 +30,12 @@ import {
   useModelConfig,
   useLocalModels,
   useModelSlots,
+  useModelSlotActions,
   pushNotificationAtom,
   type NotificationState,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
-import { Option } from 'effect'
+import { Cause, Exit, Option } from 'effect'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
@@ -87,6 +88,25 @@ export function ComposerContainer({
       dismissAfterMilliseconds: 5_000,
     })
   }, [pushNotification])
+  const { rootRoleLabel, rootProfile, rootSlotId } = useSlotProfiles()
+  const localSlots = useModelSlots()
+  const slotActions = useModelSlotActions()
+  const modelSlotsState = Result.match(localSlots, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: ({ value }) => value,
+  })
+  const controlSelectedModel = useCallback((command: 'load' | 'stop') => {
+    const result = command === 'load'
+      ? slotActions.load(rootSlotId)
+      : slotActions.stop(rootSlotId)
+    void result.then((exit) => {
+      if (Exit.isFailure(exit)) {
+        const error = Cause.squash(exit.cause)
+        showErrorToast(error instanceof Error ? error.message : String(error))
+      }
+    })
+  }, [rootSlotId, showErrorToast, slotActions])
 
   // Slash commands may trigger a send (skills, /init) — the hook that owns
   // sending is constructed with this context, so route through a ref.
@@ -107,12 +127,13 @@ export function ComposerContainer({
     initProject: () => { void sendRef.current(INIT_PROMPT) },
     openSettings: () => setMenu({ open: true, root: 'models' }),
     openModelMenu: (root) => setMenu({ open: true, root }),
+    controlSelectedModel,
     toggleTranscript: togglePresentationMode,
     openUsage: () => setUsageOpen(true),
     openSetup,
     openCloud: () => setMenu({ open: true, root: 'cloud' }),
     toggleAutopilot: () => { /* disabled */ },
-  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, openSetup, togglePresentationMode])
+  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, openSetup, togglePresentationMode, controlSelectedModel])
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
@@ -122,16 +143,9 @@ export function ComposerContainer({
   }
 
   const { interrupt, interruptAll } = useInterruptActions()
-  const { rootRoleLabel, rootProfile, rootSlotId } = useSlotProfiles()
   const modelConfig = useModelConfig()
   const localModels = useLocalModels()
-  const localSlots = useModelSlots()
   const localModelsState = Result.match(localModels, {
-    onInitial: () => null,
-    onFailure: () => null,
-    onSuccess: ({ value }) => value,
-  })
-  const modelSlotsState = Result.match(localSlots, {
     onInitial: () => null,
     onFailure: () => null,
     onSuccess: ({ value }) => value,

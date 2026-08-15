@@ -6,7 +6,6 @@ import {
   ReasoningEffortSchema,
   type CatalogModelReconciliationAdmission,
   type LocalModelsState,
-  type ModelInstanceId,
   type ModelServingConfigurationId,
   type ModelSlotsState,
   type ProviderModelId,
@@ -46,14 +45,10 @@ interface AssignedModel extends InstalledModel {
   readonly selection: SlotSelection
 }
 
-interface LoadingModel extends AssignedModel {
-  readonly instanceId: ModelInstanceId
-}
-
 interface ResolvedChoice {
   readonly prepared: PreparedModel
   readonly installed: Option.Option<InstalledModel>
-  readonly ready: Option.Option<LoadingModel>
+  readonly ready: Option.Option<AssignedModel>
 }
 
 type TerminalFact<Value> =
@@ -108,14 +103,10 @@ const resolveChoice = (
     if (primary._tag !== "ConfiguredLocal" || !sameSlotSelection(primary.selection, selection)) {
       return Option.none()
     }
-    return Option.flatMap(primary.instance, (instance) =>
-      instance.configurationId === configurationId && instance.lifecycle._tag === "Ready"
-        ? Option.some({
-            ...exact,
-            selection,
-            instanceId: instance.id,
-          })
-        : Option.none())
+    return primary.residency._tag === "Ready"
+      && primary.residency.configurationId === configurationId
+      ? Option.some({ ...exact, selection })
+      : Option.none()
   })
   return Effect.succeed({ prepared, installed, ready })
 }
@@ -266,9 +257,9 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           Effect.as({ ...installed, selection }),
         )
       }
-      const awaitReady = (loading: LoadingModel) => terminalFact(
+      const awaitReady = (loading: AssignedModel) => terminalFact(
         Registry.toStreamResult(registry, slots.state).pipe(
-          Stream.map(({ state: current }): TerminalFact<LoadingModel> => {
+          Stream.map(({ state: current }): TerminalFact<AssignedModel> => {
             const slot = current.slots.primary
             if (slot._tag !== "ConfiguredLocal"
               || !sameSlotSelection(slot.selection, loading.selection)) {
@@ -277,21 +268,19 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
                 resource: "instance",
               }) }
             }
-            const instance = Option.filter(slot.instance, (candidate) =>
-              candidate.id === loading.instanceId
-              && candidate.configurationId === loading.configurationId)
-            if (Option.isNone(instance)) {
-              return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-                configurationId: loading.configurationId,
-                resource: "instance",
-              }) }
-            }
-            switch (instance.value.lifecycle._tag) {
+            switch (slot.residency._tag) {
+              case "Requested":
               case "Loading":
               case "Stopping": return { _tag: "Waiting" }
-              case "Ready": return { _tag: "Ready", value: loading }
-              case "Failed": return { _tag: "Failed", failure: instance.value.lifecycle.failure }
-              case "Stopped": return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+              case "Ready":
+                return slot.residency.configurationId === loading.configurationId
+                  ? { _tag: "Ready", value: loading }
+                  : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+                      configurationId: loading.configurationId,
+                      resource: "instance",
+                    }) }
+              case "Failed": return { _tag: "Failed", failure: slot.residency.failure }
+              case "Unloaded": return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
                 configurationId: loading.configurationId,
                 resource: "instance",
               }) }
@@ -300,26 +289,24 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         ),
       )
       const load = (assigned: AssignedModel) => Effect.uninterruptibleMask((restore) =>
-        slots.load(PRIMARY_SLOT_ID, assigned.selection).pipe(
-          Effect.map(({ instanceId }) => ({ ...assigned, instanceId })),
-          Effect.tap((loading) => setExecution({
+        slots.load(PRIMARY_SLOT_ID).pipe(
+          Effect.tap(() => setExecution({
             _tag: "Loading",
-            configurationId: loading.configurationId,
-            instanceId: loading.instanceId,
+            configurationId: assigned.configurationId,
             cancelling: false,
           })),
-          Effect.flatMap((loading) => restore(awaitReady(loading)).pipe(
-            Effect.onInterrupt(() => slots.stop(loading.instanceId).pipe(
+          Effect.zipRight(restore(awaitReady(assigned)).pipe(
+            Effect.onInterrupt(() => slots.stop(PRIMARY_SLOT_ID).pipe(
               Effect.tapError((failure) => setExecution({
                 _tag: "Failed",
-                configurationId: loading.configurationId,
+                configurationId: assigned.configurationId,
                 failure,
               })),
               Effect.orDie,
             )),
           )),
         ))
-      const complete = (ready: LoadingModel) => setExecution({
+      const complete = (ready: AssignedModel) => setExecution({
         _tag: "Completing",
         configurationId: ready.configurationId,
       }).pipe(

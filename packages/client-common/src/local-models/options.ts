@@ -65,7 +65,7 @@ export const localModelOptions = (
     slots.slots.primary,
     slots.slots.secondary,
   ].flatMap((slot) => slot._tag === "ConfiguredLocal"
-    && Option.exists(slot.instance, (instance) => instance.lifecycle._tag === "Ready")
+    && slot.residency._tag === "Ready"
     ? [slot.selection.providerModelId]
     : []))
   const installed = installedLocalModels(models).map((model): LocalModelOption => ({

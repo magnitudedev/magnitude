@@ -14,8 +14,7 @@ const activeLocalSlots = (state: ModelSlotsState): ReadonlyArray<ModelSlotConfig
   [state.slots.primary, state.slots.secondary].filter(
     (slot): slot is ModelSlotConfiguredLocal =>
       slot._tag === "ConfiguredLocal" &&
-      Option.isSome(slot.instance) &&
-      (slot.instance.value.lifecycle._tag === "Ready" || slot.instance.value.lifecycle._tag === "Loading")
+      (slot.residency._tag === "Ready" || slot.residency._tag === "Loading")
   )
 
 export const deriveCliExitNotice = (observation: AcnClientCloseResult): Option.Option<string> =>
@@ -24,14 +23,14 @@ export const deriveCliExitNotice = (observation: AcnClientCloseResult): Option.O
     onSome: ({ modelSlots, connectedClientCount }) => {
       const byInstance = new Map<string, ModelSlotConfiguredLocal>()
       for (const slot of activeLocalSlots(modelSlots)) {
-        const instance = Option.getOrThrow(slot.instance)
-        byInstance.set(instance.id, byInstance.get(instance.id) ?? slot)
+        const residency = slot.residency
+        if (residency._tag !== "Ready" && residency._tag !== "Loading") continue
+        byInstance.set(residency.instanceId, byInstance.get(residency.instanceId) ?? slot)
       }
       if (byInstance.size === 0) return Option.none()
       if (byInstance.size > 1) {
         const descriptions = [...byInstance.values()].map((slot) => {
-          const instance = Option.getOrThrow(slot.instance)
-          const activity = instance.lifecycle._tag === "Loading" ? "loading" : "running"
+          const activity = slot.residency._tag === "Loading" ? "loading" : "running"
           return `${formatModelDisplayName(
             slot.descriptor.displayName,
             slot.descriptor.variantLabel,
@@ -51,8 +50,7 @@ export const deriveCliExitNotice = (observation: AcnClientCloseResult): Option.O
       }
 
       const slot = byInstance.values().next().value!
-      const instance = Option.getOrThrow(slot.instance)
-      const activity = instance.lifecycle._tag === "Loading" ? "loading" : "running"
+      const activity = slot.residency._tag === "Loading" ? "loading" : "running"
       const name = formatModelDisplayName(
         slot.descriptor.displayName,
         slot.descriptor.variantLabel,

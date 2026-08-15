@@ -59,64 +59,67 @@ export const deriveCurrentLocalModel = (
         slot.descriptor.displayName,
         slot.descriptor.variantLabel,
       ),
-      contextWindow: Option.match(slot.instance, {
-        onNone: Option.none,
-        onSome: (instance) => {
-          switch (instance.lifecycle._tag) {
-            case "Ready":
-              return Option.some(instance.lifecycle.allocation.contextWindowTokens)
-            case "Stopping":
-              return instance.lifecycle.allocation._tag === "Resident"
-                ? Option.some(instance.lifecycle.allocation.allocation.contextWindowTokens)
-                : Option.map(
-                    instance.lifecycle.allocation.allocation,
-                    (planned) => planned.contextWindowTokens,
-                  )
-            case "Loading":
-              return Option.map(
-                instance.lifecycle.plannedAllocation,
-                (planned) => planned.contextWindowTokens,
-              )
-            case "Stopped":
-            case "Failed":
-              return Option.none()
-          }
-        },
-      }),
+      contextWindow: (() => {
+        switch (slot.residency._tag) {
+          case "Ready":
+            return Option.some(slot.residency.allocation.contextWindowTokens)
+          case "Stopping":
+            return slot.residency.allocation._tag === "Resident"
+              ? Option.some(slot.residency.allocation.allocation.contextWindowTokens)
+              : Option.map(
+                  slot.residency.allocation.allocation,
+                  (planned) => planned.contextWindowTokens,
+                )
+          case "Loading":
+            return Option.map(
+              slot.residency.plannedAllocation,
+              (planned) => planned.contextWindowTokens,
+            )
+          case "Requested":
+          case "Unloaded":
+          case "Failed":
+            return Option.none()
+        }
+      })(),
     }
-    if (Option.isNone(slot.instance)
-      || slot.instance.value.lifecycle._tag === "Stopped") {
-      return { _tag: "NotLoaded", ...details }
-    }
-    switch (slot.instance.value.lifecycle._tag) {
+    switch (slot.residency._tag) {
+      case "Unloaded":
+        return { _tag: "NotLoaded", ...details }
+      case "Requested":
+        return {
+          _tag: "Loading",
+          ...details,
+          allocation: Option.none(),
+          percentage: 0,
+        }
       case "Loading":
         return {
           _tag: "Loading",
           ...details,
-          allocation: Option.map(slot.instance.value.lifecycle.plannedAllocation, allocation),
+          allocation: Option.map(slot.residency.plannedAllocation, allocation),
           percentage: Math.round(
-            Option.getOrElse(slot.instance.value.lifecycle.progress, () => 0) * 100,
+            Option.getOrElse(slot.residency.progress, () => 0) * 100,
           ),
         }
       case "Ready":
         return {
           _tag: "Running",
           ...details,
-          allocation: allocation(slot.instance.value.lifecycle.allocation),
+          allocation: allocation(slot.residency.allocation),
         }
       case "Stopping":
         return {
           _tag: "Stopping",
           ...details,
-          allocation: slot.instance.value.lifecycle.allocation._tag === "Resident"
-            ? Option.some(allocation(slot.instance.value.lifecycle.allocation.allocation))
-            : Option.map(slot.instance.value.lifecycle.allocation.allocation, allocation),
+          allocation: slot.residency.allocation._tag === "Resident"
+            ? Option.some(allocation(slot.residency.allocation.allocation))
+            : Option.map(slot.residency.allocation.allocation, allocation),
         }
       case "Failed":
         return {
           _tag: "Failed",
           ...details,
-          reason: slot.instance.value.lifecycle.failure,
+          reason: slot.residency.failure,
         }
     }
   },

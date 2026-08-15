@@ -13,8 +13,9 @@ import {
   type ModelSlotsState,
 } from "@magnitudedev/sdk"
 import {
-  admittedInstanceIsVisible,
   presentedSlotSelection,
+  modelLoadIsVisible,
+  selectedModelStopIsVisible,
   slotAssignmentIsVisible,
 } from "./service"
 
@@ -75,16 +76,14 @@ describe("model-slot mutation synchronization", () => {
           variantLabel: Option.none(),
         },
         availability: { _tag: "Available" },
-        instance: Option.some({
-          id: ModelInstanceIdSchema.make("instance"),
+        residency: {
+          _tag: "Loading",
+          instanceId: ModelInstanceIdSchema.make("instance"),
           configurationId: ModelServingConfigurationIdSchema.make("configuration"),
-          lifecycle: {
-            _tag: "Loading",
-            stage: "queued",
-            progress: Option.none(),
-            plannedAllocation: Option.none(),
-          },
-        }),
+          stage: "queued",
+          progress: Option.none(),
+          plannedAllocation: Option.none(),
+        },
         actions: ["Stop"],
       }),
     },
@@ -99,16 +98,39 @@ describe("model-slot mutation synchronization", () => {
     )).toBe(false)
   })
 
-  it("requires the exact admitted instance", () => {
-    expect(admittedInstanceIsVisible(
-      configured,
-      PRIMARY_SLOT_ID,
-      ModelInstanceIdSchema.make("instance"),
-    )).toBe(true)
-    expect(admittedInstanceIsVisible(
-      configured,
-      PRIMARY_SLOT_ID,
-      ModelInstanceIdSchema.make("replacement"),
-    )).toBe(false)
+  it("synchronizes selected-model control against request and instance state", () => {
+    expect(modelLoadIsVisible(configured, PRIMARY_SLOT_ID)).toBe(true)
+    expect(selectedModelStopIsVisible(configured, PRIMARY_SLOT_ID)).toBe(false)
+    const primary = configured.slots.primary
+    if (primary._tag !== "ConfiguredLocal") throw new Error("expected local slot")
+
+    const waiting: ModelSlotsState = {
+      ...configured,
+      slots: {
+        ...configured.slots,
+        primary: new ModelSlotConfiguredLocal({
+          ...primary,
+          residency: { _tag: "Requested" },
+        }),
+      },
+    }
+    expect(modelLoadIsVisible(waiting, PRIMARY_SLOT_ID)).toBe(true)
+    expect(selectedModelStopIsVisible(waiting, PRIMARY_SLOT_ID)).toBe(false)
+    const failed: ModelSlotsState = {
+      ...waiting,
+      slots: {
+        ...waiting.slots,
+        primary: new ModelSlotConfiguredLocal({
+          ...primary,
+          residency: {
+            _tag: "Failed",
+            failure: { code: "load_failed", message: "failed", retryable: true },
+          },
+          actions: ["RetryLoad"],
+        }),
+      },
+    }
+    expect(modelLoadIsVisible(failed, PRIMARY_SLOT_ID)).toBe(true)
+    expect(selectedModelStopIsVisible(authoritative, PRIMARY_SLOT_ID)).toBe(true)
   })
 })

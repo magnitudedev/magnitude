@@ -54,35 +54,27 @@ describe('agent model configuration boundary', () => {
   })
 
   it.each([
-    ['not loaded', Option.none()],
-    ['loading', Option.some({
-      id: instanceId,
+    ['not loaded', { _tag: 'Unloaded' as const }],
+    ['loading', {
+      _tag: 'Loading' as const,
+      instanceId,
       configurationId,
-      lifecycle: {
-        _tag: 'Loading' as const,
-        stage: 'loading' as const,
-        progress: Option.some(0.42),
-        plannedAllocation: Option.none(),
-      },
-    })],
-    ['stopping', Option.some({
-      id: instanceId,
+      stage: 'loading' as const,
+      progress: Option.some(0.42),
+      plannedAllocation: Option.none(),
+    }],
+    ['stopping', {
+      _tag: 'Stopping' as const,
+      instanceId,
       configurationId,
-      lifecycle: {
-        _tag: 'Stopping' as const,
-        reason: 'user_stop' as const,
-        allocation: { _tag: 'Planned' as const, allocation: Option.none() },
-      },
-    })],
-    ['failed', Option.some({
-      id: instanceId,
-      configurationId,
-      lifecycle: {
-        _tag: 'Failed' as const,
-        failure: { code: 'load_failed', message: 'failed', retryable: true },
-      },
-    })],
-  ] as const)('keeps a selected %s local model callable through the provider boundary', (_state, instance) => {
+      reason: 'user_stop' as const,
+      allocation: { _tag: 'Planned' as const, allocation: Option.none() },
+    }],
+    ['failed', {
+      _tag: 'Failed' as const,
+      failure: { code: 'load_failed', message: 'failed', retryable: true },
+    }],
+  ] as const)('keeps a selected %s local model callable through the provider boundary', (_state, residency) => {
     const providerId = ProviderIdSchema.make('local')
     const providerModelId = ProviderModelIdSchema.make('local:model')
     const reasoningEffort = ReasoningEffortSchema.make('none')
@@ -120,8 +112,14 @@ describe('agent model configuration boundary', () => {
           variantLabel: Option.some(ModelVariantLabelSchema.make('Q4 QAT')),
         },
         availability: { _tag: 'Available' },
-        instance,
-        actions: [],
+        residency,
+        actions: residency._tag === 'Unloaded'
+          ? ['Load']
+          : residency._tag === 'Loading'
+            ? ['Stop']
+            : residency._tag === 'Failed'
+              ? ['RetryLoad']
+              : [],
       }),
       secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
     }
