@@ -7,13 +7,35 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { localCatalogProviderModelId } from "./local-provider-model-id"
 
-const MAX_RECOMMENDATIONS = 4
 const COMPARISON_CONTEXT_LENGTH = 50_000
-const MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND = 5
-const SPEED_UTILITY_CEILING = 60
-const DOWNLOAD_UTILITY_BYTES = 16 * 1024 ** 3
-const LIGHTWEIGHT_CAPACITY_RATIO = 0.2
-const LIGHTWEIGHT_BALANCED_MEMORY_RATIO = 0.8
+const LINEAR_SPEED_UTILITY_LIMIT = 40
+const SPEED_UTILITY_CEILING = 100
+
+export type RecommendationIntent = RecommendationSelection["intent"]
+
+export interface RecommendationWeights {
+  readonly capability: number
+  readonly speed: number
+  readonly fidelity: number
+  readonly memory: number
+}
+
+export const recommendationIntentWeights: Readonly<Record<
+  RecommendationIntent,
+  RecommendationWeights
+>> = {
+  balanced: { capability: 0.4, speed: 0.3, fidelity: 0.2, memory: 0.1 },
+  smartest: { capability: 0.6, speed: 0.1, fidelity: 0.3, memory: 0 },
+  fastest: { capability: 0.3, speed: 0.6, fidelity: 0.05, memory: 0.05 },
+  lightweight: { capability: 0.1, speed: 0.1, fidelity: 0.1, memory: 0.7 },
+}
+
+const recommendationIntents = [
+  "balanced",
+  "smartest",
+  "fastest",
+  "lightweight",
+] as const satisfies readonly RecommendationIntent[]
 
 export interface RecommendationCandidate {
   readonly model: RecommendableModel
@@ -21,17 +43,11 @@ export interface RecommendationCandidate {
   readonly assessment: FitsModelAssessment
   readonly artifactId: string
   readonly catalogModelId: string
-  readonly capability:
-    | {
-        readonly score: number
-        readonly provenance: string
-      }
-    | undefined
+  readonly capabilityScore: number
   readonly fidelityRank: number
   readonly quantizationAware: boolean
   readonly estimatedLoadedBytes: number
   readonly stableCapacityBudgetBytes: number
-  readonly totalDownloadBytes: number
 }
 
 export interface RecommendationSelection {
@@ -43,9 +59,6 @@ export interface RecommendationSelection {
   readonly explanation: string
 }
 
-const fullContextGenerationFor = (candidate: RecommendationCandidate) =>
-  candidate.assessment.performance.at(-1)!
-
 const comparisonGenerationFor = (candidate: RecommendationCandidate) => {
   const comparisonContext = Math.min(
     COMPARISON_CONTEXT_LENGTH,
@@ -55,27 +68,6 @@ const comparisonGenerationFor = (candidate: RecommendationCandidate) => {
     contextTokens === comparisonContext)!
 }
 
-export const conservativeGenerationSpeed = (
-  candidate: RecommendationCandidate,
-): number => {
-  const generation = comparisonGenerationFor(candidate)
-  if (generation.confidence === "high") return generation.estimatedTokensPerSecond
-  if (generation.confidence === "moderate") {
-    return (generation.lowerTokensPerSecond + generation.estimatedTokensPerSecond) / 2
-  }
-  return generation.lowerTokensPerSecond
-}
-
-const capabilityScore = (candidate: RecommendationCandidate): number | undefined =>
-  candidate.capability?.score
-
-const measuredCapability = (candidate: RecommendationCandidate): boolean =>
-  candidate.capability?.provenance === "measured_terminal_bench_2.1"
-
-const meetsUsabilityFloor = (tokensPerSecond: number): boolean =>
-  Math.round(tokensPerSecond * 10) / 10
-    >= MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND
-
 const stableCompare = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,
@@ -84,69 +76,51 @@ const stableCompare = (
     String(right.assessment.configurationId),
   )
 
-const usable = (candidate: RecommendationCandidate): boolean => {
-  const generation = fullContextGenerationFor(candidate)
-  return generation.contextTokens === candidate.profile.contextLength
-    && meetsUsabilityFloor(generation.estimatedTokensPerSecond)
-}
-
-const preferScoredCandidates = (
-  candidates: readonly RecommendationCandidate[],
-): readonly RecommendationCandidate[] =>
-  candidates.some((candidate) => capabilityScore(candidate) !== undefined)
-    ? candidates.filter((candidate) => capabilityScore(candidate) !== undefined)
-    : candidates
-
-const capabilityFloor = (
-  candidates: readonly RecommendationCandidate[],
-  maximumLoss: number,
-  minimumRetention: number,
-): number => {
-  const scores = candidates.flatMap((candidate) => {
-    const score = capabilityScore(candidate)
-    return score === undefined ? [] : [score]
-  })
-  if (scores.length === 0) return Number.NEGATIVE_INFINITY
-  const ceiling = Math.max(...scores)
-  return Math.max(ceiling - maximumLoss, ceiling * minimumRetention)
-}
-
-const withinCapabilityGuard = (
-  candidates: readonly RecommendationCandidate[],
-  maximumLoss: number,
-  minimumRetention: number,
-): readonly RecommendationCandidate[] => {
-  const floor = capabilityFloor(candidates, maximumLoss, minimumRetention)
-  return candidates.filter((candidate) => (capabilityScore(candidate) ?? floor) >= floor)
-}
-
 const clamp = (value: number): number => Math.max(0, Math.min(1, value))
 
-const speedUtility = (tokensPerSecond: number): number => clamp(
-  Math.log(tokensPerSecond / MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND)
-    / Math.log(
-      SPEED_UTILITY_CEILING / MINIMUM_RECOMMENDED_FULL_CONTEXT_TOKENS_PER_SECOND,
-    ),
-)
-
-export const balancedUtility = (candidate: RecommendationCandidate): number => {
-  const generation = comparisonGenerationFor(candidate)
-  const capability = (capabilityScore(candidate) ?? 50) / 100
-  const memory = clamp(1 - candidate.estimatedLoadedBytes
-    / Math.max(1, candidate.stableCapacityBudgetBytes))
-  const download = DOWNLOAD_UTILITY_BYTES
-    / (DOWNLOAD_UTILITY_BYTES + candidate.totalDownloadBytes)
-  return capability * 0.4
-    + speedUtility(generation.estimatedTokensPerSecond) * 0.3
-    + memory * 0.15
-    + clamp(candidate.fidelityRank / 100) * 0.1
-    + download * 0.05
+export const speedUtility = (tokensPerSecond: number): number => {
+  const boundedSpeed = Math.max(0, Math.min(SPEED_UTILITY_CEILING, tokensPerSecond))
+  const rawUtility = boundedSpeed <= LINEAR_SPEED_UTILITY_LIMIT
+    ? boundedSpeed / LINEAR_SPEED_UTILITY_LIMIT
+    : 1 + Math.log(boundedSpeed / LINEAR_SPEED_UTILITY_LIMIT)
+  const maximumUtility = 1 + Math.log(
+    SPEED_UTILITY_CEILING / LINEAR_SPEED_UTILITY_LIMIT,
+  )
+  return rawUtility / maximumUtility
 }
 
-const compareBalanced = (
+export const recommendationUtility = (
+  candidate: RecommendationCandidate,
+  weights: RecommendationWeights,
+): number => {
+  const generation = comparisonGenerationFor(candidate)
+  const capability = clamp(candidate.capabilityScore / 100)
+  const speed = speedUtility(generation.estimatedTokensPerSecond)
+  const memory = clamp(1 - candidate.estimatedLoadedBytes
+    / Math.max(1, candidate.stableCapacityBudgetBytes))
+  const fidelity = clamp(candidate.fidelityRank / 100)
+  return capability ** weights.capability
+    * speed ** weights.speed
+    * fidelity ** weights.fidelity
+    * memory ** weights.memory
+}
+
+export const intentUtility = (
+  candidate: RecommendationCandidate,
+  intent: RecommendationIntent,
+): number => recommendationUtility(candidate, recommendationIntentWeights[intent])
+
+export const balancedUtility = (candidate: RecommendationCandidate): number =>
+  intentUtility(candidate, "balanced")
+
+export const smartestUtility = (candidate: RecommendationCandidate): number =>
+  intentUtility(candidate, "smartest")
+
+const compareForIntent = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,
-): number => balancedUtility(right) - balancedUtility(left)
+  intent: RecommendationIntent,
+): number => intentUtility(right, intent) - intentUtility(left, intent)
   || stableCompare(left, right)
 
 /** Compatible catalog candidates in the same general-purpose order used by Balanced. */
@@ -154,12 +128,7 @@ export const rankCatalogCandidates = (
   input: readonly RecommendationCandidate[],
 ): readonly RecommendationCandidate[] =>
   [...input]
-    .sort((left, right) =>
-      Number(usable(right)) - Number(usable(left))
-        || (usable(left) && usable(right) ? compareBalanced(left, right) : 0)
-        || (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
-        || right.fidelityRank - left.fidelityRank
-        || stableCompare(left, right))
+    .sort((left, right) => compareForIntent(left, right, "balanced"))
 
 export const assembleRecommendationCatalogCandidates = (
   input: readonly RecommendationCandidate[],
@@ -171,7 +140,8 @@ export const assembleRecommendationCatalogCandidates = (
   const selected = recommendations.flatMap((recommendation) => {
     const candidate = candidatesByConfiguration.get(recommendation.configurationId)
     return candidate ? [candidate] : []
-  })
+  }).filter((candidate, index, candidates) => candidates.findIndex(({ artifactId }) =>
+    artifactId === candidate.artifactId) === index)
   const selectedArtifactIds = new Set(
     selected.map(({ artifactId }) => artifactId),
   )
@@ -181,54 +151,6 @@ export const assembleRecommendationCatalogCandidates = (
       .filter((candidate) => !selectedArtifactIds.has(candidate.artifactId)),
   ]
 }
-
-const compareSmartest = (
-  left: RecommendationCandidate,
-  right: RecommendationCandidate,
-): number => (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
-  || Number(measuredCapability(right)) - Number(measuredCapability(left))
-  || right.fidelityRank - left.fidelityRank
-  || right.profile.contextLength - left.profile.contextLength
-  || comparisonGenerationFor(right).estimatedTokensPerSecond
-    - comparisonGenerationFor(left).estimatedTokensPerSecond
-  || stableCompare(left, right)
-
-const sameConfiguration = (
-  left: RecommendationCandidate,
-  right: RecommendationCandidate,
-): boolean => left.assessment.configurationId === right.assessment.configurationId
-
-const materiallyLighterThan = (
-  candidate: RecommendationCandidate,
-  reference: RecommendationCandidate,
-  ratio: number,
-): boolean => candidate.estimatedLoadedBytes <= reference.estimatedLoadedBytes * ratio
-  || candidate.totalDownloadBytes <= reference.totalDownloadBytes * ratio
-
-const lightweightMemoryShare = (
-  candidate: RecommendationCandidate,
-): number => Math.max(
-  0,
-  ...candidate.assessment.memory.map((domain) => domain.requiredBytes
-    / Math.max(1, domain.capacityBytes - domain.compatibilityReserveBytes)),
-)
-
-const withinLightweightMemoryTier = (
-  candidate: RecommendationCandidate,
-  balanced: RecommendationCandidate,
-): boolean => lightweightMemoryShare(candidate) <= LIGHTWEIGHT_CAPACITY_RATIO
-  && candidate.estimatedLoadedBytes
-    <= balanced.estimatedLoadedBytes * LIGHTWEIGHT_BALANCED_MEMORY_RATIO
-
-const compareLightweight = (
-  left: RecommendationCandidate,
-  right: RecommendationCandidate,
-): number => (capabilityScore(right) ?? 0) - (capabilityScore(left) ?? 0)
-  || left.estimatedLoadedBytes - right.estimatedLoadedBytes
-  || right.fidelityRank - left.fidelityRank
-  || conservativeGenerationSpeed(right) - conservativeGenerationSpeed(left)
-  || left.totalDownloadBytes - right.totalDownloadBytes
-  || stableCompare(left, right)
 
 const percentDifference = (value: number, reference: number): number => Math.round(
   Math.abs(value / Math.max(1, reference) - 1) * 100,
@@ -268,8 +190,7 @@ const describeSmartest = (
   balanced: RecommendationCandidate,
 ): string => {
   const generation = comparisonGenerationFor(candidate)
-  const capabilityGain = (capabilityScore(candidate) ?? 0)
-    - (capabilityScore(balanced) ?? 0)
+  const capabilityGain = candidate.capabilityScore - balanced.capabilityScore
   const reason = capabilityGain >= 5
     ? "Offers stronger performance on difficult coding tasks. "
     : ""
@@ -297,8 +218,7 @@ const describeFastest = (
   const speedGain = generation.estimatedTokensPerSecond >= balancedSpeed * 1.05
     ? `About ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster than Balanced, at ~${wholeSpeed(generation.estimatedTokensPerSecond)} tok/s at ${Math.round(generation.contextTokens / 1_000)}K context.`
     : `Prioritizes responsiveness at ~${wholeSpeed(generation.estimatedTokensPerSecond)} tok/s at ${Math.round(generation.contextTokens / 1_000)}K context.`
-  const capabilityTradeoff = (capabilityScore(candidate) ?? 0)
-      < (capabilityScore(balanced) ?? 0)
+  const capabilityTradeoff = candidate.capabilityScore < balanced.capabilityScore
     ? " It is less capable on difficult coding tasks."
     : ""
   return `${speedGain}${capabilityTradeoff}${shorterContextTradeoff(candidate, balanced)} ${qualitySentence(candidate)}`
@@ -312,23 +232,20 @@ const describeLightweight = (
   const loadedMemoryReduction = Math.max(0, Math.round(
     (1 - candidate.estimatedLoadedBytes / balanced.estimatedLoadedBytes) * 100,
   ))
-  const downloadReduction = Math.max(0, Math.round(
-    (1 - candidate.totalDownloadBytes / balanced.totalDownloadBytes) * 100,
-  ))
-  const reduction = loadedMemoryReduction >= downloadReduction
-    ? `${loadedMemoryReduction}% less memory while loaded`
-    : `${downloadReduction}% less disk space`
   const balancedSpeed = comparisonGenerationFor(balanced).estimatedTokensPerSecond
   const speedTradeoff = generation.estimatedTokensPerSecond < balancedSpeed * 0.95
     ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% slower than Balanced.`
     : generation.estimatedTokensPerSecond > balancedSpeed * 1.05
       ? ` It is about ${percentDifference(generation.estimatedTokensPerSecond, balancedSpeed)}% faster than Balanced.`
       : " It runs at about the same speed as Balanced."
-  const capabilityTradeoff = (capabilityScore(candidate) ?? 0)
-      < (capabilityScore(balanced) ?? 0)
+  const capabilityTradeoff = candidate.capabilityScore < balanced.capabilityScore
     ? " It is less capable on difficult coding tasks."
     : ""
-  return `Uses ${reduction} than Balanced and is easier to keep on this machine.${capabilityTradeoff}${speedTradeoff}${shorterContextTradeoff(candidate, balanced)} ${qualitySentence(candidate)}`
+  const memory = Math.round(candidate.estimatedLoadedBytes / 1024 ** 3)
+  const memorySummary = loadedMemoryReduction > 0
+    ? `Uses ${loadedMemoryReduction}% less memory while loaded than Balanced`
+    : `Prioritizes low loaded memory at about ${memory} GiB`
+  return `${memorySummary} and is easier to keep on this machine.${capabilityTradeoff}${speedTradeoff}${shorterContextTradeoff(candidate, balanced)} ${qualitySentence(candidate)}`
 }
 
 const toRecommendation = (
@@ -347,87 +264,22 @@ const toRecommendation = (
     : describeLightweight(candidate, balanced),
 })
 
-const preferNewCatalogModelWithin = (
-  candidates: readonly RecommendationCandidate[],
-  usedCatalogModelIds: ReadonlySet<string>,
-): RecommendationCandidate | undefined => candidates.find((candidate) =>
-  !usedCatalogModelIds.has(candidate.catalogModelId)) ?? candidates.at(0)
-
 export const selectRecommendationPortfolio = (
   input: readonly RecommendationCandidate[],
 ): readonly RecommendationSelection[] => {
-  const feasible = preferScoredCandidates(input.filter(usable))
-  if (feasible.length === 0) return []
+  if (input.length === 0) return []
 
-  const smartest = [...feasible].sort(compareSmartest).at(0)
-  if (!smartest) return []
-
-  const balancedCapable = withinCapabilityGuard(feasible, 20, 0.7)
-  const bestFidelity = Math.max(...balancedCapable.map(({ fidelityRank }) => fidelityRank))
-  const balancedCandidates = balancedCapable
-    .filter(({ fidelityRank }) => fidelityRank >= bestFidelity - 20)
-    .sort(compareBalanced)
-  let balanced = balancedCandidates.at(0)
+  const balanced = [...input].sort((left, right) =>
+    compareForIntent(left, right, "balanced")).at(0)
   if (!balanced) return []
 
-  if (sameConfiguration(balanced, smartest)) {
-    const lighterSameCatalogModel = balancedCandidates
-      .filter((candidate) => candidate.catalogModelId === smartest.catalogModelId
-        && !sameConfiguration(candidate, smartest)
-        && candidate.fidelityRank >= smartest.fidelityRank - 20
-        && materiallyLighterThan(candidate, smartest, 0.9))
-      .sort(compareBalanced)
-      .at(0)
-    if (lighterSameCatalogModel) balanced = lighterSameCatalogModel
-  }
-
-  const selected: Array<{
-    readonly candidate: RecommendationCandidate
-    readonly intent: RecommendationSelection["intent"]
-  }> = [{ candidate: balanced, intent: "balanced" }]
-  const selectedConfigurations = new Set([balanced.assessment.configurationId])
-  const usedCatalogModelIds = new Set([balanced.catalogModelId])
-
-  const smartestCapabilityGain = (capabilityScore(smartest) ?? 0)
-    - (capabilityScore(balanced) ?? 0)
-  const smartestFidelityGain = smartest.fidelityRank - balanced.fidelityRank
-  if (!selectedConfigurations.has(smartest.assessment.configurationId)
-    && (smartestCapabilityGain >= 5 || smartestFidelityGain >= 10)) {
-    selected.push({ candidate: smartest, intent: "smartest" })
-    selectedConfigurations.add(smartest.assessment.configurationId)
-    usedCatalogModelIds.add(smartest.catalogModelId)
-  }
-
-  const fastestCapable = withinCapabilityGuard(feasible, 35, 0.5)
-    .filter((candidate) =>
-      !selectedConfigurations.has(candidate.assessment.configurationId))
-    .sort((left, right) => conservativeGenerationSpeed(right)
-      - conservativeGenerationSpeed(left)
-      || stableCompare(left, right))
-  const fastestRate = fastestCapable.length > 0
-    ? Math.max(...fastestCapable.map(conservativeGenerationSpeed))
-    : 0
-  const nearFastest = fastestCapable.filter((candidate) =>
-    conservativeGenerationSpeed(candidate) >= fastestRate * 0.9)
-  const fastest = preferNewCatalogModelWithin(nearFastest, usedCatalogModelIds)
-  if (fastest
-    && conservativeGenerationSpeed(fastest)
-      >= conservativeGenerationSpeed(balanced) * 1.15) {
-    selected.push({ candidate: fastest, intent: "fastest" })
-    selectedConfigurations.add(fastest.assessment.configurationId)
-    usedCatalogModelIds.add(fastest.catalogModelId)
-  }
-
-  const lightweightCapable = feasible
-    .filter((candidate) =>
-      !selectedConfigurations.has(candidate.assessment.configurationId)
-      && withinLightweightMemoryTier(candidate, balanced))
-    .sort(compareLightweight)
-  const lightweight = lightweightCapable.at(0)
-  if (lightweight) {
-    selected.push({ candidate: lightweight, intent: "lightweight" })
-  }
-
-  return selected.slice(0, MAX_RECOMMENDATIONS)
-    .map(({ candidate, intent }) => toRecommendation(candidate, intent, balanced))
+  const selectedConfigurationIds = new Set<string>()
+  return recommendationIntents.flatMap((intent): readonly RecommendationSelection[] => {
+    const candidate = [...input]
+      .sort((left, right) => compareForIntent(left, right, intent))
+      .find(({ assessment }) => !selectedConfigurationIds.has(assessment.configurationId))
+    if (!candidate) return []
+    selectedConfigurationIds.add(candidate.assessment.configurationId)
+    return [toRecommendation(candidate, intent, balanced)]
+  })
 }

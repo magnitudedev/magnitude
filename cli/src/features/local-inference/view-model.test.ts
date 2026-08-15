@@ -64,10 +64,10 @@ describe("unified local inference projection", () => {
     const selections = buildLocalInferenceSelections(view.models, view.slots)
     expect(selections).toHaveLength(1)
     expect(selections[0]?.model).toBe(model)
-    expect(selections[0]?.recommendation).toMatchObject({
-      _tag: "Some",
-      value: { intent: "balanced" },
-    })
+    expect(selections[0]?.recommendations.map(({ intent }) => intent)).toEqual([
+      "balanced",
+      "fastest",
+    ])
   })
 
   it("keeps active acquisition visible without manufacturing a download record", () => {

@@ -451,10 +451,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                         assessment: result.assessment,
                         artifactId: model.configuration.id,
                         catalogModelId: model.modelId,
-                        capability: {
-                          score: model.qualityScore,
-                          provenance: model.qualityScoreProvenance,
-                        },
+                        capabilityScore: model.qualityScore,
                         fidelityRank: model.fidelityRank,
                         quantizationAware: model.quantizationAware,
                         estimatedLoadedBytes:
@@ -473,12 +470,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                               ),
                             0
                           ),
-                        totalDownloadBytes: servableModelBundlePackages(
-                          model.configuration.bundle
-                        ).flatMap(({ files }) => files).reduce(
-                          (total, file) => total + file.sizeBytes,
-                          0
-                        ),
                       }]
               }
             )

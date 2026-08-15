@@ -17,7 +17,7 @@ export interface LocalModelOption {
   readonly id: string
   readonly kind: "running" | "stored" | "recommendation"
   readonly model: LocalModel
-  readonly recommendation: Option.Option<LocalModelRecommendation>
+  readonly recommendations: readonly LocalModelRecommendation[]
 }
 
 const kindOrder: Record<LocalModelOption["kind"], number> = {
@@ -33,6 +33,13 @@ const intentOrder = {
   lightweight: 3,
 } as const
 
+const orderedRecommendations = (
+  recommendations: readonly LocalModelRecommendation[],
+): readonly LocalModelRecommendation[] => [...recommendations]
+  .filter((recommendation, index, all) => all.findIndex(({ intent }) =>
+    intent === recommendation.intent) === index)
+  .sort((left, right) => intentOrder[left.intent] - intentOrder[right.intent])
+
 export const localModelBundleKey = (model: LocalModel): string =>
   model.bundle._tag === "Standalone"
     ? `package:${model.bundle.package.id}`
@@ -44,6 +51,16 @@ export const localModelOptions = (
   models: LocalModelsState,
   slots: ModelSlotsState,
 ): readonly LocalModelOption[] => {
+  const recommendationsByBundle = new Map<string, LocalModelRecommendation[]>()
+  for (const model of models.models) {
+    if (model.servingState._tag !== "Assessed"
+      || model.servingState.assessment._tag !== "Fits") continue
+    const key = localModelBundleKey(model)
+    recommendationsByBundle.set(key, [
+      ...(recommendationsByBundle.get(key) ?? []),
+      ...model.servingState.recommendations,
+    ])
+  }
   const runningProviderModelIds = new Set([
     slots.slots.primary,
     slots.slots.secondary,
@@ -59,32 +76,33 @@ export const localModelOptions = (
     kind: Option.exists(localModelProviderModelId(model), (providerModelId) =>
       runningProviderModelIds.has(providerModelId)) ? "running" : "stored",
     model,
-    recommendation: Option.none(),
+    recommendations: orderedRecommendations(
+      recommendationsByBundle.get(localModelBundleKey(model)) ?? [],
+    ),
   }))
   const representedBundles = new Set(installed.map(({ model }) => localModelBundleKey(model)))
   const recommendations = models.models.flatMap((model): readonly LocalModelOption[] => {
     if (representedBundles.has(localModelBundleKey(model))
       || model.servingState._tag !== "Assessed"
       || model.servingState.assessment._tag !== "Fits") return []
-    const recommendation = [...model.servingState.recommendations].sort((left, right) =>
-      intentOrder[left.intent] - intentOrder[right.intent])[0]
+    const recommendations = orderedRecommendations(model.servingState.recommendations)
     const acquisitionActive = model.acquisitionState._tag === "Downloading"
       || model.acquisitionState._tag === "Failed"
-    if (recommendation === undefined && !acquisitionActive) return []
+    if (recommendations.length === 0 && !acquisitionActive) return []
     return [{
-      id: recommendation === undefined
+      id: recommendations.length === 0
         ? `acquisition:${model.servingState.configuration.id}`
-        : `recommendation:${recommendation.id}`,
+        : `recommendation:${recommendations[0]!.id}`,
       kind: "recommendation",
       model,
-      recommendation: Option.fromNullable(recommendation),
+      recommendations,
     }]
   })
   return [...installed, ...recommendations].sort((left, right) =>
     kindOrder[left.kind] - kindOrder[right.kind]
     || (left.kind === "recommendation" && right.kind === "recommendation"
-      ? (Option.isSome(left.recommendation) ? intentOrder[left.recommendation.value.intent] : 4)
-        - (Option.isSome(right.recommendation) ? intentOrder[right.recommendation.value.intent] : 4)
+      ? (left.recommendations[0] ? intentOrder[left.recommendations[0].intent] : 4)
+        - (right.recommendations[0] ? intentOrder[right.recommendations[0].intent] : 4)
       : 0)
     || formatLocalModelDisplayName(left.model).localeCompare(formatLocalModelDisplayName(right.model))
     || left.id.localeCompare(right.id))

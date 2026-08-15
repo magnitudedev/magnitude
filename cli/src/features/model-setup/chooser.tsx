@@ -80,13 +80,12 @@ const intentLabel = (intent: "balanced" | "smartest" | "fastest" | "lightweight"
   return "Balanced"
 }
 
-const actionLabel = (selection: LocalInferenceSelection): string => {
+export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string => {
   if (selection.kind === "running") return "Loaded"
-  if (selection.kind === "recommendation") {
-    return Option.isSome(selection.recommendation)
-      ? intentLabel(selection.recommendation.value.intent)
-      : "Download"
+  if (selection.recommendations.length > 0) {
+    return selection.recommendations.map(({ intent }) => intentLabel(intent)).join(" / ")
   }
+  if (selection.kind === "recommendation") return "Download"
   return "Load"
 }
 
@@ -121,9 +120,9 @@ const ModelRow = ({
   readonly onChoose: () => void
 }): ReactNode => {
   const theme = useTheme()
-  const action = actionLabel(selection)
+  const action = onboardingModelActionLabel(selection)
   const enabled = selection.kind !== "recommendation"
-    || Option.isSome(selection.recommendation)
+    || selection.recommendations.length > 0
   const markerWidth = 2
   const gap = 2
   const nameWidth = Math.max(1, width - markerWidth - gap - action.length - 1)
@@ -144,7 +143,7 @@ const ModelRow = ({
         {"  "}
         <span fg={selection.kind === "running"
           ? theme.success
-          : selection.kind === "recommendation" || selected
+          : selection.recommendations.length > 0 || selected
             ? theme.primary
             : theme.muted}>
           {action}
@@ -386,7 +385,7 @@ export function OnboardingModelChooser({
   const { selections, downloads, local } = useMemo(() => {
     const eligible = options.filter((selection) =>
       selection.kind !== "recommendation"
-        || Option.isSome(selection.recommendation))
+        || selection.recommendations.length > 0)
     const downloads = eligible.filter(({ kind }) => kind === "recommendation")
     const local = eligible.filter(({ kind }) => kind === "running" || kind === "stored")
     return { selections: [...downloads, ...local], downloads, local }
@@ -574,15 +573,15 @@ export function OnboardingModelChooser({
     1,
     RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
   )
-  const recommendationExplanation = selected !== undefined && Option.isSome(selected.recommendation)
+  const recommendationExplanation = selected?.recommendations[0] !== undefined
     ? clampTextToVisualLines(
-        selected.recommendation.value.explanation,
+        selected.recommendations[0].explanation,
         detailWidth,
         recommendationBodyRows,
       )
     : ""
   const showRecommendationExplanation = selected !== undefined
-    && Option.isSome(selected.recommendation)
+    && selected.recommendations.length > 0
     && operation?._tag !== "Downloading"
   const selectedMemoryLabel = Option.match(selectedMemory, {
     onNone: () => null,

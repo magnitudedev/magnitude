@@ -176,38 +176,9 @@ snapshot.
 
 ## Recommendation portfolio
 
-ACN selects at most one configuration for each intent:
-
-| Intent | Objective |
-|---|---|
-| `balanced` | Overall capability, speed, memory, fidelity, and download utility |
-| `smartest` | Highest useful capability and fidelity within resource guards |
-| `fastest` | Highest useful generation speed within capability guards |
-| `lightweight` | Highest useful capability within a low-memory tier relative to stable hardware capacity |
-
-Selection is deterministic for identical inputs and uses stable identity as its final tie-breaker.
-A recommendation annotates a local model; it does not copy model facts or create another identity.
-
-Curated fidelity is independent of runtime acceleration. NVFP4 occupies the same fidelity tier as
-Q6; exact hardware calibration and assessment determine whether either format is faster on the
-current execution environment.
-
-An assessed catalog configuration is eligible for recommendation only when its full-context expected generation
-speed is at least 5 tokens per second. Balanced speed utility uses 5 tokens per second as its zero
-point. Ranking, Fastest selection, and relative speed comparisons use the sample at 50K context,
-bounded by the configured context for shorter models. Clients present the expected-speed range from
-the samples at 25K and 75K, likewise bounded by the configured context, without treating those
-samples as separate configurations.
-
-The Lightweight tier admits configurations whose complete predicted loaded memory uses at most
-20% of each participating physical memory domain's stable post-reserve capacity. Within that tier,
-capability precedes memory, fidelity, speed, and download size. The selected configuration must also
-use at least 20% less loaded memory than Balanced. If no distinct configuration satisfies both
-boundaries, the portfolio omits Lightweight rather than substituting the absolute smallest model.
-
-Lightweight eligibility is independent of the strongest feasible model's capability. Adding a
-high-capability heavyweight candidate therefore cannot disqualify or downshift an otherwise
-unchanged Lightweight tier.
+Selection objectives, equations, and portfolio rules are defined by
+[Model recommendation](./recommendation.md). This document owns the assessment evidence and
+publication lifecycle consumed by that policy.
 
 ## Invalidation
 
@@ -242,16 +213,13 @@ Cached assessment never authorizes loading.
 - Assessment completion cannot publish against a superseded semantic key.
 - Assessment results correlate by exact request and profile identity, never by configuration-record comparison.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
-- The recommendation eligibility floor uses full-context performance; ranking and relative
-  comparisons use the bounded 50K sample.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
-- Lightweight is hardware-relative, capability-maximizing within its memory tier, and independent
-  of the capability ceiling outside that tier.
 - Recommendation-policy inputs remain private; client-visible recommendation annotations preserve
   the local model's serving-configuration identity.
 - Loading never treats cached assessment as admission authority.
 - ACN startup and service publication never wait for model assessment.
 - Onboarding keeps installed and downloadable model groups at a stable layout height while making
   every presented model reachable by keyboard navigation and pointer scrolling.
-- Onboarding preserves recommendation labels in the model list and renders stable fit and current
-  loadability independently in the selected model's detail pane.
+- Onboarding preserves recommendation-intent labels for installed and downloadable models in the
+  model list and renders stable fit and current loadability independently in the selected model's
+  detail pane.
