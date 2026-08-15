@@ -84,10 +84,11 @@ import {
   type CatalogLayout,
 } from "./catalog-layout"
 import {
-  catalogRadarProfile,
-  retargetCatalogRadar,
-  type CatalogRadarTransition,
-} from "./catalog-radar"
+  pentagonRadarValues,
+  retargetPentagonRadar,
+  type PentagonRadarTransition,
+} from "../../components/pentagon-radar"
+import { catalogRadarAxes } from "./catalog-radar"
 import { CatalogRadarView } from "./catalog-radar-view"
 import {
   modelMenusLocalModelsStateEquivalent,
@@ -1494,7 +1495,7 @@ const CatalogInspector = memo(function CatalogInspector({
   readonly reconciliationState: CatalogModelReconciliationState
   readonly selected: boolean
   readonly selectedSlot: CatalogPrimarySlot | null
-  readonly transition: CatalogRadarTransition | null
+  readonly transition: PentagonRadarTransition | null
   readonly actions: readonly CatalogInspectorActionId[]
   readonly actionCursor: number
   readonly actionsFocused: boolean
@@ -1506,7 +1507,7 @@ const CatalogInspector = memo(function CatalogInspector({
   const theme = useTheme()
   const platform = usePlatform()
   const [sourceHovered, setSourceHovered] = useState(false)
-  const profile = catalogRadarProfile(model)
+  const radarAxes = catalogRadarAxes(model)
   const status = catalogInspectorStatus(model, reconciliationState, selected, selectedSlot)
   const contentWidth = CATALOG_INSPECTOR_CONTENT_WIDTH
   const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
@@ -1529,7 +1530,7 @@ const CatalogInspector = memo(function CatalogInspector({
         <text> </text>
       </box>
       <box style={{ width: "100%", height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0 }}>
-        <CatalogRadarView profile={profile} transition={transition} />
+        <CatalogRadarView axes={radarAxes} transition={transition} />
       </box>
       <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, flexShrink: 0, flexDirection: "column" }}>
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
@@ -1633,7 +1634,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
-  const [radarTransition, setRadarTransition] = useState<CatalogRadarTransition | null>(null)
+  const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
   const [actionHoverTarget, setActionHoverTarget] = useState<CatalogActionHoverTarget | null>(null)
   const configurationIdFor = (model: LocalModel) => Option.getOrUndefined(
     localModelConfigurationId(model),
@@ -1681,14 +1682,14 @@ const CatalogMenu = memo(function CatalogMenu({
     const configurationId = model && configurationIdFor(model)
     if (!model || configurationId === undefined) return
     setActionHoverTarget(null)
-    const fromProfile = cursor === undefined ? Option.none() : catalogRadarProfile(cursor)
-    const toProfile = catalogRadarProfile(model)
-    if (Option.isSome(fromProfile) && Option.isSome(toProfile)
+    const fromAxes = cursor === undefined ? Option.none() : catalogRadarAxes(cursor)
+    const toAxes = catalogRadarAxes(model)
+    if (Option.isSome(fromAxes) && Option.isSome(toAxes)
       && configurationIdFor(cursor!) !== configurationId) {
       const now = getAnimationTimeSnapshot()
-      setRadarTransition(retargetCatalogRadar(
-        fromProfile.value.values,
-        toProfile.value.values,
+      setRadarTransition(retargetPentagonRadar(
+        pentagonRadarValues(fromAxes.value),
+        pentagonRadarValues(toAxes.value),
         radarTransition,
         now,
       ))
