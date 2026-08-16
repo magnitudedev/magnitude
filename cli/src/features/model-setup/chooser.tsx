@@ -44,6 +44,7 @@ import {
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
 import { localModelRadarAxes } from "../local-inference/model-radar"
+import { formatModelClassification } from "../local-inference/model-classification"
 import { discoveredModelLocation } from "./discovered-model"
 import {
   OnboardingModelDownloadProgress,
@@ -52,11 +53,11 @@ import {
 
 const SECTION_VIEWPORT_ROWS = 4
 const MODEL_TITLE_ROWS = 1
-const DESCRIPTION_ROWS = 2
-const DESCRIPTION_RADAR_GAP_ROWS = 1
+const MODEL_SUMMARY_ROWS = 1
+const MODEL_SUMMARY_RADAR_GAP_ROWS = 1
 const RECOMMENDATION_HEADING_ROWS = 1
 const RECOMMENDATION_ROWS = 3
-const WIDE_LIST_WIDTH = 40
+const WIDE_LIST_WIDTH = 38
 const WIDE_CHOOSER_MIN_WIDTH = 105
 
 const onboardingModelRowId = (selectionId: string): string =>
@@ -312,15 +313,15 @@ export const onboardingModelDetailRows = ({
   recommendation,
   memoryWarning,
   downloadRows,
-  descriptionRadarGap,
+  modelSummaryRadarGap,
 }: {
   readonly recommendation: boolean
   readonly memoryWarning: boolean
   readonly downloadRows: number
-  readonly descriptionRadarGap: boolean
+  readonly modelSummaryRadarGap: boolean
 }): number => MODEL_TITLE_ROWS
-  + DESCRIPTION_ROWS
-  + (descriptionRadarGap ? DESCRIPTION_RADAR_GAP_ROWS : 0)
+  + MODEL_SUMMARY_ROWS
+  + (modelSummaryRadarGap ? MODEL_SUMMARY_RADAR_GAP_ROWS : 0)
   + PENTAGON_RADAR_ROWS
   + (recommendation
     ? RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS
@@ -330,14 +331,14 @@ const ONBOARDING_IDLE_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
   recommendation: true,
   memoryWarning: false,
   downloadRows: 0,
-  descriptionRadarGap: true,
+  modelSummaryRadarGap: true,
 })
 
 const ONBOARDING_DOWNLOADING_DETAIL_ROWS = onboardingModelDetailRows({
   recommendation: false,
   memoryWarning: false,
   downloadRows: ONBOARDING_MODEL_DOWNLOAD_ROWS,
-  descriptionRadarGap: true,
+  modelSummaryRadarGap: true,
 })
 
 export const ONBOARDING_MODEL_DETAIL_ROWS = Math.max(
@@ -553,14 +554,22 @@ export function OnboardingModelChooser({
           ? "! Heavy memory use: Limited memory remains for other apps"
           : null,
   })
-  const description = selected === undefined
-    ? ""
-    : clampTextToVisualLines(selected.model.presentation.description, detailWidth, DESCRIPTION_ROWS)
   const discovered = selected?.model.catalogMembershipState._tag !== "InCatalog"
     ? {
         location: discoveredModelLocation(selected.model),
       }
     : null
+  const modelSummary = selected === undefined
+    ? ""
+    : selected.model.catalogMembershipState._tag === "InCatalog"
+        && selected.model.servingState._tag === "Assessed"
+      ? formatModelClassification(
+          selected.model.catalogMembershipState.catalogData.parameterization,
+          selected.model.servingState.capabilities.vision,
+        )
+      : discovered === null
+        ? ""
+        : `DISCOVERED MODEL · ${discovered.location}`
   const recommendationBodyRows = Math.max(
     1,
     RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
@@ -590,27 +599,16 @@ export function OnboardingModelChooser({
       </DetailRow>
       <box style={{
         width: detailWidth,
-        height: DESCRIPTION_ROWS,
-        minHeight: DESCRIPTION_ROWS,
-        maxHeight: DESCRIPTION_ROWS,
+        height: MODEL_SUMMARY_ROWS,
+        minHeight: MODEL_SUMMARY_ROWS,
+        maxHeight: MODEL_SUMMARY_ROWS,
         flexShrink: 0,
         flexDirection: "column",
         overflow: "hidden",
       }}>
-        {discovered === null ? (
-          <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
-            {description}
-          </text>
-        ) : (
-          <>
-            <text style={{ fg: theme.text.supporting, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
-              DISCOVERED MODEL
-            </text>
-            <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
-              {truncateToDisplayWidth(discovered.location, detailWidth)}
-            </text>
-          </>
-        )}
+        <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
+          {truncateToDisplayWidth(modelSummary, detailWidth)}
+        </text>
       </box>
       <box style={{ height: 1, flexShrink: 0 }} />
       {Option.match(selectedRadarAxes, {

@@ -1,6 +1,10 @@
 use icn_contracts::models::{ModelCapabilities, ModelReasoningCapabilities};
 use icn_contracts::{CapabilitySupport, InventoryProperties, ReasoningCapability};
 
+fn supports_image_input(modalities: &[String]) -> bool {
+    modalities.iter().any(|modality| modality == "image")
+}
+
 pub(crate) fn model_capabilities(properties: &InventoryProperties) -> ModelCapabilities {
     let InventoryProperties::Inspected {
         modalities,
@@ -66,9 +70,23 @@ pub(crate) fn model_capabilities(properties: &InventoryProperties) -> ModelCapab
         }
     };
     ModelCapabilities {
-        vision: modalities.iter().any(|modality| modality == "vision"),
+        vision: supports_image_input(modalities),
         tools: matches!(tools, CapabilitySupport::Supported { .. }),
         structured_output: matches!(structured_output, CapabilitySupport::Supported { .. }),
         reasoning,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_image_input;
+
+    #[test]
+    fn image_inventory_modality_maps_to_vision_capability() {
+        assert!(supports_image_input(&[
+            "text".to_owned(),
+            "image".to_owned()
+        ]));
+        assert!(!supports_image_input(&["text".to_owned()]));
     }
 }

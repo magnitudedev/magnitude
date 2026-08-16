@@ -9,9 +9,10 @@ use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
     CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelPackage,
-    ModelPackageSource, ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, ResolvedServableModelBundle, ServableModelBundle,
-    ServableModelBundleKey, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
+    ModelPackageSource, ModelParameterization, ModelServingConfiguration, RecommendableModel,
+    RecommendableModelCatalog, RecommendableModelCatalogProvider, ResolvedServableModelBundle,
+    ServableModelBundle, ServableModelBundleKey, ServingProfile, SpeculativeDraftSource,
+    SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -53,6 +54,7 @@ struct CatalogModel {
     id: String,
     display_name: String,
     description: String,
+    parameterization: ModelParameterization,
     repository: String,
     variants: Vec<CatalogVariant>,
     context_length: u32,
@@ -218,6 +220,7 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
         if !valid_identity_component(&model.id)
             || model.display_name.is_empty()
             || model.description.is_empty()
+            || !valid_parameterization(&model.parameterization)
             || model.repository.is_empty()
             || model.variants.is_empty()
             || variant_ids.len() != model.variants.len()
@@ -269,6 +272,16 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
         }
     }
     Ok(source)
+}
+
+fn valid_parameterization(parameterization: &ModelParameterization) -> bool {
+    match parameterization {
+        ModelParameterization::Dense { total_parameters } => *total_parameters > 0,
+        ModelParameterization::MixtureOfExperts {
+            total_parameters,
+            active_parameters,
+        } => *active_parameters > 0 && active_parameters < total_parameters,
+    }
 }
 
 pub(crate) fn valid_identity_component(value: &str) -> bool {
@@ -529,9 +542,8 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                     package
                         .properties
                         .maximum_context_length
-                        .is_some_and(|maximum| {
-                            model.configuration.profile.context_length > maximum
-                        }) || !matches!(
+                        .is_some_and(|maximum| model.configuration.profile.context_length > maximum)
+                        || !matches!(
                             &package.source,
                             ModelPackageSource::HuggingFace { revision, .. }
                                 if valid_commit(revision)
@@ -1144,6 +1156,7 @@ fn recommendable_model(
         description: declaration.description.clone(),
         license: declaration.license.clone(),
         capabilities: model_capabilities(properties),
+        parameterization: declaration.parameterization.clone(),
         quality_score: declaration.quality_score,
         quality_score_provenance: declaration.quality_score_provenance.clone(),
         fidelity_rank: variant.fidelity_rank,
@@ -1314,19 +1327,16 @@ impl ResolvingRecommendableCatalog {
             }
             None => None,
         };
-        let maximum_context_length = std::iter::once(
-            target.package.properties.maximum_context_length,
-        )
-        .chain(
-            draft
-                .as_ref()
-                .map(|draft| draft.package.properties.maximum_context_length),
-        )
-        .flatten()
-        .min();
-        if maximum_context_length
-            .is_some_and(|maximum| declaration.context_length > maximum)
-        {
+        let maximum_context_length =
+            std::iter::once(target.package.properties.maximum_context_length)
+                .chain(
+                    draft
+                        .as_ref()
+                        .map(|draft| draft.package.properties.maximum_context_length),
+                )
+                .flatten()
+                .min();
+        if maximum_context_length.is_some_and(|maximum| declaration.context_length > maximum) {
             return Err(InventoryError::Integrity(format!(
                 "{} configures {} context tokens above the artifact maximum of {}",
                 declaration.id,
@@ -1759,6 +1769,39 @@ impl RecommendableModelCatalogProvider for ReleaseRecommendableCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_catalog_declares_valid_parameterization_for_every_model() {
+        let source = catalog_source().expect("catalog source should be valid");
+        assert!(
+            source
+                .models
+                .iter()
+                .all(|model| valid_parameterization(&model.parameterization))
+        );
+    }
+
+    #[test]
+    fn parameterization_requires_meaningful_architecture_counts() {
+        assert!(valid_parameterization(&ModelParameterization::Dense {
+            total_parameters: 8_000_000_000,
+        }));
+        assert!(!valid_parameterization(&ModelParameterization::Dense {
+            total_parameters: 0,
+        }));
+        assert!(valid_parameterization(
+            &ModelParameterization::MixtureOfExperts {
+                total_parameters: 35_000_000_000,
+                active_parameters: 3_000_000_000,
+            },
+        ));
+        assert!(!valid_parameterization(
+            &ModelParameterization::MixtureOfExperts {
+                total_parameters: 3_000_000_000,
+                active_parameters: 3_000_000_000,
+            },
+        ));
+    }
 
     #[test]
     fn shard_selector_distinguishes_first_and_later_shards() {

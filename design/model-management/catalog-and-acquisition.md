@@ -36,7 +36,12 @@ The release catalog is immutable release data. Human-reviewed declarations ident
 variant by its stable format-qualified variant ID, exact upstream format selector, short variant label, fidelity rank, and
 quantization-aware-training fact. Each entry publishes one exact default
 `ModelServingConfiguration`, required package components, presentation, and recommendation
-evidence. Speculative decoding is explicit as either capability embedded in the target GGUF or an
+evidence. Reviewed model parameterization states whether the architecture is dense or
+mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
+positive active parameter count smaller than the total. Parameter counts are factual catalog data;
+clients own their human-readable rounding and formatting. Input modality remains an inspected
+capability and is not duplicated in catalog declarations. Speculative decoding is explicit as
+either capability embedded in the target GGUF or an
 exact draft file in the target or another repository. Every package source is locked.
 
 Catalog generation resolves only locked revisions through production package construction,

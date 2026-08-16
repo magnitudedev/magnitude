@@ -2027,6 +2027,9 @@ mod tests {
                     default_effort: None,
                 },
             },
+            parameterization: icn_contracts::models::ModelParameterization::Dense {
+                total_parameters: 8_000_000_000,
+            },
             quality_score: 0.0,
             quality_score_provenance: "test".to_owned(),
             fidelity_rank: 0,
