@@ -8,8 +8,8 @@ applies_to:
 
 # KV state reuse
 
-Prompt reuse is a disposable optimization over standard llama.cpp sequence state. Tokens and
-request content remain canonical; inability to reuse KV always falls back to cold prefill.
+Prompt reuse is a disposable optimization over standard llama.cpp sequence state. Prepared prompt
+input remains canonical; inability to reuse KV always falls back to cold prefill.
 
 ## Ownership
 
@@ -31,7 +31,16 @@ Prefix metadata cannot exist apart from its available sequence. Native KV stays 
 
 ## Reuse
 
-Admission selects the available sequence with the longest exact committed-token prefix.
+Admission selects the available sequence with the longest exact committed semantic prefix. A
+semantic prompt is an ordered sequence of text and media spans:
+
+```text
+Text(tokens) -> Media(identity, logical tokens, native positions) -> Text(tokens)
+```
+
+Text matches token-by-token. Media matches only when its type, decoded-content identity,
+dimensions, logical token count, and native position count are identical. A reusable boundary may
+split text but never media. An absent or ambiguous media identity is a cache miss.
 
 ```text
 retained:  [ A B C D E ]
@@ -52,21 +61,23 @@ assemble batch -> native decode -> linked speculative processing -> commit reque
 
 Logical prompt tokens are not proof of prefill. Only the post-decode processed count is reusable.
 A sampled token is likewise uncommitted until decode or speculative verification accepts it.
+Every committed boundary records both logical tokens (for progress and capacity) and native
+positions (for KV removal and continuation). They differ for M-RoPE media.
 
 ## Retention policy
 
 | Terminal condition | Reusable state |
 | --- | --- |
-| Complete, cancelled, disconnected, request-local failure | Retain committed text prefix when caching is enabled |
+| Complete, cancelled, disconnected, request-local failure | Retain committed semantic prefix when caching is enabled |
 | Acquired but not natively mutated | Return the original available sequence unchanged |
-| Multimodal or cache-disabled request | Clear and return without a prefix |
+| Cache-disabled request | Clear and return without a prefix |
 | Native cleanup failure | Quarantine the sequence |
 | Shared target/draft failure | Reset contexts; invalidate available prefixes; return active sequences empty |
 
 Speculative execution retains only at aligned target/draft boundaries. Native positions, including
 positions consumed by media embeddings, govern rollback and continuation; token-history length is
-not a position. Multimodal reuse remains disabled until exact token-and-media equivalence can be
-guaranteed.
+not a position. Media encoding and its embedding decodes form one commit operation: failure or
+cancellation invalidates ambiguous native state rather than retaining a partial image.
 
 ## Capacity
 
@@ -82,7 +93,9 @@ storage tiers, or cache-administration API.
 ## Acceptance criteria
 
 - Reuse uses only upstream llama.cpp sequence/state primitives.
-- A reusable prefix contains exact, committed tokens from the same loaded context.
+- A reusable prefix contains exact, committed text/media semantics from the same loaded context.
+- Media is matched by stable preprocessing identity and is never partially reused.
+- Logical token and native-position boundaries remain distinct.
 - Prefix metadata cannot exist independently of its available sequence.
 - Cache loss cannot fail or alter a request that can cold-prefill.
 - No public surface exposes physical-page or storage-tier policy.

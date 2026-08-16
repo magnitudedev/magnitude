@@ -44,10 +44,11 @@ The FIFO waiting queue admits a request only when:
 - its prompt leaves room for generation; and
 - the context has capacity.
 
-Oversized requests fail before allocation. Eligible text takes the available sequence with the
-longest exact reusable prefix. Before native mutation, cancellation or validation failure returns
-that sequence unchanged. Native setup transfers it to active ownership, trims any unmatched suffix,
-and prefills the remainder.
+Oversized requests fail before allocation. Every request is prepared once into an ordered semantic
+prompt before sequence selection. Cache-enabled requests take the available sequence with the
+longest exact reusable text/media prefix. Before native mutation, cancellation or validation
+failure returns that sequence unchanged. Native setup transfers it to active ownership, trims any
+unmatched suffix at its native-position boundary, and prefills the remainder.
 
 ## Batch policy
 
@@ -70,17 +71,20 @@ BatchCommit { prompt advances, speculative indices, logits }
                  mutate request state
 ```
 
-Failure drops the commit, so staged prompt work cannot become reusable. Multimodal and speculative
-preparation share this state machine; target and draft state remain natively linked. Each successful
-multimodal token or embedding decode is processed speculatively before a later decode may depend on
-it.
+Failure drops the commit, so staged prompt work cannot become reusable. Text spans participate in
+the ordinary fair batch planner. A media span is evaluated atomically at its semantic boundary, and
+then scheduling returns to ordinary text batching. At most one media span is evaluated per
+scheduler iteration, so projector execution remains serialized without disabling continuous
+batching for other resident sequences. Multimodal and speculative preparation share this state
+machine; target and draft state remain natively linked. Each successful multimodal embedding
+sub-batch is processed speculatively before a later decode may depend on it.
 
 ## Terminal handling
 
 | Outcome | Sequence disposition |
 | --- | --- |
-| Complete, cancelled, disconnected, request-local failure | Retain committed text prefix when eligible |
-| Multimodal or cache-disabled | Clear and return empty |
+| Complete, cancelled, disconnected, request-local failure | Retain committed semantic prefix when eligible |
+| Cache-disabled | Clear and return empty |
 | Shared native batch failure | Reset contexts and invalidate all affected reusable prefixes |
 | Cleanup failure | Quarantine; never return the sequence to the pool |
 
@@ -103,5 +107,5 @@ hardware observation runs at most once between batches; mutating exclusive work 
 - One executor owns every scheduler and native mutation.
 - Decode precedes prefill, and long prefills are chunked fairly.
 - Prompt progress becomes visible only after successful native processing.
-- Reuse requires an exact committed prefix and upstream sequence operations.
+- Reuse requires an exact committed text/media prefix and upstream sequence operations.
 - Cancellation, backpressure, overload, and native failure have bounded outcomes.
