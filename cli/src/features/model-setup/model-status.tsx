@@ -26,38 +26,36 @@ const progressBar = (fraction: number, width: number): string => {
 
 type ConfirmationChoice = "yes" | "no"
 
-export interface OnboardingModelStatusOperation {
+export interface OnboardingModelDownloadOperation {
   readonly starting: boolean
   readonly cancelling: boolean
   readonly cancelError: string | null
   readonly onCancel: () => void
 }
 
-export const ONBOARDING_MODEL_STATUS_MAX_ROWS = 5
+export const ONBOARDING_MODEL_DOWNLOAD_ROWS = 4
 
-export function OnboardingModelStatusSection({
+export function OnboardingModelDownloadProgress({
   model,
   width,
-  idleStatus,
   operation,
 }: {
   readonly model: LocalModel
   readonly width: number
-  readonly idleStatus: string
-  readonly operation: OnboardingModelStatusOperation | null
+  readonly operation: OnboardingModelDownloadOperation
 }): ReactNode {
   const theme = useTheme()
   const [confirmationDownloadId, setConfirmationDownloadId] = useState<ModelDownloadId | null>(null)
   const [choice, setChoice] = useState<ConfirmationChoice>("yes")
   const [hovered, setHovered] = useState<string | null>(null)
   const download = model.acquisitionState
-  const starting = operation?.starting === true
-  const activeDownload = operation !== null && !starting && download._tag === "Downloading"
+  const starting = operation.starting
+  const activeDownload = !starting && download._tag === "Downloading"
     ? download
     : null
   const downloading = activeDownload !== null
   const active = starting || downloading
-  const cancelling = operation?.cancelling === true
+  const cancelling = operation.cancelling
   const cancelable = activeDownload !== null && !cancelling
   const confirming = cancelable && confirmationDownloadId === activeDownload.downloadId
   const totalBytes = activeDownload?.totalBytes ?? model.downloadBytes
@@ -78,20 +76,19 @@ export function OnboardingModelStatusSection({
     return `${transferred} · ${formatRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
   }, [activeDownload, cancelling, rate, starting])
   const status = starting
-    ? `Starting download (${formatDownloadBytes(totalBytes)})`
+    ? `Starting download (${formatDownloadBytes(totalBytes)})…`
     : cancelling
       ? "Cancelling download…"
       : downloading
         ? `Downloading (${formatDownloadBytes(totalBytes)})`
-        : idleStatus
-  const sectionRows = active ? ONBOARDING_MODEL_STATUS_MAX_ROWS : 2
+        : null
   const declineCancellation = useCallback(() => {
     setConfirmationDownloadId(null)
     setChoice("yes")
   }, [])
 
   const confirmCancellation = useCallback(() => {
-    if (operation === null || !cancelable) return
+    if (!cancelable) return
     setConfirmationDownloadId(null)
     setChoice("yes")
     operation.onCancel()
@@ -124,6 +121,8 @@ export function OnboardingModelStatusSection({
     }
   }, [activeDownload, cancelable, cancelling, choice, confirmCancellation, confirming, declineCancellation]))
 
+  if (!active || status === null) return null
+
   const choiceButton = (value: ConfirmationChoice, label: string) => (
     <Button
       onClick={() => value === "yes" ? confirmCancellation() : declineCancellation()}
@@ -143,75 +142,66 @@ export function OnboardingModelStatusSection({
   return (
     <box style={{
       width,
-      height: sectionRows,
-      minHeight: sectionRows,
-      maxHeight: sectionRows,
+      height: ONBOARDING_MODEL_DOWNLOAD_ROWS,
+      minHeight: ONBOARDING_MODEL_DOWNLOAD_ROWS,
+      maxHeight: ONBOARDING_MODEL_DOWNLOAD_ROWS,
       flexDirection: "column",
       flexShrink: 0,
       overflow: "hidden",
     }}>
-      <text style={{ fg: theme.text.supporting, width }} attributes={TextAttributes.BOLD} wrapMode="none">
-        STATUS
-      </text>
-      <text style={{ fg: active ? theme.text.body : theme.text.supporting, width }} wrapMode="none">
+      <text style={{ fg: theme.text.body, width }} wrapMode="none">
         {status}
       </text>
-      {active && (
-        <text style={{ width }} wrapMode="none">
-          <span style={{ fg: theme.accent }}>{progressBar(fraction, barWidth)}</span>
-          <span style={{ fg: theme.text.supporting }}>{`  ${percentageLabel}`}</span>
-        </text>
-      )}
-      {active && (
-        <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
-          {transferDetail ?? ""}
-        </text>
-      )}
-      {active && (
-        <box style={{
-          width,
-          height: 1,
-          minHeight: 1,
-          maxHeight: 1,
-          flexDirection: "row",
-          flexShrink: 0,
-          overflow: "hidden",
-        }}>
-          {confirming ? (
-            <>
-              <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
-                Are you sure you want to cancel?
+      <text style={{ width }} wrapMode="none">
+        <span style={{ fg: theme.accent }}>{progressBar(fraction, barWidth)}</span>
+        <span style={{ fg: theme.text.supporting }}>{`  ${percentageLabel}`}</span>
+      </text>
+      <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
+        {transferDetail ?? ""}
+      </text>
+      <box style={{
+        width,
+        height: 1,
+        minHeight: 1,
+        maxHeight: 1,
+        flexDirection: "row",
+        flexShrink: 0,
+        overflow: "hidden",
+      }}>
+        {confirming ? (
+          <>
+            <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
+              Are you sure you want to cancel?
+            </text>
+            <box style={{ width: 2, flexShrink: 0 }} />
+            {choiceButton("yes", "Yes")}
+            <box style={{ width: 2, flexShrink: 0 }} />
+            {choiceButton("no", "No")}
+          </>
+        ) : (
+          <>
+            {operation.cancelError && (
+              <text style={{ fg: theme.status.failure, flexGrow: 1, minWidth: 0 }} wrapMode="none">
+                {operation.cancelError}
               </text>
-              <box style={{ width: 2, flexShrink: 0 }} />
-              {choiceButton("yes", "Yes")}
-              <box style={{ width: 2, flexShrink: 0 }} />
-              {choiceButton("no", "No")}
-            </>
-          ) : (
-            <>
-              {operation?.cancelError && (
-                <text style={{ fg: theme.status.failure, flexGrow: 1, minWidth: 0 }} wrapMode="none">
-                  {operation.cancelError}
+            )}
+            {cancelable && (
+              <Button
+                onClick={() => {
+                  setChoice("yes")
+                  setConfirmationDownloadId(activeDownload.downloadId)
+                }}
+                onMouseOver={() => setHovered("cancel")}
+                onMouseOut={() => setHovered((current) => current === "cancel" ? null : current)}
+              >
+                <text style={{ fg: hovered === "cancel" ? theme.status.failure : theme.text.supporting }}>
+                  Cancel (Esc)
                 </text>
-              )}
-              {cancelable && (
-                <Button
-                  onClick={() => {
-                    setChoice("yes")
-                    setConfirmationDownloadId(activeDownload.downloadId)
-                  }}
-                  onMouseOver={() => setHovered("cancel")}
-                  onMouseOut={() => setHovered((current) => current === "cancel" ? null : current)}
-                >
-                  <text style={{ fg: hovered === "cancel" ? theme.status.failure : theme.text.supporting }}>
-                    Cancel (Esc)
-                  </text>
-                </Button>
-              )}
-            </>
-          )}
-        </box>
-      )}
+              </Button>
+            )}
+          </>
+        )}
+      </box>
     </box>
   )
 }

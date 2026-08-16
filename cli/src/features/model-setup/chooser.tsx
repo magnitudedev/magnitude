@@ -46,8 +46,8 @@ import {
 import { localModelRadarAxes } from "../local-inference/model-radar"
 import { discoveredModelLocation } from "./discovered-model"
 import {
-  OnboardingModelStatusSection,
-  ONBOARDING_MODEL_STATUS_MAX_ROWS,
+  OnboardingModelDownloadProgress,
+  ONBOARDING_MODEL_DOWNLOAD_ROWS,
 } from "./model-status"
 
 const SECTION_VIEWPORT_ROWS = 4
@@ -56,7 +56,6 @@ const DESCRIPTION_ROWS = 2
 const DESCRIPTION_RADAR_GAP_ROWS = 1
 const RECOMMENDATION_HEADING_ROWS = 1
 const RECOMMENDATION_ROWS = 3
-const STATUS_GAP_ROWS = 1
 const WIDE_LIST_WIDTH = 40
 const WIDE_CHOOSER_MIN_WIDTH = 105
 
@@ -312,31 +311,33 @@ export const onboardingSelectionEnterAction = (
 export const onboardingModelDetailRows = ({
   recommendation,
   memoryWarning,
-  statusRows,
+  downloadRows,
+  descriptionRadarGap,
 }: {
   readonly recommendation: boolean
   readonly memoryWarning: boolean
-  readonly statusRows: number
+  readonly downloadRows: number
+  readonly descriptionRadarGap: boolean
 }): number => MODEL_TITLE_ROWS
   + DESCRIPTION_ROWS
-  + DESCRIPTION_RADAR_GAP_ROWS
+  + (descriptionRadarGap ? DESCRIPTION_RADAR_GAP_ROWS : 0)
   + PENTAGON_RADAR_ROWS
   + (recommendation
     ? RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS
-    : memoryWarning ? 1 : 0)
-  + STATUS_GAP_ROWS
-  + statusRows
+    : (memoryWarning ? 1 : 0) + downloadRows)
 
 const ONBOARDING_IDLE_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
   recommendation: true,
   memoryWarning: false,
-  statusRows: 2,
+  downloadRows: 0,
+  descriptionRadarGap: true,
 })
 
 const ONBOARDING_DOWNLOADING_DETAIL_ROWS = onboardingModelDetailRows({
   recommendation: false,
-  memoryWarning: true,
-  statusRows: ONBOARDING_MODEL_STATUS_MAX_ROWS,
+  memoryWarning: false,
+  downloadRows: ONBOARDING_MODEL_DOWNLOAD_ROWS,
+  descriptionRadarGap: true,
 })
 
 export const ONBOARDING_MODEL_DETAIL_ROWS = Math.max(
@@ -417,15 +418,7 @@ export function OnboardingModelChooser({
   const wide = cardWidth >= WIDE_CHOOSER_MIN_WIDTH
   const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
   const detailWidth = wide ? Math.max(1, cardWidth - leftWidth - 9) : leftWidth
-  const statusModel = operation?._tag === "Downloading" ? operation.model : selected?.model
-  const statusOperation = operation?._tag === "Downloading"
-    ? {
-        starting: operation.starting,
-        cancelling: operation.cancelling,
-        cancelError: operation.cancelError,
-        onCancel: operation.onCancel,
-      }
-    : null
+  const downloadOperation = operation?._tag === "Downloading" ? operation : null
   const detailContentRows = ONBOARDING_MODEL_DETAIL_ROWS
   const detailPanelRows = detailContentRows + (wide ? 0 : 1)
   const downloadViewportRows = Math.min(SECTION_VIEWPORT_ROWS, downloads.length)
@@ -582,17 +575,6 @@ export function OnboardingModelChooser({
   const showRecommendationExplanation = selected !== undefined
     && selected.recommendations.length > 0
     && operation?._tag !== "Downloading"
-  const selectedMemoryLabel = Option.match(selectedMemory, {
-    onNone: () => null,
-    onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
-  })
-  const idleStatus = selected?.kind === "recommendation"
-    ? `Ready to download (${formatDownloadBytes(selected.model.downloadBytes)})`
-    : selected?.kind === "stored"
-      ? `Ready to load${selectedMemoryLabel === null ? "" : ` (${selectedMemoryLabel} memory)`}`
-      : selected?.kind === "running"
-        ? `Ready to use${selectedMemoryLabel === null ? "" : ` (${selectedMemoryLabel} memory)`}`
-        : "Unavailable"
   const emptySelectionMessage = "No compatible models found."
   const regularDetails = selected ? (
     <>
@@ -670,16 +652,17 @@ export function OnboardingModelChooser({
             )}
         </box>
       )}
-      {!showRecommendationExplanation && memoryWarning && (
+      {!showRecommendationExplanation && downloadOperation === null && memoryWarning && (
         <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
       )}
-      <box style={{ flexGrow: 1, minHeight: STATUS_GAP_ROWS }} />
-      <OnboardingModelStatusSection
-        model={statusModel ?? selected.model}
-        width={detailWidth}
-        idleStatus={idleStatus}
-        operation={statusOperation}
-      />
+      <box style={{ flexGrow: 1 }} />
+      {downloadOperation !== null && (
+        <OnboardingModelDownloadProgress
+          model={downloadOperation.model}
+          width={detailWidth}
+          operation={downloadOperation}
+        />
+      )}
     </>
   ) : (
     <text style={{ fg: theme.text.supporting }}>{emptySelectionMessage}</text>
@@ -718,7 +701,9 @@ export function OnboardingModelChooser({
     ? "Esc skip for now"
     : `↑/↓ choose · Enter to ${enterAction} · Esc skip for now`
   const interactionHint = operation?._tag === "Downloading"
-      ? "Download in progress · Esc cancel"
+      ? operation.starting
+        ? "Starting download…"
+        : "Download in progress · Esc cancel"
       : operation?._tag === "Configuring"
         ? "Configuring model…"
       : operation?._tag === "Activating"
