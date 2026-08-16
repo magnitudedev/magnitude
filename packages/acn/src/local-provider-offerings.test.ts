@@ -1,4 +1,4 @@
-import { Effect, Layer, Option, Schema, Stream } from "effect"
+import { Effect, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogModelIdSchema,
@@ -10,12 +10,7 @@ import {
   type ModelPackageEntry,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
-import {
-  IcnHardware,
-  IcnInstalledModels,
-} from "@magnitudedev/icn"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
-import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelConfigurationResolver, localModelTargetIdentity } from "./local-model-configuration-resolver"
 import {
@@ -54,7 +49,7 @@ describe("local provider offering projection", () => {
     expect(sameProviderOfferingPackageEvidence(evidence, evidence)).toBe(true)
   })
 
-  it("uses the installed target inspection instead of stale catalog capabilities", async () => {
+  it("uses the capabilities selected by the configuration resolver", async () => {
     const packageId = ModelPackageIdSchema.make("package-a")
     const configurationId = ModelServingConfigurationIdSchema.make("configuration-a")
     const modelPackage = {
@@ -126,71 +121,25 @@ describe("local provider offering projection", () => {
         variantId: catalogModel.variantId,
       },
     }
-    const installedPackage = Schema.decodeUnknownSync(Generated.InstalledModelPackage)({
-      package: {
-        id: packageId,
-        source: { _tag: "Local", path: "/models/a.gguf" },
-        files: [],
-        relationships: [],
-        properties: {
-          format: "gguf",
-          quantization: "Q4_K_M",
-          quantizationName: "4-bit",
-          architecture: "test",
-          maximumContextLength: 32_768,
-        },
-      },
-      path: "/models/a.gguf",
-      origin: "Magnitude",
-      inspection: {
-        _tag: "Inspected",
-        capabilities: {
-          vision: false,
-          tools: true,
-          structuredOutput: true,
-          reasoning: {
-            supported: true,
-            efforts: ["none", "low", "medium", "xhigh"],
-            defaultEffort: "xhigh",
-          },
-        },
-      },
-      catalogAttribution: {
-        _tag: "Attributed",
-        modelId: catalogModel.modelId,
-        variantId: catalogModel.variantId,
-      },
-    })
     const dependencies = Layer.mergeAll(
       Layer.succeed(LocalModelConfigurationResolver, LocalModelConfigurationResolver.of({
         get: Effect.succeed(new Map([[
           localModelTargetIdentity(configuration.bundle),
           {
             servingConfiguration: configuration,
-            assessment: Option.some({ _tag: "Assessing" }),
+            assessment: { _tag: "Assessing" },
             catalogModel: Option.some(catalogModel),
+            targetInspection: { _tag: "Inspected", capabilities: inspectedCapabilities },
           },
         ]])),
         changes: Stream.never,
         settled: Effect.succeed(true),
         resolve: () => Effect.succeed(Option.some({
           servingConfiguration: configuration,
-          assessment: Option.some({ _tag: "Assessing" }),
+          assessment: { _tag: "Assessing" },
           catalogModel: Option.some(catalogModel),
+          targetInspection: { _tag: "Inspected", capabilities: inspectedCapabilities },
         })),
-      })),
-      Layer.succeed(IcnInstalledModels, IcnInstalledModels.of({
-        get: Effect.succeed({
-          revision: 1,
-          state: {
-            revision: 1,
-            reconciliationComplete: true,
-            packages: [installedPackage],
-          },
-        }),
-        changes: Stream.never,
-        initialized: Effect.succeed(true),
-        refresh: Effect.void,
       })),
       Layer.succeed(LocalModelPackages, LocalModelPackages.of({
         initialized: Effect.succeed(true),
@@ -243,17 +192,18 @@ describe("local provider offering projection", () => {
         bundle: { _tag: "Standalone" as const, package: modelPackage },
         profile: { contextLength: 32_768 },
       }
+      const capabilities = {
+        vision: false,
+        tools: true,
+        structuredOutput: true,
+        reasoning: { supported: false as const, efforts: [], defaultEffort: Option.none() },
+      }
       const packageEntry: ModelPackageEntry = {
         package: modelPackage,
         localState: { _tag: "Installed", path: "/models/a.gguf", origin: "Magnitude" },
         inspection: {
           _tag: "Inspected",
-          capabilities: {
-            vision: false,
-            tools: true,
-            structuredOutput: true,
-            reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
-          },
+          capabilities,
         },
         catalogAttribution: { _tag: "NotCatalogTarget" },
       }
@@ -263,33 +213,19 @@ describe("local provider offering projection", () => {
             localModelTargetIdentity(configuration.bundle),
             {
               servingConfiguration: configuration,
-              assessment: Option.some({ _tag: "Assessing" }),
+              assessment: { _tag: "Assessing" },
               catalogModel: Option.none(),
+              targetInspection: { _tag: "Inspected", capabilities },
             },
           ]])),
           changes: Stream.never,
           settled: Effect.succeed(true),
           resolve: () => Effect.succeed(Option.some({
             servingConfiguration: configuration,
-            assessment: Option.some({ _tag: "Assessing" }),
+            assessment: { _tag: "Assessing" },
             catalogModel: Option.none(),
+            targetInspection: { _tag: "Inspected", capabilities },
           })),
-        })),
-        Layer.succeed(IcnInstalledModels, IcnInstalledModels.of({
-          get: Effect.succeed({
-            revision: 1,
-            state: { revision: 1, reconciliationComplete: true, packages: [] },
-          }),
-          changes: Stream.never,
-          initialized: Effect.succeed(true),
-          refresh: Effect.void,
-        })),
-        Layer.succeed(IcnHardware, IcnHardware.of({
-          get: Effect.never,
-          changes: Stream.never,
-          initialized: Effect.succeed(true),
-          refresh: Effect.void,
-          assessmentChanges: Stream.never,
         })),
         Layer.succeed(LocalModelPackages, LocalModelPackages.of({
           initialized: Effect.succeed(true),

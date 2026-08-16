@@ -43,10 +43,11 @@ clients own their human-readable rounding and formatting. Input modality remains
 capability and is not duplicated in catalog declarations. An image-capable target requires one
 projector component in its exact target package. Catalog generation selects the projector
 automatically only when the locked target repository contains one candidate; otherwise the reviewed
-declaration names the exact projector path in that repository. Projector presence participates in
-artifact inspection and is what establishes image capability for GGUF targets whose weights do not
-declare it independently. A missing, ambiguous, incompatible, or MTP-combined projector fails
-generation.
+declaration names the exact projector path in that repository. Package construction and package
+inspection are one operation: image capability requires an exact projector component, a typed
+relationship to the package weights, and native MTMD inspection that recognizes image input.
+Primary-weight metadata and projector presence alone never establish runnable image capability. A
+missing, ambiguous, incompatible, or MTP-combined projector fails generation.
 Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft
 file in the target or another repository. Every package source is locked.
 
@@ -106,7 +107,9 @@ installed. A complete independently servable weights package may remain installe
 optional companion or a larger bundle is incomplete.
 
 Inventory reconciliation owns filesystem discovery, hashing, GGUF inspection, tensor-storage
-derivation, and package construction. One cached GGUF inspection supplies every derived property
+derivation, and package construction. Package construction produces the exact package and its one
+authoritative inspection atomically; catalog generation and installed inventory use that same
+operation. One cached GGUF inspection supplies every derived property
 for an immutable component. Reconciliation publishes complete inventory snapshots and retains the
 previous complete inventory snapshot while a refresh is in flight. Queries return the current materialized snapshot
 and perform no filesystem work. Discovery is hardware-independent and performs no network access,

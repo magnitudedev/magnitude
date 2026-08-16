@@ -99,6 +99,32 @@ const catalogModel = (configuration: ModelServingConfiguration): RecommendableMo
   qualityEvidence: [],
 })
 
+const installedPackageEntries = (
+  bundle: ServableModelBundle,
+  attributionByPackageId: ReadonlyMap<string, ModelPackageEntry["catalogAttribution"]> = new Map(),
+): ReadonlyMap<ModelPackageEntry["package"]["id"], ModelPackageEntry> => new Map(
+  (bundle._tag === "Standalone"
+    ? [bundle.package]
+    : bundle.draftSource._tag === "Embedded"
+      ? [bundle.target]
+      : [bundle.target, bundle.draftSource.draft]
+  ).map((modelPackage) => [modelPackage.id, {
+    package: modelPackage,
+    localState: { _tag: "Installed", path: `/models/${modelPackage.id}`, origin: "Magnitude" },
+    inspection: {
+      _tag: "Inspected",
+      capabilities: {
+        vision: false,
+        tools: false,
+        structuredOutput: false,
+        reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+      },
+    },
+    catalogAttribution: attributionByPackageId.get(modelPackage.id)
+      ?? { _tag: "NotCatalogTarget" },
+  }]),
+)
+
 describe("local model configuration resolution", () => {
   it("reserves every package member of a configured speculative bundle", () => {
     const target = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" }).package
@@ -135,7 +161,7 @@ describe("local model configuration resolution", () => {
     expect([...resolveLocalModelConfigurations({
       catalog: [],
       effectiveCatalogConfigurations: [],
-      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      packageEntries: installedPackageEntries(bundle),
       assessed: new Map([[standard.id, {
         configuration: standard,
         origin: "Standard",
@@ -148,12 +174,11 @@ describe("local model configuration resolution", () => {
         identity: { modelId: curated.modelId, variantId: curated.variantId },
         configuration: catalog,
       }],
-      catalogAttributionByPackageId: new Map([[bundle.package.id, {
+      packageEntries: installedPackageEntries(bundle, new Map([[bundle.package.id, {
         _tag: "Attributed",
         modelId: curated.modelId,
         variantId: curated.variantId,
-      }]]),
-      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      }]])),
       assessed: new Map([
         [standard.id, {
           configuration: standard,
@@ -201,12 +226,11 @@ describe("local model configuration resolution", () => {
         identity: { modelId: embeddedCatalog.modelId, variantId: embeddedCatalog.variantId },
         configuration: embedded,
       }],
-      catalogAttributionByPackageId: new Map([[standalone.package.id, {
+      packageEntries: installedPackageEntries(embedded.bundle, new Map([[standalone.package.id, {
         _tag: "Attributed",
         modelId: embeddedCatalog.modelId,
         variantId: embeddedCatalog.variantId,
-      }]]),
-      installedPackageIds: new Set([standalone.package.id]),
+      }]])),
       assessed,
     })
     expect(embeddedResolution.size).toBe(1)
@@ -219,12 +243,11 @@ describe("local model configuration resolution", () => {
         identity: { modelId: separateCatalog.modelId, variantId: separateCatalog.variantId },
         configuration: standard,
       }],
-      catalogAttributionByPackageId: new Map([[standalone.package.id, {
+      packageEntries: installedPackageEntries(standard.bundle, new Map([[standalone.package.id, {
         _tag: "Attributed",
         modelId: separateCatalog.modelId,
         variantId: separateCatalog.variantId,
-      }]]),
-      installedPackageIds: new Set([standalone.package.id]),
+      }]])),
       assessed,
     })
     expect(separateResolution.size).toBe(1)
@@ -238,7 +261,7 @@ describe("local model configuration resolution", () => {
     expect(resolveLocalModelConfigurations({
       catalog: [],
       effectiveCatalogConfigurations: [],
-      installedPackageIds: new Set(servableModelBundlePackageIds(bundle)),
+      packageEntries: installedPackageEntries(bundle),
       assessed: new Map([[staleCatalog.id, {
         configuration: staleCatalog,
         origin: "Authored",
@@ -256,7 +279,15 @@ describe("local model configuration resolution", () => {
     }
     const prior = configuration("configuration-prior", priorBundle, 50_000)
     const desired = configuration("configuration-current", desiredBundle, 50_000)
-    const curated = catalogModel(desired)
+    const curated: RecommendableModel = {
+      ...catalogModel(desired),
+      capabilities: {
+        vision: true,
+        tools: false,
+        structuredOutput: false,
+        reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+      },
+    }
     const assessed = new Map([
       [prior.id, {
         configuration: prior,
@@ -282,11 +313,13 @@ describe("local model configuration resolution", () => {
         configuration: prior,
       }],
       assessed,
-      installedPackageIds: new Set([priorBundle.package.id]),
-      catalogAttributionByPackageId: attribution,
+      packageEntries: installedPackageEntries(priorBundle, attribution),
     }).values()][0]
     expect(before?.servingConfiguration).toEqual(prior)
     expect(before?.catalogModel).toEqual(Option.some(curated))
+    expect(before).toMatchObject({
+      targetInspection: { _tag: "Inspected", capabilities: { vision: false } },
+    })
 
     const after = [...resolveLocalModelConfigurations({
       catalog: [curated],
@@ -295,10 +328,103 @@ describe("local model configuration resolution", () => {
         configuration: desired,
       }],
       assessed,
-      installedPackageIds: new Set([priorBundle.package.id, desiredBundle.package.id]),
-      catalogAttributionByPackageId: attribution,
+      packageEntries: new Map([
+        ...installedPackageEntries(priorBundle, attribution),
+        ...installedPackageEntries(desiredBundle),
+      ]),
     }).values()][0]
     expect(after?.servingConfiguration).toEqual(desired)
+  })
+
+  it("represents an installed package awaiting inspection as inspecting", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
+    const serving = configuration("configuration-catalog", bundle, 32_000)
+    const curated: RecommendableModel = {
+      ...catalogModel(serving),
+      capabilities: {
+        vision: true,
+        tools: false,
+        structuredOutput: false,
+        reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+      },
+    }
+    const targetEntry = installedPackageEntries(bundle).get(bundle.package.id)!
+    const packageEntries = new Map([[bundle.package.id, {
+      ...targetEntry,
+      inspection: { _tag: "Pending" as const },
+    }]])
+
+    const resolved = [...resolveLocalModelConfigurations({
+      catalog: [curated],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: curated.modelId, variantId: curated.variantId },
+        configuration: serving,
+      }],
+      assessed: new Map(),
+      packageEntries,
+    }).values()][0]
+
+    expect(resolved).toMatchObject({
+      targetInspection: { _tag: "Pending" },
+      assessment: { _tag: "Assessing" },
+    })
+  })
+
+  it("preserves an installed package inspection failure", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
+    const serving = configuration("configuration-standard", bundle, 32_000)
+    const targetEntry = installedPackageEntries(bundle).get(bundle.package.id)!
+    const failure = {
+      code: "projector_inspection_failed",
+      message: "native parse failed",
+      retryable: false,
+    }
+
+    const resolved = [...resolveLocalModelConfigurations({
+      catalog: [],
+      effectiveCatalogConfigurations: [],
+      assessed: new Map([[serving.id, {
+        configuration: serving,
+        origin: "Standard",
+        assessment: { _tag: "Assessing" },
+      }]]),
+      packageEntries: new Map([[bundle.package.id, {
+        ...targetEntry,
+        inspection: { _tag: "Incompatible" as const, failure },
+      }]]),
+    }).values()][0]
+
+    expect(resolved).toMatchObject({
+      targetInspection: { _tag: "Incompatible", failure },
+    })
+  })
+
+  it("uses exact catalog capabilities before the package is installed", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models" })
+    const serving = configuration("configuration-catalog", bundle, 32_000)
+    const curated: RecommendableModel = {
+      ...catalogModel(serving),
+      capabilities: {
+        vision: true,
+        tools: false,
+        structuredOutput: false,
+        reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+      },
+    }
+
+    const resolved = [...resolveLocalModelConfigurations({
+      catalog: [curated],
+      effectiveCatalogConfigurations: [{
+        identity: { modelId: curated.modelId, variantId: curated.variantId },
+        configuration: serving,
+      }],
+      assessed: new Map(),
+      packageEntries: new Map(),
+    }).values()][0]
+
+    expect(resolved).toMatchObject({
+      targetInspection: { _tag: "Inspected", capabilities: { vision: true } },
+    })
   })
 
   it("drops a generated resolution when its installed package disappears", () => {
@@ -308,7 +434,7 @@ describe("local model configuration resolution", () => {
     expect(resolveLocalModelConfigurations({
       catalog: [],
       effectiveCatalogConfigurations: [],
-      installedPackageIds: new Set(),
+      packageEntries: new Map(),
       assessed: new Map([[standard.id, {
         configuration: standard,
         origin: "Standard",
@@ -435,7 +561,7 @@ describe("local model availability", () => {
 
   it("reports provider publication as preparing until it matches the package snapshot", () => {
     expect(availabilityFromProviderProjection(
-      providerModelIds[0],
+      Option.some(providerModelIds[0]),
       new Map([[providerModelIds[0]!, {
         availability: { _tag: "Disabled", reason: "incompatible_runtime" },
       }]]),
@@ -446,7 +572,7 @@ describe("local model availability", () => {
 
   it("keeps an assessed configuration installable before it has an offering", () => {
     expect(availabilityFromProviderProjection(
-      undefined,
+      Option.none(),
       new Map(),
       false,
       Option.none(),
@@ -455,7 +581,7 @@ describe("local model availability", () => {
 
   it("exposes an authoritative current provider incompatibility", () => {
     expect(availabilityFromProviderProjection(
-      providerModelIds[0],
+      Option.some(providerModelIds[0]),
       new Map([[providerModelIds[0]!, {
         availability: { _tag: "Disabled", reason: "incompatible_runtime" },
       }]]),
@@ -475,7 +601,7 @@ describe("local model availability", () => {
   it("uses only the provider offering for the exact configuration", () => {
     const otherProviderModelId = ProviderModelIdSchema.make("other-configuration")
     expect(availabilityFromProviderProjection(
-      providerModelIds[0],
+      Option.some(providerModelIds[0]),
       new Map([
         [providerModelIds[0]!, {
           availability: { _tag: "Disabled", reason: "insufficient_resources" },
