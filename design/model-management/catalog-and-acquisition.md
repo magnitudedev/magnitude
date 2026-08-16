@@ -40,9 +40,15 @@ evidence. Reviewed model parameterization states whether the architecture is den
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
 positive active parameter count smaller than the total. Parameter counts are factual catalog data;
 clients own their human-readable rounding and formatting. Input modality remains an inspected
-capability and is not duplicated in catalog declarations. Speculative decoding is explicit as
-either capability embedded in the target GGUF or an
-exact draft file in the target or another repository. Every package source is locked.
+capability and is not duplicated in catalog declarations. An image-capable target requires one
+projector component in its exact target package. Catalog generation selects the projector
+automatically only when the locked target repository contains one candidate; otherwise the reviewed
+declaration names the exact projector path in that repository. Projector presence participates in
+artifact inspection and is what establishes image capability for GGUF targets whose weights do not
+declare it independently. A missing, ambiguous, incompatible, or MTP-combined projector fails
+generation.
+Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft
+file in the target or another repository. Every package source is locked.
 
 Catalog generation resolves only locked revisions through production package construction,
 inspection, template analysis, and native planning. It emits a self-contained planner-input bundle
