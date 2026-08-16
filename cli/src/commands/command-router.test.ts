@@ -15,9 +15,11 @@ function createContext(overrides: Partial<CommandContext> = {}): CommandContext 
     initProject: vi.fn(),
     openSettings: vi.fn(),
     openUsage: vi.fn(),
+    openSetup: vi.fn(),
     openCloud: vi.fn(),
     openModelMenu: vi.fn(),
     toggleTranscript: vi.fn(),
+    controlSelectedModel: vi.fn(),
     toggleAutopilot: vi.fn(),
     ...overrides,
   }
@@ -26,42 +28,77 @@ function createContext(overrides: Partial<CommandContext> = {}): CommandContext 
 describe('routeSlashCommand', () => {
   test('handles recognized commands', () => {
     const ctx = createContext()
-    expect(routeSlashCommand('/new', ctx)).toBe(true)
+    expect(routeSlashCommand('/new', ctx)._tag).toBe('Handled')
     expect(ctx.resetConversation).toHaveBeenCalledTimes(1)
   })
 
   test('opens each model menu directly', () => {
     const ctx = createContext()
-    expect(routeSlashCommand('/models', ctx)).toBe(true)
-    expect(routeSlashCommand('/catalog', ctx)).toBe(true)
-    expect(routeSlashCommand('/hardware', ctx)).toBe(true)
+    expect(routeSlashCommand('/models', ctx)._tag).toBe('Handled')
+    expect(routeSlashCommand('/catalog', ctx)._tag).toBe('Handled')
+    expect(routeSlashCommand('/hardware', ctx)._tag).toBe('Handled')
     expect(ctx.openModelMenu).toHaveBeenNthCalledWith(1, 'models')
     expect(ctx.openModelMenu).toHaveBeenNthCalledWith(2, 'catalog')
     expect(ctx.openModelMenu).toHaveBeenNthCalledWith(3, 'hardware')
   })
 
+  test('leaves model commands unhandled when the client has no model menu', () => {
+    const ctx = createContext()
+    delete ctx.openModelMenu
+
+    expect(routeSlashCommand('/models', ctx)._tag).toBe('Unhandled')
+  })
+
   test('/settings opens the Models menu', () => {
     const ctx = createContext()
-    expect(routeSlashCommand('/settings', ctx)).toBe(true)
+    expect(routeSlashCommand('/settings', ctx)._tag).toBe('Handled')
     expect(ctx.openModelMenu).toHaveBeenCalledWith('models')
   })
 
   test('/transcript preserves direct access to transcript mode', () => {
     const ctx = createContext()
-    expect(routeSlashCommand('/transcript', ctx)).toBe(true)
+    expect(routeSlashCommand('/transcript', ctx)._tag).toBe('Handled')
     expect(ctx.toggleTranscript).toHaveBeenCalledTimes(1)
+  })
+
+  test('/setup reopens onboarding setup', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/setup', ctx)._tag).toBe('Handled')
+    expect(ctx.openSetup).toHaveBeenCalledTimes(1)
+  })
+
+  test('routes selected-model control commands through one capability', () => {
+    const ctx = createContext()
+    expect(routeSlashCommand('/load', ctx)._tag).toBe('Handled')
+    expect(routeSlashCommand('/stop', ctx)._tag).toBe('Handled')
+    expect(ctx.controlSelectedModel).toHaveBeenNthCalledWith(1, 'load')
+    expect(ctx.controlSelectedModel).toHaveBeenNthCalledWith(2, 'stop')
+  })
+
+  test('leaves model control commands unhandled without a control surface', () => {
+    const ctx = createContext()
+    delete ctx.controlSelectedModel
+
+    expect(routeSlashCommand('/load', ctx)._tag).toBe('Unhandled')
+  })
+
+  test('leaves /setup unhandled when the client has no onboarding surface', () => {
+    const ctx = createContext()
+    delete ctx.openSetup
+
+    expect(routeSlashCommand('/setup', ctx)._tag).toBe('Unhandled')
   })
 
   test('unknown command is not handled', () => {
     const ctx = createContext()
-    expect(routeSlashCommand('/definitely-not-a-command', ctx)).toBe(false)
+    expect(routeSlashCommand('/definitely-not-a-command', ctx)._tag).toBe('Unhandled')
     expect(ctx.showSystemMessage).not.toHaveBeenCalled()
   })
 
   test('slash-prefixed filesystem-like text is not handled', () => {
     const ctx = createContext()
-    expect(routeSlashCommand('/Users/me/a.png /Users/me/b.png', ctx)).toBe(false)
-    expect(routeSlashCommand('/home/me/a.png /home/me/b.png', ctx)).toBe(false)
+    expect(routeSlashCommand('/Users/me/a.png /Users/me/b.png', ctx)._tag).toBe('Unhandled')
+    expect(routeSlashCommand('/home/me/a.png /home/me/b.png', ctx)._tag).toBe('Unhandled')
     expect(ctx.showSystemMessage).not.toHaveBeenCalled()
   })
 })

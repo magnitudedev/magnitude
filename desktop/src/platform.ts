@@ -15,8 +15,15 @@ import {
   type AcnEnsureEvent,
   type AcnInstanceManager as AcnInstanceManagerService,
 } from "@magnitudedev/sdk"
-import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
+import type {
+  Platform,
+  Storage,
+  Clipboard,
+  Notification,
+  Dialogs,
+} from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
+import { decodeDesktopAcnEnsureEvent } from "./desktop-rpc"
 
 const DEFAULT_SERVER_KEY = "default-server"
 
@@ -62,30 +69,46 @@ let api: DesktopApi
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-const ensuranceError = (cause: unknown) => Schema.is(AcnEnsuranceError)(cause)
-  ? cause
-  : new AcnEnsuranceFailed({ reason: errorMessage(cause) })
+const ensuranceError = (cause: unknown) =>
+  Schema.is(AcnEnsuranceError)(cause)
+    ? cause
+    : new AcnEnsuranceFailed({ reason: errorMessage(cause) })
 
-function createDesktopAcnManager(desktopApi: DesktopApi): AcnInstanceManagerService {
+function createDesktopAcnManager(
+  desktopApi: DesktopApi,
+): AcnInstanceManagerService {
   return AcnInstanceManager.of({
-    ensure: (request) => Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceError>((emit) =>
-      Effect.acquireRelease(
-        Effect.sync(() => desktopApi.acnEnsurer.ensure(
-          request,
-          (event) => emit.single(event),
-          (error) => emit.fail(ensuranceError(error)),
-          () => emit.end(),
-        )),
-        (unsubscribe) => Effect.sync(unsubscribe),
-      ).pipe(Effect.asVoid),
+    ensure: (request) =>
+      Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceError>((emit) =>
+        Effect.acquireRelease(
+          Effect.sync(() =>
+            desktopApi.acnEnsurer.ensure(
+              request,
+              (event) => {
+                try {
+                  emit.single(decodeDesktopAcnEnsureEvent(event))
+                } catch (cause) {
+                  emit.fail(ensuranceError(cause))
+                }
+              },
+              (error) => emit.fail(ensuranceError(error)),
+              () => emit.end(),
+            ),
+          ),
+          (unsubscribe) => Effect.sync(unsubscribe),
+        ).pipe(Effect.asVoid),
+      ),
+    stop: Effect.fail(
+      new AcnAdministrationFailed({
+        reason: "Desktop renderer cannot administer the ACN",
+      }),
     ),
-    stop: Effect.fail(new AcnAdministrationFailed({
-      reason: "Desktop renderer cannot administer the ACN",
-    })),
   })
 }
 
-export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Platform> {
+export async function createDesktopPlatform(
+  desktopApi: DesktopApi,
+): Promise<Platform> {
   api = desktopApi
   const manager = createDesktopAcnManager(desktopApi)
   const acnScope = await Effect.runPromise(Scope.make())
@@ -96,10 +119,13 @@ export async function createDesktopPlatform(desktopApi: DesktopApi): Promise<Pla
       Effect.provide(FetchHttpClient.layer),
     ),
   )
-  const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
-  const shutdown = () => Effect.runPromise(
-    acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+  const protocolLayer = acn.protocolLayer.pipe(
+    Layer.provide(FetchHttpClient.layer),
   )
+  const shutdown = () =>
+    Effect.runPromise(
+      acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+    )
   return {
     id: "desktop",
     protocolLayer,

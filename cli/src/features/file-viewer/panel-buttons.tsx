@@ -2,9 +2,9 @@ import { useState } from 'react'
 import { useCopyFeedback } from '@magnitudedev/client-common'
 import { writeTextToClipboard } from '../../utils/clipboard'
 import { Button } from '../../components/button'
-import type { ChatTheme } from '../../types/theme-system'
+import type { CliTheme } from '../../types/theme-system'
 
-export function CopyButton({ content, theme }: { content: string; theme: ChatTheme }) {
+export function CopyButton({ content, theme }: { content: string; theme: CliTheme }) {
   const [hovered, setHovered] = useState(false)
   const { copied, triggerCopy } = useCopyFeedback(2000)
 
@@ -17,7 +17,7 @@ export function CopyButton({ content, theme }: { content: string; theme: ChatThe
     }
   }
 
-  const color = copied ? theme.success : hovered ? theme.foreground : theme.muted
+  const color = copied ? theme.status.success : hovered ? theme.text.body : theme.text.supporting
 
   return (
     <Button
@@ -32,9 +32,9 @@ export function CopyButton({ content, theme }: { content: string; theme: ChatThe
   )
 }
 
-export function CloseButton({ theme, onClose }: { theme: ChatTheme; onClose: () => void }) {
+export function CloseButton({ theme, onClose }: { theme: CliTheme; onClose: () => void }) {
   const [hovered, setHovered] = useState(false)
-  const color = hovered ? theme.foreground : theme.muted
+  const color = hovered ? theme.text.body : theme.text.supporting
 
   return (
     <Button

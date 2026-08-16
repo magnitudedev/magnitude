@@ -42,14 +42,14 @@ export function ContextUsage({
   const animationStep = useAnimationStep(isCompacting, 240)
   const display = formatContextUsage(tokenUsage, hardCap)
 
-  if (!isCompacting) return <text style={{ fg: theme.muted }}>{display}</text>
+  if (!isCompacting) return <text style={{ fg: theme.text.metadata }}>{display}</text>
 
   const frame = animationStep % 6
   const active = (index: number) =>
     index <= frame && frame <= index + 2 ? TextAttributes.NONE : TextAttributes.DIM
 
   return (
-    <text style={{ fg: theme.muted }}>
+    <text style={{ fg: theme.text.metadata }}>
       <span attributes={active(0)}>{'>'}</span>
       <span attributes={active(1)}>{'>'}</span>
       <span attributes={active(2)}>{'>'}</span>

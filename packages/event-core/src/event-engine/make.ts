@@ -500,6 +500,7 @@ export function make<TEvent extends BaseEvent>() {
         type ExposedProjectionService = {
           readonly get?: Effect.Effect<unknown>
           readonly getFork?: (forkId: string | null) => Effect.Effect<unknown>
+          readonly changesForFork?: (forkId: string | null) => Stream.Stream<unknown>
           readonly state: SubscriptionRef.SubscriptionRef<unknown>
         }
         const stateServices = new Map<string, ExposedProjectionService>()
@@ -577,17 +578,11 @@ export function make<TEvent extends BaseEvent>() {
 
           subscribeStateFork: (name: string, forkId: string | null, callback: (state: unknown) => void) => Effect.gen(function* () {
             const p = stateServices.get(name)
-            if (!p?.getFork) return yield* Effect.die(new Error(`Unknown forked state: ${name}`))
-            const getFork = p.getFork
-            const initial = yield* getFork(forkId)
-            yield* Effect.sync(() => callback(initial))
+            if (!p?.changesForFork) return yield* Effect.die(new Error(`Unknown forked state: ${name}`))
             return yield* guardAndFork(
               `state:${name}:fork`,
               Stream.runForEach(
-                p.state.changes.pipe(
-                  Stream.mapEffect(() => getFork(forkId)),
-                  Stream.changes
-                ),
+                p.changesForFork(forkId),
                 (forkState) => Effect.sync(() => callback(forkState))
               )
             )

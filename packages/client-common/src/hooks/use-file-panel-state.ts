@@ -66,7 +66,7 @@ export function useFilePanelState(): UseFilePanelStateResult {
       onNone: () => idleAtom,
       onSome: (path) => Option.match(selectedCwd, {
         onNone: () => idleAtom,
-        onSome: (cwd) => client.query("ResolvePath", {
+        onSome: (cwd) => client.rpc.query("ResolvePath", {
           cwd,
           path,
           checkExists: true,
@@ -97,7 +97,7 @@ export function useFilePanelState(): UseFilePanelStateResult {
         onNone: () => idleAtom,
         onSome: (cwd) => Option.match(resolvedPath, {
           onNone: () => idleAtom,
-          onSome: () => client.query("ReadFile", {
+          onSome: () => client.rpc.query("ReadFile", {
             cwd,
             path,
             format: isImageFile ? "base64" : "text",

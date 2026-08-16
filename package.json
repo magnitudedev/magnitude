@@ -10,6 +10,7 @@
     "packages/*"
   ],
   "scripts": {
+    "bootstrap": "bun scripts/bootstrap.ts",
     "dev": "bun run scripts/dev.ts",
     "devl": "bun run dev:version && bun run dev:client:local",
     "dev:version": "bun run packages/version/scripts/generate-version.ts --dev",
@@ -19,7 +20,7 @@
     "build": "bun run packages/version/scripts/generate-version.ts && turbo build",
     "build:release": "bun run icn:catalog:build-bundle && bun run packages/release/scripts/build/host.ts",
     "test:release-bootstrap": "bun run packages/release/scripts/test-bootstrap.ts",
-    "typecheck": "bun run packages/version/scripts/generate-version.ts && turbo typecheck",
+    "typecheck": "turbo typecheck",
     "test": "bun run packages/version/scripts/generate-version.ts && bun test",
     "cache:clear": "bun run scripts/clear-derived-cache.ts assessments",
     "cache:clear:all": "bun run scripts/clear-derived-cache.ts all",
@@ -27,6 +28,7 @@
     "onboarding:reset": "bun run scripts/reset-onboarding.ts",
     "design-docs": "bun run scripts/design-docs.ts",
     "session": "bun run --cwd evals session",
+    "benchmark": "bun run packages/inference-benchmark/src/cli.ts",
     "tbench": "bun run evals/tbench/cli.ts",
     "dash": "bun run --cwd packages/tracing dashboard",
     "events": "cat ~/.magnitude/logs/events.jsonl",
@@ -103,7 +105,7 @@
     "sqlite3"
   ],
   "patchedDependencies": {
-    "@opentui/core@0.1.88": "patches/@opentui%2Fcore@0.1.88.patch",
-    "just-git@1.7.0": "patches/just-git@1.7.0.patch"
+    "just-git@1.7.0": "patches/just-git@1.7.0.patch",
+    "@changesets/assemble-release-plan@6.0.10": "patches/@changesets%2Fassemble-release-plan@6.0.10.patch"
   }
 }

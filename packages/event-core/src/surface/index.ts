@@ -130,15 +130,7 @@ export function state<TId, TStateSchema extends Schema.Schema.AnyNoContext>(
       ),
       subscribeFork: signal((forkId: string | null) =>
         Stream.unwrap(
-          Effect.map(projection.Tag, (service) =>
-            Stream.concat(
-              Stream.fromEffect(service.getFork(forkId)),
-              service.state.changes.pipe(
-                Stream.mapEffect(() => service.getFork(forkId)),
-                Stream.changes
-              )
-            )
-          )
+          Effect.map(projection.Tag, (service) => service.changesForFork(forkId))
         )
       )
     }

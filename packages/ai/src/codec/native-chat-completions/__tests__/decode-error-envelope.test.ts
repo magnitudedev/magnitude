@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest"
-import { Stream, Effect, Chunk } from "effect"
+import { Stream, Effect, Chunk, Option } from "effect"
 import { decode } from "../decode"
 import { acceptedHttpResponse, type StreamFailureContext } from "../../../errors/failure"
 import type { ChatCompletionsStreamChunk } from "../../../wire/chat-completions"
+import { normalizeChatCompletionsChunk } from "../chunk"
 import type { ResponseStreamEvent } from "../../../response/events"
 
 // ---------------------------------------------------------------------------
@@ -21,28 +22,34 @@ function chunkFromData(data: Partial<ChatCompletionsStreamChunk>): ChatCompletio
   } as ChatCompletionsStreamChunk
 }
 
-function textChunk(content: string): ChatCompletionsStreamChunk {
-  return chunkFromData({
+const normalized = (chunk: ChatCompletionsStreamChunk) =>
+  normalizeChatCompletionsChunk(
+    chunk,
+    Option.fromNullable(chunk.choices[0]?.delta.reasoning_content),
+  )
+
+function textChunk(content: string) {
+  return normalized(chunkFromData({
     choices: [{ index: 0, delta: { content }, finish_reason: null }],
-  })
+  }))
 }
 
-function usageChunk(): ChatCompletionsStreamChunk {
-  return chunkFromData({
+function usageChunk() {
+  return normalized(chunkFromData({
     choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
     usage: { prompt_tokens: 10, completion_tokens: 5 },
-  })
+  }))
 }
 
 function errorChunk(
   message: string,
   type = "server_error",
   code = "stream_interrupted",
-): ChatCompletionsStreamChunk {
-  return chunkFromData({
+){
+  return normalized(chunkFromData({
     choices: [],
     error: { message, type, code, param: null },
-  })
+  }))
 }
 
 const responseHeaders = new Headers({ "x-request-id": "request-test" })
@@ -140,11 +147,11 @@ describe("decode — mid-stream error envelope", () => {
   it("error envelope with missing optional fields still works", async () => {
     // errorChunk uses code="stream_interrupted" — also test minimal error shape
     const chunks = Stream.fromIterable([
-      chunkFromData({
+      normalized(chunkFromData({
         choices: [],
         // Only required field: message; type, code, param all optional
         error: { message: "something went wrong" },
-      } as Partial<ChatCompletionsStreamChunk> as ChatCompletionsStreamChunk),
+      } as Partial<ChatCompletionsStreamChunk> as ChatCompletionsStreamChunk)),
     ])
 
     const { events } = decode(chunks, {

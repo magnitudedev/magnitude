@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use llama_cpp_2::LlamaSequenceState;
 use llama_cpp_2::token::LlamaToken;
@@ -11,9 +11,49 @@ pub(crate) struct PromptCheckpoint {
 }
 
 #[derive(Debug)]
-pub(crate) struct SequenceCache {
-    pub(crate) prompt: Vec<LlamaToken>,
+pub(crate) struct ReusablePrefix {
+    pub(crate) tokens: Vec<LlamaToken>,
     pub(crate) checkpoints: Vec<PromptCheckpoint>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AvailableSequence {
+    id: i32,
+    pub(crate) reusable_prefix: Option<ReusablePrefix>,
+}
+
+impl AvailableSequence {
+    pub(crate) fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub(crate) fn activate(self) -> ActiveSequence {
+        ActiveSequence { id: self.id }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveSequence {
+    id: i32,
+}
+
+impl ActiveSequence {
+    pub(crate) fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub(crate) fn into_available(
+        self,
+        reusable_prefix: Option<ReusablePrefix>,
+    ) -> AvailableSequence {
+        AvailableSequence {
+            id: self.id,
+            reusable_prefix,
+        }
+    }
+
+    /// Consume capacity whose native state could not be made safe for another request.
+    pub(crate) fn quarantine(self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,37 +168,34 @@ impl BatchPlanner {
 
 #[derive(Debug)]
 pub(crate) struct SequencePool {
-    free: VecDeque<i32>,
-    owned: BTreeSet<i32>,
-    cached: BTreeMap<i32, SequenceCache>,
+    available: VecDeque<AvailableSequence>,
 }
 
 impl SequencePool {
     pub(crate) fn new(count: u32) -> Self {
         Self {
-            free: (0..count)
-                .map(|value| i32::try_from(value).expect("validated sequence count fits i32"))
+            available: (0..count)
+                .map(|value| AvailableSequence {
+                    id: i32::try_from(value).expect("validated sequence count fits i32"),
+                    reusable_prefix: None,
+                })
                 .collect(),
-            owned: BTreeSet::new(),
-            cached: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> Option<i32> {
-        let sequence_id = self.free.pop_front()?;
-        assert!(self.owned.insert(sequence_id), "sequence was already owned");
-        Some(sequence_id)
+    pub(crate) fn acquire(&mut self) -> Option<AvailableSequence> {
+        self.available.pop_front()
     }
 
-    pub(crate) fn acquire_matching(&mut self, prompt: &[LlamaToken]) -> Option<i32> {
+    pub(crate) fn acquire_matching(&mut self, prompt: &[LlamaToken]) -> Option<AvailableSequence> {
         let best = self
-            .free
+            .available
             .iter()
             .enumerate()
-            .max_by_key(|(_, sequence_id)| {
-                self.cached.get(sequence_id).map_or(0, |cache| {
-                    cache
-                        .prompt
+            .max_by_key(|(_, sequence)| {
+                sequence.reusable_prefix.as_ref().map_or(0, |prefix| {
+                    prefix
+                        .tokens
                         .iter()
                         .zip(prompt)
                         .take_while(|(left, right)| left == right)
@@ -166,46 +203,18 @@ impl SequencePool {
                 })
             })
             .map(|(index, _)| index)?;
-        let sequence_id = self.free.remove(best)?;
-        assert!(self.owned.insert(sequence_id), "sequence was already owned");
-        Some(sequence_id)
+        self.available.remove(best)
     }
 
-    pub(crate) fn release(&mut self, sequence_id: i32) {
-        assert!(
-            self.owned.remove(&sequence_id),
-            "attempted to release an unowned sequence"
-        );
-        self.cached.remove(&sequence_id);
-        self.free.push_front(sequence_id);
+    pub(crate) fn release(&mut self, sequence: AvailableSequence) {
+        self.available.push_front(sequence);
     }
 
-    pub(crate) fn release_cached(&mut self, sequence_id: i32, cache: SequenceCache) {
-        assert!(
-            self.owned.remove(&sequence_id),
-            "attempted to release an unowned sequence"
-        );
-        self.cached.insert(sequence_id, cache);
-        self.free.push_front(sequence_id);
-    }
-
-    pub(crate) fn take_cache(&mut self, sequence_id: i32) -> Option<SequenceCache> {
-        self.cached.remove(&sequence_id)
-    }
-
-    /// Remove a sequence from service after native cleanup failed. Reusing it could expose one
-    /// request to another request's resident state, so capacity is deliberately reduced instead.
-    pub(crate) fn quarantine(&mut self, sequence_id: i32) {
-        assert!(
-            self.owned.remove(&sequence_id),
-            "attempted to quarantine an unowned sequence"
-        );
-        self.cached.remove(&sequence_id);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owned(&self) -> &BTreeSet<i32> {
-        &self.owned
+    /// Native context reset erases KV for available sequences as well as active ones.
+    pub(crate) fn invalidate_reuse(&mut self) {
+        for sequence in &mut self.available {
+            sequence.reusable_prefix = None;
+        }
     }
 }
 
@@ -316,70 +325,82 @@ mod tests {
         let mut pool = SequencePool::new(2);
         let first = pool.acquire().unwrap();
         let second = pool.acquire().unwrap();
-        assert_ne!(first, second);
-        assert_eq!(pool.acquire(), None);
-        assert_eq!(pool.owned(), &BTreeSet::from([first, second]));
+        assert_ne!(first.id(), second.id());
+        assert!(pool.acquire().is_none());
 
+        let first_id = first.id();
         pool.release(first);
-        assert_eq!(pool.acquire(), Some(first));
-        assert_eq!(pool.owned(), &BTreeSet::from([first, second]));
+        assert_eq!(pool.acquire().unwrap().id(), first_id);
+        assert!(pool.acquire().is_none());
+        drop(second);
     }
 
     #[test]
     fn failed_cleanup_quarantines_only_the_affected_sequence() {
         let mut pool = SequencePool::new(2);
-        let cancelled = pool.acquire().unwrap();
+        let quarantined = pool.acquire().unwrap().activate();
         let survivor = pool.acquire().unwrap();
-        pool.quarantine(cancelled);
+        quarantined.quarantine();
 
-        assert_eq!(pool.acquire(), None);
-        assert_eq!(pool.owned(), &BTreeSet::from([survivor]));
+        assert!(pool.acquire().is_none());
+        let survivor_id = survivor.id();
         pool.release(survivor);
-        assert_eq!(pool.acquire(), Some(survivor));
-        assert_eq!(pool.acquire(), None);
+        assert_eq!(pool.acquire().unwrap().id(), survivor_id);
+        assert!(pool.acquire().is_none());
     }
 
     #[test]
-    fn retained_cache_returns_with_the_same_sequence() {
+    fn returning_an_unmodified_available_sequence_preserves_its_reusable_prefix() {
         let mut pool = SequencePool::new(2);
-        let sequence = pool.acquire().unwrap();
-        pool.release_cached(
-            sequence,
-            SequenceCache {
-                prompt: vec![LlamaToken::new(7)],
-                checkpoints: Vec::new(),
-            },
-        );
-        assert_eq!(pool.acquire(), Some(sequence));
-        let cache = pool.take_cache(sequence).unwrap();
-        assert_eq!(cache.prompt, vec![LlamaToken::new(7)]);
-        assert!(cache.checkpoints.is_empty());
+        let available = pool.acquire().unwrap();
+        let sequence_id = available.id();
+        let active = available.activate();
+        pool.release(active.into_available(Some(ReusablePrefix {
+            tokens: vec![LlamaToken::new(7)],
+            checkpoints: Vec::new(),
+        })));
+        let available = pool.acquire().unwrap();
+        assert_eq!(available.id(), sequence_id);
+        pool.release(available);
+        let returned = pool.acquire().unwrap();
+        let prefix = returned.reusable_prefix.unwrap();
+        assert_eq!(prefix.tokens, vec![LlamaToken::new(7)]);
+        assert!(prefix.checkpoints.is_empty());
     }
 
     #[test]
     fn matching_cache_is_selected_independently_of_free_order() {
         let mut pool = SequencePool::new(2);
         let first = pool.acquire().unwrap();
+        let first_id = first.id();
         let second = pool.acquire().unwrap();
-        pool.release_cached(
-            first,
-            SequenceCache {
-                prompt: vec![LlamaToken::new(1), LlamaToken::new(2)],
-                checkpoints: Vec::new(),
-            },
-        );
-        pool.release_cached(
-            second,
-            SequenceCache {
-                prompt: vec![LlamaToken::new(7), LlamaToken::new(8)],
-                checkpoints: Vec::new(),
-            },
-        );
+        pool.release(first.activate().into_available(Some(ReusablePrefix {
+            tokens: vec![LlamaToken::new(1), LlamaToken::new(2)],
+            checkpoints: Vec::new(),
+        })));
+        pool.release(second.activate().into_available(Some(ReusablePrefix {
+            tokens: vec![LlamaToken::new(7), LlamaToken::new(8)],
+            checkpoints: Vec::new(),
+        })));
 
-        assert_eq!(
-            pool.acquire_matching(&[LlamaToken::new(1), LlamaToken::new(9)]),
-            Some(first)
-        );
+        let acquired = pool
+            .acquire_matching(&[LlamaToken::new(1), LlamaToken::new(9)])
+            .unwrap();
+        assert_eq!(acquired.id(), first_id);
+    }
+
+    #[test]
+    fn context_reset_invalidates_available_reusable_prefixes() {
+        let mut pool = SequencePool::new(1);
+        let sequence = pool.acquire().unwrap().activate();
+        pool.release(sequence.into_available(Some(ReusablePrefix {
+            tokens: vec![LlamaToken::new(7)],
+            checkpoints: Vec::new(),
+        })));
+
+        pool.invalidate_reuse();
+
+        assert!(pool.acquire().unwrap().reusable_prefix.is_none());
     }
 
     fn batch_size(work: &BatchWork) -> usize {

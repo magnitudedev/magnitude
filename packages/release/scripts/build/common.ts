@@ -15,7 +15,10 @@ import {
   ReleaseArtifactSchema,
   type ReleaseArtifact,
 } from "../../src/contracts"
-import type { HostId } from "../../src/targets"
+import {
+  MACOS_DEPLOYMENT_TARGET,
+  type HostId,
+} from "../../src/targets"
 
 export interface ArchiveSource {
   readonly path: string
@@ -67,6 +70,43 @@ export const run = async (
     )
   }
   return stdout
+}
+
+const compareVersions = (left: string, right: string): number => {
+  const leftParts = left.split(".").map(Number)
+  const rightParts = right.split(".").map(Number)
+  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0)
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+export const verifyAppleDeploymentTarget = async (
+  host: HostId,
+  files: readonly string[],
+): Promise<void> => {
+  if (!host.startsWith("darwin-")) return
+  const architecture = host === "darwin-arm64" ? "arm64" : "x86_64"
+  for (const file of files) {
+    const report = await run([
+      "vtool",
+      "-arch",
+      architecture,
+      "-show-build",
+      file,
+    ])
+    const platform = report.match(/^\s*platform\s+(\S+)\s*$/m)?.[1]
+    const minimum = report.match(/^\s*minos\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
+    if (platform !== "MACOS" || minimum === undefined) {
+      throw new Error(`${basename(file)} has no macOS deployment target`)
+    }
+    if (compareVersions(minimum, MACOS_DEPLOYMENT_TARGET) > 0) {
+      throw new Error(
+        `${basename(file)} requires macOS ${minimum}; release floor is macOS ${MACOS_DEPLOYMENT_TARGET}`,
+      )
+    }
+  }
 }
 
 export interface OwnedLoaderPathInputs {

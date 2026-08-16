@@ -1,11 +1,13 @@
 import { Rpc, RpcClient, RpcClientError, RpcGroup } from "@effect/rpc"
 import { Schema } from "effect"
-import { MenuActionSchema, type MenuAction } from "@magnitudedev/client-common/src/types/menu-action"
+import {
+  MenuActionSchema,
+  type MenuAction,
+} from "@magnitudedev/client-common/src/types/menu-action"
 import {
   AcnEnsureEventSchema,
   AcnEnsureRequestSchema,
   AcnEnsuranceError,
-  type AcnEnsureEvent,
   type AcnEnsureRequest,
 } from "@magnitudedev/sdk"
 
@@ -86,7 +88,22 @@ export const DesktopRpcs = RpcGroup.make(
   }),
 )
 
-export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>
+export type DesktopRpcClient = RpcClient.FromGroup<
+  typeof DesktopRpcs,
+  RpcClientError.RpcClientError
+>
+
+/**
+ * Values exposed through contextBridge are structured-cloned, so Effect data
+ * types (notably Option) must cross that boundary in their encoded form.
+ */
+export type DesktopAcnEnsureEvent = Schema.Schema.Encoded<
+  typeof AcnEnsureEventSchema
+>
+export const encodeDesktopAcnEnsureEvent =
+  Schema.encodeSync(AcnEnsureEventSchema)
+export const decodeDesktopAcnEnsureEvent =
+  Schema.decodeUnknownSync(AcnEnsureEventSchema)
 
 export type DesktopPlatform = "darwin" | "win32" | "linux"
 
@@ -95,7 +112,7 @@ export interface DesktopApi {
   readonly acnEnsurer: {
     ensure(
       request: AcnEnsureRequest,
-      onEvent: (event: AcnEnsureEvent) => void,
+      onEvent: (event: DesktopAcnEnsureEvent) => void,
       onError: (error: unknown) => void,
       onEnd: () => void,
     ): () => void

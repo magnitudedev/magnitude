@@ -12,14 +12,14 @@ import {
   PlatformProvider,
   createAgentClient,
   AgentClientProvider,
-  injectCssVars,
+  initializeAppearance,
   createBrowserPlatform,
   stopDisplayViewController,
 } from "@magnitudedev/web"
 import "./styles/vars.css"
 import "./styles/globals.css"
 
-injectCssVars()
+initializeAppearance()
 
 const root = createRoot(document.getElementById("root")!)
 

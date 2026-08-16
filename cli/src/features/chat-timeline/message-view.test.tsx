@@ -3,12 +3,10 @@ import { describe, expect, it, vi } from 'vitest'
 import type { DisplayMessage } from '@magnitudedev/sdk'
 import { Option } from 'effect'
 import { MessageView } from './message-view'
+import { defaultCliThemes } from '../../utils/theme'
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({
-    foreground: 'white',
-    muted: 'gray',
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const summary = (durationMs: number): Extract<DisplayMessage, { type: 'work_summary' }> => ({

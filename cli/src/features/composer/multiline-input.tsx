@@ -10,6 +10,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import { useAnimationStep } from '../../hooks/use-animation-time'
 
@@ -31,7 +32,6 @@ import { useStableCallback } from '../../hooks/use-stable-callback'
 import { useTheme } from '../../hooks/use-theme'
 
 import { safeRenderableAccess, safeRenderableCall } from '../../utils/safe-renderable-access'
-import { terminalSupportsRgb24 } from '../../utils/theme'
 import { stepCursorVertical } from './multiline-input.helpers'
 
 import type {
@@ -44,10 +44,10 @@ import { decodeNativePasteText } from './paste-events'
 import { logger } from '@magnitudedev/logger'
 import type {
   KeyEvent,
+  CliRenderer,
   LineInfo,
   MouseEvent,
   ScrollBoxRenderable,
-  TextBufferView,
   TextRenderable,
 } from '@opentui/core'
 
@@ -103,6 +103,7 @@ function columnToCharOffsetInLine(
 }
 
 export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null): number[] {
+  const logicalLineStarts = computeLogicalLineStarts(text)
   if (
     !lineInfo ||
     !Array.isArray(lineInfo.lineSources) ||
@@ -110,11 +111,26 @@ export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null):
     lineInfo.lineSources.length === 0 ||
     lineInfo.lineStartCols.length === 0
   ) {
-    return computeLogicalLineStarts(text)
+    return logicalLineStarts
   }
 
-  const logicalLineStarts = computeLogicalLineStarts(text)
   const visualLineCount = Math.min(lineInfo.lineSources.length, lineInfo.lineStartCols.length)
+  const reportedSources = lineInfo.lineSources.slice(0, visualLineCount)
+  const lastLogicalLineIndex = logicalLineStarts.length - 1
+
+  // During a React commit, OpenTUI can briefly expose lineInfo for the previous
+  // text value. Never use it unless it covers exactly the current logical-line
+  // range; otherwise shrinking would render an empty composer at its old height.
+  if (
+    reportedSources.some(
+      (source) =>
+        !Number.isInteger(source) || source < 0 || source > lastLogicalLineIndex,
+    ) ||
+    reportedSources.at(-1) !== lastLogicalLineIndex
+  ) {
+    return logicalLineStarts
+  }
+
   const visualLineStarts: number[] = []
 
   for (let i = 0; i < visualLineCount; i++) {
@@ -144,6 +160,63 @@ export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null):
   }
 
   return visualLineStarts.length > 0 ? visualLineStarts : [0]
+}
+
+type TextLayoutStore = {
+  subscribe: (listener: () => void) => () => void
+  getSnapshot: () => number
+  setRenderable: (renderable: TextRenderable | null) => void
+}
+
+function lineInfoSignature(renderable: TextRenderable | null): string {
+  if (!renderable) return ''
+  const { lineSources, lineStartCols } = renderable.lineInfo
+  return `${lineSources.join(',')}|${lineStartCols.join(',')}`
+}
+
+function createTextLayoutStore(renderer: CliRenderer): TextLayoutStore {
+  const eventSource = renderer as Partial<Pick<CliRenderer, 'on' | 'off'>>
+  let renderable: TextRenderable | null = null
+  let revision = 0
+  let signature = ''
+  const listeners = new Set<() => void>()
+
+  const publish = () => {
+    revision += 1
+    for (const listener of listeners) listener()
+  }
+
+  const refresh = () => {
+    const nextSignature = lineInfoSignature(renderable)
+    if (signature === nextSignature) return
+    signature = nextSignature
+    publish()
+  }
+
+  return {
+    subscribe(listener) {
+      if (listeners.size === 0) eventSource.on?.('frame', refresh)
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+        if (listeners.size === 0) eventSource.off?.('frame', refresh)
+      }
+    },
+    getSnapshot: () => revision,
+    setRenderable(nextRenderable) {
+      if (renderable === nextRenderable) return
+
+      renderable?.off('line-info-change', refresh)
+      renderable = nextRenderable
+      renderable?.on('line-info-change', refresh)
+
+      if (!renderable) {
+        signature = ''
+        return
+      }
+      refresh()
+    },
+  }
 }
 
 function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
@@ -419,13 +492,29 @@ export const MultilineInput = forwardRef<
     },
     [cursorPosition],
   )
-
-
   const textRef = useRef<TextRenderable | null>(null)
+  const textLayoutStore = useMemo(() => createTextLayoutStore(renderer), [renderer])
+
+  // OpenTUI owns visual wrapping information. Subscribe to its layout signal so
+  // height and cursor scrolling are derived from the current lineInfo instead of
+  // waiting for an unrelated animation render.
+  useSyncExternalStore(
+    textLayoutStore.subscribe,
+    textLayoutStore.getSnapshot,
+    textLayoutStore.getSnapshot,
+  )
+
+  const setTextRenderable = useCallback(
+    (renderable: TextRenderable | null) => {
+      textRef.current = renderable
+      textLayoutStore.setRenderable(renderable)
+    },
+    [textLayoutStore],
+  )
 
   const lineInfo = safeRenderableAccess(
     textRef.current,
-    (el) => ((el satisfies TextRenderable as any).textBufferView as TextBufferView).lineInfo,
+    (el) => el.lineInfo,
     {
       mountedRef,
       fallback: null,
@@ -548,11 +637,10 @@ export const MultilineInput = forwardRef<
     const selection = safeRenderableAccess(
       textRef.current,
       (el) => {
-        const textBufferView = (el as any)?.textBufferView
-        if (!textBufferView?.hasSelection?.() || !textBufferView?.getSelection) {
+        if (!el.hasSelection()) {
           return null
         }
-        return textBufferView.getSelection()
+        return el.getSelection()
       },
       {
         mountedRef,
@@ -572,8 +660,8 @@ export const MultilineInput = forwardRef<
   // Helper to clear the current selection
   const dismissSelection = useCallback(() => {
     safeRenderableCall(
-      renderer as any,
-      (r) => r.clearSelection?.(),
+      renderer,
+      (r) => r.clearSelection(),
       { mountedRef },
     )
   }, [renderer, mountedRef])
@@ -728,8 +816,8 @@ export const MultilineInput = forwardRef<
         const renderableData = safeRenderableAccess(
           scrollBoxRef.current,
           (scrollBox) => ({
-            viewportTop: Number((scrollBox as any).viewport?.y ?? 0),
-            viewportLeft: Number((scrollBox as any).viewport?.x ?? 0),
+            viewportTop: scrollBox.viewport.y,
+            viewportLeft: scrollBox.viewport.x,
             scrollPosition: scrollBox.verticalScrollBar?.scrollPosition ?? 0,
           }),
           {
@@ -1496,7 +1584,7 @@ export const MultilineInput = forwardRef<
       // Read lineInfo inside the callback to get current value (not stale from closure)
       const currentLineInfo = safeRenderableAccess(
         textRef.current,
-        (el) => ((el as any).textBufferView as TextBufferView)?.lineInfo,
+        (el) => el.lineInfo,
         {
           mountedRef,
           fallback: null,
@@ -1974,13 +2062,13 @@ export const MultilineInput = forwardRef<
   })()
 
   const inputColor = isPlaceholder
-    ? theme.muted
+    ? theme.text.placeholder
     : focused
-      ? theme.inputFocusedFg
-      : theme.inputFg
+      ? theme.text.emphasized
+      : theme.text.body
 
   // Use theme's info color for selection highlight background (or custom override)
-  const highlightBg = highlightColor ?? theme.info
+  const highlightBg = highlightColor ?? theme.status.information
 
   return (
     <scrollbox
@@ -2005,7 +2093,7 @@ export const MultilineInput = forwardRef<
         rootOptions: {
           width: '100%',
           height: layoutMetrics.heightLines,
-          backgroundColor: 'transparent',
+          backgroundColor: theme.background.canvas,
           flexGrow: 0,
           flexShrink: 0,
         },
@@ -2020,8 +2108,8 @@ export const MultilineInput = forwardRef<
       }}
     >
       <text
-        ref={textRef}
-        style={{ bg: 'transparent', fg: inputColor, wrapMode: 'word' }}
+        ref={setTextRenderable}
+        style={{ bg: theme.background.canvas, fg: inputColor, wrapMode: 'word' }}
       >
         {isPlaceholder ? (
           <>
@@ -2031,7 +2119,7 @@ export const MultilineInput = forwardRef<
                 focused={focused}
                 shouldBlink={effectiveShouldBlinkCursor}
                 char={'▍'}
-                color={terminalSupportsRgb24() ? (highlightColor ?? theme.info) : 'cyan'}
+                color={highlightColor ?? theme.status.information}
                 activeChar={' '}
                 key={`placeholder-cursor-${lastActivity}`}
               />
@@ -2048,7 +2136,7 @@ export const MultilineInput = forwardRef<
 
               const pushCursor = (activeChar?: string) => {
                 if (!showRenderableCursor || cursorRendered) return
-                const cursorColor = terminalSupportsRgb24() ? (highlightColor ?? theme.info) : 'cyan'
+                const cursorColor = highlightColor ?? theme.status.information
                 const isBlockCursor =
         activeChar !== undefined &&
         activeChar !== ' ' &&
@@ -2111,7 +2199,7 @@ export const MultilineInput = forwardRef<
                   out.push(
                     <span
                       key={`p-${item.segment.id}`}
-                      fg={selectedPasteSegmentId === item.segment.id ? theme.link : theme.primary}
+                      fg={selectedPasteSegmentId === item.segment.id ? theme.link : theme.accent}
                       attributes={
                         selectedPasteSegmentId === item.segment.id
                           ? TextAttributes.BOLD
@@ -2125,7 +2213,7 @@ export const MultilineInput = forwardRef<
                   out.push(
                     <span
                       key={`m-${item.segment.id}`}
-                      fg={selectedMentionSegmentId === item.segment.id ? theme.link : theme.info}
+                      fg={selectedMentionSegmentId === item.segment.id ? theme.link : theme.status.information}
                       attributes={
                         selectedMentionSegmentId === item.segment.id
                           ? TextAttributes.BOLD

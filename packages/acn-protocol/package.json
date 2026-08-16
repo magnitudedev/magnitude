@@ -18,6 +18,7 @@
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@magnitudedev/ai": "workspace:*",
+    "@magnitudedev/icn-protocol": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "effect": "^3.21.2",
     "@effect/rpc": "0.75.1"

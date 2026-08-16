@@ -3,7 +3,7 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 
 import {
-  exactTargetTensorStorageBytes,
+  exactBundleTensorStorageBytes,
   localModelRecommendationFailure,
 } from "./local-model-recommendations"
 
@@ -21,13 +21,13 @@ describe("localModelRecommendationFailure", () => {
   })
 })
 
-describe("exactTargetTensorStorageBytes", () => {
+describe("exactBundleTensorStorageBytes", () => {
   const model = (files: readonly unknown[]) => ({
-    target: { _tag: "Package", package: { files } },
-  }) as Parameters<typeof exactTargetTensorStorageBytes>[0]
+    configuration: { bundle: { _tag: "Standalone", package: { files } } },
+  }) as Parameters<typeof exactBundleTensorStorageBytes>[0]
 
   it("sums exact tensor storage and deduplicates immutable content", () => {
-    expect(exactTargetTensorStorageBytes(model([
+    expect(exactBundleTensorStorageBytes(model([
       { role: "weights", sha256: "a", tensorStorageBytes: Option.some(10) },
       { role: "weights", sha256: "a", tensorStorageBytes: Option.some(10) },
       { role: "weights", sha256: "b", tensorStorageBytes: Option.some(15) },
@@ -36,7 +36,7 @@ describe("exactTargetTensorStorageBytes", () => {
   })
 
   it("declines to reject when any required component is unknown", () => {
-    expect(exactTargetTensorStorageBytes(model([
+    expect(exactBundleTensorStorageBytes(model([
       { role: "weights", sha256: "a", tensorStorageBytes: Option.some(10) },
       { role: "weights", sha256: "b", tensorStorageBytes: Option.none() },
     ]))).toEqual(Option.none())

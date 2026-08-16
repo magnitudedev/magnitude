@@ -45,6 +45,7 @@ export function DiffHunk({
       lineNum,
       prefix: ' ',
       text: line,
+      bg: theme.background.diffContext,
       dim: true,
     })
     lineNum++
@@ -58,7 +59,7 @@ export function DiffHunk({
       lineNum,
       prefix: '-',
       text: line,
-      bg: theme.diffRedBg,
+      bg: theme.background.diffRemoved,
     })
     lineNum++
   }
@@ -73,7 +74,7 @@ export function DiffHunk({
       lineNum,
       prefix: '+',
       text: line + (streamingCursor && isLast ? '▍' : ''),
-      bg: theme.diffGreenBg,
+      bg: theme.background.diffAdded,
     })
     lineNum++
   }
@@ -85,6 +86,7 @@ export function DiffHunk({
       lineNum,
       prefix: ' ',
       text: line,
+      bg: theme.background.diffContext,
       dim: true,
     })
     lineNum++
@@ -101,7 +103,7 @@ export function DiffHunk({
           }}
         >
           <text
-            style={{ fg: theme.foreground }}
+            style={{ fg: theme.text.body }}
             attributes={row.dim ? TextAttributes.DIM : undefined}
           >
             <span>{`${padLineNum(row.lineNum)} │ ${row.prefix} ${row.text}`}</span>

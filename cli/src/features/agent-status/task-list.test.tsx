@@ -3,12 +3,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
 import type { DisplayActor, DisplayWorkerStatus, TaskDisplayRow } from '@magnitudedev/sdk'
 import { Option } from 'effect'
-const testTheme = {
-  foreground: '#ffffff',
-  muted: '#888888',
-  success: '#00ff00',
-  border: '#444444',
-}
+import { defaultCliThemes } from '../../utils/theme'
+const testTheme = defaultCliThemes.dark
 
 vi.mock('@opentui/react', async () => {
   const actual = await vi.importActual<typeof import('@opentui/react')>('@opentui/react')
@@ -409,7 +405,7 @@ test('completed task keeps idle worker rendering', () => {
   vi.useRealTimers()
 })
 
-test('completed task text remains muted gray while checkmark stays green', () => {
+test('completed task text uses disabled text while checkmark stays successful', () => {
   const html = render(
     <TaskList
       tasks={[
@@ -423,9 +419,9 @@ test('completed task text remains muted gray while checkmark stays green', () =>
 />,
   )
 
-  expect(html).toContain('<text style="fg:#1f9670">✓ </text>')
-  expect(html).toContain('style="fg:#94a3b8">Completed task title</text>')
-  expect(html).not.toContain('style="fg:#1f9670">Completed task title</text>')
+  expect(html).toContain(`<text style="fg:${testTheme.status.success}">✓ </text>`)
+  expect(html).toContain(`style="fg:${testTheme.text.disabled}">Completed task title</text>`)
+  expect(html).not.toContain(`style="fg:${testTheme.status.success}">Completed task title</text>`)
 })
 
 test('renders killed worker with red kill icon glyph', () => {

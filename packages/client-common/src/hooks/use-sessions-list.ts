@@ -37,7 +37,7 @@ export function useSessionsList(params?: UseSessionsListParams): UseSessionsList
 
   const sessionsAtom = useMemo(
     () =>
-      client.query(
+      client.rpc.query(
         "ListSessions",
         {
           cwd: params?.cwd !== undefined ? Option.some(params.cwd) : Option.none(),

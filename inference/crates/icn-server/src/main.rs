@@ -15,31 +15,35 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType,
 };
 use icn_contracts::models::{
-    AssessModelResult, AssessModelsRequest, AssessModelsResponse, AssessmentEnvironmentId,
-    InstalledModelPackages as _, LoadModelReady, LoadModelRequest, MemoryAssessment,
-    ModelAssessment, ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile,
-    ModelAssessor, ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceId,
+    AssessModelRequest, AssessModelResult, AssessModelsRequest, AssessModelsResponse,
+    AssessmentEnvironmentId, InstalledModelPackages as _, LoadModelReady, LoadModelRequest,
+    MemoryAssessment, ModelAssessment, ModelAssessmentId,
+    ModelAssessmentProfile as DomainModelAssessmentProfile, ModelAssessor, ModelBundleInput,
+    ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceFailure, ModelInstanceId,
     ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadEvent,
-    ModelLoadPlan, ModelLoadStage, ModelOfferingTarget as DomainModelOfferingTarget,
-    ModelPackageId, ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
-    ModelServingConfigurationId, ModelStoppingAllocation, ModelTargetInput, PerformanceConfidence,
-    PerformanceEvidence, PreviewModelLoadRequest, RemoveInstalledModelPackageResponse,
-    ServingProfile as DomainServingProfile,
+    ModelLoadPlan, ModelLoadStage, ModelPackageId, ModelPackageOperand, ModelReleaseReason,
+    ModelServingConfiguration, ModelServingConfigurationId, ModelStoppingAllocation,
+    PerformanceConfidence, PerformanceEvidence, PreviewModelLoadRequest,
+    RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
+    SpeculativeDraftSource as ModelSpeculativeDraftSource, SpeculativeDraftSourceInput,
+    SpeculativeMethod,
 };
 use icn_contracts::{
-    CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
+    CacheType, CompletionBackend, ComponentRole, ExecutionIntent, GenerationPerformanceAssessment,
     HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
     ModelExecutionAssessment, ModelPreviewProfile, ResolvedModel, ResolvedModelAssessor,
-    TemplateAssessment, TemplateAssessor,
+    SpeculativeDecodingConfig, SpeculativeDraftSource, SpeculativeMethodConfig, TemplateAssessment,
+    TemplateAssessor,
 };
 use icn_engine::{
-    ModelLoadObserver, ModelPlanDefaults, MtpCandidateSelection, NativeBackend, execution_intent,
-    model_plan_defaults,
+    ModelLoadObserver, ModelPlanDefaults, NativeBackend, execution_intent, model_plan_defaults,
 };
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedModelDownloads, ModelCache, ModelManager, ReleaseCatalog,
-    ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog, offering_target_id,
+    InventoryConfig, ManagedCatalogModels, ManagedModelDownloads, ManagedModelStore, ModelCache,
+    ReleaseCatalog, ReleaseRecommendableCatalog, canonical_package_id, load_release_catalog,
+    servable_model_bundle_key, serving_configuration_id, serving_configuration_identity_is_valid,
+    speculative_servable_model_bundle_key,
 };
 use llama_cpp_2::model::params::fit::{
     FitCalibration as NativeHardwareCalibration,
@@ -103,9 +107,6 @@ enum Command {
         /// Magnitude-owned root for all disposable derived cache data.
         #[arg(long)]
         cache_root: Option<PathBuf>,
-        /// Additional read-only directories containing GGUF models.
-        #[arg(long = "model-source")]
-        model_sources: Vec<PathBuf>,
         /// Additional read-only Hugging Face hub cache roots.
         #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
         hf_caches: Vec<PathBuf>,
@@ -657,15 +658,14 @@ fn credit_replaced_instance_memory(
     mut sample: memory_supervisor::MemorySample,
     releasable_system_memory_bytes: u64,
 ) -> memory_supervisor::MemorySample {
-    sample.available_bytes = sample
-        .available_bytes
+    sample.physical_available_bytes = sample
+        .physical_available_bytes
         .saturating_add(releasable_system_memory_bytes)
-        .min(sample.total_bytes);
-    sample.available_commit_bytes = sample.available_commit_bytes.map(|available| {
-        available
-            .saturating_add(releasable_system_memory_bytes)
-            .min(sample.commit_limit_bytes.unwrap_or(u64::MAX))
-    });
+        .min(sample.physical_capacity_bytes);
+    sample.allocation_headroom_bytes = sample
+        .allocation_headroom_bytes
+        .saturating_add(releasable_system_memory_bytes)
+        .min(sample.allocation_capacity_bytes);
     sample
 }
 
@@ -714,7 +714,7 @@ type NativeAssessorServices = (
 );
 
 fn native_assessor_services(
-    inventory: &Arc<ModelManager>,
+    inventory: &Arc<ManagedModelStore>,
     planning_executor: PlanningExecutor,
     native_backend: NativeBackend,
     defaults: ModelPlanDefaults,
@@ -738,6 +738,7 @@ fn native_assessor_services(
 }
 
 const MAX_ASSESSMENT_ORCHESTRATION_CONCURRENCY: usize = 12;
+const ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN: u64 = 1536 * 1024 * 1024;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PlanningWorkerRequest {
@@ -745,7 +746,7 @@ struct PlanningWorkerRequest {
     hardware: HardwareSnapshot,
     primary: PathBuf,
     projector: Option<PathBuf>,
-    mtp: Vec<PathBuf>,
+    speculative: SpeculativeDecodingConfig,
     defaults: Vec<ModelPlanDefaults>,
     performance_context_tokens: Vec<Vec<u32>>,
     operation: PlanningOperation,
@@ -1333,10 +1334,20 @@ async fn discover_startup_hardware(
 ) -> Result<HardwareSnapshot, InventoryError> {
     let native_build = build_identity::native_build();
     spawn_blocking_traced(move || {
-        native_backend.discover_hardware(CapacityPolicy::default(), native_build, enabled_backends)
+        let snapshot = native_backend.discover_hardware(
+            CapacityPolicy::default(),
+            native_build,
+            enabled_backends,
+        );
+        let observation =
+            icn_hardware::observe_system_memory().map_err(InventoryError::Internal)?;
+        Ok(icn_hardware::with_system_memory_observation(
+            snapshot,
+            observation,
+        ))
     })
     .await
-    .map_err(|error| InventoryError::Internal(format!("hardware discovery task failed: {error}")))
+    .map_err(|error| InventoryError::Internal(format!("hardware discovery task failed: {error}")))?
 }
 
 async fn establish_hardware_calibration(
@@ -1452,8 +1463,15 @@ impl NativeResolvedModelAssessor {
         profiles: Vec<ModelPreviewProfile>,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         let hardware = HardwareProvider::snapshot(self).await?;
-        self.assess_resolved_capacity_plans_with_hardware(resolved, profiles, hardware)
-            .await
+        self.assess_resolved_capacity_plans_with_hardware(
+            resolved,
+            SpeculativeDecodingConfig::Disabled {
+                reason: "standalone_artifact_preview".to_owned(),
+            },
+            profiles,
+            hardware,
+        )
+        .await
     }
 
     async fn assess_resolved_execution_profiles(
@@ -1462,20 +1480,33 @@ impl NativeResolvedModelAssessor {
         profiles: Vec<ModelPreviewProfile>,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         let hardware = HardwareProvider::snapshot(self).await?;
-        self.assess_resolved_execution_plans_with_hardware(resolved, profiles, hardware)
-            .await
+        self.assess_resolved_execution_plans_with_hardware(
+            resolved,
+            SpeculativeDecodingConfig::Disabled {
+                reason: "standalone_artifact_preview".to_owned(),
+            },
+            profiles,
+            hardware,
+        )
+        .await
     }
 
     async fn assess_resolved_plans_cached(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         snapshot: &HardwareSnapshot,
         configuration_id: &ModelServingConfigurationId,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         let Some(cache) = self.cache.clone() else {
             return self
-                .assess_resolved_capacity_plans_with_hardware(resolved, profiles, snapshot.clone())
+                .assess_resolved_capacity_plans_with_hardware(
+                    resolved,
+                    speculative,
+                    profiles,
+                    snapshot.clone(),
+                )
                 .await;
         };
         let topology = icn_contracts::MemoryTopology::from_snapshot(snapshot).ok_or_else(|| {
@@ -1487,8 +1518,11 @@ impl NativeResolvedModelAssessor {
             .map(|profile| {
                 let planner_evidence =
                     self.capacity_assessment_cache_key(Some(&profile), snapshot)?;
-                let evidence = serde_json::to_string(&(&configuration_id.0, planner_evidence))
-                    .map_err(|error| InventoryError::Internal(error.to_string()))?;
+                let evidence = load_candidate_assessment_evidence(
+                    configuration_id,
+                    &speculative,
+                    &planner_evidence,
+                )?;
                 let assessment = cache.read_hardware_assessment(&content_id, &evidence, &topology);
                 Ok((profile, evidence, assessment))
             })
@@ -1529,6 +1563,7 @@ impl NativeResolvedModelAssessor {
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 let assessor = self.clone();
+                let task_speculative = speculative.clone();
                 let task_cache = cache.clone();
                 let task_content_id = content_id.clone();
                 let task_hardware = snapshot.clone();
@@ -1537,6 +1572,7 @@ impl NativeResolvedModelAssessor {
                     let measured = assessor
                         .assess_resolved_capacity_plans_with_hardware(
                             resolved,
+                            task_speculative,
                             missing
                                 .iter()
                                 .map(|(_, profile, _)| profile.clone())
@@ -1589,6 +1625,7 @@ impl NativeResolvedModelAssessor {
     async fn run_resolved_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         estimate_performance: bool,
         hardware: HardwareSnapshot,
@@ -1612,12 +1649,6 @@ impl NativeResolvedModelAssessor {
             .iter()
             .find(|component| component.role == ComponentRole::Projector)
             .map(|component| component.path.clone());
-        let mtp: Vec<PathBuf> = resolved
-            .components
-            .iter()
-            .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
-            .map(|component| component.path.clone())
-            .collect();
         let defaults = if profiles.is_empty() {
             vec![self.effective_defaults(None)]
         } else {
@@ -1647,7 +1678,7 @@ impl NativeResolvedModelAssessor {
             hardware,
             primary,
             projector,
-            mtp,
+            speculative,
             defaults,
             performance_context_tokens,
             operation: if estimate_performance {
@@ -1687,11 +1718,19 @@ impl NativeResolvedModelAssessor {
     async fn assess_resolved_capacity_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         hardware: HardwareSnapshot,
     ) -> Result<Vec<HardwareAssessment>, InventoryError> {
         match self
-            .run_resolved_plans_with_hardware(resolved, profiles, false, hardware, None)
+            .run_resolved_plans_with_hardware(
+                resolved,
+                speculative,
+                profiles,
+                false,
+                hardware,
+                None,
+            )
             .await?
         {
             PlanningWorkerResponse::Capacity { assessments } => Ok(assessments),
@@ -1704,11 +1743,12 @@ impl NativeResolvedModelAssessor {
     async fn assess_resolved_execution_plans_with_hardware(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         hardware: HardwareSnapshot,
     ) -> Result<Vec<ModelExecutionAssessment>, InventoryError> {
         match self
-            .run_resolved_plans_with_hardware(resolved, profiles, true, hardware, None)
+            .run_resolved_plans_with_hardware(resolved, speculative, profiles, true, hardware, None)
             .await?
         {
             PlanningWorkerResponse::Execution { assessments, .. } => Ok(assessments),
@@ -1721,6 +1761,7 @@ impl NativeResolvedModelAssessor {
     async fn assess_resolved_execution_plans_with_hardware_deadline(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profiles: Vec<ModelPreviewProfile>,
         hardware: HardwareSnapshot,
         deadline_at_ms: u64,
@@ -1728,6 +1769,7 @@ impl NativeResolvedModelAssessor {
         match self
             .run_resolved_plans_with_hardware(
                 resolved,
+                speculative,
                 profiles,
                 true,
                 hardware,
@@ -1785,8 +1827,17 @@ impl NativeResolvedModelAssessor {
     }
 }
 
+fn load_candidate_assessment_evidence(
+    configuration_id: &ModelServingConfigurationId,
+    speculative: &SpeculativeDecodingConfig,
+    planner_evidence: &str,
+) -> Result<String, InventoryError> {
+    serde_json::to_string(&(&configuration_id.0, speculative, planner_evidence))
+        .map_err(|error| InventoryError::Internal(error.to_string()))
+}
+
 struct NativeModelAssessor {
-    models: Arc<ModelManager>,
+    models: Arc<ManagedModelStore>,
     assessor: Arc<NativeResolvedModelAssessor>,
     release_catalog: Arc<ReleaseCatalog>,
 }
@@ -1800,7 +1851,7 @@ struct AssessmentEnvironment {
 
 impl NativeModelAssessor {
     fn new(
-        models: Arc<ModelManager>,
+        models: Arc<ManagedModelStore>,
         assessor: Arc<NativeResolvedModelAssessor>,
         release_catalog: Arc<ReleaseCatalog>,
     ) -> Self {
@@ -1811,17 +1862,15 @@ impl NativeModelAssessor {
         }
     }
 
-    async fn environment(
-        &self,
-        reserve_bytes: u64,
-    ) -> Result<AssessmentEnvironment, InventoryError> {
+    async fn environment(&self) -> Result<AssessmentEnvironment, InventoryError> {
         let snapshot = HardwareProvider::snapshot(self.assessor.as_ref()).await?;
-        let thresholds = icn_hardware::system_memory_thresholds(snapshot.system_memory.total_bytes);
+        let thresholds =
+            icn_hardware::system_memory_thresholds(snapshot.system_memory.physical_capacity_bytes);
         let snapshot = icn_hardware::with_capacity_policy(
             snapshot,
             CapacityPolicy {
-                reserve_bytes_per_domain: reserve_bytes,
-                system_reserve_bytes: Some(reserve_bytes.max(thresholds.assess_reserve_bytes)),
+                reserve_bytes_per_domain: ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
+                system_reserve_bytes: Some(thresholds.assess_reserve_bytes),
             },
         );
         let topology =
@@ -1839,11 +1888,10 @@ impl NativeModelAssessor {
             &snapshot.native_build,
             &snapshot.enabled_backends,
             &snapshot.topology_fingerprint,
-            reserve_bytes,
-            reserve_bytes.max(thresholds.assess_reserve_bytes),
-            snapshot.system_memory.total_bytes,
+            ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
+            thresholds.assess_reserve_bytes,
+            snapshot.system_memory.physical_capacity_bytes,
             snapshot.system_memory.assess_reserve_bytes,
-            snapshot.system_memory.warning_reserve_bytes,
             hardware_calibration_identity,
         ))
         .map_err(|error| InventoryError::Internal(error.to_string()))?;
@@ -1855,8 +1903,83 @@ impl NativeModelAssessor {
         })
     }
 
+    async fn assess_request(
+        &self,
+        item: AssessModelRequest,
+        environment: &AssessmentEnvironment,
+        release_catalog: Arc<ReleaseCatalog>,
+        deadline_at_ms: u64,
+    ) -> Result<AssessModelResult, InventoryError> {
+        let request_id = item.request_id;
+        let bundle_key = match bundle_input_key(&item.bundle) {
+            Ok(bundle_key) => bundle_key,
+            Err(message) => {
+                return Ok(AssessModelResult::InvalidBundle {
+                    request_id,
+                    failure: DomainModelFailure {
+                        code: "invalid_target".to_owned(),
+                        message,
+                        retryable: false,
+                    },
+                });
+            }
+        };
+        if let Err(message) = validate_model_assessment_profiles(&item.profiles) {
+            return Ok(AssessModelResult::InvalidBundle {
+                request_id,
+                failure: DomainModelFailure {
+                    code: "invalid_profiles".to_owned(),
+                    message,
+                    retryable: false,
+                },
+            });
+        }
+        let cached = self
+            .cached_profiles(&bundle_key, &item.profiles, environment)
+            .await?;
+        if let Some(profiles) = cached {
+            return Ok(AssessModelResult::Assessed {
+                request_id,
+                profiles,
+            });
+        }
+
+        let release_bundle_key = bundle_key.clone();
+        let release_bundle =
+            spawn_blocking_traced(move || release_catalog.resolve_bundle(&release_bundle_key))
+                .await
+                .map_err(|error| {
+                    InventoryError::Internal(format!(
+                        "release model preparation task failed for {}: {error}",
+                        bundle_key.0
+                    ))
+                })??;
+        let resolved = match release_bundle {
+            Some(resolved) => Ok(resolved),
+            None if bundle_uses_only_installed_packages(&item.bundle) => {
+                self.models.resolve_bundle(item.bundle).await
+            }
+            None => Err(InventoryError::InvalidRequest(format!(
+                "bundle {} is not installed or part of the release catalog",
+                bundle_key.0
+            ))),
+        };
+        match resolved {
+            Ok(resolved) => Ok(AssessModelResult::Assessed {
+                request_id,
+                profiles: self
+                    .assess_profiles(&resolved, &item.profiles, environment, deadline_at_ms)
+                    .await?,
+            }),
+            Err(error) => Ok(AssessModelResult::InvalidBundle {
+                request_id,
+                failure: assessment_bundle_failure(error)?,
+            }),
+        }
+    }
+
     fn resolved_for_planning(
-        resolved: &icn_contracts::models::ResolvedModelTarget,
+        resolved: &icn_contracts::models::ResolvedServableModelBundle,
     ) -> ResolvedModel {
         let mut target = resolved.target_model.clone();
         if let Some(draft) = &resolved.draft_model {
@@ -1870,11 +1993,79 @@ impl NativeModelAssessor {
         target
     }
 
+    fn speculative_config_for_resolved(
+        resolved: &icn_contracts::models::ResolvedServableModelBundle,
+    ) -> Result<SpeculativeDecodingConfig, InventoryError> {
+        let DomainServableModelBundle::SpeculativeDecoding {
+            draft_source,
+            method,
+            ..
+        } = &resolved.bundle
+        else {
+            return Ok(SpeculativeDecodingConfig::Disabled {
+                reason: "standalone_bundle".to_owned(),
+            });
+        };
+        let method = match method {
+            SpeculativeMethod::Mtp => SpeculativeMethodConfig::Mtp {
+                min_draft_probability: 0.0,
+            },
+            SpeculativeMethod::DFlash => SpeculativeMethodConfig::DFlash {
+                min_sample_probability: 0.0,
+            },
+            SpeculativeMethod::DSpark => SpeculativeMethodConfig::DSpark {
+                acceptance_threshold: 0.0,
+            },
+        };
+        let source = match draft_source {
+            ModelSpeculativeDraftSource::Embedded => {
+                if resolved.draft_model.is_some() {
+                    return Err(InventoryError::InvalidRequest(
+                        "embedded speculative bundle unexpectedly resolved a separate draft"
+                            .to_owned(),
+                    ));
+                }
+                SpeculativeDraftSource::Embedded
+            }
+            ModelSpeculativeDraftSource::Separate { .. } => {
+                let draft = resolved.draft_model.as_ref().ok_or_else(|| {
+                    InventoryError::NotReady(
+                        "separate speculative bundle did not resolve its draft package".to_owned(),
+                    )
+                })?;
+                let model_path = draft
+                    .components
+                    .iter()
+                    .filter(|component| {
+                        matches!(
+                            component.role,
+                            ComponentRole::Weights | ComponentRole::Shard
+                        )
+                    })
+                    .min_by_key(|component| component.shard_index.unwrap_or(0))
+                    .map(|component| component.path.clone())
+                    .ok_or_else(|| {
+                        InventoryError::NotReady(
+                            "separate speculative package has no runnable weights".to_owned(),
+                        )
+                    })?;
+                SpeculativeDraftSource::Separate { model_path }
+            }
+        };
+        Ok(SpeculativeDecodingConfig::Enabled {
+            source,
+            method,
+            n_max: 3,
+            n_min: 0,
+            cache_type_k: CacheType::F16,
+            cache_type_v: CacheType::F16,
+        })
+    }
+
     async fn assessment_evidence(
         &self,
-        target_id: &icn_contracts::models::ModelOfferingTargetId,
+        bundle_key: &icn_contracts::models::ServableModelBundleKey,
         profiles: &[DomainModelAssessmentProfile],
-        reserve_bytes: u64,
         environment: &AssessmentEnvironment,
     ) -> Result<Vec<String>, InventoryError> {
         let calibration_identity = NativeResolvedModelAssessor::hardware_calibration_identity(
@@ -1893,10 +2084,9 @@ impl NativeModelAssessor {
                     llama_cpp_2::model::params::fit::FIT_DECODE_WORKLOAD_METHOD,
                     &calibration_identity,
                     &environment.id.0,
-                    &target_id.0,
+                    &bundle_key.0,
                     defaults,
                     &profile.performance_context_tokens,
-                    reserve_bytes,
                 ))
                 .map_err(|error| InventoryError::Internal(error.to_string()))
             })
@@ -1905,13 +2095,12 @@ impl NativeModelAssessor {
 
     async fn cached_profiles(
         &self,
-        target_id: &icn_contracts::models::ModelOfferingTargetId,
+        bundle_key: &icn_contracts::models::ServableModelBundleKey,
         profiles: &[DomainModelAssessmentProfile],
-        reserve_bytes: u64,
         environment: &AssessmentEnvironment,
     ) -> Result<Option<Vec<ModelAssessment>>, InventoryError> {
         let evidence = self
-            .assessment_evidence(target_id, profiles, reserve_bytes, environment)
+            .assessment_evidence(bundle_key, profiles, environment)
             .await?;
         let results = evidence
             .iter()
@@ -1921,7 +2110,7 @@ impl NativeModelAssessor {
             })
             .collect::<Option<Vec<_>>>();
         tracing::info!(
-            target.id = %target_id.0,
+            target.id = %bundle_key.0,
             profile_count = profiles.len(),
             cache = if results.is_some() { "hit" } else { "partial_or_miss" },
             "model assessment cache checked"
@@ -1931,22 +2120,21 @@ impl NativeModelAssessor {
 
     async fn assess_profiles(
         &self,
-        resolved: &icn_contracts::models::ResolvedModelTarget,
+        resolved: &icn_contracts::models::ResolvedServableModelBundle,
         profiles: &[DomainModelAssessmentProfile],
-        reserve_bytes: u64,
         environment: &AssessmentEnvironment,
         deadline_at_ms: u64,
     ) -> Result<Vec<ModelAssessment>, InventoryError> {
         let hardware = &environment.snapshot;
-        let thresholds = icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes);
-        let system_reserve_bytes = reserve_bytes.max(thresholds.assess_reserve_bytes);
+        let thresholds =
+            icn_hardware::system_memory_thresholds(hardware.system_memory.physical_capacity_bytes);
         let evidence = self
-            .assessment_evidence(&resolved.target_id, profiles, reserve_bytes, environment)
+            .assessment_evidence(&resolved.bundle_key, profiles, environment)
             .await?;
         // Serialize misses for one immutable target in one assessment environment. The waiter
         // rechecks every exact profile key after admission, so overlapping requests reuse results
         // produced by the current owner instead of opening the same model concurrently.
-        let gate_key = serde_json::to_string(&(&resolved.target_id.0, &environment.id.0))
+        let gate_key = serde_json::to_string(&(&resolved.bundle_key.0, &environment.id.0))
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
         let gate = self
             .assessor
@@ -1971,7 +2159,7 @@ impl NativeModelAssessor {
                 .filter_map(|(index, assessment)| assessment.is_none().then_some(index))
                 .collect::<Vec<_>>();
             tracing::info!(
-                target.id = %resolved.target_id.0,
+                target.id = %resolved.bundle_key.0,
                 profile_count = profiles.len(),
                 missing_profile_count = missing.len(),
                 cache_hit_count = profiles.len().saturating_sub(missing.len()),
@@ -1995,6 +2183,7 @@ impl NativeModelAssessor {
             let assessed = assessor
                 .assess_resolved_execution_plans_with_hardware_deadline(
                     Self::resolved_for_planning(&resolved),
+                    Self::speculative_config_for_resolved(&resolved)?,
                     native_profiles,
                     environment.snapshot.clone(),
                     deadline_at_ms,
@@ -2007,12 +2196,12 @@ impl NativeModelAssessor {
             }
             for (index, assessment) in missing.into_iter().zip(assessed) {
                 let assessment = model_assessment(
-                    &resolved.target_id,
+                    &resolved.bundle_key,
+                    &resolved.bundle,
                     profiles[index].clone(),
                     &environment.id,
-                    reserve_bytes,
-                    system_reserve_bytes,
-                    thresholds.warning_reserve_bytes,
+                    ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
+                    thresholds.assess_reserve_bytes,
                     assessment,
                 )?;
                 models.write_model_assessment(&evidence[index], &assessment);
@@ -2036,32 +2225,27 @@ impl NativeModelAssessor {
     }
 }
 
-fn serving_configuration_id(
-    target_id: &icn_contracts::models::ModelOfferingTargetId,
-    profile: &DomainServingProfile,
-) -> ModelServingConfigurationId {
-    let mut digest = Sha256::new();
-    digest.update(target_id.0.as_bytes());
-    digest.update(profile.context_length.to_le_bytes());
-    ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
-}
-
 fn model_assessment(
-    target_id: &icn_contracts::models::ModelOfferingTargetId,
+    bundle_key: &icn_contracts::models::ServableModelBundleKey,
+    bundle: &DomainServableModelBundle,
     assessment_profile: DomainModelAssessmentProfile,
     environment_id: &AssessmentEnvironmentId,
     reserve_bytes: u64,
     system_reserve_bytes: u64,
-    warning_reserve_bytes: u64,
     assessment: ModelExecutionAssessment,
 ) -> Result<ModelAssessment, InventoryError> {
     let DomainModelAssessmentProfile {
         profile,
         performance_context_tokens,
     } = assessment_profile;
-    let configuration_id = serving_configuration_id(target_id, &profile);
+    let configuration_id = serving_configuration_id(bundle_key, &profile);
+    let configuration = ModelServingConfiguration {
+        id: configuration_id,
+        bundle: bundle.clone(),
+        profile: profile.clone(),
+    };
     let mut digest = Sha256::new();
-    digest.update(target_id.0.as_bytes());
+    digest.update(bundle_key.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
     digest.update(environment_id.0.as_bytes());
     digest.update(reserve_bytes.to_le_bytes());
@@ -2090,8 +2274,7 @@ fn model_assessment(
                 ));
             }
             Ok(ModelAssessment::Fits {
-                profile,
-                configuration_id,
+                configuration,
                 assessment_id,
                 memory: memory
                     .domains
@@ -2104,11 +2287,6 @@ fn model_assessment(
                         };
                         MemoryAssessment {
                             compatibility_reserve_bytes: domain_reserve,
-                            warning_reserve_bytes: if domain.memory_domain.is_system() {
-                                warning_reserve_bytes
-                            } else {
-                                domain_reserve
-                            },
                             memory_domain_id: domain.memory_domain,
                             capacity_bytes: domain
                                 .usable_capacity_bytes
@@ -2126,8 +2304,7 @@ fn model_assessment(
             limiting_resource,
             ..
         } => Ok(ModelAssessment::DoesNotFit {
-            profile,
-            configuration_id,
+            configuration,
             assessment_id,
             memory: memory
                 .domains
@@ -2140,11 +2317,6 @@ fn model_assessment(
                     };
                     MemoryAssessment {
                         compatibility_reserve_bytes: domain_reserve,
-                        warning_reserve_bytes: if domain.memory_domain.is_system() {
-                            warning_reserve_bytes
-                        } else {
-                            domain_reserve
-                        },
                         memory_domain_id: domain.memory_domain,
                         capacity_bytes: domain.usable_capacity_bytes.saturating_add(domain_reserve),
                         required_bytes: domain.required_bytes,
@@ -2157,8 +2329,7 @@ fn model_assessment(
         }),
         HardwareAssessment::InvalidArtifact { code, message } => {
             Ok(ModelAssessment::Incompatible {
-                profile,
-                configuration_id,
+                configuration,
                 failure: DomainModelFailure {
                     code,
                     message,
@@ -2168,8 +2339,7 @@ fn model_assessment(
         }
         HardwareAssessment::IncompatibleArtifact { code, message } => {
             Ok(ModelAssessment::Incompatible {
-                profile,
-                configuration_id,
+                configuration,
                 failure: DomainModelFailure {
                     code,
                     message,
@@ -2212,17 +2382,25 @@ fn package_operand_id(operand: &ModelPackageOperand) -> Result<&ModelPackageId, 
     }
 }
 
-fn target_input_id(
-    target: &ModelTargetInput,
-) -> Result<icn_contracts::models::ModelOfferingTargetId, String> {
-    match target {
-        ModelTargetInput::Package { package } => {
-            Ok(offering_target_id(&[package_operand_id(package)?]))
+fn bundle_input_key(
+    bundle: &ModelBundleInput,
+) -> Result<icn_contracts::models::ServableModelBundleKey, String> {
+    match bundle {
+        ModelBundleInput::Standalone { package } => {
+            Ok(servable_model_bundle_key(&[package_operand_id(package)?]))
         }
-        ModelTargetInput::SpeculativeDecodingPair { target, draft } => Ok(offering_target_id(&[
+        ModelBundleInput::SpeculativeDecoding {
+            target,
+            draft_source,
+            method,
+        } => Ok(speculative_servable_model_bundle_key(
             package_operand_id(target)?,
-            package_operand_id(draft)?,
-        ])),
+            match draft_source {
+                SpeculativeDraftSourceInput::Embedded => None,
+                SpeculativeDraftSourceInput::Separate { draft } => Some(package_operand_id(draft)?),
+            },
+            method,
+        )),
     }
 }
 
@@ -2251,19 +2429,28 @@ fn validate_model_assessment_profiles(
     Ok(())
 }
 
-fn target_uses_only_installed_packages(target: &ModelTargetInput) -> bool {
-    match target {
-        ModelTargetInput::Package { package } => {
+fn bundle_uses_only_installed_packages(bundle: &ModelBundleInput) -> bool {
+    match bundle {
+        ModelBundleInput::Standalone { package } => {
             matches!(package, ModelPackageOperand::Installed { .. })
         }
-        ModelTargetInput::SpeculativeDecodingPair { target, draft } => {
+        ModelBundleInput::SpeculativeDecoding {
+            target,
+            draft_source,
+            ..
+        } => {
             matches!(target, ModelPackageOperand::Installed { .. })
-                && matches!(draft, ModelPackageOperand::Installed { .. })
+                && match draft_source {
+                    SpeculativeDraftSourceInput::Embedded => true,
+                    SpeculativeDraftSourceInput::Separate { draft } => {
+                        matches!(draft, ModelPackageOperand::Installed { .. })
+                    }
+                }
         }
     }
 }
 
-fn assessment_target_failure(error: InventoryError) -> Result<DomainModelFailure, InventoryError> {
+fn assessment_bundle_failure(error: InventoryError) -> Result<DomainModelFailure, InventoryError> {
     match error {
         error @ (InventoryError::InvalidId(_)
         | InventoryError::InvalidRequest(_)
@@ -2285,6 +2472,42 @@ fn assessment_target_failure(error: InventoryError) -> Result<DomainModelFailure
     }
 }
 
+fn inventory_model_failure(error: InventoryError) -> DomainModelFailure {
+    let (code, retryable) = match &error {
+        InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
+        InventoryError::InvalidRequest(_) => ("invalid_request".to_owned(), false),
+        InventoryError::NotFound(_) => ("not_found".to_owned(), false),
+        InventoryError::NotReady(_) => ("not_ready".to_owned(), true),
+        InventoryError::Busy(_) => ("busy".to_owned(), true),
+        InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
+        InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
+        InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
+        InventoryError::Io(_) => ("io_failed".to_owned(), true),
+        InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
+        InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
+        InventoryError::ConcurrentMutation(_) => ("concurrent_mutation".to_owned(), true),
+        InventoryError::ModelOperation {
+            code, retryable, ..
+        } => (code.clone(), *retryable),
+        InventoryError::Internal(_) => ("internal".to_owned(), true),
+    };
+    DomainModelFailure {
+        code,
+        message: error.to_string(),
+        retryable,
+    }
+}
+
+fn failed_assessment_result(
+    request_id: icn_contracts::models::ModelAssessmentRequestId,
+    error: InventoryError,
+) -> AssessModelResult {
+    AssessModelResult::Failed {
+        request_id,
+        failure: inventory_model_failure(error),
+    }
+}
+
 impl ModelAssessor for NativeModelAssessor {
     fn assess(
         &self,
@@ -2295,111 +2518,34 @@ impl ModelAssessor for NativeModelAssessor {
             let deadline_at_ms = unix_time_millis()
                 .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
             tokio::time::timeout(remaining, async move {
-                let reserve_bytes = request
-                    .capacity_policy
-                    .required_reserve_bytes_per_memory_domain;
-                let environment = self.environment(reserve_bytes).await?;
+                let environment = self.environment().await?;
                 let release_catalog = Arc::clone(&self.release_catalog);
-                let evaluated = futures_util::stream::iter(
-                    request.requests.into_iter().enumerate(),
-                )
-                .map(|(index, item)| {
-                    let environment = environment.clone();
-                    let release_catalog = Arc::clone(&release_catalog);
-                    async move {
-                        let request_id = item.request_id;
-                        let target_id = match target_input_id(&item.target) {
-                            Ok(target_id) => target_id,
-                            Err(message) => {
-                                return Ok::<_, InventoryError>((
-                                    index,
-                                    AssessModelResult::InvalidTarget {
-                                        request_id,
-                                        failure: DomainModelFailure {
-                                            code: "invalid_target".to_owned(),
-                                            message,
-                                            retryable: false,
-                                        },
-                                    },
-                                ));
+                let evaluated =
+                    futures_util::stream::iter(request.requests.into_iter().enumerate())
+                        .map(|(index, item)| {
+                            let environment = environment.clone();
+                            let release_catalog = Arc::clone(&release_catalog);
+                            let failed_request_id = item.request_id.clone();
+                            async move {
+                                self.assess_request(
+                                    item,
+                                    &environment,
+                                    release_catalog,
+                                    deadline_at_ms,
+                                )
+                                .await
                             }
-                        };
-                        if let Err(message) = validate_model_assessment_profiles(&item.profiles) {
-                            return Ok((
-                                index,
-                                AssessModelResult::InvalidTarget {
-                                    request_id,
-                                    failure: DomainModelFailure {
-                                        code: "invalid_profiles".to_owned(),
-                                        message,
-                                        retryable: false,
-                                    },
-                                },
-                            ));
-                        }
-                        let cached = self
-                            .cached_profiles(
-                                &target_id,
-                                &item.profiles,
-                                reserve_bytes,
-                                &environment,
-                            )
-                            .await?;
-                        let result = if let Some(profiles) = cached {
-                            AssessModelResult::Assessed {
-                                request_id,
-                                target_id,
-                                profiles,
-                            }
-                        } else {
-                            let release_target_id = target_id.clone();
-                            let release_target = spawn_blocking_traced(move || {
-                                release_catalog.resolve_target(&release_target_id)
+                            .map(move |evaluated| {
+                                let result = evaluated.unwrap_or_else(|error| {
+                                    failed_assessment_result(failed_request_id, error)
+                                });
+                                (index, result)
                             })
-                            .await
-                            .map_err(|error| {
-                                InventoryError::Internal(format!(
-                                    "release model preparation task failed for {}: {error}",
-                                    target_id.0
-                                ))
-                            })??;
-                            let resolved = match release_target {
-                                Some(resolved) => Ok(resolved),
-                                None if target_uses_only_installed_packages(&item.target) => {
-                                    self.models.resolve_target(item.target).await
-                                }
-                                None => Err(InventoryError::InvalidRequest(format!(
-                                    "target {} is not installed or part of the release catalog",
-                                    target_id.0
-                                ))),
-                            };
-                            match resolved {
-                                Ok(resolved) => AssessModelResult::Assessed {
-                                    request_id,
-                                    target_id: resolved.target_id.clone(),
-                                    profiles: self
-                                        .assess_profiles(
-                                            &resolved,
-                                            &item.profiles,
-                                            reserve_bytes,
-                                            &environment,
-                                            deadline_at_ms,
-                                        )
-                                        .await?,
-                                },
-                                Err(error) => AssessModelResult::InvalidTarget {
-                                    request_id,
-                                    failure: assessment_target_failure(error)?,
-                                },
-                            }
-                        };
-                        Ok::<_, InventoryError>((index, result))
-                    }
-                })
-                .buffer_unordered(self.assessor.assessment_concurrency.concurrency())
-                .collect::<Vec<_>>()
-                .await;
-                let mut results = evaluated.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        })
+                        .buffer_unordered(self.assessor.assessment_concurrency.concurrency())
+                        .collect::<Vec<_>>()
+                        .await;
+                let mut results = evaluated;
                 results.sort_unstable_by_key(|(index, _)| *index);
                 Ok(AssessModelsResponse {
                     environment_id: environment.id,
@@ -2431,7 +2577,7 @@ fn assess_planning_request_with_backend(
         hardware,
         primary,
         projector,
-        mtp,
+        speculative,
         defaults,
         performance_context_tokens,
         operation,
@@ -2454,13 +2600,13 @@ fn assess_planning_request_with_backend(
                     if !matches!(base, HardwareAssessment::Fits { .. }) {
                         return Ok(base);
                     }
-                    plan.mtp = icn_mtp::select_mtp_with_backend(
-                        backend,
-                        plan,
-                        icn_mtp::CandidatePolicy::Automatic(&mtp),
-                    )
-                    .context("failed to select a native MTP configuration")?;
-                    if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
+                    plan.speculative = speculative.clone();
+                    plan.speculative = icn_speculative::preflight_with_backend(backend, plan)
+                        .context("failed to preflight the speculative bundle")?;
+                    if matches!(
+                        plan.speculative,
+                        icn_contracts::SpeculativeDecodingConfig::Disabled { .. }
+                    ) {
                         return Ok(base);
                     }
                     Ok(icn_hardware::assess_with_backend(backend, &topology, plan)?.assessment)
@@ -2491,13 +2637,13 @@ fn assess_planning_request_with_backend(
                 return Ok(base);
             };
             debug_assert!(matches!(base_hardware, HardwareAssessment::Fits { .. }));
-            plan.mtp = icn_mtp::select_mtp_with_backend(
-                backend,
-                plan,
-                icn_mtp::CandidatePolicy::Automatic(&mtp),
-            )
-            .context("failed to select a native MTP configuration")?;
-            if matches!(plan.mtp, icn_contracts::MtpConfig::Disabled { .. }) {
+            plan.speculative = speculative.clone();
+            plan.speculative = icn_speculative::preflight_with_backend(backend, plan)
+                .context("failed to preflight the speculative bundle")?;
+            if matches!(
+                plan.speculative,
+                icn_contracts::SpeculativeDecodingConfig::Disabled { .. }
+            ) {
                 return Ok(ModelExecutionAssessment::Executable {
                     hardware: base_hardware,
                     performance,
@@ -2505,8 +2651,8 @@ fn assess_planning_request_with_backend(
             }
             let hardware = icn_hardware::assess_with_backend(backend, &topology, plan)?.assessment;
             if matches!(hardware, HardwareAssessment::Fits { .. }) {
-                // Phase 1 intentionally estimates baseline target-model decode. MTP changes
-                // memory but is not credited with an unmeasured speculative-decoding speedup.
+                // Phase 1 intentionally estimates baseline target-model decode. Speculation
+                // changes memory but is not credited with an unmeasured speedup.
                 Ok(ModelExecutionAssessment::Executable {
                     hardware,
                     performance,
@@ -3173,14 +3319,19 @@ impl HardwareProvider for NativeResolvedModelAssessor {
             })
             .await
             .map_err(|error| InventoryError::Internal(error.to_string()))??;
-            Ok(snapshot)
+            let observation =
+                icn_hardware::observe_system_memory().map_err(InventoryError::Internal)?;
+            Ok(icn_hardware::with_system_memory_observation(
+                snapshot,
+                observation,
+            ))
         })
     }
 }
 
 #[derive(Clone)]
 struct NativeModelInstanceController {
-    inventory: Arc<ModelManager>,
+    inventory: Arc<ManagedModelStore>,
     assessor: Arc<NativeResolvedModelAssessor>,
     native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
     worker_launcher: NativeWorkerLauncher,
@@ -3238,18 +3389,112 @@ struct OwnedInferenceWorker {
 }
 
 #[derive(Clone)]
-struct ModelOperationFailure {
-    code: String,
-    message: String,
-    retryable: bool,
+enum ModelOperationFailure {
+    Operation {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    LowMemory {
+        message: String,
+        required_system_memory_bytes: u64,
+        allocation_headroom_bytes: u64,
+        system_reserve_bytes: u64,
+        load_boundary_bytes: u64,
+        minimum_additional_available_bytes: u64,
+        parallel_sequences: u32,
+    },
 }
 
 impl ModelOperationFailure {
     fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
-        Self {
+        Self::Operation {
             code: code.into(),
             message: message.into(),
             retryable,
+        }
+    }
+
+    fn low_memory(
+        sample: memory_supervisor::MemorySample,
+        required_system_memory_bytes: u64,
+        parallel_sequences: u32,
+    ) -> Self {
+        let system_reserve_bytes = sample.abort_reserve_bytes();
+        let load_boundary_bytes = required_system_memory_bytes.saturating_add(system_reserve_bytes);
+        let allocation_headroom_bytes = sample.allocation_headroom_bytes;
+        let minimum_additional_available_bytes = load_boundary_bytes
+            .saturating_sub(allocation_headroom_bytes)
+            .saturating_add(1);
+        let shortfall_unit = if minimum_additional_available_bytes == 1 {
+            "byte"
+        } else {
+            "bytes"
+        };
+        let message = format!(
+            "not enough memory available: model requires {required_system_memory_bytes} bytes plus {system_reserve_bytes} bytes reserved for the system; {allocation_headroom_bytes} bytes are available ({minimum_additional_available_bytes} {shortfall_unit} short)"
+        );
+        Self::LowMemory {
+            message,
+            required_system_memory_bytes,
+            allocation_headroom_bytes,
+            system_reserve_bytes,
+            load_boundary_bytes,
+            minimum_additional_available_bytes,
+            parallel_sequences,
+        }
+    }
+
+    fn code(&self) -> &str {
+        match self {
+            Self::Operation { code, .. } => code,
+            Self::LowMemory { .. } => LOW_MEMORY_FAILURE_CODE,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Operation { message, .. } | Self::LowMemory { message, .. } => message,
+        }
+    }
+
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Operation { retryable, .. } => *retryable,
+            Self::LowMemory { .. } => true,
+        }
+    }
+
+    fn into_instance_failure(self) -> ModelInstanceFailure {
+        match self {
+            Self::Operation {
+                code,
+                message,
+                retryable,
+            } => ModelInstanceFailure::Operation {
+                code,
+                message,
+                retryable,
+            },
+            Self::LowMemory {
+                message,
+                required_system_memory_bytes,
+                allocation_headroom_bytes,
+                system_reserve_bytes,
+                load_boundary_bytes,
+                minimum_additional_available_bytes,
+                parallel_sequences,
+            } => ModelInstanceFailure::LowMemory {
+                code: LOW_MEMORY_FAILURE_CODE.to_owned(),
+                message,
+                retryable: true,
+                required_system_memory_bytes,
+                allocation_headroom_bytes,
+                system_reserve_bytes,
+                load_boundary_bytes,
+                minimum_additional_available_bytes,
+                parallel_sequences,
+            },
         }
     }
 }
@@ -3323,34 +3568,8 @@ impl From<InventoryError> for ModelTransitionFailure {
 impl NativeModelInstanceController {
     const DISCONNECTED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-    fn load_failure(error: InventoryError) -> DomainModelFailure {
-        let (code, retryable) = match &error {
-            InventoryError::InvalidId(_) => ("invalid_id".to_owned(), false),
-            InventoryError::InvalidRequest(_) => ("invalid_request".to_owned(), false),
-            InventoryError::NotFound(_) => ("not_found".to_owned(), false),
-            InventoryError::NotReady(_) => ("not_ready".to_owned(), true),
-            InventoryError::Busy(_) => ("busy".to_owned(), true),
-            InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
-            InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
-            InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
-            InventoryError::Io(_) => ("io_failed".to_owned(), true),
-            InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
-            InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
-            InventoryError::ConcurrentMutation(_) => ("concurrent_mutation".to_owned(), true),
-            InventoryError::ModelOperation {
-                code, retryable, ..
-            } => (code.clone(), *retryable),
-            InventoryError::Internal(_) => ("internal".to_owned(), true),
-        };
-        DomainModelFailure {
-            code,
-            message: error.to_string(),
-            retryable,
-        }
-    }
-
     fn new(
-        inventory: Arc<ModelManager>,
+        inventory: Arc<ManagedModelStore>,
         assessor: Arc<NativeResolvedModelAssessor>,
         native_executor: Arc<RwLock<Option<Weak<RemoteBackend>>>>,
         worker_launcher: NativeWorkerLauncher,
@@ -3403,7 +3622,7 @@ impl NativeModelInstanceController {
         &self,
         instance_id: &ModelInstanceId,
         configuration_id: &ModelServingConfigurationId,
-        failure: DomainModelFailure,
+        failure: ModelInstanceFailure,
     ) {
         self.instances
             .publish(ModelInstance {
@@ -3565,33 +3784,59 @@ impl NativeModelInstanceController {
         (
             ResolvedModel,
             ExecutionIntent,
-            MtpCandidateSelection,
+            SpeculativeDecodingConfig,
             Vec<ModelPackageId>,
         ),
         InventoryError,
     > {
-        let (target, package_ids) = match &configuration.target {
-            DomainModelOfferingTarget::Package { package } => (
-                ModelTargetInput::Package {
+        if !serving_configuration_identity_is_valid(configuration) {
+            return Err(InventoryError::InvalidRequest(format!(
+                "configuration {} does not identify its exact bundle and profile",
+                configuration.id.0
+            )));
+        }
+        let (target, package_ids) = match &configuration.bundle {
+            DomainServableModelBundle::Standalone { package } => (
+                ModelBundleInput::Standalone {
                     package: ModelPackageOperand::Installed {
                         package_id: package.id.clone(),
                     },
                 },
                 vec![package.id.clone()],
             ),
-            DomainModelOfferingTarget::SpeculativeDecodingPair { target, draft, .. } => (
-                ModelTargetInput::SpeculativeDecodingPair {
+            DomainServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method,
+            } => (
+                ModelBundleInput::SpeculativeDecoding {
                     target: ModelPackageOperand::Installed {
                         package_id: target.id.clone(),
                     },
-                    draft: ModelPackageOperand::Installed {
-                        package_id: draft.id.clone(),
+                    draft_source: match draft_source {
+                        ModelSpeculativeDraftSource::Embedded => {
+                            SpeculativeDraftSourceInput::Embedded
+                        }
+                        ModelSpeculativeDraftSource::Separate { draft } => {
+                            SpeculativeDraftSourceInput::Separate {
+                                draft: ModelPackageOperand::Installed {
+                                    package_id: draft.id.clone(),
+                                },
+                            }
+                        }
                     },
+                    method: method.clone(),
                 },
-                vec![target.id.clone(), draft.id.clone()],
+                match draft_source {
+                    ModelSpeculativeDraftSource::Embedded => vec![target.id.clone()],
+                    ModelSpeculativeDraftSource::Separate { draft } => {
+                        vec![target.id.clone(), draft.id.clone()]
+                    }
+                },
             ),
         };
-        let resolved = self.inventory.resolve_target(target).await?;
+        let resolved = self.inventory.resolve_bundle(target).await?;
+        let speculative = NativeModelAssessor::speculative_config_for_resolved(&resolved)?;
         let mut model = resolved.target_model;
         if let Some(draft) = resolved.draft_model {
             model
@@ -3618,27 +3863,17 @@ impl NativeModelInstanceController {
             .iter()
             .find(|component| component.role == ComponentRole::Projector)
             .map(|component| component.path.clone());
-        let mtp = model
-            .components
-            .iter()
-            .filter(|component| matches!(component.role, ComponentRole::Mtp | ComponentRole::Draft))
-            .map(|component| component.path.clone())
-            .collect();
         let defaults = self.profile_defaults(&ModelExecutionProfile {
             context_length: configuration.profile.context_length,
         })?;
         let plan = execution_intent(primary, projector, &defaults);
-        Ok((
-            model,
-            plan,
-            MtpCandidateSelection::Automatic(mtp),
-            package_ids,
-        ))
+        Ok((model, plan, speculative, package_ids))
     }
 
     async fn assess_load_candidates(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profile: &ModelExecutionProfile,
         configuration_id: &ModelServingConfigurationId,
     ) -> Result<(Vec<(u32, u64)>, u64, HardwareSnapshot), ModelTransitionFailure> {
@@ -3647,7 +3882,7 @@ impl NativeModelInstanceController {
             .await
             .map_err(ModelTransitionFailure::from)?;
         let assess_reserve =
-            icn_hardware::system_memory_thresholds(hardware.system_memory.total_bytes)
+            icn_hardware::system_memory_thresholds(hardware.system_memory.physical_capacity_bytes)
                 .assess_reserve_bytes;
         let resident = self.instances.ready_instance().await;
         let releasable_system_memory_bytes = resident
@@ -3692,7 +3927,13 @@ impl NativeModelInstanceController {
         let hardware = icn_hardware::with_capacity_policy(hardware, capacity_policy);
         let assessments = self
             .assessor
-            .assess_resolved_plans_cached(resolved, profiles, &hardware, configuration_id)
+            .assess_resolved_plans_cached(
+                resolved,
+                speculative,
+                profiles,
+                &hardware,
+                configuration_id,
+            )
             .await
             .map_err(ModelTransitionFailure::from)?;
         let mut candidates = Vec::new();
@@ -3789,7 +4030,7 @@ impl NativeModelInstanceController {
                     id: resident.instance_id,
                     configuration_id: resident.configuration_id,
                     lifecycle: ModelInstanceLifecycle::Failed {
-                        failure: DomainModelFailure {
+                        failure: ModelInstanceFailure::Operation {
                             code: code.to_owned(),
                             message: reason.to_owned(),
                             retryable: true,
@@ -3920,10 +4161,9 @@ impl NativeModelInstanceController {
                             });
                             controller.block_memory_admission();
                             tracing::warn!(
-                                memory.available_bytes = sample.available_bytes,
+                                memory.physical_available_bytes = sample.physical_available_bytes,
+                                memory.allocation_headroom_bytes = sample.allocation_headroom_bytes,
                                 memory.reserve_bytes = sample.abort_reserve_bytes(),
-                                memory.available_commit_bytes = ?sample.available_commit_bytes,
-                                memory.commit_limit_bytes = ?sample.commit_limit_bytes,
                                 memory.sample_age_ms = sample.captured_at.elapsed().as_millis(),
                                 worker.resident_bytes = ?worker_resident_bytes,
                                 worker.pid = worker.pid(),
@@ -3991,6 +4231,7 @@ impl NativeModelInstanceController {
     async fn select_load_allocation(
         &self,
         resolved: ResolvedModel,
+        speculative: SpeculativeDecodingConfig,
         profile: &ModelExecutionProfile,
         configuration_id: &ModelServingConfigurationId,
     ) -> Result<(u32, u64, HardwareSnapshot), ModelTransitionFailure> {
@@ -4008,7 +4249,7 @@ impl NativeModelInstanceController {
             )));
         }
         let (candidates, releasable_system_memory_bytes, hardware) = self
-            .assess_load_candidates(resolved, profile, configuration_id)
+            .assess_load_candidates(resolved, speculative, profile, configuration_id)
             .await?;
         // Selection uses a fresh observation immediately after planning. Both preview and load
         // call this exact function; neither reconstructs parallelism from persisted assessments.
@@ -4045,15 +4286,9 @@ impl NativeModelInstanceController {
                 .first()
                 .map(|(_, required)| *required)
                 .unwrap_or_default();
-            return Err(ModelTransitionFailure::new(ModelOperationFailure::new(
-                LOW_MEMORY_FAILURE_CODE,
-                format!(
-                    "model requires at least {minimum_required} bytes of system memory at parallelism 1, but only {} bytes are available with a {} byte system reserve",
-                    sample.available_bytes,
-                    sample.abort_reserve_bytes()
-                ),
-                true,
-            )));
+            return Err(ModelTransitionFailure::new(
+                ModelOperationFailure::low_memory(sample, minimum_required, 1),
+            ));
         };
         Ok((selected.0, selected.1, hardware))
     }
@@ -4068,7 +4303,7 @@ impl NativeModelInstanceController {
         configuration: ModelServingConfiguration,
         resolved: ResolvedModel,
         mut plan: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: SpeculativeDecodingConfig,
         package_ids: Vec<ModelPackageId>,
         events: tokio::sync::mpsc::UnboundedSender<ModelLoadEvent>,
         instance_id: ModelInstanceId,
@@ -4136,7 +4371,12 @@ impl NativeModelInstanceController {
         }
 
         let (parallel_sequences, required_system_memory_bytes, hardware) = self
-            .select_load_allocation(resolved.clone(), &profile, &configuration_id)
+            .select_load_allocation(
+                resolved.clone(),
+                speculative.clone(),
+                &profile,
+                &configuration_id,
+            )
             .await?;
         if stop_requested.load(Ordering::Acquire) {
             return Err(ModelTransitionFailure::stopped());
@@ -4190,7 +4430,7 @@ impl NativeModelInstanceController {
             .install_worker(&instance_id, worker.clone())
             .await;
         self.supervise_worker(instance_id.clone(), worker.clone());
-        if let Err(error) = worker.start_load(model_id.clone(), plan, mtp_selection, hardware) {
+        if let Err(error) = worker.start_load(model_id.clone(), plan, speculative, hardware) {
             self.cleanup_owned_worker_under_mutation(
                 model_mutation,
                 &instance_id,
@@ -4669,16 +4909,16 @@ impl ModelInstanceController for NativeModelInstanceController {
             let profile = ModelExecutionProfile {
                 context_length: request.configuration.profile.context_length,
             };
-            let (resolved, plan, _, _) = self
+            let (resolved, plan, speculative, _) = self
                 .resolved_configuration_load(&request.configuration)
                 .await?;
             let (parallel_sequences, required_system_memory_bytes, _) = self
-                .select_load_allocation(resolved, &profile, &request.configuration.id)
+                .select_load_allocation(resolved, speculative, &profile, &request.configuration.id)
                 .await
                 .map_err(|failure| InventoryError::ModelOperation {
-                    code: failure.event.code,
-                    message: failure.event.message,
-                    retryable: failure.event.retryable,
+                    code: failure.event.code().to_owned(),
+                    message: failure.event.message().to_owned(),
+                    retryable: failure.event.retryable(),
                 })?;
             let physical_context_tokens = plan
                 .context_size
@@ -4710,7 +4950,9 @@ impl ModelInstanceController for NativeModelInstanceController {
             {
                 Ok(admission) => admission,
                 Err(failure) => {
-                    let _ = events.send(ModelLoadEvent::Failed { failure });
+                    let _ = events.send(ModelLoadEvent::Failed {
+                        failure: failure.into(),
+                    });
                     return;
                 }
             };
@@ -4752,7 +4994,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         None,
                     )
                     .await;
-                let (resolved, plan, mtp_selection, package_ids) = match controller
+                let (resolved, plan, speculative, package_ids) = match controller
                     .resolved_configuration_load(&configuration)
                     .await
                 {
@@ -4764,7 +5006,8 @@ impl ModelInstanceController for NativeModelInstanceController {
                                 .await;
                             send_stopped();
                         } else {
-                            let failure = Self::load_failure(error);
+                            let failure =
+                                ModelInstanceFailure::from(inventory_model_failure(error));
                             controller
                                 .publish_failed(&instance_id, &configuration_id, failure.clone())
                                 .await;
@@ -4786,7 +5029,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         configuration,
                         resolved,
                         plan,
-                        mtp_selection,
+                        speculative,
                         package_ids,
                         events.clone(),
                         instance_id.clone(),
@@ -4796,7 +5039,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                     .await
                 {
                     Ok(allocation) => allocation,
-                    Err(failure) if failure.event.code == "model_instance_stopped" => {
+                    Err(failure) if failure.event.code() == "model_instance_stopped" => {
                         controller
                             .publish_stopped_loading(&instance_id, &configuration_id)
                             .await;
@@ -4804,11 +5047,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         return;
                     }
                     Err(failure) => {
-                        let failure = DomainModelFailure {
-                            code: failure.event.code.to_owned(),
-                            message: failure.event.message,
-                            retryable: failure.event.retryable,
-                        };
+                        let failure = failure.event.into_instance_failure();
                         controller
                             .publish_failed(&instance_id, &configuration_id, failure.clone())
                             .await;
@@ -4869,7 +5108,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                         .publish_failed(
                             &instance_id,
                             &configuration_id,
-                            DomainModelFailure {
+                            ModelInstanceFailure::Operation {
                                 code: "model_instance_operation_panicked".to_owned(),
                                 message: "model instance operation panicked".to_owned(),
                                 retryable: true,
@@ -4997,6 +5236,19 @@ impl ModelInstanceController for NativeModelInstanceController {
                         configuration_id.0
                     ))
                 })
+        })
+    }
+}
+
+impl icn_contracts::models::CatalogPackageRemover for NativeModelInstanceController {
+    fn remove_catalog_package(
+        &self,
+        package_id: ModelPackageId,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        Box::pin(async move {
+            <Self as ModelInstanceController>::remove_installed(self, package_id)
+                .await
+                .map(|_| ())
         })
     }
 }
@@ -5131,7 +5383,6 @@ async fn main() -> anyhow::Result<()> {
             fake,
             model_store,
             cache_root,
-            model_sources,
             hf_caches,
             installation,
         } => {
@@ -5162,12 +5413,19 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut inventory_config = InventoryConfig::with_roots(inventory_root, cache_root)
                 .context("invalid model inventory configuration")?;
-            inventory_config.model_sources.extend(model_sources);
             inventory_config.hf_cache_dirs.extend(hf_caches);
+            let release_catalog = installation
+                .as_ref()
+                .map(open_installation_catalog)
+                .transpose()?
+                .map(Arc::new);
+            if let Some(catalog) = &release_catalog {
+                inventory_config.catalog_models = catalog.catalog().models.clone();
+            }
             let plan_defaults = model_plan_defaults();
             let native_backend = initialize_native_runtime(&runtime_authority)?;
             let inventory = Arc::new(
-                ModelManager::open_with_template_assessor(
+                ManagedModelStore::open_with_template_assessor(
                     inventory_config,
                     Some(Arc::new(NativeTemplateAssessor {
                         worker_launcher: worker_launcher.clone(),
@@ -5252,11 +5510,6 @@ async fn main() -> anyhow::Result<()> {
                 hardware_calibration,
                 enabled_backends,
             );
-            let release_catalog = installation
-                .as_ref()
-                .map(open_installation_catalog)
-                .transpose()?
-                .map(Arc::new);
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
                     .await
@@ -5288,9 +5541,17 @@ async fn main() -> anyhow::Result<()> {
             }
             .with_installed_packages(inventory.clone())
             .with_hardware(model_assessor.clone())
-            .with_model_downloads(model_downloads)
+            .with_model_downloads(model_downloads.clone())
             .with_identity(identity);
             if let Some(release_catalog) = release_catalog {
+                if let Some(model_controller) = &model_controller {
+                    state = state.with_catalog_models(ManagedCatalogModels::new(
+                        inventory.clone(),
+                        release_catalog.catalog().clone(),
+                        model_downloads,
+                        model_controller.clone(),
+                    )?);
+                }
                 state = state
                     .with_model_assessor(Arc::new(NativeModelAssessor::new(
                         inventory,
@@ -5422,14 +5683,14 @@ mod tests {
             retryable: false,
         });
 
-        assert_eq!(failure.event.code, "invalid_split_layout");
-        assert_eq!(failure.event.message, "the shard layout is invalid");
-        assert!(!failure.event.retryable);
+        assert_eq!(failure.event.code(), "invalid_split_layout");
+        assert_eq!(failure.event.message(), "the shard layout is invalid");
+        assert!(!failure.event.retryable());
     }
 
     #[test]
     fn stable_artifact_rejection_is_scoped_to_one_assessment_target() {
-        let failure = assessment_target_failure(InventoryError::ModelOperation {
+        let failure = assessment_bundle_failure(InventoryError::ModelOperation {
             code: "invalid_split_layout".to_owned(),
             message: "the shard layout is invalid".to_owned(),
             retryable: false,
@@ -5438,18 +5699,34 @@ mod tests {
         assert_eq!(failure.code, "invalid_split_layout");
         assert!(!failure.retryable);
 
-        let operational = assessment_target_failure(InventoryError::ModelOperation {
+        let operational = assessment_bundle_failure(InventoryError::ModelOperation {
             code: "planning_deadline".to_owned(),
             message: "planning timed out".to_owned(),
             retryable: true,
         })
-        .expect_err("operational failure remains endpoint-wide");
+        .expect_err("operational failure remains distinct from invalid input");
         assert!(matches!(
-            operational,
+            &operational,
             InventoryError::ModelOperation {
                 retryable: true,
                 ..
             }
+        ));
+
+        let result = failed_assessment_result(
+            icn_contracts::models::ModelAssessmentRequestId("request-failed".to_owned()),
+            operational,
+        );
+        assert!(matches!(
+            result,
+            AssessModelResult::Failed {
+                request_id,
+                failure: DomainModelFailure {
+                    code,
+                    retryable: true,
+                    ..
+                },
+            } if request_id.0 == "request-failed" && code == "planning_deadline"
         ));
     }
 
@@ -5462,9 +5739,10 @@ mod tests {
             cpu_model: Some("test-cpu".to_owned()),
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
-                total_bytes: 10,
-                current_available_bytes: 10,
-                warning_reserve_bytes: 0,
+                physical_capacity_bytes: 10,
+                physical_available_bytes: 10,
+                allocation_capacity_bytes: 10,
+                allocation_headroom_bytes: 10,
                 assess_reserve_bytes: 0,
                 abort_reserve_bytes: 0,
             },
@@ -5656,7 +5934,7 @@ mod tests {
             id: second_id,
             configuration_id: second_configuration,
             lifecycle: ModelInstanceLifecycle::Failed {
-                failure: DomainModelFailure {
+                failure: ModelInstanceFailure::Operation {
                     code: "test_failure".to_owned(),
                     message: "test failure".to_owned(),
                     retryable: false,
@@ -5755,14 +6033,43 @@ mod tests {
     }
 
     #[test]
+    fn load_candidate_cache_identity_requires_exact_speculative_configuration() {
+        let configuration_id = ModelServingConfigurationId("configuration-test".to_owned());
+        let disabled = SpeculativeDecodingConfig::Disabled {
+            reason: "standalone".to_owned(),
+        };
+        let enabled = SpeculativeDecodingConfig::Enabled {
+            source: icn_contracts::SpeculativeDraftSource::Embedded,
+            method: icn_contracts::SpeculativeMethodConfig::Mtp {
+                min_draft_probability: 0.0,
+            },
+            n_max: 3,
+            n_min: 0,
+            cache_type_k: icn_contracts::CacheType::F16,
+            cache_type_v: icn_contracts::CacheType::F16,
+        };
+
+        let disabled =
+            load_candidate_assessment_evidence(&configuration_id, &disabled, "planner-evidence")
+                .unwrap();
+        let enabled =
+            load_candidate_assessment_evidence(&configuration_id, &enabled, "planner-evidence")
+                .unwrap();
+
+        assert_ne!(disabled, enabled);
+        assert!(enabled.contains("embedded"));
+        assert!(enabled.contains("\"n_max\":3"));
+    }
+
+    #[test]
     fn load_allocation_descends_to_the_highest_freshly_permitted_parallelism() {
         let gib = 1024 * 1024 * 1024;
         let sample = memory_supervisor::MemorySample {
             captured_at: std::time::Instant::now(),
-            total_bytes: 16 * gib,
-            available_bytes: 7 * gib,
-            commit_limit_bytes: None,
-            available_commit_bytes: None,
+            physical_capacity_bytes: 16 * gib,
+            physical_available_bytes: 7 * gib,
+            allocation_capacity_bytes: 16 * gib,
+            allocation_headroom_bytes: 7 * gib,
         };
 
         assert_eq!(
@@ -5772,20 +6079,52 @@ mod tests {
     }
 
     #[test]
+    fn low_memory_failure_preserves_attempt_arithmetic() {
+        let gib = 1024 * 1024 * 1024;
+        let sample = memory_supervisor::MemorySample {
+            captured_at: std::time::Instant::now(),
+            physical_capacity_bytes: 16 * gib,
+            physical_available_bytes: 7 * gib,
+            allocation_capacity_bytes: 16 * gib,
+            allocation_headroom_bytes: 7 * gib,
+        };
+
+        assert_eq!(
+            ModelOperationFailure::low_memory(sample, 6 * gib, 1).into_instance_failure(),
+            ModelInstanceFailure::LowMemory {
+                code: LOW_MEMORY_FAILURE_CODE.to_owned(),
+                message: format!(
+                    "not enough memory available: model requires {} bytes plus {} bytes reserved for the system; {} bytes are available (1 byte short)",
+                    6 * gib,
+                    gib,
+                    7 * gib,
+                ),
+                retryable: true,
+                required_system_memory_bytes: 6 * gib,
+                allocation_headroom_bytes: 7 * gib,
+                system_reserve_bytes: gib,
+                load_boundary_bytes: 7 * gib,
+                minimum_additional_available_bytes: 1,
+                parallel_sequences: 1,
+            }
+        );
+    }
+
+    #[test]
     fn replacement_preview_credits_only_memory_the_current_residency_will_release() {
         let gib = 1024 * 1024 * 1024;
         let sample = memory_supervisor::MemorySample {
             captured_at: std::time::Instant::now(),
-            total_bytes: 16 * gib,
-            available_bytes: 3 * gib,
-            commit_limit_bytes: Some(20 * gib),
-            available_commit_bytes: Some(4 * gib),
+            physical_capacity_bytes: 16 * gib,
+            physical_available_bytes: 3 * gib,
+            allocation_capacity_bytes: 20 * gib,
+            allocation_headroom_bytes: 4 * gib,
         };
 
         assert_eq!(select_model_allocation(&[(1, 4 * gib)], sample), None);
         let credited = credit_replaced_instance_memory(sample, 3 * gib);
-        assert_eq!(credited.available_bytes, 6 * gib);
-        assert_eq!(credited.available_commit_bytes, Some(7 * gib));
+        assert_eq!(credited.physical_available_bytes, 6 * gib);
+        assert_eq!(credited.allocation_headroom_bytes, 7 * gib);
         assert_eq!(
             select_model_allocation(&[(1, 4 * gib)], credited),
             Some((1, 4 * gib))
@@ -6085,9 +6424,10 @@ mod tests {
             cpu_model: None,
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
-                total_bytes: 10,
-                current_available_bytes: 10,
-                warning_reserve_bytes: 0,
+                physical_capacity_bytes: 10,
+                physical_available_bytes: 10,
+                allocation_capacity_bytes: 10,
+                allocation_headroom_bytes: 10,
                 assess_reserve_bytes: 0,
                 abort_reserve_bytes: 0,
             },
@@ -6136,7 +6476,10 @@ mod tests {
         availability_only_change.captured_at = 2;
         availability_only_change
             .system_memory
-            .current_available_bytes = 0;
+            .physical_available_bytes = 0;
+        availability_only_change
+            .system_memory
+            .allocation_headroom_bytes = 0;
         assert_eq!(
             assessor
                 .capacity_assessment_cache_key(Some(&equivalent_preview), &snapshot)
@@ -6255,15 +6598,26 @@ mod tests {
         };
 
         for fixture in fixtures {
-            let store = tempfile::tempdir().expect("temporary model store");
+            let store =
+                tempfile::tempdir_in(inference_root.join("target")).expect("temporary model store");
             let mut config = InventoryConfig::with_roots(
                 store.path().join("inventory"),
                 store.path().join("cache"),
             )
             .expect("inventory config");
-            config.model_sources = vec![fixture.parent().expect("fixture parent").to_path_buf()];
-            config.hf_cache_dirs.clear();
-            let manager = ModelManager::open_with_template_assessor(
+            let hf_cache = store.path().join("hf-cache");
+            let snapshot = hf_cache
+                .join("models--test--parity")
+                .join("snapshots")
+                .join("0123456789abcdef");
+            std::fs::create_dir_all(&snapshot).expect("create Hugging Face cache snapshot");
+            std::fs::hard_link(
+                &fixture,
+                snapshot.join(fixture.file_name().expect("fixture filename")),
+            )
+            .expect("link parity fixture into Hugging Face cache");
+            config.hf_cache_dirs.push(hf_cache);
+            let manager = ManagedModelStore::open_with_template_assessor(
                 config,
                 Some(Arc::new(NativeTemplateAssessor {
                     worker_launcher: NativeWorkerLauncher::development(),

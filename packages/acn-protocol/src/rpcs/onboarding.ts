@@ -9,8 +9,8 @@ export const OnboardingMirror = defineMirroredState("GetOnboardingState", {
   errorSchema: OnboardingError,
 })
 
-export const UpdateOnboardingState = Rpc.make("UpdateOnboardingState", {
-  payload: Schema.Struct({ completed: Schema.Boolean }),
+export const CompleteOnboarding = Rpc.make("CompleteOnboarding", {
+  payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: OnboardingError,
 })

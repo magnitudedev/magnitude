@@ -25,20 +25,23 @@ import {
   useDisplayViewController,
   type CommandContext,
   reasoningEffortControl,
+  formatReasoningEffort,
   selectedSlotModel,
   useModelConfig,
   useLocalModels,
   useModelSlots,
+  useModelSlotActions,
+  pushNotificationAtom,
+  type NotificationState,
 } from '@magnitudedev/client-common'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
-import { addEphemeralMessage } from '@magnitudedev/client-common'
-import { Option } from 'effect'
+import { Cause, Exit, Option } from 'effect'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
 import { useTheme } from '../../hooks/use-theme'
 import { INIT_PROMPT } from '../../commands/init-prompt'
 import { Composer } from './composer'
-import { allowProviderMessageSend } from './provider-send-guard'
+import { allowModelMessageSend } from './provider-send-guard'
 
 export function ComposerContainer({
   chatColumnWidth,
@@ -48,6 +51,8 @@ export function ComposerContainer({
   modelsConfigured,
   modelSetupInProgress,
   modelSetupPlaceholder,
+  notificationState,
+  openSetup,
 }: {
   chatColumnWidth: number
   clientWorkingDirectory: string
@@ -56,6 +61,8 @@ export function ComposerContainer({
   modelsConfigured: boolean
   modelSetupInProgress: boolean
   modelSetupPlaceholder: string | null
+  notificationState: NotificationState | null
+  openSetup: () => void
 }): ReactNode {
   const theme = useTheme()
   const sessionId = useSelectedSessionId()
@@ -72,9 +79,34 @@ export function ComposerContainer({
   const usageOpen = useAtomValue(usageOpenAtom)
   const { startNewSession } = useSessionActions()
 
+  const pushNotification = useAtomSet(pushNotificationAtom)
   const showErrorToast = useCallback((message: string) => {
-    addEphemeralMessage(message, theme.error)
-  }, [theme.error])
+    pushNotification({
+      message,
+      priority: 'error',
+      action: Option.none(),
+      dismissAfterMilliseconds: 5_000,
+    })
+  }, [pushNotification])
+  const { rootRoleLabel, rootProfile, rootSlotId } = useSlotProfiles()
+  const localSlots = useModelSlots()
+  const slotActions = useModelSlotActions()
+  const modelSlotsState = Result.match(localSlots, {
+    onInitial: () => null,
+    onFailure: () => null,
+    onSuccess: ({ value }) => value,
+  })
+  const controlSelectedModel = useCallback((command: 'load' | 'stop') => {
+    const result = command === 'load'
+      ? slotActions.load(rootSlotId)
+      : slotActions.stop(rootSlotId)
+    void result.then((exit) => {
+      if (Exit.isFailure(exit)) {
+        const error = Cause.squash(exit.cause)
+        showErrorToast(error instanceof Error ? error.message : String(error))
+      }
+    })
+  }, [rootSlotId, showErrorToast, slotActions])
 
   // Slash commands may trigger a send (skills, /init) — the hook that owns
   // sending is constructed with this context, so route through a ref.
@@ -95,30 +127,25 @@ export function ComposerContainer({
     initProject: () => { void sendRef.current(INIT_PROMPT) },
     openSettings: () => setMenu({ open: true, root: 'models' }),
     openModelMenu: (root) => setMenu({ open: true, root }),
+    controlSelectedModel,
     toggleTranscript: togglePresentationMode,
     openUsage: () => setUsageOpen(true),
+    openSetup,
     openCloud: () => setMenu({ open: true, root: 'cloud' }),
     toggleAutopilot: () => { /* disabled */ },
-  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, togglePresentationMode])
+  }), [startNewSession, setShowRecentChats, setBashMode, setMenu, setUsageOpen, openSetup, togglePresentationMode, controlSelectedModel])
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => {
     if (modelSetupInProgress) return
-    if (!allowProviderMessageSend(modelsConfigured, showErrorToast)) return
+    if (!allowModelMessageSend(modelsConfigured, showErrorToast)) return
     composer.handleSend(text)
   }
 
   const { interrupt, interruptAll } = useInterruptActions()
-  const { rootRoleLabel, rootProfile, rootSlotId } = useSlotProfiles()
   const modelConfig = useModelConfig()
   const localModels = useLocalModels()
-  const localSlots = useModelSlots()
   const localModelsState = Result.match(localModels, {
-    onInitial: () => null,
-    onFailure: () => null,
-    onSuccess: ({ value }) => value,
-  })
-  const modelSlotsState = Result.match(localSlots, {
     onInitial: () => null,
     onFailure: () => null,
     onSuccess: ({ value }) => value,
@@ -189,7 +216,7 @@ export function ComposerContainer({
         role: rootRoleLabel,
         model: composer.model || '-',
         thinkingLevel: rootProfile?.reasoningEffort
-          ? rootProfile.reasoningEffort.charAt(0).toUpperCase() + rootProfile.reasoningEffort.slice(1)
+          ? formatReasoningEffort(rootProfile.reasoningEffort)
           : '-',
       }}
       localModels={localModelsState}
@@ -201,12 +228,13 @@ export function ComposerContainer({
       isCompacting={isCompacting}
       displayMode={displayMode}
       theme={theme}
-      modeColor={theme.modeDefault}
+      modeColor={theme.accent}
       chatColumnWidth={chatColumnWidth}
       attachmentsMaxWidth={attachmentsMaxWidth}
       composerCanFocus={composerCanFocus}
       widgetNavActive={widgetNavActive}
       isWorkerView={false}
+      notificationState={notificationState}
       enableAutopilot={false}
       autopilotEnabled={false}
       autopilotGenerating={false}
@@ -218,12 +246,13 @@ export function ComposerContainer({
       interruptAll={interruptAll}
       openSettings={() => setMenu({ open: true, root: 'models' })}
       openHardware={() => setMenu({ open: true, root: 'hardware' })}
+      openCatalog={() => setMenu({ open: true, root: 'catalog' })}
       thinkingOptions={thinkingOptions}
       applyThinking={applyThinking}
       handleWidgetKeyEvent={handleWidgetKeyEvent}
       enterBashMode={() => setBashMode(true)}
       exitBashMode={() => setBashMode(false)}
-      showToast={(message: string) => addEphemeralMessage(message, theme.error)}
+      showToast={showErrorToast}
       toggleAutopilot={() => { /* disabled */ }}
       displayMessages={displayMessages}
       selectedForkId={null}

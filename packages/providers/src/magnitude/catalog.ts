@@ -37,7 +37,7 @@ export function toMagnitudeModelInfo(raw: MagnitudeRawModel): MagnitudeModelWith
       }),
     },
     availability: AVAILABLE_PROVIDER_MODEL,
-    pricing: Option.getOrElse(raw.pricing, () => ({ input: 0, output: 0, cached_input: null })),
+    pricing: raw.pricing,
     object: raw.object,
     owned_by: raw.owned_by,
     roles: raw.roles,

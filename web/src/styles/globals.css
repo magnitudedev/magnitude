@@ -38,6 +38,11 @@ textarea::placeholder {
   --border-sidebar: rgba(30, 41, 59, 0.68);
 }
 
+:root[data-theme="light"][data-desktop-platform="darwin"] {
+  --bg-sidebar-window: rgba(248, 250, 252, 0.88);
+  --border-sidebar: rgba(203, 213, 225, 0.72);
+}
+
 :root[data-desktop-platform="darwin"],
 :root[data-desktop-platform="darwin"] body,
 :root[data-desktop-platform="darwin"] #root {
@@ -270,6 +275,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .settings-page, .model-center-view { max-width: 1100px; width: 100%; margin: 0 auto; padding: 24px clamp(16px, 4vw, 44px) 64px; box-sizing: border-box; }
 .settings-section { padding: 22px; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 10px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .settings-section-heading { display: flex; align-items: flex-start; gap: 12px; }
+.settings-control { display: flex; align-items: center; gap: 10px; color: var(--fg-secondary); font-size: 13px; }
+.settings-control select { min-width: 132px; }
 .settings-section h2, .model-section h2, .hardware-hero h2, .preparation-panel h2 { color: var(--fg-primary); font-size: 17px; margin: 0 0 5px; }
 .settings-section p, .section-heading p, .hardware-hero p, .preparation-panel p { color: var(--fg-secondary); margin: 0; font-size: 13px; line-height: 1.5; }
 

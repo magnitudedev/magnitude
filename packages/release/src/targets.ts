@@ -7,6 +7,8 @@ export type HostId =
 
 export type Backend = "cpu" | "metal" | "cuda" | "vulkan"
 
+export const MACOS_DEPLOYMENT_TARGET = "13.0" as const
+
 export interface ReleaseHost {
   readonly id: HostId
   readonly runner: string
@@ -160,6 +162,16 @@ export const hostById = (id: HostId): ReleaseHost => {
   if (!host) throw new Error(`Unknown release host ${id}`)
   return host
 }
+
+export const releaseBuildEnvironment = (
+  host: ReleaseHost,
+): Readonly<Record<string, string>> =>
+  host.id.startsWith("darwin-")
+    ? {
+      MACOSX_DEPLOYMENT_TARGET: MACOS_DEPLOYMENT_TARGET,
+      CMAKE_OSX_DEPLOYMENT_TARGET: MACOS_DEPLOYMENT_TARGET,
+    }
+    : {}
 
 export const cliArchive = (host: HostId) => `magnitude-cli-${host}.tar.gz`
 export const acnArchive = (host: HostId) => `magnitude-acn-${host}.tar.gz`

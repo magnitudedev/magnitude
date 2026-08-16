@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "Your agent, running on local models",
+    "description": "The open source agent with local models built in",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"
@@ -38,9 +38,8 @@
             }
         ],
         "primary": {
-            "type": "button",
-            "label": "Get started",
-            "href": "/get-started"
+            "type": "github",
+            "href": "https://github.com/magnitudedev/magnitude"
         }
     },
     "navigation": {
@@ -66,11 +65,13 @@
         "pages": [
             "why-magnitude",
             "get-started",
-            "skills",
             "models",
+            "custom-endpoints",
             "inference-engine",
+            "skills",
             "reference",
-            "troubleshooting"
+            "troubleshooting",
+            "faq"
         ]
     },
     "styling": {

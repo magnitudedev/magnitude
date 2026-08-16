@@ -17,4 +17,20 @@ describe('deriveVisualLineStarts', () => {
       deriveVisualLineStarts('a\nb', { lineSources: [0] as number[], lineStartCols: [] as number[] } as any),
     ).toEqual([0, 2])
   })
+
+  test('ignores lineInfo that still describes the previous text value', () => {
+    expect(
+      deriveVisualLineStarts('', {
+        lineSources: [0, 1, 2, 3, 4],
+        lineStartCols: [0, 0, 0, 0, 0],
+      } as any),
+    ).toEqual([0])
+
+    expect(
+      deriveVisualLineStarts('one\ntwo', {
+        lineSources: [0],
+        lineStartCols: [0],
+      } as any),
+    ).toEqual([0, 4])
+  })
 })

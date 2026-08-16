@@ -1,10 +1,11 @@
-import { Projection, type WorkerReadFn } from '@magnitudedev/event-core'
-import { Effect, Schema } from 'effect'
+import { Projection } from '@magnitudedev/event-core'
+import { Effect, Option, Schema, Stream } from 'effect'
 import type { Toolkit } from '@magnitudedev/harness'
 import type { AppEvent } from '../events'
 import {
   ConfigAmbient,
   ConfigStateSchema,
+  getSlotStateForRole,
   sameConfigStateValue,
   type ConfigState,
 } from '../ambient/config-ambient'
@@ -17,6 +18,7 @@ import {
 import { AgentLifecycleProjection } from './agent-lifecycle'
 import { getForkInfo } from '../agents/registry'
 import { selectAgentToolKeys } from '../tools/toolkits'
+import type { RoleId } from '../agents/role-validation'
 
 export const AgentToolkitStateSchema = Schema.Struct({
   config: Schema.NullOr(ConfigStateSchema),
@@ -145,14 +147,25 @@ export const AgentToolkitProjection = Projection.defineForked<AppEvent>()({
   ] as const),
 })
 
-export function readCoherentAgentToolkit(
-  read: WorkerReadFn<AppEvent>,
+export function awaitSettledAgentToolkit(
   forkId: string | null,
-): Effect.Effect<{ readonly config: ConfigState; readonly toolkit: AgentToolkitState }> {
-  return Effect.suspend(() => Effect.gen(function* () {
-    const toolkit = yield* read(AgentToolkitProjection, forkId)
-    if (toolkit.config !== null) return { config: toolkit.config, toolkit }
-    yield* Effect.yieldNow()
-    return yield* readCoherentAgentToolkit(read, forkId)
-  }))
+  roleId: RoleId,
+) {
+  return Effect.gen(function* () {
+    const projection = yield* AgentToolkitProjection.Tag
+    return yield* projection.changesForFork(forkId).pipe(
+      Stream.filterMap((toolkit) => {
+        if (toolkit.config === null) return Option.none()
+        const slot = getSlotStateForRole(toolkit.config, roleId)
+        return slot._tag === 'Pending'
+          ? Option.none()
+          : Option.some({ slot, toolkit })
+      }),
+      Stream.runHead,
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.dieMessage('Agent toolkit observation ended before model configuration settled'),
+        onSome: Effect.succeed,
+      })),
+    )
+  })
 }

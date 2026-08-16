@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use crate::{DownloadStage, InventoryError, ResolvedModel};
+use crate::{DownloadFailure, DownloadStage, InventoryError, ResolvedModel};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -18,14 +18,14 @@ macro_rules! string_id {
 
 string_id!(ModelFileId);
 string_id!(ModelPackageId);
-string_id!(DownloadAttemptId);
-string_id!(SpeculativeDecodingPairId);
+string_id!(ModelDownloadId);
 string_id!(ModelAssessmentRequestId);
-string_id!(ModelOfferingTargetId);
+string_id!(ServableModelBundleKey);
 string_id!(ModelServingConfigurationId);
 string_id!(ModelAssessmentId);
 string_id!(AssessmentEnvironmentId);
-string_id!(RecommendableModelId);
+string_id!(CatalogModelId);
+string_id!(CatalogVariantId);
 string_id!(ModelInstanceId);
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -96,6 +96,39 @@ pub enum ModelStoppingAllocation {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelInstanceFailure {
+    Operation {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    LowMemory {
+        code: String,
+        message: String,
+        retryable: bool,
+        required_system_memory_bytes: u64,
+        allocation_headroom_bytes: u64,
+        system_reserve_bytes: u64,
+        load_boundary_bytes: u64,
+        minimum_additional_available_bytes: u64,
+        parallel_sequences: u32,
+    },
+}
+
+impl From<ModelFailure> for ModelInstanceFailure {
+    fn from(failure: ModelFailure) -> Self {
+        Self::Operation {
+            code: failure.code,
+            message: failure.message,
+            retryable: failure.retryable,
+        }
+    }
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum ModelInstanceLifecycle {
@@ -121,7 +154,7 @@ pub enum ModelInstanceLifecycle {
         reason: ModelReleaseReason,
     },
     Failed {
-        failure: ModelFailure,
+        failure: ModelInstanceFailure,
     },
 }
 
@@ -162,18 +195,16 @@ pub enum ModelFileRole {
 
 /// Native algorithm used by a speculative decoding stage.
 ///
-/// Method and artifact packaging are intentionally independent: MTP may be embedded in the target
-/// or supplied by a companion, while model-backed draft methods use companion artifacts.
+/// Method and artifact packaging are intentionally independent. The enclosing speculative bundle
+/// declares whether the selected method is embedded in the target or supplied by a separate draft
+/// package.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum SpeculativeMethod {
     Mtp,
-    DraftSimple,
-    DraftEagle3,
-    DraftDFlash,
-    Ngram { method: String },
-    UnknownNative { method: String, evidence: String },
+    DFlash,
+    DSpark,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -241,7 +272,12 @@ pub struct ModelPackageProperties {
     pub quantization: String,
     pub quantization_name: String,
     pub architecture: String,
-    pub maximum_context_length: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intrinsic_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intrinsic_quality_id: Option<String>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -275,19 +311,65 @@ pub enum ModelPackageInspection {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ModelPackageInstallationOrigin {
+    Magnitude,
+    HuggingFaceCache,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CatalogPackageRole {
+    Target,
+    Dependency,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InstalledModelPackage {
-    pub target_id: ModelOfferingTargetId,
-    pub package: ModelPackage,
-    #[cfg_attr(feature = "openapi", schema(value_type = String))]
-    pub path: PathBuf,
-    pub inspection: ModelPackageInspection,
+pub struct CatalogPackageAffiliation {
+    pub model_id: CatalogModelId,
+    pub variant_id: CatalogVariantId,
+    pub package_id: ModelPackageId,
+    pub repository: String,
+    pub role: CatalogPackageRole,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstalledModelPackage {
+    pub package: ModelPackage,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub path: PathBuf,
+    pub origin: ModelPackageInstallationOrigin,
+    pub inspection: ModelPackageInspection,
+    pub catalog_attribution: InstalledCatalogAttribution,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum InstalledCatalogAttribution {
+    NotCatalogTarget,
+    #[serde(rename_all = "camelCase")]
+    Attributed {
+        model_id: CatalogModelId,
+        variant_id: CatalogVariantId,
+    },
+    Failed {
+        failure: ModelFailure,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstalledModelPackagesResponse {
+    pub revision: u64,
+    pub reconciliation_complete: bool,
     pub packages: Vec<InstalledModelPackage>,
 }
 
@@ -302,15 +384,24 @@ pub struct RemoveInstalledModelPackageResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelOfferingTarget {
-    Package {
+pub enum ServableModelBundle {
+    Standalone {
         package: ModelPackage,
     },
-    SpeculativeDecodingPair {
-        id: SpeculativeDecodingPairId,
+    #[serde(rename_all = "camelCase")]
+    SpeculativeDecoding {
         target: ModelPackage,
-        draft: ModelPackage,
+        draft_source: SpeculativeDraftSource,
+        method: SpeculativeMethod,
     },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum SpeculativeDraftSource {
+    Embedded,
+    Separate { draft: ModelPackage },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -325,7 +416,7 @@ pub struct ServingProfile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelServingConfiguration {
     pub id: ModelServingConfigurationId,
-    pub target: ModelOfferingTarget,
+    pub bundle: ServableModelBundle,
     pub profile: ServingProfile,
 }
 
@@ -350,17 +441,34 @@ pub struct ModelCapabilities {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "architecture", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ModelParameterization {
+    Dense {
+        #[serde(rename = "totalParameters")]
+        total_parameters: u64,
+    },
+    MixtureOfExperts {
+        #[serde(rename = "totalParameters")]
+        total_parameters: u64,
+        #[serde(rename = "activeParameters")]
+        active_parameters: u64,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecommendableModel {
-    pub id: RecommendableModelId,
-    pub checkpoint_id: String,
-    pub target_id: ModelOfferingTargetId,
-    pub target: ModelOfferingTarget,
+    pub model_id: CatalogModelId,
+    pub variant_id: CatalogVariantId,
+    pub configuration: ModelServingConfiguration,
     pub display_name: String,
+    pub variant_label: String,
     pub description: String,
     pub license: String,
     pub capabilities: ModelCapabilities,
+    pub parameterization: ModelParameterization,
     pub quality_score: f64,
     pub quality_score_provenance: String,
     pub fidelity_rank: u32,
@@ -372,8 +480,8 @@ pub struct RecommendableModel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogDiagnostic {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry_id: Option<RecommendableModelId>,
+    pub model_id: CatalogModelId,
+    pub variant_id: CatalogVariantId,
     pub failure: ModelFailure,
 }
 
@@ -382,6 +490,101 @@ pub struct CatalogDiagnostic {
 pub struct RecommendableModelCatalog {
     pub models: Vec<RecommendableModel>,
     pub diagnostics: Vec<CatalogDiagnostic>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CatalogModelEffectiveConfiguration {
+    Runnable {
+        configuration: ModelServingConfiguration,
+    },
+    Unavailable {
+        failure: ModelFailure,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogModelInstallation {
+    pub effective_configuration: CatalogModelEffectiveConfiguration,
+    pub packages: Vec<InstalledModelPackage>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CatalogModelUpdateState {
+    Current,
+    #[serde(rename_all = "camelCase")]
+    Available {
+        missing_package_ids: Vec<ModelPackageId>,
+        superseded_package_ids: Vec<ModelPackageId>,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CatalogModelLocalState {
+    NotInstalled,
+    #[serde(rename_all = "camelCase")]
+    Installed {
+        installation: CatalogModelInstallation,
+        update_state: CatalogModelUpdateState,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogModel {
+    pub model_id: CatalogModelId,
+    pub variant_id: CatalogVariantId,
+    pub desired_configuration: ModelServingConfiguration,
+    pub display_name: String,
+    pub variant_label: String,
+    pub description: String,
+    pub license: String,
+    pub capabilities: ModelCapabilities,
+    pub parameterization: ModelParameterization,
+    pub quality_score: f64,
+    pub quality_score_provenance: String,
+    pub fidelity_rank: u32,
+    pub quantization_aware: bool,
+    pub quality_evidence: Vec<String>,
+    pub local_state: CatalogModelLocalState,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelsResponse {
+    pub revision: u64,
+    pub reconciliation_complete: bool,
+    pub catalog_models: Vec<CatalogModel>,
+    pub uncatalogued_packages: Vec<InstalledModelPackage>,
+    pub diagnostics: Vec<CatalogDiagnostic>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReconcileCatalogModelRequest {
+    pub model_id: CatalogModelId,
+    pub variant_id: CatalogVariantId,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ReconcileCatalogModelResponse {
+    Current,
+    #[serde(rename_all = "camelCase")]
+    DownloadAdmitted {
+        download_id: ModelDownloadId,
+    },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -397,21 +600,23 @@ pub enum ModelPackageOperand {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelTargetInput {
+pub enum ModelBundleInput {
     #[serde(rename_all = "camelCase")]
-    Package { package: ModelPackageOperand },
+    Standalone { package: ModelPackageOperand },
     #[serde(rename_all = "camelCase")]
-    SpeculativeDecodingPair {
+    SpeculativeDecoding {
         target: ModelPackageOperand,
-        draft: ModelPackageOperand,
+        draft_source: SpeculativeDraftSourceInput,
+        method: SpeculativeMethod,
     },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CapacityPolicy {
-    pub required_reserve_bytes_per_memory_domain: u64,
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum SpeculativeDraftSourceInput {
+    Embedded,
+    Separate { draft: ModelPackageOperand },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -427,7 +632,7 @@ pub struct ModelAssessmentProfile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssessModelRequest {
     pub request_id: ModelAssessmentRequestId,
-    pub target: ModelTargetInput,
+    pub bundle: ModelBundleInput,
     pub profiles: Vec<ModelAssessmentProfile>,
 }
 
@@ -436,7 +641,6 @@ pub struct AssessModelRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssessModelsRequest {
     pub requests: Vec<AssessModelRequest>,
-    pub capacity_policy: CapacityPolicy,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -447,7 +651,6 @@ pub struct MemoryAssessment {
     pub capacity_bytes: u64,
     pub required_bytes: u64,
     pub compatibility_reserve_bytes: u64,
-    pub warning_reserve_bytes: u64,
     pub remaining_bytes: i64,
 }
 
@@ -477,16 +680,14 @@ pub struct PerformanceEvidence {
 pub enum ModelAssessment {
     #[serde(rename_all = "camelCase")]
     Fits {
-        profile: ServingProfile,
-        configuration_id: ModelServingConfigurationId,
+        configuration: ModelServingConfiguration,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         performance: Vec<PerformanceEvidence>,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
-        profile: ServingProfile,
-        configuration_id: ModelServingConfigurationId,
+        configuration: ModelServingConfiguration,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,
@@ -494,8 +695,7 @@ pub enum ModelAssessment {
     },
     #[serde(rename_all = "camelCase")]
     Incompatible {
-        profile: ServingProfile,
-        configuration_id: ModelServingConfigurationId,
+        configuration: ModelServingConfiguration,
         failure: ModelFailure,
     },
 }
@@ -532,11 +732,15 @@ pub enum AssessModelResult {
     #[serde(rename_all = "camelCase")]
     Assessed {
         request_id: ModelAssessmentRequestId,
-        target_id: ModelOfferingTargetId,
         profiles: Vec<ModelAssessment>,
     },
     #[serde(rename_all = "camelCase")]
-    InvalidTarget {
+    InvalidBundle {
+        request_id: ModelAssessmentRequestId,
+        failure: ModelFailure,
+    },
+    #[serde(rename_all = "camelCase")]
+    Failed {
         request_id: ModelAssessmentRequestId,
         failure: ModelFailure,
     },
@@ -553,59 +757,62 @@ pub struct AssessModelsResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadRequest {
-    pub target: ModelOfferingTarget,
+    pub bundle: ServableModelBundle,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum DownloadAttempt {
+pub enum ModelDownloadState {
     #[serde(rename_all = "camelCase")]
     Pending {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
+        completed_bytes: u64,
+        total_bytes: u64,
     },
     #[serde(rename_all = "camelCase")]
     Downloading {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
         stage: DownloadStage,
         completed_bytes: u64,
         total_bytes: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes_per_second: Option<u64>,
     },
-    #[serde(rename_all = "camelCase")]
-    Completed {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
-    },
+    Completed,
     #[serde(rename_all = "camelCase")]
     Failed {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
         completed_bytes: u64,
         total_bytes: u64,
-        failure: ModelFailure,
+        failure: DownloadFailure,
+        acknowledged: bool,
     },
     #[serde(rename_all = "camelCase")]
     Cancelled {
-        id: DownloadAttemptId,
-        package_id: ModelPackageId,
+        completed_bytes: u64,
+        total_bytes: u64,
     },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelDownload {
+    pub id: ModelDownloadId,
+    pub bundle: ServableModelBundle,
+    pub state: ModelDownloadState,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartModelDownloadResponse {
-    pub target_id: ModelOfferingTargetId,
-    pub attempts: Vec<DownloadAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub download: Option<ModelDownload>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDownloadsResponse {
-    pub attempts: Vec<DownloadAttempt>,
+    pub downloads: Vec<ModelDownload>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -672,42 +879,42 @@ pub enum ModelLoadEvent {
         instance_id: ModelInstanceId,
     },
     Failed {
-        failure: ModelFailure,
+        failure: ModelInstanceFailure,
     },
 }
 
 #[derive(Clone)]
-pub struct ResolvedModelTarget {
-    pub target_id: ModelOfferingTargetId,
-    pub target: ModelOfferingTarget,
+pub struct ResolvedServableModelBundle {
+    pub bundle_key: ServableModelBundleKey,
+    pub bundle: ServableModelBundle,
     pub target_model: ResolvedModel,
     pub draft_model: Option<ResolvedModel>,
     resolution_guards: Vec<std::sync::Arc<dyn Send + Sync>>,
 }
 
-impl std::fmt::Debug for ResolvedModelTarget {
+impl std::fmt::Debug for ResolvedServableModelBundle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ResolvedModelTarget")
-            .field("target_id", &self.target_id)
-            .field("target", &self.target)
+            .debug_struct("ResolvedServableModelBundle")
+            .field("bundle_key", &self.bundle_key)
+            .field("bundle", &self.bundle)
             .field("target_model", &self.target_model)
             .field("draft_model", &self.draft_model)
             .finish_non_exhaustive()
     }
 }
 
-impl ResolvedModelTarget {
+impl ResolvedServableModelBundle {
     #[must_use]
     pub fn new(
-        target_id: ModelOfferingTargetId,
-        target: ModelOfferingTarget,
+        bundle_key: ServableModelBundleKey,
+        bundle: ServableModelBundle,
         target_model: ResolvedModel,
         draft_model: Option<ResolvedModel>,
     ) -> Self {
         Self {
-            target_id,
-            target,
+            bundle_key,
+            bundle,
             target_model,
             draft_model,
             resolution_guards: Vec::new(),
@@ -721,15 +928,15 @@ impl ResolvedModelTarget {
     }
 }
 
-/// Installed package and exact-target resolution boundary.
+/// Installed package and exact-bundle resolution boundary.
 pub trait InstalledModelPackages: Send + Sync + 'static {
     fn list_installed(
         &self,
     ) -> BoxFuture<'_, Result<InstalledModelPackagesResponse, InventoryError>>;
-    fn resolve_target(
+    fn resolve_bundle(
         &self,
-        target: ModelTargetInput,
-    ) -> BoxFuture<'_, Result<ResolvedModelTarget, InventoryError>>;
+        bundle: ModelBundleInput,
+    ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>>;
     fn remove_installed(
         &self,
         package_id: &ModelPackageId,
@@ -738,6 +945,21 @@ pub trait InstalledModelPackages: Send + Sync + 'static {
 
 pub trait RecommendableModelCatalogProvider: Send + Sync + 'static {
     fn catalog(&self) -> BoxFuture<'_, Result<RecommendableModelCatalog, InventoryError>>;
+}
+
+pub trait CatalogModels: Send + Sync + 'static {
+    fn list(&self) -> BoxFuture<'_, Result<ModelsResponse, InventoryError>>;
+    fn reconcile(
+        &self,
+        request: ReconcileCatalogModelRequest,
+    ) -> BoxFuture<'_, Result<ReconcileCatalogModelResponse, InventoryError>>;
+}
+
+pub trait CatalogPackageRemover: Send + Sync + 'static {
+    fn remove_catalog_package(
+        &self,
+        package_id: ModelPackageId,
+    ) -> BoxFuture<'_, Result<(), InventoryError>>;
 }
 
 pub trait ModelAssessor: Send + Sync + 'static {
@@ -752,13 +974,10 @@ pub trait ModelDownloads: Send + Sync + 'static {
         &self,
         request: StartModelDownloadRequest,
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>>;
-    fn list_attempts(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>>;
-    fn get_attempt(
+    fn list(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>>;
+    fn cancel(&self, id: &ModelDownloadId) -> BoxFuture<'_, Result<ModelDownload, InventoryError>>;
+    fn acknowledge_failure(
         &self,
-        id: &DownloadAttemptId,
-    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
-    fn cancel(
-        &self,
-        id: &DownloadAttemptId,
-    ) -> BoxFuture<'_, Result<DownloadAttempt, InventoryError>>;
+        id: &ModelDownloadId,
+    ) -> BoxFuture<'_, Result<ModelDownload, InventoryError>>;
 }

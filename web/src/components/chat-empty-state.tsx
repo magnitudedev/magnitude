@@ -101,7 +101,7 @@ function DirectoryPicker(): ReactNode {
   const visibleLimit = limitState.query === trimmedQuery ? limitState.limit : DIRECTORY_PAGE_SIZE
 
   const directoriesAtom = useMemo(
-    () => client.query("SearchDirectories", {
+    () => client.rpc.query("SearchDirectories", {
       query: trimmedQuery,
       limit: visibleLimit,
       includeRecent: true,
@@ -166,9 +166,11 @@ function DirectoryPicker(): ReactNode {
         <div style={{ color: "var(--fg-primary)", fontSize: 18, fontWeight: 650 }}>
           Start a new chat in <span style={{ color: "var(--accent-primary)" }}>{selectedLabel}</span>
         </div>
-        <div style={{ color: "var(--fg-secondary)", fontSize: 13, marginTop: 4, fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {formatCwdForDisplay(selectedPath, { maxLen: 86, abbreviateHome: true })}
-        </div>
+        {selectedPath !== "." && (
+          <div style={{ color: "var(--fg-secondary)", fontSize: 13, marginTop: 4, fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {formatCwdForDisplay(selectedPath, { maxLen: 86, abbreviateHome: true })}
+          </div>
+        )}
       </div>
 
       <div

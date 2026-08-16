@@ -44,6 +44,7 @@ let mainWindow: BrowserWindow | null = null
 let acnManagerPromise: Promise<AcnInstanceManagerService> | null = null
 const acnEnsurerScope = Effect.runPromise(Scope.make())
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
+const MAXIMUM_DAEMON_STDERR_BYTES = 64 * 1024
 
 /**
  * Node-compatible child process spawner for the local daemon launcher.
@@ -53,8 +54,11 @@ const nodeSpawn: ChildProcessSpawner = {
   spawn: (command) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
-        const proc = yield* Effect.async<
-          ReturnType<typeof spawn>,
+        const spawned = yield* Effect.async<
+          {
+            readonly proc: ReturnType<typeof spawn>
+            readonly exited: Promise<{ readonly code: number; readonly stderr: string }>
+          },
           AcnEnsuranceFailed
         >((resume) => {
           const [executable, ...args] = command
@@ -63,13 +67,29 @@ const nodeSpawn: ChildProcessSpawner = {
             stdio: ["pipe", "ignore", "pipe"],
             env: process.env,
           })
+          let stderrTail = Buffer.alloc(0)
+          proc.stderr.on("data", (value: Buffer | string) => {
+            const chunk = typeof value === "string" ? Buffer.from(value) : value
+            const combined = Buffer.concat([stderrTail, chunk])
+            stderrTail = combined.length <= MAXIMUM_DAEMON_STDERR_BYTES
+              ? combined
+              : combined.subarray(combined.length - MAXIMUM_DAEMON_STDERR_BYTES)
+          })
+          const exited = new Promise<{ readonly code: number; readonly stderr: string }>((resolve) => {
+            const result = (code: number) => ({
+              code,
+              stderr: stderrTail.toString("utf8").trim(),
+            })
+            proc.once("close", (code) => resolve(result(code ?? 1)))
+            proc.once("error", () => resolve(result(1)))
+          })
           const cleanup = () => {
             proc.off("spawn", onSpawn)
             proc.off("error", onError)
           }
           const onSpawn = () => {
             cleanup()
-            resume(Effect.succeed(proc))
+            resume(Effect.succeed({ proc, exited }))
           }
           const onError = (cause: Error) => {
             cleanup()
@@ -81,26 +101,14 @@ const nodeSpawn: ChildProcessSpawner = {
           proc.once("error", onError)
           return Effect.sync(cleanup)
         })
+        const { proc } = spawned
         const pid = proc.pid
         if (pid === undefined) {
           return yield* new AcnEnsuranceFailed({
-            reason: "Spawned ACN has no process ID",
+            reason: "Spawned Magnitude daemon has no process ID",
           })
         }
-        const diagnosticLimit = 64 * 1024
-        let stderr = ""
-        proc.stderr?.setEncoding("utf8")
-        proc.stderr?.on("data", (chunk: string) => {
-          stderr = `${stderr}${chunk}`.slice(-diagnosticLimit)
-        })
-        const exitedPromise = new Promise<{ readonly code: number; readonly stderr: string }>((resolve) => {
-          proc.once("close", (code) => resolve({ code: code ?? 1, stderr }))
-          proc.once("error", (cause) => resolve({
-            code: 1,
-            stderr: `${stderr}\n${cause.message}`.trim().slice(-diagnosticLimit),
-          }))
-        })
-        const exited = Effect.promise(() => exitedPromise)
+        const exited = Effect.promise(() => spawned.exited)
         proc.unref()
 
         const signalTree = (name: NodeJS.Signals) =>
@@ -119,7 +127,7 @@ const nodeSpawn: ChildProcessSpawner = {
             },
             catch: (cause) =>
               new AcnEnsuranceFailed({
-                reason: `Failed to send ${name} to ACN ${pid}: ${String(cause)}`,
+                reason: `Failed to send ${name} to Magnitude daemon ${pid}: ${String(cause)}`,
               }),
           })
         const treeAbsent = Effect.sync(() => {
@@ -149,7 +157,7 @@ const nodeSpawn: ChildProcessSpawner = {
           yield* signalTree("SIGKILL")
           if (!(yield* waitForTreeAbsence(Duration.seconds(2)))) {
             return yield* new AcnEnsuranceFailed({
-              reason: `ACN candidate tree ${pid} did not exit after SIGKILL`,
+              reason: `Magnitude daemon process tree ${pid} did not exit after SIGKILL`,
             })
           }
         })
@@ -159,7 +167,7 @@ const nodeSpawn: ChildProcessSpawner = {
             resume(
               Effect.fail(
                 new AcnEnsuranceFailed({
-                  reason: "ACN bootstrap pipe is unavailable",
+                  reason: "Magnitude daemon bootstrap pipe is unavailable",
                 }),
               ),
             )
@@ -170,7 +178,7 @@ const nodeSpawn: ChildProcessSpawner = {
             resume(
               Effect.fail(
                 new AcnEnsuranceFailed({
-                  reason: `Failed to hand off ACN bootstrap: ${cause.message}`,
+                  reason: `Failed to hand off Magnitude daemon bootstrap: ${cause.message}`,
                 }),
               ),
             )

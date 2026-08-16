@@ -1,6 +1,8 @@
 import {
+  Cause,
   Context,
   Deferred,
+  Either,
   Effect,
   Exit,
   Layer,
@@ -18,7 +20,8 @@ import {
 } from "@magnitudedev/agent"
 import {
   LocalModelMutationFailed,
-  modelOfferingTargetPackageIds,
+  modelSlotActions,
+  servableModelBundlePackageIds,
   ModelInstanceIdSchema,
   ModelPreferenceMutationFailed,
   ModelSlotLifecycle,
@@ -35,12 +38,12 @@ import {
   type MirroredSnapshot,
   type ModelFailure,
   type ModelInstanceId,
-  type ModelLoadAdmission,
-  type ModelLoadResult,
   type ModelLoadPlan,
+  type ModelReleaseReason,
   type ModelSlot,
   type ModelSlotAvailability,
   type ModelSlotDescriptor,
+  type ModelResidency,
   type ModelSlotsState,
   type ModelSlotUpdateError,
   type ModelServingConfigurationId,
@@ -57,23 +60,22 @@ import {
   IcnInstances,
 } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
+import { MagnitudeStorage } from "@magnitudedev/storage"
 import {
   ReasoningEffortSchema,
   type ProviderId,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { ModelConfiguration } from "./model-configuration"
+import { ModelSelection } from "./model-selection"
 import { MirroredStateChanges } from "./mirrored-state"
 import { LocalModelPackages } from "./local-model-packages"
-import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import { modelServingConfigurationToIcn } from "./local-model-icn-adapter"
 import {
   localModelSlotAvailability,
-  modelSlotActions,
-  projectModelInstance,
+  projectModelResidency,
   projectModelLoadPlan,
   selectableModelCapabilities,
 } from "./model-slot-projection"
@@ -87,10 +89,6 @@ export interface ModelSlotControllerApi {
     slotId: SlotId,
     providerModelId: ProviderModelId,
   ) => Effect.Effect<ModelLoadResult, LocalInferenceError, Scope.Scope>
-  readonly ensureLocalModelReady: (
-    slotId: SlotId,
-    providerModelId: ProviderModelId,
-  ) => Effect.Effect<ModelLoadResult, LocalInferenceError>
   readonly updateModelSlot: (
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
@@ -99,12 +97,9 @@ export interface ModelSlotControllerApi {
     model: ProviderModelIdentity,
     favorite: boolean,
   ) => Effect.Effect<void, ModelPreferenceMutationFailed>
-  readonly loadModel: (slotId: SlotId) => Effect.Effect<ModelLoadResult, LocalInferenceError>
-  readonly admitModelLoad: (
-    slotId: SlotId,
-  ) => Effect.Effect<ModelLoadAdmission, LocalInferenceError>
+  readonly loadModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
   readonly previewModelLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
-  readonly stopModel: (instanceId: ModelInstanceId) => Effect.Effect<void, LocalInferenceError>
+  readonly stopModel: (slotId: SlotId) => Effect.Effect<void, LocalInferenceError>
 }
 
 export class ModelSlotController extends Context.Tag("ModelSlotController")<
@@ -136,12 +131,43 @@ interface ModelLoadCommand {
   readonly requestedBy: SlotId
   readonly configuration: LocalProviderOffering["configuration"]
   readonly instanceId: ModelInstanceId
-  readonly result: Deferred.Deferred<ModelLoadResult, LocalInferenceError>
   readonly admission: Deferred.Deferred<void, LocalInferenceError>
 }
 
+type ModelLoadResult =
+  | {
+      readonly _tag: "Ready"
+      readonly instanceId: ModelInstanceId
+      readonly configurationId: ModelServingConfigurationId
+    }
+  | {
+      readonly _tag: "Cancelled"
+      readonly reason: ModelReleaseReason
+    }
+
+interface PendingLoadRequest {
+  readonly _tag: "Pending"
+  readonly selection: SlotSelection
+  readonly cancellation: Deferred.Deferred<void>
+}
+
+interface FailedLoadRequest {
+  readonly _tag: "Failed"
+  readonly selection: SlotSelection
+  readonly failure: ModelFailure
+}
+
+type LoadRequest = PendingLoadRequest | FailedLoadRequest
+
+type LoadDecision =
+  | { readonly _tag: "Waiting" }
+  | { readonly _tag: "Cancelled" }
+  | { readonly _tag: "Satisfied" }
+  | { readonly _tag: "Load"; readonly waitOnRetryableFailure: boolean }
+  | { readonly _tag: "Failed"; readonly failure: ModelFailure }
+
 type ModelLoadClaim =
-  | { readonly _tag: "Complete"; readonly result: ModelLoadResult }
+  | { readonly _tag: "Complete"; readonly result: Extract<ModelLoadResult, { _tag: "Ready" }> }
   | { readonly _tag: "Observe"; readonly instanceId: ModelInstanceId }
   | { readonly _tag: "Join"; readonly command: ModelLoadCommand }
   | { readonly _tag: "Owner"; readonly command: ModelLoadCommand }
@@ -223,12 +249,12 @@ const modelFailure = (
 export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
-  ModelConfiguration | LocalModelPackages | LocalModelRecommendations | LocalProviderOfferings
+  ModelSelection | MagnitudeStorage | LocalModelPackages | LocalProviderOfferings
     | ProviderModelCatalog | MirroredStateChanges | IcnClient | IcnInstances
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
-  const configuration = yield* ModelConfiguration
+  const modelSelection = yield* ModelSelection
+  const storage = yield* MagnitudeStorage
   const localPackages = yield* LocalModelPackages
-  const recommendations = yield* LocalModelRecommendations
   const localOfferings = yield* LocalProviderOfferings
   const catalog = yield* ProviderModelCatalog
   const mirroredChanges = yield* MirroredStateChanges
@@ -240,23 +266,40 @@ export const ModelSlotControllerLive: Layer.Layer<
   const loadCommands = yield* Ref.make<
     ReadonlyMap<ModelServingConfigurationId, ModelLoadCommand>
   >(new Map())
+  const loadRequests = yield* Ref.make<Readonly<Record<
+    "primary" | "secondary",
+    Option.Option<LoadRequest>
+  >>>({ primary: Option.none(), secondary: Option.none() })
+  const clearLoadRequestUnsafe = (slotId: SlotId) => Effect.gen(function* () {
+    const key = slotKey(slotId)
+    const requests = yield* Ref.get(loadRequests)
+    const current = requests[key]
+    if (Option.isSome(current) && current.value._tag === "Pending") {
+      yield* Deferred.succeed(current.value.cancellation, undefined)
+    }
+    if (Option.isSome(current)) {
+      yield* Ref.set(loadRequests, { ...requests, [key]: Option.none() })
+    }
+    return current
+  })
 
-  const initialConfiguration = yield* configuration.get
+  const initialSelection = yield* modelSelection.get
+  const configuredContextLimits = yield* storage.config.getContextLimitPolicy().pipe(Effect.orDie)
   const initialCatalog = (yield* catalog.snapshot).state
   const emptyState: ModelSlotsState = {
     slots: {
       primary: new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
       secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
     },
-    recentModelIds: initialConfiguration.localModelRecency,
-    favoriteModels: initialConfiguration.favoriteModels,
+    recentModels: initialSelection.recentModels,
+    favoriteModels: initialSelection.favorites,
   }
   const aggregate = yield* SubscriptionRef.make<ControllerAggregate>({
     snapshot: { revision: 0, state: emptyState },
     agentConfiguration: buildConfigStateFromSlots(
       catalogContents(initialCatalog).models,
       emptyState.slots,
-      initialConfiguration.contextLimits,
+      configuredContextLimits,
     ),
     loadTargets: {
       primary: Option.none(),
@@ -270,7 +313,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   const commit = (
     state: ModelSlotsState,
     catalogModels: readonly ProviderModelCatalogEntry[],
-    contextLimits: typeof initialConfiguration.contextLimits,
+    contextLimits: typeof configuredContextLimits,
     loadTargets: ControllerAggregate["loadTargets"],
     instanceBindings: ControllerAggregate["instanceBindings"],
   ) => Effect.gen(function* () {
@@ -342,6 +385,8 @@ export const ModelSlotControllerLive: Layer.Layer<
     selection: SlotSelection,
     catalogState: ProviderModelCatalogState,
   ): ModelSlotAvailability => {
+    if (catalogState._tag === "Loading") return { _tag: "Pending" }
+    const refreshing = catalogState._tag === "Refreshing"
     const contents = catalogContents(catalogState)
     const providerFailure = contents.failures.find((item) =>
       item._tag === "ProviderFailure" && item.providerId === selection.providerId)
@@ -349,7 +394,10 @@ export const ModelSlotControllerLive: Layer.Layer<
       return unavailable("provider_unavailable", providerFailure.message)
     }
     const provider = contents.providers.find((item) => item.providerId === selection.providerId)
-    if (!provider) return unavailable("provider_unavailable", "The selected provider is unavailable")
+    if (!provider) {
+      if (refreshing) return { _tag: "Pending" }
+      return unavailable("provider_unavailable", "The selected provider is unavailable")
+    }
     if (provider.authentication === "NotConfigured") {
       return unavailable("provider_not_configured", "The selected provider is not configured", false)
     }
@@ -362,7 +410,11 @@ export const ModelSlotControllerLive: Layer.Layer<
     const model = contents.models.find((item) =>
       item.providerId === selection.providerId
       && item.providerModelId === selection.providerModelId)
-    if (!model || model.availability._tag !== "Available") {
+    if (!model) {
+      if (refreshing) return { _tag: "Pending" }
+      return unavailable("model_unavailable", "The selected model is unavailable")
+    }
+    if (model.availability._tag !== "Available") {
       return unavailable("model_unavailable", "The selected model is unavailable")
     }
     return { _tag: "Available" }
@@ -379,16 +431,20 @@ export const ModelSlotControllerLive: Layer.Layer<
       providerId: selection.providerId,
       providerModelId: selection.providerModelId,
       displayName: model?.displayName || selection.providerModelId,
+      variantLabel: model?.variantLabel ?? Option.none(),
     }
   }
 
   const rebuild = stateLock.withPermits(1)(Effect.gen(function* () {
-    const configured = yield* configuration.get
+    const configured = yield* modelSelection.get
     const catalogState = (yield* catalog.snapshot).state
     const contents = catalogContents(catalogState)
+    const localOfferingsReady = yield* localOfferings.ready
+    const packageState = (yield* localPackages.snapshot).state
     const packages = yield* localPackages.installedPackageIds
     const native = yield* observedInstances.get
     const previousAggregate = yield* SubscriptionRef.get(aggregate)
+    const requests = yield* Ref.get(loadRequests)
     const previous = previousAggregate.snapshot.state
     const offerings = yield* localOfferings.list.pipe(Effect.orElseSucceed(() => []))
 
@@ -427,13 +483,15 @@ export const ModelSlotControllerLive: Layer.Layer<
           const offering = offerings.find((item) =>
             item.providerModelId === selected.providerModelId)
           const downloaded = offering !== undefined
-            && modelOfferingTargetPackageIds(offering.configuration.target)
+            && servableModelBundlePackageIds(offering.configuration.bundle)
               .every((packageId) => packages.has(packageId))
-          const availability = localModelSlotAvailability(
-            { _tag: "Available" },
-            offering !== undefined,
-            downloaded,
-          )
+          const availability = localModelSlotAvailability({
+            catalogIdentityPending: baseAvailability._tag === "Pending",
+            offeringsReady: localOfferingsReady,
+            inventory: packageState.inventory,
+            offeringExists: offering !== undefined,
+            installed: downloaded,
+          })
           const configurationId = offering?.configuration.id
           const binding = previousAggregate.instanceBindings[slotKey(slotId)]
           const exact = Option.flatMap(binding, ({ configurationId: boundConfigurationId, instanceId }) =>
@@ -441,17 +499,34 @@ export const ModelSlotControllerLive: Layer.Layer<
               ? Option.fromNullable(native.instances.find((instance) =>
                 instance.id === instanceId && instance.configurationId === configurationId))
               : Option.none())
-          const instance = Option.map(
-            exact,
-            projectModelInstance,
+          const request = Option.flatMap(
+            requests[slotKey(slotId)],
+            (candidate) => sameSelection(candidate.selection, selected)
+              ? Option.some(candidate)
+              : Option.none(),
           )
+          const nativeResidency = Option.map(exact, projectModelResidency)
+          const activeResidency = Option.filter(nativeResidency, (current) =>
+            current._tag === "Loading"
+            || current._tag === "Ready"
+            || current._tag === "Stopping")
+          const residency: ModelResidency = Option.getOrElse(activeResidency, () =>
+            Option.match(request, {
+              onSome: (current) => current._tag === "Pending"
+                ? { _tag: "Requested" }
+                : { _tag: "Failed", failure: current.failure },
+              onNone: () => Option.getOrElse(
+                nativeResidency,
+                () => ({ _tag: "Unloaded" }),
+              ),
+            }))
           const props = {
             slotId,
             selection: selected,
             descriptor,
             availability,
-            instance,
-            actions: modelSlotActions(availability, instance),
+            residency,
+            actions: modelSlotActions(availability, residency),
           } as const
           switch (current._tag) {
             case "ConfiguredLocal":
@@ -468,8 +543,8 @@ export const ModelSlotControllerLive: Layer.Layer<
         primary: buildSlot(PRIMARY_SLOT_ID, configured.slots.primary),
         secondary: buildSlot(SECONDARY_SLOT_ID, configured.slots.secondary),
       },
-      recentModelIds: configured.localModelRecency,
-      favoriteModels: configured.favoriteModels,
+      recentModels: configured.recentModels,
+      favoriteModels: configured.favorites,
     }
     const loadTargetFor = (
       selection: Option.Option<SlotSelection>,
@@ -499,7 +574,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     return yield* commit(
       state,
       contents.models,
-      configured.contextLimits,
+      configuredContextLimits,
       loadTargets,
       {
         primary: nextBindingFor("primary"),
@@ -508,13 +583,55 @@ export const ModelSlotControllerLive: Layer.Layer<
     )
   }))
 
-  yield* rebuild
-  yield* Effect.forkIn(configuration.changes.pipe(
-    Stream.runForEach(() => rebuild),
+  const providerIdentityIsAuthoritative = (
+    providerId: ProviderId,
+    state: ProviderModelCatalogState,
+  ): boolean => state._tag === "Ready"
+    || state._tag === "Degraded"
+      && !state.failures.some((item) =>
+        item._tag === "ProviderFailure" && item.providerId === providerId)
+
+  const reconcileSelections = Effect.gen(function* () {
+    const configured = yield* modelSelection.get
+    const catalogState = (yield* catalog.snapshot).state
+    const contents = catalogContents(catalogState)
+    const localReady = yield* localOfferings.ready
+    const localResult = yield* Effect.either(localOfferings.list)
+    const localIds = Either.isRight(localResult)
+      ? new Set(localResult.right.map(({ providerModelId }) => providerModelId))
+      : undefined
+    for (const slotId of [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID] as const) {
+      const selected = configured.slots[slotKey(slotId)]
+      if (Option.isNone(selected)) continue
+      const selection = selected.value
+      if (selection.providerId === LOCAL_PROVIDER_ID && !localReady) continue
+      if (!providerIdentityIsAuthoritative(selection.providerId, catalogState)) continue
+      const exists = selection.providerId === LOCAL_PROVIDER_ID
+        ? localIds?.has(selection.providerModelId)
+        : contents.models.some((model) => model.providerId === selection.providerId
+          && model.providerModelId === selection.providerModelId)
+      if (exists === false) {
+        yield* clearLoadRequestUnsafe(slotId)
+        yield* modelSelection.updateSlot(slotId, Option.none()).pipe(Effect.orDie)
+      }
+    }
+  })
+
+  const reconcileAndRebuild = commandLock.withPermits(1)(
+    reconcileSelections.pipe(Effect.zipRight(rebuild)),
+  )
+
+  yield* reconcileAndRebuild
+  yield* Effect.forkIn(modelSelection.changes.pipe(
+    Stream.runForEach(() => reconcileAndRebuild),
   ), scope)
   yield* Effect.forkIn(localPackages.changes.pipe(Stream.runForEach(() => rebuild)), scope)
-  yield* Effect.forkIn(localOfferings.changes.pipe(Stream.runForEach(() => rebuild)), scope)
-  yield* Effect.forkIn(catalog.changes.pipe(Stream.runForEach(() => rebuild)), scope)
+  yield* Effect.forkIn(localOfferings.changes.pipe(
+    Stream.runForEach(() => reconcileAndRebuild),
+  ), scope)
+  yield* Effect.forkIn(catalog.changes.pipe(
+    Stream.runForEach(() => reconcileAndRebuild),
+  ), scope)
   yield* Effect.forkIn(observedInstances.changes.pipe(
     Stream.runForEach(() => rebuild),
   ), scope)
@@ -684,7 +801,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       commandIsCurrent(command),
     )
     if (!remainsCurrent) {
-      yield* stopModel(command.instanceId).pipe(
+      yield* stopModelInstance(command.instanceId).pipe(
         Effect.catchAll((error) => Effect.logWarning("Superseded model instance stop failed").pipe(
           Effect.annotateLogs({ instanceId: command.instanceId, error: error.message }),
         )),
@@ -694,7 +811,9 @@ export const ModelSlotControllerLive: Layer.Layer<
     const published = yield* rebuild
     const publishedSlot = published.snapshot.state.slots[slotKey(command.requestedBy)]
     if (publishedSlot._tag !== "ConfiguredLocal"
-      || !Option.exists(publishedSlot.instance, ({ id }) => id === command.instanceId)) {
+      || (publishedSlot.residency._tag !== "Loading"
+        && publishedSlot.residency._tag !== "Ready")
+      || publishedSlot.residency.instanceId !== command.instanceId) {
       return yield* failure(
         "model_load_admission_not_published",
         "The admitted model instance was not published to its slot",
@@ -707,9 +826,11 @@ export const ModelSlotControllerLive: Layer.Layer<
     return result
   })
 
-  const admitModelLoad: ModelSlotControllerApi["admitModelLoad"] = (slotId) => Effect.gen(function* () {
+  const admitModelLoad = (
+    slotId: SlotId,
+    expectedSelection?: SlotSelection,
+  ): Effect.Effect<ModelInstanceId, LocalInferenceError> => Effect.gen(function* () {
     yield* rebuild
-    const candidateResult = yield* Deferred.make<ModelLoadResult, LocalInferenceError>()
     const candidateAdmission = yield* Deferred.make<void, LocalInferenceError>()
     const claim: ModelLoadClaim = yield* commandLock.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(aggregate)
@@ -718,35 +839,34 @@ export const ModelSlotControllerLive: Layer.Layer<
       if (slot._tag !== "ConfiguredLocal") {
         return yield* reject(slotId, "The slot does not contain a local model")
       }
+      if (expectedSelection !== undefined && !sameSelection(slot.selection, expectedSelection)) {
+        return yield* reject(slotId, "The selected local model changed before load admission")
+      }
       const loadTarget = current.loadTargets[key]
       if (Option.isNone(loadTarget)
         || !sameSelection(loadTarget.value.selection, slot.selection)) {
         return yield* reject(slotId, "The selected local model configuration is unavailable")
       }
-      if (Option.isSome(slot.instance)) {
-        const instance = slot.instance.value
-        if (instance.lifecycle._tag === "Ready") {
-          return {
-            _tag: "Complete" as const,
-            result: {
-              _tag: "Ready" as const,
-              instanceId: instance.id,
-              configurationId: instance.configurationId,
-            },
-          }
+      if (slot.residency._tag === "Ready") {
+        return {
+          _tag: "Complete" as const,
+          result: {
+            _tag: "Ready" as const,
+            instanceId: slot.residency.instanceId,
+            configurationId: slot.residency.configurationId,
+          },
         }
-        if (instance.lifecycle._tag === "Loading") {
-          return {
-            _tag: "Observe" as const,
-            instanceId: instance.id,
-          }
+      }
+      if (slot.residency._tag === "Loading") {
+        return {
+          _tag: "Observe" as const,
+          instanceId: slot.residency.instanceId,
         }
       }
       const candidate: ModelLoadCommand = {
         requestedBy: slotId,
         configuration: loadTarget.value.configuration,
         instanceId: ModelInstanceIdSchema.make(crypto.randomUUID()),
-        result: candidateResult,
         admission: candidateAdmission,
       }
       const currentCommands = yield* Ref.get(loadCommands)
@@ -777,21 +897,16 @@ export const ModelSlotControllerLive: Layer.Layer<
       return { _tag: "Owner" as const, command: candidate }
     }))
     if (claim._tag === "Complete") {
-      return {
-        instanceId: claim.result.instanceId,
-      }
+      return claim.result.instanceId
     }
     if (claim._tag === "Observe") {
-      return {
-        instanceId: claim.instanceId,
-      }
+      return claim.instanceId
     }
     yield* rebuild
     if (claim._tag === "Owner") {
       yield* Effect.forkIn(Effect.gen(function* () {
         const result = yield* Effect.exit(runLoadCommand(claim.command))
         yield* Deferred.done(claim.command.admission, Exit.asVoid(result))
-        yield* Deferred.done(claim.command.result, result)
         yield* commandLock.withPermits(1)(
           Ref.update(loadCommands, (current) => {
             const configurationId = claim.command.configuration.id
@@ -807,23 +922,16 @@ export const ModelSlotControllerLive: Layer.Layer<
     const current = yield* SubscriptionRef.get(aggregate)
     const admittedSlot = current.snapshot.state.slots[slotKey(slotId)]
     if (admittedSlot._tag !== "ConfiguredLocal"
-      || !Option.exists(admittedSlot.instance, ({ id }) => id === claim.command.instanceId)) {
+      || (admittedSlot.residency._tag !== "Loading"
+        && admittedSlot.residency._tag !== "Ready")
+      || admittedSlot.residency.instanceId !== claim.command.instanceId) {
       return yield* failure(
         "model_load_admission_not_published",
         "The admitted model instance was not published to its slot",
         false,
       )
     }
-    return {
-      instanceId: claim.command.instanceId,
-    }
-  })
-
-  const loadModel: ModelSlotControllerApi["loadModel"] = (slotId) => Effect.gen(function* () {
-    const admission = yield* admitModelLoad(slotId)
-    const result = yield* awaitReadyInstance(admission.instanceId)
-    yield* rebuild
-    return result
+    return claim.command.instanceId
   })
 
   const previewModelLoad: ModelSlotControllerApi["previewModelLoad"] = (slotId) =>
@@ -836,13 +944,15 @@ export const ModelSlotControllerLive: Layer.Layer<
         || !sameSelection(slot.selection, target.value.selection)) {
         return yield* reject(slotId, "The slot does not contain a previewable local model")
       }
+      if (slot.availability._tag === "Pending") {
+        return yield* reject(slotId, "The selected local model is still initializing")
+      }
       if (slot.availability._tag === "Unavailable") {
         return yield* new LocalModelMutationFailed(slot.availability.failure)
       }
-      if (Option.exists(slot.instance, (instance) =>
-        instance.lifecycle._tag === "Loading"
-        || instance.lifecycle._tag === "Ready"
-        || instance.lifecycle._tag === "Stopping")) {
+      if (slot.residency._tag === "Loading"
+        || slot.residency._tag === "Ready"
+        || slot.residency._tag === "Stopping") {
         return yield* reject(slotId, "The selected local model already has an active instance")
       }
       const configuration = yield* modelServingConfigurationToIcn(
@@ -859,7 +969,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       return projectModelLoadPlan(plan)
     })
 
-  const stopModel: ModelSlotControllerApi["stopModel"] = (instanceId) =>
+  const stopModelInstance = (instanceId: ModelInstanceId) =>
     client.models.stopModelInstance({
       path: { instance_id: instanceId },
     }).pipe(
@@ -867,101 +977,296 @@ export const ModelSlotControllerLive: Layer.Layer<
       Effect.asVoid,
     )
 
-  const ensureLocalModelReady = (
+  const loadRequestFailure = (error: LocalInferenceError): ModelFailure => {
+    switch (error._tag) {
+      case "LocalModelMutationFailed":
+      case "ModelSlotMutationFailed":
+        return modelFailure(error.code, error.message, error.retryable)
+      case "ModelSlotMutationRejected":
+        return modelFailure("model_load_rejected", error.message, true)
+    }
+  }
+
+  const transitionLoadRequest = (
+    slotId: SlotId,
+    expected: LoadRequest,
+    next: Option.Option<LoadRequest>,
+  ) => commandLock.withPermits(1)(Effect.gen(function* () {
+    const key = slotKey(slotId)
+    const requests = yield* Ref.get(loadRequests)
+    if (!Option.exists(requests[key], (current) => current === expected)) return false
+    yield* Ref.set(loadRequests, { ...requests, [key]: next })
+    yield* rebuild
+    return true
+  }))
+
+  const decideLoadRequest = (
+    slotId: SlotId,
+    request: PendingLoadRequest,
+    current: ControllerAggregate,
+  ): LoadDecision => {
+    const key = slotKey(slotId)
+    const slot = current.snapshot.state.slots[key]
+    if (slot._tag !== "ConfiguredLocal"
+      || !sameSelection(slot.selection, request.selection)) {
+      return { _tag: "Cancelled" }
+    }
+    if (slot.residency._tag === "Loading" || slot.residency._tag === "Ready") {
+      return { _tag: "Satisfied" }
+    }
+    if (slot.residency._tag === "Stopping") return { _tag: "Waiting" }
+    if (slot.residency._tag === "Failed" && !slot.residency.failure.retryable) {
+      return { _tag: "Failed", failure: slot.residency.failure }
+    }
+    if (slot.availability._tag === "Pending") return { _tag: "Waiting" }
+    if (slot.availability._tag === "Unavailable") {
+      if (!slot.availability.failure.retryable) {
+        return { _tag: "Failed", failure: slot.availability.failure }
+      }
+      return Option.exists(current.loadTargets[key], (target) =>
+        sameSelection(target.selection, request.selection))
+        ? { _tag: "Load", waitOnRetryableFailure: true }
+        : { _tag: "Waiting" }
+    }
+    return Option.exists(current.loadTargets[key], (target) =>
+      sameSelection(target.selection, request.selection))
+      ? { _tag: "Load", waitOnRetryableFailure: false }
+      : { _tag: "Waiting" }
+  }
+
+  const awaitLoadDecision = (
+    slotId: SlotId,
+    request: PendingLoadRequest,
+  ): Effect.Effect<Exclude<LoadDecision, { readonly _tag: "Waiting" }>> =>
+    aggregate.changes.pipe(
+      Stream.map((current) => decideLoadRequest(slotId, request, current)),
+      Stream.filter((decision): decision is Exclude<
+        LoadDecision,
+        { readonly _tag: "Waiting" }
+      > => decision._tag !== "Waiting"),
+      Stream.runHead,
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.die("Model-slot state ended before load request completed"),
+        onSome: Effect.succeed,
+      })),
+    )
+
+  const runLoadRequest = (
+    slotId: SlotId,
+    request: PendingLoadRequest,
+  ): Effect.Effect<void> => Effect.suspend(() => Effect.gen(function* () {
+    const decision = yield* Effect.raceFirst(
+      Deferred.await(request.cancellation).pipe(
+        Effect.as({ _tag: "Cancelled" } as const),
+      ),
+      awaitLoadDecision(slotId, request),
+    )
+    if (decision._tag === "Cancelled" || decision._tag === "Satisfied") {
+      yield* transitionLoadRequest(slotId, request, Option.none())
+      return
+    }
+    if (decision._tag === "Failed") {
+      yield* transitionLoadRequest(slotId, request, Option.some({
+        _tag: "Failed",
+        selection: request.selection,
+        failure: decision.failure,
+      }))
+      return
+    }
+    if (Option.isSome(yield* Deferred.poll(request.cancellation))) {
+      yield* transitionLoadRequest(slotId, request, Option.none())
+      return
+    }
+
+    const admission = yield* Effect.exit(admitModelLoad(slotId, request.selection))
+    if (Exit.isFailure(admission)) {
+      const typed = Cause.failureOption(admission.cause)
+      const requestFailure = Option.match(typed, {
+        onNone: () => modelFailure(
+          "model_load_request_failed",
+          Cause.pretty(admission.cause),
+          false,
+        ),
+        onSome: loadRequestFailure,
+      })
+      if (decision.waitOnRetryableFailure && requestFailure.retryable) {
+        const failedAtRevision = (yield* SubscriptionRef.get(aggregate)).snapshot.revision
+        const resumed = yield* Effect.raceFirst(
+          Deferred.await(request.cancellation).pipe(Effect.as("Cancelled" as const)),
+          aggregate.changes.pipe(
+            Stream.filter(({ snapshot }) => snapshot.revision > failedAtRevision),
+            Stream.runHead,
+            Effect.as("Changed" as const),
+          ),
+        )
+        if (resumed === "Changed") return yield* runLoadRequest(slotId, request)
+        yield* transitionLoadRequest(slotId, request, Option.none())
+        return
+      }
+      yield* transitionLoadRequest(slotId, request, Option.some({
+        _tag: "Failed",
+        selection: request.selection,
+        failure: requestFailure,
+      }))
+      return
+    }
+
+    const cancelled = Option.isSome(yield* Deferred.poll(request.cancellation))
+    yield* transitionLoadRequest(slotId, request, Option.none())
+    if (cancelled) {
+      yield* stopModelInstance(admission.value).pipe(
+        Effect.catchAll((error) => Effect.logWarning(
+          "Cancelled model load request could not stop its admitted instance",
+        ).pipe(Effect.annotateLogs({ slotId, error: error.message }))),
+      )
+    }
+  })).pipe(
+    Effect.catchAllCause((cause) => Cause.isInterruptedOnly(cause)
+      ? Effect.void
+      : transitionLoadRequest(
+          slotId,
+          request,
+          Option.some({
+            _tag: "Failed",
+            selection: request.selection,
+            failure: modelFailure("model_load_request_failed", Cause.pretty(cause), false),
+          }),
+        ).pipe(Effect.asVoid)),
+  )
+
+  const loadModel: ModelSlotControllerApi["loadModel"] = (slotId) =>
+    Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+      yield* restore(rebuild)
+      yield* restore(commandLock.withPermits(1)(Effect.gen(function* () {
+        const key = slotKey(slotId)
+        const current = yield* SubscriptionRef.get(aggregate)
+        const slot = current.snapshot.state.slots[key]
+        if (slot._tag === "Unassigned") {
+          return yield* reject(slotId, "Select a model before requesting a load")
+        }
+        if (slot._tag === "ConfiguredRemote") {
+          return yield* reject(slotId, "The selected remote model does not require loading")
+        }
+        if (slot.residency._tag === "Requested"
+          || slot.residency._tag === "Loading"
+          || slot.residency._tag === "Ready") return
+
+        const requests = yield* Ref.get(loadRequests)
+        const existing = requests[key]
+        if (Option.exists(existing, (request) =>
+          request._tag === "Pending"
+          && sameSelection(request.selection, slot.selection))) return
+        const request: PendingLoadRequest = {
+          _tag: "Pending",
+          selection: slot.selection,
+          cancellation: yield* Deferred.make<void>(),
+        }
+        yield* Effect.uninterruptible(Effect.gen(function* () {
+          if (Option.isSome(existing) && existing.value._tag === "Pending") {
+            yield* Deferred.succeed(existing.value.cancellation, undefined)
+          }
+          yield* Ref.set(loadRequests, {
+            ...requests,
+            [key]: Option.some(request),
+          })
+          yield* rebuild
+          yield* Effect.forkIn(
+            Effect.interruptible(runLoadRequest(slotId, request)),
+            scope,
+          )
+        }))
+      })))
+    }))
+
+  const stopModel: ModelSlotControllerApi["stopModel"] = (slotId) =>
+    Effect.gen(function* () {
+      const instanceId = yield* commandLock.withPermits(1)(Effect.gen(function* () {
+        const slot = (yield* SubscriptionRef.get(aggregate)).snapshot.state.slots[slotKey(slotId)]
+        if (slot._tag === "Unassigned") {
+          return yield* reject(slotId, "Select a model before requesting a stop")
+        }
+        if (slot._tag === "ConfiguredRemote") {
+          return yield* reject(slotId, "The selected remote model does not run locally")
+        }
+        switch (slot.residency._tag) {
+          case "Requested":
+            yield* clearLoadRequestUnsafe(slotId)
+            yield* rebuild
+            return Option.none<ModelInstanceId>()
+          case "Loading":
+          case "Ready":
+            yield* clearLoadRequestUnsafe(slotId)
+            yield* rebuild
+            return Option.some(slot.residency.instanceId)
+          case "Stopping":
+            return Option.none<ModelInstanceId>()
+          case "Unloaded":
+          case "Failed":
+            return yield* reject(slotId, "No selected model load is active")
+        }
+      }))
+      if (Option.isSome(instanceId)) yield* stopModelInstance(instanceId.value)
+    })
+
+  const awaitLocalModelReady = (
     slotId: SlotId,
     providerModelId: ProviderModelId,
-  ): Effect.Effect<ModelLoadResult, LocalInferenceError> =>
-    Effect.suspend(() => Effect.gen(function* () {
-      yield* rebuild
-      const current = yield* SubscriptionRef.get(aggregate)
+  ): Effect.Effect<ModelLoadResult, LocalInferenceError> => {
+    const evaluate = (
+      current: ControllerAggregate,
+    ): Effect.Effect<Option.Option<ModelLoadResult>, LocalInferenceError> => Effect.gen(function* () {
       const slot = current.snapshot.state.slots[slotKey(slotId)]
       if (slot._tag !== "ConfiguredLocal"
+        || slot.selection.providerId !== LOCAL_PROVIDER_ID
         || slot.selection.providerModelId !== providerModelId) {
         return yield* reject(slotId, "The local request no longer matches the selected slot")
       }
-
-      if (Option.isSome(slot.instance)) {
-        const instance = slot.instance.value
-        switch (instance.lifecycle._tag) {
-          case "Ready":
-            return {
-              _tag: "Ready" as const,
-              instanceId: instance.id,
-              configurationId: instance.configurationId,
-            }
-          case "Loading": {
-            const terminal = yield* awaitInstance(
-              instance.id,
-              (observed) => observed.lifecycle._tag === "Ready"
-                || observed.lifecycle._tag === "Stopped"
-                || observed.lifecycle._tag === "Failed",
-            )
-            if (terminal.lifecycle._tag === "Failed") {
-              return yield* failure(
-                terminal.lifecycle.failure.code,
-                terminal.lifecycle.failure.message,
-                terminal.lifecycle.failure.retryable,
-              )
-            }
-            if (terminal.lifecycle._tag === "Stopped") {
-              return {
-                _tag: "Cancelled" as const,
-                instanceId: ModelInstanceIdSchema.make(terminal.id),
-                reason: terminal.lifecycle.reason,
-              }
-            }
-            return yield* ensureLocalModelReady(slotId, providerModelId)
-          }
-          case "Stopping": {
-            const terminal = yield* awaitInstance(
-              instance.id,
-              (observed) => observed.lifecycle._tag === "Stopped"
-                || observed.lifecycle._tag === "Failed",
-            )
-            if (terminal.lifecycle._tag === "Stopped") {
-              return {
-                _tag: "Cancelled" as const,
-                instanceId: ModelInstanceIdSchema.make(terminal.id),
-                reason: terminal.lifecycle.reason,
-              }
-            }
-            if (terminal.lifecycle._tag === "Failed") {
-              return yield* failure(
-                terminal.lifecycle.failure.code,
-                terminal.lifecycle.failure.message,
-                terminal.lifecycle.failure.retryable,
-              )
-            }
-            return yield* failure(
-              "invalid_model_instance_terminal_state",
-              "Model-instance observation returned before stopping completed",
-              false,
-            )
-          }
-          case "Failed":
-            if (!instance.lifecycle.failure.retryable) {
-              return yield* failure(
-                instance.lifecycle.failure.code,
-                instance.lifecycle.failure.message,
-                false,
-              )
-            }
-            break
-          case "Stopped":
-            break
-        }
+      switch (slot.residency._tag) {
+        case "Ready":
+          return Option.some({
+            _tag: "Ready" as const,
+            instanceId: slot.residency.instanceId,
+            configurationId: slot.residency.configurationId,
+          })
+        case "Requested":
+        case "Loading":
+        case "Stopping":
+          return Option.none()
+        case "Failed":
+          return yield* failure(
+            slot.residency.failure.code,
+            slot.residency.failure.message,
+            slot.residency.failure.retryable,
+          )
+        case "Unloaded":
+          return Option.some({
+            _tag: "Cancelled" as const,
+            reason: "user_stop",
+          })
       }
+    })
 
-      const result = yield* loadModel(slotId)
-      if (result._tag === "Cancelled") return result
-      return yield* ensureLocalModelReady(slotId, providerModelId)
-    }))
+    return aggregate.changes.pipe(
+      Stream.mapEffect(evaluate),
+      Stream.filterMap((result) => result),
+      Stream.runHead,
+      Effect.flatMap(Option.match({
+        onNone: () => failure(
+          "model_slot_observation_ended",
+          "Model-slot observation ended before the requested model became ready",
+          false,
+        ),
+        onSome: Effect.succeed,
+      })),
+    )
+  }
 
   const acquireLocalModel: ModelSlotControllerApi["acquireLocalModel"] = (
     slotId,
     providerModelId,
   ) => Effect.gen(function* () {
-    const result = yield* ensureLocalModelReady(slotId, providerModelId)
+    yield* loadModel(slotId)
+    const result = yield* awaitLocalModelReady(slotId, providerModelId)
     if (result._tag === "Ready") {
       yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
         instanceId: result.instanceId,
@@ -984,7 +1289,8 @@ export const ModelSlotControllerLive: Layer.Layer<
         if (Option.isNone(normalized) && previous._tag === "Unassigned") return previous
         if (Option.isSome(normalized) && previous._tag !== "Unassigned"
           && sameSelection(previous.selection, normalized.value)) return previous
-        yield* configuration.updateSlot(slotId, normalized).pipe(
+        yield* clearLoadRequestUnsafe(slotId)
+        yield* modelSelection.updateSlot(slotId, normalized).pipe(
           Effect.mapError((error) => new ModelSlotMutationFailed({
             slotId,
             code: "model_slot_persistence_failed",
@@ -995,24 +1301,26 @@ export const ModelSlotControllerLive: Layer.Layer<
         yield* rebuild
         return previous
       }))
-      if (previous._tag === "ConfiguredLocal" && Option.isSome(previous.instance)) {
-        const configured = (yield* configuration.get).slots
+      if (previous._tag === "ConfiguredLocal"
+        && (previous.residency._tag === "Loading"
+          || previous.residency._tag === "Ready")) {
+        const configured = (yield* modelSelection.get).slots
         const stillSelected = [configured.primary, configured.secondary].some((candidate) =>
           Option.exists(candidate, (value) =>
             value.providerId === LOCAL_PROVIDER_ID
             && value.providerModelId === previous.selection.providerModelId))
         if (!stillSelected) {
-          yield* stopModel(previous.instance.value.id).pipe(
+          yield* Effect.forkIn(stopModelInstance(previous.residency.instanceId).pipe(
             Effect.catchAll((error) => Effect.logWarning("Follow-up local model stop failed").pipe(
               Effect.annotateLogs({ slotId, error: error.message }),
             )),
-          )
+          ), scope)
         }
       }
     })
 
   const setModelFavorite: ModelSlotControllerApi["setModelFavorite"] = (model, favorite) =>
-    configuration.setFavorite(model, favorite).pipe(
+    modelSelection.setFavorite(model, favorite).pipe(
       Effect.mapError(() => new ModelPreferenceMutationFailed({
         message: "Failed to save model favorite",
       })),
@@ -1034,11 +1342,8 @@ export const ModelSlotControllerLive: Layer.Layer<
       Stream.changesWith(sameConfigStateValue),
     ),
     acquireLocalModel,
-    ensureLocalModelReady: (slotId, providerModelId) =>
-      ensureLocalModelReady(slotId, providerModelId),
     updateModelSlot,
     setModelFavorite,
-    admitModelLoad,
     loadModel,
     previewModelLoad,
     stopModel,

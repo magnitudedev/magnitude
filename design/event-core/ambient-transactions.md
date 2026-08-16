@@ -38,6 +38,9 @@ Their invalidation subscription is active before the initial snapshot begins, so
 that boundary cannot be lost while the consumer transitions from its snapshot to its change stream.
 Code already executing inside that transaction may use projection reads without waiting on itself.
 Raw subscription references remain observation primitives rather than transactional read boundaries.
+Fork-specific consumers use the projection's fork-change stream, which emits the current fork and
+re-reads it through the transactional accessor after each invalidation. Consumers do not combine a
+raw full-projection subscription with independent fork reads themselves.
 
 Ambient domain values do not carry synchronization revisions. Transaction coordination is
 process-local event-core state and is not serialized into events, projections, or protocol

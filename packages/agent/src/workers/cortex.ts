@@ -21,7 +21,7 @@ import { WindowProjection } from '../window'
 import { SessionContextProjection } from '../projections/session-context'
 import { AgentLifecycleProjection, getAgentByForkId } from '../projections/agent-lifecycle'
 import { HarnessStateProjection } from '../projections/harness-state'
-import { AgentToolkitProjection, readCoherentAgentToolkit } from '../projections/agent-toolkit'
+import { awaitSettledAgentToolkit } from '../projections/agent-toolkit'
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { MAX_RETRIES } from '../util/retry-backoff'
 
@@ -59,8 +59,6 @@ import { isToolKey, type ToolKey } from '../tools/toolkits'
 
 import { buildStandardHooks } from '../execution/harness-hooks'
 import { TurnContextTag } from '../engine/turn-context'
-import { ConfigAmbient } from '../ambient/config-ambient'
-import { getSlotConfigForRole } from '../ambient/config-ambient'
 import { ImageQueryTarget } from '../tools/query-image'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
 import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
@@ -145,14 +143,38 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // ──────────────────────────────────────────────────────────────────────
         // 2. Resolve model
         // ──────────────────────────────────────────────────────────────────────
+        const { slot: activeSlot, toolkit: toolkitState } = yield* awaitSettledAgentToolkit(
+          forkId,
+          roleId,
+        )
+        if (activeSlot._tag === 'Unassigned' || activeSlot._tag === 'Unavailable') {
+          const failure = activeSlot._tag === 'Unavailable'
+            ? activeSlot.failure
+            : {
+                code: 'model_slot_unassigned',
+                message: `No model is selected for the ${activeSlot.slotId} slot.`,
+                retryable: false,
+              }
+          yield* publish({
+            type: 'turn_outcome', forkId, turnId, chainId,
+            strategyId: 'native',
+            outcome: { _tag: 'ModelNotReady', failure, requestId: null },
+            commitPolicy: { _tag: 'commitErrorOnly' },
+            inputTokens: null, outputTokens: null,
+            cacheReadTokens: null, cacheWriteTokens: null,
+            cost: null,
+            providerId: null, modelId: null,
+            generationPerformance: null,
+          })
+          return
+        }
         const ambientService = yield* AmbientServiceTag
-        const { config: configState, toolkit: toolkitState } = yield* readCoherentAgentToolkit(read, forkId)
         const modelResolver = yield* AgentModelResolver
         const agentId = forkId
           ? getAgentByForkId(agentState, forkId)?.agentId ?? '000000000000'
           : '000000000000'
-        const activeSlot = getSlotConfigForRole(configState, roleId)
-        const agentModel = yield* modelResolver.resolveSlotConfig(activeSlot, agentId, roleId)
+        const activeSlotConfig = activeSlot.config
+        const agentModel = yield* modelResolver.resolveSlotConfig(activeSlotConfig, agentId, roleId)
 
         // ──────────────────────────────────────────────────────────────────────
         // 3. Observations
@@ -204,7 +226,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const turnContextLayer = Layer.succeed(TurnContextTag, { turnId, chainId, forkId })
         // Opposite-slot image queries are temporarily disabled with the secondary model.
         // const activeSlotId = ROLE_TO_SLOT[roleId]
-        // const otherSlot = getSlotConfigOrNull(configState, activeSlotId === 'primary' ? 'secondary' : 'primary')
+        // const otherSlot = getSlotConfigOrNull(toolkitState.config, activeSlotId === 'primary' ? 'secondary' : 'primary')
         const turnLayer = Layer.merge(Layer.merge(forkLayer, turnContextLayer), Layer.succeed(ImageQueryTarget, { slot: null }))
 
         // Record turn-start checkpoint — captures state at the turn boundary
@@ -257,7 +279,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         })
 
         const timezone = sessionCtx.context?.timezone ?? null
-        const formatter = createAgentFormatter(createToolResultFormatter(toolkit), { includeImageData: activeSlot.vision === true })
+        const formatter = createAgentFormatter(createToolResultFormatter(toolkit), { includeImageData: activeSlotConfig.vision === true })
 
         const rawPrompt = windowToPrompt({
           windowState,
@@ -266,9 +288,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           formatter,
           autopilotEnabled: windowState.autopilotEnabled,
           leaderLastAutopilotKnowledge: windowState.consumerAutopilotKnowledge.leader,
-          includeImageData: activeSlot.vision === true,
+          includeImageData: activeSlotConfig.vision === true,
         })
-        const prompt = activeSlot.vision === true
+        const prompt = activeSlotConfig.vision === true
           ? rawPrompt
           : normalizeVision(rawPrompt, () => '')
 

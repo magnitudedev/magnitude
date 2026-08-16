@@ -35,15 +35,15 @@ export const RecentChatEntry = memo(function RecentChatEntry({
         flexDirection: 'row',
         paddingLeft: 1,
         paddingRight: 1,
-        backgroundColor: isSelected ? theme.surface : undefined,
+        backgroundColor: isSelected ? theme.background.selected : undefined,
       }}
     >
-      <text style={{ fg: isSelected ? theme.primary : theme.foreground, flexGrow: 1 }}>
+      <text style={{ fg: isSelected ? theme.accent : theme.text.body, flexGrow: 1 }}>
         <span attributes={TextAttributes.BOLD}>
           {isSelected ? '> ' : '  '}{displayTitle}
         </span>
       </text>
-      <text style={{ fg: theme.muted, flexShrink: 0 }}>
+      <text style={{ fg: theme.text.metadata, flexShrink: 0 }}>
         {' '}{messageLabel} · {timeStr}
       </text>
     </Button>

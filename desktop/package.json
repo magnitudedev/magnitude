@@ -5,7 +5,8 @@
   "main": "out/main/main.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "electron-vite build"
+    "build": "electron-vite build",
+    "test": "bunx --bun vitest run"
   },
   "dependencies": {
     "@effect/platform": "^0.96.1",

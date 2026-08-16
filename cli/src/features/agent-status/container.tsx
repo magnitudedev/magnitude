@@ -13,8 +13,7 @@ import {
   isDisplayRootStatusActive,
   type LocalModelLoadActivity,
 } from '@magnitudedev/client-common'
-import { type ModelInstanceId } from '@magnitudedev/sdk'
-import type { TaskDisplayRow, InterruptedMessage } from '@magnitudedev/sdk'
+import type { TaskDisplayRow, InterruptedMessage, SlotId } from '@magnitudedev/sdk'
 import { ActivityRail } from './activity-rail'
 import { ActivityRailSlot } from './activity-rail-slot'
 import { TaskList } from './task-list'
@@ -27,7 +26,7 @@ export function ActivityRailContainer({
   agentActivityEnabled = true,
 }: {
   readonly modelLoadActivity: LocalModelLoadActivity | null
-  readonly onStopModel: (instanceId: ModelInstanceId) => void
+  readonly onStopModel: (slotId: SlotId) => void
   readonly width: number
   readonly agentActivityEnabled?: boolean
 }): ReactNode {
@@ -59,7 +58,7 @@ export function ActivityRailContainer({
   }
 
   return (
-    <ActivityRailSlot width={slotWidth} color={theme.modeDefault}>
+    <ActivityRailSlot width={slotWidth} color={theme.accent}>
       <ActivityRail
         status={agentActivityEnabled ? rootStatus : null}
         width={activityWidth}

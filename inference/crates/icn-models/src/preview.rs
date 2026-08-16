@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::cache::{ModelBlobKind, ModelCacheWorkspace, ModelIndexKind};
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
-use crate::inventory::{ModelManager, build_model, now};
+use crate::inventory::{ManagedModelStore, build_model, now};
 
 const INITIAL_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 128 * 1024 * 1024;
@@ -50,7 +50,7 @@ struct CachedHuggingFaceRepositorySnapshot {
 }
 
 pub struct ModelPreviewService {
-    models: Arc<ModelManager>,
+    models: Arc<ManagedModelStore>,
     assessor: Arc<dyn ResolvedModelAssessor>,
     http: reqwest::Client,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -63,7 +63,7 @@ pub struct ModelPreviewService {
 
 impl ModelPreviewService {
     #[must_use]
-    pub fn new(models: Arc<ModelManager>, assessor: Arc<dyn ResolvedModelAssessor>) -> Self {
+    pub fn new(models: Arc<ManagedModelStore>, assessor: Arc<dyn ResolvedModelAssessor>) -> Self {
         let http = models.http.clone();
         Self {
             models,
@@ -271,7 +271,7 @@ impl ModelPreviewService {
 }
 
 pub async fn refresh_hugging_face_repository(
-    models: &Arc<ModelManager>,
+    models: &Arc<ManagedModelStore>,
     request: HuggingFaceRepositoryRequest,
 ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
     validate_repository_request(&request)?;
@@ -749,7 +749,7 @@ enum HubModelFetch {
 }
 
 async fn refresh_hub_repository_snapshot(
-    models: &ModelManager,
+    models: &ManagedModelStore,
     http: &reqwest::Client,
     endpoint: &str,
     request: HuggingFaceRepositoryRequest,
@@ -909,7 +909,7 @@ struct SelectedComponent<'a> {
     relationship: Option<ComponentRelationship>,
 }
 
-impl ModelManager {
+impl ManagedModelStore {
     fn cached_preview_artifact(&self, source: &ModelPreviewSource) -> Option<CachedArtifact> {
         let evidence = serde_json::to_string(source).ok()?;
         self.cache
@@ -1947,9 +1947,10 @@ mod tests {
                     cpu_model: None,
                     logical_cores: 1,
                     system_memory: icn_contracts::HardwareSystemMemory {
-                        total_bytes: 1,
-                        current_available_bytes: 1,
-                        warning_reserve_bytes: 0,
+                        physical_capacity_bytes: 1,
+                        physical_available_bytes: 1,
+                        allocation_capacity_bytes: 1,
+                        allocation_headroom_bytes: 1,
                         assess_reserve_bytes: 0,
                         abort_reserve_bytes: 0,
                     },
@@ -2167,10 +2168,12 @@ mod tests {
             crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
                 .unwrap();
         config.hf_cache_dirs.clear();
-        let manager =
-            ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))
-                .await
-                .unwrap();
+        let manager = ManagedModelStore::open_with_template_assessor(
+            config,
+            Some(Arc::new(TestTemplateAssessor)),
+        )
+        .await
+        .unwrap();
         let _ = fs::remove_dir_all(&cache_root);
         fs::write(&cache_root, b"not a directory").unwrap();
 
@@ -2256,7 +2259,7 @@ mod tests {
                 icn_contracts::ModelPreviewComponentSource {
                     path: PathBuf::from("draft.gguf"),
                     role: icn_contracts::ModelPreviewComponentRole::Draft {
-                        method: icn_contracts::models::SpeculativeMethod::DraftDFlash,
+                        method: icn_contracts::models::SpeculativeMethod::DFlash,
                     },
                 },
             ],
@@ -2337,7 +2340,7 @@ mod tests {
         )
         .unwrap();
         config.hf_cache_dirs.clear();
-        let manager = ModelManager::open(config).await.unwrap();
+        let manager = ManagedModelStore::open(config).await.unwrap();
         let assessment = HardwareAssessment::Fits {
             profile: icn_contracts::HardwareProfile {
                 context_length: 4096,
@@ -2432,9 +2435,12 @@ mod tests {
                 .unwrap();
         config.hf_cache_dirs.clear();
         let manager = Arc::new(
-            ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))
-                .await
-                .unwrap(),
+            ManagedModelStore::open_with_template_assessor(
+                config,
+                Some(Arc::new(TestTemplateAssessor)),
+            )
+            .await
+            .unwrap(),
         );
         let source = ModelPreviewSource {
             repository: "owner/repository".to_owned(),
@@ -2530,10 +2536,12 @@ mod tests {
         )
         .unwrap();
         config.hf_cache_dirs.clear();
-        let manager =
-            ModelManager::open_with_template_assessor(config, Some(Arc::new(TestTemplateAssessor)))
-                .await
-                .unwrap();
+        let manager = ManagedModelStore::open_with_template_assessor(
+            config,
+            Some(Arc::new(TestTemplateAssessor)),
+        )
+        .await
+        .unwrap();
 
         for (index, fixture) in fixtures.into_iter().enumerate() {
             let inspection = crate::gguf::inspect(&fixture).unwrap();

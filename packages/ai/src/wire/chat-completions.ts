@@ -99,7 +99,7 @@ export interface ChatCompletionsRequest {
   }
 }
 
-const ChatToolCallDelta = Schema.Struct({
+export const ChatToolCallDeltaSchema = Schema.Struct({
   index: Schema.Number,
   id: Schema.optional(Schema.NullOr(Schema.String)),
   type: Schema.optional(Schema.NullOr(Schema.Literal("function"))),
@@ -113,14 +113,14 @@ const ChatToolCallDelta = Schema.Struct({
   ),
 })
 
-const ChatChunkDelta = Schema.Struct({
+export const ChatChunkDeltaSchema = Schema.Struct({
   role: Schema.optional(Schema.NullOr(Schema.String)),
   content: Schema.optional(Schema.NullOr(Schema.String)),
   reasoning_content: Schema.optional(Schema.NullOr(Schema.String)),
-  tool_calls: Schema.optional(Schema.NullOr(Schema.Array(ChatToolCallDelta))),
+  tool_calls: Schema.optional(Schema.NullOr(Schema.Array(ChatToolCallDeltaSchema))),
 })
 
-const ChatChunkLogprobs = Schema.Struct({
+export const ChatChunkLogprobsSchema = Schema.Struct({
   content: Schema.optional(Schema.NullOr(Schema.Array(Schema.Struct({
     token: Schema.String,
     logprob: Schema.Number,
@@ -131,14 +131,7 @@ const ChatChunkLogprobs = Schema.Struct({
   })))),
 })
 
-const ChatChunkChoice = Schema.Struct({
-  index: Schema.Number,
-  delta: ChatChunkDelta,
-  finish_reason: Schema.optional(Schema.NullOr(Schema.String)),
-  logprobs: Schema.optional(Schema.NullOr(ChatChunkLogprobs)),
-})
-
-const ChatChunkUsage = Schema.Struct({
+export const ChatChunkUsageSchema = Schema.Struct({
   prompt_tokens: Schema.Number,
   completion_tokens: Schema.Number,
   prompt_tokens_details: Schema.optional(
@@ -151,15 +144,20 @@ const ChatChunkUsage = Schema.Struct({
   cost: Schema.optional(Schema.Number),
 })
 
-export class ChatCompletionsStreamChunk extends Schema.Class<ChatCompletionsStreamChunk>(
-  "ChatCompletionsStreamChunk",
-)({
+export const chatCompletionsStreamChunkFields = <A, I, R>(
+  delta: Schema.Schema<A, I, R>,
+) => ({
   id: Schema.String,
   object: Schema.String,
   created: Schema.Number,
   model: Schema.String,
-  choices: Schema.Array(ChatChunkChoice),
-  usage: Schema.optional(Schema.NullOr(ChatChunkUsage)),
+  choices: Schema.Array(Schema.Struct({
+    index: Schema.Number,
+    delta,
+    finish_reason: Schema.optional(Schema.NullOr(Schema.String)),
+    logprobs: Schema.optional(Schema.NullOr(ChatChunkLogprobsSchema)),
+  })),
+  usage: Schema.optional(Schema.NullOr(ChatChunkUsageSchema)),
   raw_input: Schema.optional(
     Schema.Array(
       Schema.Struct({
@@ -194,4 +192,8 @@ export class ChatCompletionsStreamChunk extends Schema.Class<ChatCompletionsStre
       }),
     ),
   ),
-}) {}
+})
+
+export class ChatCompletionsStreamChunk extends Schema.Class<ChatCompletionsStreamChunk>(
+  "ChatCompletionsStreamChunk",
+)(chatCompletionsStreamChunkFields(ChatChunkDeltaSchema)) {}

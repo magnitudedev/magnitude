@@ -1,67 +1,125 @@
-import { Effect, Option } from "effect"
+import { Effect, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 
 import {
-  clearAssessmentLifecycle,
-  completeAssessmentLifecycle,
+  correlateLocalModelAssessmentProfiles,
   formatLocalModelAssessmentFailure,
   localModelAssessmentProfiles,
   localModelAssessmentResultFromIcn,
   performanceSampleContextTokens,
+  type LocalModelAssessment,
 } from "./local-model-assessments"
 import {
   AssessmentEnvironmentIdSchema,
-  ModelAssessmentIdSchema,
-  ModelOfferingTargetIdSchema,
+  ModelPackageSchema,
   ModelServingConfigurationIdSchema,
-  type ModelOfferingTarget,
+  ServableModelBundleSchema,
+  type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
+import {
+  ModelServingConfiguration as NativeModelServingConfigurationSchema,
+  type ModelServingConfiguration as NativeModelServingConfiguration,
+} from "@magnitudedev/icn-protocol/schemas"
 
-const packageTarget = (maximumContextLength: number): ModelOfferingTarget => ({
-  _tag: "Package",
-  package: { properties: { maximumContextLength } },
-} as unknown as ModelOfferingTarget)
+const modelPackage = (id: string, maximumContextLength: number) =>
+  Schema.decodeUnknownSync(ModelPackageSchema)({
+    id,
+    source: { _tag: "Local", path: `/models/${id}.gguf` },
+    files: [{
+      id: `file-${id}`,
+      path: `${id}.gguf`,
+      role: "weights",
+      sizeBytes: 1,
+      sha256: "a".repeat(64),
+    }],
+    relationships: [],
+    properties: {
+      format: "gguf",
+      quantization: "Q4_K_M",
+      quantizationName: "4-bit",
+      architecture: "test",
+      maximumContextLength,
+    },
+  })
+
+const standaloneBundle = (maximumContextLength: number): ServableModelBundle =>
+  Schema.validateSync(ServableModelBundleSchema)({
+    _tag: "Standalone",
+    package: modelPackage("package-test", maximumContextLength),
+  })
 
 describe("localModelAssessmentProfiles", () => {
-  it("caps every local model at the 100K baseline", () => {
-    expect(localModelAssessmentProfiles(packageTarget(131_072))).toEqual([
+  it("defaults discovered local models to the 100K baseline", () => {
+    expect(localModelAssessmentProfiles(standaloneBundle(131_072))).toEqual([
       { contextLength: 100_000 },
     ])
-    expect(localModelAssessmentProfiles(packageTarget(300_000))).toEqual([
+    expect(localModelAssessmentProfiles(standaloneBundle(300_000))).toEqual([
       { contextLength: 100_000 },
     ])
   })
 
+  it("uses the catalog context when provided", () => {
+    expect(localModelAssessmentProfiles(standaloneBundle(131_072), 50_000)).toEqual([
+      { contextLength: 50_000 },
+    ])
+  })
+
+  it("bounds a catalog context by the bundle maximum", () => {
+    expect(localModelAssessmentProfiles(standaloneBundle(40_000), 50_000)).toEqual([
+      { contextLength: 40_000 },
+    ])
+  })
+
   it("uses the model maximum when it is below the local baseline", () => {
-    expect(localModelAssessmentProfiles(packageTarget(80_000))).toEqual([
+    expect(localModelAssessmentProfiles(standaloneBundle(80_000))).toEqual([
       { contextLength: 80_000 },
     ])
   })
 
   it("uses the lower package limit for speculative decoding", () => {
-    const target = {
-      _tag: "SpeculativeDecodingPair",
-      target: { properties: { maximumContextLength: 131_072 } },
-      draft: { properties: { maximumContextLength: 32_768 } },
-    } as unknown as ModelOfferingTarget
+    const target = Schema.validateSync(ServableModelBundleSchema)({
+      _tag: "SpeculativeDecoding",
+      target: modelPackage("target", 131_072),
+      draftSource: {
+        _tag: "Separate",
+        draft: modelPackage("draft", 32_768),
+      },
+      method: { _tag: "DFlash" },
+    })
     expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 32_768 },
     ])
   })
 
-  it("caps a speculative pair when both package limits exceed 100K", () => {
-    const target = {
-      _tag: "SpeculativeDecodingPair",
-      target: { properties: { maximumContextLength: 262_144 } },
-      draft: { properties: { maximumContextLength: 131_072 } },
-    } as unknown as ModelOfferingTarget
+  it("caps separately paired speculative packages when both limits exceed 100K", () => {
+    const target = Schema.validateSync(ServableModelBundleSchema)({
+      _tag: "SpeculativeDecoding",
+      target: modelPackage("target", 262_144),
+      draftSource: {
+        _tag: "Separate",
+        draft: modelPackage("draft", 131_072),
+      },
+      method: { _tag: "DSpark" },
+    })
     expect(localModelAssessmentProfiles(target)).toEqual([
       { contextLength: 100_000 },
     ])
   })
 
+  it("uses only the target package limit for embedded speculative decoding", () => {
+    const target = Schema.validateSync(ServableModelBundleSchema)({
+      _tag: "SpeculativeDecoding",
+      target: modelPackage("target", 80_000),
+      draftSource: { _tag: "Embedded" },
+      method: { _tag: "Mtp" },
+    })
+    expect(localModelAssessmentProfiles(target)).toEqual([
+      { contextLength: 80_000 },
+    ])
+  })
+
   it("does not invent a profile below the product minimum", () => {
-    expect(localModelAssessmentProfiles(packageTarget(2_048))).toEqual([])
+    expect(localModelAssessmentProfiles(standaloneBundle(2_048))).toEqual([])
   })
 })
 
@@ -84,66 +142,46 @@ describe("performanceSampleContextTokens", () => {
   })
 })
 
-describe("assessment lifecycle", () => {
-  const targetId = ModelOfferingTargetIdSchema.make("target-test")
-  const current = new Map([[targetId, {
-    _tag: "Assessing" as const,
-  }]])
-
-  it("clears active state when its serialized owner exits", () => {
-    expect(clearAssessmentLifecycle(current, [targetId]).get(targetId)).toEqual({
-      _tag: "Unassessed",
-    })
-  })
-
-  it("terminalizes completed assessment state", () => {
-    const configurationId = ModelServingConfigurationIdSchema.make("configuration-test")
-    const completed = [{
-      _tag: "Assessed" as const,
-      targetId,
-      environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
-      assessments: [{
-        _tag: "DoesNotFit" as const,
-        profile: { contextLength: 100_000 },
-        configurationId,
-        assessmentId: ModelAssessmentIdSchema.make("assessment-test"),
-        memory: [],
-        deficitBytes: 1,
-        limitingResource: "system",
-      }],
-    }]
-    expect(completeAssessmentLifecycle(
-      current,
-      [targetId],
-      completed,
-    ).get(targetId)).toEqual({
-      _tag: "Assessed",
-      environmentId: "environment-test",
-      configurationIds: [configurationId],
-    })
-  })
-})
-
 describe("localModelAssessmentResultFromIcn", () => {
   const environmentId = AssessmentEnvironmentIdSchema.make("environment-test")
+  const assessmentBundle = standaloneBundle(100_000)
+  const nativeConfiguration = (
+    id: string,
+    contextLength: number,
+  ): NativeModelServingConfiguration => Schema.validateSync(
+    NativeModelServingConfigurationSchema,
+  )({ id, bundle: assessmentBundle, profile: { contextLength } })
+
+  it("preserves a request-local operational failure", () => {
+    const failure = {
+      code: "planning_worker_defect",
+      message: "failed to create llama context",
+      retryable: true,
+    }
+    const result = Effect.runSync(localModelAssessmentResultFromIcn({
+      _tag: "Failed",
+      requestId: "assessment-failed",
+      failure,
+    }, environmentId))
+
+    expect(result).toEqual({ _tag: "Failed", failure })
+  })
 
   it("preserves terminal non-capacity assessment evidence", () => {
     const result = Effect.runSync(localModelAssessmentResultFromIcn({
       _tag: "Assessed",
       requestId: "assessment-0",
-      targetId: "target-0",
       profiles: [{
         _tag: "DoesNotFit",
-        profile: { contextLength: 50_000 },
-        configurationId: "configuration-0",
+        configuration: nativeConfiguration("configuration-0", 50_000),
         assessmentId: "assessment-result-0",
         memory: [],
+        totalRequiredBytes: 0,
         limitingResource: "system_memory",
         deficitBytes: 1024,
       }, {
         _tag: "Incompatible",
-        profile: { contextLength: 100_000 },
-        configurationId: "configuration-1",
+        configuration: nativeConfiguration("configuration-1", 100_000),
         failure: {
           code: "unsupported_architecture",
           message: "Unsupported architecture",
@@ -154,20 +192,26 @@ describe("localModelAssessmentResultFromIcn", () => {
 
     expect(result).toEqual({
       _tag: "Assessed",
-      targetId: "target-0",
       environmentId,
       assessments: [{
         _tag: "DoesNotFit",
-        profile: { contextLength: 50_000 },
-        configurationId: "configuration-0",
+        configuration: {
+          id: "configuration-0",
+          bundle: assessmentBundle,
+          profile: { contextLength: 50_000 },
+        },
         assessmentId: "assessment-result-0",
         memory: [],
+        totalRequiredBytes: 0,
         limitingResource: "system_memory",
         deficitBytes: 1024,
       }, {
         _tag: "Incompatible",
-        profile: { contextLength: 100_000 },
-        configurationId: "configuration-1",
+        configuration: {
+          id: "configuration-1",
+          bundle: assessmentBundle,
+          profile: { contextLength: 100_000 },
+        },
         failure: {
           code: "unsupported_architecture",
           message: "Unsupported architecture",
@@ -175,6 +219,55 @@ describe("localModelAssessmentResultFromIcn", () => {
         },
       }],
     })
+  })
+
+  it("correlates plural results into requested profile order", () => {
+    const assessment = (contextLength: number): LocalModelAssessment => ({
+      _tag: "Incompatible",
+      configuration: {
+        id: ModelServingConfigurationIdSchema.make(`configuration-${contextLength}`),
+        bundle: assessmentBundle,
+        profile: { contextLength },
+      },
+      failure: { code: "unsupported", message: "unsupported", retryable: false },
+    })
+    const result = Effect.runSync(correlateLocalModelAssessmentProfiles(
+      [{ contextLength: 50_000 }, { contextLength: 100_000 }],
+      [assessment(100_000), assessment(50_000)],
+    ))
+
+    expect(result.map(({ configuration }) => configuration.profile.contextLength))
+      .toEqual([50_000, 100_000])
+  })
+
+  it("rejects malformed profile result sets as operation failures", () => {
+    const assessment = (contextLength: number): LocalModelAssessment => ({
+      _tag: "Incompatible",
+      configuration: {
+        id: ModelServingConfigurationIdSchema.make(`configuration-${contextLength}`),
+        bundle: assessmentBundle,
+        profile: { contextLength },
+      },
+      failure: { code: "unsupported", message: "unsupported", retryable: false },
+    })
+    const requested = [{ contextLength: 50_000 }, { contextLength: 100_000 }]
+
+    for (const assessments of [
+      [assessment(50_000)],
+      [assessment(50_000), assessment(50_000), assessment(100_000)],
+      [assessment(50_000), assessment(100_000), assessment(75_000)],
+    ]) {
+      expect(() => Effect.runSync(
+        correlateLocalModelAssessmentProfiles(requested, assessments),
+      )).toThrow()
+    }
+  })
+
+  it("rejects duplicate requested profiles before assessment", () => {
+    expect(() => Effect.runSync(correlateLocalModelAssessmentProfiles(
+      [{ contextLength: 50_000 }, { contextLength: 50_000 }],
+      [],
+    ))).toThrow()
   })
 })
 

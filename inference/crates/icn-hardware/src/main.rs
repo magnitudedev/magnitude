@@ -169,6 +169,7 @@ fn main() -> anyhow::Result<()> {
         tensor_split: None,
         use_mmap: true,
         use_mlock: false,
+        load_mtp: false,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
         flash_attention: args.flash_attention.into(),

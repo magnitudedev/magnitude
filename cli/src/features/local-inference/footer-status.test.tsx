@@ -10,6 +10,7 @@ import {
 import {
   GIB,
   LOCAL_PROVIDER_ID,
+  makeModel,
   makeView,
   TEST_CONFIGURATION_ID,
   TEST_MEMORY_DOMAIN_ID,
@@ -26,7 +27,7 @@ const selection = {
 }
 const localSlot = (
   slotId: typeof PRIMARY_SLOT_ID | typeof SECONDARY_SLOT_ID,
-  instance: ModelSlotConfiguredLocal["instance"],
+  residency: ModelSlotConfiguredLocal["residency"],
 ) => new ModelSlotConfiguredLocal({
   slotId,
   selection,
@@ -34,22 +35,21 @@ const localSlot = (
     providerId: LOCAL_PROVIDER_ID,
     providerModelId: TEST_MODEL_ID,
     displayName: "Qwen Test",
+    variantLabel: Option.none(),
   },
   availability: { _tag: "Available" },
-  instance,
-  actions: Option.isSome(instance) && instance.value.lifecycle._tag === "Loading"
+  residency,
+  actions: residency._tag === "Loading"
     ? ["Stop"]
     : [],
 })
-const loadingInstance = (progress: number) => Option.some({
-  id: instanceId,
+const loadingResidency = (progress: number) => ({
+  _tag: "Loading" as const,
+  instanceId,
   configurationId: TEST_CONFIGURATION_ID,
-  lifecycle: {
-    _tag: "Loading" as const,
-    stage: "loading" as const,
-    progress: Option.some(progress),
-    plannedAllocation: Option.none(),
-  },
+  stage: "loading" as const,
+  progress: Option.some(progress),
+  plannedAllocation: Option.none(),
 })
 
 test("ready status exposes the model, residency, and complete resident allocation", () => {
@@ -116,7 +116,7 @@ test("loading status remains in the activity rail", () => {
       ...ready.slots,
       slots: {
         ...ready.slots.slots,
-        primary: localSlot(PRIMARY_SLOT_ID, loadingInstance(0.42)),
+        primary: localSlot(PRIMARY_SLOT_ID, loadingResidency(0.42)),
       },
     },
   }
@@ -138,7 +138,7 @@ test("memory state comes from the selected slot", () => {
       ...ready.slots,
       slots: {
         ...ready.slots.slots,
-        secondary: localSlot(SECONDARY_SLOT_ID, loadingInstance(0.27)),
+        secondary: localSlot(SECONDARY_SLOT_ID, loadingResidency(0.27)),
       },
     },
   }
@@ -162,7 +162,7 @@ test("idle status keeps reasoning available and hides memory", () => {
       ...ready.slots,
       slots: {
         ...ready.slots.slots,
-        primary: localSlot(PRIMARY_SLOT_ID, Option.none()),
+        primary: localSlot(PRIMARY_SLOT_ID, { _tag: "Unloaded" }),
       },
     },
   }

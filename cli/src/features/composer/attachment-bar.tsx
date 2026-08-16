@@ -80,11 +80,11 @@ export const AttachmentsBar = memo(function AttachmentsBar({ attachments, onRemo
     <box style={{ flexDirection: 'row', paddingBottom: 0 }}>
       {visible.map((item, visibleIndex) => (
         <box key={item.index} style={{ flexDirection: 'row' }}>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.metadata }}>
             {`${visibleIndex > 0 ? ' │ ' : ''}${item.label} `}
           </text>
           <text
-            style={{ fg: hoveredRemoveIndex === item.index ? theme.foreground : theme.muted }}
+            style={{ fg: hoveredRemoveIndex === item.index ? theme.text.body : theme.text.metadata }}
             onMouseOver={() => { setHoveredRemoveIndex(item.index); renderer.setMousePointer('pointer') }}
             onMouseOut={() => { setHoveredRemoveIndex((prev) => (prev === item.index ? null : prev)); renderer.setMousePointer('default') }}
             onMouseDown={() => onRemove(item.index)}
@@ -94,7 +94,7 @@ export const AttachmentsBar = memo(function AttachmentsBar({ attachments, onRemo
         </box>
       ))}
       {hiddenCount > 0 && (
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+        <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>
           {`${visible.length > 0 ? ' ' : ''}[and ${hiddenCount} more...]`}
         </text>
       )}

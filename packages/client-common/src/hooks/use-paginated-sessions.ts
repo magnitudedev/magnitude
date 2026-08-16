@@ -82,7 +82,7 @@ const uniqueSessions = (sessions: readonly SessionMetadata[]): SessionMetadata[]
 
 export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePaginatedSessionsResult {
   const client = useAgentClient()
-  const listSessionsAtom = useMemo(() => client.mutation("ListSessions"), [client])
+  const listSessionsAtom = useMemo(() => client.rpc.mutation("ListSessions"), [client])
   const listSessionsResult = useAtomValue(listSessionsAtom)
   const listSessionsMutation = useAtomSet(listSessionsAtom, { mode: "promise" })
   const loadingMore = Result.isWaiting(listSessionsResult)

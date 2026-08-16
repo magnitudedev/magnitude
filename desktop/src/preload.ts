@@ -5,12 +5,27 @@
  * Effect RPC stays inside the preload layer; the renderer receives the same
  * narrow desktop facade for platform actions and daemon boundaries.
  */
-import { contextBridge, ipcRenderer, clipboard as electronClipboard, shell } from "electron"
+import {
+  contextBridge,
+  ipcRenderer,
+  clipboard as electronClipboard,
+  shell,
+} from "electron"
 import { RpcClient } from "@effect/rpc"
-import { Cause, Context, Effect, Fiber, Layer, ManagedRuntime, Option, Stream } from "effect"
+import {
+  Cause,
+  Context,
+  Effect,
+  Fiber,
+  Layer,
+  ManagedRuntime,
+  Option,
+  Stream,
+} from "effect"
 import {
   DesktopRpcError,
   DesktopRpcs,
+  encodeDesktopAcnEnsureEvent,
   type DesktopApi,
   type DesktopPlatform,
   type DesktopRpcClient,
@@ -59,23 +74,32 @@ function makeDesktopRpcRuntime() {
     ): () => void {
       let active = true
       let fiber: Fiber.RuntimeFiber<void, unknown> | null = null
-      void clientPromise.then((client) => {
-        if (!active) return
-        fiber = runtime.runFork(operation(client).pipe(
-          Stream.runForEach((value) => Effect.sync(() => onValue(value))),
-          Effect.matchCauseEffect({
-            onFailure: (cause) => Cause.isInterruptedOnly(cause)
-              ? Effect.void
-              : Effect.sync(() => onError(Option.getOrElse(
-                Cause.failureOption(cause),
-                () => new Error(errorMessage(cause)),
-              ))),
-            onSuccess: () => Effect.sync(onEnd),
-          }),
-        ))
-      }).catch((cause) => {
-        if (active) onError(new Error(errorMessage(cause)))
-      })
+      void clientPromise
+        .then((client) => {
+          if (!active) return
+          fiber = runtime.runFork(
+            operation(client).pipe(
+              Stream.runForEach((value) => Effect.sync(() => onValue(value))),
+              Effect.matchCauseEffect({
+                onFailure: (cause) =>
+                  Cause.isInterruptedOnly(cause)
+                    ? Effect.void
+                    : Effect.sync(() =>
+                        onError(
+                          Option.getOrElse(
+                            Cause.failureOption(cause),
+                            () => new Error(errorMessage(cause)),
+                          ),
+                        ),
+                      ),
+                onSuccess: () => Effect.sync(onEnd),
+              }),
+            ),
+          )
+        })
+        .catch((cause) => {
+          if (active) onError(new Error(errorMessage(cause)))
+        })
       return () => {
         active = false
         if (fiber !== null) runtime.runFork(Fiber.interrupt(fiber))
@@ -86,21 +110,23 @@ function makeDesktopRpcRuntime() {
       let active = true
       let fiber: Fiber.RuntimeFiber<void, unknown> | null = null
 
-      void clientPromise.then((client) => {
-        if (!active) return
-        fiber = runtime.runFork(
-          client.StreamMenuActions({}).pipe(
-            Stream.runForEach((action) => Effect.sync(() => cb(action))),
-            Effect.catchAllCause((cause) =>
-              Effect.sync(() => {
-                console.error("[desktop] Menu action stream failed:", cause)
-              })
+      void clientPromise
+        .then((client) => {
+          if (!active) return
+          fiber = runtime.runFork(
+            client.StreamMenuActions({}).pipe(
+              Stream.runForEach((action) => Effect.sync(() => cb(action))),
+              Effect.catchAllCause((cause) =>
+                Effect.sync(() => {
+                  console.error("[desktop] Menu action stream failed:", cause)
+                }),
+              ),
             ),
-          ),
-        )
-      }).catch((cause) => {
-        console.error("[desktop] Failed to start menu action stream:", cause)
-      })
+          )
+        })
+        .catch((cause) => {
+          console.error("[desktop] Failed to start menu action stream:", cause)
+        })
 
       return () => {
         active = false
@@ -124,7 +150,7 @@ function makeDesktopApi(): DesktopApi {
       ensure(request, onEvent, onError, onEnd) {
         return desktopRpc.runStream(
           (client) => client.AcnEnsure(request),
-          onEvent,
+          (event) => onEvent(encodeDesktopAcnEnsureEvent(event)),
           onError,
           onEnd,
         )
@@ -134,14 +160,18 @@ function makeDesktopApi(): DesktopApi {
       return desktopRpc.onMenuAction(cb)
     },
     quit(): void {
-      void desktopRpc.run((client) => client.Quit({})).catch((cause) => {
-        console.error("[desktop] Quit RPC failed:", cause)
-      })
+      void desktopRpc
+        .run((client) => client.Quit({}))
+        .catch((cause) => {
+          console.error("[desktop] Quit RPC failed:", cause)
+        })
     },
     interruptStream(): void {
-      void desktopRpc.run((client) => client.InterruptStream({})).catch((cause) => {
-        console.error("[desktop] Interrupt stream RPC failed:", cause)
-      })
+      void desktopRpc
+        .run((client) => client.InterruptStream({}))
+        .catch((cause) => {
+          console.error("[desktop] Interrupt stream RPC failed:", cause)
+        })
     },
     async openPath(path: string): Promise<void> {
       await shell.openPath(path)
@@ -175,16 +205,22 @@ function makeDesktopApi(): DesktopApi {
       async openDirectory(): Promise<string | null> {
         return desktopRpc.run((client) => client.DialogOpenDirectory({}))
       },
-      async openFile(options?: { multiple?: boolean }): Promise<string[] | null> {
-        const paths = await desktopRpc.run((client) => client.DialogOpenFile({ multiple: options?.multiple ?? false }))
+      async openFile(options?: {
+        multiple?: boolean
+      }): Promise<string[] | null> {
+        const paths = await desktopRpc.run((client) =>
+          client.DialogOpenFile({ multiple: options?.multiple ?? false }),
+        )
         return paths === null ? null : [...paths]
       },
     },
     notifications: {
       show(title: string, body: string): void {
-        void desktopRpc.run((client) => client.NotificationShow({ title, body })).catch((cause) => {
-          console.error("[desktop] Notification RPC failed:", cause)
-        })
+        void desktopRpc
+          .run((client) => client.NotificationShow({ title, body }))
+          .catch((cause) => {
+            console.error("[desktop] Notification RPC failed:", cause)
+          })
       },
     },
   }

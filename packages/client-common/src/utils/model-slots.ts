@@ -3,31 +3,24 @@ import {
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   type ModelInstanceAllocation,
-  type ModelInstanceId,
   type ModelReleaseReason,
   type ModelSlot,
-  type LocalModelCatalogCandidate,
+  type LocalModel,
   type LocalModelsState,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
   type SlotId,
 } from "@magnitudedev/sdk"
-
-export const deriveSelectedLocalModelCandidate = (
+import { localModelProviderModelId } from "../local-models/projection"
+export const deriveSelectedLocalModel = (
   models: LocalModelsState,
   slots: ModelSlotsState,
-): LocalModelCatalogCandidate | null => {
+): LocalModel | null => {
   const primary = slots.slots.primary
-  if (primary._tag === "Unassigned" || models.recommendations._tag !== "Ready") return null
-  const configurationId = models.models
-    .flatMap((model) => model.offerings)
-    .find(({ providerModelId }) => providerModelId === primary.selection.providerModelId)
-    ?.configurationId
-  if (configurationId === undefined) return null
-  return models.recommendations.catalog.find((candidate) =>
-    candidate.configurationId === configurationId)
-    ?? null
+  if (primary._tag === "Unassigned") return null
+  return models.models.find((model) =>
+    Option.contains(localModelProviderModelId(model), primary.selection.providerModelId)) ?? null
 }
 
 type AssignedSlot = Exclude<ModelSlot, { readonly _tag: "Unassigned" }>
@@ -54,12 +47,10 @@ export function deriveLocalModelLoadActivity(
   slotId: SlotId,
 ) {
   const slot = slots.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  if (slot._tag !== "ConfiguredLocal" || Option.isNone(slot.instance)) return null
-  const lifecycle = slot.instance.value.lifecycle
-  return lifecycle._tag === "Loading"
-    || lifecycle._tag === "Stopping"
-    || lifecycle._tag === "Stopped" && lifecycle.reason === "memory_pressure"
-    || lifecycle._tag === "Failed" && lifecycle.failure.code === "low_memory"
+  if (slot._tag !== "ConfiguredLocal") return null
+  return slot.residency._tag === "Loading"
+    || slot.residency._tag === "Stopping"
+    || slot.residency._tag === "Failed" && slot.residency.failure.code === "low_memory"
     ? slot
     : null
 }
@@ -71,21 +62,13 @@ export type LocalModelLoadActivity = NonNullable<
 export const isModelSlotConfigured = (slot: ModelSlot): slot is AssignedSlot =>
   slot._tag !== "Unassigned"
 
-export const modelSlotInstanceId = (
-  slot: ModelSlot,
-): Option.Option<ModelInstanceId> =>
-  slot._tag === "ConfiguredLocal"
-    ? Option.map(slot.instance, (instance) => instance.id)
-    : Option.none()
-
 export const modelSlotResidentAllocation = (
   slot: ModelSlot,
 ): Option.Option<ModelInstanceAllocation> => {
-  if (slot._tag !== "ConfiguredLocal" || Option.isNone(slot.instance)) return Option.none()
-  const lifecycle = slot.instance.value.lifecycle
-  if (lifecycle._tag === "Ready") return Option.some(lifecycle.allocation)
-  if (lifecycle._tag === "Stopping" && lifecycle.allocation._tag === "Resident") {
-    return Option.some(lifecycle.allocation.allocation)
+  if (slot._tag !== "ConfiguredLocal") return Option.none()
+  if (slot.residency._tag === "Ready") return Option.some(slot.residency.allocation)
+  if (slot.residency._tag === "Stopping" && slot.residency.allocation._tag === "Resident") {
+    return Option.some(slot.residency.allocation.allocation)
   }
   return Option.none()
 }

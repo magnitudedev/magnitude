@@ -46,9 +46,20 @@ The ordinary normalized ordering is:
 | 7 | `max` | A distinct maximum setting where the model defines one |
 
 Native `off`, `no_think`, and `disabled` spellings normalize to `none`. Native `extra_high`,
-`extra-high`, `very_high`, and `xhigh` spellings normalize to `xhigh`. Aliases never appear as
-duplicate public options. `max` is not collapsed into `xhigh`, because current GLM and DeepSeek
-templates distinguish high from max.
+`extra-high`, `very_high`, and `xhigh` spellings normalize to `xhigh`. Alternate native spellings do
+not appear as duplicate public options. Public ordinal options represent distinct enabled rendering
+behaviors, not every accepted input spelling. When several accepted ordinal inputs have identical
+complete behavior, ICN orders their normalized levels by two keys: whether one of the level's
+affiliated native spellings appears as a bounded term in the shared rendered prompt, followed by
+the ordinary normalized rank. The maximum is the single public representative. Rendered name
+evidence therefore overrides rank, while rank resolves groups whose render contains no affiliated
+name. Alias resolution is total and always produces exactly one representative.
+A coarse `high` is synthesized only for a toggle or fixed-reasoning template with no verified
+symbolic effort domain. `max` is not collapsed into `xhigh` when a template distinguishes their
+behavior, as current GLM and DeepSeek templates do.
+
+Verified disabling controls and named non-ordinal modes are not deduplicated against ordinal effort
+behaviors. Their semantics come from their control domain, not solely from rendered prompt text.
 
 Some templates expose a meaningful named state outside this scale. MiniMax M3's adaptive mode is
 the important current example. Such a state remains `adaptive`; it is not mislabeled as medium.
@@ -66,14 +77,15 @@ and test requirements, not runtime dispatch keys.
 
 ### Boolean thinking control
 
-Qwen 3.5 and Qwen 3.6 use `enable_thinking`. Kimi K2.5 and Kimi K2.6 use a similar boolean named
-`thinking`. Gemma 4 also uses `enable_thinking`; all are rendered through the pinned common-chat
-input contract.
+Qwen 3.5 and Qwen 3.6 use `enable_thinking`. Qwen 3.8 combines that toggle with a closed symbolic
+effort domain. Kimi K2.5 and Kimi K2.6 use a similar boolean named `thinking`. Gemma 4 also uses
+`enable_thinking`; all are rendered through the pinned common-chat input contract.
 
 | Example | Native behavior | Normalized options | Normalized default |
 | --- | --- | --- | --- |
 | Qwen 3.5 | `enable_thinking` on or off | `none`, `high` | `high` |
 | Qwen 3.6 | `enable_thinking` on or off | `none`, `high` | `high` |
+| Qwen 3.8 | `enable_thinking` plus low/medium/xhigh effort | `none`, `low`, `medium`, `xhigh` | `xhigh` |
 | Kimi K2.5 | `thinking` on or off | `none`, `high` | `high` |
 | Kimi K2.6 | `thinking` on or off | `none`, `high` | `high` |
 | Gemma 4 | `enable_thinking` on or off | `none`, `high` | `high` |
@@ -224,6 +236,15 @@ One meaningful alternate effort is retained. The inspector does not require two 
 before recognizing a real control. Default detection keeps baseline-equivalent values available;
 it does not discard them before asking which value matches omission.
 
+When randomized unknown values are consistently rejected, every normalized candidate that renders
+across the probe shapes is accepted domain evidence, including a candidate equivalent to omission.
+When unknown values instead share one rendered fallback, a candidate is accepted only when it is
+distinguishable from that fallback. Different outputs for randomized unknown values establish an
+open pass-through domain and never authorize automatic enumeration. Accepted ordinal inputs are
+partitioned by complete rendered behavior before public options are constructed. The normalized
+default is the unique resulting option equivalent to omission; absence or ambiguity is an assessment
+failure unless trusted semantic evidence resolves it.
+
 ### Semantic evidence
 
 Known semantics that cannot be proven from rendering are held in a small, versioned registry tied
@@ -305,6 +326,7 @@ advertise a disabling option.
 ## Acceptance criteria
 
 - Qwen 3.5/3.6 boolean controls normalize to `none` and `high` with the pinned common-chat default.
+- Qwen 3.8 normalizes to `none`, `low`, `medium`, and `xhigh`, with `xhigh` as the detected default.
 - Kimi K2.5/K2.6 nonstandard booleans normalize to `none` and `high`.
 - Kimi K2.7 Code and MiniMax M2 fixed reasoning normalize to `high` only.
 - Gemma 4 normalizes to `none` and `high` with the pinned common-chat default.
@@ -312,7 +334,8 @@ advertise a disabling option.
 - DeepSeek V3/V4 modes map to the correct normalized options and private mode recipes.
 - MiniMax M3 preserves `adaptive` rather than relabeling it as an effort.
 - GPT-OSS exposes only its declared low, medium, and high values despite open pass-through Jinja.
-- Native aliases collapse to one normalized option in deterministic order.
+- Equivalent native spellings collapse to one normalized option in deterministic order.
+- Equivalent ordinal inputs use rendered affiliated-name evidence first and normalized rank second.
 - One meaningful alternate effort is not discarded.
 - No fixed-thinking template is advertised as disableable.
 - Explicit unsupported requests fail rather than falling back.

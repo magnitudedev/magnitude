@@ -26,6 +26,8 @@ import {
   type MentionFileItem,
   type SlashCommandDefinition,
   type MentionSearchClient,
+  type SlashCommandOutcome,
+  slashCommandUnhandled,
 } from "@magnitudedev/client-common"
 import { useAtomValue, useAtomSet, useAtomMount, Atom } from "@effect-atom/atom-react"
 import { Effect } from "effect"
@@ -52,7 +54,7 @@ export interface ComposerProps {
   /** Run a bash command (bash mode) */
   onRunBash?: (command: string) => Promise<boolean>
   /** Execute a slash command */
-  onSlashCommand?: (command: string) => void
+  onSlashCommand?: (command: string) => SlashCommandOutcome
   /** Toggle bash mode */
   onToggleBashMode?: () => void
   /** File mention confirmation callback */
@@ -99,6 +101,7 @@ export function Composer({
   // Track what the user last typed so we can distinguish external restore
   // (queued input / rollback) from normal user input.
   const lastUserTextRef = useRef("")
+  const [cursorPosition, setCursorPosition] = useState(0)
 
   // Cursor/focus restore on external `composerTextAtom` changes (queued input
   // restore, send-failure rollback). useAtomMount — the change originates from
@@ -127,16 +130,19 @@ export function Composer({
 
   // Slash commands
   const slashState = useSlashCommands(text, (cmdText: string) => {
-    if (onSlashCommand) {
-      onSlashCommand(cmdText)
+    const outcome = onSlashCommand?.(cmdText) ?? slashCommandUnhandled
+    if (outcome._tag === "Handled") {
+      setText("")
+      setAttachments([])
+      setHistoryIndex(-1)
+      setSavedDraft({ text: "", mentions: [] })
+      setCursorPosition(0)
+      lastUserTextRef.current = ""
     }
-    setText("")
-    lastUserTextRef.current = ""
+    return outcome
   })
 
   // File mentions
-  const [cursorPosition, setCursorPosition] = useState(0)
-
   const mentionState = useFileMentions({
     inputText: text,
     cursorPosition,
@@ -581,6 +587,8 @@ function SlashCommandMenu({
                 color: "var(--fg-tertiary)",
                 fontSize: 11,
                 marginLeft: "auto",
+                minWidth: 0,
+                flex: "1 1 0",
                 overflow: "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",

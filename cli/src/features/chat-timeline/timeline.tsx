@@ -24,7 +24,6 @@ import type {
 import {
   messageForEntry,
   shortenCommandPreview,
-  slate,
   toolSummaryLabel,
   TRANSCRIPT_LINE_CAP,
   truncateToDisplayWidth,
@@ -39,7 +38,6 @@ import { Button } from '../../components/button'
 import { useTheme } from '../../hooks/use-theme'
 import { fitItems } from './fit-items'
 import { SystemMessageRow } from './messages/system-message-row'
-import { green, red, violet } from '../../utils/theme'
 
 const SHIMMER_INTERVAL_MS = 160
 const MAX_COMMAND_DISPLAY_LEN = 80
@@ -77,7 +75,7 @@ function PathButton({
     >
       <text>
         <span
-          style={{ fg: hovered ? theme.link : theme.primary }}
+          style={{ fg: hovered ? theme.link : theme.accent }}
           attributes={TextAttributes.UNDERLINE}
         >
           {displayPath ?? path}
@@ -107,7 +105,7 @@ function SummaryRow({
       default: return '• '
     }
   })()
-  const iconColor = summary.failed ? theme.error : theme.info
+  const iconColor = summary.failed ? theme.status.failure : theme.status.information
   const label = toolSummaryLabel(summary)
   const detailItems = summary.detail.map((item) => item.text).filter(Boolean)
   const prefix = `${icon}${label}`
@@ -118,18 +116,18 @@ function SummaryRow({
   return (
     <text>
       <span style={{ fg: iconColor }}>{icon}</span>
-      <span style={{ fg: theme.foreground }}>{label}</span>
-      {shown.length > 0 && <span style={{ fg: slate[400] }}>{' ('}</span>}
+      <span style={{ fg: theme.text.body }}>{label}</span>
+      {shown.length > 0 && <span style={{ fg: theme.text.metadata }}>{' ('}</span>}
       {shown.map((item, index) => (
         <span key={`${item}-${index}`}>
-          {index > 0 && <span style={{ fg: slate[400] }}>{', '}</span>}
-          <span style={{ fg: slate[400] }}>{item}</span>
+          {index > 0 && <span style={{ fg: theme.text.metadata }}>{', '}</span>}
+          <span style={{ fg: theme.text.metadata }}>{item}</span>
         </span>
       ))}
       {remaining > 0 && (
-        <span style={{ fg: slate[400] }}>{`${shown.length > 0 ? ', ' : ''}+${remaining} more`}</span>
+        <span style={{ fg: theme.text.metadata }}>{`${shown.length > 0 ? ', ' : ''}+${remaining} more`}</span>
       )}
-      {shown.length > 0 && <span style={{ fg: slate[400] }}>{')'}</span>}
+      {shown.length > 0 && <span style={{ fg: theme.text.metadata }}>{')'}</span>}
     </text>
   )
 }
@@ -202,43 +200,43 @@ function ShellStep({
   return (
     <box style={{ flexDirection: 'column', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: theme.muted }}>{'$ '}</span>
-        <span style={{ fg: isStreaming ? theme.muted : theme.foreground }}>
+        <span style={{ fg: theme.text.metadata }}>{'$ '}</span>
+        <span style={{ fg: isStreaming ? theme.text.metadata : theme.text.body }}>
           {mode === 'transcript' ? command : shortenCommandPreview(command, MAX_COMMAND_DISPLAY_LEN)}
         </span>
-        {isStreaming && <span style={{ fg: theme.muted }}>{'▍'}</span>}
+        {isStreaming && <span style={{ fg: theme.text.metadata }}>{'▍'}</span>}
         {isExecuting && (
           <>
-            <span style={{ fg: theme.muted }}>{' · '}</span>
-            <ShimmerText text="Running..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+            <span style={{ fg: theme.text.metadata }}>{' · '}</span>
+            <ShimmerText text="Running..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
           </>
         )}
         {isCompleted && (
-          <span style={{ fg: isFailed ? theme.error : theme.success }}>
+          <span style={{ fg: isFailed ? theme.status.failure : theme.status.success }}>
             {' '}{isFailed ? `✗ Exit ${exitCode ?? 1}` : '✓'}
           </span>
         )}
-        {isError && <span style={{ fg: theme.error }}>{' ✗ Error'}</span>}
-        {isRejected && <span style={{ fg: theme.muted }}>{' · Rejected (Permission Policy)'}</span>}
-        {isInterrupted && <span style={{ fg: theme.muted }}>{' · Interrupted'}</span>}
+        {isError && <span style={{ fg: theme.status.failure }}>{' ✗ Error'}</span>}
+        {isRejected && <span style={{ fg: theme.status.inactive }}>{' · Rejected (Permission Policy)'}</span>}
+        {isInterrupted && <span style={{ fg: theme.status.interrupted }}>{' · Interrupted'}</span>}
       </text>
 
       {(isExecuting || isCompleted) && outputDisplayText && (
         mode === 'transcript' ? (
-          <box style={{ borderStyle: 'single', border: ['left'], borderColor: theme.muted, paddingLeft: 1 }}>
-            <text style={{ fg: isFailed ? theme.error : theme.muted, wrapMode: 'none' }}>
+          <box style={{ borderStyle: 'single', border: ['left'], borderColor: theme.border.subtle, paddingLeft: 1 }}>
+            <text style={{ fg: isFailed ? theme.status.failure : theme.text.metadata, wrapMode: 'none' }}>
               {outputDisplayText}
             </text>
           </box>
         ) : (
-          <text style={{ fg: isFailed ? theme.error : theme.muted, paddingLeft: 2, wrapMode: 'none' }}>
+          <text style={{ fg: isFailed ? theme.status.failure : theme.text.metadata, paddingLeft: 2, wrapMode: 'none' }}>
             {outputDisplayText}
           </text>
         )
       )}
 
       {isError && step.errorText && (
-        <text style={{ fg: theme.error, marginTop: 1, paddingLeft: 2 }}>
+        <text style={{ fg: theme.status.failure, marginTop: 1, paddingLeft: 2 }}>
           {step.errorText}
         </text>
       )}
@@ -265,22 +263,22 @@ function FileWriteStep({
     return (
       <box style={{ flexDirection: 'row', marginBottom: 1 }}>
         <text>
-          <span style={{ fg: step.failed ? theme.error : violet[300] }}>{step.failed ? '✗ ' : '✎ '}</span>
-          <span style={{ fg: theme.foreground }}>{'Write to scratchpad'}</span>
-          <span style={{ fg: theme.muted }}>{' · '}</span>
+          <span style={{ fg: step.failed ? theme.status.failure : theme.planAccent }}>{step.failed ? '✗ ' : '✎ '}</span>
+          <span style={{ fg: theme.text.body }}>{'Write to scratchpad'}</span>
+          <span style={{ fg: theme.text.metadata }}>{' · '}</span>
         </text>
         {path ? (
           <PathButton path={path} displayPath={displayPath} onFileClick={onFileClick} />
         ) : (
-          <text><span style={{ fg: theme.primary }}>{displayPath}</span></text>
+          <text><span style={{ fg: theme.accent }}>{displayPath}</span></text>
         )}
         <text>
           {step.failed ? (
-            <span style={{ fg: theme.error }}>{' · Error'}</span>
+            <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
           ) : (
-            <span style={{ fg: theme.muted }}>{` · ${lineCount} lines`}</span>
+            <span style={{ fg: theme.text.metadata }}>{` · ${lineCount} lines`}</span>
           )}
-          {isRunning && <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />}
+          {isRunning && <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />}
         </text>
       </box>
     )
@@ -290,21 +288,21 @@ function FileWriteStep({
     <box style={{ flexDirection: 'column', marginBottom: 1 }}>
       <box style={{ flexDirection: 'row' }}>
         <text>
-          <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '✎ '}</span>
-          <span style={{ fg: theme.foreground }}>{'Write '}</span>
+          <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '✎ '}</span>
+          <span style={{ fg: theme.text.body }}>{'Write '}</span>
         </text>
         {path ? (
           <PathButton path={path} displayPath={displayPath} onFileClick={onFileClick} />
         ) : (
-          <text><span style={{ fg: theme.primary }}>{displayPath}</span></text>
+          <text><span style={{ fg: theme.accent }}>{displayPath}</span></text>
         )}
         <text>
           {step.failed ? (
-            <span style={{ fg: theme.error }}>{' · Error'}</span>
+            <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
           ) : isRunning ? (
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
           ) : (
-            <span style={{ fg: green[500] }} attributes={TextAttributes.DIM}>{` +${lineCount}`}</span>
+            <span style={{ fg: theme.status.changeAdded }} attributes={TextAttributes.DIM}>{` +${lineCount}`}</span>
           )}
         </text>
       </box>
@@ -343,27 +341,27 @@ function FileEditStep({
     return (
       <box style={{ flexDirection: 'row', marginBottom: 1 }}>
         <text>
-          <span style={{ fg: step.failed ? theme.error : violet[300] }}>{step.failed ? '✗ ' : '✎ '}</span>
-          <span style={{ fg: theme.foreground }}>{'Edit file in scratchpad'}</span>
-          <span style={{ fg: theme.muted }}>{' · '}</span>
+          <span style={{ fg: step.failed ? theme.status.failure : theme.planAccent }}>{step.failed ? '✗ ' : '✎ '}</span>
+          <span style={{ fg: theme.text.body }}>{'Edit file in scratchpad'}</span>
+          <span style={{ fg: theme.text.metadata }}>{' · '}</span>
         </text>
         {path ? (
           <PathButton path={path} displayPath={displayPath} onFileClick={onFileClick} />
         ) : (
-          <text><span style={{ fg: theme.primary }}>{displayPath}</span></text>
+          <text><span style={{ fg: theme.accent }}>{displayPath}</span></text>
         )}
         <text>
           {step.failed ? (
-            <span style={{ fg: theme.error }}>{' · Error'}</span>
+            <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
           ) : added > 0 || removed > 0 ? (
             <>
-              <span style={{ fg: theme.muted }}>{' ·'}</span>
-              <span style={{ fg: green[500] }} attributes={TextAttributes.DIM}>{` +${added}`}</span>
-              <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>{'/'}</span>
-              <span style={{ fg: red[400] }} attributes={TextAttributes.DIM}>{`-${removed}`}</span>
+              <span style={{ fg: theme.text.metadata }}>{' ·'}</span>
+              <span style={{ fg: theme.status.changeAdded }} attributes={TextAttributes.DIM}>{` +${added}`}</span>
+              <span style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>{'/'}</span>
+              <span style={{ fg: theme.status.failure }} attributes={TextAttributes.DIM}>{`-${removed}`}</span>
             </>
           ) : isRunning ? (
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
           ) : null}
         </text>
       </box>
@@ -374,24 +372,24 @@ function FileEditStep({
     <box style={{ flexDirection: 'column', marginBottom: 1 }}>
       <box style={{ flexDirection: 'row' }}>
         <text>
-          <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '✎ '}</span>
-          <span style={{ fg: theme.foreground }}>{'Edit '}</span>
+          <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '✎ '}</span>
+          <span style={{ fg: theme.text.body }}>{'Edit '}</span>
         </text>
         {path ? (
           <PathButton path={path} displayPath={displayPath} onFileClick={onFileClick} />
         ) : (
-          <text><span style={{ fg: theme.primary }}>{displayPath}</span></text>
+          <text><span style={{ fg: theme.accent }}>{displayPath}</span></text>
         )}
         <text>
           {step.failed ? (
-            <span style={{ fg: theme.error }}>{' · Error'}</span>
+            <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
           ) : isRunning && !step.diff ? (
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
           ) : added > 0 || removed > 0 ? (
             <>
-              <span style={{ fg: green[500] }} attributes={TextAttributes.DIM}>{` +${added}`}</span>
-              <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>{'/'}</span>
-              <span style={{ fg: red[400] }} attributes={TextAttributes.DIM}>{`-${removed}`}</span>
+              <span style={{ fg: theme.status.changeAdded }} attributes={TextAttributes.DIM}>{` +${added}`}</span>
+              <span style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>{'/'}</span>
+              <span style={{ fg: theme.status.failure }} attributes={TextAttributes.DIM}>{`-${removed}`}</span>
             </>
           ) : null}
         </text>
@@ -425,22 +423,22 @@ function SkillStep({
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '✦ '}</span>
-        <span style={{ fg: theme.foreground }}>{'Skill'}</span>
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '✦ '}</span>
+        <span style={{ fg: theme.text.body }}>{'Skill'}</span>
         {skillName && (
           <>
-            <span style={{ fg: theme.muted }}>{': '}</span>
-            <span style={{ fg: theme.muted }}>{skillName}</span>
+            <span style={{ fg: theme.text.metadata }}>{': '}</span>
+            <span style={{ fg: theme.text.metadata }}>{skillName}</span>
           </>
         )}
-        {skillPath && <span style={{ fg: theme.muted }}>{' · '}</span>}
+        {skillPath && <span style={{ fg: theme.text.metadata }}>{' · '}</span>}
       </text>
       {skillPath && (
         <PathButton path={skillPath} onFileClick={onFileClick} />
       )}
       <text>
-        {step.failed && <span style={{ fg: theme.error }}>{' · Error'}</span>}
-        {step.errorText && <span style={{ fg: theme.muted }}>{` (${step.errorText})`}</span>}
+        {step.failed && <span style={{ fg: theme.status.failure }}>{' · Error'}</span>}
+        {step.errorText && <span style={{ fg: theme.text.metadata }}>{` (${step.errorText})`}</span>}
       </text>
     </box>
   )
@@ -455,7 +453,7 @@ function CheckpointStep({ step }: { step: CheckpointPresentation }): ReactNode {
 
   if (step.failed) {
     return (
-      <text style={{ fg: theme.error }}>
+      <text style={{ fg: theme.status.failure }}>
         {isRollback ? '✗ Roll back · Error' : '✗ Inspect changes · Error'}
       </text>
     )
@@ -463,26 +461,26 @@ function CheckpointStep({ step }: { step: CheckpointPresentation }): ReactNode {
 
   return (
     <text>
-      <span style={{ fg: theme.info }}>{icon}</span>
-      <span style={{ fg: theme.foreground }}>{isRollback ? 'Roll back' : 'Inspect changes'}</span>
+      <span style={{ fg: theme.status.information }}>{icon}</span>
+      <span style={{ fg: theme.text.body }}>{isRollback ? 'Roll back' : 'Inspect changes'}</span>
       {step.since && (
         <>
-          <span style={{ fg: theme.muted }}>{' · '}</span>
-          <span style={{ fg: theme.muted }}>{step.since}</span>
+          <span style={{ fg: theme.text.metadata }}>{' · '}</span>
+          <span style={{ fg: theme.text.metadata }}>{step.since}</span>
         </>
       )}
       {step.running ? (
         <>
           <span>{' '}</span>
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         </>
       ) : (
         <>
-          <span style={{ fg: theme.muted }}>{' · '}</span>
-          <span style={{ fg: green[500] }}>{`+${additions}`}</span>
-          <span style={{ fg: theme.muted }}>{'/'}</span>
-          <span style={{ fg: red[400] }}>{`-${deletions}`}</span>
-          <span style={{ fg: theme.muted }}>{` · ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}`}</span>
+          <span style={{ fg: theme.text.metadata }}>{' · '}</span>
+          <span style={{ fg: theme.status.changeAdded }}>{`+${additions}`}</span>
+          <span style={{ fg: theme.text.metadata }}>{'/'}</span>
+          <span style={{ fg: theme.status.failure }}>{`-${deletions}`}</span>
+          <span style={{ fg: theme.text.metadata }}>{` · ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}`}</span>
         </>
       )}
     </text>
@@ -500,16 +498,16 @@ function SpawnWorkerStep({ step, mode }: { step: SpawnWorkerPresentation; mode: 
   return (
     <box style={{ flexDirection: 'column', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: violet[300] }}>{'▶ '}</span>
-        <span style={{ fg: theme.muted }}>
+        <span style={{ fg: theme.planAccent }}>{'▶ '}</span>
+        <span style={{ fg: theme.text.metadata }}>
           {step.role ? `${step.role}` : 'Worker'}
           {step.title ? `: ${step.title}` : ''}
         </span>
-        {step.failed && <span style={{ fg: theme.error }}>{' · Error'}</span>}
+        {step.failed && <span style={{ fg: theme.status.failure }}>{' · Error'}</span>}
       </text>
       {message && (
-        <box style={{ borderStyle: 'single', border: ['left'], borderColor: theme.muted, paddingLeft: 1 }}>
-          <text style={{ fg: theme.muted }}>
+        <box style={{ borderStyle: 'single', border: ['left'], borderColor: theme.border.subtle, paddingLeft: 1 }}>
+          <text style={{ fg: theme.text.metadata }}>
             {isTruncated
               ? [...visibleLines, `...${hidden} lines hidden. Content capped at 300 lines`].join('\n')
               : visibleLines.join('\n')}
@@ -533,18 +531,18 @@ function CompactPathStep({
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '• '}</span>
-        <span style={{ fg: theme.foreground }}>{verb}</span>
-        {path && <span style={{ fg: theme.muted }}>{' '}</span>}
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '• '}</span>
+        <span style={{ fg: theme.text.body }}>{verb}</span>
+        {path && <span style={{ fg: theme.text.metadata }}>{' '}</span>}
       </text>
       {path && <PathButton path={path} onFileClick={onFileClick} />}
       <text>
         {step.failed ? (
-          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         ) : step.toolKey === 'fileRead' && step.lineCount != null ? (
-          <span style={{ fg: theme.muted }}>{` · ${step.lineCount} lines`}</span>
+          <span style={{ fg: theme.text.metadata }}>{` · ${step.lineCount} lines`}</span>
         ) : null}
       </text>
     </box>
@@ -556,22 +554,22 @@ function FileSearchStep({ step }: { step: FileSearchPresentation }): ReactNode {
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '/ '}</span>
-        <span style={{ fg: theme.foreground }}>{'Search'}</span>
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '/ '}</span>
+        <span style={{ fg: theme.text.body }}>{'Search'}</span>
         {step.pattern && (
           <>
-            <span style={{ fg: theme.muted }}>{': '}</span>
-            <span style={{ fg: theme.muted }}>{step.pattern}</span>
+            <span style={{ fg: theme.text.metadata }}>{': '}</span>
+            <span style={{ fg: theme.text.metadata }}>{step.pattern}</span>
           </>
         )}
       </text>
       <text>
         {step.failed ? (
-          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         ) : (
-          <span style={{ fg: theme.muted }}>{` · ${step.matchCount} match${step.matchCount === 1 ? '' : 'es'} in ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}`}</span>
+          <span style={{ fg: theme.text.metadata }}>{` · ${step.matchCount} match${step.matchCount === 1 ? '' : 'es'} in ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}`}</span>
         )}
       </text>
     </box>
@@ -583,22 +581,22 @@ function FileTreeStep({ step }: { step: FileTreePresentation }): ReactNode {
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '◫ '}</span>
-        <span style={{ fg: theme.foreground }}>{'List files'}</span>
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '◫ '}</span>
+        <span style={{ fg: theme.text.body }}>{'List files'}</span>
         {step.path && (
           <>
-            <span style={{ fg: theme.muted }}>{' · '}</span>
-            <span style={{ fg: theme.muted }}>{step.path}</span>
+            <span style={{ fg: theme.text.metadata }}>{' · '}</span>
+            <span style={{ fg: theme.text.metadata }}>{step.path}</span>
           </>
         )}
       </text>
       <text>
         {step.failed ? (
-          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         ) : (
-          <span style={{ fg: theme.muted }}>{` · ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}, ${step.dirCount} dir${step.dirCount === 1 ? '' : 's'}`}</span>
+          <span style={{ fg: theme.text.metadata }}>{` · ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}, ${step.dirCount} dir${step.dirCount === 1 ? '' : 's'}`}</span>
         )}
       </text>
     </box>
@@ -610,22 +608,22 @@ function WebSearchStep({ step }: { step: WebSearchPresentation }): ReactNode {
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '[⌕] '}</span>
-        <span style={{ fg: theme.foreground }}>{'Web search'}</span>
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '[⌕] '}</span>
+        <span style={{ fg: theme.text.body }}>{'Web search'}</span>
         {step.query && (
           <>
-            <span style={{ fg: theme.muted }}>{': '}</span>
-            <span style={{ fg: theme.muted }}>{step.query}</span>
+            <span style={{ fg: theme.text.metadata }}>{': '}</span>
+            <span style={{ fg: theme.text.metadata }}>{step.query}</span>
           </>
         )}
       </text>
       <text>
         {step.failed ? (
-          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         ) : (
-          <span style={{ fg: theme.muted }}>{` · ${step.sourceCount} source${step.sourceCount === 1 ? '' : 's'}`}</span>
+          <span style={{ fg: theme.text.metadata }}>{` · ${step.sourceCount} source${step.sourceCount === 1 ? '' : 's'}`}</span>
         )}
       </text>
     </box>
@@ -637,22 +635,22 @@ function WebFetchStep({ step }: { step: WebFetchPresentation }): ReactNode {
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '[↓] '}</span>
-        <span style={{ fg: theme.foreground }}>{'Fetch'}</span>
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '[↓] '}</span>
+        <span style={{ fg: theme.text.body }}>{'Fetch'}</span>
         {step.url && (
           <>
-            <span style={{ fg: theme.muted }}>{' '}</span>
-            <span style={{ fg: theme.muted }}>{step.url}</span>
+            <span style={{ fg: theme.text.metadata }}>{' '}</span>
+            <span style={{ fg: theme.text.metadata }}>{step.url}</span>
           </>
         )}
       </text>
       <text>
         {step.failed ? (
-          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         ) : (
-          <span style={{ fg: theme.success }}>{' · Done'}</span>
+          <span style={{ fg: theme.status.success }}>{' · Done'}</span>
         )}
       </text>
     </box>
@@ -671,18 +669,18 @@ function QueryImageStep({
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text>
-        <span style={{ fg: step.failed ? theme.error : theme.info }}>{step.failed ? '✗ ' : '▣ '}</span>
-        <span style={{ fg: theme.foreground }}>{'Inspect image'}</span>
-        {path && <span style={{ fg: theme.muted }}>{': '}</span>}
+        <span style={{ fg: step.failed ? theme.status.failure : theme.status.information }}>{step.failed ? '✗ ' : '▣ '}</span>
+        <span style={{ fg: theme.text.body }}>{'Inspect image'}</span>
+        {path && <span style={{ fg: theme.text.metadata }}>{': '}</span>}
       </text>
       {path && <PathButton path={path} onFileClick={onFileClick} />}
       <text>
         {step.failed ? (
-          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
         ) : (
-          <span style={{ fg: theme.success }}>{' · Done'}</span>
+          <span style={{ fg: theme.status.success }}>{' · Done'}</span>
         )}
       </text>
     </box>
@@ -695,15 +693,15 @@ function GenericStep({ step }: { step: GenericToolPresentation }): ReactNode {
   return (
     <box style={{ flexDirection: 'column', marginBottom: 1 }}>
       <text style={{ wrapMode: 'word' }}>
-        <span style={{ fg: isErrorLike ? theme.error : theme.info }}>{isErrorLike ? '✗ ' : '• '}</span>
-        <span style={{ fg: theme.foreground }}>{step.label}</span>
+        <span style={{ fg: isErrorLike ? theme.status.failure : theme.status.information }}>{isErrorLike ? '✗ ' : '• '}</span>
+        <span style={{ fg: theme.text.body }}>{step.label}</span>
         {step.running ? (
           <>
             <span>{' '}</span>
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
           </>
         ) : (
-          <span style={{ fg: isErrorLike ? theme.error : theme.success }}>
+          <span style={{ fg: isErrorLike ? theme.status.failure : theme.status.success }}>
             {isErrorLike ? ' · Error' : ' · Done'}
           </span>
         )}

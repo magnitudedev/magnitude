@@ -11,7 +11,10 @@ import { AmbientServiceTag, EventEngine } from '@magnitudedev/event-core'
 import { Effect } from 'effect'
 import type { AppEvent } from '../src/events'
 import { AgentLifecycleProjection } from '../src/projections/agent-lifecycle'
-import { AgentToolkitProjection } from '../src/projections/agent-toolkit'
+import {
+  AgentToolkitProjection,
+  awaitSettledAgentToolkit,
+} from '../src/projections/agent-toolkit'
 import { ToolUniverseSourceLive } from '../src/tools/tool-universe-live'
 import {
   ToolAvailabilityAmbient,
@@ -39,7 +42,6 @@ function slot(slotId: 'primary' | 'secondary', vision: boolean): SlotConfig {
 
 function config(primary: boolean, secondary: boolean): ConfigState {
   return {
-    catalogLoaded: true,
     bySlot: {
       primary: { _tag: 'Ready', config: slot('primary', primary) },
       secondary: { _tag: 'Ready', config: slot('secondary', secondary) },
@@ -63,6 +65,52 @@ function imageTools(state: ConfigState, role: 'leader' | 'advisor' = 'leader'): 
 }
 
 describe('dynamic image tooling', () => {
+  it('waits for coherent turn configuration to leave pending', async () => {
+    const client = await ToolkitProjectionAgent.createClient(ToolUniverseSourceLive)
+    try {
+      const pending: ConfigState = {
+        bySlot: {
+          primary: { _tag: 'Pending', slotId: 'primary' },
+          secondary: { _tag: 'Unassigned', slotId: 'secondary' },
+        },
+      }
+      await client.runEffect(Effect.gen(function* () {
+        const ambient = yield* AmbientServiceTag
+        yield* ambient.update(ConfigAmbient, pending)
+      }))
+      await client.send({
+        type: 'session_initialized',
+        forkId: null,
+        context: {
+          cwd: '/workspace',
+          scratchpadPath: '/scratchpad',
+          platform: 'linux',
+          shell: 'zsh',
+          timezone: 'UTC',
+          username: 'test',
+          fullName: null,
+          git: null,
+          folderStructure: '',
+          agentsFile: null,
+          skills: null,
+        },
+      })
+
+      const waiting = client.runEffect(awaitSettledAgentToolkit(null, 'leader'))
+      await client.runEffect(Effect.gen(function* () {
+        const ambient = yield* AmbientServiceTag
+        yield* ambient.update(ConfigAmbient, config(true, false))
+      }))
+
+      const resolved = await waiting
+      expect(resolved.slot._tag).toBe('Ready')
+      expect(resolved.toolkit.config).toEqual(config(true, false))
+      expect(resolved.toolkit.toolKeys).toContain('fileView')
+    } finally {
+      await client.dispose()
+    }
+  })
+
   it('uses view when the active slot has vision', () => {
     expect(imageTools(config(true, false))).toEqual(['fileView'])
   })
@@ -80,7 +128,15 @@ describe('dynamic image tooling', () => {
       ...config(false, true),
       bySlot: {
         primary: { _tag: 'Ready', config: slot('primary', false) },
-        secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'provider_unavailable' },
+        secondary: {
+          _tag: 'Unavailable',
+          slotId: 'secondary',
+          failure: {
+            code: 'provider_unavailable',
+            message: 'The provider is unavailable.',
+            retryable: true,
+          },
+        },
       },
     }
     expect(imageTools(state)).toEqual([])

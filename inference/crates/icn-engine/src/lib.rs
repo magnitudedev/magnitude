@@ -41,7 +41,10 @@ use llama_cpp_2::llama_backend::{LlamaBackend, LlamaThreadPool, LlamaThreadPoolP
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::mtp::{MtpOperations, MtpParams, MtpSession};
+use llama_cpp_2::speculative::{
+    SpeculativeMethod as NativeSpeculativeMethod, SpeculativeOperations, SpeculativeParams,
+    SpeculativeSession, SpeculativeVerificationResolution,
+};
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
 
@@ -125,7 +128,7 @@ pub fn execution_intent(
             projector.image_max_tokens = defaults.image_max_tokens;
             projector
         }),
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     }
 }
 
@@ -168,7 +171,7 @@ impl NativeBackend {
         &self,
         model_id: impl Into<String>,
         config: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: icn_contracts::SpeculativeDecodingConfig,
         hardware: HardwareSnapshot,
     ) -> Result<PreparedModelLoad, ModelLoadError> {
         let topology = MemoryTopology::from_snapshot(&hardware).ok_or_else(|| {
@@ -178,7 +181,7 @@ impl NativeBackend {
             Arc::clone(&self.backend),
             model_id.into(),
             config,
-            mtp_selection,
+            speculative,
             topology,
         )
     }
@@ -201,7 +204,8 @@ mod multimodal {
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
 use scheduler::{
-    BatchPlanner, BatchWork, PromptCheckpoint, SequenceCache, SequencePool, WorkCandidate, WorkKind,
+    ActiveSequence, BatchPlanner, BatchWork, PromptCheckpoint, ReusablePrefix, SequencePool,
+    WorkCandidate, WorkKind,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -313,8 +317,80 @@ enum RequestPhase {
     Terminal,
 }
 
+/// Request-state changes earned by one successful target and linked-draft native batch.
+/// Assembly records effects here so active requests never expose staged prompt progress.
+struct BatchCommit {
+    started_at: Instant,
+    prompt_ends: Vec<(i32, usize)>,
+    speculative_indices: Vec<(i32, Vec<i32>)>,
+    logits: Vec<(i32, i32)>,
+}
+
+impl BatchCommit {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            prompt_ends: Vec::new(),
+            speculative_indices: Vec::new(),
+            logits: Vec::new(),
+        }
+    }
+
+    fn prompt_start(&self, sequence_id: i32, committed: usize) -> usize {
+        self.prompt_ends
+            .iter()
+            .rev()
+            .find_map(|(id, end)| (*id == sequence_id).then_some(*end))
+            .unwrap_or(committed)
+    }
+
+    fn advance_prompt(&mut self, sequence_id: i32, end: usize) {
+        if let Some((_, current)) = self
+            .prompt_ends
+            .iter_mut()
+            .find(|(id, _)| *id == sequence_id)
+        {
+            *current = end;
+        } else {
+            self.prompt_ends.push((sequence_id, end));
+        }
+    }
+
+    fn record_speculative_indices(&mut self, sequence_id: i32, indices: Vec<i32>) {
+        self.speculative_indices.push((sequence_id, indices));
+    }
+
+    fn record_logits(&mut self, sequence_id: i32, batch_index: i32) {
+        self.logits.push((sequence_id, batch_index));
+    }
+
+    fn apply(self, active: &mut [ActiveRequest<'_>]) -> Result<(), InferenceError> {
+        for (sequence_id, processed_prompt_tokens) in self.prompt_ends {
+            let request = request_by_sequence(active, sequence_id)?;
+            request.prompt_started_at.get_or_insert(self.started_at);
+            request.processed_prompt_tokens = processed_prompt_tokens;
+            request.pending_progress = Some(InferenceProgress::Prefill {
+                completed_tokens: processed_prompt_tokens,
+                total_tokens: request.prompt_tokens,
+                cached_tokens: request.cached_prompt_tokens,
+            });
+        }
+        for (sequence_id, indices) in self.speculative_indices {
+            request_by_sequence(active, sequence_id)?.speculative_indices = indices;
+        }
+        for (sequence_id, batch_index) in self.logits {
+            let request = request_by_sequence(active, sequence_id)?;
+            if let RequestPhase::Decode { token, .. } = request.phase {
+                request.token_history.push(token);
+            }
+            request.phase = RequestPhase::ReadyToSample { batch_index };
+        }
+        Ok(())
+    }
+}
+
 struct ActiveRequest<'model> {
-    sequence_id: Option<i32>,
+    sequence: Option<ActiveSequence>,
     events: SyncSender<ExecutorItem>,
     span: tracing::Span,
     cancelled: Arc<AtomicBool>,
@@ -323,10 +399,10 @@ struct ActiveRequest<'model> {
     last_progress_emitted_at: Option<Instant>,
     phase: RequestPhase,
     prompt: Vec<LlamaToken>,
-    /// Tokens whose target KV state is known to be committed. The currently
-    /// sampled decode token is deliberately excluded until verification.
-    cache_history: Vec<LlamaToken>,
-    prompt_offset: usize,
+    /// Full logical prompt followed by generated tokens committed to target KV. During prefill,
+    /// `processed_prompt_tokens`, rather than this history, is the resident prompt boundary.
+    token_history: Vec<LlamaToken>,
+    processed_prompt_tokens: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
     prompt_checkpoints: Vec<PromptCheckpoint>,
@@ -335,15 +411,15 @@ struct ActiveRequest<'model> {
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
-    mtp_started: bool,
-    mtp_draft: Vec<LlamaToken>,
-    mtp_indices: Vec<i32>,
+    speculative_started: bool,
+    speculative_draft: Vec<LlamaToken>,
+    speculative_indices: Vec<i32>,
+    speculative_replaying: bool,
     draft_tokens: usize,
     accepted_draft_tokens: usize,
     draft_ms: f64,
     verification_ms: f64,
     cache_prompt: bool,
-    cacheable: bool,
     ignore_eos: bool,
     timings_per_token: bool,
     sampler: CommonSampler<'model>,
@@ -380,12 +456,6 @@ pub struct LlamaCompletionBackend {
     acceleration: String,
     commands: SyncSender<ExecutorCommand>,
     executor: Mutex<Option<JoinHandle<()>>>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub enum MtpCandidateSelection {
-    Automatic(Vec<PathBuf>),
-    Explicit(PathBuf),
 }
 
 /// Stable semantic phases of prepared native model loading.
@@ -430,7 +500,7 @@ impl PreparedModelLoad {
         backend: Arc<LlamaBackend>,
         model_id: String,
         config: ExecutionIntent,
-        mtp_selection: MtpCandidateSelection,
+        speculative: icn_contracts::SpeculativeDecodingConfig,
         topology: MemoryTopology,
     ) -> Result<Self, ModelLoadError> {
         validate_model_config(&config).map_err(ModelLoadError::from)?;
@@ -443,8 +513,7 @@ impl PreparedModelLoad {
         let executor = thread::Builder::new()
             .name(format!("icn-llama-{model_id}"))
             .spawn(move || {
-                let result =
-                    prepare_native_plan(backend.as_ref(), &topology, config, mtp_selection);
+                let result = prepare_native_plan(backend.as_ref(), &topology, config, speculative);
                 match result {
                     Ok((planned, acceleration, phases)) => {
                         let timing_plan_identity = timing_plan_identity(&planned.assessed.plan);
@@ -548,7 +617,7 @@ impl PreparedModelLoad {
 #[derive(Debug)]
 pub enum ModelLoadError {
     InvalidConfiguration(String),
-    MtpSelection(String),
+    SpeculativePreflight(String),
     Planning(String),
     AssessmentRejected(Box<HardwareAssessment>),
     MemoryAttribution(LlamaMemoryBreakdownError),
@@ -561,7 +630,9 @@ impl std::fmt::Display for ModelLoadError {
             Self::InvalidConfiguration(message) => {
                 write!(formatter, "invalid model configuration: {message}")
             }
-            Self::MtpSelection(message) => write!(formatter, "MTP selection failed: {message}"),
+            Self::SpeculativePreflight(message) => {
+                write!(formatter, "speculative selection failed: {message}")
+            }
             Self::Planning(message) => write!(formatter, "native load planning failed: {message}"),
             Self::AssessmentRejected(assessment) => write!(
                 formatter,
@@ -731,16 +802,21 @@ fn prepare_native_plan(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     mut requested: ExecutionIntent,
-    mtp_selection: MtpCandidateSelection,
+    speculative: icn_contracts::SpeculativeDecodingConfig,
 ) -> Result<(icn_hardware::BackendLoadPlan, String, Vec<ModelLoadPhase>), ModelLoadError> {
-    let candidates = match &mtp_selection {
-        MtpCandidateSelection::Automatic(paths) => icn_mtp::CandidatePolicy::Automatic(paths),
-        MtpCandidateSelection::Explicit(path) => icn_mtp::CandidatePolicy::Explicit(path),
+    requested.speculative = speculative;
+    requested.speculative = icn_speculative::preflight_with_backend(backend, &requested)
+        .map_err(|error| ModelLoadError::SpeculativePreflight(error.to_string()))?;
+    let planned = match icn_hardware::plan_load_with_backend(backend, topology, &requested)
+        .map_err(|error| ModelLoadError::Planning(error.to_string()))?
+    {
+        icn_hardware::BackendLoadPlanningOutcome::Planned(planned) => planned,
+        icn_hardware::BackendLoadPlanningOutcome::Rejected(assessed) => {
+            return Err(ModelLoadError::AssessmentRejected(Box::new(
+                assessed.assessment,
+            )));
+        }
     };
-    requested.mtp = icn_mtp::select_mtp_with_backend(backend, &requested, candidates)
-        .map_err(|error| ModelLoadError::MtpSelection(error.to_string()))?;
-    let planned = icn_hardware::plan_load_with_backend(backend, topology, &requested)
-        .map_err(|error| ModelLoadError::Planning(error.to_string()))?;
     let acceleration = match &planned.assessed.assessment {
         HardwareAssessment::Fits { profile, .. } => profile.acceleration.clone(),
         assessment => {
@@ -751,17 +827,17 @@ fn prepare_native_plan(
     };
     let mut phases = vec![ModelLoadPhase::TargetModel, ModelLoadPhase::TargetContext];
     if matches!(
-        planned.assessed.plan.mtp,
-        icn_contracts::MtpConfig::Enabled {
-            source: icn_contracts::MtpSource::Separate { .. },
+        planned.assessed.plan.speculative,
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
+            source: icn_contracts::SpeculativeDraftSource::Separate { .. },
             ..
         }
     ) {
         phases.push(ModelLoadPhase::DraftModel);
     }
     if matches!(
-        planned.assessed.plan.mtp,
-        icn_contracts::MtpConfig::Enabled { .. }
+        planned.assessed.plan.speculative,
+        icn_contracts::SpeculativeDecodingConfig::Enabled { .. }
     ) {
         phases.push(ModelLoadPhase::DraftContext);
     }
@@ -777,24 +853,26 @@ fn prepare_native_plan(
 }
 
 fn timing_plan_identity(config: &ExecutionIntent) -> String {
-    let mtp = match &config.mtp {
-        icn_contracts::MtpConfig::Disabled { .. } => serde_json::json!({ "enabled": false }),
-        icn_contracts::MtpConfig::Enabled {
+    let speculative = match &config.speculative {
+        icn_contracts::SpeculativeDecodingConfig::Disabled { .. } => {
+            serde_json::json!({ "enabled": false })
+        }
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
             source,
+            method,
             n_max,
             n_min,
-            p_min,
             cache_type_k,
             cache_type_v,
         } => serde_json::json!({
             "enabled": true,
             "source": match source {
-                icn_contracts::MtpSource::Bundled => "bundled",
-                icn_contracts::MtpSource::Separate { .. } => "separate",
+                icn_contracts::SpeculativeDraftSource::Embedded => "bundled",
+                icn_contracts::SpeculativeDraftSource::Separate { .. } => "separate",
             },
             "nMax": n_max,
             "nMin": n_min,
-            "pMin": p_min,
+            "method": method,
             "cacheTypeK": cache_type_k,
             "cacheTypeV": cache_type_v,
         }),
@@ -817,7 +895,7 @@ fn timing_plan_identity(config: &ExecutionIntent) -> String {
         "prefillQuantum": config.prefill_quantum,
         "execution": config.execution,
         "projector": projector,
-        "mtp": mtp,
+        "speculative": speculative,
     });
     format!("{:x}", Sha256::digest(evidence.to_string().as_bytes()))
 }
@@ -851,7 +929,7 @@ fn executor_main(
     #[cfg(not(feature = "mtmd"))]
     let auxiliary_allocations = Vec::<ResidentAllocation>::new();
     let config = planned.assessed.plan;
-    let native_mtp = planned.native_mtp.map(|plan| plan.into_parts());
+    let native_speculative = planned.native_speculative.map(|plan| plan.into_parts());
     let (model_path, model_params, context_params, threads, threads_batch) =
         planned.native.into_parts();
     let threads = match nonzero_i32(threads, "threads") {
@@ -903,10 +981,10 @@ fn executor_main(
     };
     observer.phase_completed(ModelLoadPhase::TargetContext);
     let mut context = Some(context);
-    let draft_model = match (&config.mtp, native_mtp.as_ref()) {
+    let draft_model = match (&config.speculative, native_speculative.as_ref()) {
         (
-            icn_contracts::MtpConfig::Enabled {
-                source: icn_contracts::MtpSource::Separate { model_path },
+            icn_contracts::SpeculativeDecodingConfig::Enabled {
+                source: icn_contracts::SpeculativeDraftSource::Separate { model_path },
                 ..
             },
             Some((_, draft_model_params, _, _, _)),
@@ -927,9 +1005,9 @@ fn executor_main(
                 }
             }
         }
-        (icn_contracts::MtpConfig::Enabled { .. }, None) => {
+        (icn_contracts::SpeculativeDecodingConfig::Enabled { .. }, None) => {
             let _ = ready.send(Err(InferenceError::InvalidConfig(
-                "native planner omitted the enabled MTP plan".to_owned(),
+                "native planner omitted the enabled speculative plan".to_owned(),
             )
             .into()));
             return;
@@ -937,39 +1015,55 @@ fn executor_main(
         _ => None,
     };
     let draft_has_separate_model = draft_model.is_some();
-    let mut mtp = match &config.mtp {
-        icn_contracts::MtpConfig::Disabled { .. } => None,
-        icn_contracts::MtpConfig::Enabled {
+    let mut speculative = match &config.speculative {
+        icn_contracts::SpeculativeDecodingConfig::Disabled { .. } => None,
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
             n_max,
             n_min,
-            p_min,
+            method,
             ..
         } => {
             observer.phase_started(ModelLoadPhase::DraftContext);
-            let Some((_, _, draft_context_params, _, _)) = native_mtp.as_ref() else {
+            let Some((_, _, draft_context_params, _, _)) = native_speculative.as_ref() else {
                 let _ = ready.send(Err(InferenceError::InvalidConfig(
-                    "native planner omitted the enabled MTP context".to_owned(),
+                    "native planner omitted the enabled speculative context".to_owned(),
                 )
                 .into()));
                 return;
             };
             let draft_context_params = draft_context_params.clone();
             let draft_model = draft_model.as_ref().unwrap_or(&model);
-            match MtpSession::new_linked(
+            match SpeculativeSession::new_linked(
                 context.take().expect("target context is constructed once"),
                 draft_model,
                 &backend,
                 draft_context_params,
-                MtpParams {
+                SpeculativeParams {
+                    method: match method {
+                        icn_contracts::SpeculativeMethodConfig::Mtp {
+                            min_draft_probability,
+                        } => NativeSpeculativeMethod::Mtp {
+                            min_draft_probability: *min_draft_probability,
+                        },
+                        icn_contracts::SpeculativeMethodConfig::DFlash {
+                            min_sample_probability,
+                        } => NativeSpeculativeMethod::DFlash {
+                            min_sample_probability: *min_sample_probability,
+                        },
+                        icn_contracts::SpeculativeMethodConfig::DSpark {
+                            acceptance_threshold,
+                        } => NativeSpeculativeMethod::DSpark {
+                            acceptance_threshold: *acceptance_threshold,
+                        },
+                    },
                     n_max: i32::try_from(*n_max).unwrap_or(i32::MAX),
                     n_min: i32::try_from(*n_min).unwrap_or(i32::MAX),
-                    p_min: *p_min,
                 },
                 config.max_sequences,
             ) {
-                Ok(mtp) => {
+                Ok(speculative) => {
                     observer.phase_completed(ModelLoadPhase::DraftContext);
-                    Some(mtp)
+                    Some(speculative)
                 }
                 Err(error) => {
                     let _ = ready.send(Err(backend_error(error).into()));
@@ -1016,7 +1110,7 @@ fn executor_main(
             return;
         }
     };
-    if let Some(mtp) = mtp.as_mut() {
+    if let Some(speculative) = speculative.as_mut() {
         let mut draft_main_pool =
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads)) {
                 Ok(pool) => pool,
@@ -1025,7 +1119,7 @@ fn executor_main(
                     return;
                 }
             };
-        let (context, draft_context, mut operations) = mtp.split_all_mut();
+        let (context, draft_context, mut operations) = speculative.split_all_mut();
         if threads == threads_batch {
             let mut draft_attached = draft_context.attach_threadpool(&mut draft_main_pool);
             let mut attached = context.attach_threadpool(&mut main_pool);
@@ -1089,7 +1183,7 @@ fn executor_main(
     } else if threads == threads_batch {
         let mut context = context
             .take()
-            .expect("non-MTP target context remains owned");
+            .expect("non-speculative target context remains owned");
         let mut attached = context.attach_threadpool(&mut main_pool);
         observer.phase_completed(ModelLoadPhase::Runtime);
         run_initialized_executor(
@@ -1112,7 +1206,7 @@ fn executor_main(
     } else {
         let mut context = context
             .take()
-            .expect("non-MTP target context remains owned");
+            .expect("non-speculative target context remains owned");
         let mut batch_pool =
             match LlamaThreadPool::new(&backend, &LlamaThreadPoolParams::new(threads_batch)) {
                 Ok(pool) => pool,
@@ -1183,7 +1277,7 @@ fn run_initialized_executor<'model>(
     draft_context: Option<&mut LlamaContext<'model>>,
     draft_has_separate_model: bool,
     auxiliary_allocations: &[ResidentAllocation],
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
     ready: &SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
@@ -1191,7 +1285,7 @@ fn run_initialized_executor<'model>(
     observer: &dyn ModelLoadObserver,
 ) {
     observer.phase_started(ModelLoadPhase::Warmup);
-    if let Err(error) = warm_up(model, context, mtp.as_deref_mut()) {
+    if let Err(error) = warm_up(model, context, speculative.as_deref_mut()) {
         let _ = ready.send(Err(error.into()));
         return;
     }
@@ -1236,7 +1330,7 @@ fn run_initialized_executor<'model>(
         chat_templates,
         context,
         draft_context,
-        mtp,
+        speculative,
         multimodal,
         commands,
         resident_allocations,
@@ -1336,7 +1430,7 @@ fn run_scheduler<'model>(
     chat_templates: &CommonChatTemplates,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     commands: &Receiver<ExecutorCommand>,
     resident_allocations: Vec<ResidentAllocation>,
@@ -1417,18 +1511,28 @@ fn run_scheduler<'model>(
             }
         }
 
-        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+        cleanup_requests(
+            context,
+            speculative.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
 
         if shutting_down {
             fail_queued(&mut queued, InferenceError::ExecutorStopped);
             fail_active(
                 context,
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 &mut sequence_pool,
                 &mut active,
                 InferenceError::ExecutorStopped,
             );
-            cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+            cleanup_requests(
+                context,
+                speculative.as_deref_mut(),
+                &mut sequence_pool,
+                &mut active,
+            );
             if active.is_empty() {
                 break;
             }
@@ -1439,7 +1543,7 @@ fn run_scheduler<'model>(
                 multimodal.as_ref(),
                 context,
                 draft_context.as_deref_mut(),
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 &mut sequence_pool,
                 &mut queued,
                 &mut active,
@@ -1450,11 +1554,16 @@ fn run_scheduler<'model>(
         sample_ready_requests(
             model,
             context,
-            mtp.as_deref_mut(),
+            speculative.as_deref_mut(),
             &mut sequence_pool,
             &mut active,
         );
-        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+        cleanup_requests(
+            context,
+            speculative.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
 
         let decoded = if shutting_down {
             false
@@ -1463,7 +1572,7 @@ fn run_scheduler<'model>(
                 model,
                 context,
                 draft_context.as_deref_mut(),
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 multimodal,
                 &mut planner,
                 &mut decode_buffer,
@@ -1480,24 +1589,26 @@ fn run_scheduler<'model>(
                         draft_context.synchronize();
                         draft_context.clear_memory(false);
                     }
+                    // The whole native context includes available sequences too. Remove their
+                    // reusable prefixes before later admission can observe a false cache hit.
+                    sequence_pool.invalidate_reuse();
                     let failure = if matches!(error, InferenceError::Cancelled) {
                         InferenceError::Cancelled
                     } else {
                         InferenceError::Backend(error.to_string())
                     };
-                    fail_active(
-                        context,
-                        mtp.as_deref_mut(),
-                        &mut sequence_pool,
-                        &mut active,
-                        failure,
-                    );
+                    fail_active_after_context_reset(&mut sequence_pool, &mut active, failure);
                     false
                 }
             }
         };
 
-        cleanup_requests(context, mtp.as_deref_mut(), &mut sequence_pool, &mut active);
+        cleanup_requests(
+            context,
+            speculative.as_deref_mut(),
+            &mut sequence_pool,
+            &mut active,
+        );
 
         if !decoded {
             match commands.recv_timeout(IDLE_POLL_INTERVAL) {
@@ -1632,13 +1743,23 @@ fn admit_requests<'model>(
     multimodal: Option<&MultimodalRuntime<'model>>,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     queued: &mut VecDeque<QueuedCompletion>,
     active: &mut Vec<ActiveRequest<'model>>,
     shared_context_capacity: usize,
 ) {
     while !queued.is_empty() {
+        if queued
+            .front()
+            .is_some_and(|queued| queued.cancelled.load(Ordering::Acquire))
+        {
+            let cancelled = queued.pop_front().expect("queue front exists");
+            let _ = cancelled
+                .events
+                .try_send(ExecutorItem::Failed(InferenceError::Cancelled));
+            continue;
+        }
         let matching_prompt = queued.front().and_then(|queued| {
             (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
                 .then(|| {
@@ -1653,13 +1774,14 @@ fn admit_requests<'model>(
                 })
                 .flatten()
         });
-        let sequence_id = match matching_prompt.as_deref() {
+        let acquired = match matching_prompt.as_deref() {
             Some(prompt) => sequence_pool.acquire_matching(prompt),
             None => sequence_pool.acquire(),
         };
-        let Some(sequence_id) = sequence_id else {
+        let Some(mut acquired) = acquired else {
             break;
         };
+        let sequence_id = acquired.id();
         let queued_request = queued
             .pop_front()
             .expect("queue was checked before acquiring a sequence");
@@ -1667,10 +1789,10 @@ fn admit_requests<'model>(
             let _ = queued_request
                 .events
                 .try_send(ExecutorItem::Failed(InferenceError::Cancelled));
-            sequence_pool.release(sequence_id);
+            sequence_pool.release(acquired);
             continue;
         }
-        let cached = sequence_pool.take_cache(sequence_id);
+        let available_prefix = acquired.reusable_prefix.as_ref();
         let _ = queued_request
             .events
             .try_send(ExecutorItem::Event(InferenceStreamEvent {
@@ -1684,22 +1806,32 @@ fn admit_requests<'model>(
             shared_context_capacity,
             context.n_batch() as usize,
             context.n_ubatch() as usize,
-            sequence_id,
             queued_request,
-            cached.as_ref(),
+            available_prefix,
         ) {
             Ok(mut request) => {
-                let requested_start = request.prompt_offset;
+                let reusable_prefix = acquired.reusable_prefix.take();
+                let sequence = acquired.activate();
+                let requested_start = request.processed_prompt_tokens;
                 let partial = clear_sequence_range(
                     context,
-                    mtp.as_deref_mut(),
+                    speculative.as_deref_mut(),
                     sequence_id,
                     i32::try_from(requested_start).unwrap_or(i32::MAX),
                     -1,
                 );
-                if partial.is_err() && requested_start > 0 {
-                    let checkpoint = cached.as_ref().and_then(|cache| {
-                        cache
+                if partial.is_err() && requested_start == 0 {
+                    let _ = request
+                        .events
+                        .try_send(ExecutorItem::Failed(InferenceError::Backend(format!(
+                            "llama.cpp refused to reset sequence {sequence_id}"
+                        ))));
+                    sequence.quarantine();
+                    continue;
+                }
+                if partial.is_err() {
+                    let checkpoint = reusable_prefix.as_ref().and_then(|prefix| {
+                        prefix
                             .checkpoints
                             .iter()
                             .rev()
@@ -1713,20 +1845,20 @@ fn admit_requests<'model>(
                             checkpoint,
                         )
                     });
-                    request.prompt_offset = checkpoint
+                    request.processed_prompt_tokens = checkpoint
                         .filter(|_| restored)
                         .map_or(0, |value| value.prefix);
-                    request.cached_prompt_tokens = request.prompt_offset;
+                    request.cached_prompt_tokens = request.processed_prompt_tokens;
                     request.pending_progress = Some(InferenceProgress::Prefill {
-                        completed_tokens: request.prompt_offset,
+                        completed_tokens: request.processed_prompt_tokens,
                         total_tokens: request.prompt_tokens,
                         cached_tokens: request.cached_prompt_tokens,
                     });
                     if clear_sequence_range(
                         context,
-                        mtp.as_deref_mut(),
+                        speculative.as_deref_mut(),
                         sequence_id,
-                        i32::try_from(request.prompt_offset).unwrap_or(i32::MAX),
+                        i32::try_from(request.processed_prompt_tokens).unwrap_or(i32::MAX),
                         -1,
                     )
                     .is_err()
@@ -1737,19 +1869,17 @@ fn admit_requests<'model>(
                                 .try_send(ExecutorItem::Failed(InferenceError::Backend(format!(
                                     "llama.cpp refused to reset cached sequence {sequence_id}"
                                 ))));
-                        sequence_pool.quarantine(sequence_id);
+                        sequence.quarantine();
                         continue;
                     }
                 }
+                request.sequence = Some(sequence);
                 active.push(request);
             }
             Err((events, error)) => {
                 let _ = events.try_send(ExecutorItem::Failed(error));
-                if clear_sequence(context, mtp.as_deref_mut(), sequence_id).is_ok() {
-                    sequence_pool.release(sequence_id);
-                } else {
-                    sequence_pool.quarantine(sequence_id);
-                }
+                // Admission performs no native mutation before returning an error.
+                sequence_pool.release(acquired);
             }
         }
     }
@@ -1758,7 +1888,7 @@ fn admit_requests<'model>(
 fn sample_ready_requests<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut [ActiveRequest<'model>],
 ) {
@@ -1770,32 +1900,33 @@ fn sample_ready_requests<'model>(
         let _entered = current_span.enter();
         if request.cancelled.load(Ordering::Acquire) {
             cancel_request(request);
-            release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+            release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
             continue;
         }
-        if !request.mtp_started
-            && request.multimodal_prompt.is_none()
-            && let Some(operations) = mtp.as_deref_mut()
+        if !request.speculative_started
+            && let Some(operations) = speculative.as_deref_mut()
         {
-            let sequence_id = request.sequence_id.expect("ready request owns a sequence");
-            if let Err(error) = operations.begin(sequence_id, &request.cache_history) {
+            let sequence_id = request
+                .sequence_id()
+                .expect("ready request owns a sequence");
+            if let Err(error) = operations.begin(sequence_id, &request.token_history) {
                 fail_request(request, backend_error(error));
-                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                discard_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
                 continue;
             }
-            request.mtp_started = true;
+            request.speculative_started = true;
         }
         match request.sample_next(model, context, batch_index) {
             Ok(Some(reason)) => {
                 if let Err(error) = request.complete(reason) {
                     fail_request(request, error);
                 }
-                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
             }
             Ok(None) => {}
             Err(error) => {
                 fail_request(request, error);
-                release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+                release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
             }
         }
     }
@@ -1806,31 +1937,31 @@ fn decode_batch<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     planner: &mut BatchPlanner,
     batch: &mut LlamaBatch<'_>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
-    if decode_multimodal_prefill(context, multimodal, active)? {
+    if decode_multimodal_prefill(context, speculative.as_deref_mut(), multimodal, active)? {
         return Ok(true);
     }
 
-    let can_checkpoint_prompt = mtp.is_none() || draft_context.is_some();
+    let can_checkpoint_prompt = speculative.is_none() || draft_context.is_some();
     if can_checkpoint_prompt {
         for request in active.iter_mut().filter(|request| {
             request.cache_prompt
-                && request.cacheable
+                && request.multimodal_prompt.is_none()
                 && matches!(request.phase, RequestPhase::Prefill)
                 && request.pending_checkpoint_prefixes.front().copied()
-                    == Some(request.prompt_offset)
+                    == Some(request.processed_prompt_tokens)
         }) {
             let prefix = request
                 .pending_checkpoint_prefixes
                 .pop_front()
                 .expect("checkpoint position was matched");
             let sequence_id = request
-                .sequence_id
+                .sequence_id()
                 .expect("prefill request owns a sequence");
             let target_checkpoint = context
                 .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
@@ -1843,7 +1974,7 @@ fn decode_batch<'model>(
                     .filter(|checkpoint| !checkpoint.is_empty())
             });
             if let Some(target) = target_checkpoint
-                && (mtp.is_none() || draft_checkpoint.is_some())
+                && (speculative.is_none() || draft_checkpoint.is_some())
             {
                 request.prompt_checkpoints.push(PromptCheckpoint {
                     target,
@@ -1860,23 +1991,33 @@ fn decode_batch<'model>(
         }
     }
 
-    let mut draft_extra_tokens = 0_usize;
-    if let Some(operations) = mtp.as_mut() {
+    let mut draft_extra_tokens = active
+        .iter()
+        .filter(|request| {
+            request.sequence_id().is_some()
+                && request.outbound.is_empty()
+                && matches!(request.phase, RequestPhase::Decode { .. })
+        })
+        .map(|request| request.speculative_draft.len())
+        .sum::<usize>();
+    if let Some(operations) = speculative.as_mut() {
         let mut drafted_sequences = Vec::new();
         let started = Instant::now();
         let decode_count = active
             .iter()
             .filter(|request| {
-                request.sequence_id.is_some()
+                request.sequence_id().is_some()
                     && request.outbound.is_empty()
                     && matches!(request.phase, RequestPhase::Decode { .. })
             })
             .count();
-        let mut extra_budget = (context.n_batch() as usize).saturating_sub(decode_count);
+        let mut extra_budget = (context.n_batch() as usize)
+            .saturating_sub(decode_count)
+            .saturating_sub(draft_extra_tokens);
         for request in active.iter_mut().filter(|request| {
-            request.mtp_started
-                && request.mtp_draft.is_empty()
-                && request.sequence_id.is_some()
+            request.speculative_started
+                && request.speculative_draft.is_empty()
+                && request.sequence_id().is_some()
                 && request.outbound.is_empty()
                 && matches!(request.phase, RequestPhase::Decode { .. })
         }) {
@@ -1892,9 +2033,11 @@ fn decode_batch<'model>(
             if n_max == 0 {
                 continue;
             }
-            let sequence_id = request.sequence_id.expect("selected request owns sequence");
+            let sequence_id = request
+                .sequence_id()
+                .expect("selected request owns sequence");
             operations
-                .prepare_draft(sequence_id, position, token, &request.cache_history, n_max)
+                .prepare_draft(sequence_id, position, token, &request.token_history, n_max)
                 .map_err(backend_error)?;
             extra_budget -= n_max;
             drafted_sequences.push(sequence_id);
@@ -1904,22 +2047,13 @@ fn decode_batch<'model>(
             let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
             for sequence_id in drafted_sequences {
                 let request = request_by_sequence(active, sequence_id)?;
-                request.mtp_draft = operations.take_draft(sequence_id).map_err(backend_error)?;
-                let RequestPhase::Decode { position, .. } = request.phase else {
-                    return Err(InferenceError::Backend(
-                        "MTP request left decode state while drafting".into(),
-                    ));
-                };
-                // MTP autoregressively advances its draft context while producing the
-                // proposal. The target verification batch will mirror the sampled token
-                // and accepted proposal back into that context, so discard the temporary
-                // speculative suffix first. This is the same transition performed by
-                // llama.cpp's server immediately after common_speculative_draft().
-                operations
-                    .remove_sequence_range(sequence_id, position, -1)
-                    .map_err(backend_error)?;
-                draft_extra_tokens = draft_extra_tokens.saturating_add(request.mtp_draft.len());
-                request.draft_tokens = request.draft_tokens.saturating_add(request.mtp_draft.len());
+                request.speculative_draft =
+                    operations.take_draft(sequence_id).map_err(backend_error)?;
+                draft_extra_tokens =
+                    draft_extra_tokens.saturating_add(request.speculative_draft.len());
+                request.draft_tokens = request
+                    .draft_tokens
+                    .saturating_add(request.speculative_draft.len());
                 request.draft_ms += elapsed;
             }
         }
@@ -1928,12 +2062,12 @@ fn decode_batch<'model>(
     let candidates = active
         .iter()
         .filter(|request| {
-            request.sequence_id.is_some()
+            request.sequence_id().is_some()
                 && request.outbound.is_empty()
                 && !request.cancelled.load(Ordering::Acquire)
         })
         .filter_map(|request| {
-            let sequence_id = request.sequence_id?;
+            let sequence_id = request.sequence_id()?;
             let kind = match request.phase {
                 RequestPhase::Prefill => WorkKind::Prefill {
                     remaining: request
@@ -1941,8 +2075,13 @@ fn decode_batch<'model>(
                         .front()
                         .filter(|_| can_checkpoint_prompt && request.cache_prompt)
                         .map_or_else(
-                            || request.prompt.len().saturating_sub(request.prompt_offset),
-                            |prefix| prefix.saturating_sub(request.prompt_offset),
+                            || {
+                                request
+                                    .prompt
+                                    .len()
+                                    .saturating_sub(request.processed_prompt_tokens)
+                            },
+                            |prefix| prefix.saturating_sub(request.processed_prompt_tokens),
                         ),
                 },
                 RequestPhase::Decode { .. } => WorkKind::Decode,
@@ -1959,8 +2098,8 @@ fn decode_batch<'model>(
         return Ok(false);
     }
     batch.clear();
-    let mut logits = Vec::<(i32, i32)>::new();
     let batch_started = Instant::now();
+    let mut commit = BatchCommit::new(batch_started);
 
     for work in plan {
         match work {
@@ -1971,15 +2110,14 @@ fn decode_batch<'model>(
                         "scheduler selected sequence {sequence_id} for decode in the wrong state"
                     )));
                 };
-                request.mtp_indices.clear();
                 batch
                     .add(token, position, &[sequence_id], true)
                     .map_err(backend_error)?;
-                request.mtp_indices.push(batch.n_tokens() - 1);
-                if request.mtp_draft.is_empty() {
-                    logits.push((sequence_id, batch.n_tokens() - 1));
+                if request.speculative_draft.is_empty() {
+                    commit.record_logits(sequence_id, batch.n_tokens() - 1);
                 } else {
-                    for (offset, draft) in request.mtp_draft.iter().copied().enumerate() {
+                    let mut indices = vec![batch.n_tokens() - 1];
+                    for (offset, draft) in request.speculative_draft.iter().copied().enumerate() {
                         let draft_position = position
                             .checked_add(i32::try_from(offset + 1).map_err(backend_error)?)
                             .ok_or_else(|| {
@@ -1990,8 +2128,9 @@ fn decode_batch<'model>(
                         batch
                             .add(draft, draft_position, &[sequence_id], true)
                             .map_err(backend_error)?;
-                        request.mtp_indices.push(batch.n_tokens() - 1);
+                        indices.push(batch.n_tokens() - 1);
                     }
+                    commit.record_speculative_indices(sequence_id, indices);
                 }
             }
             BatchWork::Prefill {
@@ -1999,8 +2138,7 @@ fn decode_batch<'model>(
                 tokens,
             } => {
                 let request = request_by_sequence(active, sequence_id)?;
-                request.prompt_started_at.get_or_insert(batch_started);
-                let start = request.prompt_offset;
+                let start = commit.prompt_start(sequence_id, request.processed_prompt_tokens);
                 let end = start + tokens;
                 for (relative, token) in request.prompt[start..end].iter().enumerate() {
                     let absolute = start + relative;
@@ -2014,68 +2152,60 @@ fn decode_batch<'model>(
                         )
                         .map_err(backend_error)?;
                     if final_prompt_token {
-                        logits.push((sequence_id, batch.n_tokens() - 1));
+                        commit.record_logits(sequence_id, batch.n_tokens() - 1);
                     }
                 }
-                request.prompt_offset = end;
+                commit.advance_prompt(sequence_id, end);
             }
         }
     }
 
     let verification_started = Instant::now();
     context.decode(batch).map_err(backend_error)?;
-    if let Some(operations) = mtp.as_mut() {
+    if let Some(operations) = speculative.as_mut() {
         operations.process(batch).map_err(backend_error)?;
     }
-    for request in active.iter_mut().filter(|request| {
-        request.sequence_id.is_some() && matches!(request.phase, RequestPhase::Prefill)
-    }) {
-        request.pending_progress = Some(InferenceProgress::Prefill {
-            completed_tokens: request.prompt_offset,
-            total_tokens: request.prompt_tokens,
-            cached_tokens: request.cached_prompt_tokens,
-        });
-    }
+    commit.apply(active)?;
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
-    for (sequence_id, batch_index) in logits {
-        let request = request_by_sequence(active, sequence_id)?;
-        if let RequestPhase::Decode { token, .. } = request.phase {
-            request.cache_history.push(token);
-        }
-        request.phase = RequestPhase::ReadyToSample { batch_index };
-    }
-    if let Some(operations) = mtp.as_mut() {
-        verify_mtp_batch(model, context, operations, active, verification_ms)?;
+    if let Some(operations) = speculative.as_mut() {
+        verify_speculative_batch(model, context, operations, active, verification_ms)?;
     }
     Ok(true)
 }
 
-fn verify_mtp_batch<'model>(
+fn verify_speculative_batch<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
-    operations: &mut MtpOperations<'_>,
+    operations: &mut SpeculativeOperations<'_>,
     active: &mut [ActiveRequest<'model>],
     verification_ms: f64,
 ) -> Result<(), InferenceError> {
     for request in active
         .iter_mut()
-        .filter(|request| !request.mtp_draft.is_empty())
+        .filter(|request| !request.speculative_draft.is_empty())
     {
-        let sequence_id = request
-            .sequence_id
-            .ok_or_else(|| InferenceError::Backend("MTP request lost its sequence".into()))?;
+        let sequence_id = request.sequence_id().ok_or_else(|| {
+            InferenceError::Backend("speculative request lost its sequence".into())
+        })?;
         let RequestPhase::Decode {
             token: pending,
-            position: _,
+            position: verification_start_position,
         } = request.phase
         else {
             return Err(InferenceError::Backend(
-                "MTP verification request was not in decode state".into(),
+                "speculative verification request was not in decode state".into(),
             ));
         };
+        let sampler_checkpoint = request.sampler.snapshot().map_err(backend_error)?;
+        let proposed_drafts = request.speculative_draft.len();
         let accepted = request
             .sampler
-            .sample_and_accept_n(context, &request.mtp_indices, &request.mtp_draft, false)
+            .sample_and_accept_n(
+                context,
+                &request.speculative_indices,
+                &request.speculative_draft,
+                false,
+            )
             .map_err(backend_error)?;
         if accepted.is_empty() {
             return Err(InferenceError::Backend(
@@ -2083,27 +2213,39 @@ fn verify_mtp_batch<'model>(
             ));
         }
         let accepted_drafts = accepted.len() - 1;
-        operations
-            .accept(
-                sequence_id,
-                u16::try_from(accepted_drafts).map_err(backend_error)?,
-            )
+        let next_position = verification_start_position
+            .checked_add(1)
+            .and_then(|position| position.checked_add(i32::try_from(accepted_drafts).ok()?))
+            .ok_or_else(|| {
+                InferenceError::Backend("speculative position exceeded i32::MAX".into())
+            })?;
+        let resolution = operations
+            .resolve_verification(sequence_id, proposed_drafts, accepted_drafts, next_position)
             .map_err(backend_error)?;
+        if resolution == SpeculativeVerificationResolution::Replay {
+            request
+                .sampler
+                .restore(&sampler_checkpoint)
+                .map_err(backend_error)?;
+            request.speculative_draft = accepted;
+            request.speculative_indices.clear();
+            request.speculative_replaying = true;
+            continue;
+        }
 
-        request.cache_history.push(pending);
+        request.token_history.push(pending);
         request
-            .cache_history
+            .token_history
             .extend(accepted.iter().take(accepted_drafts).copied());
-        let next_position = i32::try_from(request.cache_history.len()).map_err(backend_error)?;
-        operations
-            .remove_sequence_range(sequence_id, next_position, -1)
-            .map_err(backend_error)?;
+        let accepted_original_drafts =
+            accepted_drafts.saturating_sub(usize::from(request.speculative_replaying));
         request.accepted_draft_tokens = request
             .accepted_draft_tokens
-            .saturating_add(accepted_drafts);
+            .saturating_add(accepted_original_drafts);
         request.verification_ms += verification_ms;
-        request.mtp_draft.clear();
-        request.mtp_indices.clear();
+        request.speculative_draft.clear();
+        request.speculative_indices.clear();
+        request.speculative_replaying = false;
 
         let mut terminal = None;
         for token in accepted.iter().copied() {
@@ -2132,13 +2274,14 @@ fn verify_mtp_batch<'model>(
 #[cfg(feature = "mtmd")]
 fn decode_multimodal_prefill<'model>(
     context: &mut LlamaContext<'model>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
     let Some(index) = active.iter().position(|request| {
         request.multimodal_prompt.is_some()
             && matches!(request.phase, RequestPhase::Prefill)
-            && request.sequence_id.is_some()
+            && request.sequence_id().is_some()
             && request.outbound.is_empty()
             && !request.cancelled.load(Ordering::Acquire)
     }) else {
@@ -2146,7 +2289,7 @@ fn decode_multimodal_prefill<'model>(
     };
     if active
         .iter()
-        .filter(|request| request.sequence_id.is_some())
+        .filter(|request| request.sequence_id().is_some())
         .count()
         != 1
     {
@@ -2159,7 +2302,7 @@ fn decode_multimodal_prefill<'model>(
     })?;
     let request = &mut active[index];
     let sequence_id = request
-        .sequence_id
+        .sequence_id()
         .ok_or_else(|| InferenceError::Backend("multimodal sequence lost ownership".into()))?;
     let batch_size = i32::try_from(context.n_batch()).map_err(backend_error)?;
     let started = Instant::now();
@@ -2173,6 +2316,7 @@ fn decode_multimodal_prefill<'model>(
         context,
         sequence_id,
         batch_size,
+        speculative,
     );
     context.clear_abort_callback();
     if request.cancelled.load(Ordering::Acquire) {
@@ -2180,7 +2324,7 @@ fn decode_multimodal_prefill<'model>(
     }
     let next_position = result?;
     request.next_position = next_position;
-    request.prompt_offset = request.prompt.len();
+    request.processed_prompt_tokens = request.prompt.len();
     request.pending_progress = Some(InferenceProgress::Prefill {
         completed_tokens: request.prompt_tokens,
         total_tokens: request.prompt_tokens,
@@ -2193,6 +2337,7 @@ fn decode_multimodal_prefill<'model>(
 #[cfg(not(feature = "mtmd"))]
 fn decode_multimodal_prefill<'model>(
     _context: &mut LlamaContext<'model>,
+    _speculative: Option<&mut SpeculativeOperations<'_>>,
     _multimodal: &mut Option<MultimodalRuntime<'model>>,
     active: &mut [ActiveRequest<'model>],
 ) -> Result<bool, InferenceError> {
@@ -2213,7 +2358,7 @@ fn request_by_sequence<'a, 'model>(
 ) -> Result<&'a mut ActiveRequest<'model>, InferenceError> {
     active
         .iter_mut()
-        .find(|request| request.sequence_id == Some(sequence_id))
+        .find(|request| request.sequence_id() == Some(sequence_id))
         .ok_or_else(|| {
             InferenceError::Backend(format!(
                 "scheduler referenced unowned sequence {sequence_id}"
@@ -2247,7 +2392,7 @@ fn restore_prompt_checkpoint(
 
 fn cleanup_requests(
     context: &mut LlamaContext<'_>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut Vec<ActiveRequest<'_>>,
 ) {
@@ -2259,7 +2404,7 @@ fn cleanup_requests(
             cancel_request(&mut active[index]);
             release_sequence(
                 context,
-                mtp.as_deref_mut(),
+                speculative.as_deref_mut(),
                 sequence_pool,
                 &mut active[index],
             );
@@ -2268,7 +2413,7 @@ fn cleanup_requests(
             FlushOutcome::Empty if matches!(active[index].phase, RequestPhase::Terminal) => {
                 release_sequence(
                     context,
-                    mtp.as_deref_mut(),
+                    speculative.as_deref_mut(),
                     sequence_pool,
                     &mut active[index],
                 );
@@ -2281,7 +2426,7 @@ fn cleanup_requests(
             FlushOutcome::Disconnected => {
                 release_sequence(
                     context,
-                    mtp.as_deref_mut(),
+                    speculative.as_deref_mut(),
                     sequence_pool,
                     &mut active[index],
                 );
@@ -2344,31 +2489,47 @@ fn flush_outbound(request: &mut ActiveRequest<'_>) -> FlushOutcome {
 
 fn release_sequence(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     request: &mut ActiveRequest<'_>,
 ) {
-    let Some(sequence_id) = request.sequence_id.take() else {
+    let Some(sequence) = request.sequence.take() else {
         return;
     };
-    if request.cache_prompt && request.cacheable {
-        sequence_pool.release_cached(
-            sequence_id,
-            SequenceCache {
-                prompt: request.prompt.clone(),
-                checkpoints: std::mem::take(&mut request.prompt_checkpoints),
-            },
-        );
+    if let Some(reusable_prefix) = request.take_reusable_prefix() {
+        sequence_pool.release(sequence.into_available(Some(reusable_prefix)));
         return;
     }
+    let sequence_id = sequence.id();
     // Full sequence removal is supported for every llama.cpp memory implementation. This is the
     // sole cache policy required by this milestone: a sequence is never reassigned while resident
     // state still belongs to the previous request.
-    match clear_sequence(context, mtp, sequence_id) {
-        Ok(()) => sequence_pool.release(sequence_id),
+    match clear_sequence(context, speculative, sequence_id) {
+        Ok(()) => sequence_pool.release(sequence.into_available(None)),
         Err(error) => {
             // Never hand a sequence to another request unless native state removal succeeded.
-            sequence_pool.quarantine(sequence_id);
+            sequence.quarantine();
+            request.phase = RequestPhase::Terminal;
+            request.outbound.clear();
+            request.outbound.push_back(ExecutorItem::Failed(error));
+        }
+    }
+}
+
+fn discard_sequence(
+    context: &mut LlamaContext<'_>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
+    sequence_pool: &mut SequencePool,
+    request: &mut ActiveRequest<'_>,
+) {
+    let Some(sequence) = request.sequence.take() else {
+        return;
+    };
+    let sequence_id = sequence.id();
+    match clear_sequence(context, speculative, sequence_id) {
+        Ok(()) => sequence_pool.release(sequence.into_available(None)),
+        Err(error) => {
+            sequence.quarantine();
             request.phase = RequestPhase::Terminal;
             request.outbound.clear();
             request.outbound.push_back(ExecutorItem::Failed(error));
@@ -2378,21 +2539,21 @@ fn release_sequence(
 
 fn clear_sequence(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
 ) -> Result<(), InferenceError> {
-    clear_sequence_range(context, mtp, sequence_id, 0, -1)
+    clear_sequence_range(context, speculative, sequence_id, 0, -1)
 }
 
 fn clear_sequence_range(
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
     start: i32,
     end: i32,
 ) -> Result<(), InferenceError> {
-    if let Some(mtp) = mtp {
-        return mtp
+    if let Some(speculative) = speculative {
+        return speculative
             .remove_sequence_range(sequence_id, start, end)
             .map_err(backend_error);
     }
@@ -2415,7 +2576,6 @@ fn clear_sequence_range(
 
 fn fail_request(request: &mut ActiveRequest<'_>, error: InferenceError) {
     request.phase = RequestPhase::Terminal;
-    request.cacheable = false;
     if request.outbound.len() >= OUTBOUND_QUEUE_CAPACITY {
         request.outbound.clear();
     }
@@ -2424,7 +2584,6 @@ fn fail_request(request: &mut ActiveRequest<'_>, error: InferenceError) {
 
 fn cancel_request(request: &mut ActiveRequest<'_>) {
     request.outbound.clear();
-    request.cacheable = false;
     fail_request(request, InferenceError::Cancelled);
 }
 
@@ -2438,7 +2597,7 @@ fn fail_queued(queued: &mut VecDeque<QueuedCompletion>, reason: InferenceError) 
 
 fn fail_active(
     context: &mut LlamaContext<'_>,
-    mut mtp: Option<&mut MtpOperations<'_>>,
+    mut speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_pool: &mut SequencePool,
     active: &mut [ActiveRequest<'_>],
     reason: InferenceError,
@@ -2447,7 +2606,22 @@ fn fail_active(
         if !matches!(request.phase, RequestPhase::Terminal) {
             fail_request(request, clone_inference_error(&reason));
         }
-        release_sequence(context, mtp.as_deref_mut(), sequence_pool, request);
+        release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
+    }
+}
+
+fn fail_active_after_context_reset(
+    sequence_pool: &mut SequencePool,
+    active: &mut [ActiveRequest<'_>],
+    reason: InferenceError,
+) {
+    for request in active {
+        if !matches!(request.phase, RequestPhase::Terminal) {
+            fail_request(request, clone_inference_error(&reason));
+        }
+        if let Some(sequence) = request.sequence.take() {
+            sequence_pool.release(sequence.into_available(None));
+        }
     }
 }
 
@@ -2577,6 +2751,18 @@ fn validate_projector_config(
                 .into(),
         ));
     }
+    if matches!(
+        config.speculative,
+        icn_contracts::SpeculativeDecodingConfig::Enabled {
+            method: icn_contracts::SpeculativeMethodConfig::Mtp { .. },
+            ..
+        }
+    ) {
+        return Err(InferenceError::InvalidConfig(
+            "multimodal projector mode does not support MTP because the native MTP drafter cannot consume media embedding batches"
+                .into(),
+        ));
+    }
     if config.batch_size > i32::MAX as u32 {
         return Err(InferenceError::InvalidConfig(
             "multimodal projector mode requires batch_size <= i32::MAX".into(),
@@ -2615,7 +2801,7 @@ fn validate_projector_config(
 fn warm_up(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
-    mtp: Option<&mut MtpOperations<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
 ) -> Result<(), InferenceError> {
     let tokens = model
         .str_to_token(" ", AddBos::Always)
@@ -2624,8 +2810,8 @@ fn warm_up(
         let mut batch = LlamaBatch::new(1, 1);
         batch.add(token, 0, &[0], false).map_err(backend_error)?;
         context.decode(&mut batch).map_err(backend_error)?;
-        if let Some(mtp) = mtp {
-            mtp.process(&batch).map_err(backend_error)?;
+        if let Some(speculative) = speculative {
+            speculative.process(&batch).map_err(backend_error)?;
         }
         context.synchronize();
         context.clear_kv_cache();
@@ -2668,23 +2854,23 @@ fn model_properties(
         },
         reasoning: reasoning.profile,
         modalities,
-        mtp: match &config.mtp {
-            icn_contracts::MtpConfig::Disabled { reason } => {
-                icn_contracts::MtpRuntimeProperties::Disabled {
+        speculative: match &config.speculative {
+            icn_contracts::SpeculativeDecodingConfig::Disabled { reason } => {
+                icn_contracts::SpeculativeDecodingRuntimeProperties::Disabled {
                     reason: reason.clone(),
                 }
             }
-            icn_contracts::MtpConfig::Enabled {
+            icn_contracts::SpeculativeDecodingConfig::Enabled {
                 source,
+                method,
                 n_max,
                 n_min,
-                p_min,
                 ..
-            } => icn_contracts::MtpRuntimeProperties::Enabled {
+            } => icn_contracts::SpeculativeDecodingRuntimeProperties::Enabled {
                 source: source.clone(),
+                method: method.clone(),
                 n_max: *n_max,
                 n_min: *n_min,
-                p_min: *p_min,
             },
         },
         execution: ExecutionConfigReport {
@@ -2842,6 +3028,10 @@ fn validate_prompt_capacity(
 }
 
 impl<'model> ActiveRequest<'model> {
+    fn sequence_id(&self) -> Option<i32> {
+        self.sequence.as_ref().map(ActiveSequence::id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn admit(
         model: &'model LlamaModel,
@@ -2850,9 +3040,8 @@ impl<'model> ActiveRequest<'model> {
         context_capacity: usize,
         batch_size: usize,
         ubatch_size: usize,
-        sequence_id: i32,
         queued: QueuedCompletion,
-        cached: Option<&SequenceCache>,
+        reusable_prefix: Option<&ReusablePrefix>,
     ) -> Result<Self, (SyncSender<ExecutorItem>, InferenceError)> {
         let QueuedCompletion {
             request,
@@ -2896,8 +3085,8 @@ impl<'model> ActiveRequest<'model> {
             stops.extend(prepared.additional_stops().iter().cloned());
             let mut cached_prompt_tokens = if request.cache_prompt && tokenized.multimodal.is_none()
             {
-                cached.map_or(0, |cached| {
-                    common_token_prefix(&cached.prompt, &tokenized.text_tokens)
+                reusable_prefix.map_or(0, |prefix| {
+                    common_token_prefix(&prefix.tokens, &tokenized.text_tokens)
                 })
             } else {
                 0
@@ -2906,9 +3095,8 @@ impl<'model> ActiveRequest<'model> {
             if cached_prompt_tokens == tokenized.text_tokens.len() {
                 cached_prompt_tokens = cached_prompt_tokens.saturating_sub(1);
             }
-            let cacheable = tokenized.multimodal.is_none();
-            let prompt_checkpoints = cached.map_or_else(Vec::new, |cache| {
-                cache
+            let prompt_checkpoints = reusable_prefix.map_or_else(Vec::new, |prefix| {
+                prefix
                     .checkpoints
                     .iter()
                     .filter(|checkpoint| checkpoint.prefix <= cached_prompt_tokens)
@@ -2932,7 +3120,7 @@ impl<'model> ActiveRequest<'model> {
             pending_checkpoint_prefixes.dedup();
 
             Ok(Self {
-                sequence_id: Some(sequence_id),
+                sequence: None,
                 events: events.clone(),
                 span,
                 cancelled,
@@ -2944,9 +3132,9 @@ impl<'model> ActiveRequest<'model> {
                 }),
                 last_progress_emitted_at: None,
                 phase: RequestPhase::Prefill,
-                cache_history: tokenized.text_tokens.clone(),
+                token_history: tokenized.text_tokens.clone(),
                 prompt: tokenized.text_tokens,
-                prompt_offset: cached_prompt_tokens,
+                processed_prompt_tokens: cached_prompt_tokens,
                 prompt_tokens,
                 cached_prompt_tokens,
                 prompt_checkpoints,
@@ -2956,15 +3144,15 @@ impl<'model> ActiveRequest<'model> {
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
-                mtp_started: false,
-                mtp_draft: Vec::new(),
-                mtp_indices: Vec::new(),
+                speculative_started: false,
+                speculative_draft: Vec::new(),
+                speculative_indices: Vec::new(),
+                speculative_replaying: false,
                 draft_tokens: 0,
                 accepted_draft_tokens: 0,
                 draft_ms: 0.0,
                 verification_ms: 0.0,
                 cache_prompt: request.cache_prompt,
-                cacheable,
                 ignore_eos: request.ignore_eos,
                 timings_per_token: request.timings_per_token,
                 sampler,
@@ -2981,6 +3169,25 @@ impl<'model> ActiveRequest<'model> {
             })
         })();
         result.map_err(|error| (events, error))
+    }
+
+    fn take_reusable_prefix(&mut self) -> Option<ReusablePrefix> {
+        if !self.cache_prompt || self.multimodal_prompt.is_some() {
+            return None;
+        }
+        let tokens = self.prompt.get(..self.processed_prompt_tokens)?.to_vec();
+        if tokens.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            self.prompt_checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.prefix <= self.processed_prompt_tokens)
+        );
+        Some(ReusablePrefix {
+            tokens,
+            checkpoints: std::mem::take(&mut self.prompt_checkpoints),
+        })
     }
 
     fn sample_next(
@@ -3786,6 +3993,109 @@ mod tests {
     }
 
     #[test]
+    fn batch_commit_keeps_repeated_prompt_quanta_local_until_apply() {
+        let mut commit = BatchCommit::new(Instant::now());
+        assert_eq!(commit.prompt_start(2, 7), 7);
+        commit.advance_prompt(2, 9);
+        assert_eq!(commit.prompt_start(2, 7), 9);
+        commit.advance_prompt(2, 11);
+        assert_eq!(commit.prompt_ends, vec![(2, 11)]);
+    }
+
+    struct NoopLoadObserver;
+
+    impl ModelLoadObserver for NoopLoadObserver {
+        fn phase_started(&self, _phase: ModelLoadPhase) {}
+
+        fn phase_completed(&self, _phase: ModelLoadPhase) {}
+    }
+
+    #[test]
+    #[ignore = "loads the repository's real 18 MB GGUF acceptance fixture"]
+    fn interrupted_generation_reuses_prompt_prefix_with_real_model() {
+        disable_native_diagnostics();
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.parity-models/tinyllamas/stories15M-q4_0.gguf");
+        assert!(model_path.is_file(), "missing {}", model_path.display());
+
+        let native = NativeBackend::initialize().expect("initialize native backend");
+        let hardware = native.discover_hardware(
+            icn_hardware::CapacityPolicy::default(),
+            "real-model-prompt-retention-test",
+            Vec::new(),
+        );
+        let mut defaults = model_plan_defaults();
+        defaults.context_size = 512;
+        defaults.physical_context_size = 512;
+        defaults.batch_size = 128;
+        defaults.ubatch_size = 128;
+        defaults.max_sequences = 1;
+        defaults.prefill_quantum = 32;
+        let intent = execution_intent(model_path, None, &defaults);
+        let prepared = native
+            .prepare_load(
+                "stories15m-retention-test",
+                intent,
+                icn_contracts::SpeculativeDecodingConfig::default(),
+                hardware,
+            )
+            .expect("prepare real model load");
+        let backend = prepared
+            .execute(Arc::new(NoopLoadObserver))
+            .expect("load real model");
+
+        let mut completion = request();
+        completion.template.messages = vec![ChatMessage::text(
+            ChatRole::User,
+            "Write one short continuation for this story. The small red fox walked through the quiet forest every morning. It knew every mossy stone, every narrow path, and every bird song. Today it found a bright blue box beneath the oldest oak tree. The box was warm, and something inside made a gentle ticking sound.",
+        )];
+        completion.max_tokens = 8;
+        completion.ignore_eos = true;
+
+        let mut reached_generation = false;
+        let interrupted = backend.complete(completion.clone(), &mut |event| {
+            if matches!(
+                event.delta,
+                InferenceEvent::StreamStart
+                    | InferenceEvent::ContentDelta { .. }
+                    | InferenceEvent::ReasoningDelta { .. }
+                    | InferenceEvent::ToolCallDelta { .. }
+            ) {
+                reached_generation = true;
+                return Err(InferenceError::Callback(
+                    "intentional real-model interruption".into(),
+                ));
+            }
+            Ok(())
+        });
+        assert!(
+            reached_generation,
+            "request produced no stream event before returning {interrupted:?}"
+        );
+        assert!(matches!(interrupted, Err(InferenceError::Callback(_))));
+
+        let mut observed_cached_tokens = 0;
+        let completed = backend
+            .complete(completion, &mut |event| {
+                if let InferenceEvent::Progress(InferenceProgress::Prefill {
+                    cached_tokens, ..
+                }) = event.delta
+                {
+                    observed_cached_tokens = observed_cached_tokens.max(cached_tokens);
+                }
+                Ok(())
+            })
+            .expect("complete request after interruption");
+
+        assert!(
+            observed_cached_tokens > 0,
+            "follow-up prefill did not report cached prompt tokens"
+        );
+        assert_eq!(completed.cached_prompt_tokens, observed_cached_tokens);
+        assert!(completed.generated_tokens > 0);
+    }
+
+    #[test]
     fn common_chat_preparation_is_used_for_plain_messages() {
         let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
         let prepared = prepare_chat(&templates, &request().template, None).unwrap();
@@ -3894,7 +4204,7 @@ mod tests {
                 ..ExecutionConfig::default()
             },
             projector: Some(ProjectorConfig::new(executable)),
-            mtp: icn_contracts::MtpConfig::default(),
+            speculative: icn_contracts::SpeculativeDecodingConfig::default(),
         }
     }
 
@@ -3934,6 +4244,58 @@ mod tests {
         let error = validate_model_config(&model_config_with_projector(2)).unwrap_err();
         assert!(error.to_string().contains("requires max_sequences=1"));
         validate_model_config(&model_config_with_projector(1)).unwrap();
+    }
+
+    #[cfg(feature = "mtmd")]
+    #[test]
+    fn projector_mode_rejects_embedded_and_separate_mtp_before_loading() {
+        for source in [
+            icn_contracts::SpeculativeDraftSource::Embedded,
+            icn_contracts::SpeculativeDraftSource::Separate {
+                model_path: "draft.gguf".into(),
+            },
+        ] {
+            let mut config = model_config_with_projector(1);
+            config.speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
+                source,
+                method: icn_contracts::SpeculativeMethodConfig::Mtp {
+                    min_draft_probability: 0.1,
+                },
+                n_max: 3,
+                n_min: 0,
+                cache_type_k: CacheType::F16,
+                cache_type_v: CacheType::F16,
+            };
+
+            let error = validate_model_config(&config).unwrap_err();
+            assert!(error.to_string().contains("does not support MTP"));
+        }
+    }
+
+    #[cfg(feature = "mtmd")]
+    #[test]
+    fn projector_mode_accepts_embedding_capable_speculative_methods() {
+        for method in [
+            icn_contracts::SpeculativeMethodConfig::DFlash {
+                min_sample_probability: 0.1,
+            },
+            icn_contracts::SpeculativeMethodConfig::DSpark {
+                acceptance_threshold: 0.1,
+            },
+        ] {
+            let mut config = model_config_with_projector(1);
+            config.speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
+                source: icn_contracts::SpeculativeDraftSource::Separate {
+                    model_path: "draft.gguf".into(),
+                },
+                method,
+                n_max: 3,
+                n_min: 0,
+                cache_type_k: CacheType::F16,
+                cache_type_v: CacheType::F16,
+            };
+            validate_model_config(&config).unwrap();
+        }
     }
 
     #[cfg(not(feature = "mtmd"))]
@@ -4349,9 +4711,10 @@ mod tests {
             cpu_model: Some("Apple".to_owned()),
             logical_cores: 8,
             system_memory: HardwareSystemMemory {
-                total_bytes: 64,
-                current_available_bytes: 20,
-                warning_reserve_bytes: 0,
+                physical_capacity_bytes: 64,
+                physical_available_bytes: 20,
+                allocation_capacity_bytes: 64,
+                allocation_headroom_bytes: 20,
                 assess_reserve_bytes: 0,
                 abort_reserve_bytes: 0,
             },

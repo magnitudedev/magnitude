@@ -20,6 +20,7 @@ const descriptor = {
   providerId: selection.providerId,
   providerModelId: selection.providerModelId,
   displayName: "Canonical local model",
+  variantLabel: Option.none(),
 }
 const allocation = {
   contextWindowTokens: 200_000,
@@ -35,7 +36,7 @@ describe("current local model derivation", () => {
       selection,
       descriptor,
       availability: { _tag: "Available" },
-      instance: Option.none(),
+      residency: { _tag: "Unloaded" },
       actions: ["Load"],
     })))
 
@@ -52,11 +53,12 @@ describe("current local model derivation", () => {
       selection,
       descriptor,
       availability: { _tag: "Available" },
-      instance: Option.some({
-        id: ModelInstanceIdSchema.make("instance"),
+      residency: {
+        _tag: "Ready",
+        instanceId: ModelInstanceIdSchema.make("instance"),
         configurationId: ModelServingConfigurationIdSchema.make("configuration"),
-        lifecycle: { _tag: "Ready", allocation },
-      }),
+        allocation,
+      },
       actions: ["Stop"],
     })))
 

@@ -12,13 +12,13 @@
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
-import { App, PlatformProvider, createAgentClient, AgentClientProvider, injectCssVars, stopDisplayViewController } from "@magnitudedev/web"
+import { App, PlatformProvider, createAgentClient, AgentClientProvider, initializeAppearance, stopDisplayViewController } from "@magnitudedev/web"
 import { DaemonConnectionError } from "@magnitudedev/web"
 import { createDesktopPlatform } from "./platform"
 import "@web-styles/vars.css"
 import "@web-styles/globals.css"
 
-injectCssVars()
+initializeAppearance()
 
 const desktopApi = window.__magnitudeDesktop
 const root = createRoot(document.getElementById("root")!)

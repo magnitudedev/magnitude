@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { modelSlotResidentAllocation } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, modelSlotResidentAllocation } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import type { LocalModelsState, ModelSlot, ModelSlotsState, ProviderId, SlotId } from "@magnitudedev/sdk"
 
@@ -56,22 +56,27 @@ export const deriveLocalInferenceFooterView = (
     ? selectedSlot
     : undefined
   const activeModel = slot && models !== null
-    ? models.models.find((model) => model.offerings.some(({ providerModelId }) =>
-      providerModelId === slot.selection.providerModelId))
+    ? models.models.find((model) => model.servingState._tag === "Assessed"
+      && model.servingState.availabilityState._tag === "Selectable"
+      && model.servingState.availabilityState.providerModelId === slot.selection.providerModelId)
     : undefined
-  const downloadModel = models?.models.find((model) =>
-    model.download._tag === "Downloading" || model.download._tag === "Failed")
-  const model = activeModel ?? downloadModel
-  const lifecycle = slot?._tag === "ConfiguredLocal"
-    ? Option.getOrNull(slot.instance)?.lifecycle
+  const download = models?.models.find(({ acquisitionState }) =>
+    acquisitionState._tag === "Downloading" || acquisitionState._tag === "Failed")
+  const currentResidency = slot?._tag === "ConfiguredLocal"
+    ? slot.residency
     : undefined
-  const residency = lifecycle?._tag === "Ready"
+  const residency = currentResidency?._tag === "Ready"
     ? "loaded" as const
-    : lifecycle?._tag === "Loading" || lifecycle?._tag === "Stopping"
+    : currentResidency?._tag === "Requested"
+      || currentResidency?._tag === "Loading"
+      || currentResidency?._tag === "Stopping"
       ? "loading" as const
       : "not_loaded" as const
   return {
-    modelName: selectedModelName ?? model?.displayName ?? null,
+    modelName: selectedModelName
+      ?? (activeModel ? formatLocalModelDisplayName(activeModel) : undefined)
+      ?? (download ? formatLocalModelDisplayName(download) : undefined)
+      ?? null,
     residency,
     memoryLabel: residency === "loaded" && slot ? residentMemoryLabel(slot) : null,
   }

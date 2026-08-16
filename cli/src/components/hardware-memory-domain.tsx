@@ -33,20 +33,20 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
   const complete = isComplete(domain)
   const barSegments = complete
     ? [
-        { value: domain.fixedBytes, color: theme.foreground },
-        { value: domain.kvCacheBytes, color: theme.primary },
-        { value: domain.systemAndAppsBytes, color: theme.warning },
+        { value: domain.fixedBytes, color: theme.text.body },
+        { value: domain.kvCacheBytes, color: theme.accent },
+        { value: domain.systemAndAppsBytes, color: theme.status.warning },
       ]
     : domain.usedBytes !== null && domain.freeBytes !== null
       ? [
-          { value: domain.usedBytes, color: theme.secondary },
+          { value: domain.usedBytes, color: theme.text.supporting },
         ]
       : []
 
   return (
     <box style={{ flexDirection: 'column', paddingTop: 1 }}>
-      <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{domain.label}</text>
-      <text style={{ fg: theme.foreground }}>
+      <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{domain.label}</text>
+      <text style={{ fg: theme.text.body }}>
         {domain.usedBytes === null
           ? `${formatMemoryBytes(domain.totalBytes)} total`
           : `${formatMemoryBytes(domain.usedBytes)} / ${formatMemoryBytes(domain.totalBytes)} used`}
@@ -56,22 +56,21 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
           segments={barSegments}
           total={domain.totalBytes}
           width={width}
-          trackColor={theme.border}
+          trackColor={theme.border.standard}
         />
       )}
       {complete ? (
         <box style={{ flexDirection: 'column' }}>
-          <text><span fg={theme.foreground}>■</span>{` Weights       ${formatMemoryBytes(domain.fixedBytes)}`}</text>
-          <text><span fg={theme.primary}>■</span>{` KV cache      ${formatMemoryBytes(domain.kvCacheBytes)}`}</text>
-          <text><span fg={theme.warning}>■</span>{` System & apps ${formatMemoryBytes(domain.systemAndAppsBytes)}`}</text>
-          <text><span fg={theme.border}>□</span>{` Free          ${formatMemoryBytes(domain.freeBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.text.body}>■</span>{` Weights       ${formatMemoryBytes(domain.fixedBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.accent}>■</span>{` KV cache      ${formatMemoryBytes(domain.kvCacheBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.status.warning}>■</span>{` System & apps ${formatMemoryBytes(domain.systemAndAppsBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.border.standard}>□</span>{` Free          ${formatMemoryBytes(domain.freeBytes)}`}</text>
         </box>
       ) : domain.notice ? (
-        <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>{domain.notice}</span></text>
+        <text style={{ fg: theme.text.supporting }}><span attributes={TextAttributes.DIM}>{domain.notice}</span></text>
       ) : null}
     </box>
   )
 }
 
 export { formatMemoryBytes }
-

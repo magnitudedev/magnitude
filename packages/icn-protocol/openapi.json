@@ -308,6 +308,36 @@
         }
       }
     },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "listModels",
+        "responses": {
+          "200": {
+            "description": "Catalog models joined with current local artifact state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models/assess": {
       "post": {
         "tags": [
@@ -331,6 +361,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AssessModelsResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model assessment could not be completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -378,6 +418,56 @@
         }
       }
     },
+    "/v1/models/catalog/reconcile": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "reconcileCatalogModel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconcileCatalogModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Catalog model reconciliation admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileCatalogModelResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog model reconciliation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models/downloads": {
       "get": {
         "tags": [
@@ -386,7 +476,7 @@
         "operationId": "listModelDownloads",
         "responses": {
           "200": {
-            "description": "Retained model download attempts",
+            "description": "Retained model downloads and internal package attempts",
             "content": {
               "application/json": {
                 "schema": {
@@ -396,7 +486,7 @@
             }
           },
           "500": {
-            "description": "Download attempts unavailable",
+            "description": "Model downloads unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -424,7 +514,7 @@
         },
         "responses": {
           "200": {
-            "description": "Authoritative download attempt",
+            "description": "Authoritative model-download admission",
             "content": {
               "application/json": {
                 "schema": {
@@ -446,17 +536,17 @@
         }
       }
     },
-    "/v1/models/downloads/{attempt_id}": {
-      "get": {
+    "/v1/models/downloads/{download_id}/acknowledge-failure": {
+      "post": {
         "tags": [
           "models"
         ],
-        "operationId": "getModelDownload",
+        "operationId": "acknowledgeModelDownloadFailure",
         "parameters": [
           {
-            "name": "attempt_id",
+            "name": "download_id",
             "in": "path",
-            "description": "Download attempt ID",
+            "description": "Failed model download ID",
             "required": true,
             "schema": {
               "type": "string"
@@ -465,17 +555,27 @@
         ],
         "responses": {
           "200": {
-            "description": "Authoritative model download attempt",
+            "description": "Acknowledged failed model download",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DownloadAttempt"
+                  "$ref": "#/components/schemas/ModelDownload"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model download has not failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
           },
           "404": {
-            "description": "Attempt not found",
+            "description": "Model download not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -487,7 +587,7 @@
         }
       }
     },
-    "/v1/models/downloads/{attempt_id}/cancel": {
+    "/v1/models/downloads/{download_id}/cancel": {
       "post": {
         "tags": [
           "models"
@@ -495,9 +595,9 @@
         "operationId": "cancelModelDownload",
         "parameters": [
           {
-            "name": "attempt_id",
+            "name": "download_id",
             "in": "path",
-            "description": "Download attempt ID",
+            "description": "Model download ID",
             "required": true,
             "schema": {
               "type": "string"
@@ -506,17 +606,17 @@
         ],
         "responses": {
           "200": {
-            "description": "Cancelled or terminal model download attempt",
+            "description": "Cancelled or terminal model download",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DownloadAttempt"
+                  "$ref": "#/components/schemas/ModelDownload"
                 }
               }
             }
           },
           "404": {
-            "description": "Attempt not found",
+            "description": "Model download not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -1108,15 +1208,15 @@
         "type": "object",
         "required": [
           "requestId",
-          "target",
+          "bundle",
           "profiles"
         ],
         "properties": {
           "requestId": {
             "$ref": "#/components/schemas/ModelAssessmentRequestId"
           },
-          "target": {
-            "$ref": "#/components/schemas/ModelTargetInput"
+          "bundle": {
+            "$ref": "#/components/schemas/ModelBundleInput"
           },
           "profiles": {
             "type": "array",
@@ -1133,16 +1233,12 @@
             "type": "object",
             "required": [
               "requestId",
-              "targetId",
               "profiles",
               "_tag"
             ],
             "properties": {
               "requestId": {
                 "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "targetId": {
-                "$ref": "#/components/schemas/ModelOfferingTargetId"
               },
               "profiles": {
                 "type": "array",
@@ -1175,7 +1271,29 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "InvalidTarget"
+                  "InvalidBundle"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "requestId",
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "requestId": {
+                "$ref": "#/components/schemas/ModelAssessmentRequestId"
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
                 ]
               }
             }
@@ -1185,8 +1303,7 @@
       "AssessModelsRequest": {
         "type": "object",
         "required": [
-          "requests",
-          "capacityPolicy"
+          "requests"
         ],
         "properties": {
           "requests": {
@@ -1194,9 +1311,6 @@
             "items": {
               "$ref": "#/components/schemas/AssessModelRequest"
             }
-          },
-          "capacityPolicy": {
-            "$ref": "#/components/schemas/CapacityPolicy"
           }
         },
         "additionalProperties": false
@@ -1264,41 +1378,250 @@
           "q5_1"
         ]
       },
-      "CapacityPolicy": {
-        "type": "object",
-        "required": [
-          "requiredReserveBytesPerMemoryDomain"
-        ],
-        "properties": {
-          "requiredReserveBytesPerMemoryDomain": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
       "CatalogDiagnostic": {
         "type": "object",
         "required": [
+          "modelId",
+          "variantId",
           "failure"
         ],
         "properties": {
-          "entryId": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/RecommendableModelId"
-              }
-            ]
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
           },
           "failure": {
             "$ref": "#/components/schemas/ModelFailure"
           }
         },
         "additionalProperties": false
+      },
+      "CatalogModel": {
+        "type": "object",
+        "required": [
+          "modelId",
+          "variantId",
+          "desiredConfiguration",
+          "displayName",
+          "variantLabel",
+          "description",
+          "license",
+          "capabilities",
+          "parameterization",
+          "qualityScore",
+          "qualityScoreProvenance",
+          "fidelityRank",
+          "quantizationAware",
+          "qualityEvidence",
+          "localState"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
+          },
+          "desiredConfiguration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "license": {
+            "type": "string"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "parameterization": {
+            "$ref": "#/components/schemas/ModelParameterization"
+          },
+          "qualityScore": {
+            "type": "number",
+            "format": "double"
+          },
+          "qualityScoreProvenance": {
+            "type": "string"
+          },
+          "fidelityRank": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "quantizationAware": {
+            "type": "boolean"
+          },
+          "qualityEvidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "localState": {
+            "$ref": "#/components/schemas/CatalogModelLocalState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogModelEffectiveConfiguration": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "configuration",
+              "_tag"
+            ],
+            "properties": {
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Runnable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogModelId": {
+        "type": "string"
+      },
+      "CatalogModelInstallation": {
+        "type": "object",
+        "required": [
+          "effectiveConfiguration",
+          "packages"
+        ],
+        "properties": {
+          "effectiveConfiguration": {
+            "$ref": "#/components/schemas/CatalogModelEffectiveConfiguration"
+          },
+          "packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledModelPackage"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogModelLocalState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotInstalled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "installation",
+              "updateState",
+              "_tag"
+            ],
+            "properties": {
+              "installation": {
+                "$ref": "#/components/schemas/CatalogModelInstallation"
+              },
+              "updateState": {
+                "$ref": "#/components/schemas/CatalogModelUpdateState"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Installed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogModelUpdateState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Current"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "missingPackageIds",
+              "supersededPackageIds",
+              "_tag"
+            ],
+            "properties": {
+              "missingPackageIds": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelPackageId"
+                }
+              },
+              "supersededPackageIds": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelPackageId"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Available"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogVariantId": {
+        "type": "string"
       },
       "ChatCompletionChunk": {
         "type": "object",
@@ -1959,26 +2282,18 @@
         },
         "additionalProperties": false
       },
-      "DownloadAttempt": {
+      "DownloadFailure": {
         "oneOf": [
           {
             "type": "object",
             "required": [
-              "id",
-              "packageId",
               "_tag"
             ],
             "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Pending"
+                  "Interrupted"
                 ]
               }
             }
@@ -1986,45 +2301,25 @@
           {
             "type": "object",
             "required": [
-              "id",
-              "packageId",
-              "stage",
-              "completedBytes",
-              "totalBytes",
+              "requiredBytes",
+              "availableBytes",
               "_tag"
             ],
             "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "stage": {
-                "$ref": "#/components/schemas/DownloadStage"
-              },
-              "completedBytes": {
+              "requiredBytes": {
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
               },
-              "totalBytes": {
+              "availableBytes": {
                 "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "bytesPerSecond": {
-                "type": [
-                  "integer",
-                  "null"
-                ],
                 "format": "int64",
                 "minimum": 0
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Downloading"
+                  "InsufficientDiskSpace"
                 ]
               }
             }
@@ -2032,21 +2327,13 @@
           {
             "type": "object",
             "required": [
-              "id",
-              "packageId",
               "_tag"
             ],
             "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Completed"
+                  "SourceUnavailable"
                 ]
               }
             }
@@ -2054,37 +2341,13 @@
           {
             "type": "object",
             "required": [
-              "id",
-              "packageId",
-              "completedBytes",
-              "totalBytes",
-              "failure",
               "_tag"
             ],
             "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Failed"
+                  "NetworkUnavailable"
                 ]
               }
             }
@@ -2092,29 +2355,50 @@
           {
             "type": "object",
             "required": [
-              "id",
-              "packageId",
               "_tag"
             ],
             "properties": {
-              "id": {
-                "$ref": "#/components/schemas/DownloadAttemptId"
-              },
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LocalStorageFailure"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "CorruptDownload"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "message",
+              "_tag"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Cancelled"
+                  "Internal"
                 ]
               }
             }
           }
         ]
-      },
-      "DownloadAttemptId": {
-        "type": "string"
       },
       "DownloadStage": {
         "type": "string",
@@ -2652,24 +2936,30 @@
       "HardwareSystemMemory": {
         "type": "object",
         "required": [
-          "total_bytes",
-          "current_available_bytes",
-          "warning_reserve_bytes",
+          "physical_capacity_bytes",
+          "physical_available_bytes",
+          "allocation_capacity_bytes",
+          "allocation_headroom_bytes",
           "assess_reserve_bytes",
           "abort_reserve_bytes"
         ],
         "properties": {
-          "total_bytes": {
+          "physical_capacity_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "current_available_bytes": {
+          "physical_available_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "warning_reserve_bytes": {
+          "allocation_capacity_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "allocation_headroom_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -3184,26 +3474,88 @@
         },
         "additionalProperties": false
       },
+      "InstalledCatalogAttribution": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotCatalogTarget"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "modelId",
+              "variantId",
+              "_tag"
+            ],
+            "properties": {
+              "modelId": {
+                "$ref": "#/components/schemas/CatalogModelId"
+              },
+              "variantId": {
+                "$ref": "#/components/schemas/CatalogVariantId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Attributed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "InstalledModelPackage": {
         "type": "object",
         "required": [
-          "targetId",
           "package",
           "path",
-          "inspection"
+          "origin",
+          "inspection",
+          "catalogAttribution"
         ],
         "properties": {
-          "targetId": {
-            "$ref": "#/components/schemas/ModelOfferingTargetId"
-          },
           "package": {
             "$ref": "#/components/schemas/ModelPackage"
           },
           "path": {
             "type": "string"
           },
+          "origin": {
+            "$ref": "#/components/schemas/ModelPackageInstallationOrigin"
+          },
           "inspection": {
             "$ref": "#/components/schemas/ModelPackageInspection"
+          },
+          "catalogAttribution": {
+            "$ref": "#/components/schemas/InstalledCatalogAttribution"
           }
         },
         "additionalProperties": false
@@ -3211,16 +3563,27 @@
       "InstalledModelPackagesResponse": {
         "type": "object",
         "required": [
+          "revision",
+          "reconciliationComplete",
           "packages"
         ],
         "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
           "packages": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/InstalledModelPackage"
             }
           }
-        }
+        },
+        "additionalProperties": false
       },
       "JsonSchemaRequest": {
         "type": "object",
@@ -3284,7 +3647,6 @@
           "capacityBytes",
           "requiredBytes",
           "compatibilityReserveBytes",
-          "warningReserveBytes",
           "remainingBytes"
         ],
         "properties": {
@@ -3302,11 +3664,6 @@
             "minimum": 0
           },
           "compatibilityReserveBytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "warningReserveBytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -3383,19 +3740,15 @@
           {
             "type": "object",
             "required": [
-              "profile",
-              "configurationId",
+              "configuration",
               "assessmentId",
               "memory",
               "performance",
               "_tag"
             ],
             "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
               },
               "assessmentId": {
                 "$ref": "#/components/schemas/ModelAssessmentId"
@@ -3423,8 +3776,7 @@
           {
             "type": "object",
             "required": [
-              "profile",
-              "configurationId",
+              "configuration",
               "assessmentId",
               "memory",
               "limitingResource",
@@ -3432,11 +3784,8 @@
               "_tag"
             ],
             "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
               },
               "assessmentId": {
                 "$ref": "#/components/schemas/ModelAssessmentId"
@@ -3466,17 +3815,13 @@
           {
             "type": "object",
             "required": [
-              "profile",
-              "configurationId",
+              "configuration",
               "failure",
               "_tag"
             ],
             "properties": {
-              "profile": {
-                "$ref": "#/components/schemas/ServingProfile"
-              },
-              "configurationId": {
-                "$ref": "#/components/schemas/ModelServingConfigurationId"
+              "configuration": {
+                "$ref": "#/components/schemas/ModelServingConfiguration"
               },
               "failure": {
                 "$ref": "#/components/schemas/ModelFailure"
@@ -3518,6 +3863,54 @@
       "ModelAssessmentRequestId": {
         "type": "string"
       },
+      "ModelBundleInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "package",
+              "_tag"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Standalone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "target",
+              "draftSource",
+              "method",
+              "_tag"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "draftSource": {
+                "$ref": "#/components/schemas/SpeculativeDraftSourceInput"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "SpeculativeDecoding"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelCapabilities": {
         "type": "object",
         "required": [
@@ -3542,16 +3935,181 @@
         },
         "additionalProperties": false
       },
+      "ModelDownload": {
+        "type": "object",
+        "required": [
+          "id",
+          "bundle",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelDownloadId"
+          },
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ModelDownloadState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelDownloadId": {
+        "type": "string"
+      },
+      "ModelDownloadState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stage",
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "stage": {
+                "$ref": "#/components/schemas/DownloadStage"
+              },
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "bytesPerSecond": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Downloading"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "failure",
+              "acknowledged",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "failure": {
+                "$ref": "#/components/schemas/DownloadFailure"
+              },
+              "acknowledged": {
+                "type": "boolean"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Cancelled"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelDownloadsResponse": {
         "type": "object",
         "required": [
-          "attempts"
+          "downloads"
         ],
         "properties": {
-          "attempts": {
+          "downloads": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/DownloadAttempt"
+              "$ref": "#/components/schemas/ModelDownload"
             }
           }
         }
@@ -3785,6 +4343,98 @@
         },
         "additionalProperties": false
       },
+      "ModelInstanceFailure": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "retryable",
+              "_tag"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Operation"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "retryable",
+              "requiredSystemMemoryBytes",
+              "allocationHeadroomBytes",
+              "systemReserveBytes",
+              "loadBoundaryBytes",
+              "minimumAdditionalAvailableBytes",
+              "parallelSequences",
+              "_tag"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "requiredSystemMemoryBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "allocationHeadroomBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "systemReserveBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "loadBoundaryBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "minimumAdditionalAvailableBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "parallelSequences": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LowMemory"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelInstanceId": {
         "type": "string"
       },
@@ -3881,7 +4531,7 @@
             ],
             "properties": {
               "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
+                "$ref": "#/components/schemas/ModelInstanceFailure"
               },
               "_tag": {
                 "type": "string",
@@ -4045,7 +4695,7 @@
             ],
             "properties": {
               "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
+                "$ref": "#/components/schemas/ModelInstanceFailure"
               },
               "_tag": {
                 "type": "string",
@@ -4098,57 +4748,6 @@
           "loading",
           "verifying"
         ]
-      },
-      "ModelOfferingTarget": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "package",
-              "_tag"
-            ],
-            "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Package"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "target",
-              "draft",
-              "_tag"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/SpeculativeDecodingPairId"
-              },
-              "target": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "SpeculativeDecodingPair"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelOfferingTargetId": {
-        "type": "string"
       },
       "ModelPackage": {
         "type": "object",
@@ -4259,6 +4858,13 @@
           }
         ]
       },
+      "ModelPackageInstallationOrigin": {
+        "type": "string",
+        "enum": [
+          "Magnitude",
+          "HuggingFaceCache"
+        ]
+      },
       "ModelPackageOperand": {
         "oneOf": [
           {
@@ -4305,8 +4911,7 @@
           "format",
           "quantization",
           "quantizationName",
-          "architecture",
-          "maximumContextLength"
+          "architecture"
         ],
         "properties": {
           "format": {
@@ -4322,9 +4927,24 @@
             "type": "string"
           },
           "maximumContextLength": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
             "minimum": 0
+          },
+          "intrinsicModelId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "intrinsicQualityId": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false
@@ -4373,6 +4993,56 @@
           }
         ]
       },
+      "ModelParameterization": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "totalParameters",
+              "architecture"
+            ],
+            "properties": {
+              "totalParameters": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "architecture": {
+                "type": "string",
+                "enum": [
+                  "dense"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "totalParameters",
+              "activeParameters",
+              "architecture"
+            ],
+            "properties": {
+              "totalParameters": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "activeParameters": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "architecture": {
+                "type": "string",
+                "enum": [
+                  "mixtureOfExperts"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelReasoningCapabilities": {
         "type": "object",
         "required": [
@@ -4411,15 +5081,15 @@
         "type": "object",
         "required": [
           "id",
-          "target",
+          "bundle",
           "profile"
         ],
         "properties": {
           "id": {
             "$ref": "#/components/schemas/ModelServingConfigurationId"
           },
-          "target": {
-            "$ref": "#/components/schemas/ModelOfferingTarget"
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
           },
           "profile": {
             "$ref": "#/components/schemas/ServingProfile"
@@ -4469,49 +5139,44 @@
           }
         ]
       },
-      "ModelTargetInput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "package",
-              "_tag"
-            ],
-            "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Package"
-                ]
-              }
+      "ModelsResponse": {
+        "type": "object",
+        "required": [
+          "revision",
+          "reconciliationComplete",
+          "catalogModels",
+          "uncataloguedPackages",
+          "diagnostics"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
+          "catalogModels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogModel"
             }
           },
-          {
-            "type": "object",
-            "required": [
-              "target",
-              "draft",
-              "_tag"
-            ],
-            "properties": {
-              "target": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "SpeculativeDecodingPair"
-                ]
-              }
+          "uncataloguedPackages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledModelPackage"
+            }
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogDiagnostic"
             }
           }
-        ]
+        },
+        "additionalProperties": false
       },
       "NamedFunctionCallRequest": {
         "type": "object",
@@ -4578,6 +5243,20 @@
         "properties": {
           "configuration": {
             "$ref": "#/components/schemas/ModelServingConfiguration"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PromptTokensDetails": {
+        "type": "object",
+        "required": [
+          "cached_tokens"
+        ],
+        "properties": {
+          "cached_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -4655,7 +5334,6 @@
       "ReasoningProfileResponse": {
         "type": "object",
         "required": [
-          "default_reasoning_effort",
           "reasoning_efforts"
         ],
         "properties": {
@@ -4674,14 +5352,15 @@
       "RecommendableModel": {
         "type": "object",
         "required": [
-          "id",
-          "checkpointId",
-          "targetId",
-          "target",
+          "modelId",
+          "variantId",
+          "configuration",
           "displayName",
+          "variantLabel",
           "description",
           "license",
           "capabilities",
+          "parameterization",
           "qualityScore",
           "qualityScoreProvenance",
           "fidelityRank",
@@ -4689,19 +5368,19 @@
           "qualityEvidence"
         ],
         "properties": {
-          "id": {
-            "$ref": "#/components/schemas/RecommendableModelId"
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
           },
-          "checkpointId": {
-            "type": "string"
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
           },
-          "targetId": {
-            "$ref": "#/components/schemas/ModelOfferingTargetId"
-          },
-          "target": {
-            "$ref": "#/components/schemas/ModelOfferingTarget"
+          "configuration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration"
           },
           "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
             "type": "string"
           },
           "description": {
@@ -4712,6 +5391,9 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "parameterization": {
+            "$ref": "#/components/schemas/ModelParameterization"
           },
           "qualityScore": {
             "type": "number",
@@ -4758,8 +5440,57 @@
           }
         }
       },
-      "RecommendableModelId": {
-        "type": "string"
+      "ReconcileCatalogModelRequest": {
+        "type": "object",
+        "required": [
+          "modelId",
+          "variantId"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReconcileCatalogModelResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Current"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "downloadId",
+              "_tag"
+            ],
+            "properties": {
+              "downloadId": {
+                "$ref": "#/components/schemas/ModelDownloadId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DownloadAdmitted"
+                ]
+              }
+            }
+          }
+        ]
       },
       "RemoveInstalledModelPackageResponse": {
         "type": "object",
@@ -4844,6 +5575,54 @@
           }
         ]
       },
+      "ServableModelBundle": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "package",
+              "_tag"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Standalone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "target",
+              "draftSource",
+              "method",
+              "_tag"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "draftSource": {
+                "$ref": "#/components/schemas/SpeculativeDraftSource"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "SpeculativeDecoding"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ServingProfile": {
         "type": "object",
         "required": [
@@ -4878,8 +5657,77 @@
         },
         "additionalProperties": false
       },
-      "SpeculativeDecodingPairId": {
-        "type": "string"
+      "SpeculativeDraftSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Separate"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "SpeculativeDraftSourceInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackageOperand"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Separate"
+                ]
+              }
+            }
+          }
+        ]
       },
       "SpeculativeMethod": {
         "oneOf": [
@@ -4906,7 +5754,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "DraftSimple"
+                  "DFlash"
                 ]
               }
             }
@@ -4920,67 +5768,13 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "DraftEagle3"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DraftDFlash"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "method",
-              "_tag"
-            ],
-            "properties": {
-              "method": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Ngram"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "method",
-              "evidence",
-              "_tag"
-            ],
-            "properties": {
-              "method": {
-                "type": "string"
-              },
-              "evidence": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "UnknownNative"
+                  "DSpark"
                 ]
               }
             }
           }
         ],
-        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent: MTP may be embedded in the target\nor supplied by a companion, while model-backed draft methods use companion artifacts."
+        "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a separate draft\npackage."
       },
       "SplitModeResponse": {
         "type": "string",
@@ -4994,29 +5788,19 @@
       "StartModelDownloadRequest": {
         "type": "object",
         "required": [
-          "target"
+          "bundle"
         ],
         "properties": {
-          "target": {
-            "$ref": "#/components/schemas/ModelOfferingTarget"
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
           }
         }
       },
       "StartModelDownloadResponse": {
         "type": "object",
-        "required": [
-          "target_id",
-          "attempts"
-        ],
         "properties": {
-          "target_id": {
-            "$ref": "#/components/schemas/ModelOfferingTargetId"
-          },
-          "attempts": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DownloadAttempt"
-            }
+          "download": {
+            "$ref": "#/components/schemas/ModelDownload"
           }
         }
       },
@@ -5195,7 +5979,8 @@
         "required": [
           "prompt_tokens",
           "completion_tokens",
-          "total_tokens"
+          "total_tokens",
+          "prompt_tokens_details"
         ],
         "properties": {
           "prompt_tokens": {
@@ -5212,6 +5997,9 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "prompt_tokens_details": {
+            "$ref": "#/components/schemas/PromptTokensDetails"
           }
         },
         "additionalProperties": false

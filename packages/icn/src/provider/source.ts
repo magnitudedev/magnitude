@@ -16,6 +16,7 @@ import {
   streamStartFailureFromRejectedResponse,
   toCauseInfo,
   nativeChatCompletionsCodec,
+  normalizeChatCompletionsChunk,
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
   type GenerationPerformance,
@@ -284,6 +285,10 @@ const bindIcnModel = (
                 Stream.filter((chunk) => Option.isNone(chunk.progress)),
                 Stream.mapEffect((chunk) => Schema.encode(Generated.ChatCompletionChunk)(chunk).pipe(
                   Effect.flatMap(Schema.decodeUnknown(ChatCompletionsStreamChunk)),
+                  Effect.map((chunk) => normalizeChatCompletionsChunk(
+                    chunk,
+                    Option.fromNullable(chunk.choices[0]?.delta.reasoning_content),
+                  )),
                   Effect.mapError((cause) => new GeneratedClientInvalidResponseError({
                     operationId: "createChatCompletion",
                     status,

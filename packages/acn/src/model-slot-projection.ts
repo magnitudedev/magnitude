@@ -2,12 +2,13 @@ import { Option } from "effect"
 import {
   ModelInstanceIdSchema,
   ModelServingConfigurationIdSchema,
+  modelSlotActions,
+  type ModelResidency,
   type ModelInstanceAllocation,
   type ModelLoadPlan,
+  type ModelPackagesState,
   type ModelCapabilities,
-  type ModelSlotAction,
   type ModelSlotAvailability,
-  type ModelSlotInstance,
   type ProviderModelCatalogEntry,
   type SlotId,
 } from "@magnitudedev/acn-protocol"
@@ -37,86 +38,97 @@ export const projectModelLoadPlan = (
   requiredSystemMemoryBytes: plan.requiredSystemMemoryBytes,
 })
 
-export const projectModelInstance = (
+export const projectModelResidency = (
   instance: Generated.ModelInstance,
-): ModelSlotInstance => ({
-  id: ModelInstanceIdSchema.make(instance.id),
-  configurationId: ModelServingConfigurationIdSchema.make(instance.configurationId),
-  lifecycle: (() => {
-    switch (instance.lifecycle._tag) {
-      case "Loading":
-        return {
-          _tag: "Loading" as const,
-          stage: instance.lifecycle.stage,
-          progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
-          plannedAllocation: Option.map(
-            instance.lifecycle.plannedAllocation,
-            projectModelLoadPlan,
-          ),
-        }
-      case "Ready":
-        return {
-          _tag: "Ready" as const,
-          allocation: projectModelInstanceAllocation(instance.lifecycle.allocation),
-        }
-      case "Stopping":
-        return {
-          _tag: "Stopping" as const,
-          reason: instance.lifecycle.reason,
-          allocation: instance.lifecycle.allocation._tag === "Resident"
-            ? {
-                _tag: "Resident" as const,
-                allocation: projectModelInstanceAllocation(
-                  instance.lifecycle.allocation.allocation,
-                ),
-              }
-            : {
-                _tag: "Planned" as const,
-                allocation: Option.map(
-                  instance.lifecycle.allocation.allocation,
-                  projectModelLoadPlan,
-                ),
-              },
-        }
-      case "Stopped":
-        return { _tag: "Stopped" as const, reason: instance.lifecycle.reason }
-      case "Failed":
-        return { _tag: "Failed" as const, failure: instance.lifecycle.failure }
-    }
-  })(),
-})
-
-export const modelSlotActions = (
-  availability: ModelSlotAvailability,
-  instance: Option.Option<ModelSlotInstance>,
-): readonly ModelSlotAction[] => {
-  if (availability._tag !== "Available") return []
-  return Option.match(instance, {
-    onNone: () => ["Load"],
-    onSome: (current) => {
-      switch (current.lifecycle._tag) {
-        case "Loading":
-        case "Ready":
-          return ["Stop"]
-        case "Stopping":
-          return []
-        case "Stopped":
-          return ["Load"]
-        case "Failed":
-          return current.lifecycle.failure.retryable
-            ? ["RetryLoad"]
-            : []
+): ModelResidency => {
+  const identity = {
+    instanceId: ModelInstanceIdSchema.make(instance.id),
+    configurationId: ModelServingConfigurationIdSchema.make(instance.configurationId),
+  }
+  switch (instance.lifecycle._tag) {
+    case "Loading":
+      return {
+        _tag: "Loading" as const,
+        ...identity,
+        stage: instance.lifecycle.stage,
+        progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
+        plannedAllocation: Option.map(
+          instance.lifecycle.plannedAllocation,
+          projectModelLoadPlan,
+        ),
       }
-    },
-  })
+    case "Ready":
+      return {
+        _tag: "Ready" as const,
+        ...identity,
+        allocation: projectModelInstanceAllocation(instance.lifecycle.allocation),
+      }
+    case "Stopping":
+      return {
+        _tag: "Stopping" as const,
+        ...identity,
+        reason: instance.lifecycle.reason,
+        allocation: instance.lifecycle.allocation._tag === "Resident"
+          ? {
+              _tag: "Resident" as const,
+              allocation: projectModelInstanceAllocation(
+                instance.lifecycle.allocation.allocation,
+              ),
+            }
+          : {
+              _tag: "Planned" as const,
+              allocation: Option.map(
+                instance.lifecycle.allocation.allocation,
+                projectModelLoadPlan,
+              ),
+            },
+      }
+    case "Stopped":
+      return instance.lifecycle.reason === "memory_pressure"
+        ? {
+            _tag: "Failed" as const,
+            failure: {
+              code: "low_memory",
+              message: "The model stopped because available memory became too low",
+              retryable: true,
+            },
+          }
+        : { _tag: "Unloaded" as const }
+    case "Failed":
+      return {
+        _tag: "Failed" as const,
+        failure: instance.lifecycle.failure._tag === "LowMemory"
+          ? {
+              ...instance.lifecycle.failure,
+              code: "low_memory" as const,
+            }
+          : {
+              code: instance.lifecycle.failure.code,
+              message: instance.lifecycle.failure.message,
+              retryable: instance.lifecycle.failure.retryable,
+            },
+      }
+  }
 }
 
 export const localModelSlotAvailability = (
-  catalogAvailability: ModelSlotAvailability,
-  offeringExists: boolean,
-  installed: boolean,
+  input: {
+    readonly catalogIdentityPending: boolean
+    readonly offeringsReady: boolean
+    readonly inventory: ModelPackagesState["inventory"]
+    readonly offeringExists: boolean
+    readonly installed: boolean
+  },
 ): ModelSlotAvailability => {
-  if (!offeringExists) {
+  if (input.catalogIdentityPending
+    || !input.offeringsReady
+    || input.inventory._tag === "Initializing") {
+    return { _tag: "Pending" }
+  }
+  if (input.inventory._tag === "Degraded") {
+    return { _tag: "Unavailable", failure: input.inventory.failure }
+  }
+  if (!input.offeringExists) {
     return {
       _tag: "Unavailable",
       failure: {
@@ -126,7 +138,7 @@ export const localModelSlotAvailability = (
       },
     }
   }
-  if (!installed) {
+  if (!input.installed) {
     return {
       _tag: "Unavailable",
       failure: {
@@ -136,7 +148,7 @@ export const localModelSlotAvailability = (
       },
     }
   }
-  return catalogAvailability
+  return { _tag: "Available" }
 }
 
 export interface LocalOfferingSelectionEvidence {
@@ -152,7 +164,7 @@ export const selectableModelCapabilities = (
     if (catalogModel && !catalogModel.supportedSlots.includes(slotId)) {
       return undefined
     }
-    return catalogModel?.capabilities ?? localOffering.capabilities
+    return localOffering.capabilities
   }
   return catalogModel?.availability._tag === "Available"
     && catalogModel.supportedSlots.includes(slotId)

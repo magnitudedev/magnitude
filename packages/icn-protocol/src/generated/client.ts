@@ -25,9 +25,13 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         searchHuggingFaceModels: makeHttpOperation(http, options, Operations.searchHuggingFaceModelsOperation),
       },
       models: {
+        acknowledgeModelDownloadFailure: makeHttpOperation(
+          http,
+          options,
+          Operations.acknowledgeModelDownloadFailureOperation,
+        ),
         assessModels: makeHttpOperation(http, options, Operations.assessModelsOperation),
         cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
-        getModelDownload: makeHttpOperation(http, options, Operations.getModelDownloadOperation),
         getModelInstances: makeHttpOperation(http, options, Operations.getModelInstancesOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),
         getRecommendableModelCatalog: makeHttpOperation(
@@ -37,7 +41,9 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         ),
         listInstalledModels: makeHttpOperation(http, options, Operations.listInstalledModelsOperation),
         listModelDownloads: makeHttpOperation(http, options, Operations.listModelDownloadsOperation),
+        listModels: makeHttpOperation(http, options, Operations.listModelsOperation),
         previewModelLoad: makeHttpOperation(http, options, Operations.previewModelLoadOperation),
+        reconcileCatalogModel: makeHttpOperation(http, options, Operations.reconcileCatalogModelOperation),
         removeInstalledModel: makeHttpOperation(http, options, Operations.removeInstalledModelOperation),
         setModelResidencyPolicy: makeHttpOperation(http, options, Operations.setModelResidencyPolicyOperation),
         startModelDownload: makeHttpOperation(http, options, Operations.startModelDownloadOperation),

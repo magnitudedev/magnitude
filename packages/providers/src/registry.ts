@@ -24,6 +24,7 @@ export type AuthStatus =
 export interface ProviderInfo {
   readonly id: ProviderId
   readonly displayName: string
+  readonly kind: "Hosted" | "Local" | "Custom"
   readonly authStatus: AuthStatus
   readonly status?: "ok" | "loading" | "not_found" | "error"
   readonly message?: string
@@ -33,6 +34,7 @@ export interface ProviderInfo {
 export interface DiscoverableProviderInstance {
   readonly provider: Pick<Provider, "id" | "displayName" | "bindModel" | "catalog" | "discoverModelProperties">
   readonly authStatus?: AuthStatus
+  readonly kind: ProviderInfo["kind"]
   readonly checkStatus: Effect.Effect<{
     readonly status: "ok" | "loading" | "not_found" | "error"
     readonly message?: string
@@ -84,6 +86,7 @@ export function makeProviderRegistry(config: {
     providerInfos.push({
       id: config.magnitude.provider.id,
       displayName: "Magnitude",
+      kind: "Hosted",
       authStatus: config.magnitude.authentication._tag === "Configured"
         ? { _tag: "authenticated" }
         : { _tag: "not_configured", reason: "Magnitude authentication is not configured" },
@@ -106,6 +109,7 @@ export function makeProviderRegistry(config: {
         infos.push({
           id: instance.provider.id,
           displayName: instance.provider.displayName,
+          kind: instance.kind,
           authStatus: instance.authStatus ?? { _tag: "no_auth_required" },
           status: result.status,
           ...(result.message ? { message: result.message } : {}),

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@magnitudedev/sdk": "workspace:*",
+    "@magnitudedev/effect-query": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "@effect-atom/atom-react": "^0.5.0",
@@ -23,7 +24,9 @@
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
+    "@types/react-test-renderer": "^19.1.0",
     "@types/react": "^19.0.0",
+    "react-test-renderer": "^19.1.1",
     "typescript": "^5.8.3"
   }
 }

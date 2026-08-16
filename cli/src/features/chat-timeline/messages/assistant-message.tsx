@@ -37,16 +37,16 @@ export const AssistantMessage = memo(function AssistantMessage({
     <box ref={box.ref} onSizeChange={box.onSizeChange} style={{ flexDirection: 'column', marginBottom: 1 }}>
       <BlockRenderer
         blocks={blocks}
-        foreground={theme.foreground}
+        foreground={theme.text.body}
         palette={markdownPalette}
         contentWidth={contentWidth}
         showCursor={showCursor && !pendingText}
         onOpenFile={onFileClick}
       />
       {pendingText && (
-        <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
+        <text style={{ fg: theme.text.body, wrapMode: 'word' }}>
           {pendingText}
-          {showCursor && <span style={{ fg: theme.muted }}>▍</span>}
+          {showCursor && <span style={{ fg: theme.text.supporting }}>▍</span>}
         </text>
       )}
     </box>

@@ -1,16 +1,9 @@
 import { test, expect, mock } from 'bun:test'
 
-mock.module('../hooks/use-theme', () => ({
-  useTheme: () => ({
-    foreground: 'white',
-    muted: 'gray',
-    primary: 'blue',
-    success: 'green',
-    border: 'gray',
-    link: 'blue',
-    syntax: {},
-  }),
-}))
+mock.module('../hooks/use-theme', async () => {
+  const { defaultCliThemes } = await import('../utils/theme')
+  return { useTheme: () => defaultCliThemes.dark }
+})
 
 mock.module('../utils/clipboard', () => ({
   writeTextToClipboard: async () => {},

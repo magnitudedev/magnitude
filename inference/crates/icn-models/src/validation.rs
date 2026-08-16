@@ -339,7 +339,9 @@ mod tests {
                 quantization: "test".to_owned(),
                 quantization_name: "test".to_owned(),
                 architecture: "test".to_owned(),
-                maximum_context_length: 1,
+                maximum_context_length: Some(1),
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             },
         }
     }

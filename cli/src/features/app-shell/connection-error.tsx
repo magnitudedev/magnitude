@@ -45,12 +45,12 @@ export const FatalErrorScreen = ({ error, invariantViolation = false, onRetry, o
         alignItems: 'center',
       }}
     >
-      <text style={{ fg: theme.error }} attributes={TextAttributes.BOLD}>
+      <text style={{ fg: theme.status.failure }} attributes={TextAttributes.BOLD}>
         {title}
       </text>
 
       <box style={{ marginTop: 1, maxWidth: 80, paddingLeft: 2, paddingRight: 2 }}>
-        <text style={{ fg: theme.foreground }}>{body}</text>
+        <text style={{ fg: theme.text.body }}>{body}</text>
       </box>
 
       <box
@@ -60,8 +60,8 @@ export const FatalErrorScreen = ({ error, invariantViolation = false, onRetry, o
           alignItems: 'center',
         }}
       >
-        <text style={{ fg: theme.muted }}>Press R to retry</text>
-        <text style={{ fg: theme.muted }}>Press Q to quit</text>
+        <text style={{ fg: theme.text.supporting }}>Press R to retry</text>
+        <text style={{ fg: theme.text.supporting }}>Press Q to quit</text>
       </box>
     </box>
   )

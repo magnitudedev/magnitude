@@ -21,6 +21,7 @@ applies_to:
 | Concern | Owner |
 |---|---|
 | Hardware discovery, calibration, native planning, memory and performance evidence | ICN |
+| Serving-configuration construction, canonical identity, validation | ICN |
 | Profile policy, assessment orchestration, recommendations | ACN |
 | Presentation | Clients |
 
@@ -29,7 +30,7 @@ applies_to:
 | Term | Meaning |
 |---|---|
 | **Hardware calibration** | Model-free, serializable backend-performance evidence |
-| **Model assessment** | Native evaluation of one exact target at one exact serving profile |
+| **Model assessment** | Native evaluation of one exact servable bundle at one exact serving profile |
 | **Assessing** | Ephemeral observable state while an admitted assessment scope is alive |
 
 ## Hardware calibration
@@ -41,6 +42,10 @@ class:
 - launch and synchronization cost;
 - sample count, duration, dispersion, and stability;
 - calibration-method identity.
+
+Calibration attempts every curated weight tensor family supported by the pinned runtime, including
+NVFP4, for both dense and routed operations. Unsupported backend/type/operation combinations are
+omitted rather than represented by fabricated measurements.
 
 It reads no model and produces no placement, memory, context, compatibility, or token-rate result.
 
@@ -71,9 +76,10 @@ metric digest.
 
 ## Model assessment
 
-`POST /v1/models/assess` accepts batches of exact targets and explicit assessment profiles. A target
-is one package or an ordered target/draft pair. Each assessment profile specifies maximum context
-for one sequence and the context depths at which performance must be estimated.
+`POST /v1/models/assess` accepts batches of exact bundles and explicit assessment profiles. A bundle
+is one standalone package or one method-identified speculative-decoding bundle with embedded or
+separate draft capability. Each assessment profile specifies maximum context for one sequence and
+the context depths at which performance must be estimated.
 
 An uncached assessment performs native work:
 
@@ -108,21 +114,19 @@ Every requested profile produces one result:
 | `DoesNotFit` | Configuration identity, memory accounting, limiting resource, and deficit |
 | `Incompatible` | The artifact/runtime combination cannot execute |
 
-Malformed or unresolved input produces target-level `InvalidTarget`. Native crash, timeout,
-malformed output, impossible arithmetic, or missing output fails the endpoint. Operational failure
-is not a model result and creates no cache entry.
+Malformed or unresolved input produces target-level `InvalidTarget`. An operational failure while
+assessing one requested target produces `Failed` for that request ID; sibling results remain valid.
+`Failed` is not a compatibility or capacity result and creates no cache entry. A failure of shared
+batch setup, or a failure that prevents ICN from constructing a valid complete response envelope,
+fails the endpoint.
 
 ## Profiles
 
-ACN chooses one profile for each target:
-
-```text
-min(100,000 tokens, exact target maximum)
-```
-
-This applies to release-catalog and discovered installed targets. A pair uses the lower component
-maximum. Profiles below 4,096 tokens are not submitted. ICN does not search a context range or
-choose a profile.
+ACN submits the exact profile contained in each issued catalog configuration. For an installed
+standalone package without a catalog configuration, ACN submits the profile produced by its
+canonical standard-profile rule. Catalog generation rejects a reviewed profile above its artifact
+maximum; a pair is bounded by the lower component maximum. Profiles below 4,096 tokens are not
+submitted. ICN does not search a context range or choose a profile.
 
 For that one profile, ACN requests performance samples at 25K, 50K, 75K, and full configured
 context. Sample depths above the configured context are omitted and duplicates are removed. The
@@ -178,17 +182,19 @@ may populate driver caches; correctness never depends on cross-process CUDA-cont
 ## Assessing lifecycle
 
 ```text
-Unassessed -> Assessing -> Assessed
-                  |
-                  +----> Unassessed on failure, interruption, or deadline
+assessment admitted -> Assessing -> terminal result
+                                      |-- Fits
+                                      |-- DoesNotFit
+                                      |-- Incompatible
+                                      +-- Failed
 ```
 
-`Assessing` is an empty external marker, not a durable record or public operation identity. ACN owns
-it inside the scoped assessment Effect:
+`Assessing` is an internal marker, not a durable record or public operation identity. ACN owns it
+inside the scoped assessment Effect:
 
 - enter only after operation admission;
 - complete only from that scope's successful result;
-- clear in finalization on every exit path;
+- publish a typed terminal result on every exit path;
 - never persist it;
 - serialize overlapping owners so stale completion is structurally impossible.
 
@@ -197,41 +203,62 @@ deadline even if child termination or reaping stalls.
 
 ## Assessment cache and single-flight
 
-The cache unit is one exact profile result. Identity covers:
+The cache unit is one exact bundle/profile result. Identity covers:
 
-- immutable target content, roles, and relationships;
+- immutable package content, ordered bundle structure, roles, and relationships;
 - exact serving profile, requested performance depths, and capacity policy;
 - native build, backend ABI, enabled backends, topology, and planning method;
 - hardware-calibration metric identity;
 - projector, speculative, placement, and execution policy.
 
-ICN checks memory and disk before planner preparation. Missing profiles for one target are batched.
-Equivalent target/environment misses share one gate and recheck the cache after admission. Cache
+ICN checks memory and disk before planner preparation. Missing profiles for one bundle are batched.
+Equivalent bundle/environment misses share one gate and recheck the cache after admission. Cache
 corruption is a miss. Process-local parsed model state is reused only within its batch and is not
 serialized.
 
 Stable-topology-checked `Fits`, `DoesNotFit`, and artifact/runtime `Incompatible` results are
 persisted. Operational failures are never persisted.
 
+## ACN demand boundary
+
+`LocalModelAssessor` is ACN's sole native-assessment demand owner for issued catalog
+configurations plus canonical standard profiles for installed standalone bundles. ACN supplies the
+bundle and chosen profile for standard demand; ICN constructs and canonically identifies the exact
+configuration it assesses. The semantic assessment key covers every native cache-identity input
+plus that exact configuration and requested performance-depth policy. Provider, recommendation,
+and product projections consume the resulting per-configuration state and do not invoke this
+endpoint directly.
+
+Source revisions and notifications only request reconciliation. Download progress, attempt state,
+semantically equivalent inventory observations, catalog presentation, live memory, and client
+activity cannot admit assessment. A genuine semantic-key change admits work only for affected
+configurations, and completion publishes only if that key remains current.
+
 ## Product behavior
 
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
-- One catalog projection assesses recommendable and discovered installed targets through the shared
-  assessment service; recommendation policy consumes only recommendable candidates.
+- One assessor evaluates issued catalog configurations plus canonical standard profiles through
+  the shared assessment service; ICN constructs every resulting exact
+  configuration, and recommendation policy consumes only private eligible catalog inputs.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
-- Installed targets remain visible while assessment is pending or fails.
-- Only completed `Fits` configurations become catalog candidates or are eligible for initial
-  provider-offering creation.
+- Resolved configurations remain visible while assessment is pending or fails.
+- Only completed `Fits` configurations can become installable catalog rows or enabled provider
+  offerings; assessment itself creates no durable configuration.
 - Downloading never performs hardware calibration.
 
 ## Conformance
 
 - ICN cannot become ready without hardware calibration and an operational worker pool.
-- One same-target job returns one result per requested profile.
+- One same-bundle job returns one result per requested profile.
+- Every profile result carries the exact ICN-constructed serving configuration it assessed.
+- ACN standard demand supplies bundle and profile policy without constructing or predicting
+  configuration identity.
 - Every `Fits` result contains ordered performance samples ending at the profile context.
 - Multiple performance depths for one profile require only one native context graph.
 - Warm exact-cache reads invoke no native planner.
 - Warm `DoesNotFit` cache reads invoke no native planner.
+- Download progress and semantically equivalent source revisions invoke no native assessment.
+- A stale assessment completion cannot overwrite state for a newer semantic key.
 - No domain result represents an operational defect.
 - `Assessing` cannot survive its owning Effect scope.
 - Queueing, native work, caller completion, and child cleanup are all bounded.

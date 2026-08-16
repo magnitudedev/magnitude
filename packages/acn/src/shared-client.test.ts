@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Deferred, Effect, Fiber, Ref } from "effect"
+import { Deferred, Effect, Fiber, Option, Ref } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import type { ProviderAuth } from "@magnitudedev/acn-protocol"
 import {
@@ -82,7 +82,7 @@ const providerClient = (
         reasoning: new ReasoningProperty.states.Resolved({ value: [ReasoningEffortSchema.make("none")] }),
       },
       availability: { _tag: "Available" },
-      pricing: { input: 0, output: 0, cached_input: null },
+      pricing: Option.some({ input: 0, output: 0, cached_input: null }),
     }]),
     get: () => Effect.die("not used"),
     refresh: Effect.die("not used"),
