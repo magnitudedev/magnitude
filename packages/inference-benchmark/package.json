@@ -1,0 +1,30 @@
+{
+  "name": "@magnitudedev/inference-benchmark",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "magnitude-inference-benchmark": "src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run",
+    "verify": "bun run typecheck && bun run test"
+  },
+  "dependencies": {
+    "@effect/cli": "^0.75.2",
+    "@effect/platform": "^0.96.1",
+    "@effect/platform-bun": "^0.90.0",
+    "@huggingface/gguf": "0.4.2",
+    "@huggingface/hub": "2.13.3",
+    "@magnitudedev/ai": "workspace:*",
+    "@magnitudedev/icn-protocol": "workspace:*",
+    "effect": "3.21.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "vitest": "^3.2.4"
+  }
+}

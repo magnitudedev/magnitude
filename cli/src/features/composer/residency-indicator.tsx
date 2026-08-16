@@ -12,7 +12,7 @@ export function ResidencyIndicator({
   const theme = useTheme()
   const animationStep = useAnimationStep(residency === 'loading', 160)
 
-  if (residency === 'loaded') return <text style={{ fg: theme.success }}>●</text>
-  if (residency === 'not_loaded') return <text style={{ fg: theme.muted }}>○</text>
-  return <text style={{ fg: theme.warning }}>{LOADING_FRAMES[animationStep % LOADING_FRAMES.length]}</text>
+  if (residency === 'loaded') return <text style={{ fg: theme.status.success }}>●</text>
+  if (residency === 'not_loaded') return <text style={{ fg: theme.text.metadata }}>○</text>
+  return <text style={{ fg: theme.status.warning }}>{LOADING_FRAMES[animationStep % LOADING_FRAMES.length]}</text>
 }

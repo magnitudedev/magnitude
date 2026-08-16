@@ -1,5 +1,155 @@
 # @magnitudedev/cli
 
+## 0.0.5
+
+### Patch Changes
+
+- [`e23e3f2`](https://github.com/magnitudedev/magnitude/commit/e23e3f2c5e42e86b348cb91b79cd30036721ed36) Thanks [@anerli](https://github.com/anerli)! - update drafters for deepseek v4 flash, nemotron lightning, muse glimmer
+
+- [`d319b12`](https://github.com/magnitudedev/magnitude/commit/d319b1221b39f4f9e36521367721e75b9a11c840) Thanks [@anerli](https://github.com/anerli)! - add qwen 3.8 27b support
+
+## 0.0.4
+
+### Patch Changes
+
+- [`228d2c3`](https://github.com/magnitudedev/magnitude/commit/228d2c33a9ed60e3fc4bc163d84b043baed1d252) Thanks [@anerli](https://github.com/anerli)! - feat: dflash and dspark support
+
+- [`228d2c3`](https://github.com/magnitudedev/magnitude/commit/228d2c33a9ed60e3fc4bc163d84b043baed1d252) Thanks [@anerli](https://github.com/anerli)! - fix: simplify stored installations
+
+## 0.0.3
+
+### Patch Changes
+
+- [`a3df81f`](https://github.com/magnitudedev/magnitude/commit/a3df81f0b4098572dc595abdb620b620b019e3fb) Thanks [@anerli](https://github.com/anerli)! - fix: preserve prompt cache on interrupt
+
+- [`f368a70`](https://github.com/magnitudedev/magnitude/commit/f368a70dd879a185b85688a71e28294b83067600) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add support for Nvidia Nemotron 3.5 Lightning and NVFP4
+
+- [#28](https://github.com/magnitudedev/magnitude/pull/28) [`f9d692c`](https://github.com/magnitudedev/magnitude/commit/f9d692c5c0d431002a6158cfa63461771348517e) Thanks [@fabianhug](https://github.com/fabianhug)! - Exit with WSL guidance instead of failing to download artifacts when the launcher runs on native Windows.
+
+## 0.0.2
+
+### Patch Changes
+
+- [`5635b0a`](https://github.com/magnitudedev/magnitude/commit/5635b0a667fab490974e11aebfae768167e8da74) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add Muse Glimmer 30B to catalog, update llama.cpp version
+
+## 0.0.1
+
+### Patch Changes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - rm advisor
+
+- [`d5489f6`](https://github.com/magnitudedev/magnitude/commit/d5489f6ea193a3d8b30173e2f8b3a06104c470bc) Thanks [@anerli](https://github.com/anerli)! - feat: configurable custom chat completions endpoints
+
+- [#19](https://github.com/magnitudedev/magnitude/pull/19) [`fcdd491`](https://github.com/magnitudedev/magnitude/commit/fcdd491ad6e813feb47601b084b4187645be123a) Thanks [@nicolasdmolina](https://github.com/nicolasdmolina)! - Fix first-run install failing with "ACN candidate … no longer available" when daemon startup phases (Resolving / PreparingBackend / Starting) hold a stable progress key longer than 30s
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix tui defects
+
+- [`fedb8dc`](https://github.com/magnitudedev/magnitude/commit/fedb8dc8b56315d8b799d4bd4f556ee16b6db935) Thanks [@anerli](https://github.com/anerli)! - fix: remove unnecessary acn coordination historical revision check
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - words
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - response format overhaul, grammar, provider, etc
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - advisor improvements
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - provider
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - pass NO_COLOR=1 for shell tool
+
+- [`7a49f4a`](https://github.com/magnitudedev/magnitude/commit/7a49f4ae329713d9955aed3951eb6d1caf9cfdf2) Thanks [@anerli](https://github.com/anerli)! - download/load endpoint termination fixes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - advisor
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - file picker
+
+- [`d3b10cb`](https://github.com/magnitudedev/magnitude/commit/d3b10cb558907fbce6de26a60b257574d0a473fe) Thanks [@anerli](https://github.com/anerli)! - fix cuda resolution issues
+
+- [`847d612`](https://github.com/magnitudedev/magnitude/commit/847d612bf97fd27e5598d0a3d93f06d50957fa1c) Thanks [@anerli](https://github.com/anerli)! - local
+
+- [`c7d2298`](https://github.com/magnitudedev/magnitude/commit/c7d2298b503f7d8852572488746a6adbca43120f) Thanks [@anerli](https://github.com/anerli)! - improve icn lifecycle error specificity
+
+- [`72dbf86`](https://github.com/magnitudedev/magnitude/commit/72dbf8693d76d0c2083704a2a4dcc187b1920b3a) Thanks [@anerli](https://github.com/anerli)! - daemon fixes
+
+- [`262f85d`](https://github.com/magnitudedev/magnitude/commit/262f85d7a4b220732819ac861603bf862e1c1d43) Thanks [@anerli](https://github.com/anerli)! - fix inference workers missing native libs
+
+- [`6401c9c`](https://github.com/magnitudedev/magnitude/commit/6401c9c0346a98e47cd8a3de31452bd6ac36ff3d) Thanks [@anerli](https://github.com/anerli)! - fix linux arm64 dynamic bindings
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix: turn off baml logs env var on cli entry
+
+- [`9151adc`](https://github.com/magnitudedev/magnitude/commit/9151adca5170626bebd76c213a3f7196c44cc174) Thanks [@nicolasdmolina](https://github.com/nicolasdmolina)! - fix: do not retire live Starting ACN on stable progress key
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - Switch Linux x64 binary to bun-linux-x64-baseline target to fix SIGILL crash on CPUs without BMI2 support
+
+- [`90ffcb5`](https://github.com/magnitudedev/magnitude/commit/90ffcb5787ab67249b1b3e0741a3bf9c44fdd2e3) Thanks [@anerli](https://github.com/anerli)! - local
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - various improvements
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fixes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - task system
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix: auth refresh coordination with multiple sessions
+
+- [`b0e72cc`](https://github.com/magnitudedev/magnitude/commit/b0e72cc96232d81967eeb969468a51de30ca643a) Thanks [@anerli](https://github.com/anerli)! - fix: build linux with ubuntu 22 to lower floor of required glibc support
+
+- [`497c151`](https://github.com/magnitudedev/magnitude/commit/497c151272dc7ae5bb6892ed746b74a3bed3900b) Thanks [@anerli](https://github.com/anerli)! - fix: remove native openssl implicit dep
+
+- [`311dcb6`](https://github.com/magnitudedev/magnitude/commit/311dcb68e1186b8f4df039c95717577ad7cbdbfb) Thanks [@anerli](https://github.com/anerli)! - fix inference worker timeout
+
+- [`7ea43d0`](https://github.com/magnitudedev/magnitude/commit/7ea43d07185933a182ae95d1680a675c6b206089) Thanks [@anerli](https://github.com/anerli)! - allow launcher to use node or bun
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix cli entry
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fixes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - compaction fixes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fixes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - better shell tool
+
+- [`f76256c`](https://github.com/magnitudedev/magnitude/commit/f76256c00739bf172e6d6a91da922345cba52e08) Thanks [@anerli](https://github.com/anerli)! - fix timeouts
+
+- [`94ecdde`](https://github.com/magnitudedev/magnitude/commit/94ecdde39a164c5791950a5b92fd106261a3493d) Thanks [@anerli](https://github.com/anerli)! - installation and acn lifecycle fixes
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - init
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - vcs fixes, load skills
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix ripgrep packaging
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix: lead hang on subagent idle with no message
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix render crash
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - fix distributed executable name
+
+- [`76f39df`](https://github.com/magnitudedev/magnitude/commit/76f39df010704575e8881e04e21d7fe8d45c4360) Thanks [@anerli](https://github.com/anerli)! - fix: preserve logic shard paths
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - Parse file mentions in CLI options with support for line ranges and support line ranges in the TUI file picker.
+
+- [`041bd76`](https://github.com/magnitudedev/magnitude/commit/041bd764075fbad1965afebeb7881a4046e74003) Thanks [@anerli](https://github.com/anerli)! - fix: ensure hardware calibration during ICN startup and other calibration issues
+
+- [`ba17e6f`](https://github.com/magnitudedev/magnitude/commit/ba17e6f967fc9ed3eaa991d8a8da547cd6867e3f) Thanks [@anerli](https://github.com/anerli)! - update package info, use root README
+
+- [`cd89dfc`](https://github.com/magnitudedev/magnitude/commit/cd89dfcca87c5862374b4daa910fb2124f0975fb) Thanks [@anerli](https://github.com/anerli)! - timeout fixes, daemon coordination fixes
+
+- [`e948b25`](https://github.com/magnitudedev/magnitude/commit/e948b256416245846b7c4f60695b0c97076f650d) Thanks [@anerli](https://github.com/anerli)! - fix: support macOS 13 and above instead of only 15 and above
+
+## 0.0.1-alpha.41
+
+### Patch Changes
+
+- [`e948b25`](https://github.com/magnitudedev/magnitude/commit/e948b256416245846b7c4f60695b0c97076f650d) Thanks [@anerli](https://github.com/anerli)! - fix: support macOS 13 and above instead of only 15 and above
+
+## 0.0.1-alpha.40
+
+### Patch Changes
+
+- [`fedb8dc`](https://github.com/magnitudedev/magnitude/commit/fedb8dc8b56315d8b799d4bd4f556ee16b6db935) Thanks [@anerli](https://github.com/anerli)! - fix: remove unnecessary acn coordination historical revision check
+
+- [`c7d2298`](https://github.com/magnitudedev/magnitude/commit/c7d2298b503f7d8852572488746a6adbca43120f) Thanks [@anerli](https://github.com/anerli)! - improve icn lifecycle error specificity
+
 ## 0.0.1-alpha.39
 
 ### Patch Changes

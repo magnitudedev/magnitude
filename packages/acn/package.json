@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "bun run --cwd ../.. icn:build && bun run --cwd ../.. dev:version && bun run --cwd ../.. dev:client",
     "dev:run": "bun run --cwd ../.. dev:client",
-    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@effect/cli": "^0.75.2",

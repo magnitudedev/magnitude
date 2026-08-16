@@ -3,6 +3,12 @@
 ':' //; if command -v bun >/dev/null 2>&1; then exec bun "$0" "$@"; fi
 ':' //; echo "Magnitude requires Node.js or Bun to start." >&2; exit 127
 
+// Releases only ship macOS and Linux artifacts; Windows users run Magnitude through WSL.
+if (process.platform === 'win32') {
+  console.error('Magnitude supports macOS and Linux. On Windows, run Magnitude inside WSL: https://learn.microsoft.com/windows/wsl/install');
+  process.exit(1);
+}
+
 const { ensureBinary } = require('../lib/download.js');
 
 const version = require('../package.json').version;

@@ -173,14 +173,14 @@ export function SingleLineInput({
       onMouseOut={() => renderer.setMousePointer('default')}
       onPaste={(event) => handlePasteEvent({ text: decodePasteBytes(event.bytes) })}
     >
-      <text style={{ fg: isPlaceholder ? theme.muted : theme.foreground }}>
+      <text style={{ fg: isPlaceholder ? theme.text.placeholder : theme.text.body }}>
         {isPlaceholder ? (
           <>
             <InputCursor
               visible={true}
               focused={focused}
               char={'▍'}
-              color={theme.info}
+              color={theme.status.information}
               activeChar={' '}
             />
             {displayValue}
@@ -192,8 +192,8 @@ export function SingleLineInput({
               visible={true}
               focused={focused}
               char={isBlockCursor ? activeChar : '▍'}
-              color={isBlockCursor ? undefined : theme.info}
-              backgroundColor={isBlockCursor ? theme.info : undefined}
+              color={isBlockCursor ? undefined : theme.status.information}
+              backgroundColor={isBlockCursor ? theme.status.information : undefined}
               activeChar={activeChar}
             />
             {afterCursor}

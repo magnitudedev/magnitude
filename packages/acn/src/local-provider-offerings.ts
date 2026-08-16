@@ -1,33 +1,81 @@
-import { Context, Effect, Layer, Option, PubSub, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelMutationFailed,
   type LocalInferenceError,
   ModelCapabilitiesSchema,
   type LocalProviderOffering,
-  type ModelCapabilities,
-  type ModelOfferingTarget,
-  type ModelOfferingTargetId,
   type ModelServingConfiguration,
   type ModelPackageEntry,
-  type RecommendableModel,
-  modelOfferingTargetPackageIds,
-  ModelOfferingTargetSchema,
-  ModelServingConfigurationSchema,
+  servableModelBundlePackageIds,
+  PRIMARY_SLOT_ID,
+  SECONDARY_SLOT_ID,
+  ProviderModelCatalogEntrySchema,
+  type ProviderModelCatalogEntry,
+  type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
-import {
-  ProviderModelIdSchema,
-  type ProviderModelId,
-} from "@magnitudedev/sdk"
-import {
-  MagnitudeStorage,
-  type PersistedLocalProviderOffering,
-} from "@magnitudedev/storage"
-import { IcnCatalog, IcnInstalledModels } from "@magnitudedev/icn"
+import type { ProviderModelId } from "@magnitudedev/sdk"
+import { IcnInstalledModels } from "@magnitudedev/icn"
+import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import {
   modelPackageFromIcn,
   packageInspectionFromIcn,
-  recommendableModelFromIcn,
 } from "./local-model-icn-adapter"
+import { LocalModelPackages } from "./local-model-packages"
+import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver"
+import { makeObservedState } from "./mirrored-state"
+import { resolveBundlePresentation } from "./local-model-presentation"
+export { localProviderModelId, localCatalogProviderModelId } from "./local-provider-model-id"
+import { localCatalogProviderModelId, localProviderModelId } from "./local-provider-model-id"
+
+export type ProviderOfferingPackageEvidence = readonly {
+  readonly providerModelId: LocalProviderOffering["providerModelId"]
+  readonly configurationId: LocalProviderOffering["configuration"]["id"]
+  readonly packages: readonly {
+    readonly packageId: ModelPackageEntry["package"]["id"]
+    readonly installed: boolean
+    readonly inspection: ModelPackageEntry["inspection"]["_tag"]
+  }[]
+}[]
+
+export const providerOfferingPackageEvidence = (
+  offerings: readonly Pick<LocalProviderOffering, "providerModelId" | "configuration">[],
+  entries: ReadonlyMap<ModelPackageEntry["package"]["id"], ModelPackageEntry>,
+): ProviderOfferingPackageEvidence => [...offerings]
+  .sort((left, right) => left.providerModelId.localeCompare(right.providerModelId))
+  .map((offering) => ({
+    providerModelId: offering.providerModelId,
+    configurationId: offering.configuration.id,
+    packages: servableModelBundlePackageIds(offering.configuration.bundle).map((packageId) => {
+      const entry = entries.get(packageId)
+      return {
+        packageId,
+        installed: entry?.localState._tag === "Installed",
+        inspection: entry?.inspection._tag ?? "Pending",
+      }
+    }).sort((left, right) => left.packageId.localeCompare(right.packageId)),
+  }))
+
+export const sameProviderOfferingPackageEvidence = (
+  left: ProviderOfferingPackageEvidence,
+  right: ProviderOfferingPackageEvidence,
+): boolean => left.length === right.length && left.every((offering, index) => {
+  const other = right[index]
+  return offering.providerModelId === other?.providerModelId
+    && offering.configurationId === other.configurationId
+    && offering.packages.length === other.packages.length
+    && offering.packages.every((modelPackage, packageIndex) => {
+      const otherPackage = other.packages[packageIndex]
+      return modelPackage.packageId === otherPackage?.packageId
+        && modelPackage.installed === otherPackage.installed
+        && modelPackage.inspection === otherPackage.inspection
+    })
+})
+
+export interface LocalProviderOfferingsState {
+  readonly packageEvidence: Option.Option<ProviderOfferingPackageEvidence>
+  readonly entries: readonly ProviderModelCatalogEntry[]
+  readonly failure: Option.Option<LocalInferenceError>
+}
 
 const failure = (operation: string, error: unknown) =>
   new LocalModelMutationFailed({
@@ -36,40 +84,26 @@ const failure = (operation: string, error: unknown) =>
     retryable: true,
   })
 
-const capabilitySet = (
-  target: ModelOfferingTarget,
-  catalog: readonly RecommendableModel[],
-  installed: readonly Pick<ModelPackageEntry, "package" | "inspection">[],
-): ModelCapabilities => {
-  const sameTarget = Schema.equivalence(ModelOfferingTargetSchema)
-  const recommendation = catalog.find((model) => sameTarget(model.target, target))
-  if (recommendation) return recommendation.capabilities
-  const primaryPackageId = target._tag === "Package" ? target.package.id : target.target.id
-  const inspection = installed.find(({ package: modelPackage }) =>
-    modelPackage.id === primaryPackageId)?.inspection
-  return inspection?._tag === "Inspected"
-    ? inspection.capabilities
-    : ModelCapabilitiesSchema.make({
-        vision: false,
-        tools: false,
-        structuredOutput: false,
-        reasoning: {
-          supported: false,
-          efforts: [],
-          defaultEffort: Option.none(),
-        },
-      })
-}
+const CONSERVATIVE_CAPABILITIES = ModelCapabilitiesSchema.make({
+  vision: false,
+  tools: false,
+  structuredOutput: false,
+  reasoning: {
+    supported: false,
+    efforts: [],
+    defaultEffort: Option.none(),
+  },
+})
 
 export interface LocalProviderOfferingsApi {
+  readonly ready: Effect.Effect<boolean>
   readonly list: Effect.Effect<readonly LocalProviderOffering[], LocalInferenceError>
   readonly changes: Stream.Stream<void>
+  readonly catalog: Effect.Effect<readonly ProviderModelCatalogEntry[], LocalInferenceError>
+  readonly state: Effect.Effect<LocalProviderOfferingsState>
+  readonly catalogChanges: Stream.Stream<void>
   readonly resolve: (
     providerModelId: ProviderModelId,
-  ) => Effect.Effect<LocalProviderOffering, LocalInferenceError>
-  readonly save: (
-    targetId: ModelOfferingTargetId,
-    configuration: ModelServingConfiguration,
   ) => Effect.Effect<LocalProviderOffering, LocalInferenceError>
 }
 
@@ -81,38 +115,52 @@ export class LocalProviderOfferings extends Context.Tag("LocalProviderOfferings"
 export const LocalProviderOfferingsLive: Layer.Layer<
   LocalProviderOfferings,
   never,
-  MagnitudeStorage | IcnCatalog | IcnInstalledModels
-> = Layer.effect(LocalProviderOfferings, Effect.gen(function* () {
-  const storage = yield* MagnitudeStorage
-  const catalog = yield* IcnCatalog
+  IcnInstalledModels | LocalModelConfigurationResolver | LocalModelPackages
+> = Layer.scoped(LocalProviderOfferings, Effect.gen(function* () {
   const installed = yield* IcnInstalledModels
-  const mutations = yield* PubSub.sliding<void>(16)
-  const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
+  const resolver = yield* LocalModelConfigurationResolver
+  const packages = yield* LocalModelPackages
 
-  const capabilitySources = Effect.all({
-    catalog: catalog.get.pipe(
-      Effect.flatMap(({ state }) => Effect.forEach(state.models, recommendableModelFromIcn)),
-      Effect.mapError((error) => failure("read_recommendable_model_catalog_failed", error)),
-    ),
-    installed: installed.get.pipe(
-      Effect.flatMap(({ state }) => Effect.forEach(
-        state.packages,
-        (entry) => Effect.all({
-          package: modelPackageFromIcn(entry.package),
-          inspection: packageInspectionFromIcn(entry.inspection),
-        }),
-      )),
-      Effect.mapError((error) => failure("read_installed_model_capabilities_failed", error)),
-    ),
+  const installedCapabilities = installed.get.pipe(
+    Effect.flatMap((snapshot) => Effect.forEach(
+      snapshot.state.packages,
+      (entry) => Effect.all({
+        package: modelPackageFromIcn(entry.package),
+        inspection: packageInspectionFromIcn(entry.inspection),
+      }),
+    )),
+    Effect.mapError((error) => failure("read_installed_model_capabilities_failed", error)),
+  )
+
+  const offeringsFrom = (
+    resolved: readonly import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration[],
+    installedEntries: Effect.Effect.Success<typeof installedCapabilities>,
+  ): readonly LocalProviderOffering[] => resolved.map(({ servingConfiguration, catalogModel }) => {
+    const targetPackageId = servingConfiguration.bundle._tag === "Standalone"
+      ? servingConfiguration.bundle.package.id
+      : servingConfiguration.bundle.target.id
+    const inspection = installedEntries.find(({ package: modelPackage }) =>
+      modelPackage.id === targetPackageId)?.inspection
+    const capabilities = inspection?._tag === "Inspected"
+      ? inspection.capabilities
+      : Option.match(catalogModel, {
+          onNone: () => CONSERVATIVE_CAPABILITIES,
+          onSome: (model) => model.capabilities,
+        })
+
+    return {
+      providerModelId: Option.match(catalogModel, {
+        onNone: () => localProviderModelId(servingConfiguration.id),
+        onSome: localCatalogProviderModelId,
+      }),
+      configuration: servingConfiguration,
+      capabilities,
+    }
   })
 
   const list: LocalProviderOfferingsApi["list"] = Effect.gen(function* () {
-    const persisted = (yield* storage.config.load()).models?.localProviderOfferings ?? []
-    const sources = yield* capabilitySources
-    return persisted.map((offering): LocalProviderOffering => ({
-      ...offering,
-      capabilities: capabilitySet(offering.configuration.target, sources.catalog, sources.installed),
-    }))
+    const resolved = [...(yield* resolver.get).values()]
+    return offeringsFrom(resolved, yield* installedCapabilities)
   }).pipe(
     Effect.mapError((error) => error instanceof LocalModelMutationFailed
       ? error
@@ -120,14 +168,122 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   )
 
   const changes = Stream.mergeAll([
-    Stream.fromPubSub(mutations),
-    catalog.changes.pipe(Stream.map(() => undefined)),
+    resolver.changes,
     installed.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" })
 
+  const observed = yield* makeObservedState<LocalProviderOfferingsState>({
+    packageEvidence: Option.none(),
+    entries: [],
+    failure: Option.none(),
+  })
+  const entriesEquivalent = Schema.equivalence(Schema.Array(ProviderModelCatalogEntrySchema))
+  const stateEquivalent = (
+    left: LocalProviderOfferingsState,
+    right: LocalProviderOfferingsState,
+  ): boolean => Option.match(left.packageEvidence, {
+    onNone: () => Option.isNone(right.packageEvidence),
+    onSome: (evidence) => Option.exists(right.packageEvidence, (other) =>
+      sameProviderOfferingPackageEvidence(evidence, other)),
+  }) && entriesEquivalent(left.entries, right.entries)
+    && Option.getOrUndefined(left.failure)?.message === Option.getOrUndefined(right.failure)?.message
+
+  const compute = Effect.gen(function* () {
+    const resolved = [...(yield* resolver.get).values()]
+    const installedEntries = yield* installedCapabilities
+    const packageSnapshot = yield* packages.snapshot
+    const packageEntries = new Map(
+      packageSnapshot.state.entries.map((entry) => [entry.package.id, entry]),
+    )
+    const configured = offeringsFrom(resolved, installedEntries)
+    const packageEvidence = providerOfferingPackageEvidence(configured, packageEntries)
+    const bundleEntries = configured.map(({ configuration }) =>
+      servableModelBundlePackageIds(configuration.bundle).map((id) => packageEntries.get(id)))
+    const installedBundles = bundleEntries.map((entries) =>
+      entries.every((entry) => entry?.localState._tag === "Installed"))
+    const inspectable = bundleEntries.map((entries, index) => installedBundles[index]
+      && entries.every((entry) => entry?.inspection._tag === "Inspected"))
+    const entries = configured.map((offering, index): ProviderModelCatalogEntry => {
+      const { bundle, profile } = offering.configuration
+      const installed = installedBundles[index] ?? false
+      const assessment = inspectable[index]
+        ? Option.getOrUndefined(resolved[index]?.assessment ?? Option.none())
+        : undefined
+      const curated = Option.getOrUndefined(resolved[index]?.catalogModel ?? Option.none())
+      const presentation = resolveBundlePresentation(bundle, curated && {
+        displayName: curated.displayName,
+        variantLabel: curated.variantLabel,
+        description: curated.description,
+        license: curated.license,
+      })
+      return {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: offering.providerModelId,
+        modelFamilyId: Option.none(),
+        displayName: presentation.displayName,
+        variantLabel: Option.some(presentation.variantLabel),
+        supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+        contextWindow: profile.contextLength,
+        maxOutputTokens: profile.contextLength,
+        memory: assessment?._tag === "Fits"
+          ? Option.some(assessment.assessment.memory)
+          : assessment?._tag === "DoesNotFit" ? Option.some(assessment.memory) : Option.none(),
+        capabilities: offering.capabilities,
+        availability: !installed
+          ? { _tag: "Disabled", reason: "installation_unavailable" }
+          : assessment?._tag === "Fits"
+            ? { _tag: "Available" }
+            : assessment?._tag === "DoesNotFit"
+              ? { _tag: "Disabled", reason: "insufficient_resources" }
+              : assessment?._tag === "Incompatible"
+                ? { _tag: "Disabled", reason: "incompatible_runtime" }
+                : { _tag: "Disabled", reason: "provider_unavailable" },
+        pricing: Option.none(),
+      }
+    })
+    return {
+      entries,
+      packageEvidence,
+    }
+  })
+
+  const publishCurrent: Effect.Effect<void, LocalInferenceError> = compute.pipe(
+    Effect.flatMap(({ entries, packageEvidence }) => observed.setIfChanged({
+      packageEvidence: Option.some(packageEvidence),
+      entries,
+      failure: Option.none(),
+    }, stateEquivalent)),
+  )
+
+  const project = publishCurrent.pipe(
+    Effect.catchAll((error) => observed.get.pipe(Effect.flatMap(({ state }) =>
+      observed.setIfChanged(
+        { ...state, failure: Option.some(error) },
+        stateEquivalent,
+      ).pipe(Effect.asVoid)))),
+    Effect.catchAllCause((cause) => Effect.logWarning(
+      "Unable to project local provider offerings",
+    ).pipe(Effect.annotateLogs({ cause: String(cause) }))),
+  )
+  yield* Stream.make(undefined).pipe(
+    Stream.concat(Stream.mergeAll([
+      changes,
+      packages.changes.pipe(Stream.map(() => undefined)),
+    ], { concurrency: "unbounded" }).pipe(Stream.debounce("25 millis"))),
+    Stream.runForEach(() => project),
+    Effect.forkScoped,
+  )
+
   return LocalProviderOfferings.of({
+    ready: resolver.settled,
     list,
     changes,
+    catalog: observed.get.pipe(Effect.flatMap(({ state }) => Option.match(state.failure, {
+      onNone: () => Effect.succeed(state.entries),
+      onSome: Effect.fail,
+    }))),
+    state: observed.get.pipe(Effect.map(({ state }) => state)),
+    catalogChanges: observed.changes.pipe(Stream.map(() => undefined)),
     resolve: (providerModelId) => list.pipe(Effect.flatMap((offerings) => {
       const offering = offerings.find((candidate) => candidate.providerModelId === providerModelId)
       return offering
@@ -138,38 +294,5 @@ export const LocalProviderOfferingsLive: Layer.Layer<
             retryable: false,
           }))
     })),
-    save: (targetId, configuration) => Effect.gen(function* () {
-      const providerModelId = ProviderModelIdSchema.make(configuration.id)
-      const persisted: PersistedLocalProviderOffering = {
-        providerModelId,
-        targetId,
-        configuration,
-      }
-      const configured = yield* list
-      const existing = configured.find((offering) => offering.providerModelId === providerModelId)
-      if (existing && (existing.targetId !== targetId
-        || !sameConfiguration(existing.configuration, configuration))) {
-        return yield* new LocalModelMutationFailed({
-          code: "local_provider_offering_identity_conflict",
-          message: `Local provider offering ${providerModelId} conflicts with its stored identity`,
-          retryable: false,
-        })
-      }
-      if (existing) return existing
-      yield* Effect.uninterruptible(Effect.gen(function* () {
-        yield* storage.config.upsertLocalProviderOffering(persisted).pipe(
-          Effect.mapError((error) => failure("save_local_provider_offering_failed", error)),
-        )
-        yield* PubSub.publish(mutations, undefined)
-      }))
-      const offerings = yield* list
-      const saved = offerings.find((offering) => offering.providerModelId === providerModelId)
-      if (saved) return saved
-      return yield* new LocalModelMutationFailed({
-        code: "saved_local_provider_offering_unresolved",
-        message: `Saved local provider offering ${providerModelId} could not be resolved`,
-        retryable: true,
-      })
-    }),
   })
 }))

@@ -1,5 +1,12 @@
-export { connect, makeClientLayer, protocolLayer, protocolLayerWithRecovery, AcnClientTag } from "./protocol"
-export type { AcnClient } from "./protocol"
+export {
+  connect,
+  makeClientLayer,
+  protocolLayer,
+  protocolLayerWithRecovery,
+  AcnClientTag,
+  AcnRpcClientTag,
+} from "./protocol"
+export type { AcnClient, AcnRpcClient } from "./protocol"
 
 export {
   AcnInstanceManager,
@@ -78,6 +85,7 @@ export {
   PercentageSchema,
   ModelCapabilitiesSchema,
   ModelFailureSchema,
+  ModelDownloadFailureSchema,
   ProviderModelCatalogStateSchema,
   ProviderCatalogEntrySchema,
   ProviderModelCatalogEntrySchema,
@@ -85,8 +93,7 @@ export {
   ModelSlotDescriptorSchema,
   ModelSlotAvailabilitySchema,
   ModelLoadPlanSchema,
-  ModelSlotInstanceLifecycleSchema,
-  ModelSlotInstanceSchema,
+  ModelResidencySchema,
   ModelSlotActionSchema,
   ModelSlotSchema,
   LocalInferenceAcceleratorSchema,
@@ -100,11 +107,18 @@ export {
   ModelSlotsMirror,
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
+  servableModelBundlePackages,
   OnboardingMirror,
-  ModelOfferingTargetIdSchema,
-  DownloadAttemptIdSchema,
+  ModelPackageIdSchema,
+  CatalogModelIdSchema,
+  CatalogVariantIdSchema,
+  CatalogIdentitySchema,
+  ModelDownloadIdSchema,
+  LocalModelInstalledPackageSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
+  ModelVariantLabelSchema,
+  formatModelDisplayName,
   RecommendationIdSchema,
   ModelAssessmentIdSchema,
   AssessmentEnvironmentIdSchema,
@@ -113,8 +127,11 @@ export {
 } from "@magnitudedev/acn-protocol"
 
 export type {
-  DownloadAttemptId,
-  ModelOfferingTargetId,
+  CatalogModelId,
+  CatalogVariantId,
+  CatalogIdentity,
+  ModelDownloadId,
+  LocalModelInstalledPackage,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,
@@ -222,6 +239,8 @@ export { normalizeReferencedPath } from "./path-utils"
 
 export {
   ProviderClient,
+  createCustomEndpointProvider,
+  customEndpointProviderId,
   createProviderClient,
   type ProviderClientShape,
   type ProviderClientConfig,

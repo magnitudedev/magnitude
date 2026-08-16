@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
 import { expect, test, vi } from 'vitest'
+import { defaultCliThemes } from '../../utils/theme'
 
 vi.mock('@opentui/react', () => ({
   useKeyboard: () => {},
@@ -21,13 +22,7 @@ vi.mock('@magnitudedev/client-common', async () => {
 })
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({
-    primary: '#00aaff',
-    foreground: '#ffffff',
-    muted: '#888888',
-    border: '#444444',
-    error: '#ff0000',
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 vi.mock('../../components/button', () => ({

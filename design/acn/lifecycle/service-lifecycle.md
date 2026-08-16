@@ -2,6 +2,7 @@
 applies_to:
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
+  - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/activity-tracker.ts
   - packages/acn/src/resource-use-gate.ts
   - packages/acn/src/acn-subscriptions.ts
@@ -29,12 +30,16 @@ After binding its control endpoint, the candidate reads the complete current own
 predecessor's dedicated process tree absent, then atomically replaces the singleton SQLite owner
 row only if the complete owner remains unchanged. That commit is process admission. Owner mismatch
 makes the candidate stop and exit without expensive initialization. Successful admission removes
-dependence on its launching manager and permits application startup.
+dependence on its launching manager, installs the mandatory lifetime owner monitor, and permits
+application startup.
 
-An admitted ACN does not poll durable version intent. A manager prepares a successor before asking
-a lower-revision live owner to stop, then proves the predecessor ACN/ICN tree absent before the
-successor may commit ownership. Retirement otherwise begins only through exact explicit shutdown,
-idle policy, the ACN's own terminal failure, or process signals.
+An admitted ACN does not poll durable version intent, but it continuously proves that the complete
+owner row still equals the row it admitted. A confirmed missing or changed row begins
+`Stopping(ownership-lost)`. Any surfaced owner-store failure means ownership can no longer be
+proven and fails closed through `Stopping(fatal)`. A manager prepares a successor before asking a
+lower-revision live owner to stop, then proves the predecessor ACN/ICN tree absent before the
+successor may commit ownership. Retirement otherwise begins through exact explicit shutdown, idle
+policy, ownership loss, the ACN's own terminal failure, or process signals.
 
 ## Readiness and admission
 
@@ -94,7 +99,8 @@ belongs to manager-side owner and exact-process revalidation, not a required end
 - No application or ICN work starts before atomic exact-owner admission.
 - Losing owner acquisition cannot initialize expensive resources.
 - No application work is admitted outside the exact admitted `Ready` ACN.
-- Missing or unreadable coordination state cannot make a healthy admitted ACN self-destruct.
+- A confirmed missing or changed owner row stops the admitted ACN, and any store failure fails
+  closed rather than leaving an unfenced service alive.
 - Observation cannot retain ACN, and operation duration cannot replace it.
 - The stopping transition is single-flight; cooperative teardown and external exact-tree escalation
   are independently bounded.

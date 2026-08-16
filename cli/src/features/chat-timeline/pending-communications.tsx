@@ -20,14 +20,14 @@ export function PendingCommunicationsPanel({ messages, onFileClick }: PendingCom
       <box
         style={{
           borderStyle: 'single',
-          borderColor: theme.border,
+          borderColor: theme.border.standard,
           customBorderChars: BOX_CHARS,
           flexDirection: 'column',
           paddingLeft: 1,
           paddingRight: 1,
         }}
       >
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>Pending messages</text>
+        <text style={{ fg: theme.text.supporting }} attributes={TextAttributes.BOLD}>Pending messages</text>
         {agentMessages.map((message) => {
           const cardMessage: AgentCommunicationMessage = {
             id: message.id,

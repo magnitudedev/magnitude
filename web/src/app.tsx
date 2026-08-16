@@ -8,10 +8,22 @@
  * StreamDisplayView uses the display view store (spec §6.1).
  * Local UI state uses plain atoms (spec §6.3).
  */
-import { useCallback, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react"
+import {
+  useCallback,
+  useMemo,
+  useRef,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react"
 import { Menu } from "lucide-react"
 import { Option, Effect } from "effect"
-import { useAtomValue, useAtomSet, useAtomMount, Atom, Result } from "@effect-atom/atom-react"
+import {
+  useAtomValue,
+  useAtomSet,
+  useAtomMount,
+  Atom,
+  Result,
+} from "@effect-atom/atom-react"
 import {
   type CommandContext,
   DisplayViewControllerProvider,
@@ -25,7 +37,7 @@ import {
   useSessionPreload,
   useSessionActions,
   usePaginatedSessions,
-  useOnboardingState,
+  useOnboardingModelSetup,
   useModelSlots,
   deriveCurrentLocalModel,
   modelSlotResidentAllocation,
@@ -101,14 +113,19 @@ function findSlotProfileForRole(
   role: string | null | undefined,
 ): SlotProfile | null {
   if (!profiles || !role || !isRoleId(role)) return null
-  const slotId = ROLE_TO_SLOT[role] === "primary" ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
+  const slotId =
+    ROLE_TO_SLOT[role] === "primary" ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
   return Option.getOrNull(findSlotProfile(profiles, slotId))
 }
 
-function useRootSlotProfile(
-  slotProfiles: SlotProfiles | null,
-): { roleId: string; roleLabel: string; profile: SlotProfile | null } {
-  const rootRole = useDisplayState((state) => state.actors["root"]?.role ?? null)
+function useRootSlotProfile(slotProfiles: SlotProfiles | null): {
+  roleId: string
+  roleLabel: string
+  profile: SlotProfile | null
+} {
+  const rootRole = useDisplayState(
+    (state) => state.actors["root"]?.role ?? null,
+  )
   const roleId = rootRole ?? "leader"
   return {
     roleId,
@@ -118,7 +135,10 @@ function useRootSlotProfile(
 }
 
 /** Sessions sidebar container — ListSessions query + shared session actions */
-function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: () => void }): ReactNode {
+function SessionsSidebarContainer(props?: {
+  overlay?: boolean
+  onCloseOverlay?: () => void
+}): ReactNode {
   const client = useAgentClient()
   const { startNewSession, resumeSession } = useSessionActions()
   const cwdFilter = useAtomValue(sidebarCwdFilterAtom)
@@ -146,7 +166,9 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
           }
           window.addEventListener("__magnitude:focus-search", handler)
           yield* Effect.addFinalizer(() =>
-            Effect.sync(() => window.removeEventListener("__magnitude:focus-search", handler)),
+            Effect.sync(() =>
+              window.removeEventListener("__magnitude:focus-search", handler),
+            ),
           )
         }),
       ),
@@ -155,12 +177,13 @@ function SessionsSidebarContainer(props?: { overlay?: boolean; onCloseOverlay?: 
   useAtomMount(focusSearchAtom)
 
   const cwdOptionsResult = useAtomValue(
-    client.query("ListSessionCwds", {}, { reactivityKeys: ["sessions"] }),
+    client.rpc.query("ListSessionCwds", {}, { reactivityKeys: ["sessions"] }),
   )
   const cwdOptions = Result.match(cwdOptionsResult, {
     onInitial: () => [] as string[],
     onFailure: () => [] as string[],
-    onSuccess: (result) => (result.value as SessionCwdSummary[]).map((summary) => summary.cwd),
+    onSuccess: (result) =>
+      (result.value as SessionCwdSummary[]).map((summary) => summary.cwd),
   })
 
   const handleNewSession = () => {
@@ -236,26 +259,34 @@ function FileViewerPanelContainer(): ReactNode {
   // When no file is selected, use a static idle atom so the hook count stays stable.
   // P1: reactivityKeys: ["files"] so the query refreshes when files change.
   const readFileAtom = useMemo(
-    () => filePath && selectedCwd
-      ? client.query("ReadFile", {
-          cwd: selectedCwd,
-          path: filePath,
-          format: isImageFile ? "base64" : "text",
-        }, { reactivityKeys: ["files"] })
-      : Atom.make(() => null),
+    () =>
+      filePath && selectedCwd
+        ? client.rpc.query(
+            "ReadFile",
+            {
+              cwd: selectedCwd,
+              path: filePath,
+              format: isImageFile ? "base64" : "text",
+            },
+            { reactivityKeys: ["files"] },
+          )
+        : Atom.make(() => null),
     [client, selectedCwd, filePath, isImageFile],
   )
   const result = useAtomValue(readFileAtom)
 
   // P2: Handle loading and error states explicitly
   // result is null when no file is selected (idle atom), so guard for that.
-  const loading = !!filePath && !!selectedCwd && result !== null && Result.isInitial(result)
-  const errorMsg = filePath && selectedCwd && result !== null && Result.isFailure(result)
-    ? "Failed to read file. The file may not exist or is not accessible."
-    : null
-  const content = filePath && result !== null && Result.isSuccess(result)
-    ? (result.value as ReadFileResult).content
-    : null
+  const loading =
+    !!filePath && !!selectedCwd && result !== null && Result.isInitial(result)
+  const errorMsg =
+    filePath && selectedCwd && result !== null && Result.isFailure(result)
+      ? "Failed to read file. The file may not exist or is not accessible."
+      : null
+  const content =
+    filePath && result !== null && Result.isSuccess(result)
+      ? (result.value as ReadFileResult).content
+      : null
 
   return (
     <FileViewerPanel
@@ -296,7 +327,11 @@ function WorkerDetailPanelContainer({
   )
 }
 
-function WorkerDetailPageContainer({ slotProfiles }: { slotProfiles: SlotProfiles | null }): ReactNode {
+function WorkerDetailPageContainer({
+  slotProfiles,
+}: {
+  slotProfiles: SlotProfiles | null
+}): ReactNode {
   const { topForkId, popFork } = useDisplayViewController()
   const actors = useDisplayState((state) => state.actors)
   const actor = topForkId ? actors[topForkId] ?? null : null
@@ -311,16 +346,18 @@ function WorkerDetailPageContainer({ slotProfiles }: { slotProfiles: SlotProfile
       title={title}
       backLabel="Back to session"
       onBack={popFork}
-      actions={actor ? (
-        <ContextUsageIndicator
-          context={actor.context}
-          tokenCap={profile?.contextWindow ?? null}
-          size={20}
-          strokeWidth={2}
-          showTokenLabel
-          tooltip="native"
-        />
-      ) : null}
+      actions={
+        actor ? (
+          <ContextUsageIndicator
+            context={actor.context}
+            tokenCap={profile?.contextWindow ?? null}
+            size={20}
+            strokeWidth={2}
+            showTokenLabel
+            tooltip="native"
+          />
+        ) : null
+      }
     >
       <WorkerDetailPanelContainer slotProfiles={slotProfiles} />
     </ChatColumnPage>
@@ -337,7 +374,11 @@ function deriveWorkerInfo(
 }
 
 /** Work status container — timer + active task table above composer */
-function WorkStatusBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | null }): ReactNode {
+function WorkStatusBarContainer({
+  slotProfiles,
+}: {
+  slotProfiles: SlotProfiles | null
+}): ReactNode {
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
   const actors = useDisplayState((state) => state.actors)
   const tasks = useDisplayState((state) => state.tasks)
@@ -362,7 +403,11 @@ function WorkStatusBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles |
   )
 }
 
-function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode {
+function ComposerContainer({
+  docked = false,
+}: {
+  docked?: boolean
+}): ReactNode {
   const platform = usePlatform()
   const setBashMode = useAtomSet(bashModeAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
@@ -373,68 +418,91 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
   const { startNewSession } = useSessionActions()
   const sendRef = useRef<(text: string) => void>(() => {})
   const slotsResult = useModelSlots()
+  const onboarding = useOnboardingModelSetup()
   const slots = Option.getOrNull(Result.value(slotsResult))
   const primary = slots?.slots.primary ?? null
-  const modelReady = primary?._tag === "ConfiguredLocal"
-    && primary.availability._tag === "Available"
-    && Option.exists(primary.instance, ({ lifecycle }) => lifecycle._tag === "Ready")
+  const modelReady =
+    primary?._tag === "ConfiguredLocal" &&
+    primary.availability._tag === "Available" &&
+    primary.residency._tag === "Ready"
   const disabledReason = modelReady
     ? null
     : Result.isFailure(slotsResult)
-      ? "Model runtime state is unavailable"
-      : "Load a local model before sending"
+    ? "Model runtime state is unavailable"
+    : "Load a local model before sending"
 
-  const commandContext: CommandContext = useMemo(() => ({
-    resetConversation: () => startNewSession(),
-    showSystemMessage: (message: string) => showToast("info", message),
-    exitApp: () => { if (platform.quit) platform.quit() },
-    openRecentChats: () => {
-      if (sidebarVisible === false) {
-        setSidebarVisible(true)
-      }
-      window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
-    },
-    enterBashMode: () => setBashMode(true),
-    activateSkill: (skillName: string, _skillPath: string | undefined, args: string) => {
-      const content = args.trim() ? `/${skillName} ${args.trim()}` : `/${skillName}`
-      sendRef.current(content)
-    },
-    initProject: () => {
-      showToast("info", "Project initialization is not available in the web app yet.")
-    },
-    openSettings: () => setSettingsOpen(true),
-    openModelMenu: (menu) => {
-      if (menu === "models" || menu === "catalog" || menu === "hardware") {
-        setSettingsOpen(false)
-        setModelCenterTab(menu)
-      }
-    },
-    toggleAutopilot: () => {
-      showToast("info", "Autopilot mode is not yet available in the web app.")
-    },
-  }), [
-    startNewSession,
-    platform,
-    sidebarVisible,
-    setSidebarVisible,
-    setBashMode,
-    setSettingsOpen,
-    setModelCenterTab,
-  ])
+  const commandContext: CommandContext = useMemo(
+    () => ({
+      resetConversation: () => startNewSession(),
+      showSystemMessage: (message: string) => showToast("info", message),
+      exitApp: () => {
+        if (platform.quit) platform.quit()
+      },
+      openRecentChats: () => {
+        if (sidebarVisible === false) {
+          setSidebarVisible(true)
+        }
+        window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
+      },
+      enterBashMode: () => setBashMode(true),
+      activateSkill: (
+        skillName: string,
+        _skillPath: string | undefined,
+        args: string,
+      ) => {
+        const content = args.trim()
+          ? `/${skillName} ${args.trim()}`
+          : `/${skillName}`
+        sendRef.current(content)
+      },
+      initProject: () => {
+        showToast(
+          "info",
+          "Project initialization is not available in the web app yet.",
+        )
+      },
+      openSettings: () => setSettingsOpen(true),
+      openSetup: onboarding.open,
+      openModelMenu: (menu) => {
+        if (menu === "models" || menu === "catalog" || menu === "hardware") {
+          setSettingsOpen(false)
+          setModelCenterTab(menu)
+        }
+      },
+      toggleAutopilot: () => {
+        showToast("info", "Autopilot mode is not yet available in the web app.")
+      },
+    }),
+    [
+      startNewSession,
+      platform,
+      sidebarVisible,
+      setSidebarVisible,
+      setBashMode,
+      setSettingsOpen,
+      setModelCenterTab,
+      onboarding.open,
+    ],
+  )
 
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => composer.handleSend(text)
 
-  const handleMentionConfirm = useCallback((item: { path: string }) => {
-    setFilePath(item.path)
-  }, [setFilePath])
+  const handleMentionConfirm = useCallback(
+    (item: { path: string }) => {
+      setFilePath(item.path)
+    },
+    [setFilePath],
+  )
 
   return (
     <Composer
       role={composer.roleLabel}
       isStreaming={composer.isStreaming}
       bashMode={composer.bashMode}
-      onSend={(text, mentions) => { void composer.handleSend(text, { mentions }) }}
+      onSend={(text, mentions) => {
+        void composer.handleSend(text, { mentions })
+      }}
       onInterrupt={composer.handleInterrupt}
       onRunBash={composer.handleRunBash}
       onSlashCommand={composer.handleSlashCommand}
@@ -450,11 +518,17 @@ function ComposerContainer({ docked = false }: { docked?: boolean }): ReactNode 
 }
 
 /** FooterBar container */
-function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | null }): ReactNode {
+function FooterBarContainer({
+  slotProfiles,
+}: {
+  slotProfiles: SlotProfiles | null
+}): ReactNode {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
-  const context = useDisplayState((state) => state.actors["root"]?.context ?? null)
+  const context = useDisplayState(
+    (state) => state.actors["root"]?.context ?? null,
+  )
   const { profile } = useRootSlotProfile(slotProfiles)
   const tokenCap = profile?.contextWindow ?? null
   const bashMode = useAtomValue(bashModeAtom)
@@ -464,33 +538,71 @@ function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nul
   const setModelCenterTab = useAtomSet(modelCenterTabAtom)
   const slotsResult = useModelSlots()
   const slots = Option.getOrNull(Result.value(slotsResult))
-  const currentModel = deriveCurrentLocalModel(Option.fromNullable(slots?.slots.primary))
-  const allocation = slots ? modelSlotResidentAllocation(slots.slots.primary) : Option.none()
+  const currentModel = deriveCurrentLocalModel(
+    Option.fromNullable(slots?.slots.primary),
+  )
+  const allocation = slots
+    ? modelSlotResidentAllocation(slots.slots.primary)
+    : Option.none()
   const residentBytes = Option.match(allocation, {
     onNone: () => null,
-    onSome: ({ memoryDomains }) => memoryDomains.reduce((total, domain) => total
-      + domain.modelBytes + domain.contextBytes + domain.computeBytes + domain.auxiliaryBytes, 0),
+    onSome: ({ memoryDomains }) =>
+      memoryDomains.reduce(
+        (total, domain) =>
+          total +
+          domain.modelBytes +
+          domain.contextBytes +
+          domain.computeBytes +
+          domain.auxiliaryBytes,
+        0,
+      ),
   })
   const selectedSessionAtom = useMemo(
-    () => selectedSessionId
-      ? client.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
-      : Atom.make(() => null),
+    () =>
+      selectedSessionId
+        ? client.rpc.query(
+            "GetSession",
+            { sessionId: selectedSessionId },
+            { reactivityKeys: ["sessions"] },
+          )
+        : Atom.make(() => null),
     [client, selectedSessionId],
   )
   const selectedSessionResult = useAtomValue(selectedSessionAtom)
-  const sessionCwd = selectedSessionResult !== null && Result.isSuccess(selectedSessionResult)
-    ? (selectedSessionResult.value as SessionMetadata).cwd
-    : null
+  const sessionCwd =
+    selectedSessionResult !== null && Result.isSuccess(selectedSessionResult)
+      ? (selectedSessionResult.value as SessionMetadata).cwd
+      : null
   const cwd = sessionCwd ?? selectedCwd
 
   const thinkingLevel = profile?.reasoningEffort
-    ? profile.reasoningEffort.charAt(0).toUpperCase() + profile.reasoningEffort.slice(1)
+    ? profile.reasoningEffort.charAt(0).toUpperCase() +
+      profile.reasoningEffort.slice(1)
     : null
-  const openModels = useCallback(() => { setSettingsOpen(false); setModelCenterTab("models") }, [setModelCenterTab, setSettingsOpen])
-  const openSettings = useCallback(() => { setModelCenterTab(null); setSettingsOpen(true) }, [setModelCenterTab, setSettingsOpen])
-  const modelLabel = currentModel._tag === "NoSelection"
-    ? "Choose model"
-    : `${currentModel.displayName} · ${currentModel._tag === "Running" ? "Ready" : currentModel._tag === "Loading" ? `Loading ${currentModel.percentage}%` : currentModel._tag === "Stopping" ? "Stopping" : currentModel._tag === "Failed" ? "Failed" : "Not loaded"}${residentBytes === null ? "" : ` · ${formatBytes(residentBytes)} mem`}`
+  const openModels = useCallback(() => {
+    setSettingsOpen(false)
+    setModelCenterTab("models")
+  }, [setModelCenterTab, setSettingsOpen])
+  const openSettings = useCallback(() => {
+    setModelCenterTab(null)
+    setSettingsOpen(true)
+  }, [setModelCenterTab, setSettingsOpen])
+  const modelLabel =
+    currentModel._tag === "NoSelection"
+      ? "Choose model"
+      : `${currentModel.displayName} · ${
+          currentModel._tag === "Running"
+            ? "Ready"
+            : currentModel._tag === "Loading"
+            ? `Loading ${currentModel.percentage}%`
+            : currentModel._tag === "Stopping"
+            ? "Stopping"
+            : currentModel._tag === "Failed"
+            ? "Failed"
+            : "Not loaded"
+        }${
+          residentBytes === null ? "" : ` · ${formatBytes(residentBytes)} mem`
+        }`
 
   return (
     <FooterBar
@@ -508,7 +620,11 @@ function FooterBarContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nul
   )
 }
 
-function BottomDockContainer({ slotProfiles }: { slotProfiles: SlotProfiles | null }): ReactNode {
+function BottomDockContainer({
+  slotProfiles,
+}: {
+  slotProfiles: SlotProfiles | null
+}): ReactNode {
   return (
     <div
       style={{
@@ -526,23 +642,32 @@ function BottomDockContainer({ slotProfiles }: { slotProfiles: SlotProfiles | nu
   )
 }
 
-function ChatTitleBar({ onOpenSidebar }: { onOpenSidebar?: () => void }): ReactNode {
+function ChatTitleBar({
+  onOpenSidebar,
+}: {
+  onOpenSidebar?: () => void
+}): ReactNode {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const displaySession = useDisplayState((state) => state.session)
   const selectedSessionAtom = useMemo(
-    () => selectedSessionId
-      ? client.query("GetSession", { sessionId: selectedSessionId }, { reactivityKeys: ["sessions"] })
-      : Atom.make(() => null),
+    () =>
+      selectedSessionId
+        ? client.rpc.query(
+            "GetSession",
+            { sessionId: selectedSessionId },
+            { reactivityKeys: ["sessions"] },
+          )
+        : Atom.make(() => null),
     [client, selectedSessionId],
   )
   const selectedSessionResult = useAtomValue(selectedSessionAtom)
-  const metadataTitle = selectedSessionResult !== null && Result.isSuccess(selectedSessionResult)
-    ? (selectedSessionResult.value as SessionMetadata).title
-    : null
-  const streamedTitle = displaySession.sessionId === selectedSessionId
-    ? displaySession.title
-    : null
+  const metadataTitle =
+    selectedSessionResult !== null && Result.isSuccess(selectedSessionResult)
+      ? (selectedSessionResult.value as SessionMetadata).title
+      : null
+  const streamedTitle =
+    displaySession.sessionId === selectedSessionId ? displaySession.title : null
   const title = selectedSessionId
     ? (streamedTitle ?? metadataTitle)?.trim() || "Untitled session"
     : "New session"
@@ -569,7 +694,7 @@ function ChatTitleBar({ onOpenSidebar }: { onOpenSidebar?: () => void }): ReactN
 function useInterruptAllListener(): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptMutation = useAtomSet(client.mutation("Interrupt"))
+  const interruptMutation = useAtomSet(client.rpc.mutation("Interrupt"))
 
   const interruptAtom = useMemo(
     () =>
@@ -586,7 +711,9 @@ function useInterruptAllListener(): void {
           }
           window.addEventListener("__magnitude:interrupt-all", handler)
           yield* Effect.addFinalizer(() =>
-            Effect.sync(() => window.removeEventListener("__magnitude:interrupt-all", handler)),
+            Effect.sync(() =>
+              window.removeEventListener("__magnitude:interrupt-all", handler),
+            ),
           )
         }),
       ),
@@ -622,21 +749,36 @@ function AppInner(): ReactNode {
   useMenuActions()
   useInterruptAllListener()
 
-  const onboarding = useOnboardingState()
-  const onboardingState = Option.getOrNull(Result.value(onboarding.state))
+  const onboarding = useOnboardingModelSetup()
+  const onboardingState = Option.getOrNull(Result.value(onboarding.view))
 
-  if (Result.isFailure(onboarding.state)) {
-    return <div className="full-page-state"><AlertTriangleIcon /><h1>Couldn’t load local setup</h1><p>The daemon did not return onboarding state.</p><button className="primary-button" type="button" onClick={() => window.location.reload()}>Retry</button></div>
+  if (Result.isFailure(onboarding.view)) {
+    return (
+      <div className="full-page-state">
+        <AlertTriangleIcon />
+        <h1>Couldn’t load local setup</h1>
+        <p>The daemon did not return onboarding state.</p>
+        <button
+          className="primary-button"
+          type="button"
+          onClick={onboarding.retry}
+        >
+          Retry
+        </button>
+      </div>
+    )
   }
   if (onboardingState === null) {
-    return <div className="full-page-state"><div className="state-spinner" /><h1>Connecting to local inference</h1><p>Reading the current daemon state…</p></div>
+    return (
+      <div className="full-page-state">
+        <div className="state-spinner" />
+        <h1>Connecting to local inference</h1>
+        <p>Reading the current daemon state…</p>
+      </div>
+    )
   }
-  if (!onboardingState.completed) {
-    return <LocalModelOnboarding
-      onSkip={() => { void onboarding.update(true) }}
-      completing={Result.isWaiting(onboarding.updateResult)}
-      completionFailed={Result.isFailure(onboarding.updateResult)}
-    />
+  if (onboardingState._tag === "Open") {
+    return <LocalModelOnboarding setup={onboarding} />
   }
   return <AuthenticatedAppContent isNarrow={isNarrow} />
 }
@@ -645,7 +787,11 @@ function AlertTriangleIcon(): ReactNode {
   return <span className="state-error-icon">!</span>
 }
 
-function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode {
+function AuthenticatedAppContent({
+  isNarrow,
+}: {
+  isNarrow: boolean
+}): ReactNode {
   useSessionPreload()
   useActiveSessionStatusesSubscription()
 
@@ -680,9 +826,22 @@ function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode
       {!isNarrow && <SessionsSidebarContainer />}
       {/* Overlay sidebar — shown when narrow + visible */}
       {showOverlaySidebar && (
-        <SessionsSidebarContainer overlay onCloseOverlay={() => setSidebarVisible(false)} />
+        <SessionsSidebarContainer
+          overlay
+          onCloseOverlay={() => setSidebarVisible(false)}
+        />
       )}
-      <div className="chat-column" style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", position: "relative", background: "var(--bg-base)" }}>
+      <div
+        className="chat-column"
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+          position: "relative",
+          background: "var(--bg-base)",
+        }}
+      >
         {/* Main chat column — always mounted, always in the layout. When a
             panel or worker detail is open, it's covered by an absolute
             overlay. Keeping it in the layout (not display:none) preserves
@@ -695,7 +854,9 @@ function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode
             minHeight: 0,
           }}
         >
-          <ChatTitleBar onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined} />
+          <ChatTitleBar
+            onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
+          />
           <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
           <BottomDockContainer slotProfiles={slotProfiles} />
         </div>
@@ -714,11 +875,24 @@ function AuthenticatedAppContent({ isNarrow }: { isNarrow: boolean }): ReactNode
               <ChatColumnPage
                 title={modelCenterTab !== null ? "Model Center" : "Settings"}
                 backLabel="Back to session"
-                onBack={() => { setSettingsOpen(false); setModelCenterTab(null) }}
+                onBack={() => {
+                  setSettingsOpen(false)
+                  setModelCenterTab(null)
+                }}
               >
-                {modelCenterTab !== null
-                  ? <ModelCenter tab={modelCenterTab} onTabChange={setModelCenterTab} />
-                  : <SettingsPanel onOpenModels={() => { setSettingsOpen(false); setModelCenterTab("models") }} />}
+                {modelCenterTab !== null ? (
+                  <ModelCenter
+                    tab={modelCenterTab}
+                    onTabChange={setModelCenterTab}
+                  />
+                ) : (
+                  <SettingsPanel
+                    onOpenModels={() => {
+                      setSettingsOpen(false)
+                      setModelCenterTab("models")
+                    }}
+                  />
+                )}
               </ChatColumnPage>
             )}
             {workerDetailOpen && (

@@ -6,7 +6,6 @@ import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommo
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
 import { filenameWithImageExtension, useAgentClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
 import { createId } from '@magnitudedev/generate-id'
-import { orange, violet } from '../../utils/theme'
 import { Button } from '../../components/button'
 import { ChatSurfaceKeyboard } from './chat-surface-keyboard'
 import { FileMentionMenu } from './mention-menu'
@@ -14,7 +13,9 @@ import { SlashCommandMenu } from './slash-menu'
 import { MultilineInput, type MultilineInputHandle } from './multiline-input'
 import { AttachmentsBar } from './attachment-bar'
 import { AutopilotIndicator } from './autopilot-indicator'
-import { deriveLocalInferenceFooterView } from '../local-inference/footer-status'
+import {
+  deriveLocalInferenceFooterView,
+} from '../local-inference/footer-status'
 import { useFileMentions, type MentionSearchClient } from '@magnitudedev/client-common'
 import { useSlashCommands } from '@magnitudedev/client-common'
 import { readClipboardBitmap, readClipboardText } from '../../utils/clipboard'
@@ -31,7 +32,7 @@ import { composerTextAtom, composerAttachmentsAtom, composerHistoryIndexAtom, co
 import type { InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
 import { shouldHandleSlashCommandInTab } from '@magnitudedev/client-common'
-import { allowProviderMessageSend } from './provider-send-guard'
+import { allowModelMessageSend } from './provider-send-guard'
 import { ContextUsage, contextUsageWidth } from './context-usage'
 import { ResidencyIndicator } from './residency-indicator'
 import {
@@ -40,6 +41,10 @@ import {
   thinkingSelectorWidth,
 } from './thinking-selector'
 import { BOX_CHARS } from '../../utils/ui-constants'
+import {
+  NotificationArea,
+  notificationAreaWidth,
+} from '../notification-area/notification-area'
 
 const displayWorkingDirectory = (cwd: string): string => {
   const home = process.env.HOME
@@ -187,6 +192,7 @@ export function Composer(props: ComposerProps) {
     composerCanFocus,
     widgetNavActive,
     isWorkerView,
+    notificationState,
     enableAutopilot,
     autopilotEnabled,
     autopilotGenerating,
@@ -198,6 +204,7 @@ export function Composer(props: ComposerProps) {
     interruptAll,
     openSettings,
     openHardware,
+    openCatalog,
     thinkingOptions,
     applyThinking,
     handleWidgetKeyEvent,
@@ -213,9 +220,9 @@ export function Composer(props: ComposerProps) {
   } = props
 
   const atomClient = useAgentClient()
-  const resolvePathMutation = useAtomSet(atomClient.mutation('ResolvePath'), { mode: 'promise' })
-  const readFileMutation = useAtomSet(atomClient.mutation('ReadFile'), { mode: 'promise' })
-  const searchMentionsMutation = useAtomSet(atomClient.mutation('SearchMentions'), { mode: 'promise' })
+  const resolvePathMutation = useAtomSet(atomClient.rpc.mutation('ResolvePath'), { mode: 'promise' })
+  const readFileMutation = useAtomSet(atomClient.rpc.mutation('ReadFile'), { mode: 'promise' })
+  const searchMentionsMutation = useAtomSet(atomClient.rpc.mutation('SearchMentions'), { mode: 'promise' })
 
   const composerText = useAtomValueClientCommon(composerTextAtom)
   const setComposerText = useAtomSet(composerTextAtom)
@@ -288,7 +295,7 @@ export function Composer(props: ComposerProps) {
   const footerPrimaryWidth = bashMode
     ? 'Bash Mode'.length
     : !modelsConfigured
-      ? 'No model configured'.length
+      ? 'No model configured · /models to see available models'.length
       : (modelFooter.residency === null ? 0 : 2)
         + stringWidth(modelNameLabel)
         + 2
@@ -300,9 +307,15 @@ export function Composer(props: ComposerProps) {
             + (modelFooter.memoryLabel === null
               ? 0
               : 3 + stringWidth(modelFooter.memoryLabel)))
-  const footerLeftWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
+  const footerNotificationWidth = notificationState === null
+    ? 0
+    : 3 + notificationAreaWidth(notificationState)
+  const footerBaseWidth = footerPrimaryWidth + footerModeWidth + footerTransientWidth
   const footerRightWidth = stringWidth(workingDirectoryLabel)
-  const footerStacks = footerLeftWidth + footerRightWidth + 8 > chatColumnWidth
+  const footerNotificationStacks = notificationState !== null
+    && footerBaseWidth + footerNotificationWidth + 4 > chatColumnWidth
+  const footerEnvironmentStacks = footerNotificationStacks
+    || footerBaseWidth + footerNotificationWidth + footerRightWidth + 8 > chatColumnWidth
   const openThinking = useCallback(() => {
     if (thinkingOptions.length === 0) return
     setThinkingIndex(currentThinkingIndex)
@@ -456,15 +469,18 @@ export function Composer(props: ComposerProps) {
   }, [setComposerHasContent])
 
   const executeSlashCommand = useCallback((commandText: string) => {
-    const handled = runSlashCommand(commandText)
-    if (handled) {
+    const outcome = runSlashCommand(commandText)
+    if (outcome._tag === 'Handled') {
       setInputValue(EMPTY_INPUT)
       setComposerText('')
       setComposerAttachments([])
       setAttachments([])
       setComposerHasContent(false)
+      setComposerHistoryIndex(-1)
+      setSavedDraft('')
     }
-  }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent])
+    return outcome
+  }, [runSlashCommand, setComposerText, setComposerAttachments, setComposerHasContent, setComposerHistoryIndex])
 
   const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'directory'; lineRange?: { start: number; end: number } }) => {
     setInputValue(prev => {
@@ -611,7 +627,7 @@ export function Composer(props: ComposerProps) {
       clearComposer()
       return
     }
-    if (!allowProviderMessageSend(modelsConfigured, showToast)) return
+    if (!allowModelMessageSend(modelsConfigured, showToast)) return
 
     clearSystemBanners()
 
@@ -647,14 +663,37 @@ export function Composer(props: ComposerProps) {
     }
   }, [inputValue, attachments.length, handleSubmit, setComposerHistoryIndex])
 
+  const notificationStatus = notificationState === null ? null : (
+    <NotificationArea
+      notificationState={notificationState}
+      theme={theme}
+      compact={footerNotificationStacks}
+      onAction={(action) => {
+        if (action === 'openCatalog') openCatalog()
+      }}
+    />
+  )
+
   const footerStatus = (
     <box style={{ flexDirection: 'row', alignItems: 'center' }}>
       {bashMode ? (
-        <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+        <text style={{ fg: theme.bashAccent }} attributes={TextAttributes.BOLD}>Bash Mode</text>
       ) : !modelsConfigured ? (
-        <Button onClick={openSettings}>
-          <text style={{ fg: theme.foreground }}>No model configured</text>
-        </Button>
+        <>
+          <text style={{ fg: theme.text.body }}>No model configured · </text>
+          <Button
+            onClick={openSettings}
+            onMouseOver={() => setModelLabelHovered(true)}
+            onMouseOut={() => setModelLabelHovered(false)}
+          >
+            <text style={{ fg: modelLabelHovered ? theme.accent : theme.text.body }}>
+              <span attributes={modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
+                /models
+              </span>
+            </text>
+          </Button>
+          <text style={{ fg: theme.text.body }}> to see available models</text>
+        </>
       ) : (
         <>
           {modelFooter.residency !== null && (
@@ -669,7 +708,7 @@ export function Composer(props: ComposerProps) {
             cursor={footerControlsDisabled ? 'default' : undefined}
           >
             <text
-              style={{ fg: !footerControlsDisabled && modelLabelHovered ? theme.primary : theme.foreground }}
+              style={{ fg: !footerControlsDisabled && modelLabelHovered ? theme.accent : theme.text.body }}
             >
               <span attributes={!footerControlsDisabled && modelLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {modelNameLabel}
@@ -683,7 +722,7 @@ export function Composer(props: ComposerProps) {
             onMouseOut={footerControlsDisabled ? undefined : () => setThinkingLabelHovered(false)}
             cursor={footerControlsDisabled ? 'default' : undefined}
           >
-            <text style={{ fg: !footerControlsDisabled && (thinkingLabelHovered || thinkingOpen) ? violet[200] : violet[300] }}>
+            <text style={{ fg: !footerControlsDisabled && (thinkingLabelHovered || thinkingOpen) ? theme.highlightAccent : theme.planAccent }}>
               <span attributes={!footerControlsDisabled && thinkingLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                 {thinkingLevelLabel}
               </span>
@@ -713,7 +752,7 @@ export function Composer(props: ComposerProps) {
                     onMouseOut={footerControlsDisabled ? undefined : () => setMemoryLabelHovered(false)}
                     cursor={footerControlsDisabled ? 'default' : undefined}
                   >
-                    <text style={{ fg: !footerControlsDisabled && memoryLabelHovered ? theme.primary : theme.muted }}>
+                    <text style={{ fg: !footerControlsDisabled && memoryLabelHovered ? theme.accent : theme.text.supporting }}>
                       <span attributes={!footerControlsDisabled && memoryLabelHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                         {modelFooter.memoryLabel}
                       </span>
@@ -725,10 +764,16 @@ export function Composer(props: ComposerProps) {
           )}
         </>
       )}
+      {!footerNotificationStacks && notificationStatus !== null && (
+        <>
+          <box style={{ width: 3, flexShrink: 0 }} />
+          {notificationStatus}
+        </>
+      )}
       {displayMode === 'transcript' && (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          <text style={{ fg: theme.info }}>Transcript Mode</text>
+          <text style={{ fg: theme.status.information }}>Transcript Mode</text>
         </>
       )}
       {enableAutopilot && (
@@ -741,12 +786,12 @@ export function Composer(props: ComposerProps) {
       {nextEscWillKillAll ? (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all workers</text>
+          <text style={{ fg: theme.text.supporting }}>Press Esc again to interrupt all workers</text>
         </>
       ) : bashMode ? (
         <>
           <box style={{ width: 3, flexShrink: 0 }} />
-          <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
+          <text style={{ fg: theme.text.supporting }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
         </>
       ) : null}
     </box>
@@ -754,7 +799,7 @@ export function Composer(props: ComposerProps) {
 
   const footerEnvironment = (
     <box style={{ flexDirection: 'row', alignItems: 'center' }}>
-      <text style={{ fg: theme.muted }}>{workingDirectoryLabel}</text>
+      <text style={{ fg: theme.text.supporting }}>{workingDirectoryLabel}</text>
     </box>
   )
 
@@ -789,11 +834,11 @@ export function Composer(props: ComposerProps) {
         <box style={{
           borderStyle: 'single',
           border: ['left'],
-          borderColor: bashMode ? orange[400] : modeColor,
+          borderColor: bashMode ? theme.bashAccent : modeColor,
           customBorderChars: COMPOSER_BORDER_CHARS,
         }}>
           <box style={{
-            backgroundColor: theme.inputBg,
+            backgroundColor: theme.background.input,
             paddingTop: 1,
             paddingBottom: 1,
             paddingLeft: 1,
@@ -843,7 +888,7 @@ export function Composer(props: ComposerProps) {
                   onPaste={handlePaste}
                   onKeyIntercept={handleKeyIntercept}
                   focused={composerCanFocus && !thinkingOpen}
-                  highlightColor={bashMode ? orange[400] : undefined}
+                  highlightColor={bashMode ? theme.bashAccent : undefined}
                   placeholder={thinkingOpen
                     ? 'Select reasoning level...'
                     : modelSetupInProgress
@@ -865,10 +910,15 @@ export function Composer(props: ComposerProps) {
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, flexDirection: 'column' }}>
         <box style={{ height: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
           {footerStatus}
-          {!footerStacks && footerEnvironment}
+          {!footerEnvironmentStacks && footerEnvironment}
         </box>
-        {footerStacks && (
-          <box style={{ height: 1, flexDirection: 'row', justifyContent: 'flex-end' }}>
+        {footerEnvironmentStacks && (
+          <box style={{
+            height: 1,
+            flexDirection: 'row',
+            justifyContent: footerNotificationStacks ? 'space-between' : 'flex-end',
+          }}>
+            {footerNotificationStacks && notificationStatus}
             {footerEnvironment}
           </box>
         )}

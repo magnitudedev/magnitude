@@ -130,7 +130,7 @@ describe("ACN installation lifecycle", () => {
         });
         yield* lifecycle.report({
           _tag: "Starting",
-          phase: "LaunchingAcn",
+          phase: "PreparingAcn",
         });
         const launching = yield* lifecycle.get;
         expect(launching._tag).toBe("Installing");

@@ -48,16 +48,10 @@ mock.module('react/jsx-dev-runtime', () => ({
   },
 }))
 
-mock.module('../hooks/use-theme', () => ({
-  useTheme: () => ({
-    muted: 'gray',
-    inputFocusedFg: 'white',
-    inputFg: 'white',
-    info: 'blue',
-    primary: 'cyan',
-    link: 'magenta',
-  }),
-}))
+mock.module('../../hooks/use-theme', async () => {
+  const { defaultCliThemes } = await import('../../utils/theme')
+  return { useTheme: () => defaultCliThemes.dark }
+})
 
 mock.module('../hooks/use-mounted-ref', () => ({
   useMountedRef: () => ({ current: true }),
@@ -73,11 +67,6 @@ mock.module('../hooks/use-safe-interval', () => ({
 
 mock.module('../hooks/use-safe-timeout', () => ({
   useSafeTimeout: () => ({ set: setTimeout, clear: clearTimeout }),
-}))
-
-mock.module('../utils/theme', () => ({
-  terminalSupportsRgb24: () => false,
-  orange: { 400: 'darkyellow' },
 }))
 
 mock.module('@opentui/react', () => ({

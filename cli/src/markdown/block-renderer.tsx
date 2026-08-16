@@ -4,7 +4,6 @@ import {
   TextAttributes,
   type LineInfo,
   type MouseEvent as OTMouseEvent,
-  type TextBufferView,
   type TextRenderable,
 } from '@opentui/core'
 import { useRenderer } from '@opentui/react'
@@ -84,7 +83,7 @@ const SpanRenderer = memo(function SpanRenderer({
       const isHovered = hoveredZone === zoneIdx
       const baseAttrs = attrs ?? 0
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
+        <span key={i} fg={isHovered ? theme.link : theme.accent} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
           {span.text}
         </span>,
       )
@@ -105,7 +104,7 @@ const SpanRenderer = memo(function SpanRenderer({
       const isHovered = hoveredZone === zoneIdx
       const baseAttrs = attrs ?? 0
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
+        <span key={i} fg={isHovered ? theme.link : theme.accent} bg={span.bg} attributes={baseAttrs | TextAttributes.UNDERLINE}>
           {displayText}
         </span>,
       )
@@ -128,7 +127,7 @@ const SpanRenderer = memo(function SpanRenderer({
 
       const isHovered = hoveredZone === zoneIdx
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.UNDERLINE}>
+        <span key={i} fg={isHovered ? theme.link : theme.accent} attributes={TextAttributes.UNDERLINE}>
           {displayText}
         </span>,
       )
@@ -159,8 +158,7 @@ const SpanRenderer = memo(function SpanRenderer({
       (el) => {
         const localX = event.x - el.x
         const localY = event.y - el.y
-        const view = (el as unknown as Record<string, unknown>).textBufferView as TextBufferView
-        const info: LineInfo = view.lineInfo
+        const info: LineInfo = el.lineInfo
         if (localY < 0 || localY >= info.lineStartCols.length) return null
         const charIndex = info.lineStartCols[localY] + localX
         for (let i = 0; i < hitZones.length; i++) {
@@ -319,7 +317,7 @@ function CodeBlockView({
           </text>
         </box>
       </box>
-      <text style={{ fg: copied ? theme.success : foreground }}>
+      <text style={{ fg: copied ? theme.status.success : foreground }}>
         <span fg={palette.codeBorderColor}>└</span>
         {isHovered && (copied ? ' [Copied ✔]' : ' [Copy ⧉ ]')}
       </text>

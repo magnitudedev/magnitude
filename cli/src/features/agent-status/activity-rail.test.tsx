@@ -12,9 +12,10 @@ import {
   ReasoningEffortSchema,
   type DisplayRootStatus,
 } from '@magnitudedev/sdk'
+import { defaultCliThemes } from '../../utils/theme'
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({ primary: 'cyan', foreground: 'white', muted: 'gray', warning: 'yellow' }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 vi.mock('@opentui/react', async () => ({
   ...await vi.importActual<typeof import('@opentui/react')>('@opentui/react'),
@@ -66,9 +67,12 @@ const localActivity = (lifecycle: {
     providerId: selection.providerId,
     providerModelId: selection.providerModelId,
     displayName: 'Local test',
+    variantLabel: Option.none(),
   },
   availability: { _tag: 'Available' },
-  instance: Option.some({ id: instanceId, configurationId, lifecycle }),
+  residency: lifecycle._tag === 'Loading'
+    ? { ...lifecycle, instanceId, configurationId }
+    : lifecycle,
   actions: lifecycle._tag === 'Loading' ? ['Stop'] : [],
 })
 

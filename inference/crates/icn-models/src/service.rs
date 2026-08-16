@@ -1,19 +1,17 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use futures_util::future::BoxFuture;
 use icn_contracts::{
     DeletePlan, DeletedModel, InventoryError, InventoryModel, ModelAvailability, ModelId,
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
-use crate::download::blob_key;
-use crate::inventory::{ModelManager, hf_repo_dir, now};
-use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationManifest};
+use crate::inventory::{ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::store_fs::acquire_exclusive_lock;
 
-impl ModelInventory for ModelManager {
+impl ModelInventory for ManagedModelStore {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
         Box::pin(async move {
             let mut models = self
@@ -58,9 +56,6 @@ impl ModelInventory for ModelManager {
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
             ensure_deletable_status(&model)?;
-            if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
-                return plan_interrupted_delete(&self.config.root, &model);
-            }
             match &model.location {
                 ModelLocation::MagnitudeCache { components, .. } => {
                     plan_managed_delete(&self.config.root, &model, components)
@@ -85,11 +80,25 @@ impl ModelInventory for ModelManager {
     fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            let lock_path = self
-                .config
-                .root
-                .join("locks")
-                .join(format!("{}.lock", id.0));
+            self.ensure_installed_model_inventory().await?;
+            let observed = self
+                .models
+                .read()
+                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let lock_path = match (&observed.location, &observed.source) {
+                (
+                    ModelLocation::MagnitudeCache { .. },
+                    ModelSource::HuggingFace { repository, .. },
+                ) => repository_lock_path(&self.config.root, repository),
+                _ => self
+                    .config
+                    .root
+                    .join("locks")
+                    .join(format!("{}.lock", id.0)),
+            };
             let lock = acquire_delete_lock(&lock_path)?;
             let model = self
                 .models
@@ -99,19 +108,6 @@ impl ModelInventory for ModelManager {
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
             ensure_deletable_status(&model)?;
-            if matches!(model.availability, ModelAvailability::Interrupted { .. }) {
-                let plan = plan_interrupted_delete(&self.config.root, &model)?;
-                let freed_bytes = delete_interrupted(&self.config.root, &model)?;
-                drop(lock);
-                self.remove_published_model(&id).await?;
-                return Ok(DeletedModel {
-                    id: id.clone(),
-                    deleted: true,
-                    freed_bytes,
-                    retained_shared_bytes: plan.retained_shared_bytes,
-                    plan,
-                });
-            }
             let plan = match &model.location {
                 ModelLocation::MagnitudeCache { components, .. } => {
                     plan_managed_delete(&self.config.root, &model, components)?
@@ -170,202 +166,6 @@ impl ModelInventory for ModelManager {
             Ok(ResolvedModel { model, components })
         })
     }
-}
-
-fn plan_interrupted_delete(
-    root: &Path,
-    model: &InventoryModel,
-) -> Result<DeletePlan, InventoryError> {
-    let operation = root.join("operations").join(format!("{}.json", model.id.0));
-    if !operation.is_file() {
-        return Err(InventoryError::DeletionUnsafe(
-            "interrupted model is missing its operation manifest".to_owned(),
-        ));
-    }
-    let mut reclaimable_bytes = 0_u64;
-    let mut paths = vec![operation];
-    if let ModelSource::HuggingFace { repository, .. } = &model.source {
-        let blobs = root.join("hub").join(hf_repo_dir(repository)).join("blobs");
-        for component in model.location.components() {
-            let partial = blobs.join(format!("{}.incomplete", blob_key(&component.content)));
-            if let Ok(metadata) = partial.symlink_metadata()
-                && metadata.is_file()
-            {
-                reclaimable_bytes = reclaimable_bytes.saturating_add(metadata.len());
-                paths.push(partial);
-            }
-        }
-    }
-    Ok(DeletePlan {
-        model_id: model.id.clone(),
-        supported: true,
-        reason: None,
-        reclaimable_bytes,
-        retained_shared_bytes: 0,
-        paths,
-    })
-}
-
-fn delete_interrupted(root: &Path, model: &InventoryModel) -> Result<u64, InventoryError> {
-    let plan = plan_interrupted_delete(root, model)?;
-    let operation = root.join("operations").join(format!("{}.json", model.id.0));
-    let tombstone = root
-        .join("trash")
-        .join(format!("operation-{}.{}.json", model.id.0, now()));
-    fs::rename(&operation, &tombstone).map_err(io_error)?;
-    let mut freed = 0_u64;
-    for path in plan.paths.iter().skip(1) {
-        if let Ok(metadata) = path.symlink_metadata() {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "interrupted partial is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            fs::remove_file(path).map_err(io_error)?;
-            freed = freed.saturating_add(metadata.len());
-        }
-    }
-    fs::remove_file(tombstone).map_err(io_error)?;
-    Ok(freed)
-}
-
-pub(crate) fn reconcile_tombstones(root: &Path) -> Result<(), InventoryError> {
-    let trash = root.join("trash");
-    if !trash.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(&trash).map_err(io_error)? {
-        let path = entry.map_err(io_error)?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        if path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.starts_with("operation-"))
-        {
-            let Ok(manifest) = serde_json::from_slice::<OperationManifest>(&bytes) else {
-                continue;
-            };
-            finish_operation_tombstone(root, &manifest, &path)?;
-            continue;
-        }
-        let Ok(manifest) = serde_json::from_slice::<ManagedManifest>(&bytes) else {
-            continue;
-        };
-        if manifest.validate().is_err() {
-            continue;
-        }
-        let model = InventoryModel {
-            id: manifest.model_id.clone(),
-            content_id: manifest.content_id.clone(),
-            created: manifest.created_at,
-            name: manifest.repository.clone(),
-            supported_parameters: Vec::new(),
-            availability: ModelAvailability::Available {
-                ready_at: manifest.ready_at,
-            },
-            source: ModelSource::HuggingFace {
-                repository: manifest.repository.clone(),
-                requested_revision: manifest.requested_revision.clone(),
-                commit: manifest.commit.clone(),
-                metadata: None,
-            },
-            location: ModelLocation::MagnitudeCache {
-                total_bytes: manifest.components.iter().map(|item| item.size_bytes).sum(),
-                components: manifest.components.clone(),
-                integrity: icn_contracts::Integrity::Verified {
-                    method: "manifest".to_owned(),
-                },
-            },
-            properties: icn_contracts::InventoryProperties::Pending,
-            operations: Vec::new(),
-            updated_at: manifest.ready_at,
-        };
-        finish_managed_tombstone(root, &model, &manifest.components, &path)?;
-    }
-    Ok(())
-}
-
-fn finish_operation_tombstone(
-    root: &Path,
-    manifest: &OperationManifest,
-    tombstone: &Path,
-) -> Result<(), InventoryError> {
-    if manifest.version != MANIFEST_VERSION
-        || manifest.components.is_empty()
-        || crate::validation::validate_repository(&manifest.repository).is_err()
-        || manifest.components.iter().any(|component| {
-            component.expected_size == 0
-                || component.content_key != blob_key(&component.content)
-                || crate::validation::validate_relative_path(&component.path).is_err()
-        })
-    {
-        return Err(InventoryError::DeletionUnsafe(format!(
-            "invalid interrupted-download tombstone: {}",
-            tombstone.display()
-        )));
-    }
-    let blobs = root
-        .join("hub")
-        .join(hf_repo_dir(&manifest.repository))
-        .join("blobs");
-    for component in &manifest.components {
-        let partial = blobs.join(format!("{}.incomplete", component.content_key));
-        let Ok(metadata) = partial.symlink_metadata() else {
-            continue;
-        };
-        if metadata.is_file() {
-            fs::remove_file(&partial).map_err(io_error)?;
-        } else {
-            let quarantine = root.join("quarantine").join(format!(
-                "{}-{}-{}",
-                manifest.model_id.0,
-                component.content_key,
-                now()
-            ));
-            fs::rename(&partial, quarantine).map_err(io_error)?;
-        }
-    }
-    fs::remove_file(tombstone).map_err(io_error)
-}
-
-fn finish_managed_tombstone(
-    root: &Path,
-    model: &InventoryModel,
-    components: &[icn_contracts::ModelComponent],
-    tombstone: &Path,
-) -> Result<(), InventoryError> {
-    let referenced = other_managed_blob_keys(root, &model.id)?;
-    let ModelSource::HuggingFace {
-        repository, commit, ..
-    } = &model.source
-    else {
-        return Err(InventoryError::Internal(
-            "managed tombstone is missing Hugging Face identity".to_owned(),
-        ));
-    };
-    let repo_root = root.join("hub").join(hf_repo_dir(repository));
-    let snapshot = repo_root.join("snapshots").join(commit);
-    for component in components {
-        let link = snapshot.join(&component.path);
-        if link.symlink_metadata().is_ok() {
-            fs::remove_file(&link).map_err(io_error)?;
-        }
-        let key = blob_key(&component.content);
-        if !referenced.contains(&key) {
-            let blob = repo_root.join("blobs").join(key);
-            if blob.is_file() {
-                fs::remove_file(blob).map_err(io_error)?;
-            }
-        }
-    }
-    remove_empty_parents(&snapshot, &repo_root.join("snapshots"));
-    fs::remove_file(tombstone).map_err(io_error)
 }
 
 fn status_rank(model: &InventoryModel) -> u8 {
@@ -507,13 +307,9 @@ fn plan_managed_delete(
     model: &InventoryModel,
     components: &[icn_contracts::ModelComponent],
 ) -> Result<DeletePlan, InventoryError> {
-    let referenced = other_managed_blob_keys(root, &model.id)?;
     let mut reclaimable = 0_u64;
     let mut retained = 0_u64;
-    let mut paths = vec![
-        root.join("installations")
-            .join(format!("{}.json", model.id.0)),
-    ];
+    let mut paths = Vec::new();
     let ModelSource::HuggingFace {
         repository, commit, ..
     } = &model.source
@@ -524,13 +320,20 @@ fn plan_managed_delete(
     };
     let repo_root = root.join("hub").join(hf_repo_dir(repository));
     let snapshot = repo_root.join("snapshots").join(commit);
+    let links = components
+        .iter()
+        .map(|component| snapshot.join(&component.path))
+        .collect::<BTreeSet<_>>();
+    let referenced = other_snapshot_blob_references(&repo_root, &links)?;
     for component in components {
-        paths.push(snapshot.join(&component.path));
-        if referenced.contains(&blob_key(&component.content)) {
+        let link = snapshot.join(&component.path);
+        let blob = link.canonicalize().map_err(io_error)?;
+        paths.push(link);
+        if referenced.contains(&blob) {
             retained = retained.saturating_add(component.size_bytes);
         } else {
             reclaimable = reclaimable.saturating_add(component.size_bytes);
-            paths.push(repo_root.join("blobs").join(blob_key(&component.content)));
+            paths.push(blob);
         }
     }
     Ok(DeletePlan {
@@ -548,14 +351,6 @@ fn delete_managed(
     model: &InventoryModel,
     components: &[icn_contracts::ModelComponent],
 ) -> Result<u64, InventoryError> {
-    let manifest = root
-        .join("installations")
-        .join(format!("{}.json", model.id.0));
-    let tombstone = root
-        .join("trash")
-        .join(format!("{}.{}.json", model.id.0, now()));
-    fs::rename(&manifest, &tombstone).map_err(io_error)?;
-    let referenced = other_managed_blob_keys(root, &model.id)?;
     let ModelSource::HuggingFace {
         repository, commit, ..
     } = &model.source
@@ -566,52 +361,70 @@ fn delete_managed(
     };
     let repo_root = root.join("hub").join(hf_repo_dir(repository));
     let snapshot = repo_root.join("snapshots").join(commit);
+    let links = components
+        .iter()
+        .map(|component| snapshot.join(&component.path))
+        .collect::<BTreeSet<_>>();
+    let referenced = other_snapshot_blob_references(&repo_root, &links)?;
     let mut freed = 0_u64;
     for component in components {
         let link = snapshot.join(&component.path);
+        let blob = link.canonicalize().map_err(io_error)?;
         if link.symlink_metadata().is_ok() {
             fs::remove_file(&link).map_err(io_error)?;
         }
-        let key = blob_key(&component.content);
-        if !referenced.contains(&key) {
-            let blob = repo_root.join("blobs").join(key);
+        if !referenced.contains(&blob) {
             if let Ok(metadata) = blob.metadata() {
-                fs::remove_file(&blob).map_err(io_error)?;
+                fs::remove_file(blob).map_err(io_error)?;
                 freed = freed.saturating_add(metadata.len());
             }
         }
     }
     remove_empty_parents(&snapshot, &repo_root.join("snapshots"));
-    fs::remove_file(tombstone).map_err(io_error)?;
     Ok(freed)
 }
 
-fn other_managed_blob_keys(
-    root: &Path,
-    excluded: &ModelId,
-) -> Result<BTreeSet<String>, InventoryError> {
-    let mut keys = BTreeSet::new();
-    let installations = root.join("installations");
-    if !installations.is_dir() {
-        return Ok(keys);
+fn other_snapshot_blob_references(
+    repo_root: &Path,
+    excluded_links: &BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, InventoryError> {
+    let mut references = BTreeSet::new();
+    collect_other_snapshot_blobs(
+        &repo_root.join("snapshots"),
+        repo_root,
+        excluded_links,
+        &mut references,
+    )?;
+    Ok(references)
+}
+
+fn collect_other_snapshot_blobs(
+    path: &Path,
+    repo_root: &Path,
+    excluded_links: &BTreeSet<PathBuf>,
+    output: &mut BTreeSet<PathBuf>,
+) -> Result<(), InventoryError> {
+    if !path.is_dir() {
+        return Ok(());
     }
-    for entry in fs::read_dir(installations).map_err(io_error)? {
-        let path = entry.map_err(io_error)?.path();
-        let manifest = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<ManagedManifest>(&bytes).ok());
-        if let Some(manifest) = manifest
-            && manifest.model_id != *excluded
-        {
-            keys.extend(
-                manifest
-                    .components
-                    .iter()
-                    .map(|component| blob_key(&component.content)),
-            );
+    for entry in fs::read_dir(path).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(io_error)?;
+        if kind.is_dir() {
+            collect_other_snapshot_blobs(&path, repo_root, excluded_links, output)?;
+        } else if !excluded_links.contains(&path) && (kind.is_symlink() || kind.is_file()) {
+            let canonical = path.canonicalize().map_err(io_error)?;
+            if !canonical.starts_with(repo_root.join("blobs")) {
+                return Err(InventoryError::DeletionUnsafe(format!(
+                    "snapshot entry does not resolve to repository blobs: {}",
+                    path.display()
+                )));
+            }
+            output.insert(canonical);
         }
     }
-    Ok(keys)
+    Ok(())
 }
 
 fn plan_hf_cache_delete(
@@ -757,15 +570,7 @@ fn remove_empty_parents(path: &Path, stop: &Path) {
 }
 
 fn acquire_delete_lock(path: &Path) -> Result<File, InventoryError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(io_error)?;
-    FileExt::lock_exclusive(&file).map_err(io_error)?;
-    Ok(file)
+    acquire_exclusive_lock(path)
 }
 
 fn io_error(error: impl std::fmt::Display) -> InventoryError {
@@ -775,7 +580,6 @@ fn io_error(error: impl std::fmt::Display) -> InventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{OperationComponent, OperationManifest};
     use icn_contracts::{
         ComponentRole, ContentId, ContentIdentity, Integrity, InventoryProperties, ModelComponent,
         ModelId,
@@ -878,60 +682,5 @@ mod tests {
             InventoryError::ModelOperation { code, retryable: false, .. }
                 if code == "invalid_split_layout"
         ));
-    }
-
-    #[test]
-    fn startup_finishes_interrupted_download_tombstone() {
-        let root = tempfile::tempdir().expect("temp store");
-        for directory in ["trash", "quarantine"] {
-            fs::create_dir_all(root.path().join(directory)).expect("layout");
-        }
-        let repository = "owner/repo";
-        let content = ContentIdentity::Sha256 {
-            value: "a".repeat(64),
-        };
-        let key = blob_key(&content);
-        let blobs = root
-            .path()
-            .join("hub")
-            .join(hf_repo_dir(repository))
-            .join("blobs");
-        fs::create_dir_all(&blobs).expect("blobs");
-        let partial = blobs.join(format!("{key}.incomplete"));
-        fs::write(&partial, b"partial").expect("partial");
-        let manifest = OperationManifest {
-            version: MANIFEST_VERSION,
-            operation_id: "download_test".to_owned(),
-            model_id: ModelId("mdl_test".to_owned()),
-            content_id: ContentId("content_test".to_owned()),
-            repository: repository.to_owned(),
-            requested_revision: "main".to_owned(),
-            commit: "commit".to_owned(),
-            components: vec![OperationComponent {
-                path: PathBuf::from("model.gguf"),
-                role: ComponentRole::Weights,
-                content,
-                shard_index: None,
-                relationship: None,
-                expected_size: 100,
-                content_key: key,
-                completed_bytes: 7,
-            }],
-            stage: "downloading".to_owned(),
-            started_at: 1,
-            updated_at: 1,
-            last_error: None,
-        };
-        let tombstone = root.path().join("trash/operation-mdl_test.1.json");
-        fs::write(
-            &tombstone,
-            serde_json::to_vec(&manifest).expect("manifest json"),
-        )
-        .expect("tombstone");
-
-        reconcile_tombstones(root.path()).expect("reconcile");
-
-        assert!(!partial.exists());
-        assert!(!tombstone.exists());
     }
 }

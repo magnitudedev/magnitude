@@ -3,20 +3,17 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 let rendererWidth = 120
 
-mock.module('../hooks/use-theme', () => ({
-  useTheme: () => ({
-    info: '#88c0d0',
-    secondary: '#81a1c1',
-    foreground: '#eceff4',
-    muted: '#9aa3b2',
-  }),
-}))
+mock.module('../../../hooks/use-theme', async () => {
+  const { defaultCliThemes } = await import('../../../utils/theme')
+  return { useTheme: () => defaultCliThemes.dark }
+})
 
 mock.module('../hooks/use-terminal-width', () => ({
   useTerminalWidth: () => rendererWidth,
 }))
 
 mock.module('@opentui/react', () => ({
+  useKeyboard: () => {},
   useRenderer: () => ({
     terminal: { width: rendererWidth },
     clearSelection() {},
@@ -27,7 +24,7 @@ mock.module('@opentui/react', () => ({
   }),
 }))
 
-mock.module('../markdown/markdown-content', () => ({
+mock.module('../../../markdown/markdown-content', () => ({
   MarkdownContent: ({ content }: { content: string }) => <markdown-content data-content={content} />,
 }))
 

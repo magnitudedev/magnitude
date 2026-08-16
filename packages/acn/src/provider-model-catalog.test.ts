@@ -12,7 +12,7 @@ import {
   type ProviderClientShape,
   type ProviderModel,
 } from "@magnitudedev/sdk"
-import { LocalProviderOfferingProjection } from "./local-provider-offering-projection"
+import { LocalProviderOfferings } from "./local-provider-offerings"
 import { MirroredStateChangesLive } from "./mirrored-state"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderClient } from "@magnitudedev/sdk"
@@ -36,7 +36,7 @@ const model = (providerId: typeof providerA, name: string): ProviderModel => ({
   },
   servingCapabilities: { tools: true, structuredOutput: false },
   availability: { _tag: "Available" },
-  pricing: { input: 0, output: 0, cached_input: null },
+  pricing: Option.some({ input: 0, output: 0, cached_input: null }),
 })
 
 describe("provider model catalog", () => {
@@ -81,8 +81,8 @@ describe("provider model catalog", () => {
           }),
         },
         listProviders: Effect.succeed([
-          { id: providerA, displayName: "Provider A", authStatus: { _tag: "authenticated" }, status: "ok" },
-          { id: providerB, displayName: "Provider B", authStatus: { _tag: "authenticated" }, status: "error", message: failure.message },
+          { id: providerA, displayName: "Provider A", kind: "Hosted", authStatus: { _tag: "authenticated" }, status: "ok" },
+          { id: providerB, displayName: "Provider B", kind: "Hosted", authStatus: { _tag: "authenticated" }, status: "error", message: failure.message },
         ]),
         sessionId: null,
         resolveModel: () => Effect.die("not used"),
@@ -95,8 +95,10 @@ describe("provider model catalog", () => {
       }
       const dependencies = Layer.mergeAll(
         Layer.succeed(ProviderClient, ProviderClient.of(client)),
-        Layer.succeed(LocalProviderOfferingProjection, LocalProviderOfferingProjection.of({
-          list: Effect.gen(function* () {
+        Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
+          ready: Effect.succeed(true),
+          list: Effect.succeed([]),
+          catalog: Effect.gen(function* () {
             const signal = yield* Ref.get(localReadSignal)
             if (Option.isSome(signal)) yield* Deferred.succeed(signal.value, undefined)
             return []
@@ -106,7 +108,9 @@ describe("provider model catalog", () => {
             entries: [],
             failure: Option.none(),
           }),
-          changes: Stream.fromPubSub(localChanges),
+          changes: Stream.never,
+          catalogChanges: Stream.fromPubSub(localChanges),
+          resolve: () => Effect.die("unused"),
         })),
         MirroredStateChangesLive,
         AcnActivityTrackerLive.pipe(

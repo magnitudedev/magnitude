@@ -1,163 +1,75 @@
-import type { SyntaxColors } from '@magnitudedev/client-common'
+import type { SyntaxColors } from "@magnitudedev/client-common"
 
-export type ThemeName = 'dark' | 'light'
-
+export type ThemeMode = "dark" | "light"
 export type MarkdownHeadingLevel = 1 | 2 | 3 | 4 | 5 | 6
 
-// ThemeColor is always a resolved color string (never 'default' or undefined)
-export type ThemeColor = string
-
-export interface MarkdownThemeOverrides {
-  codeBackground?: string
-  codeBorderColor?: string
-  codeHeaderFg?: string
-  inlineCodeFg?: string
-  codeTextFg?: string
-  headingFg?: Partial<Record<MarkdownHeadingLevel, string>>
-  listBulletFg?: string
-  blockquoteBorderFg?: string
-  blockquoteTextFg?: string
-  dividerFg?: string
-  codeMonochrome?: boolean
-  linkFg?: string
+export interface TerminalAppearance {
+  readonly mode: ThemeMode
+  readonly defaultBackground: string | null
 }
 
-/**
- * Semantic Color Theme Interface
- * Inspired by Tailwind - uses semantic color roles instead of specific names
- * This makes theming easier and more intuitive
- */
-export interface ChatTheme {
-  /** Theme identifier ('dark' or 'light') */
-  name: ThemeName
-  // ============================================================================
-  // CORE SEMANTIC COLORS
-  // ============================================================================
-
-  /** Primary brand color - main actions, highlights, important elements */
-  primary: string
-
-  /** Secondary brand color - supporting elements, less emphasis */
-  secondary: string
-
-  /** Success color - checkmarks, completed states, positive feedback */
-  success: string
-
-  /** Error/danger color - errors, destructive actions, failures */
-  error: string
-
-  /** Warning color - cautions, alerts, validation issues */
-  warning: string
-
-  /** Info color - informational elements, hints */
-  info: string
-
-  /** Link color - hyperlinks, clickable references */
-  link: string
-
-  /** Directory color - folder/directory paths */
-  directory: string
-
-  // ============================================================================
-  // NEUTRAL SCALE
-  // ============================================================================
-
-  /** Default text color */
-  foreground: ThemeColor
-
-  /** Base background color */
-  background: string
-
-  /** Subdued/secondary text color */
-  muted: ThemeColor
-
-  /** Border and divider color */
-  border: string
-
-  /** Surface color for panels, cards, chrome */
-  surface: string
-
-  /** Hover state for interactive surfaces */
-  surfaceHover: string
-
-  // ============================================================================
-  // CONTEXT-SPECIFIC COLORS (Minimal - most use semantic colors)
-  // ============================================================================
-
-  // AI/User differentiation
-  /** AI message indicator line color */
-  aiLine: string
-
-  /** User message indicator line color */
-  userLine: string
-
-  /** User message block background color */
-  userMessageBg: string
-
-  /** User message block hover background color */
-  userMessageHoverBg: string
-
-  /** Input box background color */
-  inputBg: string
-
-  /** Menu background color */
-  menuBg: string
-
-  /** Alternating menu-row background color */
-  menuAltBg: string
-
-  // Agent backgrounds (specific states that don't map to semantics)
-  /** Agent toggle expanded background */
-  agentToggleExpandedBg: string
-
-  /** Agent focused background */
-  agentFocusedBg: string
-
-  /** Agent content background */
-  agentContentBg: string
-
-  /** Terminal/shell command block background */
-  terminalBg: string
-
-  /** Diff added line background */
-  diffGreenBg: string
-
-  /** Diff removed line background */
-  diffRedBg: string
-
-  /** Input text color */
-  inputFg: ThemeColor
-
-  /** Focused input text color */
-  inputFocusedFg: ThemeColor
-
-  // Agent mode colors
-  /** Default mode color (border + label) */
-  modeDefault: string
-
-  /** Plan mode color (border + label) */
-  modePlan: string
-
-  // ============================================================================
-  // IMAGE CARD
-  // ============================================================================
-
-  /** Image card border color */
-  imageCardBorder: string
-
-  // ============================================================================
-  // MARKDOWN
-  // ============================================================================
-
-  /** Detected terminal background color (from OSC query) */
-  terminalDetectedBg?: string
-
-  /** Markdown-specific styling */
-  markdown?: MarkdownThemeOverrides
-
-  /** Syntax highlighting colors */
-  syntax: SyntaxColors
-
-  /** Text attributes (bold, dim, etc.) */
-  messageTextAttributes?: number
+export interface CliTheme {
+  readonly text: {
+    readonly body: string
+    readonly emphasized: string
+    readonly detail: string
+    readonly guidance: string
+    readonly supporting: string
+    readonly metadata: string
+    readonly placeholder: string
+    readonly disabled: string
+  }
+  readonly background: {
+    readonly canvas: string
+    readonly terminal: string
+    readonly surface: string
+    readonly input: string
+    readonly menu: string
+    readonly alternateRow: string
+    readonly selected: string
+    readonly hovered: string
+    readonly focused: string
+    readonly diffAdded: string
+    readonly diffRemoved: string
+    readonly diffContext: string
+  }
+  readonly border: {
+    readonly subtle: string
+    readonly standard: string
+    readonly strong: string
+  }
+  readonly accent: string
+  readonly highlightAccent: string
+  readonly link: string
+  readonly activityPulse: readonly string[]
+  readonly neutralPulse: readonly string[]
+  readonly planAccent: string
+  readonly bashAccent: string
+  readonly status: {
+    readonly information: string
+    readonly progress: string
+    readonly success: string
+    readonly achievement: string
+    readonly changeAdded: string
+    readonly warning: string
+    readonly failure: string
+    readonly interrupted: string
+    readonly terminated: string
+    readonly inactive: string
+  }
+  readonly markdown: {
+    readonly text: string
+    readonly heading: Readonly<Record<MarkdownHeadingLevel, string>>
+    readonly link: string
+    readonly inlineCode: string
+    readonly codeText: string
+    readonly codeBackground: string
+    readonly codeBorder: string
+    readonly codeHeader: string
+    readonly listMarker: string
+    readonly blockquoteText: string
+    readonly blockquoteBorder: string
+    readonly divider: string
+  }
+  readonly syntax: SyntaxColors
 }

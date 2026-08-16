@@ -13,7 +13,6 @@ import {
 const configState = (
   overrides: Partial<SlotConfig> = {},
 ): ConfigState => ({
-  catalogLoaded: true,
   bySlot: {
     primary: {
       _tag: 'Ready',
@@ -32,7 +31,7 @@ const configState = (
         ...overrides,
       },
     },
-    secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'Unassigned' },
+    secondary: { _tag: 'Unassigned', slotId: 'secondary' },
   },
 })
 

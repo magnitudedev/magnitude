@@ -2,6 +2,7 @@ export * from "./lifecycle/index.js";
 export * from "./client.js";
 export * from "./observed-state.js";
 export * from "./hardware/index.js";
+export * from "./models/index.js";
 export * from "./catalog/index.js";
 export * from "./installed/index.js";
 export * from "./downloads/index.js";

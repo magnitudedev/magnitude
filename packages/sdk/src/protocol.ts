@@ -5,7 +5,7 @@
  * not spawn or discover daemons. Consumers that need the operation contract
  * use `makeAcnJitRuntime` from the SDK entrypoint.
  */
-import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
+import { RpcClient, RpcClientError, RpcGroup, RpcSerialization } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { HttpClient } from "@effect/platform/HttpClient"
 import { Context, Effect, Layer } from "effect"
@@ -18,6 +18,16 @@ export { MagnitudeRpcs } from "@magnitudedev/acn-protocol"
 export type * from "@magnitudedev/acn-protocol"
 
 export type AcnClient = RpcClient.FromGroup<typeof MagnitudeRpcs, RpcClientError.RpcClientError>
+
+export type AcnRpcClient = RpcClient.RpcClient.Flat<
+  RpcGroup.Rpcs<typeof MagnitudeRpcs>,
+  RpcClientError.RpcClientError
+>
+
+export class AcnRpcClientTag extends Context.Tag("AcnRpcClient")<
+  AcnRpcClientTag,
+  AcnRpcClient
+>() {}
 
 export class AcnClientTag extends Context.Tag("AcnClient")<
   AcnClientTag,

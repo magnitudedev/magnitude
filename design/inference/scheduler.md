@@ -6,82 +6,102 @@ applies_to:
   - inference/crates/icn-server/src/main.rs
 ---
 
-# Inference scheduler design
+# Inference scheduler
 
-The scheduler multiplexes requests through one persistent llama.cpp context. It owns request
-admission, native sequence IDs, batch construction, sampling transitions, cancellation, cleanup,
-and retained prompt-state selection. Its priorities are correctness, responsive decode, bounded
-resource use, and useful continuous batching.
+The scheduler multiplexes requests through one persistent llama.cpp context. Its single executor
+owns admission, active requests, native sequences, batch construction, sampling, cancellation, and
+cleanup.
 
-Each loaded model has one executor thread and bounded command and result channels. The executor is
-the sole mutator of the model context, sequence pool, active requests, and sampling state. Native
-work is serialized even though callers and transport work remain concurrent.
+The sequence-pool size is resolved load evidence, not provider concurrency. Loading selects one to
+four sequences while preserving the configured context limit for each request.
 
-The sequence-pool size is resolved load evidence, not configured provider concurrency. Loading
-selects one through four sequences; scheduling may use any available sequence while enforcing the
-configured per-request context independently of total physical context.
+## Request states
 
 ```text
-queued → prefill → ready to sample → decode ─┐
-              └──────────────────────────────┘
-                         ↓
-                      terminal
+waiting -> prefill -> ready -> sample -> decode --+
+                       ^                         |
+                       `-------------------------'
+
+any state -- stop / cancel / disconnect / fail --> terminal
 ```
 
-## Admission and prompt reuse
+Cancellation is checked before admission, sampling, and batch selection.
 
-The waiting queue is FIFO. Admission requires a free native sequence, a prompt that leaves room for
-generation, and capacity within the context. Oversized requests fail before allocation so they
-cannot block the queue indefinitely.
+## Executor iteration
 
-For cacheable text requests, the scheduler chooses the free sequence whose committed token history
-has the longest exact prefix. It trims unmatched suffix state with standard llama.cpp sequence
-operations and prefills the remainder. If no useful prefix exists, it clears the sequence and uses
-cold prefill. Reuse never crosses a model context and never relies on a parallel logical or physical
-KV representation.
+```text
+commands -> observation -> idle-only native task -> cleanup -> admission
+   -> sample -> build/decode one batch -> flush -> cleanup -> brief poll
+```
 
-## Batch construction
+Each step is bounded. Scheduling and native KV mutation share one owner thread.
 
-Each iteration adds at most one decode token for every runnable decode sequence, ordered by sequence
-ID, then spends remaining logical capacity on prompt work. Prefill start order rotates, and each
-request receives at most one configured quantum per pass until the batch is full or no work remains.
-Decode-first ordering protects token latency while rotating chunked prefill prevents a long prompt
-from monopolizing the context.
+## Admission
 
-Multimodal prefill and MTP use specialized preparation paths but enter the same request state
-machine. MTP keeps its target and draft sequence states synchronized through native linked contexts
-and the native speculative controller.
+The FIFO waiting queue admits a request only when:
 
-## Commitment and failure
+- a native sequence is available;
+- its prompt leaves room for generation; and
+- the context has capacity.
 
-Prompt history becomes reusable only after native decode succeeds. A sampled token remains
-uncommitted until its decode or speculative-verification step succeeds. Cancellation is observed
-before admission, sampling, and batch selection.
+Oversized requests fail before allocation. Eligible text takes the available sequence with the
+longest exact reusable prefix. Before native mutation, cancellation or validation failure returns
+that sequence unchanged. Native setup transfers it to active ownership, trims any unmatched suffix,
+and prefills the remainder.
 
-Completed, cancelled, disconnected, and failed requests flow through sequence cleanup. A shared
-native decode failure can leave several sequences ambiguous; the executor synchronizes and clears
-the affected context instead of guessing what committed. Cleanup failure quarantines a sequence.
+## Batch policy
 
-Command, event, and per-request outbound queues are bounded. Overload is explicit. A slow consumer
-temporarily stops only its own request from receiving native work while other runnable sequences
-continue. Exclusive native tasks run only while inference is idle.
+```text
+batch capacity
+  1. one decode token per runnable decode sequence, ordered by sequence ID
+  2. remaining capacity split into rotating prompt quanta
+```
 
-Hardware observation is a read-only command class on the existing bounded command stream. The
-scheduler performs at most one capture between native batches, and then continues ordinary request
-work. Observation cannot mutate request or context state and cannot be implemented as an exclusive
-task, because exclusive tasks intentionally wait until inference is idle.
+Decode-first service protects latency; rotating prompt starts prevent monopolization.
 
-## Current limitations
+Batch construction stages all request effects:
 
-- Queue admission is FIFO and can head-block; there are no priorities or deadlines.
+```text
+BatchCommit { prompt advances, speculative indices, logits }
+                         |
+       target decode + linked speculative processing succeed
+                         |
+                         v
+                 mutate request state
+```
+
+Failure drops the commit, so staged prompt work cannot become reusable. Multimodal and speculative
+preparation share this state machine; target and draft state remain natively linked. Each successful
+multimodal token or embedding decode is processed speculatively before a later decode may depend on
+it.
+
+## Terminal handling
+
+| Outcome | Sequence disposition |
+| --- | --- |
+| Complete, cancelled, disconnected, request-local failure | Retain committed text prefix when eligible |
+| Multimodal or cache-disabled | Clear and return empty |
+| Shared native batch failure | Reset contexts and invalidate all affected reusable prefixes |
+| Cleanup failure | Quarantine; never return the sequence to the pool |
+
+Request outcome alone does not determine whether committed native state is reusable.
+
+## Backpressure and exclusive work
+
+Command, event, and outbound queues are bounded. A slow consumer pauses only its request. Read-only
+hardware observation runs at most once between batches; mutating exclusive work waits for idle.
+
+## Limitations
+
+- FIFO admission can head-block; there are no priorities or deadlines.
 - Waiting requests are not reordered by prefix benefit or estimated cost.
 - Running requests are not preempted.
-- Retained prompt state is sequence-local and process-local; concurrent sequences do not share
-  physical KV pages.
+- Reusable state is sequence-local and process-local; concurrent sequences share no physical pages.
 
 ## Acceptance criteria
 
-- One executor exclusively owns all mutable native state for a loaded model.
-- Decode work is serviced ahead of prefill and long prefills are chunked fairly.
-- Reuse requires an exact committed-token prefix and uses upstream sequence operations only.
-- Cancellation, backpressure, overload, and native failure have bounded, explicit outcomes.
+- One executor owns every scheduler and native mutation.
+- Decode precedes prefill, and long prefills are chunked fairly.
+- Prompt progress becomes visible only after successful native processing.
+- Reuse requires an exact committed prefix and upstream sequence operations.
+- Cancellation, backpressure, overload, and native failure have bounded outcomes.

@@ -1,9 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test'
 import React, { type ReactNode } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
-import type { InputValue } from '@magnitudedev/client-common'
+import { slashCommandUnhandled, type InputValue } from '@magnitudedev/client-common'
 import type { ComposerProps } from './types'
-import { chatThemes } from '../../utils/theme'
+import { defaultCliThemes } from '../../utils/theme'
 import { PRIMARY_SLOT_ID } from '@magnitudedev/sdk'
 
 let latestMultilineProps: {
@@ -74,6 +74,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       modelsConfigured: true,
       modelSetupInProgress: false,
       modelSetupPlaceholder: null,
+      notificationState: null,
       modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
       localModels: null,
       modelSlots: null,
@@ -82,7 +83,7 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       tokenUsage: null,
       contextHardCap: null,
       isCompacting: false,
-      theme: chatThemes.dark,
+      theme: defaultCliThemes.dark,
       modeColor: '#00aaff',
       chatColumnWidth: 100,
       attachmentsMaxWidth: 80,
@@ -95,13 +96,14 @@ function makeProps(overrides: Partial<ComposerProps> = {}): ComposerProps {
       autopilotGenerating: false,
       displayMode: 'default' as const,
       submitUserMessage: mock(() => {}),
-      runSlashCommand: mock(() => false),
+      runSlashCommand: mock(() => slashCommandUnhandled),
       executeBash: mock((_command: string) => true),
       clearSystemBanners: mock(() => {}),
       interruptFork: mock(() => {}),
       interruptAll: mock(() => {}),
       openSettings: mock(() => {}),
       openHardware: mock(() => {}),
+      openCatalog: mock(() => {}),
       thinkingOptions: [],
       applyThinking: mock(() => {}),
       handleWidgetKeyEvent: mock(() => false),

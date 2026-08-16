@@ -8,22 +8,29 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, ModelFailure, ModelOfferingTarget, ModelOfferingTargetId, ModelPackage,
-    ModelPackageSource, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, RecommendableModelId, ResolvedModelTarget,
+    CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage,
+    ModelPackageSource, ModelParameterization, ModelServingConfiguration, RecommendableModel,
+    RecommendableModelCatalog, RecommendableModelCatalogProvider, ResolvedServableModelBundle,
+    ServableModelBundle, ServableModelBundleKey, ServingProfile, SpeculativeDraftSource,
+    SpeculativeMethod,
 };
 use icn_contracts::{
-    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
-    InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
-    ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
+    ModelComponent, ModelId, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
+    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::cache::ModelBlobKind;
 use crate::capabilities::model_capabilities;
-use crate::inventory::ModelManager;
-use crate::package_service::{offering_target_id, package_from_resolved};
+use crate::inventory::ManagedModelStore;
+use crate::package_service::{
+    package_from_resolved, servable_model_bundle_key_for_bundle, serving_configuration_id,
+    serving_configuration_identity_is_valid,
+};
 use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
+use crate::preview::PreparedPreview;
 use crate::refresh_hugging_face_repository;
 
 #[path = "../../../catalog/planner_bundle.rs"]
@@ -32,6 +39,7 @@ use planner_bundle::PlannerBundle;
 
 const CATALOG_SOURCE: &str = include_str!("../../../catalog/models.json");
 const CATALOG_LOCK: &str = include_str!("../../../catalog/models.lock.json");
+const MIN_CATALOG_CONTEXT_LENGTH: u32 = 4_096;
 const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -46,29 +54,126 @@ struct CatalogModel {
     id: String,
     display_name: String,
     description: String,
+    parameterization: ModelParameterization,
     repository: String,
-    formats: Vec<String>,
+    variants: Vec<CatalogVariant>,
+    context_length: u32,
+    #[serde(default)]
+    projector: Option<CatalogProjectorSource>,
+    #[serde(default)]
+    speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
     quality_score: f64,
     quality_score_provenance: String,
     quality_evidence: Vec<String>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogVariant {
+    variant_id: String,
+    format: String,
+    variant_label: String,
+    fidelity_rank: u32,
+    quantization_aware: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogProjectorSource {
+    path: PathBuf,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogSpeculativeDecoding {
+    method: CatalogSpeculativeMethod,
+    draft: CatalogSpeculativeDraftSource,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum CatalogSpeculativeDraftSource {
+    Embedded,
+    File {
+        #[serde(default)]
+        repository: Option<String>,
+        path: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+enum CatalogSpeculativeMethod {
+    #[serde(rename = "mtp")]
+    Mtp,
+    #[serde(rename = "dflash")]
+    DFlash,
+    #[serde(rename = "dspark")]
+    DSpark,
+}
+
+impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
+    fn from(method: CatalogSpeculativeMethod) -> Self {
+        match method {
+            CatalogSpeculativeMethod::Mtp => Self::Mtp,
+            CatalogSpeculativeMethod::DFlash => Self::DFlash,
+            CatalogSpeculativeMethod::DSpark => Self::DSpark,
+        }
+    }
+}
+
+impl CatalogSpeculativeDraftSource {
+    fn file<'a>(&'a self, target_repository: &'a str) -> Option<(&'a str, &'a Path)> {
+        match self {
+            Self::Embedded => None,
+            Self::File { repository, path } => Some((
+                repository.as_deref().unwrap_or(target_repository),
+                path.as_path(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerManifest {
-    planner_inputs: BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    planner_inputs: BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerInput {
-    model_id: RecommendableModelId,
+    model_id: CatalogModelId,
+    variant_id: CatalogVariantId,
+    target: ReleasePlannerPackage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft: Option<ReleasePlannerPackage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleasePlannerPackage {
     package: ModelPackage,
     properties: InventoryProperties,
     primary_gguf: PathBuf,
     components: Vec<ReleasePlannerComponent>,
 }
+
+impl ReleasePlannerInput {
+    fn packages(&self) -> impl Iterator<Item = &ReleasePlannerPackage> {
+        std::iter::once(&self.target).chain(self.draft.iter())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCatalogLockEntry {
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative_draft: Option<String>,
+}
+
+pub type ModelCatalogLock = BTreeMap<String, ModelCatalogLockEntry>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -82,7 +187,7 @@ struct ReleasePlannerComponent {
 
 pub struct GeneratedReleaseCatalog {
     pub catalog: RecommendableModelCatalog,
-    planner_inputs: BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    planner_inputs: BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
     source_headers: BTreeMap<String, Vec<u8>>,
     planner_stubs: BTreeMap<String, Vec<u8>>,
 }
@@ -90,7 +195,7 @@ pub struct GeneratedReleaseCatalog {
 #[derive(Clone)]
 pub struct ReleaseCatalog {
     catalog: RecommendableModelCatalog,
-    planner_inputs: Arc<BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>>,
+    planner_inputs: Arc<BTreeMap<ServableModelBundleKey, ReleasePlannerInput>>,
     planner_bundle: Arc<PlannerBundle<'static>>,
 }
 
@@ -103,20 +208,74 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
         ));
     }
     let mut ids = BTreeSet::new();
+    let mut presentations = BTreeSet::new();
     for model in &source.models {
-        let formats = model.formats.iter().collect::<BTreeSet<_>>();
-        if model.id.is_empty()
+        let variant_ids = model
+            .variants
+            .iter()
+            .map(|variant| variant.variant_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let formats = model
+            .variants
+            .iter()
+            .map(|variant| variant.format.as_str())
+            .collect::<BTreeSet<_>>();
+        let variant_labels = model
+            .variants
+            .iter()
+            .map(|variant| variant.variant_label.as_str())
+            .collect::<BTreeSet<_>>();
+        if !valid_identity_component(&model.id)
             || model.display_name.is_empty()
             || model.description.is_empty()
+            || !valid_parameterization(&model.parameterization)
             || model.repository.is_empty()
-            || model.formats.is_empty()
-            || formats.len() != model.formats.len()
+            || model.variants.is_empty()
+            || variant_ids.len() != model.variants.len()
+            || formats.len() != model.variants.len()
+            || variant_labels.len() != model.variants.len()
+            || model.variants.iter().any(|variant| {
+                !valid_variant_id(&variant.variant_id)
+                    || variant.format.is_empty()
+                    || variant.format.trim() != variant.format.as_str()
+                    || variant.variant_label.is_empty()
+                    || variant.variant_label.trim() != variant.variant_label.as_str()
+                    || variant.variant_label.contains('(')
+                    || variant.variant_label.contains(')')
+                    || variant.fidelity_rank == 0
+            })
+            || model.context_length < MIN_CATALOG_CONTEXT_LENGTH
+            || model
+                .projector
+                .as_ref()
+                .is_some_and(|projector| projector.path.as_os_str().is_empty())
+            || model
+                .speculative_decoding
+                .as_ref()
+                .is_some_and(|speculative| {
+                    matches!(
+                        (&speculative.method, &speculative.draft),
+                        (
+                            CatalogSpeculativeMethod::DFlash | CatalogSpeculativeMethod::DSpark,
+                            CatalogSpeculativeDraftSource::Embedded
+                        )
+                    ) || match &speculative.draft {
+                        CatalogSpeculativeDraftSource::Embedded => false,
+                        CatalogSpeculativeDraftSource::File { repository, path } => {
+                            repository.as_ref().is_some_and(String::is_empty)
+                                || path.as_os_str().is_empty()
+                        }
+                    }
+                })
             || model.license.is_empty()
             || !model.quality_score.is_finite()
             || model.quality_score < 0.0
             || model.quality_score_provenance.is_empty()
             || model.quality_evidence.is_empty()
             || !ids.insert(model.id.as_str())
+            || model.variants.iter().any(|variant| {
+                !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
+            })
         {
             return Err(InventoryError::Integrity(format!(
                 "invalid or duplicate catalog declaration {}",
@@ -127,23 +286,108 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     Ok(source)
 }
 
-pub fn model_catalog_lock() -> Result<BTreeMap<String, String>, InventoryError> {
+fn is_projector_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("mmproj"))
+}
+
+fn resolve_projector_path(
+    declaration: &CatalogModel,
+    snapshot: &HuggingFaceRepositorySnapshot,
+) -> Result<Option<PathBuf>, InventoryError> {
+    let projector = if let Some(projector) = &declaration.projector {
+        if !is_projector_path(&projector.path)
+            || !snapshot
+                .gguf_files
+                .iter()
+                .any(|file| file.path == projector.path)
+        {
+            return Err(InventoryError::Integrity(format!(
+                "{} projector {} is not a repository mmproj GGUF",
+                declaration.id,
+                projector.path.display()
+            )));
+        }
+        Some(projector.path.clone())
+    } else {
+        let candidates = snapshot
+            .gguf_files
+            .iter()
+            .filter(|file| is_projector_path(&file.path))
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [projector] => Some(projector.clone()),
+            [] => None,
+            _ => {
+                return Err(InventoryError::Integrity(format!(
+                    "{} has {} projector candidates; declare an exact projector path",
+                    declaration.id,
+                    candidates.len()
+                )));
+            }
+        }
+    };
+    if projector.is_some()
+        && declaration
+            .speculative_decoding
+            .as_ref()
+            .is_some_and(|speculative| speculative.method == CatalogSpeculativeMethod::Mtp)
+    {
+        return Err(InventoryError::Integrity(format!(
+            "{} combines a projector with MTP, which cannot process projector embedding batches",
+            declaration.id
+        )));
+    }
+    Ok(projector)
+}
+
+fn valid_parameterization(parameterization: &ModelParameterization) -> bool {
+    match parameterization {
+        ModelParameterization::Dense { total_parameters } => *total_parameters > 0,
+        ModelParameterization::MixtureOfExperts {
+            total_parameters,
+            active_parameters,
+        } => *active_parameters > 0 && active_parameters < total_parameters,
+    }
+}
+
+pub(crate) fn valid_identity_component(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.contains(':')
+}
+
+pub(crate) fn valid_variant_id(value: &str) -> bool {
+    let mut components = value.split(':');
+    matches!(
+        (components.next(), components.next(), components.next()),
+        (Some(format), Some(quality), None)
+            if valid_identity_component(format) && valid_identity_component(quality)
+    )
+}
+
+pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
     model_catalog_lock_from(CATALOG_LOCK.as_bytes(), &catalog_source()?)
 }
 
 pub async fn advance_model_catalog_lock(
-    models: Arc<ModelManager>,
-) -> Result<BTreeMap<String, String>, InventoryError> {
+    models: Arc<ManagedModelStore>,
+) -> Result<ModelCatalogLock, InventoryError> {
     let source = catalog_source()?;
     let resolved = stream::iter(source.models)
         .map(|declaration| {
             let models = Arc::clone(&models);
             async move {
                 let entry_id = declaration.id;
-                let snapshot = refresh_hugging_face_repository(
+                let target_repository = declaration.repository;
+                let target = refresh_hugging_face_repository(
                     &models,
                     HuggingFaceRepositoryRequest {
-                        repository: declaration.repository,
+                        repository: target_repository.clone(),
                         revision: "main".to_owned(),
                     },
                 )
@@ -153,7 +397,42 @@ pub async fn advance_model_catalog_lock(
                         "failed to resolve catalog entry {entry_id}: {error}"
                     ))
                 })?;
-                Ok::<_, InventoryError>((entry_id, snapshot.commit))
+                let speculative_draft = match declaration
+                    .speculative_decoding
+                    .and_then(|speculative| match speculative.draft {
+                        CatalogSpeculativeDraftSource::Embedded => None,
+                        CatalogSpeculativeDraftSource::File { repository, .. } => {
+                            Some(repository.unwrap_or_else(|| target_repository.clone()))
+                        }
+                    }) {
+                    Some(repository) if repository == target_repository => {
+                        Some(target.commit.clone())
+                    }
+                    Some(repository) => Some(
+                        refresh_hugging_face_repository(
+                            &models,
+                            HuggingFaceRepositoryRequest {
+                                repository,
+                                revision: "main".to_owned(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            InventoryError::Upstream(format!(
+                                "failed to resolve catalog entry {entry_id} speculative draft: {error}"
+                            ))
+                        })?
+                        .commit,
+                    ),
+                    None => None,
+                };
+                Ok::<_, InventoryError>((
+                    entry_id,
+                    ModelCatalogLockEntry {
+                        target: target.commit,
+                        speculative_draft,
+                    },
+                ))
             }
         })
         .buffer_unordered(12)
@@ -165,8 +444,8 @@ pub async fn advance_model_catalog_lock(
 fn model_catalog_lock_from(
     bytes: &[u8],
     source: &CatalogSource,
-) -> Result<BTreeMap<String, String>, InventoryError> {
-    let lock: BTreeMap<String, String> = serde_json::from_slice(bytes).map_err(|error| {
+) -> Result<ModelCatalogLock, InventoryError> {
+    let lock: ModelCatalogLock = serde_json::from_slice(bytes).map_err(|error| {
         InventoryError::Integrity(format!("invalid model catalog lock: {error}"))
     })?;
     validate_model_catalog_lock(&lock, source)?;
@@ -174,7 +453,7 @@ fn model_catalog_lock_from(
 }
 
 fn validate_model_catalog_lock(
-    lock: &BTreeMap<String, String>,
+    lock: &ModelCatalogLock,
     source: &CatalogSource,
 ) -> Result<(), InventoryError> {
     let expected = source
@@ -187,17 +466,38 @@ fn validate_model_catalog_lock(
             "model catalog lock does not exactly cover models.json".to_owned(),
         ));
     }
-    if lock.values().any(|commit| {
-        commit.len() != 40
-            || !commit
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    if source.models.iter().any(|model| {
+        let Some(entry) = lock.get(&model.id) else {
+            return true;
+        };
+        !valid_commit(&entry.target)
+            || entry.speculative_draft.is_some()
+                != model
+                    .speculative_decoding
+                    .as_ref()
+                    .is_some_and(|speculative| {
+                        matches!(
+                            speculative.draft,
+                            CatalogSpeculativeDraftSource::File { .. }
+                        )
+                    })
+            || entry
+                .speculative_draft
+                .as_ref()
+                .is_some_and(|commit| !valid_commit(commit))
     }) {
         return Err(InventoryError::Integrity(
-            "model catalog lock contains a non-commit revision".to_owned(),
+            "model catalog lock contains invalid or mismatched package revisions".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn valid_commit(commit: &str) -> bool {
+    commit.len() == 40
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog, InventoryError> {
@@ -217,7 +517,10 @@ pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog
     validate_planner_inputs(&catalog, &manifest.planner_inputs)?;
     let mut expected_inputs = BTreeMap::new();
     for input in manifest.planner_inputs.values() {
-        for component in &input.components {
+        for component in input
+            .packages()
+            .flat_map(|package| package.components.iter())
+        {
             if let Some(previous_size) = expected_inputs.insert(
                 component.planner_stub_digest.as_str(),
                 component.planner_stub_size_bytes,
@@ -275,98 +578,184 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
     let model_ids = catalog
         .models
         .iter()
-        .map(|model| model.id.clone())
+        .map(|model| (model.model_id.clone(), model.variant_id.clone()))
         .collect::<BTreeSet<_>>();
-    let target_ids = catalog
+    let configuration_ids = catalog
         .models
         .iter()
-        .map(|model| model.target_id.clone())
+        .map(|model| model.configuration.id.clone())
         .collect::<BTreeSet<_>>();
+    let target_packages = catalog
+        .models
+        .iter()
+        .map(|model| match &model.configuration.bundle {
+            ServableModelBundle::Standalone { package } => package,
+            ServableModelBundle::SpeculativeDecoding { target, .. } => target,
+        })
+        .collect::<Vec<_>>();
+    let target_package_ids = target_packages
+        .iter()
+        .map(|package| package.id.clone())
+        .collect::<BTreeSet<_>>();
+    let complete_intrinsic_targets = target_packages
+        .iter()
+        .filter(|package| {
+            package.properties.intrinsic_model_id.is_some()
+                && package.properties.intrinsic_quality_id.is_some()
+        })
+        .count();
     if catalog.models.is_empty()
         || model_ids.len() != catalog.models.len()
-        || target_ids.len() != catalog.models.len()
-        || catalog.models.iter().any(|model| match &model.target {
-            ModelOfferingTarget::Package { package } => match &package.source {
-                ModelPackageSource::HuggingFace { revision, .. } => {
-                    revision.len() != 40
-                        || !revision
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || configuration_ids.len() != catalog.models.len()
+        || target_package_ids.len() != catalog.models.len()
+        || catalog.models.iter().any(|model| {
+            let (target, method) = match &model.configuration.bundle {
+                ServableModelBundle::Standalone { package } => (package, None),
+                ServableModelBundle::SpeculativeDecoding { target, method, .. } => {
+                    (target, Some(method))
                 }
-                ModelPackageSource::Local { .. } => true,
-            },
-            ModelOfferingTarget::SpeculativeDecodingPair { .. } => true,
+            };
+            let projector_count = target
+                .files
+                .iter()
+                .filter(|file| file.role == ModelFileRole::Projector)
+                .count();
+            !serving_configuration_identity_is_valid(&model.configuration)
+                || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
+                || projector_count > 1
+                || model.capabilities.vision != (projector_count == 1)
+                || (model.capabilities.vision && method == Some(&SpeculativeMethod::Mtp))
+                || servable_bundle_packages(&model.configuration.bundle).any(|package| {
+                    package
+                        .properties
+                        .maximum_context_length
+                        .is_some_and(|maximum| model.configuration.profile.context_length > maximum)
+                        || !matches!(
+                            &package.source,
+                            ModelPackageSource::HuggingFace { revision, .. }
+                                if valid_commit(revision)
+                        )
+                })
         })
     {
-        return Err(InventoryError::Integrity(
-            "release catalog has missing or duplicate model identities".to_owned(),
-        ));
+        return Err(InventoryError::Integrity(format!(
+            "release catalog has missing or duplicate exact identities (models={}, model_ids={}, configurations={}, target_packages={}, complete_intrinsic_targets={})",
+            catalog.models.len(),
+            model_ids.len(),
+            configuration_ids.len(),
+            target_package_ids.len(),
+            complete_intrinsic_targets,
+        )));
     }
     Ok(())
 }
 
+fn servable_bundle_packages(bundle: &ServableModelBundle) -> impl Iterator<Item = &ModelPackage> {
+    let target = match bundle {
+        ServableModelBundle::Standalone { package } => package,
+        ServableModelBundle::SpeculativeDecoding { target, .. } => target,
+    };
+    let draft = match bundle {
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            ..
+        } => Some(draft),
+        _ => None,
+    };
+    std::iter::once(target).chain(draft)
+}
+
+fn recommendable_model_bundle_key(model: &RecommendableModel) -> ServableModelBundleKey {
+    servable_model_bundle_key_for_bundle(&model.configuration.bundle)
+}
+
 fn validate_planner_inputs(
     catalog: &RecommendableModelCatalog,
-    artifacts: &BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    artifacts: &BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 ) -> Result<(), InventoryError> {
-    let catalog_targets = catalog
+    let catalog_bundles = catalog
         .models
         .iter()
-        .map(|model| model.target_id.clone())
+        .map(recommendable_model_bundle_key)
         .collect::<BTreeSet<_>>();
-    let artifact_targets = artifacts.keys().cloned().collect::<BTreeSet<_>>();
-    if artifact_targets != catalog_targets {
+    let artifact_bundles = artifacts.keys().cloned().collect::<BTreeSet<_>>();
+    if artifact_bundles != catalog_bundles {
         return Err(InventoryError::Integrity(
-            "release planner inputs do not exactly cover the catalog targets".to_owned(),
+            "release planner inputs do not exactly cover the catalog bundles".to_owned(),
         ));
     }
-    for (target_id, artifact) in artifacts {
-        let package_files = catalog
+    for (bundle_key, artifact) in artifacts {
+        let bundle = catalog
             .models
             .iter()
-            .find(|model| &model.target_id == target_id)
-            .and_then(|model| match &model.target {
-                ModelOfferingTarget::Package { package } => Some(
-                    package
-                        .files
-                        .iter()
-                        .map(|file| (file.path.clone(), file.size_bytes))
-                        .collect::<BTreeSet<_>>(),
-                ),
-                ModelOfferingTarget::SpeculativeDecodingPair { .. } => None,
-            });
-        let planner_files = artifact
-            .components
-            .iter()
-            .map(|component| {
-                (
-                    component.component.path.clone(),
-                    component.component.size_bytes,
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        if package_files.as_ref() != Some(&planner_files)
-            || artifact.components.is_empty()
-            || !artifact
-                .components
-                .iter()
-                .any(|component| component.component.path == artifact.primary_gguf)
-            || artifact.components.iter().any(|component| {
-                component.source_header_digest.len() != 64
-                    || component.source_header_size_bytes == 0
-                    || component.planner_stub_digest.len() != 64
-                    || component.planner_stub_size_bytes == 0
-                    || !valid_hex_digest(&component.source_header_digest)
-                    || !valid_hex_digest(&component.planner_stub_digest)
-            })
+            .find(|model| recommendable_model_bundle_key(model) == *bundle_key)
+            .map(|model| &model.configuration.bundle)
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "release planner input {} has no catalog bundle",
+                    bundle_key.0
+                ))
+            })?;
+        let (target, draft) = match bundle {
+            ServableModelBundle::Standalone { package } => (package, None),
+            ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                ..
+            } => (
+                target,
+                match draft_source {
+                    SpeculativeDraftSource::Embedded => None,
+                    SpeculativeDraftSource::Separate { draft } => Some(draft),
+                },
+            ),
+        };
+        if !valid_release_planner_package(target, &artifact.target)
+            || draft
+                .zip(artifact.draft.as_ref())
+                .is_some_and(|(package, planner)| !valid_release_planner_package(package, planner))
+            || draft.is_some() != artifact.draft.is_some()
         {
             return Err(InventoryError::Integrity(format!(
                 "invalid release planner input {}",
-                target_id.0
+                bundle_key.0
             )));
         }
     }
     Ok(())
+}
+
+fn valid_release_planner_package(package: &ModelPackage, planner: &ReleasePlannerPackage) -> bool {
+    let package_files = package
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.size_bytes))
+        .collect::<BTreeSet<_>>();
+    let planner_files = planner
+        .components
+        .iter()
+        .map(|component| {
+            (
+                component.component.path.clone(),
+                component.component.size_bytes,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    package == &planner.package
+        && package_files == planner_files
+        && !planner.components.is_empty()
+        && planner
+            .components
+            .iter()
+            .any(|component| component.component.path == planner.primary_gguf)
+        && planner.components.iter().all(|component| {
+            component.source_header_digest.len() == 64
+                && component.source_header_size_bytes > 0
+                && component.planner_stub_digest.len() == 64
+                && component.planner_stub_size_bytes > 0
+                && valid_hex_digest(&component.source_header_digest)
+                && valid_hex_digest(&component.planner_stub_digest)
+        })
 }
 
 fn valid_hex_digest(value: &str) -> bool {
@@ -389,31 +778,31 @@ impl GeneratedReleaseCatalog {
             .map_err(InventoryError::Integrity)
     }
 
-    pub fn resolve_source_planner_target(
+    pub fn resolve_source_planner_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
-    ) -> Result<ResolvedModelTarget, InventoryError> {
-        self.resolve_generated_planner_target(target_id, false)
+        bundle_key: &ServableModelBundleKey,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        self.resolve_generated_planner_bundle(bundle_key, false)
     }
 
-    pub fn resolve_compact_planner_target(
+    pub fn resolve_compact_planner_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
-    ) -> Result<ResolvedModelTarget, InventoryError> {
-        self.resolve_generated_planner_target(target_id, true)
+        bundle_key: &ServableModelBundleKey,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        self.resolve_generated_planner_bundle(bundle_key, true)
     }
 
-    fn resolve_generated_planner_target(
+    fn resolve_generated_planner_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
+        bundle_key: &ServableModelBundleKey,
         compact: bool,
-    ) -> Result<ResolvedModelTarget, InventoryError> {
-        let (artifact, target) =
-            planner_input_and_target(&self.catalog, &self.planner_inputs, target_id)?;
-        materialize_planner_target(
-            target_id,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        let (artifact, bundle) =
+            planner_input_and_bundle(&self.catalog, &self.planner_inputs, bundle_key)?;
+        materialize_planner_bundle(
+            bundle_key,
             artifact,
-            target,
+            bundle,
             |component| {
                 let (digest, expected_size) = if compact {
                     (
@@ -451,29 +840,29 @@ impl ReleaseCatalog {
         &self.catalog
     }
 
-    pub fn resolve_target(
+    pub fn resolve_bundle(
         &self,
-        target_id: &ModelOfferingTargetId,
-    ) -> Result<Option<ResolvedModelTarget>, InventoryError> {
-        let Some(artifact) = self.planner_inputs.get(target_id) else {
+        bundle_key: &ServableModelBundleKey,
+    ) -> Result<Option<ResolvedServableModelBundle>, InventoryError> {
+        let Some(artifact) = self.planner_inputs.get(bundle_key) else {
             return Ok(None);
         };
-        let target = self
+        let bundle = self
             .catalog
             .models
             .iter()
-            .find(|model| &model.target_id == target_id)
-            .map(|model| model.target.clone())
+            .find(|model| recommendable_model_bundle_key(model) == *bundle_key)
+            .map(|model| model.configuration.bundle.clone())
             .ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "catalog target {} has no model declaration",
-                    target_id.0
+                    "catalog bundle {} has no model declaration",
+                    bundle_key.0
                 ))
             })?;
-        Ok(Some(materialize_planner_target(
-            target_id,
+        Ok(Some(materialize_planner_bundle(
+            bundle_key,
             artifact,
-            target,
+            bundle,
             |component| {
                 let stub = self
                     .planner_bundle
@@ -486,46 +875,83 @@ impl ReleaseCatalog {
     }
 }
 
-fn planner_input_and_target<'a>(
+fn planner_input_and_bundle<'a>(
     catalog: &'a RecommendableModelCatalog,
-    artifacts: &'a BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
-    target_id: &ModelOfferingTargetId,
-) -> Result<(&'a ReleasePlannerInput, ModelOfferingTarget), InventoryError> {
-    let artifact = artifacts.get(target_id).ok_or_else(|| {
+    artifacts: &'a BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
+    bundle_key: &ServableModelBundleKey,
+) -> Result<(&'a ReleasePlannerInput, ServableModelBundle), InventoryError> {
+    let artifact = artifacts.get(bundle_key).ok_or_else(|| {
         InventoryError::Integrity(format!(
-            "catalog target {} has no planner input",
-            target_id.0
+            "catalog bundle {} has no planner input",
+            bundle_key.0
         ))
     })?;
-    let target = catalog
+    let bundle = catalog
         .models
         .iter()
-        .find(|model| &model.target_id == target_id)
-        .map(|model| model.target.clone())
+        .find(|model| recommendable_model_bundle_key(model) == *bundle_key)
+        .map(|model| model.configuration.bundle.clone())
         .ok_or_else(|| {
             InventoryError::Integrity(format!(
-                "catalog target {} has no model declaration",
-                target_id.0
+                "catalog bundle {} has no model declaration",
+                bundle_key.0
             ))
         })?;
-    Ok((artifact, target))
+    Ok((artifact, bundle))
 }
 
-fn materialize_planner_target<'a>(
-    target_id: &ModelOfferingTargetId,
+fn materialize_planner_bundle<'a>(
+    bundle_key: &ServableModelBundleKey,
     artifact: &ReleasePlannerInput,
-    target: ModelOfferingTarget,
+    bundle: ServableModelBundle,
     mut input_for: impl FnMut(&ReleasePlannerComponent) -> Result<(Cow<'a, [u8]>, u64), InventoryError>,
     integrity_method: &str,
-) -> Result<ResolvedModelTarget, InventoryError> {
-    let package = match &target {
-        ModelOfferingTarget::Package { package } => package,
-        ModelOfferingTarget::SpeculativeDecodingPair { .. } => {
-            return Err(InventoryError::Integrity(
-                "release planner input requires a package target".to_owned(),
-            ));
-        }
+) -> Result<ResolvedServableModelBundle, InventoryError> {
+    let (target, draft) = match &bundle {
+        ServableModelBundle::Standalone { package } => (package, None),
+        ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source,
+            ..
+        } => (
+            target,
+            match draft_source {
+                SpeculativeDraftSource::Embedded => None,
+                SpeculativeDraftSource::Separate { draft } => Some(draft),
+            },
+        ),
     };
+    if draft.is_some() != artifact.draft.is_some() {
+        return Err(InventoryError::Integrity(
+            "release planner input draft does not match its bundle".to_owned(),
+        ));
+    }
+    let (target_model, target_workspace) =
+        materialize_planner_package(&artifact.target, target, &mut input_for, integrity_method)?;
+    let (draft_model, draft_workspace) = match (draft, artifact.draft.as_ref()) {
+        (Some(package), Some(planner)) => {
+            let (model, workspace) =
+                materialize_planner_package(planner, package, &mut input_for, integrity_method)?;
+            (Some(model), Some(workspace))
+        }
+        (None, None) => (None, None),
+        _ => unreachable!("draft presence was validated"),
+    };
+    let mut resolved =
+        ResolvedServableModelBundle::new(bundle_key.clone(), bundle, target_model, draft_model)
+            .retain_resolution_guard(target_workspace);
+    if let Some(workspace) = draft_workspace {
+        resolved = resolved.retain_resolution_guard(workspace);
+    }
+    Ok(resolved)
+}
+
+fn materialize_planner_package<'a>(
+    artifact: &ReleasePlannerPackage,
+    package: &ModelPackage,
+    input_for: &mut impl FnMut(&ReleasePlannerComponent) -> Result<(Cow<'a, [u8]>, u64), InventoryError>,
+    integrity_method: &str,
+) -> Result<(ResolvedModel, tempfile::TempDir), InventoryError> {
     let source = match &package.source {
         ModelPackageSource::HuggingFace {
             repository,
@@ -611,10 +1037,7 @@ fn materialize_planner_target<'a>(
             })
             .collect(),
     };
-    Ok(
-        ResolvedModelTarget::new(target_id.clone(), target, resolved, None)
-            .retain_resolution_guard(workspace),
-    )
+    Ok((resolved, workspace))
 }
 
 fn validate_resolved_catalog(
@@ -630,21 +1053,21 @@ fn validate_resolved_catalog(
     let actual = catalog
         .models
         .iter()
-        .map(|model| model.id.0.as_str())
+        .map(|model| (model.model_id.0.as_str(), model.variant_id.0.as_str()))
         .collect::<BTreeSet<_>>();
     let expected = source
         .models
         .iter()
         .flat_map(|model| {
             model
-                .formats
+                .variants
                 .iter()
-                .map(|format| format!("{}:{format}", model.id))
+                .map(|variant| (model.id.as_str(), variant.variant_id.as_str()))
         })
         .collect::<BTreeSet<_>>();
     if actual.len() != catalog.models.len()
         || actual.len() != expected.len()
-        || !expected.iter().all(|id| actual.contains(id.as_str()))
+        || !expected.iter().all(|identity| actual.contains(identity))
     {
         return Err(InventoryError::Integrity(
             "release catalog does not exactly cover its source declarations".to_owned(),
@@ -655,31 +1078,93 @@ fn validate_resolved_catalog(
         let declaration = source
             .models
             .iter()
-            .find(|declaration| declaration.id == model.checkpoint_id)
+            .find(|declaration| declaration.id == model.model_id.0)
             .ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "release catalog target {} has no source declaration",
-                    model.id.0
+                    "release catalog model {} variant {} has no source declaration",
+                    model.model_id.0, model.variant_id.0
                 ))
             })?;
-        let expected_commit = lock.get(&model.checkpoint_id).ok_or_else(|| {
+        let expected_lock = lock.get(&model.model_id.0).ok_or_else(|| {
             InventoryError::Integrity(format!(
                 "model catalog lock is missing {}",
-                model.checkpoint_id
+                model.model_id.0
             ))
         })?;
-        let package_source = match &model.target {
-            ModelOfferingTarget::Package { package } => &package.source,
-            ModelOfferingTarget::SpeculativeDecodingPair { .. } => {
-                return Err(InventoryError::Integrity(
-                    "release catalog contains an unsupported speculative target".to_owned(),
-                ));
-            }
+        let (target, draft_source, method) = match &model.configuration.bundle {
+            ServableModelBundle::Standalone { package } => (package, None, None),
+            ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method,
+            } => (target, Some(draft_source), Some(method)),
         };
-        if !package_source_matches(package_source, declaration, expected_commit) {
+        let speculative_matches = match (&declaration.speculative_decoding, draft_source, method) {
+            (None, None, None) => true,
+            (
+                Some(CatalogSpeculativeDecoding {
+                    method: expected_method,
+                    draft: CatalogSpeculativeDraftSource::Embedded,
+                }),
+                Some(SpeculativeDraftSource::Embedded),
+                Some(method),
+            ) => expected_lock.speculative_draft.is_none() && method == &(*expected_method).into(),
+            (
+                Some(CatalogSpeculativeDecoding {
+                    method: expected_method,
+                    draft: CatalogSpeculativeDraftSource::File { .. },
+                }),
+                Some(SpeculativeDraftSource::Separate { draft }),
+                Some(method),
+            ) => {
+                let Some(expected_draft_commit) = expected_lock.speculative_draft.as_deref() else {
+                    return Err(InventoryError::Integrity(format!(
+                        "model catalog lock is missing {} speculative draft",
+                        model.model_id.0
+                    )));
+                };
+                let Some((expected_repository, expected_path)) = declaration
+                    .speculative_decoding
+                    .as_ref()
+                    .and_then(|speculative| speculative.draft.file(&declaration.repository))
+                else {
+                    return Err(InventoryError::Integrity(
+                        "file draft declaration lost its source".to_owned(),
+                    ));
+                };
+                method == &(*expected_method).into()
+                    && package_source_matches(
+                        &draft.source,
+                        expected_repository,
+                        expected_draft_commit,
+                    )
+                    && draft.files.iter().any(|file| file.path == expected_path)
+            }
+            _ => false,
+        };
+        let projector_files = target
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Projector)
+            .collect::<Vec<_>>();
+        let projector_matches = match &declaration.projector {
+            Some(projector) => {
+                projector_files.len() == 1 && projector_files[0].path == projector.path
+            }
+            None => projector_files.len() == usize::from(model.capabilities.vision),
+        };
+        if model.configuration.profile.context_length != declaration.context_length
+            || !package_source_matches(
+                &target.source,
+                &declaration.repository,
+                &expected_lock.target,
+            )
+            || !projector_matches
+            || !speculative_matches
+        {
             return Err(InventoryError::Integrity(format!(
-                "release catalog target {} does not match models.json and models.lock.json",
-                model.id.0
+                "release catalog model {} variant {} does not match models.json and models.lock.json",
+                model.model_id.0, model.variant_id.0
             )));
         }
     }
@@ -688,7 +1173,7 @@ fn validate_resolved_catalog(
 
 fn package_source_matches(
     source: &ModelPackageSource,
-    declaration: &CatalogModel,
+    expected_repository: &str,
     expected_commit: &str,
 ) -> bool {
     matches!(
@@ -696,88 +1181,126 @@ fn package_source_matches(
         ModelPackageSource::HuggingFace {
             repository,
             revision,
-        } if repository == &declaration.repository && revision == expected_commit
+        } if repository == expected_repository && revision == expected_commit
     )
-}
-
-fn fidelity(declaration_id: &str, format: &str) -> (u32, bool) {
-    if declaration_id.starts_with("gemma-4-") {
-        return (58, true);
-    }
-    if declaration_id == "nemotron-3-super-120b-a12b"
-        || declaration_id == "nemotron-3-ultra-550b-a55b"
-    {
-        return (58, true);
-    }
-    let rank = if format.contains("Q8") {
-        80
-    } else if format.contains("Q6") {
-        60
-    } else if format.contains("Q5") {
-        50
-    } else {
-        40
-    };
-    (rank, false)
 }
 
 fn recommendable_model(
     declaration: &CatalogModel,
-    format: &str,
-    package: ModelPackage,
+    variant: &CatalogVariant,
+    target: ModelPackage,
+    draft: Option<ModelPackage>,
     properties: &InventoryProperties,
-) -> RecommendableModel {
-    let (fidelity_rank, quantization_aware) = fidelity(&declaration.id, format);
-    RecommendableModel {
-        id: RecommendableModelId(format!("{}:{format}", declaration.id)),
-        checkpoint_id: declaration.id.clone(),
-        target_id: offering_target_id(&[&package.id]),
-        target: ModelOfferingTarget::Package { package },
+) -> Result<RecommendableModel, InventoryError> {
+    let has_draft = draft.is_some();
+    let bundle = match &declaration.speculative_decoding {
+        None => ServableModelBundle::Standalone { package: target },
+        Some(speculative) => {
+            let draft_source = match speculative.draft {
+                CatalogSpeculativeDraftSource::Embedded => {
+                    let InventoryProperties::Inspected {
+                        nextn_predict_layers,
+                        ..
+                    } = properties
+                    else {
+                        return Err(InventoryError::Integrity(format!(
+                            "{} cannot verify its embedded speculative draft",
+                            declaration.id
+                        )));
+                    };
+                    if nextn_predict_layers.unwrap_or(0) == 0 {
+                        return Err(InventoryError::Integrity(format!(
+                            "{} declares an embedded speculative draft but its target GGUF has no NextN layers",
+                            declaration.id
+                        )));
+                    }
+                    SpeculativeDraftSource::Embedded
+                }
+                CatalogSpeculativeDraftSource::File { .. } => SpeculativeDraftSource::Separate {
+                    draft: draft.ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "{} has no resolved speculative draft",
+                            declaration.id
+                        ))
+                    })?,
+                },
+            };
+            ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method: speculative.method.into(),
+            }
+        }
+    };
+    if declaration.speculative_decoding.is_none() && has_draft {
+        return Err(InventoryError::Integrity(format!(
+            "{} resolved an undeclared speculative draft",
+            declaration.id
+        )));
+    }
+    let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
+    let profile = ServingProfile {
+        context_length: declaration.context_length,
+    };
+    Ok(RecommendableModel {
+        model_id: CatalogModelId(declaration.id.clone()),
+        variant_id: CatalogVariantId(variant.variant_id.clone()),
+        configuration: ModelServingConfiguration {
+            id: serving_configuration_id(&bundle_key, &profile),
+            bundle,
+            profile,
+        },
         display_name: declaration.display_name.clone(),
+        variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
         license: declaration.license.clone(),
         capabilities: model_capabilities(properties),
+        parameterization: declaration.parameterization.clone(),
         quality_score: declaration.quality_score,
         quality_score_provenance: declaration.quality_score_provenance.clone(),
-        fidelity_rank,
-        quantization_aware,
+        fidelity_rank: variant.fidelity_rank,
+        quantization_aware: variant.quantization_aware,
         quality_evidence: declaration.quality_evidence.clone(),
-    }
+    })
 }
 
 fn catalog_from_planner_inputs(
     source: &CatalogSource,
-    inputs: &BTreeMap<ModelOfferingTargetId, ReleasePlannerInput>,
+    inputs: &BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
 ) -> Result<RecommendableModelCatalog, InventoryError> {
-    let by_model_id = inputs
+    let by_identity = inputs
         .values()
-        .map(|input| (input.model_id.clone(), input))
+        .map(|input| ((input.model_id.clone(), input.variant_id.clone()), input))
         .collect::<BTreeMap<_, _>>();
-    if by_model_id.len() != inputs.len() {
+    if by_identity.len() != inputs.len() {
         return Err(InventoryError::Integrity(
             "planner bundle contains duplicate catalog model identities".to_owned(),
         ));
     }
     let mut models = Vec::new();
     for declaration in &source.models {
-        for format in &declaration.formats {
-            let model_id = RecommendableModelId(format!("{}:{format}", declaration.id));
-            let input = by_model_id.get(&model_id).ok_or_else(|| {
+        for variant in &declaration.variants {
+            let identity = (
+                CatalogModelId(declaration.id.clone()),
+                CatalogVariantId(variant.variant_id.clone()),
+            );
+            let input = by_identity.get(&identity).ok_or_else(|| {
                 InventoryError::Integrity(format!(
-                    "planner bundle is missing catalog model {}",
-                    model_id.0
+                    "planner bundle is missing catalog model {} variant {}",
+                    declaration.id, variant.variant_id
                 ))
             })?;
             let model = recommendable_model(
                 declaration,
-                format,
-                input.package.clone(),
-                &input.properties,
-            );
-            if !inputs.contains_key(&model.target_id) {
+                variant,
+                input.target.package.clone(),
+                input.draft.as_ref().map(|draft| draft.package.clone()),
+                &input.target.properties,
+            )?;
+            if !inputs.contains_key(&recommendable_model_bundle_key(&model)) {
                 return Err(InventoryError::Integrity(format!(
-                    "planner bundle target does not match catalog model {}",
-                    model_id.0
+                    "planner bundle key does not match catalog model {} variant {}",
+                    declaration.id, variant.variant_id
                 )));
             }
             models.push(model);
@@ -795,20 +1318,20 @@ fn catalog_from_planner_inputs(
 }
 
 pub struct ResolvingRecommendableCatalog {
-    models: Arc<ModelManager>,
+    models: Arc<ManagedModelStore>,
 }
 
 impl ResolvingRecommendableCatalog {
     #[must_use]
-    pub fn new(models: Arc<ModelManager>) -> Self {
+    pub fn new(models: Arc<ManagedModelStore>) -> Self {
         Self { models }
     }
 
     async fn resolve_model(
         &self,
         declaration: &CatalogModel,
-        format: &str,
-        snapshot: &HuggingFaceRepositorySnapshot,
+        variant: &CatalogVariant,
+        snapshots: &BTreeMap<String, HuggingFaceRepositorySnapshot>,
     ) -> Result<
         (
             RecommendableModel,
@@ -818,7 +1341,13 @@ impl ResolvingRecommendableCatalog {
         ),
         InventoryError,
     > {
-        let selector = format.to_ascii_lowercase();
+        let snapshot = snapshots.get(&declaration.repository).ok_or_else(|| {
+            InventoryError::Integrity(format!(
+                "target repository {} was not resolved",
+                declaration.repository
+            ))
+        })?;
+        let selector = variant.format.to_ascii_lowercase();
         let mut matches = snapshot
             .gguf_files
             .iter()
@@ -826,38 +1355,131 @@ impl ResolvingRecommendableCatalog {
                 let path = file.path.to_string_lossy().to_ascii_lowercase();
                 let basename = path.rsplit('/').next().unwrap_or(path.as_str());
                 path.contains(&selector)
-                    && !basename.starts_with("mmproj-")
+                    && !is_projector_path(&file.path)
                     && !basename.contains("imatrix")
                     && (!is_later_shard(basename) || is_first_shard(basename))
             })
             .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(InventoryError::Integrity(format!(
-                "{} format {format} resolved to {} primary files",
+                "{} format {} resolved to {} primary files",
                 declaration.repository,
+                variant.format,
                 matches.len()
             )));
         }
         let primary = matches.remove(0);
-        let prepared = self
+        let projector = resolve_projector_path(declaration, snapshot)?;
+        let additional_components = projector
+            .map(|path| ModelPreviewComponentSource {
+                path,
+                role: ModelPreviewComponentRole::Projector,
+            })
+            .into_iter()
+            .collect();
+        let target_prepared = self
             .models
             .prepare_preview_from_repository_snapshot(
                 &ModelPreviewSource {
                     repository: snapshot.repository.clone(),
                     revision: snapshot.commit.clone(),
                     primary_gguf: primary.path.clone(),
-                    additional_components: Vec::new(),
+                    additional_components,
                 },
                 snapshot,
             )
             .await?;
-        let package = package_from_resolved(&prepared.model)?;
+        let (target, mut headers, mut planner_stubs) =
+            self.release_planner_package(target_prepared, &primary.path)?;
+        let draft = match declaration
+            .speculative_decoding
+            .as_ref()
+            .and_then(|speculative| speculative.draft.file(&declaration.repository))
+        {
+            Some((draft_repository, draft_path)) => {
+                let snapshot = snapshots.get(draft_repository).ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "draft repository {} was not resolved",
+                        draft_repository
+                    ))
+                })?;
+                if !snapshot
+                    .gguf_files
+                    .iter()
+                    .any(|file| file.path == draft_path)
+                {
+                    return Err(InventoryError::Integrity(format!(
+                        "{} has no draft file {}",
+                        draft_repository,
+                        draft_path.display()
+                    )));
+                }
+                let prepared = self
+                    .models
+                    .prepare_preview_from_repository_snapshot(
+                        &ModelPreviewSource {
+                            repository: snapshot.repository.clone(),
+                            revision: snapshot.commit.clone(),
+                            primary_gguf: draft_path.to_path_buf(),
+                            additional_components: Vec::new(),
+                        },
+                        snapshot,
+                    )
+                    .await?;
+                let (draft, draft_headers, draft_stubs) =
+                    self.release_planner_package(prepared, draft_path)?;
+                merge_content_map(&mut headers, draft_headers, "source header")?;
+                merge_content_map(&mut planner_stubs, draft_stubs, "planner stub")?;
+                Some(draft)
+            }
+            None => None,
+        };
+        let maximum_context_length =
+            std::iter::once(target.package.properties.maximum_context_length)
+                .chain(
+                    draft
+                        .as_ref()
+                        .map(|draft| draft.package.properties.maximum_context_length),
+                )
+                .flatten()
+                .min();
+        if maximum_context_length.is_some_and(|maximum| declaration.context_length > maximum) {
+            return Err(InventoryError::Integrity(format!(
+                "{} configures {} context tokens above the artifact maximum of {}",
+                declaration.id,
+                declaration.context_length,
+                maximum_context_length.expect("checked as present")
+            )));
+        }
         let model = recommendable_model(
             declaration,
-            format,
-            package.clone(),
-            &prepared.model.model.properties,
-        );
+            variant,
+            target.package.clone(),
+            draft.as_ref().map(|draft| draft.package.clone()),
+            &target.properties,
+        )?;
+        let planner = ReleasePlannerInput {
+            model_id: model.model_id.clone(),
+            variant_id: model.variant_id.clone(),
+            target,
+            draft,
+        };
+        Ok((model, planner, headers, planner_stubs))
+    }
+
+    fn release_planner_package(
+        &self,
+        prepared: PreparedPreview,
+        primary: &Path,
+    ) -> Result<
+        (
+            ReleasePlannerPackage,
+            BTreeMap<String, Vec<u8>>,
+            BTreeMap<String, Vec<u8>>,
+        ),
+        InventoryError,
+    > {
+        let package = package_from_resolved(&prepared.model)?;
         let headers = prepared
             .headers
             .iter()
@@ -877,7 +1499,7 @@ impl ResolvingRecommendableCatalog {
         let primary_header = prepared
             .headers
             .iter()
-            .find(|header| header.path == primary.path)
+            .find(|header| header.path == primary)
             .ok_or_else(|| {
                 InventoryError::Integrity("catalog primary has no planner header".to_owned())
             })?;
@@ -920,10 +1542,12 @@ impl ResolvingRecommendableCatalog {
                         header.digest
                     )));
                 }
-                let kind = if component.path == primary.path {
+                let kind = if component.path == primary {
                     PlannerStubComponent::Primary
+                } else if component.role == ComponentRole::Shard {
+                    PlannerStubComponent::Shard
                 } else {
-                    PlannerStubComponent::Auxiliary
+                    PlannerStubComponent::Companion
                 };
                 let stub = compact_planner_stub(source, &context, kind)
                     .map_err(|error| InventoryError::Integrity(error.to_string()))?;
@@ -950,15 +1574,31 @@ impl ResolvingRecommendableCatalog {
                 })
             })
             .collect::<Result<Vec<_>, InventoryError>>()?;
-        let planner = ReleasePlannerInput {
-            model_id: model.id.clone(),
+        let planner = ReleasePlannerPackage {
             package,
             properties: prepared.model.model.properties.clone(),
-            primary_gguf: primary.path.clone(),
+            primary_gguf: primary.to_path_buf(),
             components,
         };
-        Ok((model, planner, headers, planner_stubs))
+        Ok((planner, headers, planner_stubs))
     }
+}
+
+fn merge_content_map(
+    target: &mut BTreeMap<String, Vec<u8>>,
+    source: BTreeMap<String, Vec<u8>>,
+    kind: &str,
+) -> Result<(), InventoryError> {
+    for (digest, content) in source {
+        if let Some(previous) = target.insert(digest.clone(), content.clone())
+            && previous != content
+        {
+            return Err(InventoryError::Integrity(format!(
+                "{kind} digest collision {digest}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_first_shard(name: &str) -> bool {
@@ -981,6 +1621,21 @@ fn is_later_shard(name: &str) -> bool {
         })
 }
 
+fn insert_locked_repository(
+    repositories: &mut BTreeMap<String, String>,
+    repository: &str,
+    revision: &str,
+) -> Result<(), InventoryError> {
+    if let Some(existing) = repositories.insert(repository.to_owned(), revision.to_owned())
+        && existing != revision
+    {
+        return Err(InventoryError::Integrity(format!(
+            "catalog repository {repository} is locked to conflicting revisions"
+        )));
+    }
+    Ok(())
+}
+
 impl ResolvingRecommendableCatalog {
     pub fn resolve_release_catalog<F>(
         &self,
@@ -999,7 +1654,7 @@ impl ResolvingRecommendableCatalog {
 
     pub fn resolve_release_catalog_with_lock<F>(
         &self,
-        lock: BTreeMap<String, String>,
+        lock: ModelCatalogLock,
         progress: F,
     ) -> BoxFuture<'_, Result<GeneratedReleaseCatalog, InventoryError>>
     where
@@ -1016,27 +1671,42 @@ impl ResolvingRecommendableCatalog {
     async fn resolve_release_catalog_from_lock<F>(
         &self,
         source: CatalogSource,
-        lock: BTreeMap<String, String>,
+        lock: ModelCatalogLock,
         progress: F,
     ) -> Result<GeneratedReleaseCatalog, InventoryError>
     where
         F: Fn(&str, usize, usize) + Send + Sync + 'static,
     {
-        let repositories = source
-            .models
-            .iter()
-            .map(|declaration| {
-                Ok::<_, InventoryError>((
-                    declaration.repository.clone(),
-                    lock.get(&declaration.id).cloned().ok_or_else(|| {
-                        InventoryError::Integrity(format!(
-                            "model catalog lock is missing {}",
-                            declaration.id
-                        ))
-                    })?,
+        let mut repositories = BTreeMap::new();
+        for declaration in &source.models {
+            let entry = lock.get(&declaration.id).ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "model catalog lock is missing {}",
+                    declaration.id
                 ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            })?;
+            insert_locked_repository(&mut repositories, &declaration.repository, &entry.target)?;
+            if let Some(speculative) = &declaration.speculative_decoding {
+                if let Some((repository, _)) = speculative.draft.file(&declaration.repository) {
+                    insert_locked_repository(
+                        &mut repositories,
+                        repository,
+                        entry.speculative_draft.as_deref().ok_or_else(|| {
+                            InventoryError::Integrity(format!(
+                                "model catalog lock is missing {} speculative draft",
+                                declaration.id
+                            ))
+                        })?,
+                    )?;
+                } else if entry.speculative_draft.is_some() {
+                    return Err(InventoryError::Integrity(format!(
+                        "model catalog lock unexpectedly includes {} embedded speculative draft",
+                        declaration.id
+                    )));
+                }
+            }
+        }
+        let repositories = repositories.into_iter().collect::<Vec<_>>();
         let repository_total = repositories.len();
         let mut repository_completed = 0;
         let snapshots = stream::iter(repositories)
@@ -1078,55 +1748,64 @@ impl ResolvingRecommendableCatalog {
         let snapshot_failures = &snapshot_failures;
         let model_total = source.models.len();
         let mut model_completed = 0;
-        let resolved = stream::iter(source.models.into_iter().enumerate())
-            .map(|(declaration_index, declaration)| async move {
-                let mut formats = Vec::with_capacity(declaration.formats.len());
-                for (format_index, format) in declaration.formats.iter().enumerate() {
-                    let result = match resolved_snapshots.get(&declaration.repository) {
-                        Some(snapshot) => self.resolve_model(&declaration, format, snapshot).await,
-                        None => Err(InventoryError::Io(
-                            snapshot_failures
-                                .get(&declaration.repository)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "repository {} was not resolved",
-                                        declaration.repository
-                                    )
-                                }),
-                        )),
-                    };
-                    formats.push((
-                        declaration_index,
-                        format_index,
-                        declaration.clone(),
-                        format.clone(),
-                        result,
-                    ));
-                }
-                formats
-            })
-            .buffer_unordered(6)
-            .inspect(|_| {
-                model_completed += 1;
-                progress("Prepared catalog models", model_completed, model_total);
-            })
-            .flat_map(stream::iter)
-            .collect::<Vec<_>>()
-            .await;
+        let resolved =
+            stream::iter(source.models.into_iter().enumerate())
+                .map(|(declaration_index, declaration)| async move {
+                    let mut variants = Vec::with_capacity(declaration.variants.len());
+                    for (variant_index, variant) in declaration.variants.iter().enumerate() {
+                        let missing_repository = std::iter::once(declaration.repository.as_str())
+                            .chain(declaration.speculative_decoding.iter().filter_map(
+                                |speculative| {
+                                    speculative
+                                        .draft
+                                        .file(&declaration.repository)
+                                        .map(|(repository, _)| repository)
+                                },
+                            ))
+                            .find(|repository| !resolved_snapshots.contains_key(*repository));
+                        let result =
+                            match missing_repository {
+                                None => {
+                                    self.resolve_model(&declaration, variant, resolved_snapshots)
+                                        .await
+                                }
+                                Some(repository) => Err(InventoryError::Io(
+                                    snapshot_failures.get(repository).cloned().unwrap_or_else(
+                                        || format!("repository {repository} was not resolved"),
+                                    ),
+                                )),
+                            };
+                        variants.push((
+                            declaration_index,
+                            variant_index,
+                            declaration.clone(),
+                            variant.clone(),
+                            result,
+                        ));
+                    }
+                    variants
+                })
+                .buffer_unordered(6)
+                .inspect(|_| {
+                    model_completed += 1;
+                    progress("Prepared catalog models", model_completed, model_total);
+                })
+                .flat_map(stream::iter)
+                .collect::<Vec<_>>()
+                .await;
         let mut resolved = resolved;
-        resolved.sort_by_key(|(declaration_index, format_index, ..)| {
-            (*declaration_index, *format_index)
+        resolved.sort_by_key(|(declaration_index, variant_index, ..)| {
+            (*declaration_index, *variant_index)
         });
         let mut models = Vec::new();
         let mut planner_inputs = BTreeMap::new();
         let mut source_headers = BTreeMap::new();
         let mut planner_stubs = BTreeMap::new();
         let mut diagnostics = Vec::new();
-        for (_, _, declaration, format, result) in resolved {
+        for (_, _, declaration, variant, result) in resolved {
             match result {
                 Ok((model, planner, model_headers, model_stubs)) => {
-                    planner_inputs.insert(model.target_id.clone(), planner);
+                    planner_inputs.insert(recommendable_model_bundle_key(&model), planner);
                     models.push(model);
                     for (digest, header) in model_headers {
                         if let Some(previous) =
@@ -1149,7 +1828,8 @@ impl ResolvingRecommendableCatalog {
                     }
                 }
                 Err(error) => diagnostics.push(CatalogDiagnostic {
-                    entry_id: Some(RecommendableModelId(format!("{}:{format}", declaration.id))),
+                    model_id: CatalogModelId(declaration.id.clone()),
+                    variant_id: CatalogVariantId(variant.variant_id.clone()),
                     failure: ModelFailure {
                         code: "catalog_resolution_failed".to_owned(),
                         message: error.to_string(),
@@ -1197,6 +1877,144 @@ impl RecommendableModelCatalogProvider for ReleaseRecommendableCatalog {
 mod tests {
     use super::*;
 
+    fn repository_snapshot(paths: &[&str]) -> HuggingFaceRepositorySnapshot {
+        HuggingFaceRepositorySnapshot {
+            repository: "publisher/model".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            last_modified: None,
+            downloads: None,
+            likes: None,
+            gated: false,
+            private: false,
+            license: None,
+            license_url: None,
+            base_models: Vec::new(),
+            tags: Vec::new(),
+            gguf_files: paths
+                .iter()
+                .map(|path| icn_contracts::HuggingFaceRepositoryFile {
+                    path: PathBuf::from(path),
+                    size_bytes: 1,
+                    content: icn_contracts::ContentIdentity::Unknown,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn authored_catalog_declares_valid_parameterization_for_every_model() {
+        let source = catalog_source().expect("catalog source should be valid");
+        assert!(
+            source
+                .models
+                .iter()
+                .all(|model| valid_parameterization(&model.parameterization))
+        );
+    }
+
+    #[test]
+    fn authored_catalog_has_complete_vision_projector_policy() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let projected = source
+            .models
+            .iter()
+            .filter(|model| model.projector.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(projected.len(), 12);
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|model| model.speculative_decoding.is_none())
+                .count(),
+            9
+        );
+        assert!(projected.iter().all(|model| {
+            model
+                .speculative_decoding
+                .as_ref()
+                .is_none_or(|speculative| {
+                    matches!(
+                        speculative.method,
+                        CatalogSpeculativeMethod::DFlash | CatalogSpeculativeMethod::DSpark
+                    )
+                })
+        }));
+    }
+
+    #[test]
+    fn projector_resolution_is_automatic_only_when_unambiguous() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let mut declaration = source.models[0].clone();
+        declaration.projector = None;
+        declaration.speculative_decoding = None;
+        assert_eq!(
+            resolve_projector_path(
+                &declaration,
+                &repository_snapshot(&["model.gguf", "mmproj-model-F16.gguf"]),
+            )
+            .unwrap(),
+            Some(PathBuf::from("mmproj-model-F16.gguf"))
+        );
+        let error = resolve_projector_path(
+            &declaration,
+            &repository_snapshot(&[
+                "model.gguf",
+                "mmproj-model-BF16.gguf",
+                "mmproj-model-F16.gguf",
+            ]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2 projector candidates"));
+    }
+
+    #[test]
+    fn projector_resolution_rejects_invalid_paths_and_mtp() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let mut declaration = source.models[0].clone();
+        let snapshot = repository_snapshot(&["model.gguf", "mmproj-BF16.gguf"]);
+        declaration.projector = Some(CatalogProjectorSource {
+            path: PathBuf::from("mmproj-missing.gguf"),
+        });
+        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not a repository mmproj GGUF")
+        );
+
+        declaration.projector = Some(CatalogProjectorSource {
+            path: PathBuf::from("mmproj-BF16.gguf"),
+        });
+        declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
+            method: CatalogSpeculativeMethod::Mtp,
+            draft: CatalogSpeculativeDraftSource::Embedded,
+        });
+        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        assert!(error.to_string().contains("combines a projector with MTP"));
+    }
+
+    #[test]
+    fn parameterization_requires_meaningful_architecture_counts() {
+        assert!(valid_parameterization(&ModelParameterization::Dense {
+            total_parameters: 8_000_000_000,
+        }));
+        assert!(!valid_parameterization(&ModelParameterization::Dense {
+            total_parameters: 0,
+        }));
+        assert!(valid_parameterization(
+            &ModelParameterization::MixtureOfExperts {
+                total_parameters: 35_000_000_000,
+                active_parameters: 3_000_000_000,
+            },
+        ));
+        assert!(!valid_parameterization(
+            &ModelParameterization::MixtureOfExperts {
+                total_parameters: 3_000_000_000,
+                active_parameters: 3_000_000_000,
+            },
+        ));
+    }
+
     #[test]
     fn shard_selector_distinguishes_first_and_later_shards() {
         assert!(is_first_shard("model-00001-of-00003.gguf"));
@@ -1206,75 +2024,28 @@ mod tests {
     }
 
     #[test]
-    fn workstation_catalog_uses_published_gguf_format_names() {
-        let formats = |id: &str| {
-            catalog_source()
-                .expect("catalog source")
-                .models
-                .iter()
-                .find(|model| model.id == id)
-                .expect("catalog model")
-                .formats
-                .clone()
-        };
-        assert_eq!(
-            formats("laguna-s-2.1"),
-            ["UD-Q4_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(
-            formats("qwen3.5-122b-a10b"),
-            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(
-            formats("nemotron-3-super-120b-a12b"),
-            ["UD-Q4_K_XL", "MXFP4_MOE"]
-        );
-        assert_eq!(formats("deepseek-v4-flash"), ["UD-Q4_K_XL", "UD-Q8_K_XL"]);
-        assert_eq!(
-            formats("glm-5.2"),
-            ["UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"]
-        );
-        assert_eq!(fidelity("glm-5.2", "UD-Q4_K_XL"), (40, false));
-        assert_eq!(fidelity("glm-5.2", "UD-Q8_K_XL"), (80, false));
-    }
-
-    #[test]
-    fn model_lock_exactly_covers_the_authored_catalog() {
-        let source = catalog_source().expect("catalog source");
-        let lock = model_catalog_lock().expect("model catalog lock");
-        assert_eq!(lock.len(), source.models.len());
-        assert!(
-            source
-                .models
-                .iter()
-                .all(|model| lock.contains_key(&model.id))
-        );
-    }
-
-    #[test]
     fn package_source_must_match_the_authored_repository_and_locked_commit() {
-        let source = catalog_source().expect("catalog source");
-        let declaration = &source.models[0];
-        let commit = model_catalog_lock().expect("model catalog lock")[&declaration.id].clone();
+        let repository = "publisher/model";
+        let commit = "0123456789abcdef0123456789abcdef01234567";
         let package_source =
             |repository: String, revision: String| ModelPackageSource::HuggingFace {
                 repository,
                 revision,
             };
         assert!(package_source_matches(
-            &package_source(declaration.repository.clone(), commit.clone()),
-            declaration,
-            &commit,
+            &package_source(repository.to_owned(), commit.to_owned()),
+            repository,
+            commit,
         ));
         assert!(!package_source_matches(
-            &package_source("other/repository".to_owned(), commit.clone()),
-            declaration,
-            &commit,
+            &package_source("other/repository".to_owned(), commit.to_owned()),
+            repository,
+            commit,
         ));
         assert!(!package_source_matches(
-            &package_source(declaration.repository.clone(), "0".repeat(40)),
-            declaration,
-            &commit,
+            &package_source(repository.to_owned(), "0".repeat(40)),
+            repository,
+            commit,
         ));
     }
 }

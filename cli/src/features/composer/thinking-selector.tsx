@@ -1,7 +1,6 @@
 import { TextAttributes } from '@opentui/core'
 import type { ReasoningEffort } from '@magnitudedev/sdk'
 import stringWidth from 'string-width'
-import { violet } from '../../utils/theme'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
 
@@ -41,7 +40,7 @@ export function ThinkingSelector({
   return (
     <box style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 0 }}>
       <box style={{ width: 2, flexShrink: 0 }} />
-      <text style={{ fg: theme.muted }}>{'>'}</text>
+      <text style={{ fg: theme.text.supporting }}>{'>'}</text>
       <box style={{ width: 2, flexShrink: 0 }} />
       {options.map((option, index) => {
         const selected = index === previewIndex
@@ -52,7 +51,7 @@ export function ThinkingSelector({
               onClick={() => onCommit(index)}
               onMouseOver={() => onPreview(index)}
             >
-              <text style={{ fg: selected ? violet[200] : theme.foreground }}>
+              <text style={{ fg: selected ? theme.highlightAccent : theme.text.body }}>
                 <span attributes={selected ? TextAttributes.UNDERLINE : TextAttributes.NONE}>
                   {option.label}
                 </span>

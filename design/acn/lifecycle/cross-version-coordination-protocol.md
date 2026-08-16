@@ -4,6 +4,7 @@ applies_to:
   - packages/acn-protocol/src/schemas/acn-health.ts
   - packages/sdk/src/acn-jit/local-acn-instance-manager.ts
   - packages/acn/src/server.ts
+  - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/binary.ts
   - packages/acn/src/version.ts
   - packages/sdk/src/version.ts
@@ -39,9 +40,9 @@ CREATE TABLE owner (
 
 There is no persisted revision election, desired version, process history, workflow, lifecycle,
 generation, lease, or compatibility state. Every connection uses SQLite rollback-journal mode and
-`busy_timeout=0`. `SQLITE_BUSY` is the only contention result and callers retry it only within a
-fixed operation deadline. Connections and transactions are short-lived and never represent process
-ownership.
+`busy_timeout=0`. `SQLITE_BUSY` is the only contention result and the owner-store operation resolves
+it only within a fixed deadline. Contention never escapes the owner-store contract. Connections and
+transactions are short-lived and never represent process ownership.
 
 ## Owner value and authority
 
@@ -86,6 +87,11 @@ The transaction contains no HTTP, process inspection, sleep, Effect suspension, 
 application callback, or process launch. Atomic commit exposes either the complete predecessor or
 the complete candidate. Two candidates that observed the same predecessor cannot both commit.
 
+Each owner-store operation returns one validated snapshot or compare-and-replace outcome. Expected
+SQLite contention is resolved within the operation. Failure to open, read, validate, or complete an
+operation surfaces immediately as a typed store failure; consumers never reinterpret it as absence
+and never add their own database retry policy.
+
 ## Required owner endpoint
 
 The exact live process recorded as owner serves:
@@ -124,6 +130,13 @@ scope-owned by its manager. It rereads the expected owner, proves the predecesso
 calls `replaceOwner`. `OwnerChanged` rejects admission and the candidate exits. `Replaced` transfers
 ownership to the row and permits application startup.
 
+Every admitted ACN continuously rereads the complete owner row for its entire admitted lifetime.
+A successful read returning no owner or any value other than that ACN's admitted owner immediately
+begins lifecycle shutdown with reason `ownership-lost`. Any store failure means no trustworthy
+ownership snapshot was produced and immediately begins fatal shutdown. The monitor starts before
+application or ICN initialization and remains scoped to the admitted ACN until shutdown. An exiting
+predecessor never deletes or rewrites a successor's owner row.
+
 Concurrent candidates need no persisted version election. Atomic owner replacement chooses one
 occurrence. If a lower revision wins, a live newer manager subsequently replaces it; if a higher
 revision wins, older managers adopt it. Process death removes revision authority automatically.
@@ -136,6 +149,7 @@ revision wins, older managers adopt it. Process death removes revision authority
 - Two candidates observing the same predecessor cannot both commit.
 - A predecessor row is replaced only after exact predecessor-tree absence proof.
 - Every raw candidate is scope-owned until exact owner publication.
+- Every admitted ACN remains fenced by a mandatory lifetime owner monitor.
 - A lower live revision is replaced only after successor launch material is prepared.
 - An equal or greater live revision is never downgraded by an older client.
 - No stale manager action targets a changed owner or reused PID.

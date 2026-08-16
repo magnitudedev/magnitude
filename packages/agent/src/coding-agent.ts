@@ -679,7 +679,10 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           if (!slotConfig || !slotConfig.isUserOverride) return
           if (slotConfig.providerId === 'local') return
 
-          yield* options.storage.config.updateModelSlot(SlotIdSchema.make(slotId), Option.none()).pipe(
+          yield* options.storage.models.update((current) => ({
+            ...current,
+            slots: { ...current.slots, [SlotIdSchema.make(slotId)]: Option.none() },
+          })).pipe(
             Effect.catchAll(() =>
               Effect.logWarning(`Self-heal: failed to clear override for slot ${slotId}`)
             ),

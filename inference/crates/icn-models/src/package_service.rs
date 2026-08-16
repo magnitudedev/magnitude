@@ -1,16 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use futures_util::future::BoxFuture;
 use icn_contracts::models::{
+    CatalogPackageAffiliation, CatalogPackageRole, InstalledCatalogAttribution,
     InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessment,
-    ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
-    ModelOfferingTarget, ModelOfferingTargetId, ModelPackage, ModelPackageId,
-    ModelPackageInspection, ModelPackageOperand, ModelPackageProperties, ModelPackageSource,
-    ModelTargetInput, RemoveInstalledModelPackageResponse, ResolvedModelTarget,
-    SpeculativeDecodingPairId,
+    ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
+    ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageInstallationOrigin,
+    ModelPackageOperand, ModelPackageProperties, ModelPackageSource, ModelServingConfiguration,
+    ModelServingConfigurationId, RemoveInstalledModelPackageResponse, ResolvedServableModelBundle,
+    ServableModelBundle, ServableModelBundleKey, ServingProfile,
 };
 use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, InventoryError, InventoryModel,
@@ -22,7 +24,10 @@ use sha2::{Digest, Sha256};
 use crate::PreparedPreview;
 use crate::cache::ModelIndexKind;
 use crate::capabilities::model_capabilities;
-use crate::inventory::{InstalledPackageRecord, InstalledPackageSnapshot, ModelManager};
+use crate::inventory::{
+    InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, catalog_packages,
+    catalog_target,
+};
 
 struct ResolvedPackageOperand {
     package: ModelPackage,
@@ -53,7 +58,36 @@ fn file_id(sha256: &str) -> ModelFileId {
     ModelFileId(format!("file_{sha256}"))
 }
 
-fn package_properties(properties: &InventoryProperties) -> ModelPackageProperties {
+fn intrinsic_target_identity(
+    inspected: &[(ComponentRole, crate::gguf::GgufInspection)],
+) -> (Option<String>, Option<String>) {
+    let inspected = inspected
+        .iter()
+        .filter_map(|(role, inspection)| {
+            matches!(role, ComponentRole::Weights | ComponentRole::Shard).then_some(inspection)
+        })
+        .collect::<Vec<_>>();
+    let model_ids = inspected
+        .iter()
+        .filter_map(|inspection| inspection.name.clone())
+        .collect::<BTreeSet<_>>();
+    let quality_ids = inspected
+        .iter()
+        .filter_map(|inspection| inspection.quantization.clone())
+        .collect::<BTreeSet<_>>();
+    let complete = !inspected.is_empty() && model_ids.len() == 1 && quality_ids.len() == 1;
+    if !complete {
+        return (None, None);
+    }
+    (model_ids.into_iter().next(), quality_ids.into_iter().next())
+}
+
+fn package_properties(
+    resolved: &ResolvedModel,
+    inspections: &[(ComponentRole, crate::gguf::GgufInspection)],
+) -> ModelPackageProperties {
+    let properties = &resolved.model.properties;
+    let (intrinsic_model_id, intrinsic_quality_id) = intrinsic_target_identity(inspections);
     match properties {
         InventoryProperties::Inspected {
             architecture,
@@ -68,7 +102,9 @@ fn package_properties(properties: &InventoryProperties) -> ModelPackagePropertie
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned()),
             architecture: architecture.clone().unwrap_or_else(|| "unknown".to_owned()),
-            maximum_context_length: training_context_length.unwrap_or(1).max(1),
+            maximum_context_length: *training_context_length,
+            intrinsic_model_id,
+            intrinsic_quality_id,
         },
         InventoryProperties::Pending | InventoryProperties::Unavailable { .. } => {
             ModelPackageProperties {
@@ -76,7 +112,9 @@ fn package_properties(properties: &InventoryProperties) -> ModelPackagePropertie
                 quantization: "unknown".to_owned(),
                 quantization_name: "unknown".to_owned(),
                 architecture: "unknown".to_owned(),
-                maximum_context_length: 1,
+                maximum_context_length: None,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             }
         }
     }
@@ -130,6 +168,21 @@ pub fn canonical_package_id(
     ModelPackageId(format!("package_{:x}", digest.finalize()))
 }
 
+pub fn serving_configuration_id(
+    bundle_key: &ServableModelBundleKey,
+    profile: &ServingProfile,
+) -> ModelServingConfigurationId {
+    let mut digest = Sha256::new();
+    digest.update(bundle_key.0.as_bytes());
+    digest.update(profile.context_length.to_le_bytes());
+    ModelServingConfigurationId(format!("configuration_{:x}", digest.finalize()))
+}
+
+pub fn serving_configuration_identity_is_valid(configuration: &ModelServingConfiguration) -> bool {
+    let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+    configuration.id == serving_configuration_id(&bundle_key, &configuration.profile)
+}
+
 fn package_relationship(
     relationship: &ComponentRelationship,
     ids_by_declared_path: &BTreeMap<PathBuf, ModelFileId>,
@@ -160,7 +213,7 @@ fn package_relationship(
 fn package_from_resolved_with(
     resolved: &ResolvedModel,
     digest: impl Fn(&Path) -> Result<String, InventoryError>,
-    tensor_storage: impl Fn(&Path, &ContentIdentity) -> Option<u64>,
+    inspect: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
 ) -> Result<ModelPackage, InventoryError> {
     let model = &resolved.model;
     let source = package_source(model, resolved);
@@ -176,8 +229,15 @@ fn package_from_resolved_with(
 
     let mut files = Vec::with_capacity(declared_components.len());
     let mut ids_by_declared_path = BTreeMap::new();
+    let mut inspections = Vec::new();
     for (declared, resolved_component) in declared_components.iter().zip(&resolved.components) {
         let absolute = resolved_component.path.as_path();
+        let inspection = matches!(model.properties, InventoryProperties::Inspected { .. })
+            .then(|| inspect(absolute, &declared.content))
+            .flatten();
+        if let Some(inspection) = inspection.as_ref() {
+            inspections.push((declared.role.clone(), inspection.clone()));
+        }
         let sha256 = match &declared.content {
             ContentIdentity::Sha256 { value }
                 if value.len() == 64
@@ -202,7 +262,7 @@ fn package_from_resolved_with(
                 ComponentRole::Auxiliary => ModelFileRole::Auxiliary,
             },
             size_bytes: declared.size_bytes,
-            tensor_storage_bytes: tensor_storage(absolute, &declared.content),
+            tensor_storage_bytes: inspection.map(|inspection| inspection.tensor_storage_bytes),
             sha256,
         });
     }
@@ -236,7 +296,7 @@ fn package_from_resolved_with(
         }
     }
     relationships.sort_by_key(|relationship| format!("{relationship:?}"));
-    let properties = package_properties(&model.properties);
+    let properties = package_properties(resolved, &inspections);
     let id = canonical_package_id(&files, &relationships);
     Ok(ModelPackage {
         id,
@@ -255,9 +315,7 @@ pub(crate) fn package_from_resolved(
     resolved: &ResolvedModel,
 ) -> Result<ModelPackage, InventoryError> {
     package_from_resolved_with(resolved, digest_file, |path, _| {
-        crate::gguf::inspect(path)
-            .ok()
-            .map(|inspection| inspection.tensor_storage_bytes)
+        crate::gguf::inspect(path).ok()
     })
 }
 
@@ -311,29 +369,241 @@ fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
     }
 }
 
-pub fn offering_target_id(package_ids: &[&ModelPackageId]) -> ModelOfferingTargetId {
+pub fn servable_model_bundle_key(package_ids: &[&ModelPackageId]) -> ServableModelBundleKey {
     let mut digest = Sha256::new();
-    digest.update(b"magnitude-model-offering-target-v1\0");
+    digest.update(b"magnitude-servable-model-bundle-v1\0");
     for package_id in package_ids {
         digest.update(package_id.0.as_bytes());
         digest.update(b"\0");
     }
-    ModelOfferingTargetId(format!("target_{:x}", digest.finalize()))
+    ServableModelBundleKey(format!("bundle_{:x}", digest.finalize()))
 }
 
-fn speculative_pair_id(
+pub fn speculative_servable_model_bundle_key(
     target: &ModelPackageId,
-    draft: &ModelPackageId,
-) -> SpeculativeDecodingPairId {
+    draft: Option<&ModelPackageId>,
+    method: &icn_contracts::models::SpeculativeMethod,
+) -> ServableModelBundleKey {
     let mut digest = Sha256::new();
-    digest.update(b"magnitude-speculative-decoding-pair-v1\0");
+    digest.update(b"magnitude-servable-model-bundle-v2\0speculative\0");
     digest.update(target.0.as_bytes());
     digest.update(b"\0");
-    digest.update(draft.0.as_bytes());
-    SpeculativeDecodingPairId(format!("pair_{:x}", digest.finalize()))
+    digest.update(serde_json::to_vec(method).expect("speculative method is serializable"));
+    digest.update(b"\0");
+    match draft {
+        None => digest.update(b"embedded\0"),
+        Some(draft) => {
+            digest.update(b"separate\0");
+            digest.update(draft.0.as_bytes());
+            digest.update(b"\0");
+        }
+    }
+    ServableModelBundleKey(format!("bundle_{:x}", digest.finalize()))
 }
 
-impl ModelManager {
+pub fn servable_model_bundle_key_for_bundle(
+    bundle: &ServableModelBundle,
+) -> ServableModelBundleKey {
+    match bundle {
+        ServableModelBundle::Standalone { package } => servable_model_bundle_key(&[&package.id]),
+        ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source,
+            method,
+        } => speculative_servable_model_bundle_key(
+            &target.id,
+            match draft_source {
+                icn_contracts::models::SpeculativeDraftSource::Embedded => None,
+                icn_contracts::models::SpeculativeDraftSource::Separate { draft } => {
+                    Some(&draft.id)
+                }
+            },
+            method,
+        ),
+    }
+}
+
+impl ManagedModelStore {
+    fn installed_catalog_attribution(
+        &self,
+        model: &InventoryModel,
+        package: &ModelPackage,
+    ) -> InstalledCatalogAttribution {
+        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
+            return InstalledCatalogAttribution::NotCatalogTarget;
+        }
+
+        let attributed = |model: &icn_contracts::models::RecommendableModel| {
+            InstalledCatalogAttribution::Attributed {
+                model_id: model.model_id.clone(),
+                variant_id: model.variant_id.clone(),
+            }
+        };
+        let failure = |code: &str, message: String| InstalledCatalogAttribution::Failed {
+            failure: ModelFailure {
+                code: code.to_owned(),
+                message,
+                retryable: false,
+            },
+        };
+        let exact = self
+            .config
+            .catalog_models
+            .iter()
+            .filter(|catalog_model| catalog_target(catalog_model).id == package.id)
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            self.remember_catalog_package(exact[0], package, CatalogPackageRole::Target);
+            return attributed(exact[0]);
+        }
+        if exact.len() > 1 {
+            return failure(
+                "catalog_target_package_ambiguous",
+                format!(
+                    "package {} is the current target of multiple catalog variants",
+                    package.id.0
+                ),
+            );
+        }
+
+        let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
+            return failure(
+                "catalog_target_source_missing",
+                "managed catalog model has no Hugging Face target repository".to_owned(),
+            );
+        };
+        let Some(quality) = package.properties.intrinsic_quality_id.as_deref() else {
+            return failure(
+                "catalog_target_identity_missing",
+                "managed catalog model has no intrinsic GGUF quality identity".to_owned(),
+            );
+        };
+
+        let affiliated_keys = self
+            .catalog_affiliations
+            .read()
+            .ok()
+            .map(|affiliations| {
+                affiliations
+                    .entries()
+                    .filter(|affiliation| {
+                        affiliation.role == CatalogPackageRole::Target
+                            && affiliation.repository == *repository
+                    })
+                    .map(|affiliation| {
+                        (affiliation.model_id.clone(), affiliation.variant_id.clone())
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let affiliated = self
+            .config
+            .catalog_models
+            .iter()
+            .filter(|catalog_model| {
+                affiliated_keys.contains(&(
+                    catalog_model.model_id.clone(),
+                    catalog_model.variant_id.clone(),
+                )) && catalog_target(catalog_model)
+                    .properties
+                    .intrinsic_quality_id
+                    .as_deref()
+                    == Some(quality)
+            })
+            .collect::<Vec<_>>();
+        if affiliated.len() == 1 {
+            return attributed(affiliated[0]);
+        }
+        if affiliated.len() > 1 {
+            return failure(
+                "catalog_repository_affiliation_ambiguous",
+                format!(
+                    "repository {repository} and GGUF quality {quality} identify multiple catalog variants"
+                ),
+            );
+        }
+
+        let Some(intrinsic_model_id) = package.properties.intrinsic_model_id.as_deref() else {
+            return failure(
+                "catalog_target_identity_missing",
+                "managed catalog model has no intrinsic GGUF model identity".to_owned(),
+            );
+        };
+        let intrinsic = self
+            .config
+            .catalog_models
+            .iter()
+            .filter(|catalog_model| {
+                catalog_target(catalog_model)
+                    .properties
+                    .intrinsic_model_id
+                    .as_deref()
+                    == Some(intrinsic_model_id)
+                    && catalog_target(catalog_model)
+                        .properties
+                        .intrinsic_quality_id
+                        .as_deref()
+                        == Some(quality)
+            })
+            .collect::<Vec<_>>();
+        if intrinsic.len() == 1 {
+            self.remember_catalog_package(intrinsic[0], package, CatalogPackageRole::Target);
+            return attributed(intrinsic[0]);
+        }
+        if intrinsic.len() > 1 {
+            failure(
+                "catalog_intrinsic_identity_ambiguous",
+                format!(
+                    "intrinsic GGUF identity ({intrinsic_model_id}, {quality}) identifies multiple catalog variants"
+                ),
+            )
+        } else {
+            failure(
+                "catalog_target_unrecognized",
+                format!(
+                    "intrinsic GGUF identity ({intrinsic_model_id}, {quality}) is not in the catalog"
+                ),
+            )
+        }
+    }
+
+    fn remember_catalog_package(
+        &self,
+        catalog_model: &icn_contracts::models::RecommendableModel,
+        package: &ModelPackage,
+        role: CatalogPackageRole,
+    ) {
+        let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
+            return;
+        };
+        let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+            tracing::warn!("catalog affiliation lock poisoned while recording installed package");
+            return;
+        };
+        let added = affiliations.add(CatalogPackageAffiliation {
+            model_id: catalog_model.model_id.clone(),
+            variant_id: catalog_model.variant_id.clone(),
+            package_id: package.id.clone(),
+            repository: repository.clone(),
+            role,
+        });
+        if added {
+            self.catalog_affiliations_dirty
+                .store(true, Ordering::Release);
+        }
+        if self.catalog_affiliations_dirty.load(Ordering::Acquire) {
+            match affiliations.persist(&self.config.root) {
+                Ok(()) => self
+                    .catalog_affiliations_dirty
+                    .store(false, Ordering::Release),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
+                ),
+            }
+        }
+    }
+
     fn seed_package_digests_from_snapshot(
         &self,
         resolved: &ResolvedModel,
@@ -441,35 +711,37 @@ impl ModelManager {
                     );
                 Ok(digest)
             },
-            |path, content| self.inspect_tensor_storage_bytes(path, content),
+            |path, content| self.inspect_gguf(path, content),
         )
     }
 
-    fn tensor_storage_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
-        let evidence = serde_json::to_vec(&(
-            "gguf-tensor-storage-v1",
-            content,
-            path.metadata().ok()?.len(),
-        ))
-        .ok()?;
-        Some(format!("tensor_storage_{:x}", Sha256::digest(evidence)))
+    fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
+        let evidence =
+            serde_json::to_vec(&("gguf-inspection-v1", content, path.metadata().ok()?.len()))
+                .ok()?;
+        Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }
 
-    fn inspect_tensor_storage_bytes(&self, path: &Path, content: &ContentIdentity) -> Option<u64> {
-        let key = Self::tensor_storage_cache_key(path, content)?;
-        if let Some(bytes) = self.cache.read_index(ModelIndexKind::TensorStorage, &key) {
-            return Some(bytes);
+    fn inspect_gguf(
+        &self,
+        path: &Path,
+        content: &ContentIdentity,
+    ) -> Option<crate::gguf::GgufInspection> {
+        let key = Self::gguf_inspection_cache_key(path, content)?;
+        if let Some(inspection) = self.cache.read_index(ModelIndexKind::GgufInspection, &key) {
+            return Some(inspection);
         }
-        let bytes = crate::gguf::inspect(path).ok()?.tensor_storage_bytes;
+        let inspection = crate::gguf::inspect(path).ok()?;
         self.cache
-            .write_index(ModelIndexKind::TensorStorage, &key, &bytes);
-        Some(bytes)
+            .write_index(ModelIndexKind::GgufInspection, &key, &inspection);
+        Some(inspection)
     }
 
     pub(crate) fn build_installed_package_snapshot(
         &self,
         models: &BTreeMap<icn_contracts::ModelId, InventoryModel>,
     ) -> Result<InstalledPackageSnapshot, InventoryError> {
+        self.retry_catalog_affiliation_persistence();
         let mut records = BTreeMap::new();
         for model in models.values() {
             if !matches!(
@@ -486,10 +758,28 @@ impl ModelManager {
             };
             self.seed_package_digests_from_snapshot(&resolved)?;
             let package = self.package_from_resolved(&resolved)?;
+            for catalog_model in &self.config.catalog_models {
+                for (catalog_package, role) in catalog_packages(catalog_model) {
+                    if catalog_package.id == package.id {
+                        self.remember_catalog_package(catalog_model, &package, role);
+                    }
+                }
+            }
             let installed = InstalledModelPackage {
-                target_id: offering_target_id(&[&package.id]),
                 path: installed_path(model, &resolved),
+                origin: match &model.location {
+                    ModelLocation::MagnitudeCache { .. } => {
+                        ModelPackageInstallationOrigin::Magnitude
+                    }
+                    ModelLocation::HuggingFaceCache { .. } => {
+                        ModelPackageInstallationOrigin::HuggingFaceCache
+                    }
+                    ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
+                        ModelPackageInstallationOrigin::Magnitude
+                    }
+                },
                 inspection: inspection_for(model),
+                catalog_attribution: self.installed_catalog_attribution(model, &package),
                 package,
             };
             records.insert(
@@ -501,6 +791,25 @@ impl ModelManager {
             );
         }
         Ok(InstalledPackageSnapshot { records })
+    }
+
+    fn retry_catalog_affiliation_persistence(&self) {
+        if !self.catalog_affiliations_dirty.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(affiliations) = self.catalog_affiliations.read() else {
+            tracing::warn!("catalog affiliation lock poisoned while retrying persistence");
+            return;
+        };
+        match affiliations.persist(&self.config.root) {
+            Ok(()) => self
+                .catalog_affiliations_dirty
+                .store(false, Ordering::Release),
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
+            ),
+        }
     }
 
     #[must_use]
@@ -681,58 +990,77 @@ impl ModelManager {
     }
 }
 
-impl InstalledModelPackages for ModelManager {
+impl InstalledModelPackages for ManagedModelStore {
     fn list_installed(
         &self,
     ) -> BoxFuture<'_, Result<InstalledModelPackagesResponse, InventoryError>> {
-        Box::pin(async move {
-            self.installed_packages
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-                })
-                .map(|snapshot| snapshot.response())
-        })
+        Box::pin(async move { self.installed_packages_response() })
     }
 
-    fn resolve_target(
+    fn resolve_bundle(
         &self,
-        target: ModelTargetInput,
-    ) -> BoxFuture<'_, Result<ResolvedModelTarget, InventoryError>> {
+        bundle: ModelBundleInput,
+    ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>> {
         Box::pin(async move {
-            match target {
-                ModelTargetInput::Package { package } => {
+            match bundle {
+                ModelBundleInput::Standalone { package } => {
                     let resolved = self.resolve_package_operand(package).await?;
-                    let target_id = offering_target_id(&[&resolved.package.id]);
-                    let target = ModelOfferingTarget::Package {
+                    let bundle_key = servable_model_bundle_key(&[&resolved.package.id]);
+                    let bundle = ServableModelBundle::Standalone {
                         package: resolved.package,
                     };
                     let mut result =
-                        ResolvedModelTarget::new(target_id, target, resolved.model, None);
+                        ResolvedServableModelBundle::new(bundle_key, bundle, resolved.model, None);
                     if let Some(guard) = resolved.resolution_guard {
                         result = result.retain_resolution_guard(guard);
                     }
                     Ok(result)
                 }
-                ModelTargetInput::SpeculativeDecodingPair { target, draft } => {
+                ModelBundleInput::SpeculativeDecoding {
+                    target,
+                    draft_source,
+                    method,
+                } => {
                     let target = self.resolve_package_operand(target).await?;
-                    let draft = self.resolve_package_operand(draft).await?;
-                    let pair_id = speculative_pair_id(&target.package.id, &draft.package.id);
-                    let target_id = offering_target_id(&[&target.package.id, &draft.package.id]);
-                    let mut result = ResolvedModelTarget::new(
-                        target_id,
-                        ModelOfferingTarget::SpeculativeDecodingPair {
-                            id: pair_id,
-                            target: target.package,
-                            draft: draft.package,
-                        },
+                    let (draft_source, draft_model, draft_guard) = match draft_source {
+                        icn_contracts::models::SpeculativeDraftSourceInput::Embedded => (
+                            icn_contracts::models::SpeculativeDraftSource::Embedded,
+                            None,
+                            None,
+                        ),
+                        icn_contracts::models::SpeculativeDraftSourceInput::Separate { draft } => {
+                            let resolved = self.resolve_package_operand(draft).await?;
+                            if resolved.package.id == target.package.id {
+                                return Err(InventoryError::InvalidRequest(
+                                    "a separate speculative draft must be distinct from its target"
+                                        .to_owned(),
+                                ));
+                            }
+                            (
+                                icn_contracts::models::SpeculativeDraftSource::Separate {
+                                    draft: resolved.package,
+                                },
+                                Some(resolved.model),
+                                resolved.resolution_guard,
+                            )
+                        }
+                    };
+                    let bundle = ServableModelBundle::SpeculativeDecoding {
+                        target: target.package,
+                        draft_source,
+                        method,
+                    };
+                    let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
+                    let mut result = ResolvedServableModelBundle::new(
+                        bundle_key,
+                        bundle,
                         target.model,
-                        Some(draft.model),
+                        draft_model,
                     );
                     if let Some(guard) = target.resolution_guard {
                         result = result.retain_resolution_guard(guard);
                     }
-                    if let Some(guard) = draft.resolution_guard {
+                    if let Some(guard) = draft_guard {
                         result = result.retain_resolution_guard(guard);
                     }
                     Ok(result)
@@ -763,9 +1091,11 @@ mod tests {
     use std::path::PathBuf;
 
     use icn_contracts::ComponentRelationship;
-    use icn_contracts::models::{ModelFileId, ModelFileRelationship, SpeculativeMethod};
+    use icn_contracts::models::{
+        ModelFileId, ModelFileRelationship, ModelPackageId, SpeculativeMethod,
+    };
 
-    use super::{package_relationship, shard_count};
+    use super::{package_relationship, shard_count, speculative_servable_model_bundle_key};
 
     #[test]
     fn shard_count_uses_one_based_component_indices() {
@@ -786,7 +1116,7 @@ mod tests {
             &ComponentRelationship::DraftFor {
                 draft,
                 model: target,
-                method: SpeculativeMethod::DraftDFlash,
+                method: SpeculativeMethod::DFlash,
             },
             &ids,
         );
@@ -794,9 +1124,30 @@ mod tests {
         assert!(matches!(
             relationship,
             Some(ModelFileRelationship::DraftFor {
-                method: SpeculativeMethod::DraftDFlash,
+                method: SpeculativeMethod::DFlash,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn speculative_bundle_identity_includes_source_method_and_separate_draft() {
+        let target = ModelPackageId("target".to_owned());
+        let draft = ModelPackageId("draft".to_owned());
+        let embedded =
+            speculative_servable_model_bundle_key(&target, None, &SpeculativeMethod::Mtp);
+        let dflash = speculative_servable_model_bundle_key(
+            &target,
+            Some(&draft),
+            &SpeculativeMethod::DFlash,
+        );
+        let dspark = speculative_servable_model_bundle_key(
+            &target,
+            Some(&draft),
+            &SpeculativeMethod::DSpark,
+        );
+
+        assert_ne!(embedded, dflash);
+        assert_ne!(dflash, dspark);
     }
 }

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest"
 import { ProcessStartIdentitySchema } from "../acn-identity"
 import { BunSqliteDriverLayer } from "./bun"
 import { makeAcnOwnerStore } from "./owner-store"
+import { SqliteDriver, SqliteDriverFailure } from "./sqlite-driver"
 
 const platform = Layer.merge(BunContext.layer, BunSqliteDriverLayer)
 
@@ -74,6 +75,48 @@ describe("ACN coordination database", () => {
 
     expect(result.filter((value) => value._tag === "Replaced")).toHaveLength(1)
     expect(result.filter((value) => value._tag === "OwnerChanged")).toHaveLength(1)
+  })
+
+  test("resolves transient SQLite contention inside the store operation", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const owners = yield* makeAcnOwnerStore(root)
+      yield* owners.current
+
+      const database = yield* Effect.acquireRelease(
+        Effect.sync(() => new Database(join(root, "acn", "coordination.sqlite"))),
+        (database) => Effect.sync(() => database.close()),
+      )
+      yield* Effect.sync(() => database.exec("BEGIN IMMEDIATE"))
+      yield* Effect.sleep("50 millis").pipe(
+        Effect.zipRight(Effect.sync(() => database.exec("ROLLBACK"))),
+        Effect.forkScoped,
+      )
+
+      expect(yield* owners.replaceOwner(Option.none(), owner("winner", 42_001))).toEqual({
+        _tag: "Replaced",
+      })
+    }).pipe(Effect.provide(platform))))
+  })
+
+  test("surfaces actual database failures without retrying them", async () => {
+    let attempts = 0
+    const failingDriver = Layer.succeed(SqliteDriver, {
+      open: () => Effect.sync(() => {
+        attempts += 1
+      }).pipe(Effect.zipRight(Effect.fail(new SqliteDriverFailure({
+        operation: "open",
+        message: "test failure",
+      })))),
+    })
+
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const owners = yield* makeAcnOwnerStore(root)
+      return yield* Effect.either(owners.current)
+    }).pipe(Effect.provide(Layer.merge(BunContext.layer, failingDriver))))
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left._tag).toBe("AcnProcessStoreUnavailable")
+    expect(attempts).toBe(1)
   })
 
   test("fails typed instead of treating an incompatible owner table as absence", async () => {

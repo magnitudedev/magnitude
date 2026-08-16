@@ -122,6 +122,44 @@ mutation success  !=  operation success
 transport success !=  query visibility
 ```
 
+When submitted input completely determines an immediate user-facing value, presentation may
+project the latest pending mutation over the authoritative query result. This optimistic value is
+a derived view of command intent, not copied server state and not a query-cache write. Rejection
+removes the pending projection and reveals the unchanged query value. Success keeps the mutation
+pending through synchronization so the refreshed authoritative value replaces the projection
+without exposing a stale intermediate value.
+
+Synchronization validates the mutation's exact acknowledgement contract in the refreshed query,
+not merely that a fetch completed. When a command returns an admitted occurrence or commits an
+exact selection, mutation success requires that same identity and postcondition to be visible.
+Dependent Effects may then consume the command output without a separate `seen` flag or timing
+assumption.
+
+### Client-side services
+
+A client-owned use case may span several backend domains without becoming an ACN operation. When
+that use case has meaningful in-memory state, concurrency, and cancellation, client-common owns one
+client-lifetime service. The service represents its owned state with keep-alive Effect Atoms,
+exposes passive derived state and Effect operations, and composes semantic lower client services.
+
+Each command is one Effect program. Every step consumes the exact value returned by the preceding
+step; it never infers identity from mutation recency or an unrelated query fact. The public state
+atom joins only service-owned causal identities with canonical lower queries. It is observational,
+and it never copies lower lifecycle or progress into writable client state.
+
+Client-owned in-memory state is not put into Effect Query merely to make the API resemble a remote
+domain: that would create a redundant cache and mutation registry. This pattern introduces neither
+a workflow engine nor a second query runtime. The Effect Query client composition root may host
+ordinary service Layers, but Query and Mutation semantics gain no workflow or composition
+primitive. A concrete service is justified only by a real stateful client-owned use case. Ordinary
+one-shot composition remains an ordinary Effect.
+
+The materialization boundary and responsibilities of lower ACN-backed services, composed services,
+hooks, and UI are defined by
+[Client query and mutation abstraction](../patterns/query-atom-abstraction.md). Their identity,
+dependency graph, and renderer lifetime are defined by
+[Client dependency injection](../patterns/client-di.md).
+
 ## Queries
 
 Queries observe state or compose observations. They never request product change.
@@ -143,6 +181,21 @@ A query defines:
 - retry and cancellation;
 - composition; and
 - observational failure.
+
+Query cache lifetime is distinct from observer lifetime. A canonical query entry owns its retained
+result, fetch status, freshness/invalidation state, and in-flight coordination as one lifecycle.
+The canonical entry is the query object returned to consumers: keyed lookup must retain and return
+that same object, never an unretained wrapper whose collection can silently recreate the query.
+Unmounting the last observer schedules collection according to the entry's retention policy; it
+must not discard only part of the entry or recreate an empty observation on remount. While retained,
+equivalent reads reuse the same result and concurrent fetches join the same work. Invalidation is
+idempotent with respect to active replacement work: repeated notifications may advance freshness,
+but they do not fan out parallel snapshot reads.
+
+Fetch and prefetch obey freshness: they return or preserve a fresh retained result, join active
+work, and execute only for missing or stale state. Refetch is the explicit operation that forces
+new observational work. A mutation that changes query authority invalidates the affected query
+before fetching the synchronized snapshot.
 
 ```text
 mount / read / refetch / watch
@@ -318,17 +371,49 @@ local interaction  -> presentation atom
 - Shared atoms choose disposable or keep-alive lifetime intentionally.
 - CLI, web, and desktop share state behavior through client-common.
 
+Effect Query is the client cache and command-state authority for a subsystem that adopts it.
+A subsystem defines each query and mutation once in client-common as static domain values whose
+Effects require the stable ACN RPC client service. One connection-scoped Effect Query client
+provides that service and materializes definitions into query and mutation atoms. Components
+consume those atoms; they do not construct runtimes or wrap them in parallel request atoms or
+writable status state.
+
+Mutation states are retained per invocation and keyed by the mutation definition and, when
+concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports
+concurrent installations of different configurations while serializing duplicate commands for the
+same configuration. Pending and failure presentation is selected from those exact mutation states.
+It is never represented by a singleton `installingId`, `busy`, or error side channel.
+
+Mutation success includes synchronization with every canonical query whose visibility is promised
+by the command. A command that admits a download remains pending until a fresh local-model snapshot
+shows that exact configuration with either the admitted model-download identity or installed
+acquisition. Mutation synchronization does not wait for the admitted download or later provider
+publication to finish; progress, physical completion, and serving readiness remain authoritative
+query state consumed by the dependent Effect.
+
+Adoption is vertical and explicit. A subsystem may use Effect Query while unrelated subsystems
+continue to use AtomRpc queries and mutations. Within an adopted subsystem, however, there is one
+canonical query cache and one mutation-state registry; mixing a second cache or command-state
+mechanism for the same data is prohibited.
+
 ### AgentClient and RPC
 
 ```text
 component
-   +-- query definition ----> AgentClient ----> ACN query
-   +-- mutation definition -> AgentClient ----> ACN mutation
-                                      ^
-                                      +-- watch invalidates query
+   +-- static query definition ----> Effect Query client ----> ACN RPC service
+   +-- static mutation definition -> Effect Query client ----> ACN RPC service
+                                                ^
+                                                +-- watch invalidates query
 ```
 
-- One AgentClient owns transport recovery, query state, and mutation state.
+- The ACN RPC service owns typed transport access, not query or mutation state.
+- One Effect Query client per connection owns the Atom runtime, query cache, and mutation history.
+- Definitions are transport-using Effects but are independent of connection and runtime lifetime.
+- AtomRpc and Effect Query may serve different domains over the same transport during migration;
+  adopted domains do not use AtomRpc or the mirror cache as a second state authority.
+- The generic mirror abstraction is not implemented on top of Effect Query. Domains migrate
+  vertically and delete their mirror ownership once query, mutation, and invalidation semantics
+  have moved together.
 - Components do not own RPC clients, request caches, retries, or invalidation wiring.
 - Mutation receipts may await query visibility; they do not create another resource state.
 - Reconnection preserves client state and rereads authoritative ACN state.
@@ -389,11 +474,13 @@ durable product intent --command--> physical admitted occurrence
 hardware query ----> fit/load advice ----> fresh validation at mutation admission
 ```
 
-- Slot selection, instance lifecycle, hardware topology, downloads, and catalog state remain
+- Slot selection, model residency, hardware topology, downloads, and catalog state remain
   independent authorities.
-- ACN projects exact ICN instance state; it never authors `Loading`, `Ready`, or `Stopping`.
-- Load/stop addresses the retained exact instance identity.
-- Mutation pending and response progress never substitute for instance lifecycle.
+- ACN authors `Requested` residency and otherwise projects current ICN instance truth into the
+  slot's single residency lifecycle.
+- Client load and stop address a slot; ACN resolves physical commands to the retained exact
+  instance identity.
+- Client mutation pending and response progress never substitute for authoritative residency.
 - Loading repeats current hardware and package validation at ICN admission.
 
 ### Providers, files, skills, and external systems
@@ -451,6 +538,11 @@ local view    = f(presentation state)
 ```
 
 Components compose these views; they do not merge them into another authority.
+
+A client-owned composite workflow exposes its canonical operation state directly to presentation.
+Consumers must not decompose that state and reconstruct its phase from mutation waiting and later
+query snapshots. The workflow state may present that a command has been requested immediately;
+authoritative resource progress and lifecycle still come only from the correlated query state.
 
 Client synchronization is declarative:
 

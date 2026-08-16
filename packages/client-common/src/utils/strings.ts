@@ -15,36 +15,92 @@ export function stripTrailingLineBreaks(content: string): string {
   return content.replace(/[\r\n]+$/u, '')
 }
 
-export function wrapTextToVisualLines(text: string, maxWidth: number): string[] {
+const splitWordToVisualLines = (word: string, maxWidth: number): string[] => {
+  const lines: string[] = []
+  let current = ''
+  let currentWidth = 0
+  for (const char of word) {
+    const charWidth = Math.max(1, stringWidth(char))
+    if (current.length > 0 && currentWidth + charWidth > maxWidth) {
+      lines.push(current)
+      current = char
+      currentWidth = charWidth
+    } else {
+      current += char
+      currentWidth += charWidth
+    }
+  }
+  if (current.length > 0) lines.push(current)
+  return lines
+}
+
+export function wrapTextToWordLines(text: string, maxWidth: number): string[] {
   const safeWidth = Math.max(1, Math.floor(maxWidth))
-  const segments = text.split('\n')
+  const paragraphs = text.replace(/\r\n?/gu, '\n').split('\n')
   const lines: string[] = []
 
-  for (const segment of segments) {
-    if (segment.length === 0) {
+  for (const paragraph of paragraphs) {
+    const words = paragraph.trim().split(/\s+/u).filter(Boolean)
+    if (words.length === 0) {
       lines.push('')
       continue
     }
 
     let current = ''
     let currentWidth = 0
-
-    for (const char of segment) {
-      const charWidth = Math.max(1, stringWidth(char))
-      if (currentWidth + charWidth > safeWidth) {
-        lines.push(current)
-        current = char
-        currentWidth = charWidth
+    for (const word of words) {
+      const wordWidth = stringWidth(word)
+      if (wordWidth > safeWidth) {
+        if (current.length > 0) {
+          lines.push(current)
+          current = ''
+          currentWidth = 0
+        }
+        const chunks = splitWordToVisualLines(word, safeWidth)
+        lines.push(...chunks.slice(0, -1))
+        current = chunks.at(-1) ?? ''
+        currentWidth = stringWidth(current)
+      } else if (current.length === 0) {
+        current = word
+        currentWidth = wordWidth
+      } else if (currentWidth + 1 + wordWidth <= safeWidth) {
+        current += ` ${word}`
+        currentWidth += 1 + wordWidth
       } else {
-        current += char
-        currentWidth += charWidth
+        lines.push(current)
+        current = word
+        currentWidth = wordWidth
       }
     }
-
-    lines.push(current)
+    if (current.length > 0) lines.push(current)
   }
 
   return lines
+}
+
+const ellipsizeWordLine = (line: string, maxWidth: number): string => {
+  const safeWidth = Math.max(1, Math.floor(maxWidth))
+  if (getDisplayWidth(`${line}…`) <= safeWidth) return `${line}…`
+  const words = line.split(' ')
+  while (words.length > 1) {
+    words.pop()
+    const candidate = `${words.join(' ')}…`
+    if (getDisplayWidth(candidate) <= safeWidth) return candidate
+  }
+  return truncateToDisplayWidth(`${line}…`, safeWidth)
+}
+
+export function clampTextToVisualLines(
+  text: string,
+  maxWidth: number,
+  maxLines: number,
+): string {
+  const safeLines = Math.max(1, Math.floor(maxLines))
+  const lines = wrapTextToWordLines(text, maxWidth)
+  if (lines.length <= safeLines) return lines.join('\n')
+  const visible = lines.slice(0, safeLines)
+  visible[safeLines - 1] = ellipsizeWordLine(visible[safeLines - 1]!, maxWidth)
+  return visible.join('\n')
 }
 
 export function getDisplayWidth(text: string): number {

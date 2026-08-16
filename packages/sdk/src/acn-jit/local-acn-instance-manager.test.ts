@@ -263,6 +263,127 @@ describe("LocalAcnInstanceManager", () => {
     }).pipe(Effect.provide(platform))))
   })
 
+  it("reports retained stderr when its admitted daemon exits before readiness", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-admitted-exit-" })
+      const processFixture = yield* makeExactProcessFixture
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      let admissions = 0
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
+      }).pipe(
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.gen(function* () {
+            const expected = yield* owners.current
+            const replaced = yield* owners.replaceOwner(
+              expected,
+              { ...processFixture.exact, port: 49_152 },
+            )
+            if (replaced._tag !== "Replaced") {
+              return yield* Effect.dieMessage("candidate was not admitted")
+            }
+            return {
+              pid: processFixture.exact.pid,
+              exited: Effect.succeed({ code: 17, stderr: "fatal startup detail" }),
+              admit: Effect.sync(() => {
+                admissions += 1
+                processFixture.stop()
+              }),
+            }
+          }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+        })),
+      )
+
+      const result = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.either)
+      expect(result).toMatchObject({
+        _tag: "Left",
+        left: {
+          reason: `Magnitude daemon ${processFixture.exact.pid} exited with code 17 after admission before it became ready:\nfatal startup detail`,
+        },
+      })
+      expect(admissions).toBe(1)
+    }).pipe(Effect.provide(platform))))
+  })
+
+  it("reports an admitted daemon exit after another owner replaces its row", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-replaced-owner-exit-" })
+      const current = yield* ExactProcessControllerLive.current
+      const candidate = current
+      const successor = { ...current, pid: current.pid + 1 }
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      const successorId = AcnInstanceIdSchema.make("successor-owner")
+      const controller = ExactProcessController.of({
+        inspect: (pid) => Effect.succeed(
+          pid === candidate.pid || pid === successor.pid
+            ? Option.some(current.processStartIdentity)
+            : Option.none(),
+        ),
+        current: Effect.succeed(current),
+        signal: () => Effect.succeed(false),
+        signalTree: () => Effect.succeed(false),
+        treeAbsent: () => Effect.succeed(false),
+      })
+      const http = HttpClient.make((request) => Effect.succeed(
+        request.url.includes(":49153/")
+          ? HttpClientResponse.fromWeb(request, Response.json(
+              Schema.encodeSync(AcnHealthResponseSchema)({
+                service: "magnitude-acn",
+                version: SDK_VERSION,
+                revision: SDK_ACN_TARGET.revision,
+                id: successorId,
+                pid: successor.pid,
+                state: new AcnReady({}),
+              }),
+            ))
+          : HttpClientResponse.fromWeb(request, new Response("starting", { status: 503 })),
+      ))
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http),
+        Effect.provideService(ExactProcessController, controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.gen(function* () {
+            const replaced = yield* owners.replaceOwner(
+              yield* owners.current,
+              { ...candidate, port: 49_152 },
+            )
+            if (replaced._tag !== "Replaced") {
+              return yield* Effect.dieMessage("candidate was not admitted")
+            }
+            return {
+              pid: candidate.pid,
+              exited: Effect.succeed({ code: 23, stderr: "original daemon failed" }),
+              admit: owners.replaceOwner(
+                Option.some({ ...candidate, port: 49_152 }),
+                { ...successor, port: 49_153 },
+              ).pipe(
+                Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) })),
+                Effect.flatMap((result) => result._tag === "Replaced"
+                  ? Effect.void
+                  : Effect.dieMessage("successor did not replace admitted candidate")),
+              ),
+            }
+          }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+        })),
+      )
+
+      const result = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.either)
+      expect(result).toMatchObject({
+        _tag: "Left",
+        left: {
+          reason: `Magnitude daemon ${candidate.pid} exited with code 23 after admission before it became ready:\noriginal daemon failed`,
+        },
+      })
+    }).pipe(Effect.provide(platform))))
+  })
+
   it("stops cleanly without an owner and never resolves or spawns", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem

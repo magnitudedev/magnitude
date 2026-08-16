@@ -5,6 +5,7 @@ import { testRender } from "@opentui/react/test-utils"
 import { act } from "react"
 import { LocalInferenceAcceleratorIdSchema, LocalInferenceMemoryDomainIdSchema } from "@magnitudedev/sdk"
 import { GIB, makeHardware, makeView } from "../local-inference/test-fixtures"
+import { defaultCliThemes } from "../../utils/theme"
 
 const textPosition = (frame: string, needle: string) => {
   const lines = frame.split("\n")
@@ -59,19 +60,7 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
 }))
 
 vi.mock("../../hooks/use-theme", () => ({
-  useTheme: () => ({
-    primary: "blue",
-    foreground: "white",
-    muted: "gray",
-    success: "green",
-    error: "red",
-    warning: "yellow",
-    border: "gray",
-    secondary: "gray",
-    info: "cyan",
-    link: "blue",
-    terminalDetectedBg: "black",
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { SettingsOverlay } = await import("./settings")

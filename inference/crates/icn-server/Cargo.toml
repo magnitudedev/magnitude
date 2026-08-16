@@ -19,7 +19,7 @@ icn-contracts.workspace = true
 icn-engine.workspace = true
 icn-hardware.workspace = true
 icn-models.workspace = true
-icn-mtp.workspace = true
+icn-speculative.workspace = true
 icn-reasoning.workspace = true
 libc.workspace = true
 libloading = "0.8.9"
@@ -41,12 +41,12 @@ tracing-subscriber.workspace = true
 
 [features]
 default = ["mtmd", "dynamic-backends"]
-cuda = ["icn-engine/cuda", "icn-hardware/cuda", "icn-mtp/cuda"]
-cuda-no-vmm = ["icn-engine/cuda-no-vmm", "icn-hardware/cuda-no-vmm", "icn-mtp/cuda-no-vmm"]
+cuda = ["icn-engine/cuda", "icn-hardware/cuda", "icn-speculative/cuda"]
+cuda-no-vmm = ["icn-engine/cuda-no-vmm", "icn-hardware/cuda-no-vmm", "icn-speculative/cuda-no-vmm"]
 dynamic-backends = ["llama-cpp-2/dynamic-backends"]
-metal = ["icn-engine/metal", "icn-hardware/metal", "icn-mtp/metal"]
+metal = ["icn-engine/metal", "icn-hardware/metal", "icn-speculative/metal"]
 mtmd = ["icn-engine/mtmd", "icn-hardware/mtmd"]
-vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-mtp/vulkan"]
+vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-speculative/vulkan"]
 
 [dev-dependencies]
 tempfile = "3.24.0"
@@ -58,7 +58,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
-    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

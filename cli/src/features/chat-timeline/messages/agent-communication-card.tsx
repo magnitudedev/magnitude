@@ -46,7 +46,7 @@ const ExpandedContent = memo(function ExpandedContent({
     <box style={{ flexDirection: 'column' }}>
       <MarkdownContent content={text} contentWidth={contentWidth} onOpenFile={onFileClick} />
       {wasTruncated && (
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.supporting }}>
           …{hiddenCount} lines hidden. Content capped at {EXPANDED_LINE_CAP} lines
         </text>
       )}
@@ -102,19 +102,19 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
           <span attributes={TextAttributes.BOLD}>✉ </span>
           {message.direction === 'from_agent' ? (
             <>
-              <span fg={theme.info} attributes={TextAttributes.BOLD}>Lead</span>
+              <span fg={theme.status.information} attributes={TextAttributes.BOLD}>Lead</span>
               <span attributes={TextAttributes.BOLD}> → </span>
-              <span fg={theme.secondary} attributes={TextAttributes.BOLD}>
+              <span fg={theme.text.supporting} attributes={TextAttributes.BOLD}>
                 {roleDisplay}
               </span>
             </>
           ) : (
             <>
-              <span fg={theme.secondary} attributes={TextAttributes.BOLD}>
+              <span fg={theme.text.supporting} attributes={TextAttributes.BOLD}>
                 {roleDisplay}
               </span>
               <span attributes={TextAttributes.BOLD}> → </span>
-              <span fg={theme.info} attributes={TextAttributes.BOLD}>Lead</span>
+              <span fg={theme.status.information} attributes={TextAttributes.BOLD}>Lead</span>
             </>
           )}
         </text>
@@ -133,7 +133,7 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
             onMouseOver={() => setHovered(true)}
             onMouseOut={() => setHovered(false)}
           >
-            <text style={{ fg: hovered ? theme.foreground : theme.muted }}>
+            <text style={{ fg: hovered ? theme.text.body : theme.text.supporting }}>
               {expanded ? '⌃ Collapse' : '⌄ Expand'}
             </text>
           </Button>

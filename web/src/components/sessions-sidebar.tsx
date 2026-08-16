@@ -77,7 +77,7 @@ function SessionContextMenu({
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const { startNewSession } = useSessionActions()
-  const deleteMutation = useAtomSet(client.mutation("DeleteSession"), { mode: "promise" })
+  const deleteMutation = useAtomSet(client.rpc.mutation("DeleteSession"), { mode: "promise" })
 
   // Close on any click outside — attached in onContextMenu, but we also
   // handle it with a backdrop click here

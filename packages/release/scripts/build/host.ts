@@ -23,6 +23,7 @@ import {
   currentHost,
   hostById,
   icnBaseArchive,
+  releaseBuildEnvironment,
   type HostId,
 } from "../../src/targets"
 import { buildAcnBinary } from "./acn"
@@ -31,6 +32,7 @@ import {
   buildArchive,
   type ArchiveSource,
   run,
+  verifyAppleDeploymentTarget,
   verifyOwnedLoaderPaths,
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
@@ -269,6 +271,7 @@ export const buildHostArtifacts = async (
     target: host.bunTarget,
     profile: `base-${host.id}`,
     features: host.cargoFeatures,
+    buildEnvironment: releaseBuildEnvironment(host),
   })
   const cpuModules = icn.backendModules.filter((file) =>
     basename(file).toLowerCase().includes("cpu")
@@ -282,6 +285,13 @@ export const buildHostArtifacts = async (
     modules: cpuModules,
     runtime: icn.runtimeLibraries,
   })
+  await verifyAppleDeploymentTarget(host.id, [
+    cli,
+    acn,
+    icn.binary,
+    ...icn.runtimeLibraries,
+    ...cpuModules,
+  ])
 
   if (host.id.startsWith("darwin-")) {
     for (const file of [icn.binary, ...icn.runtimeLibraries, ...cpuModules]) {

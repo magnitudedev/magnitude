@@ -325,7 +325,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     recoveryPolicy: acnRpcRecoveryPolicy,
   })
 
-  yield* lifecycle.report({ _tag: "Starting", phase: "Discovering" })
+  yield* lifecycle.report({ _tag: "Starting", phase: "PreparingAcn" })
   yield* Effect.forkIn(endpoint.pipe(Effect.ignore), selectionScope)
 
   const prepare = lifecycle.get.pipe(
@@ -341,7 +341,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
       : Effect.succeed(state)),
   )
 
-  const retry = lifecycle.report({ _tag: "Starting", phase: "Discovering" }).pipe(
+  const retry = lifecycle.report({ _tag: "Starting", phase: "PreparingAcn" }).pipe(
     Effect.zipRight(endpoint),
     Effect.mapError((error) => error._tag === "AcnRuntimeClosed"
       ? new AcnEnsuranceFailed({ reason: "ACN client runtime is closed" })

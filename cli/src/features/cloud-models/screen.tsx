@@ -65,9 +65,9 @@ const CloudConfiguredScreen = memo(function CloudConfiguredScreen({
 
   return (
     <box style={{ height: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-      <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>CLOUD MODELS</text>
-      <text style={{ fg: theme.success }} attributes={TextAttributes.BOLD}>Magnitude Cloud is configured.</text>
-      <text style={{ fg: theme.muted }}>Cloud models are ready.</text>
+      <text style={{ fg: theme.accent }} attributes={TextAttributes.BOLD}>CLOUD MODELS</text>
+      <text style={{ fg: theme.status.success }} attributes={TextAttributes.BOLD}>Magnitude Cloud is configured.</text>
+      <text style={{ fg: theme.text.supporting }}>Cloud models are ready.</text>
       <box style={{ paddingTop: 1 }}>
         <Button
           onClick={onExit}
@@ -76,12 +76,12 @@ const CloudConfiguredScreen = memo(function CloudConfiguredScreen({
         >
           <box style={{
             borderStyle: "single",
-            borderColor: closeHovered ? theme.primary : theme.border,
+            borderColor: closeHovered ? theme.accent : theme.border.standard,
             customBorderChars: BOX_CHARS,
             paddingLeft: 1,
             paddingRight: 1,
           }}>
-            <text style={{ fg: closeHovered ? theme.primary : theme.foreground }}>Close (Esc)</text>
+            <text style={{ fg: closeHovered ? theme.accent : theme.text.body }}>Close (Esc)</text>
           </box>
         </Button>
       </box>

@@ -1,6 +1,7 @@
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
+import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Duration from "effect/Duration"
 import * as EffectData from "effect/Data"
 import * as Effect from "effect/Effect"
@@ -24,6 +25,8 @@ import {
 } from "./Model.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Query")
+const SetInputTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Query/setInput")
+const OptionsTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Query/options")
 
 export interface State<Data, Error> {
   readonly result: AtomResult.Result<Data, Error>
@@ -47,8 +50,7 @@ export interface Query<Input, Data, Error, Requirements> extends QueryDefinition
     readonly requirements: Requirements
   }
   readonly name: string
-  (input: Input): QueryAtom<Input, Data, Error, Requirements>
-  readonly atom: (input: Input) => QueryAtom<Input, Data, Error, Requirements>
+  readonly [OptionsTypeId]: unknown
   readonly match: {
     (): QueryFilter
     (input: Input): QueryFilter
@@ -85,15 +87,6 @@ export type Options<Input, Data, Error, Requirements> = CommonOptions<Input, Err
   readonly effect: (input: Input) => Effect.Effect<Data, Error, Requirements>
 }
 
-export interface Factory<Provided, RuntimeError> {
-  readonly make: {
-    <Input, Data, Error, Required extends Provided>(
-      name: string,
-      options: Options<Input, Data, Error, Required>
-    ): Query<Input, Data, Error | RuntimeError, Required>
-  }
-}
-
 interface Control<Data> {
   readonly invalidation: number
   readonly acceptedInvalidation: number
@@ -102,6 +95,7 @@ interface Control<Data> {
   readonly overrideRequest: number
   readonly failureCount: number
   readonly cancelled: boolean
+  readonly refetchRequest: Option.Option<number>
 }
 
 interface FetchedValue<Data> {
@@ -124,14 +118,37 @@ const normalizeInterrupted = <A, E>(result: AtomResult.Result<A, E>): AtomResult
   })
 }
 
-const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required extends Provided>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+export const make = <Input, Data, Error, Requirements>(
   name: string,
-  options: Options<Input, Data, Error, Required>
-): Query<Input, Data, Error | RuntimeError, Required> => {
+  options: Options<Input, Data, Error, Requirements>
+): Query<Input, Data, Error, Requirements> => {
+  let definition!: Query<Input, Data, Error, Requirements>
+  const keyFor = (input: Input): QueryKey => {
+    const key = options.key(input)
+    if ((typeof key === "object" && key !== null) && !Equal.isEqual(key)) {
+      throw new TypeError(`Query ${name} returned a structured key without Effect Equal semantics`)
+    }
+    return key
+  }
+  definition = {
+    [QueryDefinitionTypeId]: true,
+    [OptionsTypeId]: options,
+    name,
+    match: (input?: Input): QueryFilter => input === undefined
+      ? { definition }
+      : { definition, key: keyFor(input), exact: true }
+  }
+  return definition
+}
+
+export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Required extends Provided | Reactivity.Reactivity>(
+  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  definition: Query<Input, Data, Error, Required>
+): ((input: Input) => QueryAtom<Input, Data, Error | RuntimeError, Required>) => {
+  const { name } = definition
+  const options = definition[OptionsTypeId] as Options<Input, Data, Error, Required>
   const staleTime = Duration.toMillis(Duration.decode(options.staleTime ?? 0))
   const gcTime = options.gcTime ?? Duration.minutes(5)
-  let definition!: Query<Input, Data, Error | RuntimeError, Required>
   const keyFor = (input: Input): QueryKey => {
     const key = options.key(input)
     if ((typeof key === "object" && key !== null) && !Equal.isEqual(key)) {
@@ -149,18 +166,20 @@ const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required ext
   const family = Atom.family((identity: QueryKey) => {
     let canonicalInput!: Input
     let hasCanonicalInput = false
-    const control = Atom.make<Control<Data>>({
+    const retain = <A extends Atom.Atom<any>>(atom: A): A => Atom.setIdleTTL(atom, gcTime)
+    const control = retain(Atom.make<Control<Data>>({
       invalidation: 0,
       acceptedInvalidation: -1,
       override: Option.none(),
       overrideUpdatedAt: Option.none(),
       overrideRequest: -1,
       failureCount: 0,
-      cancelled: false
-    })
-    const request = Atom.make(0)
+      cancelled: false,
+      refetchRequest: Option.none()
+    }))
+    const request = retain(Atom.make(0))
 
-    const fetched = runtime.atom((get) => {
+    const fetched = retain(runtime.atom((get) => {
       const requestId = get(request)
       const captured = get.once(control)
       const registry = get.registry
@@ -179,14 +198,23 @@ const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required ext
           core.touch()
           queueMicrotask(() => {
             if (!registry.getNodes().has(control)) return
-            registry.update(control, (current) => ({
-              ...current,
-              failureCount: exit._tag === "Success" ? 0 : current.failureCount + 1
-            }))
+            if (registry.get(request) !== requestId) return
+            let refetch = false
+            registry.update(control, (current) => {
+              refetch = !current.cancelled && current.invalidation > captured.invalidation
+              return {
+                ...current,
+                failureCount: exit._tag === "Success" ? 0 : current.failureCount + 1,
+                refetchRequest: refetch
+                  ? Option.some(requestId + 1)
+                  : Option.none()
+              }
+            })
+            if (refetch) registry.update(request, (value) => value + 1)
           })
         }))
       )
-    })
+    }))
 
     const scheduler = options.refresh === undefined ? undefined : runtime.atom((get) => {
       const registry = get.registry
@@ -240,7 +268,7 @@ const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required ext
         failureCount: current.failureCount
       })
     }, (refresh) => refresh(fetched))
-    atom = Atom.setIdleTTL(atom, gcTime)
+    atom = retain(atom)
 
     entry = {
       stateAtom: atom,
@@ -256,12 +284,30 @@ const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required ext
         const result = registry.get(atom).result
         return result._tag === "Failure" ? Option.some(result.cause) : Option.none()
       },
-      start: (registry) => {
-        registry.update(control, (current) => ({ ...current, cancelled: false }))
-        registry.update(request, (value) => value + 1)
+      start: (registry, options) => {
+        const status = entry.state(registry).fetchStatus
+        const nextRequest = registry.get(request) + 1
+        let shouldStart = status !== "fetching"
+        registry.update(control, (current) => {
+          if (status === "fetching" && options?.cancelRefetch === true && Option.isNone(current.refetchRequest)) {
+            shouldStart = true
+          }
+          return {
+            ...current,
+            cancelled: false,
+            refetchRequest: shouldStart && status === "fetching"
+              ? Option.some(nextRequest)
+              : current.refetchRequest
+          }
+        })
+        if (shouldStart) registry.update(request, () => nextRequest)
       },
       cancel: (registry) => {
-        registry.update(control, (current) => ({ ...current, cancelled: true }))
+        registry.update(control, (current) => ({
+          ...current,
+          cancelled: true,
+          refetchRequest: Option.none()
+        }))
         registry.update(request, (value) => value + 1)
       },
       invalidate: (registry) => {
@@ -288,40 +334,30 @@ const makeDefinition = <Provided, RuntimeError, Input, Data, Error, Required ext
       hasData: (registry) => Option.isSome(AtomResult.value(registry.get(atom).result)),
       getData: (registry) => AtomResult.value(registry.get(atom).result)
     }
-    return {
-      atom: Object.assign(atom, { [QueryEntryTypeId]: entry, definition, get input() { return canonicalInput } }),
-      setInput: (input: Input) => {
+    const atomWithInput = Object.defineProperty(atom, "input", {
+      get: () => canonicalInput,
+      enumerable: true,
+      configurable: false
+    }) as typeof atom & { readonly input: Input }
+    return Object.assign(atomWithInput, {
+      [QueryEntryTypeId]: entry,
+      definition,
+      [SetInputTypeId]: (input: Input) => {
         if (!hasCanonicalInput) {
           canonicalInput = input
           hasCanonicalInput = true
         }
       }
-    }
+    })
   })
 
-  const callable = (input: Input) => {
+  return (input: Input) => {
     const identity = keyFor(input)
-    const entry = family(identity)
-    entry.setInput(input)
-    return entry.atom
+    const atom = family(identity)
+    atom[SetInputTypeId](input)
+    return atom
   }
-  Object.defineProperty(callable, "name", { value: name, configurable: true })
-  definition = Object.assign(callable, {
-    [QueryDefinitionTypeId]: true as const,
-    atom: callable,
-    match: (input?: Input): QueryFilter => input === undefined
-      ? { definition }
-      : { definition, key: keyFor(input), exact: true }
-  })
-  return definition
 }
-
-export const bind = <Provided, RuntimeError>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>
-): Factory<Provided, RuntimeError> => ({
-  make: ((name: string, options: Options<unknown, unknown, unknown, Provided>) =>
-    makeDefinition(runtime, name, options)) as Factory<Provided, RuntimeError>["make"]
-})
 
 export const select = <Input, Data, Error, Requirements, Selected>(
   query: QueryAtom<Input, Data, Error, Requirements>,

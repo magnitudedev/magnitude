@@ -1,6 +1,7 @@
 import { expect, test, vi } from "vitest"
 import { act } from "react"
 import { testRender } from "@opentui/react/test-utils"
+import { defaultCliThemes } from "../../utils/theme"
 
 const saveApiKey = vi.fn()
 
@@ -19,14 +20,7 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
 }))
 
 vi.mock("../../hooks/use-theme", () => ({
-  useTheme: () => ({
-    primary: "blue",
-    foreground: "white",
-    muted: "gray",
-    success: "green",
-    error: "red",
-    border: "gray",
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { CloudModelsScreen } = await import("./screen")
