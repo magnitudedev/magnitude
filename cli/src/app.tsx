@@ -414,7 +414,24 @@ function CliAppContent(
     });
     switch (state._tag) {
       case "Choosing": return chooser(null, "Select a model to start coding…");
-      case "Preparing":
+      case "Preparing": {
+        const acquisition = state.model.acquisitionState;
+        if (acquisition._tag !== "Installed") {
+          const starting = acquisition._tag !== "Downloading";
+          return chooser({
+            _tag: "Downloading",
+            model: state.model,
+            starting,
+            cancelling: state.cancelling,
+            cancelError,
+            onCancel: cancelOnboardingModelSetup,
+          }, `${starting ? "Starting download for" : "Downloading"} ${formatLocalModelDisplayName(state.model)}…`);
+        }
+        return chooser({
+          _tag: "Configuring",
+          model: state.model,
+        }, `Configuring ${formatLocalModelDisplayName(state.model)}…`);
+      }
       case "Configuring": return chooser({
         _tag: "Configuring",
         model: state.model,

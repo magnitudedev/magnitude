@@ -32,14 +32,16 @@ describe("onboarding model chooser identity", () => {
     expect(onboardingModelDetailRows({
       recommendation: false,
       memoryWarning: false,
-      statusRows: 2,
-    })).toBe(22)
+      downloadRows: 0,
+      descriptionRadarGap: true,
+    })).toBe(19)
     expect(onboardingModelDetailRows({
       recommendation: false,
-      memoryWarning: true,
-      statusRows: 5,
-    })).toBe(26)
-    expect(ONBOARDING_MODEL_DETAIL_ROWS).toBe(26)
+      memoryWarning: false,
+      downloadRows: 4,
+      descriptionRadarGap: true,
+    })).toBe(23)
+    expect(ONBOARDING_MODEL_DETAIL_ROWS).toBe(23)
   })
 
   it("lets local models fill the remaining wide-layout rows", () => {
@@ -49,7 +51,7 @@ describe("onboarding model chooser identity", () => {
       detailPanelRows: ONBOARDING_MODEL_DETAIL_ROWS,
       downloadRows: 5,
       sectionGap: 1,
-    })).toBe(19)
+    })).toBe(16)
     expect(onboardingLocalModelViewportRows({
       wide: false,
       localCount: 12,
