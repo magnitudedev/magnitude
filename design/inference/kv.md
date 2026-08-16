@@ -64,6 +64,11 @@ A sampled token is likewise uncommitted until decode or speculative verification
 Every committed boundary records both logical tokens (for progress and capacity) and native
 positions (for KV removal and continuation). They differ for M-RoPE media.
 
+For linked speculation, those values are also the two cache coordinates: target KV uses the native
+position and draft KV uses the logical token position. The binding accepts both coordinates for
+mirroring, drafting, verification, rollback, and trimming. It never derives draft position from
+target position or from text-only token history.
+
 ## Retention policy
 
 | Terminal condition | Reusable state |
@@ -74,10 +79,15 @@ positions (for KV removal and continuation). They differ for M-RoPE media.
 | Native cleanup failure | Quarantine the sequence |
 | Shared target/draft failure | Reset contexts; invalidate available prefixes; return active sequences empty |
 
-Speculative execution retains only at aligned target/draft boundaries. Native positions, including
-positions consumed by media embeddings, govern rollback and continuation; token-history length is
-not a position. Media encoding and its embedding decodes form one commit operation: failure or
-cancellation invalidates ambiguous native state rather than retaining a partial image.
+Speculative execution retains only at linked target/draft boundaries. Its checkpoint is a single
+state variant containing both native sequence snapshots and any method-owned state; target plus an
+optional draft snapshot is not a valid state. Media encoding and its embedding decodes form one
+commit operation: failure or cancellation invalidates ambiguous native state rather than retaining
+a partial image.
+
+Checkpoint policy may request a logical position inside a media span, but that is not a legal
+semantic boundary. The prompt layout advances such a request to the end of the indivisible media
+span so the cache can retain the completed image without representing partial media state.
 
 ## Capacity
 

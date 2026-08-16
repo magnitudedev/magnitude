@@ -104,6 +104,13 @@ committed only when a later decode or speculative-verification step accepts it.
 Multimodal projector execution supports only speculative methods that can advance from embedding
 sub-batches; MTP is rejected during configuration validation.
 
+Linked speculative execution carries two explicit coordinates at every boundary: the target's
+native position and the draft context's consecutive logical-token position. Text-only execution
+advances them together. M-RoPE media may advance the target coordinate differently, so the binding
+mirrors target batch rows through a lightweight position view rather than passing target positions
+to the draft model. Draft preparation, verification, rollback, and trimming consume the same
+linked boundary; there is no independently inferred draft cursor.
+
 Prepared prompts use one semantic representation for text-only and multimodal requests. Text spans
 contain exact model tokens; media spans contain a stable content identity, their logical
 token cost, and their native position cost. Exact media spans can therefore reuse resident KV just
@@ -136,6 +143,9 @@ An available native sequence carries its optional reusable prefix as one owned v
 chooses the longest exact semantic match and transfers the sequence into active ownership. Native
 KV never leaves llama.cpp. Logical token counts drive capacity and progress; native positions drive
 KV trimming and continuation, including M-RoPE prompts where those values differ.
+When speculation is active, a reusable checkpoint is one value containing the linked boundary and
+a binding-owned prompt state with target state, draft state, and any method-owned state. A
+target-only or partially restored speculative checkpoint is not representable.
 
 Cancellation and stream disconnection do not make committed semantic state ambiguous. They
 preserve it when cache policy permits. See [KV state reuse](./kv.md) for invalidation rules.
@@ -179,3 +189,4 @@ explicit approval under the inference fork-maintenance policy.
   explicit and is delegated to the pinned native implementation.
 - Target and draft state advance atomically. Failure after either side advances resets both before
   the sequence can be reused.
+- Every speculative operation uses an explicit target-native/draft-sequential position pair.
