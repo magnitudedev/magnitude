@@ -490,10 +490,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           onboarding.snapshot,
         ),
 
-      UpdateOnboardingState: ({ completed }) =>
+      CompleteOnboarding: () =>
         observeRpcDefects(
-          "UpdateOnboardingState",
-          onboarding.update(completed).pipe(Effect.as({})),
+          "CompleteOnboarding",
+          onboarding.complete.pipe(Effect.as({})),
         ),
 
       // Server-side operations

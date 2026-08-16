@@ -37,8 +37,14 @@ interface FavoriteInput {
   readonly favorite: boolean
 }
 
-const slotScope = (slotId: SlotId): Mutation.MutationScope =>
-  Mutation.MutationScope(`model-slot:${slotId}`)
+const slotSelectionScope = (slotId: SlotId): Mutation.MutationScope =>
+  Mutation.MutationScope(`model-slot-selection:${slotId}`)
+
+const slotLoadScope = (slotId: SlotId): Mutation.MutationScope =>
+  Mutation.MutationScope(`model-slot-load:${slotId}`)
+
+const slotStopScope = (slotId: SlotId): Mutation.MutationScope =>
+  Mutation.MutationScope(`model-slot-stop:${slotId}`)
 
 const favoriteScope = ({ providerId, providerModelId }: ProviderModelIdentity) =>
   Mutation.MutationScope(`model-favorite:${providerId}:${providerModelId}`)
@@ -95,7 +101,7 @@ export const selectedModelStopIsVisible = (
 }
 
 const assignMutation = Mutation.make("AssignSlot", {
-  scope: ({ slotId }: AssignmentInput) => slotScope(slotId),
+  scope: ({ slotId }: AssignmentInput) => slotSelectionScope(slotId),
   effect: ({ slotId, selection }: AssignmentInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("AssignSlot", { slotId, selection })),
   synchronize: (_, { slotId, selection }) => synchronizeModelSlots().pipe(
@@ -111,14 +117,14 @@ const assignMutation = Mutation.make("AssignSlot", {
 })
 
 const clearMutation = Mutation.make("ClearSlot", {
-  scope: ({ slotId }: SlotInput) => slotScope(slotId),
+  scope: ({ slotId }: SlotInput) => slotSelectionScope(slotId),
   effect: ({ slotId }: SlotInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("ClearSlot", { slotId })),
   synchronize: () => synchronizeModelSlots().pipe(Effect.asVoid),
 })
 
 const loadMutation = Mutation.make("LoadModel", {
-  scope: ({ slotId }: SlotInput) => slotScope(slotId),
+  scope: ({ slotId }: SlotInput) => slotLoadScope(slotId),
   effect: ({ slotId }: SlotInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("LoadModel", { slotId })),
   synchronize: (_, { slotId }) => synchronizeModelSlots().pipe(
@@ -134,7 +140,7 @@ const loadMutation = Mutation.make("LoadModel", {
 })
 
 const stopMutation = Mutation.make("StopModel", {
-  scope: ({ slotId }: SlotInput) => slotScope(slotId),
+  scope: ({ slotId }: SlotInput) => slotStopScope(slotId),
   effect: ({ slotId }: SlotInput) =>
     Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("StopModel", { slotId })),
   synchronize: (_, { slotId }) => synchronizeModelSlots().pipe(
@@ -214,6 +220,7 @@ const makeModelSlots = Effect.gen(function* () {
     assignResult,
     clearResult,
     favoriteResult,
+    retry: queryClient.invalidate(modelSlotsQuery.match()),
     assign: (slotId: SlotId, selection: SlotSelection) =>
       Mutation.execute(assign, { slotId, selection }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),

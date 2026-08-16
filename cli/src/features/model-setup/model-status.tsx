@@ -29,7 +29,6 @@ type ConfirmationChoice = "yes" | "no"
 export interface OnboardingModelDownloadOperation {
   readonly starting: boolean
   readonly cancelling: boolean
-  readonly cancelError: string | null
   readonly onCancel: () => void
 }
 
@@ -180,11 +179,6 @@ export function OnboardingModelDownloadProgress({
           </>
         ) : (
           <>
-            {operation.cancelError && (
-              <text style={{ fg: theme.status.failure, flexGrow: 1, minWidth: 0 }} wrapMode="none">
-                {operation.cancelError}
-              </text>
-            )}
             {cancelable && (
               <Button
                 onClick={() => {

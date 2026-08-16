@@ -1,9 +1,13 @@
+import { act } from "react"
+import { testRender } from "@opentui/react/test-utils"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
+import { Result } from "@effect-atom/atom-react"
 import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   makeAcquiringModel,
   makeCatalogModel,
+  makeHardware,
   makeModel,
   makeRecommendation,
   makeView,
@@ -12,6 +16,7 @@ import {
   ONBOARDING_MODEL_DETAIL_ROWS,
   onboardingLocalModelViewportRows,
   onboardingModelActionLabel,
+  OnboardingModelChooser,
   onboardingModelDetailRows,
   onboardingSelectionEnterAction,
   onboardingModelRowName,
@@ -21,6 +26,56 @@ import {
 import { buildLocalInferenceSelections } from "../local-inference/view-model"
 
 describe("onboarding model chooser identity", () => {
+  it("renders the empty choice state without dereferencing a selection", async () => {
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[]}
+        width={120}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toContain("No compatible models found.")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("keeps exact active-operation detail visible when discovery options are empty", async () => {
+    const model = makeModel()
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[]}
+        width={120}
+        error={null}
+        operation={{ _tag: "Configuring", model }}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Qwen Test (Q4)")
+      expect(frame).toContain("Configuring model…")
+      expect(frame).not.toContain("No compatible models found.")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
   it("describes the Enter action from the selected model state", () => {
     expect(onboardingSelectionEnterAction("recommendation")).toBe("download")
     expect(onboardingSelectionEnterAction("stored")).toBe("load")
@@ -141,7 +196,6 @@ describe("onboarding model chooser identity", () => {
       model,
       starting: false,
       cancelling: false,
-      cancelError: null,
       onCancel: () => undefined,
     }
     expect(operation._tag === "Downloading" && operation.model).toBe(model)

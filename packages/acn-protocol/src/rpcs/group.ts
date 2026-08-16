@@ -53,7 +53,7 @@ const ReplaySafeDemandRpcs = RpcGroup.make(
   LocalInference.LocalModelsMirror.getRpc,
   LocalInference.PreviewModelLoad,
   Onboarding.OnboardingMirror.getRpc,
-  Onboarding.UpdateOnboardingState,
+  Onboarding.CompleteOnboarding,
   Files.ListFiles,
   Files.ReadFile,
   Files.CheckFileExists,

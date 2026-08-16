@@ -10,7 +10,11 @@ import {
   MagnitudeRpcs,
   ProviderModelCatalogMirror,
 } from "@magnitudedev/sdk"
-import { clientServicesLayer, type ClientServices } from "./client-services"
+import {
+  clientServicesLayer,
+  type ClientServices,
+  type ClientServicesOptions,
+} from "./client-services"
 import { runMirroredStateInvalidationWatch } from "./mirrored-state-invalidation"
 
 export type AgentClientInstance = ReturnType<typeof createAgentClient>
@@ -24,6 +28,7 @@ class AcnAtomRpcClient {}
  */
 export function createAgentClient(
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
+  options: ClientServicesOptions = {},
 ) {
   const runtime = Atom.context({ memoMap: Effect.runSync(Layer.makeMemoMap) })
   const rpc = AtomRpc.Tag<AcnAtomRpcClient>()("AcnRpc", {
@@ -47,7 +52,7 @@ export function createAgentClient(
   const rpcLayer = Layer.effect(AcnRpcClientTag, rpc).pipe(Layer.provide(rpc.layer))
   const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
     rpcLayer,
-    (client) => clientServicesLayer(client),
+    (client) => clientServicesLayer(client, options),
   )
   return { rpc, effectQuery }
 }

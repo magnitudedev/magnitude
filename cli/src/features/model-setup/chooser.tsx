@@ -283,7 +283,6 @@ export type OnboardingModelChooserOperation =
       readonly model: LocalModel
       readonly starting: boolean
       readonly cancelling: boolean
-      readonly cancelError: string | null
       readonly onCancel: () => void
     }
   | {
@@ -293,7 +292,7 @@ export type OnboardingModelChooserOperation =
   | {
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
-      readonly displayName: string
+      readonly model: LocalModel
       readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
       readonly failure: ModelInstanceFailure | null
       readonly onRetry: () => void
@@ -372,7 +371,8 @@ export function OnboardingModelChooser({
   error,
   operation,
   onSelect,
-  onSkip,
+  onExit,
+  exitKind,
 }: {
   readonly hardware: LocalInferenceHardwareResult
   readonly options: readonly LocalModelOption[]
@@ -380,7 +380,8 @@ export function OnboardingModelChooser({
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
   readonly onSelect: (configurationId: ModelServingConfigurationId) => void
-  readonly onSkip: () => void
+  readonly onExit: () => void
+  readonly exitKind: "Skip" | "Close"
 }): ReactNode {
   const theme = useTheme()
   const { selections, downloads, local } = useMemo(() => {
@@ -402,18 +403,21 @@ export function OnboardingModelChooser({
       ? Option.exists(localModelConfigurationId(operation.model), (configurationId) =>
           Option.contains(selectionConfigurationId(selection), configurationId))
       : Option.contains(selectionProviderModelId(selection), operation.providerModelId))?.id)
-  const selectedIndex = selectedInferenceIndex(
-    selections,
-    Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
-  )
+  const selectedIndex = operation !== null && Option.isNone(activeSelectionId)
+    ? -1
+    : selectedInferenceIndex(
+        selections,
+        Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
+      )
   const selected = selections[selectedIndex]
-  const selectedMemory = selected?.model.servingState._tag === "Assessed"
-    && selected.model.servingState.assessment._tag === "Fits"
-    ? Option.some(selected.model.servingState.assessment.memory)
+  const detailModel = operation?.model ?? selected?.model
+  const selectedMemory = detailModel?.servingState._tag === "Assessed"
+    && detailModel.servingState.assessment._tag === "Fits"
+    ? Option.some(detailModel.servingState.assessment.memory)
     : Option.none<LocalModelMemory>()
-  const selectedRadarAxes = selected === undefined
+  const selectedRadarAxes = detailModel === undefined
     ? Option.none()
-    : localModelRadarAxes(selected.model)
+    : localModelRadarAxes(detailModel)
   const locked = operation !== null
   const cardWidth = setupCardWidth(width)
   const wide = cardWidth >= WIDE_CHOOSER_MIN_WIDTH
@@ -486,9 +490,9 @@ export function OnboardingModelChooser({
     }
     if (key.name === "escape") {
       key.preventDefault()
-      onSkip()
+      onExit()
     }
-  }, [choose, locked, moveSelectionTo, onSkip, selected, selectedIndex, selections.length]))
+  }, [choose, locked, moveSelectionTo, onExit, selected, selectedIndex, selections.length]))
 
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
@@ -554,22 +558,21 @@ export function OnboardingModelChooser({
           ? "! Heavy memory use: Limited memory remains for other apps"
           : null,
   })
-  const discovered = selected?.model.catalogMembershipState._tag !== "InCatalog"
-    ? {
-        location: discoveredModelLocation(selected.model),
-      }
+  const discoveredLocation = detailModel !== undefined
+      && detailModel.catalogMembershipState._tag !== "InCatalog"
+    ? discoveredModelLocation(detailModel)
     : null
-  const modelSummary = selected === undefined
+  const modelSummary = detailModel === undefined
     ? ""
-    : selected.model.catalogMembershipState._tag === "InCatalog"
-        && selected.model.servingState._tag === "Assessed"
+    : detailModel.catalogMembershipState._tag === "InCatalog"
+        && detailModel.servingState._tag === "Assessed"
       ? formatModelClassification(
-          selected.model.catalogMembershipState.catalogData.parameterization,
-          selected.model.servingState.capabilities.vision,
+          detailModel.catalogMembershipState.catalogData.parameterization,
+          detailModel.servingState.capabilities.vision,
         )
-      : discovered === null
+      : discoveredLocation === null
         ? ""
-        : `DISCOVERED MODEL · ${discovered.location}`
+        : `DISCOVERED MODEL · ${discoveredLocation}`
   const recommendationBodyRows = Math.max(
     1,
     RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
@@ -585,11 +588,11 @@ export function OnboardingModelChooser({
     && selected.recommendations.length > 0
     && operation?._tag !== "Downloading"
   const emptySelectionMessage = "No compatible models found."
-  const regularDetails = selected ? (
+  const regularDetails = detailModel ? (
     <>
       <DetailRow width={detailWidth}>
         <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
-          {truncateToDisplayWidth(onboardingModelRowName(selected), titleNameWidth)}
+          {truncateToDisplayWidth(formatLocalModelDisplayName(detailModel), titleNameWidth)}
         </text>
         {titleMetadata && (
           <text style={{ fg: theme.text.supporting }} wrapMode="none">
@@ -667,7 +670,7 @@ export function OnboardingModelChooser({
   )
   const detailsContent = operation?._tag === "Activating" ? (
     <OnboardingModelLoadingDetails
-      displayName={operation.displayName}
+      displayName={formatLocalModelDisplayName(operation.model)}
       width={detailWidth}
       height={detailContentRows}
       phase={operation.phase}
@@ -695,9 +698,10 @@ export function OnboardingModelChooser({
     </box>
   )
   const enterAction = onboardingSelectionEnterAction(selected?.kind)
+  const exitHint = exitKind === "Close" ? "close setup" : "skip for now"
   const selectionHint = enterAction === null
-    ? "Esc skip for now"
-    : `↑/↓ choose · Enter to ${enterAction} · Esc skip for now`
+    ? `Esc ${exitHint}`
+    : `↑/↓ choose · Enter to ${enterAction} · Esc ${exitHint}`
   const interactionHint = operation?._tag === "Downloading"
       ? operation.starting
         ? "Starting download…"
@@ -751,13 +755,15 @@ export function OnboardingModelPreparation({
   progress,
   error,
   width,
-  onSkip,
+  onExit,
+  exitKind,
 }: {
   readonly hardware: LocalInferenceHardwareResult
   readonly progress: readonly LocalModelRecommendationProgressStep[]
   readonly error: string | null
   readonly width: number
-  readonly onSkip: () => void
+  readonly onExit: (() => void) | undefined
+  readonly exitKind: "Skip" | "Close" | null
 }): ReactNode {
   const theme = useTheme()
   const lines = localInferenceProgressLines(progress)
@@ -768,11 +774,11 @@ export function OnboardingModelPreparation({
   )
   const cardWidth = setupCardWidth(width)
   useKeyboard(useCallback((key: KeyEvent) => {
-    if (key.name === "escape") {
+    if (key.name === "escape" && onExit !== undefined) {
       key.preventDefault()
-      onSkip()
+      onExit()
     }
-  }, [onSkip]))
+  }, [onExit]))
   return (
     <OnboardingSetupCard
       cardWidth={cardWidth}
@@ -790,7 +796,34 @@ export function OnboardingModelPreparation({
       ))}
       {error && <text style={{ fg: theme.status.failure }}>{error}</text>}
       <box style={{ height: 1 }} />
-      <text style={{ fg: theme.text.supporting }}>Esc skip for now</text>
+      {exitKind !== null && (
+        <text style={{ fg: theme.text.supporting }}>
+          {exitKind === "Close" ? "Esc close setup" : "Esc skip for now"}
+        </text>
+      )}
+    </OnboardingSetupCard>
+  )
+}
+
+export function OnboardingModelExiting({
+  hardware,
+  width,
+}: {
+  readonly hardware: LocalInferenceHardwareResult
+  readonly width: number
+}): ReactNode {
+  const theme = useTheme()
+  const spinner = useSpinnerFrame(true)
+  return (
+    <OnboardingSetupCard
+      cardWidth={setupCardWidth(width)}
+      title="Finishing onboarding"
+      hardware={hardware}
+      spinnerFrame={spinner}
+    >
+      <text style={{ fg: theme.text.body }}>{spinner} Saving onboarding completion…</text>
+      <box style={{ height: 1 }} />
+      <text style={{ fg: theme.text.supporting }}>Setup will close when this finishes.</text>
     </OnboardingSetupCard>
   )
 }

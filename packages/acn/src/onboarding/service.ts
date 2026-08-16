@@ -13,7 +13,7 @@ export interface OnboardingApi {
   readonly state: Effect.Effect<OnboardingState, OnboardingError>
   readonly snapshot: Effect.Effect<MirroredSnapshot<OnboardingState>>
   readonly changes: Stream.Stream<MirroredSnapshot<OnboardingState>>
-  readonly update: (completed: boolean) => Effect.Effect<void, OnboardingError>
+  readonly complete: Effect.Effect<void, OnboardingError>
 }
 
 export class Onboarding extends Context.Tag("Onboarding")<Onboarding, OnboardingApi>() {}
@@ -35,9 +35,9 @@ export const makeOnboarding = (storage: OnboardingStorage): OnboardingPersistenc
 
   return {
     state,
-    update: (completed) => storage.update(() => ({ completed })).pipe(
+    complete: storage.update((current) => current.completed ? current : { completed: true }).pipe(
       Effect.asVoid,
-      Effect.mapError((cause) => onboardingError("update onboarding state", cause)),
+      Effect.mapError((cause) => onboardingError("complete onboarding", cause)),
     ),
   }
 }
@@ -64,7 +64,7 @@ export const OnboardingLive: Layer.Layer<
       state: mirror.get.pipe(Effect.map(({ state }) => state)),
       snapshot: mirror.get,
       changes: mirror.changes,
-      update: (completed) => persisted.update(completed).pipe(Effect.zipRight(refresh)),
+      complete: persisted.complete.pipe(Effect.zipRight(refresh)),
     })
   }),
 )
