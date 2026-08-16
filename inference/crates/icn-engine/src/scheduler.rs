@@ -1,12 +1,31 @@
 use std::collections::VecDeque;
 
 use llama_cpp_2::LlamaSequenceState;
+use llama_cpp_2::speculative::{SpeculativePosition, SpeculativePromptState};
 use llama_cpp_2::token::LlamaToken;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PromptBoundary {
     pub(crate) logical_tokens: usize,
     pub(crate) native_position: i32,
+}
+
+impl PromptBoundary {
+    pub(crate) fn speculative_position(self) -> Option<SpeculativePosition> {
+        Some(SpeculativePosition {
+            target: self.native_position,
+            draft: i32::try_from(self.logical_tokens).ok()?,
+        })
+    }
+
+    pub(crate) fn advance(self, tokens: usize) -> Option<Self> {
+        Some(Self {
+            logical_tokens: self.logical_tokens.checked_add(tokens)?,
+            native_position: self
+                .native_position
+                .checked_add(i32::try_from(tokens).ok()?)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +208,45 @@ impl PromptLayout {
         (boundary.logical_tokens == logical_tokens).then_some(boundary)
     }
 
+    /// Return the first legal semantic boundary at or after a requested logical position.
+    ///
+    /// Text can be split token-by-token. Media cannot, so a position inside a media span advances
+    /// to the end of that span instead of inventing a partially reusable media boundary.
+    pub(crate) fn boundary_at_or_after(&self, logical_tokens: usize) -> Option<PromptBoundary> {
+        let mut boundary = PromptBoundary::default();
+        for segment in &self.segments {
+            let segment_tokens = segment.logical_tokens();
+            let segment_end = boundary.logical_tokens.checked_add(segment_tokens)?;
+            if segment_end < logical_tokens {
+                boundary.logical_tokens = segment_end;
+                boundary.native_position = boundary
+                    .native_position
+                    .checked_add(segment.native_positions())?;
+                continue;
+            }
+            if logical_tokens <= boundary.logical_tokens {
+                return Some(boundary);
+            }
+            match segment {
+                PromptSegment::Text(_) => {
+                    let within = logical_tokens.checked_sub(boundary.logical_tokens)?;
+                    boundary.logical_tokens = boundary.logical_tokens.checked_add(within)?;
+                    boundary.native_position = boundary
+                        .native_position
+                        .checked_add(i32::try_from(within).ok()?)?;
+                }
+                PromptSegment::Media { .. } => {
+                    boundary.logical_tokens = segment_end;
+                    boundary.native_position = boundary
+                        .native_position
+                        .checked_add(segment.native_positions())?;
+                }
+            }
+            return Some(boundary);
+        }
+        (boundary.logical_tokens == logical_tokens).then_some(boundary)
+    }
+
     pub(crate) fn prefix(&self, boundary: PromptBoundary) -> Option<Self> {
         if self.boundary_at(boundary.logical_tokens)? != boundary {
             return None;
@@ -215,9 +273,14 @@ impl PromptLayout {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum PromptCheckpointState {
+    Target(LlamaSequenceState),
+    Speculative(SpeculativePromptState),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PromptCheckpoint {
-    pub(crate) target: LlamaSequenceState,
-    pub(crate) draft: Option<LlamaSequenceState>,
+    pub(crate) state: PromptCheckpointState,
     pub(crate) boundary: PromptBoundary,
 }
 
@@ -433,6 +496,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_position_preserves_target_and_draft_coordinate_systems() {
+        let boundary = PromptBoundary {
+            logical_tokens: 4_096,
+            native_position: 137,
+        };
+        assert_eq!(
+            boundary.speculative_position(),
+            Some(SpeculativePosition {
+                target: 137,
+                draft: 4_096,
+            })
+        );
+        assert_eq!(
+            boundary.advance(3),
+            Some(PromptBoundary {
+                logical_tokens: 4_099,
+                native_position: 140,
+            })
+        );
+    }
+
+    #[test]
     fn decode_work_always_precedes_prefill() {
         let mut planner = BatchPlanner::new(2);
         let plan = planner.plan(
@@ -621,12 +706,20 @@ mod tests {
         let cached = multimodal_layout("image-a", &[1, 2], 576, 1, &[3, 4]);
         let incoming = multimodal_layout("image-a", &[1, 2], 576, 1, &[3, 9]);
 
+        let boundary = cached.common_prefix(&incoming);
         assert_eq!(
-            cached.common_prefix(&incoming),
+            boundary,
             PromptBoundary {
                 logical_tokens: 2 + 576 + 1,
                 native_position: 2 + 1 + 1,
             }
+        );
+        assert_eq!(
+            boundary.speculative_position(),
+            Some(SpeculativePosition {
+                target: 4,
+                draft: 579,
+            })
         );
     }
 
@@ -656,6 +749,26 @@ mod tests {
                     native_position: 32,
                 })
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn checkpoint_inside_media_advances_to_the_next_semantic_boundary() {
+        let layout = multimodal_layout("image-a", &[1, 2], 512, 32, &[3, 4]);
+
+        assert_eq!(
+            layout.boundary_at_or_after(128),
+            Some(PromptBoundary {
+                logical_tokens: 514,
+                native_position: 34,
+            })
+        );
+        assert_eq!(
+            layout.boundary_at_or_after(515),
+            Some(PromptBoundary {
+                logical_tokens: 515,
+                native_position: 35,
+            })
         );
     }
 

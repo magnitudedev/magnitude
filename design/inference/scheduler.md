@@ -79,6 +79,12 @@ batching for other resident sequences. Multimodal and speculative preparation sh
 machine; target and draft state remain natively linked. Each successful multimodal embedding
 sub-batch is processed speculatively before a later decode may depend on it.
 
+Batch assembly records one draft-sequential position for every target row. The binding preserves
+the target batch's token or embedding storage, sequence IDs, row order, and logits flags while
+substituting only that position view for linked draft processing. Multimodal callbacks advance and
+return both the target-native and draft-sequential boundary, so later scheduling, caching, and
+verification continue from the same explicit pair.
+
 ## Terminal handling
 
 | Outcome | Sequence disposition |

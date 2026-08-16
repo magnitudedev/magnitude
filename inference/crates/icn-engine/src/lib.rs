@@ -204,8 +204,8 @@ mod multimodal {
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
 use scheduler::{
-    ActiveSequence, BatchPlanner, BatchWork, PromptCheckpoint, ReusablePrefix, SequencePool,
-    WorkCandidate, WorkKind,
+    ActiveSequence, BatchPlanner, BatchWork, PromptCheckpoint, PromptCheckpointState,
+    ReusablePrefix, SequencePool, WorkCandidate, WorkKind,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -318,8 +318,13 @@ struct PreparedInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestPhase {
     Prefill,
-    ReadyToSample { batch_index: i32 },
-    Decode { token: LlamaToken, position: i32 },
+    ReadyToSample {
+        batch_index: i32,
+    },
+    Decode {
+        token: LlamaToken,
+        position: scheduler::PromptBoundary,
+    },
     Terminal,
 }
 
@@ -379,7 +384,7 @@ impl BatchCommit {
             let request = request_by_sequence(active, sequence_id)?;
             request.prompt_started_at.get_or_insert(self.started_at);
             request.processed_prompt_tokens = boundary.logical_tokens;
-            request.next_position = boundary.native_position;
+            request.next_boundary = boundary;
             request.pending_progress = Some(InferenceProgress::Prefill {
                 completed_tokens: boundary.logical_tokens,
                 total_tokens: request.prompt_tokens,
@@ -418,7 +423,7 @@ struct ActiveRequest<'model> {
     cached_prompt_tokens: usize,
     prompt_checkpoints: Vec<PromptCheckpoint>,
     pending_checkpoint_prefixes: VecDeque<scheduler::PromptBoundary>,
-    next_position: i32,
+    next_boundary: scheduler::PromptBoundary,
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
@@ -1833,16 +1838,13 @@ fn admit_requests<'model>(
             Ok(mut request) => {
                 let reusable_prefix = acquired.reusable_prefix.take();
                 let sequence = acquired.activate();
-                let requested_start = scheduler::PromptBoundary {
-                    logical_tokens: request.processed_prompt_tokens,
-                    native_position: request.next_position,
-                };
+                let requested_start = request.next_boundary;
                 let partial = clear_sequence_range(
                     context,
                     speculative.as_deref_mut(),
                     sequence_id,
-                    requested_start.native_position,
-                    -1,
+                    requested_start,
+                    None,
                 );
                 if partial.is_err() && requested_start.logical_tokens == 0 {
                     let _ = request
@@ -1863,6 +1865,7 @@ fn admit_requests<'model>(
                         restore_prompt_checkpoint(
                             context,
                             draft_context.as_deref_mut(),
+                            speculative.as_deref_mut(),
                             sequence_id,
                             checkpoint,
                         )
@@ -1871,7 +1874,7 @@ fn admit_requests<'model>(
                         .filter(|_| restored)
                         .map_or_else(scheduler::PromptBoundary::default, |value| value.boundary);
                     request.processed_prompt_tokens = restored_boundary.logical_tokens;
-                    request.next_position = restored_boundary.native_position;
+                    request.next_boundary = restored_boundary;
                     request.cached_prompt_tokens = request.processed_prompt_tokens;
                     request.pending_progress = Some(InferenceProgress::Prefill {
                         completed_tokens: request.processed_prompt_tokens,
@@ -1882,8 +1885,8 @@ fn admit_requests<'model>(
                         context,
                         speculative.as_deref_mut(),
                         sequence_id,
-                        request.next_position,
-                        -1,
+                        request.next_boundary,
+                        None,
                     )
                     .is_err()
                     {
@@ -1960,7 +1963,7 @@ fn sample_ready_requests<'model>(
 fn decode_batch<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
-    mut draft_context: Option<&mut LlamaContext<'model>>,
+    draft_context: Option<&mut LlamaContext<'model>>,
     mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     planner: &mut BatchPlanner,
@@ -1979,7 +1982,7 @@ fn decode_batch<'model>(
                 && request.pending_checkpoint_prefixes.front().copied()
                     == Some(scheduler::PromptBoundary {
                         logical_tokens: request.processed_prompt_tokens,
-                        native_position: request.next_position,
+                        native_position: request.next_boundary.native_position,
                     })
         }) {
             let boundary = request
@@ -1989,24 +1992,30 @@ fn decode_batch<'model>(
             let sequence_id = request
                 .sequence_id()
                 .expect("prefill request owns a sequence");
-            let target_checkpoint = context
-                .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
-                .ok()
-                .filter(|checkpoint| !checkpoint.is_empty());
-            let draft_checkpoint = draft_context.as_deref_mut().and_then(|draft_context| {
-                draft_context
+            let state = match speculative.as_deref_mut() {
+                Some(operations) => draft_context.as_deref().and_then(|draft_context| {
+                    match operations.capture_prompt_state(context, draft_context, sequence_id) {
+                        Ok(state) => Some(PromptCheckpointState::Speculative(state)),
+                        Err(error) => {
+                            tracing::warn!(
+                                sequence_id,
+                                error = %error,
+                                "failed to capture speculative prompt checkpoint"
+                            );
+                            None
+                        }
+                    }
+                }),
+                None => context
                     .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
                     .ok()
                     .filter(|checkpoint| !checkpoint.is_empty())
-            });
-            if let Some(target) = target_checkpoint
-                && (speculative.is_none() || draft_checkpoint.is_some())
-            {
-                request.prompt_checkpoints.push(PromptCheckpoint {
-                    target,
-                    draft: draft_checkpoint,
-                    boundary,
-                });
+                    .map(PromptCheckpointState::Target),
+            };
+            if let Some(state) = state {
+                request
+                    .prompt_checkpoints
+                    .push(PromptCheckpoint { state, boundary });
                 request
                     .prompt_checkpoints
                     .sort_by_key(|checkpoint| checkpoint.boundary.logical_tokens);
@@ -2063,7 +2072,15 @@ fn decode_batch<'model>(
                 .sequence_id()
                 .expect("selected request owns sequence");
             operations
-                .prepare_draft(sequence_id, position, token, &request.token_history, n_max)
+                .prepare_draft(
+                    sequence_id,
+                    position.speculative_position().ok_or_else(|| {
+                        InferenceError::Backend("draft position exceeded i32::MAX".into())
+                    })?,
+                    token,
+                    &request.token_history,
+                    n_max,
+                )
                 .map_err(backend_error)?;
             extra_budget -= n_max;
             drafted_sequences.push(sequence_id);
@@ -2134,6 +2151,7 @@ fn decode_batch<'model>(
         return Ok(false);
     }
     batch.clear();
+    let mut draft_positions = Vec::new();
     let batch_started = Instant::now();
     let mut commit = BatchCommit::new(batch_started);
 
@@ -2147,23 +2165,29 @@ fn decode_batch<'model>(
                     )));
                 };
                 batch
-                    .add(token, position, &[sequence_id], true)
+                    .add(token, position.native_position, &[sequence_id], true)
                     .map_err(backend_error)?;
+                draft_positions.push(i32::try_from(position.logical_tokens).map_err(|_| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?);
                 if request.speculative_draft.is_empty() {
                     commit.record_logits(sequence_id, batch.n_tokens() - 1);
                 } else {
                     let mut indices = vec![batch.n_tokens() - 1];
                     for (offset, draft) in request.speculative_draft.iter().copied().enumerate() {
-                        let draft_position = position
-                            .checked_add(i32::try_from(offset + 1).map_err(backend_error)?)
-                            .ok_or_else(|| {
-                                InferenceError::Backend(
-                                    "speculative position exceeded i32::MAX".into(),
-                                )
-                            })?;
+                        let draft_position = position.advance(offset + 1).ok_or_else(|| {
+                            InferenceError::Backend(
+                                "speculative position exceeded its numeric range".into(),
+                            )
+                        })?;
                         batch
-                            .add(draft, draft_position, &[sequence_id], true)
+                            .add(draft, draft_position.native_position, &[sequence_id], true)
                             .map_err(backend_error)?;
+                        draft_positions.push(
+                            i32::try_from(draft_position.logical_tokens).map_err(|_| {
+                                InferenceError::Backend("draft position exceeded i32::MAX".into())
+                            })?,
+                        );
                         indices.push(batch.n_tokens() - 1);
                     }
                     commit.record_speculative_indices(sequence_id, indices);
@@ -2178,7 +2202,7 @@ fn decode_batch<'model>(
                     sequence_id,
                     scheduler::PromptBoundary {
                         logical_tokens: request.processed_prompt_tokens,
-                        native_position: request.next_position,
+                        native_position: request.next_boundary.native_position,
                     },
                 );
                 let prompt_tokens = request
@@ -2213,6 +2237,9 @@ fn decode_batch<'model>(
                             final_prompt_token,
                         )
                         .map_err(backend_error)?;
+                    draft_positions.push(i32::try_from(absolute).map_err(|_| {
+                        InferenceError::Backend("draft position exceeded i32::MAX".into())
+                    })?);
                     if final_prompt_token {
                         commit.record_logits(sequence_id, batch.n_tokens() - 1);
                     }
@@ -2236,7 +2263,9 @@ fn decode_batch<'model>(
     let verification_started = Instant::now();
     context.decode(batch).map_err(backend_error)?;
     if let Some(operations) = speculative.as_mut() {
-        operations.process(batch).map_err(backend_error)?;
+        operations
+            .process(batch, &draft_positions)
+            .map_err(backend_error)?;
     }
     commit.apply(active)?;
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
@@ -2287,13 +2316,19 @@ fn verify_speculative_batch<'model>(
         }
         let accepted_drafts = accepted.len() - 1;
         let next_position = verification_start_position
-            .checked_add(1)
-            .and_then(|position| position.checked_add(i32::try_from(accepted_drafts).ok()?))
+            .advance(1_usize.saturating_add(accepted_drafts))
             .ok_or_else(|| {
-                InferenceError::Backend("speculative position exceeded i32::MAX".into())
+                InferenceError::Backend("speculative position exceeded its numeric range".into())
             })?;
         let resolution = operations
-            .resolve_verification(sequence_id, proposed_drafts, accepted_drafts, next_position)
+            .resolve_verification(
+                sequence_id,
+                proposed_drafts,
+                accepted_drafts,
+                next_position.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?,
+            )
             .map_err(backend_error)?;
         if resolution == SpeculativeVerificationResolution::Replay {
             request
@@ -2336,8 +2371,8 @@ fn verify_speculative_batch<'model>(
                 token: continuation,
                 position: next_position,
             };
-            request.next_position = next_position.checked_add(1).ok_or_else(|| {
-                InferenceError::Backend("generation position exceeded i32::MAX".into())
+            request.next_boundary = next_position.advance(1).ok_or_else(|| {
+                InferenceError::Backend("generation position exceeded its numeric range".into())
             })?;
         }
     }
@@ -2383,7 +2418,7 @@ fn decode_multimodal_prefill<'model>(
         context,
         scheduler::PromptBoundary {
             logical_tokens: request.processed_prompt_tokens,
-            native_position: request.next_position,
+            native_position: request.next_boundary.native_position,
         },
         sequence_id,
         batch_size,
@@ -2394,7 +2429,7 @@ fn decode_multimodal_prefill<'model>(
         return Err(InferenceError::Cancelled);
     }
     let boundary = result?;
-    request.next_position = boundary.native_position;
+    request.next_boundary = boundary;
     request.processed_prompt_tokens = boundary.logical_tokens;
     request.pending_progress = Some(InferenceProgress::Prefill {
         completed_tokens: request.processed_prompt_tokens,
@@ -2439,18 +2474,29 @@ fn request_by_sequence<'a, 'model>(
 fn restore_prompt_checkpoint(
     context: &mut LlamaContext<'_>,
     draft_context: Option<&mut LlamaContext<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
     checkpoint: &PromptCheckpoint,
 ) -> bool {
-    if let Some(draft_context) = draft_context {
-        let Some(draft_checkpoint) = checkpoint.draft.as_ref() else {
-            return false;
-        };
-        if !draft_context.restore_sequence_state(draft_checkpoint, sequence_id) {
-            return false;
+    match (&checkpoint.state, draft_context, speculative) {
+        (PromptCheckpointState::Target(state), None, None) => {
+            context.restore_sequence_state(state, sequence_id)
         }
+        (PromptCheckpointState::Speculative(state), Some(draft), Some(operations)) => {
+            match operations.restore_prompt_state(context, draft, sequence_id, state) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        sequence_id,
+                        error = %error,
+                        "failed to restore speculative prompt checkpoint"
+                    );
+                    false
+                }
+            }
+        }
+        _ => false,
     }
-    context.restore_sequence_state(&checkpoint.target, sequence_id)
 }
 
 fn cleanup_requests(
@@ -2605,27 +2651,46 @@ fn clear_sequence(
     speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
 ) -> Result<(), InferenceError> {
-    clear_sequence_range(context, speculative, sequence_id, 0, -1)
+    clear_sequence_range(
+        context,
+        speculative,
+        sequence_id,
+        scheduler::PromptBoundary::default(),
+        None,
+    )
 }
 
 fn clear_sequence_range(
     context: &mut LlamaContext<'_>,
     speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
-    start: i32,
-    end: i32,
+    start: scheduler::PromptBoundary,
+    end: Option<scheduler::PromptBoundary>,
 ) -> Result<(), InferenceError> {
     if let Some(speculative) = speculative {
+        let draft_end = end
+            .map(|boundary| {
+                boundary.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })
+            })
+            .transpose()?;
         return speculative
-            .remove_sequence_range(sequence_id, start, end)
+            .remove_sequence_range(
+                sequence_id,
+                start.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?,
+                draft_end,
+            )
             .map_err(backend_error);
     }
     let sequence = u32::try_from(sequence_id).map_err(backend_error)?;
     let removed = context
         .clear_kv_cache_seq(
             Some(sequence),
-            (start > 0).then_some(start as u32),
-            (end >= 0).then_some(end as u32),
+            (start.native_position > 0).then_some(start.native_position as u32),
+            end.map(|boundary| boundary.native_position as u32),
         )
         .map_err(backend_error)?;
     if removed {
@@ -2868,10 +2933,21 @@ fn warm_up(
         batch.add(token, 0, &[0], false).map_err(backend_error)?;
         context.decode(&mut batch).map_err(backend_error)?;
         if let Some(speculative) = speculative {
-            speculative.process(&batch).map_err(backend_error)?;
+            speculative.process(&batch, &[0]).map_err(backend_error)?;
+            speculative
+                .remove_sequence_range(
+                    0,
+                    llama_cpp_2::speculative::SpeculativePosition {
+                        target: 0,
+                        draft: 0,
+                    },
+                    None,
+                )
+                .map_err(backend_error)?;
+        } else {
+            context.clear_kv_cache();
         }
         context.synchronize();
-        context.clear_kv_cache();
     }
     context.reset_timings();
     Ok(())
@@ -3185,7 +3261,7 @@ impl<'model> ActiveRequest<'model> {
                 .into_iter()
                 .map(|offset| prompt_tokens.saturating_sub(offset.min(batch_size)))
                 .filter(|prefix| *prefix > cached_prompt_tokens && *prefix > 0)
-                .filter_map(|prefix| tokenized.layout.boundary_at(prefix))
+                .filter_map(|prefix| tokenized.layout.boundary_at_or_after(prefix))
                 .collect::<Vec<_>>();
             pending_checkpoint_prefixes.sort_unstable_by_key(|boundary| boundary.logical_tokens);
             pending_checkpoint_prefixes.dedup();
@@ -3210,7 +3286,7 @@ impl<'model> ActiveRequest<'model> {
                 cached_prompt_tokens,
                 prompt_checkpoints,
                 pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
-                next_position: cached_boundary.native_position,
+                next_boundary: cached_boundary,
                 multimodal_prompt: tokenized.multimodal,
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
@@ -3281,9 +3357,9 @@ impl<'model> ActiveRequest<'model> {
             return Ok(Some(reason));
         }
 
-        let position = self.next_position;
-        self.next_position = self.next_position.checked_add(1).ok_or_else(|| {
-            InferenceError::Backend("generation position exceeded i32::MAX".into())
+        let position = self.next_boundary;
+        self.next_boundary = self.next_boundary.advance(1).ok_or_else(|| {
+            InferenceError::Backend("generation position exceeded its numeric range".into())
         })?;
         self.phase = RequestPhase::Decode { token, position };
         Ok(None)
@@ -4288,6 +4364,191 @@ mod tests {
             "cached prefill ({:.2} ms) was not faster than cold prefill ({:.2} ms)",
             second.metrics.prompt_ms,
             first.metrics.prompt_ms
+        );
+    }
+
+    #[test]
+    #[ignore = "loads an installed vision model selected through ICN_VISION_TEST_* variables"]
+    fn multimodal_multiturn_cache_and_speculation_with_real_model() {
+        disable_native_diagnostics();
+        let required_path = |name: &str| {
+            let path = PathBuf::from(
+                std::env::var_os(name).unwrap_or_else(|| panic!("{name} must name a local file")),
+            );
+            assert!(path.is_file(), "missing {}", path.display());
+            path
+        };
+        let model_path = required_path("ICN_VISION_TEST_MODEL");
+        let projector_path = required_path("ICN_VISION_TEST_PROJECTOR");
+        let first_image = std::fs::read(required_path("ICN_VISION_TEST_IMAGE"))
+            .expect("read first vision test image");
+        let second_image = std::fs::read(required_path("ICN_VISION_TEST_IMAGE_2"))
+            .expect("read second vision test image");
+        let first_expected =
+            std::env::var("ICN_VISION_TEST_EXPECTED").unwrap_or_else(|_| "7429".into());
+        let second_expected =
+            std::env::var("ICN_VISION_TEST_EXPECTED_2").unwrap_or_else(|_| "3816".into());
+
+        let speculative = match std::env::var("ICN_VISION_TEST_SPECULATIVE_METHOD")
+            .unwrap_or_else(|_| "none".into())
+            .as_str()
+        {
+            "none" => icn_contracts::SpeculativeDecodingConfig::default(),
+            method @ ("dflash" | "dspark") => {
+                let draft = required_path("ICN_VISION_TEST_DRAFT");
+                let threshold = std::env::var("ICN_VISION_TEST_SPECULATIVE_THRESHOLD")
+                    .ok()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(0.1);
+                let method = if method == "dflash" {
+                    icn_contracts::SpeculativeMethodConfig::DFlash {
+                        min_sample_probability: threshold,
+                    }
+                } else {
+                    icn_contracts::SpeculativeMethodConfig::DSpark {
+                        acceptance_threshold: threshold,
+                    }
+                };
+                icn_contracts::SpeculativeDecodingConfig::Enabled {
+                    source: icn_contracts::SpeculativeDraftSource::Separate { model_path: draft },
+                    method,
+                    n_max: 3,
+                    n_min: 0,
+                    cache_type_k: CacheType::F16,
+                    cache_type_v: CacheType::F16,
+                }
+            }
+            method => panic!("unsupported ICN_VISION_TEST_SPECULATIVE_METHOD {method:?}"),
+        };
+        let speculative_enabled = matches!(
+            speculative,
+            icn_contracts::SpeculativeDecodingConfig::Enabled { .. }
+        );
+
+        let native = NativeBackend::initialize().expect("initialize native backend");
+        let hardware = native.discover_hardware(
+            icn_hardware::CapacityPolicy::default(),
+            "real-multimodal-speculative-test",
+            Vec::new(),
+        );
+        let mut defaults = model_plan_defaults();
+        defaults.context_size = 32_768;
+        defaults.physical_context_size = 32_768;
+        defaults.batch_size = 512;
+        defaults.ubatch_size = 512;
+        defaults.max_sequences = 1;
+        defaults.prefill_quantum = 128;
+        let mut intent = execution_intent(model_path, Some(projector_path), &defaults);
+        intent.speculative = speculative.clone();
+        let prepared = native
+            .prepare_load(
+                "installed-vision-multiturn-test",
+                intent,
+                speculative,
+                hardware,
+            )
+            .expect("prepare vision model load");
+        let backend = prepared
+            .execute(Arc::new(NoopLoadObserver))
+            .expect("load vision model");
+
+        fn image_message(bytes: Vec<u8>) -> ChatMessage {
+            ChatMessage {
+                role: ChatRole::User,
+                content: Some(ChatContent::Parts(vec![
+                    ChatContentPart::Image(ImageInput::new("image/png", bytes)),
+                    ChatContentPart::Text {
+                        text: "Transcribe the large verification code in this image. Reply with only the four-digit code."
+                            .into(),
+                    },
+                ])),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }
+        }
+        let run = |messages: Vec<ChatMessage>| {
+            let mut completion = request();
+            completion.template.messages = messages;
+            completion.template.reasoning = ReasoningControl::Disabled;
+            completion.max_tokens = 64;
+            backend
+                .complete(completion, &mut |_| Ok(()))
+                .expect("complete multimodal turn")
+        };
+
+        let first_message = image_message(first_image);
+        let first = run(vec![first_message.clone()]);
+        let first_text = format!("{} {}", first.reasoning, first.text);
+        assert!(
+            first_text.contains(&first_expected),
+            "first image was not perceived: {first_text:?}"
+        );
+
+        let second_message = image_message(second_image);
+        let conversation = vec![
+            first_message,
+            ChatMessage::text(ChatRole::Assistant, first.text.clone()),
+            second_message,
+        ];
+        let second = run(conversation.clone());
+        let second_text = format!("{} {}", second.reasoning, second.text);
+        assert!(
+            second_text.contains(&second_expected),
+            "second image was not perceived: {second_text:?}"
+        );
+        assert!(
+            second.cached_prompt_tokens > 0,
+            "the second turn did not reuse the first image prefix"
+        );
+
+        let repeated = run(conversation);
+        let repeated_text = format!("{} {}", repeated.reasoning, repeated.text);
+        assert!(
+            repeated_text.contains(&second_expected),
+            "cached second image was not perceived: {repeated_text:?}"
+        );
+        assert_eq!(
+            repeated.cached_prompt_tokens,
+            repeated.prompt_tokens.saturating_sub(1),
+            "the repeated multimodal turn did not reuse both images"
+        );
+        assert!(
+            repeated.metrics.prompt_ms < second.metrics.prompt_ms,
+            "exact cached prefill ({:.2} ms) was not faster than the extended turn ({:.2} ms)",
+            repeated.metrics.prompt_ms,
+            second.metrics.prompt_ms
+        );
+        if speculative_enabled {
+            let drafted = first.metrics.draft_tokens
+                + second.metrics.draft_tokens
+                + repeated.metrics.draft_tokens;
+            let accepted = first.metrics.accepted_draft_tokens
+                + second.metrics.accepted_draft_tokens
+                + repeated.metrics.accepted_draft_tokens;
+            assert!(
+                drafted > 0,
+                "the configured speculative method produced no drafts"
+            );
+            assert!(
+                accepted > 0,
+                "the configured speculative method accepted no draft tokens"
+            );
+        }
+        eprintln!(
+            "vision multiturn first_cached={} second_cached={} repeated_cached={} first_ms={:.2} second_ms={:.2} repeated_ms={:.2} drafted={} accepted={}",
+            first.cached_prompt_tokens,
+            second.cached_prompt_tokens,
+            repeated.cached_prompt_tokens,
+            first.metrics.prompt_ms,
+            second.metrics.prompt_ms,
+            repeated.metrics.prompt_ms,
+            first.metrics.draft_tokens
+                + second.metrics.draft_tokens
+                + repeated.metrics.draft_tokens,
+            first.metrics.accepted_draft_tokens
+                + second.metrics.accepted_draft_tokens
+                + repeated.metrics.accepted_draft_tokens,
         );
     }
 

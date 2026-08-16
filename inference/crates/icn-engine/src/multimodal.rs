@@ -9,7 +9,7 @@ use llama_cpp_2::context::params::FlashAttentionPolicy;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{
     MtmdBitmap, MtmdChunkEvalParams, MtmdContext, MtmdContextParams, MtmdInputChunkType,
-    MtmdInputChunks, MtmdInputText,
+    MtmdInputChunks, MtmdInputText, MtmdSpeculativeChunkEvalParams,
 };
 use llama_cpp_2::speculative::SpeculativeOperations;
 use sha2::{Digest, Sha256};
@@ -287,38 +287,67 @@ impl<'model> MultimodalRuntime<'model> {
                     start.logical_tokens
                 ))
             })?;
-        let next_position = match speculative {
-            Some(speculative) => prompt.chunks.eval_chunk_speculative(
-                &mut self.context,
-                speculative,
-                MtmdChunkEvalParams {
-                    index: chunk_index,
-                    n_past: start.native_position,
-                    seq_id: sequence_id,
-                    n_batch: batch_size,
-                    logits_last: false,
-                },
-            ),
-            None => prompt.chunks.eval_chunk(
-                &mut self.context,
-                llama_context,
-                MtmdChunkEvalParams {
-                    index: chunk_index,
-                    n_past: start.native_position,
-                    seq_id: sequence_id,
-                    n_batch: batch_size,
-                    logits_last: false,
-                },
-            ),
+        let next = match speculative {
+            Some(speculative) => {
+                let position = start.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?;
+                let next = prompt
+                    .chunks
+                    .eval_chunk_speculative(
+                        &mut self.context,
+                        speculative,
+                        MtmdSpeculativeChunkEvalParams {
+                            index: chunk_index,
+                            position,
+                            seq_id: sequence_id,
+                            n_batch: batch_size,
+                            logits_last: false,
+                        },
+                    )
+                    .map_err(native_error)?;
+                PromptBoundary {
+                    logical_tokens: usize::try_from(next.draft).map_err(native_error)?,
+                    native_position: next.target,
+                }
+            }
+            None => {
+                let native_position = prompt
+                    .chunks
+                    .eval_chunk(
+                        &mut self.context,
+                        llama_context,
+                        MtmdChunkEvalParams {
+                            index: chunk_index,
+                            n_past: start.native_position,
+                            seq_id: sequence_id,
+                            n_batch: batch_size,
+                            logits_last: false,
+                        },
+                    )
+                    .map_err(native_error)?;
+                PromptBoundary {
+                    logical_tokens: start
+                        .logical_tokens
+                        .checked_add(logical_tokens)
+                        .ok_or_else(|| {
+                            InferenceError::Backend("prompt token count overflowed".into())
+                        })?,
+                    native_position,
+                }
+            }
+        };
+        let expected_logical = start
+            .logical_tokens
+            .checked_add(logical_tokens)
+            .ok_or_else(|| InferenceError::Backend("prompt token count overflowed".into()))?;
+        if next.logical_tokens != expected_logical {
+            return Err(InferenceError::Backend(format!(
+                "linked draft advanced to logical position {} instead of {expected_logical}",
+                next.logical_tokens
+            )));
         }
-        .map_err(native_error)?;
-        Ok(PromptBoundary {
-            logical_tokens: start
-                .logical_tokens
-                .checked_add(logical_tokens)
-                .ok_or_else(|| InferenceError::Backend("prompt token count overflowed".into()))?,
-            native_position: next_position,
-        })
+        Ok(next)
     }
 }
 
