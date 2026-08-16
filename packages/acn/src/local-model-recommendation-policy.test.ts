@@ -110,6 +110,7 @@ const candidate = (input: {
           defaultEffort: Option.none(),
         },
       },
+      parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
       qualityScore: input.score ?? 0,
       qualityScoreProvenance: input.provenance ?? "measured_terminal_bench_2.1",
       fidelityRank: fidelity,

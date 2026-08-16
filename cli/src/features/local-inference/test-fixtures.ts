@@ -192,6 +192,7 @@ export const makeCatalogOnlyModel = (
       catalogData: {
         modelId: CatalogModelIdSchema.make("qwen-test"),
         variantId: CatalogVariantIdSchema.make("gguf:q4"),
+        parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
         intelligenceScore: 75,
         intelligenceScoreSource: "Test catalog score",
         fidelityRank: 75,

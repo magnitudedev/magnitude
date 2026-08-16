@@ -91,6 +91,7 @@ const catalogModel = (configuration: ModelServingConfiguration): RecommendableMo
     structuredOutput: false,
     reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
   },
+  parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
   qualityScore: 1,
   qualityScoreProvenance: "test",
   fidelityRank: 1,

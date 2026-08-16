@@ -199,6 +199,9 @@ export const CatalogModel = S.Struct({
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelLocalState, CatalogModelLocalStateEncoded> => CatalogModelLocalState),
   modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
+  parameterization: S.suspend(
+    (): S.Schema<ModelParameterization, ModelParameterizationEncoded> => ModelParameterization,
+  ),
   qualityEvidence: S.Array(S.String),
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,
@@ -1626,6 +1629,26 @@ export const ModelPackageSource = S.Union(
 export type ModelPackageSource = S.Schema.Type<typeof ModelPackageSource>
 export type ModelPackageSourceEncoded = S.Schema.Encoded<typeof ModelPackageSource>
 
+export const ModelParameterization = S.Union(
+  S.extend(
+    S.Struct({
+      architecture: S.Literal("dense"),
+      totalParameters: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      activeParameters: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      architecture: S.Literal("mixtureOfExperts"),
+      totalParameters: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelParameterization = S.Schema.Type<typeof ModelParameterization>
+export type ModelParameterizationEncoded = S.Schema.Encoded<typeof ModelParameterization>
+
 export const ModelReasoningCapabilities = S.Struct({
   defaultEffort: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   efforts: S.Array(S.String),
@@ -1774,6 +1797,9 @@ export const RecommendableModel = S.Struct({
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   license: S.String,
   modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
+  parameterization: S.suspend(
+    (): S.Schema<ModelParameterization, ModelParameterizationEncoded> => ModelParameterization,
+  ),
   qualityEvidence: S.Array(S.String),
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,

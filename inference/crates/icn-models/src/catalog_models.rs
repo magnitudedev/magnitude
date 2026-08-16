@@ -311,6 +311,7 @@ fn catalog_model(
         description: definition.description.clone(),
         license: definition.license.clone(),
         capabilities: definition.capabilities.clone(),
+        parameterization: definition.parameterization.clone(),
         quality_score: definition.quality_score,
         quality_score_provenance: definition.quality_score_provenance.clone(),
         fidelity_rank: definition.fidelity_rank,
@@ -434,6 +435,9 @@ mod tests {
                     efforts: Vec::new(),
                     default_effort: None,
                 },
+            },
+            parameterization: icn_contracts::models::ModelParameterization::Dense {
+                total_parameters: 8_000_000_000,
             },
             quality_score: 1.0,
             quality_score_provenance: "test".to_owned(),

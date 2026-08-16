@@ -539,6 +539,7 @@ export const LocalModelsLive: Layer.Layer<
             catalogData: {
               modelId: curated.modelId,
               variantId: curated.variantId,
+              parameterization: curated.parameterization,
               intelligenceScore: curated.qualityScore,
               intelligenceScoreSource: curated.qualityScoreProvenance,
               fidelityRank: curated.fidelityRank,

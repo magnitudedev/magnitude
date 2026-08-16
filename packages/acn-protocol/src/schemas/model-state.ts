@@ -427,6 +427,26 @@ export type ModelServingConfiguration = typeof ModelServingConfigurationSchema.T
 export const RecommendableModelCapabilitiesSchema = ModelCapabilitiesSchema
 export type RecommendableModelCapabilities = typeof RecommendableModelCapabilitiesSchema.Type
 
+const DenseModelParameterizationSchema = Schema.Struct({
+  architecture: Schema.Literal("dense"),
+  totalParameters: PositiveSafeInteger,
+})
+
+const MixtureOfExpertsModelParameterizationSchema = Schema.Struct({
+  architecture: Schema.Literal("mixtureOfExperts"),
+  totalParameters: PositiveSafeInteger,
+  activeParameters: PositiveSafeInteger,
+}).pipe(Schema.filter(
+  ({ activeParameters, totalParameters }) => activeParameters < totalParameters,
+  { message: () => "active parameters must be less than total parameters" },
+))
+
+export const ModelParameterizationSchema = Schema.Union(
+  DenseModelParameterizationSchema,
+  MixtureOfExpertsModelParameterizationSchema,
+)
+export type ModelParameterization = typeof ModelParameterizationSchema.Type
+
 export const RecommendableModelSchema = Schema.Struct({
   ...CatalogIdentitySchema.fields,
   configuration: ModelServingConfigurationSchema,
@@ -435,6 +455,7 @@ export const RecommendableModelSchema = Schema.Struct({
   description: Schema.String,
   license: NonEmptyString,
   capabilities: RecommendableModelCapabilitiesSchema,
+  parameterization: ModelParameterizationSchema,
   qualityScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   qualityScoreProvenance: NonEmptyString,
   fidelityRank: NonNegativeSafeInteger,
@@ -600,6 +621,7 @@ export type LocalModelConfigurationAssessment =
 
 export const LocalModelCatalogDataSchema = Schema.Struct({
   ...CatalogIdentitySchema.fields,
+  parameterization: ModelParameterizationSchema,
   intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   intelligenceScoreSource: NonEmptyString,
   fidelityRank: NonNegativeSafeInteger,

@@ -1409,6 +1409,7 @@
           "description",
           "license",
           "capabilities",
+          "parameterization",
           "qualityScore",
           "qualityScoreProvenance",
           "fidelityRank",
@@ -1440,6 +1441,9 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "parameterization": {
+            "$ref": "#/components/schemas/ModelParameterization"
           },
           "qualityScore": {
             "type": "number",
@@ -4989,6 +4993,56 @@
           }
         ]
       },
+      "ModelParameterization": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "totalParameters",
+              "architecture"
+            ],
+            "properties": {
+              "totalParameters": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "architecture": {
+                "type": "string",
+                "enum": [
+                  "dense"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "totalParameters",
+              "activeParameters",
+              "architecture"
+            ],
+            "properties": {
+              "totalParameters": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "activeParameters": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "architecture": {
+                "type": "string",
+                "enum": [
+                  "mixtureOfExperts"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelReasoningCapabilities": {
         "type": "object",
         "required": [
@@ -5306,6 +5360,7 @@
           "description",
           "license",
           "capabilities",
+          "parameterization",
           "qualityScore",
           "qualityScoreProvenance",
           "fidelityRank",
@@ -5336,6 +5391,9 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "parameterization": {
+            "$ref": "#/components/schemas/ModelParameterization"
           },
           "qualityScore": {
             "type": "number",

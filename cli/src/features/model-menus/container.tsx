@@ -22,7 +22,6 @@ import {
   localModelProviderModelId,
   localModelCapabilities,
   localModelSpeculativeMethodLabel,
-  clampTextToVisualLines,
   truncateToDisplayWidth,
   type NotificationState,
   usePlatform,
@@ -88,6 +87,7 @@ import {
   type PentagonRadarTransition,
 } from "../../components/pentagon-radar"
 import { localModelRadarAxes } from "../local-inference/model-radar"
+import { formatModelClassification } from "../local-inference/model-classification"
 import { CatalogRadarView } from "./catalog-radar-view"
 import {
   modelMenusLocalModelsStateEquivalent,
@@ -1506,7 +1506,13 @@ const CatalogInspector = memo(function CatalogInspector({
   const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
   const repository = repositoryUrl?.replace("https://", "")
   const license = Option.getOrElse(model.presentation.license, () => "Unknown license")
-  const description = clampTextToVisualLines(model.presentation.description, contentWidth, 2)
+  const classification = model.catalogMembershipState._tag === "InCatalog"
+    && model.servingState._tag === "Assessed"
+    ? formatModelClassification(
+        model.catalogMembershipState.catalogData.parameterization,
+        model.servingState.capabilities.vision,
+      )
+    : ""
 
   return (
     <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
@@ -1519,7 +1525,9 @@ const CatalogInspector = memo(function CatalogInspector({
             || reconciliationState._tag === "RemoveFailed"
             || model.upgradeState._tag === "Failed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
         </box>
-        <text style={{ fg: theme.text.supporting }} wrapMode="none">{description}</text>
+        <text style={{ fg: theme.text.supporting }} wrapMode="none">
+          {truncateToDisplayWidth(classification, contentWidth)}
+        </text>
         <text> </text>
       </box>
       <box style={{ width: "100%", height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0 }}>

@@ -87,6 +87,7 @@ describe("LocalModelAssessor", () => {
         capabilities: packageEntry.inspection._tag === "Inspected"
           ? packageEntry.inspection.capabilities
           : undefined,
+        parameterization: { architecture: "dense" as const, totalParameters: 8_000_000_000 },
         qualityScore: 1,
         qualityScoreProvenance: "test",
         fidelityRank: 1,

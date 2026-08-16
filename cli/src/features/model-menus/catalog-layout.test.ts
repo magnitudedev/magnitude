@@ -3,6 +3,7 @@ import { getDisplayWidth } from "@magnitudedev/client-common"
 import { ModelVariantLabelSchema } from "@magnitudedev/sdk"
 import {
   CATALOG_INSPECTOR_WIDTH,
+  CATALOG_INSPECTOR_CONTENT_WIDTH,
   CATALOG_SPLIT_INSPECTOR_HEIGHT,
   CATALOG_SPLIT_INSPECTOR_HEIGHTS,
   CATALOG_SPLIT_MIN_WIDTH,
@@ -15,14 +16,14 @@ import { PENTAGON_RADAR_ROWS } from "../../components/pentagon-radar"
 
 describe("catalog responsive layout", () => {
   test.each([
-    [102, "list", false, true, true, true, false],
-    [103, "split", true, false, false, false, false],
-    [112, "split", true, false, false, false, false],
-    [113, "split", true, true, false, false, false],
-    [123, "split", true, true, false, false, false],
-    [124, "split", true, true, true, false, false],
-    [134, "split", true, true, true, false, false],
-    [135, "split", true, true, true, true, false],
+    [104, "list", false, true, true, true, false],
+    [105, "split", true, false, false, false, false],
+    [114, "split", true, false, false, false, false],
+    [115, "split", true, true, false, false, false],
+    [125, "split", true, true, false, false, false],
+    [126, "split", true, true, true, false, false],
+    [136, "split", true, true, true, false, false],
+    [137, "split", true, true, true, true, false],
   ] as const)(
     "derives the %i-column layout",
     (width, mode, split, memory, speed, speculative, compact) => {
@@ -38,7 +39,7 @@ describe("catalog responsive layout", () => {
   )
 
   test("keeps the inspector fixed and gives the list the remainder", () => {
-    for (const width of [CATALOG_SPLIT_MIN_WIDTH, 113, 135, 180]) {
+    for (const width of [CATALOG_SPLIT_MIN_WIDTH, 115, 137, 180]) {
       const layout = deriveCatalogLayout(width)
       expect(layout.inspectorWidth).toBe(CATALOG_INSPECTOR_WIDTH)
       expect(layout.listWidth + layout.dividerWidth + layout.inspectorWidth).toBe(width)
@@ -51,10 +52,11 @@ describe("catalog responsive layout", () => {
   })
 
   test("keeps every split inspector region inside the available content area", () => {
-    expect(CATALOG_SPLIT_INSPECTOR_HEIGHT).toBe(26)
+    expect(CATALOG_INSPECTOR_CONTENT_WIDTH).toBe(58)
+    expect(CATALOG_SPLIT_INSPECTOR_HEIGHT).toBe(25)
     expect(CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics).toBe(PENTAGON_RADAR_ROWS)
     expect(CATALOG_SPLIT_INSPECTOR_HEIGHTS).toEqual({
-      identity: 4,
+      identity: 3,
       metrics: 15,
       info: 3,
       actions: 4,

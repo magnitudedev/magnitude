@@ -441,6 +441,22 @@ pub struct ModelCapabilities {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "architecture", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ModelParameterization {
+    Dense {
+        #[serde(rename = "totalParameters")]
+        total_parameters: u64,
+    },
+    MixtureOfExperts {
+        #[serde(rename = "totalParameters")]
+        total_parameters: u64,
+        #[serde(rename = "activeParameters")]
+        active_parameters: u64,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecommendableModel {
@@ -452,6 +468,7 @@ pub struct RecommendableModel {
     pub description: String,
     pub license: String,
     pub capabilities: ModelCapabilities,
+    pub parameterization: ModelParameterization,
     pub quality_score: f64,
     pub quality_score_provenance: String,
     pub fidelity_rank: u32,
@@ -531,6 +548,7 @@ pub struct CatalogModel {
     pub description: String,
     pub license: String,
     pub capabilities: ModelCapabilities,
+    pub parameterization: ModelParameterization,
     pub quality_score: f64,
     pub quality_score_provenance: String,
     pub fidelity_rank: u32,
