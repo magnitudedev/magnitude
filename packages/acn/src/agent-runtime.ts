@@ -281,9 +281,7 @@ export const makeAgentRuntimeLive = (
         const gate = yield* makeResourceUseGate({
           resource: `session:${request.sessionId}`,
           generation,
-          // TMP: Keep sessions resident long enough for slow local-model loads;
-          // replace this mitigation with authoritative agent-work ownership.
-          idleTimeout: options.idleTimeout ?? "30 minutes",
+          idleTimeout: options.idleTimeout ?? "2 minutes",
           retire: () => retireGeneration(request.sessionId, generation),
         }).pipe(Effect.provideService(Scope.Scope, managerScope))
         const releaseStartup = yield* gate.acquire("session-start").pipe(Effect.orDie)

@@ -2,14 +2,10 @@
 applies_to:
   - web/src/app.tsx
   - web/src/commands/**
-  - web/src/components/composer.tsx
-  - web/src/components/local-model-onboarding.tsx
-  - web/src/components/model-center.tsx
-  - web/src/components/settings-panel.tsx
+  - web/src/components/**
   - web/src/hooks/use-menu-actions.ts
   - web/src/state/web-atoms.ts
-  - web/src/stores/appearance-store.ts
-  - web/src/stores/shiki-store.ts
+  - web/src/stores/**
   - web/src/styles/**
   - desktop/src/renderer.tsx
   - packages/client-common/src/hooks/use-local-inference-state.ts
@@ -65,6 +61,12 @@ only local invocation admission.
 Chat readiness requires an available local slot whose residency is `Ready`. Selection alone is not
 readiness. When submission is unavailable, the composer routes the user to Model Center instead of
 discarding the attempt.
+
+The chat footer follows the CLI's runtime-information structure without combining independent
+facts into the model label. It presents residency, model identity, reasoning effort, resident
+memory, context usage with percentage, and working directory in that order. Model identity routes
+to Models, resident memory routes to Hardware, and reasoning choices expand inline. Interactive
+labels are underlined only while hovered; reasoning retains its violet semantic color.
 
 ## Appearance
 

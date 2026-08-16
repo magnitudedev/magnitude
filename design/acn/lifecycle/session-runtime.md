@@ -31,9 +31,9 @@ A resident runtime unloads after two minutes without session work. Commands, age
 display materialization, shape changes, resynchronization, and preload count as work. Merely
 watching a session does not. The final claim starts that generation's idle timer.
 
-Agent work has one authoritative status covering turns, queued triggers, workers, compaction, and
-owned detached processes. Runtime retention and UI consume that status instead of reconstructing
-work independently.
+Agent work has one authoritative status covering accepted messages awaiting resolution, turns,
+queued triggers, workers, compaction, and owned detached processes. Runtime retention and UI
+consume that status instead of reconstructing work independently.
 
 Resolving a session under the runtime admission lock never waits for that session's retirement, so
 one wedged generation cannot block unrelated sessions. Work arriving behind abnormal retirement

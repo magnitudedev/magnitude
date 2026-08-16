@@ -18,6 +18,7 @@ import { InterruptedMessage } from "./interrupted"
 import { ErrorMessage } from "./error-message"
 import { AgentCommunication } from "./agent-communication"
 import { UserBashCommand } from "./user-bash-command"
+import { WorkSummary } from "./work-summary"
 
 export interface MessageDispatchProps {
   message: DisplayMessage
@@ -52,6 +53,8 @@ function MessageDispatchImpl({
       return <ThinkingMessage message={message} mode={mode} />
     case "status_indicator":
       return <StatusIndicator message={message} />
+    case "work_summary":
+      return <WorkSummary message={message} />
     case "goal_status":
       return <GoalStatus message={message} />
     case "interrupted":

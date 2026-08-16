@@ -45,11 +45,10 @@ export type ModelCenterTab = "models" | "catalog" | "hardware"
 export const modelCenterTabAtom = Atom.keepAlive(Atom.make<ModelCenterTab | null>(null))
 
 /**
- * Sidebar visibility for responsive overlay mode (≤640px).
- * null = not in responsive mode (sidebar always visible).
- * true/false = overlay sidebar visible/hidden.
+ * Whether the responsive sidebar overlay is open.
+ * Wide layouts ignore this state because their sidebar is always docked.
  */
-export const sidebarVisibleAtom = Atom.make<boolean | null>(null)
+export const sidebarVisibleAtom = Atom.make(false)
 
 /**
  * Sidebar search query.

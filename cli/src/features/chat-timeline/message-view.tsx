@@ -10,6 +10,7 @@ import { ErrorMessage } from './messages/error-message'
 import { BashOutput } from './messages/bash-output'
 import { useTheme } from '../../hooks/use-theme'
 import { TextAttributes } from '@opentui/core'
+import { formatWorkDuration } from '@magnitudedev/client-common'
 
 interface MessageViewProps {
   message: DisplayMessage
@@ -45,16 +46,6 @@ const StatusIndicatorRow = ({ message }: { message: Extract<DisplayMessage, { ty
       </text>
     </box>
   )
-}
-
-function formatWorkDuration(durationMs: number): string {
-  if (durationMs < 1_000) return '<1 second'
-  const totalSeconds = Math.floor(durationMs / 1000)
-  if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`
-  const minutes = Math.floor(totalSeconds / 60)
-  const remainingSeconds = totalSeconds % 60
-  if (remainingSeconds === 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`
-  return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`
 }
 
 const WorkSummaryRow = ({ message }: { message: Extract<DisplayMessage, { type: 'work_summary' }> }) => {

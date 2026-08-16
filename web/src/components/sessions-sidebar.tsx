@@ -22,7 +22,6 @@ import {
 import {
   sidebarSearchAtom,
   sidebarWidthAtom,
-  sidebarVisibleAtom,
 } from "../state/web-atoms"
 import { SidebarEmptyState, SidebarLoadingState } from "./sidebar-states"
 

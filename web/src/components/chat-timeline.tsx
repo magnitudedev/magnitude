@@ -589,6 +589,9 @@ function getEntrySpacing(
 
   const prevMessage = messageForEntry(timeline, prev)
   const currMessage = messageForEntry(timeline, curr)
+  if (prevMessage?.type === "assistant_message" && currMessage?.type === "work_summary") {
+    return 6
+  }
   const prevSystem = prevMessage?.type === "status_indicator" || prevMessage?.type === "interrupted"
   const currSystem = currMessage?.type === "status_indicator" || currMessage?.type === "interrupted"
   if (prevSystem && currSystem) return 4
