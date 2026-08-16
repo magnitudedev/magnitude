@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelPackage,
+    CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage,
     ModelPackageSource, ModelParameterization, ModelServingConfiguration, RecommendableModel,
     RecommendableModelCatalog, RecommendableModelCatalogProvider, ResolvedServableModelBundle,
     ServableModelBundle, ServableModelBundleKey, ServingProfile, SpeculativeDraftSource,
@@ -17,8 +17,8 @@ use icn_contracts::models::{
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
-    ModelComponent, ModelId, ModelLocation, ModelPreviewSource, ModelSource, ResolvedComponent,
-    ResolvedModel,
+    ModelComponent, ModelId, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
+    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,8 @@ struct CatalogModel {
     variants: Vec<CatalogVariant>,
     context_length: u32,
     #[serde(default)]
+    projector: Option<CatalogProjectorSource>,
+    #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
     quality_score: f64,
@@ -74,6 +76,12 @@ struct CatalogVariant {
     variant_label: String,
     fidelity_rank: u32,
     quantization_aware: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogProjectorSource {
+    path: PathBuf,
 }
 
 #[derive(Clone, Deserialize)]
@@ -238,6 +246,10 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             })
             || model.context_length < MIN_CATALOG_CONTEXT_LENGTH
             || model
+                .projector
+                .as_ref()
+                .is_some_and(|projector| projector.path.as_os_str().is_empty())
+            || model
                 .speculative_decoding
                 .as_ref()
                 .is_some_and(|speculative| {
@@ -272,6 +284,67 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
         }
     }
     Ok(source)
+}
+
+fn is_projector_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("mmproj"))
+}
+
+fn resolve_projector_path(
+    declaration: &CatalogModel,
+    snapshot: &HuggingFaceRepositorySnapshot,
+) -> Result<Option<PathBuf>, InventoryError> {
+    let projector = if let Some(projector) = &declaration.projector {
+        if !is_projector_path(&projector.path)
+            || !snapshot
+                .gguf_files
+                .iter()
+                .any(|file| file.path == projector.path)
+        {
+            return Err(InventoryError::Integrity(format!(
+                "{} projector {} is not a repository mmproj GGUF",
+                declaration.id,
+                projector.path.display()
+            )));
+        }
+        Some(projector.path.clone())
+    } else {
+        let candidates = snapshot
+            .gguf_files
+            .iter()
+            .filter(|file| is_projector_path(&file.path))
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [projector] => Some(projector.clone()),
+            [] => None,
+            _ => {
+                return Err(InventoryError::Integrity(format!(
+                    "{} has {} projector candidates; declare an exact projector path",
+                    declaration.id,
+                    candidates.len()
+                )));
+            }
+        }
+    };
+    if projector.is_some()
+        && declaration
+            .speculative_decoding
+            .as_ref()
+            .is_some_and(|speculative| speculative.method == CatalogSpeculativeMethod::Mtp)
+    {
+        return Err(InventoryError::Integrity(format!(
+            "{} combines a projector with MTP, which cannot process projector embedding batches",
+            declaration.id
+        )));
+    }
+    Ok(projector)
 }
 
 fn valid_parameterization(parameterization: &ModelParameterization) -> bool {
@@ -536,8 +609,22 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         || configuration_ids.len() != catalog.models.len()
         || target_package_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
+            let (target, method) = match &model.configuration.bundle {
+                ServableModelBundle::Standalone { package } => (package, None),
+                ServableModelBundle::SpeculativeDecoding { target, method, .. } => {
+                    (target, Some(method))
+                }
+            };
+            let projector_count = target
+                .files
+                .iter()
+                .filter(|file| file.role == ModelFileRole::Projector)
+                .count();
             !serving_configuration_identity_is_valid(&model.configuration)
                 || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
+                || projector_count > 1
+                || model.capabilities.vision != (projector_count == 1)
+                || (model.capabilities.vision && method == Some(&SpeculativeMethod::Mtp))
                 || servable_bundle_packages(&model.configuration.bundle).any(|package| {
                     package
                         .properties
@@ -1055,12 +1142,24 @@ fn validate_resolved_catalog(
             }
             _ => false,
         };
+        let projector_files = target
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Projector)
+            .collect::<Vec<_>>();
+        let projector_matches = match &declaration.projector {
+            Some(projector) => {
+                projector_files.len() == 1 && projector_files[0].path == projector.path
+            }
+            None => projector_files.len() == usize::from(model.capabilities.vision),
+        };
         if model.configuration.profile.context_length != declaration.context_length
             || !package_source_matches(
                 &target.source,
                 &declaration.repository,
                 &expected_lock.target,
             )
+            || !projector_matches
             || !speculative_matches
         {
             return Err(InventoryError::Integrity(format!(
@@ -1256,7 +1355,7 @@ impl ResolvingRecommendableCatalog {
                 let path = file.path.to_string_lossy().to_ascii_lowercase();
                 let basename = path.rsplit('/').next().unwrap_or(path.as_str());
                 path.contains(&selector)
-                    && !basename.starts_with("mmproj-")
+                    && !is_projector_path(&file.path)
                     && !basename.contains("imatrix")
                     && (!is_later_shard(basename) || is_first_shard(basename))
             })
@@ -1270,6 +1369,14 @@ impl ResolvingRecommendableCatalog {
             )));
         }
         let primary = matches.remove(0);
+        let projector = resolve_projector_path(declaration, snapshot)?;
+        let additional_components = projector
+            .map(|path| ModelPreviewComponentSource {
+                path,
+                role: ModelPreviewComponentRole::Projector,
+            })
+            .into_iter()
+            .collect();
         let target_prepared = self
             .models
             .prepare_preview_from_repository_snapshot(
@@ -1277,7 +1384,7 @@ impl ResolvingRecommendableCatalog {
                     repository: snapshot.repository.clone(),
                     revision: snapshot.commit.clone(),
                     primary_gguf: primary.path.clone(),
-                    additional_components: Vec::new(),
+                    additional_components,
                 },
                 snapshot,
             )
@@ -1770,6 +1877,30 @@ impl RecommendableModelCatalogProvider for ReleaseRecommendableCatalog {
 mod tests {
     use super::*;
 
+    fn repository_snapshot(paths: &[&str]) -> HuggingFaceRepositorySnapshot {
+        HuggingFaceRepositorySnapshot {
+            repository: "publisher/model".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            last_modified: None,
+            downloads: None,
+            likes: None,
+            gated: false,
+            private: false,
+            license: None,
+            license_url: None,
+            base_models: Vec::new(),
+            tags: Vec::new(),
+            gguf_files: paths
+                .iter()
+                .map(|path| icn_contracts::HuggingFaceRepositoryFile {
+                    path: PathBuf::from(path),
+                    size_bytes: 1,
+                    content: icn_contracts::ContentIdentity::Unknown,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn authored_catalog_declares_valid_parameterization_for_every_model() {
         let source = catalog_source().expect("catalog source should be valid");
@@ -1779,6 +1910,87 @@ mod tests {
                 .iter()
                 .all(|model| valid_parameterization(&model.parameterization))
         );
+    }
+
+    #[test]
+    fn authored_catalog_has_complete_vision_projector_policy() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let projected = source
+            .models
+            .iter()
+            .filter(|model| model.projector.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(projected.len(), 12);
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|model| model.speculative_decoding.is_none())
+                .count(),
+            9
+        );
+        assert!(projected.iter().all(|model| {
+            model
+                .speculative_decoding
+                .as_ref()
+                .is_none_or(|speculative| {
+                    matches!(
+                        speculative.method,
+                        CatalogSpeculativeMethod::DFlash | CatalogSpeculativeMethod::DSpark
+                    )
+                })
+        }));
+    }
+
+    #[test]
+    fn projector_resolution_is_automatic_only_when_unambiguous() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let mut declaration = source.models[0].clone();
+        declaration.projector = None;
+        declaration.speculative_decoding = None;
+        assert_eq!(
+            resolve_projector_path(
+                &declaration,
+                &repository_snapshot(&["model.gguf", "mmproj-model-F16.gguf"]),
+            )
+            .unwrap(),
+            Some(PathBuf::from("mmproj-model-F16.gguf"))
+        );
+        let error = resolve_projector_path(
+            &declaration,
+            &repository_snapshot(&[
+                "model.gguf",
+                "mmproj-model-BF16.gguf",
+                "mmproj-model-F16.gguf",
+            ]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2 projector candidates"));
+    }
+
+    #[test]
+    fn projector_resolution_rejects_invalid_paths_and_mtp() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let mut declaration = source.models[0].clone();
+        let snapshot = repository_snapshot(&["model.gguf", "mmproj-BF16.gguf"]);
+        declaration.projector = Some(CatalogProjectorSource {
+            path: PathBuf::from("mmproj-missing.gguf"),
+        });
+        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not a repository mmproj GGUF")
+        );
+
+        declaration.projector = Some(CatalogProjectorSource {
+            path: PathBuf::from("mmproj-BF16.gguf"),
+        });
+        declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
+            method: CatalogSpeculativeMethod::Mtp,
+            draft: CatalogSpeculativeDraftSource::Embedded,
+        });
+        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        assert!(error.to_string().contains("combines a projector with MTP"));
     }
 
     #[test]

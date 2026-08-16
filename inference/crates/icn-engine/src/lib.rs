@@ -4272,6 +4272,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mtmd")]
+    #[test]
+    fn projector_mode_accepts_embedding_capable_speculative_methods() {
+        for method in [
+            icn_contracts::SpeculativeMethodConfig::DFlash {
+                min_sample_probability: 0.1,
+            },
+            icn_contracts::SpeculativeMethodConfig::DSpark {
+                acceptance_threshold: 0.1,
+            },
+        ] {
+            let mut config = model_config_with_projector(1);
+            config.speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
+                source: icn_contracts::SpeculativeDraftSource::Separate {
+                    model_path: "draft.gguf".into(),
+                },
+                method,
+                n_max: 3,
+                n_min: 0,
+                cache_type_k: CacheType::F16,
+                cache_type_v: CacheType::F16,
+            };
+            validate_model_config(&config).unwrap();
+        }
+    }
+
     #[cfg(not(feature = "mtmd"))]
     #[test]
     fn feature_disabled_binary_rejects_a_projector() {
