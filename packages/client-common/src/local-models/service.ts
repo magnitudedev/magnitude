@@ -292,6 +292,7 @@ const makeLocalModels = Effect.gen(function* () {
     state,
     catalog,
     latestInstallationFailed,
+    retry: queryClient.invalidate(localModelsQuery.match()),
     install: (configurationId: ModelServingConfigurationId) =>
       Mutation.execute(install, { configurationId }).pipe(
         Effect.provideService(Registry.AtomRegistry, registry),

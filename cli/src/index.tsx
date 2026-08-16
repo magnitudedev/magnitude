@@ -16,6 +16,7 @@ import {
   deriveCliExitNotice,
   stopDisplayViewController,
   pushNotificationAtom,
+  onboardingModelSetupViewAtom,
 } from "@magnitudedev/client-common";
 import { CliApp, type SessionStart } from "./app";
 import type { AuthSource } from "./state/cli-atoms";
@@ -143,7 +144,15 @@ async function main() {
     const initialAcnLifecycleState = await Effect.runPromise(
       platform.acnStartup.prepare
     );
-    const agentClientTag = createAgentClient(platform.protocolLayer);
+    const agentClientTag = createAgentClient(platform.protocolLayer, {
+      onboardingSetupInitiallyOpen: opts.setup ?? false,
+    });
+    await Effect.runPromise(Effect.exit(
+      Registry.getResult(
+        atomRegistry,
+        onboardingModelSetupViewAtom(agentClientTag),
+      ),
+    ));
     const renderer = await createCliRenderer({
       exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
     });
@@ -196,7 +205,6 @@ async function main() {
                 initialPrompt={opts.prompt}
                 goal={opts.goal}
                 envAuth={resolveEnvAuth()}
-                forceLocalInferenceSetup={opts.setup ?? false}
                 initialAcnLifecycle={initialAcnLifecycleState}
                 sessionOptions={{
                   disableShellSafeguards:

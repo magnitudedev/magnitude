@@ -7,6 +7,7 @@ import {
   localModelBundleKey,
   localModelOptions,
   localModelSpeculativeMethodLabel,
+  formatDownloadBytes,
   type LocalModelOption,
 } from "@magnitudedev/client-common"
 export {
@@ -15,12 +16,13 @@ export {
   localModelConfigurationId,
   localModelProviderModelId,
   localModelBundleKey,
+  formatDownloadBytes,
+  modelDownloadFailureMessage,
 } from "@magnitudedev/client-common"
 import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
-  type ModelDownloadFailure,
   type LocalModelsState,
   type LocalModelRecommendationProgressStep,
   type ModelAssessmentId,
@@ -87,31 +89,6 @@ export const selectionAssessmentId = (
 export const formatBytes = (bytes: number): string => {
   const gib = bytes / 1024 ** 3
   return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
-}
-
-export const formatDownloadBytes = (bytes: number): string => {
-  const gigabytes = bytes / 1_000_000_000
-  return gigabytes >= 1
-    ? `${gigabytes.toFixed(gigabytes >= 10 ? 1 : 2)} GB`
-    : `${(bytes / 1_000_000).toFixed(0)} MB`
-}
-
-export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): string => {
-  switch (failure._tag) {
-    case "Interrupted": return "The download was interrupted. Try again to continue."
-    case "InsufficientDiskSpace":
-      return `Not enough disk space. Free at least ${formatDownloadBytes(
-        Math.max(0, failure.requiredBytes - failure.availableBytes),
-      )} and try again.`
-    case "SourceUnavailable": return "This model is not available from its source."
-    case "NetworkUnavailable":
-      return "Couldn’t reach the model source. Check your connection and try again."
-    case "CorruptDownload":
-      return "The downloaded file couldn’t be verified. Try the download again."
-    case "LocalStorageFailure":
-      return "Magnitude couldn’t write the model to disk. Check disk access and try again."
-    case "Internal": return "Magnitude couldn’t complete the download. Try again."
-  }
 }
 
 export const formatContext = (tokens: number): string => tokens < 1_000

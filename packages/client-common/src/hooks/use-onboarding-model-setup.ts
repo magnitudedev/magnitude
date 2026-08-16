@@ -1,45 +1,59 @@
 import { useCallback, useMemo } from "react"
-import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import {
+  Atom,
+  Result,
+  useAtomSet,
+  useAtomValue,
+} from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import { LocalInferenceHardwareMirror, type ModelServingConfigurationId } from "@magnitudedev/sdk"
 import { OnboardingModelSetup } from "../local-models/setup"
+import { onboardingModelSetupViewAtom } from "../local-models/setup-view"
 import { useAgentClient } from "../state/agent-client-context"
 import { useMirroredStateAtom } from "./use-mirrored-state"
 
 export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
   const hardwareAtom = useMirroredStateAtom(LocalInferenceHardwareMirror)
-  const service = useMemo(() => client.effectQuery.runtime.atom(OnboardingModelSetup), [client])
-  const state = useMemo(() => Atom.make((get) =>
-    Result.flatMap(get(service), (setup) => get(setup.state))), [service])
-  const startAction = useMemo(() => Atom.keepAlive(client.effectQuery.runtime.fn<ModelServingConfigurationId>()(
+  const view = useMemo(() => onboardingModelSetupViewAtom(client), [client])
+  const retryAction = useMemo(() => client.effectQuery.runtime.fn(
+    () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.retry),
+    { concurrent: true },
+  ), [client])
+  const openAction = useMemo(() => client.effectQuery.runtime.fn(
+    () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.open),
+    { concurrent: true },
+  ), [client])
+  const selectAction = useMemo(() => client.effectQuery.runtime.fn<ModelServingConfigurationId>()(
     (configurationId) => Effect.flatMap(
       OnboardingModelSetup,
-      (setup) => setup.start(configurationId),
+      (setup) => setup.select(configurationId),
     ),
     { concurrent: true },
-  )), [client])
-  const cancelAction = useMemo(() => Atom.keepAlive(client.effectQuery.runtime.fn(
+  ), [client])
+  const cancelAction = useMemo(() => client.effectQuery.runtime.fn(
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.cancel),
     { concurrent: true },
-  )), [client])
-  const skipAction = useMemo(() => Atom.keepAlive(client.effectQuery.runtime.fn(
-    () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.skip),
+  ), [client])
+  const exitAction = useMemo(() => client.effectQuery.runtime.fn(
+    () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.exit),
     { concurrent: true },
-  )), [client])
-  const setup = useAtomSet(startAction)
+  ), [client])
+  const retry = useAtomSet(retryAction)
+  const open = useAtomSet(openAction)
+  const select = useAtomSet(selectAction)
   const cancel = useAtomSet(cancelAction)
-  const skip = useAtomSet(skipAction)
+  const exit = useAtomSet(exitAction)
+
   return {
     hardware: Result.map(useAtomValue(hardwareAtom), ({ state }) => state),
-    state: useAtomValue(state),
-    startResult: useAtomValue(startAction),
-    cancelResult: useAtomValue(cancelAction),
-    skipResult: useAtomValue(skipAction),
-    setup: useCallback((configurationId: ModelServingConfigurationId) => {
-      setup(configurationId)
-    }, [setup]),
+    view: useAtomValue(view),
+    retry: useCallback(() => retry(), [retry]),
+    open: useCallback(() => open(), [open]),
+    select: useCallback((configurationId: ModelServingConfigurationId) => {
+      select(configurationId)
+    }, [select]),
     cancel: useCallback(() => cancel(), [cancel]),
-    skip: useCallback(() => skip(), [skip]),
+    exit: useCallback(() => exit(), [exit]),
   }
 }

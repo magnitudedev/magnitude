@@ -1,6 +1,10 @@
 import { Context, Layer } from "effect"
 import { LocalModels, LocalModelsLive } from "../local-models/service"
-import { OnboardingModelSetup, OnboardingModelSetupLive } from "../local-models/setup"
+import {
+  OnboardingModelSetup,
+  OnboardingModelSetupConfig,
+  OnboardingModelSetupLive,
+} from "../local-models/setup"
 import { ModelSlots, ModelSlotsLive } from "../model-slots/service"
 import {
   OnboardingPersistence,
@@ -20,8 +24,13 @@ export type ClientServices =
   | OnboardingPersistence
   | OnboardingModelSetup
 
+export interface ClientServicesOptions {
+  readonly onboardingSetupInitiallyOpen?: boolean
+}
+
 export const clientServicesLayer = (
   effectQuery: Context.Tag.Service<typeof ClientEffectQuery>,
+  options: ClientServicesOptions = {},
 ) => {
   const infrastructure = Layer.mergeAll(
     Layer.succeed(ClientEffectQuery, effectQuery),
@@ -35,5 +44,10 @@ export const clientServicesLayer = (
     Layer.provideMerge(infrastructure),
   )
 
-  return OnboardingModelSetupLive.pipe(Layer.provideMerge(domains))
+  return OnboardingModelSetupLive.pipe(
+    Layer.provideMerge(domains),
+    Layer.provide(Layer.succeed(OnboardingModelSetupConfig, {
+      initiallyOpen: options.onboardingSetupInitiallyOpen ?? false,
+    })),
+  )
 }

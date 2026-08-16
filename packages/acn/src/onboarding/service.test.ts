@@ -8,7 +8,7 @@ import { MirroredStateChangesLive } from "../mirrored-state"
 import { makeOnboarding, Onboarding, OnboardingLive } from "./service"
 
 describe("Onboarding", () => {
-  it("defaults to incomplete and persists the requested value", async () => {
+  it("defaults to incomplete and persists completion", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const stored = yield* Ref.make({ completed: false })
       const onboarding = makeOnboarding({
@@ -16,7 +16,7 @@ describe("Onboarding", () => {
         update: (transition) => Ref.updateAndGet(stored, transition),
       })
       const before = yield* onboarding.state
-      yield* onboarding.update(true)
+      yield* onboarding.complete
       const after = yield* onboarding.state
       return { before, after, stored: yield* Ref.get(stored) }
     }))
@@ -26,18 +26,18 @@ describe("Onboarding", () => {
     expect(result.stored).toEqual({ completed: true })
   })
 
-  it("can explicitly return to incomplete", async () => {
+  it("completion is idempotent and cannot return to incomplete", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const stored = yield* Ref.make({ completed: true })
       const onboarding = makeOnboarding({
         get: Ref.get(stored),
         update: (transition) => Ref.updateAndGet(stored, transition),
       })
-      yield* onboarding.update(false)
+      yield* onboarding.complete
       return yield* onboarding.state
     }))
 
-    expect(result).toEqual({ completed: false })
+    expect(result).toEqual({ completed: true })
   })
 
   it("publishes updates through the onboarding mirror", async () => {
@@ -56,9 +56,11 @@ describe("Onboarding", () => {
       return yield* Effect.gen(function* () {
         const onboarding = yield* Onboarding
         const before = yield* onboarding.snapshot
-        yield* onboarding.update(true)
+        yield* onboarding.complete
         const after = yield* onboarding.snapshot
-        return { before, after }
+        yield* onboarding.complete
+        const afterRepeatedCompletion = yield* onboarding.snapshot
+        return { before, after, afterRepeatedCompletion }
       }).pipe(Effect.provide(layer))
     })))
 
@@ -70,5 +72,6 @@ describe("Onboarding", () => {
       revision: 1,
       state: { completed: true },
     })
+    expect(result.afterRepeatedCompletion).toEqual(result.after)
   })
 })
