@@ -29,7 +29,7 @@ use crate::store_fs::ensure_store_layout;
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
-const MODEL_INSPECTION_SCHEMA_VERSION: u32 = 2;
+const MODEL_INSPECTION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CacheEvidence {
@@ -347,16 +347,10 @@ impl ManagedModelStore {
         &self,
         content_id: &icn_contracts::ContentId,
         primary_name: &str,
-        has_projector: bool,
     ) -> Option<CachedModelInspection> {
         let assessor = self.template_assessor.as_deref()?;
-        let evidence = model_inspection_evidence(
-            content_id,
-            assessor.cache_identity(),
-            primary_name,
-            has_projector,
-        )
-        .ok()?;
+        let evidence =
+            model_inspection_evidence(content_id, assessor.cache_identity(), primary_name).ok()?;
         self.cache
             .read_index(ModelIndexKind::ArtifactInspection, &evidence)
     }
@@ -921,11 +915,6 @@ fn scan(
                             .file_name()
                             .and_then(|value| value.to_str())
                             .unwrap_or("local model"),
-                        candidate
-                            .location
-                            .components()
-                            .iter()
-                            .any(|component| component.role == ComponentRole::Projector),
                     )?;
                     observations.insert(candidate.id.clone(), observation_key.clone());
                     inspection_keys.insert(candidate.id.clone(), inspection_key.clone());
@@ -1386,16 +1375,8 @@ pub(crate) fn build_model(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("local model");
-    let has_projector = location
-        .components()
-        .iter()
-        .any(|component| component.role == ComponentRole::Projector);
-    let inspection_evidence = model_inspection_evidence(
-        &content_id,
-        assessor.cache_identity(),
-        primary_name,
-        has_projector,
-    )?;
+    let inspection_evidence =
+        model_inspection_evidence(&content_id, assessor.cache_identity(), primary_name)?;
     let cached_inspection = cache.read_index::<CachedModelInspection>(
         ModelIndexKind::ArtifactInspection,
         &inspection_evidence,
@@ -1460,10 +1441,6 @@ pub(crate) fn build_model(
                 ) {
                     supported_parameters.push("reasoning_effort".to_owned());
                 }
-                let mut modalities = inspection.modalities;
-                if has_projector && !modalities.iter().any(|modality| modality == "image") {
-                    modalities.push("image".to_owned());
-                }
                 let inspected = CachedModelInspection {
                     name,
                     properties: InventoryProperties::Inspected {
@@ -1475,7 +1452,7 @@ pub(crate) fn build_model(
                         training_context_length: inspection.training_context_length,
                         nextn_predict_layers: inspection.nextn_predict_layers,
                         tokenizer: inspection.tokenizer,
-                        modalities,
+                        modalities: inspection.modalities,
                         base_models: inspection.base_models,
                         tools,
                         structured_output: CapabilitySupport::Supported { parallel: None },
@@ -1539,14 +1516,12 @@ fn model_inspection_evidence(
     content_id: &icn_contracts::ContentId,
     assessor_identity: &str,
     primary_name: &str,
-    has_projector: bool,
 ) -> Result<String, InventoryError> {
     serde_json::to_string(&(
         MODEL_INSPECTION_SCHEMA_VERSION,
         &content_id.0,
         assessor_identity,
         primary_name,
-        has_projector,
     ))
     .map_err(|error| InventoryError::Internal(error.to_string()))
 }
@@ -1568,17 +1543,7 @@ fn model_inspection_evidence_for_model(
         .and_then(|component| Path::new(&component.path).file_name())
         .and_then(|value| value.to_str())
         .unwrap_or("local model");
-    let has_projector = model
-        .location
-        .components()
-        .iter()
-        .any(|component| component.role == ComponentRole::Projector);
-    model_inspection_evidence(
-        &model.content_id,
-        assessor_identity,
-        primary_name,
-        has_projector,
-    )
+    model_inspection_evidence(&model.content_id, assessor_identity, primary_name)
 }
 
 #[allow(clippy::too_many_arguments)]

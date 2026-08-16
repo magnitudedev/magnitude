@@ -120,12 +120,9 @@ impl ModelPreviewService {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("remote model");
-        let has_projector = components
-            .iter()
-            .any(|component| component.role == ComponentRole::Projector);
-        let Some(inspection) =
-            self.models
-                .cached_model_inspection(&content_id, primary_name, has_projector)
+        let Some(inspection) = self
+            .models
+            .cached_model_inspection(&content_id, primary_name)
         else {
             return Ok(None);
         };
