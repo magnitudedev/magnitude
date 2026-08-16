@@ -827,11 +827,13 @@ export function createCodingAgentSession(options: CreateClientOptions) {
   )
 
   const readWorkStatus = Effect.gen(function* () {
+    const userMessages = yield* UserMessageResolutionProjection.Tag
     const turn = yield* TurnProjection.Tag
     const agents = yield* AgentLifecycleProjection.Tag
     const compaction = yield* CompactionProjection.Tag
     const execution = yield* ExecutionManager
     return deriveSessionWorkStatus({
+      pendingUserMessageCount: (yield* userMessages.get).rawByMessageId.size,
       turns: yield* turn.getAllForks(),
       agents: yield* agents.get,
       compactions: yield* compaction.getAllForks(),
@@ -841,11 +843,13 @@ export function createCodingAgentSession(options: CreateClientOptions) {
 
   const workStatusChanges = Stream.unwrap(
     Effect.gen(function* () {
+      const userMessages = yield* UserMessageResolutionProjection.Tag
       const turn = yield* TurnProjection.Tag
       const agents = yield* AgentLifecycleProjection.Tag
       const compaction = yield* CompactionProjection.Tag
       const execution = yield* ExecutionManager
       return Stream.mergeAll([
+        userMessages.state.changes.pipe(Stream.map(() => undefined)),
         turn.state.changes.pipe(Stream.map(() => undefined)),
         agents.state.changes.pipe(Stream.map(() => undefined)),
         compaction.state.changes.pipe(Stream.map(() => undefined)),

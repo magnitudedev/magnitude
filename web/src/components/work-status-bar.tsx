@@ -31,6 +31,13 @@ export interface WorkStatusBarProps {
   onWorkerClick?: (forkId: string) => void
 }
 
+export function isWorkStatusBarVisible(
+  rootStatus: DisplayRootStatus | null,
+  hasTasks: boolean,
+): boolean {
+  return rootStatus !== null && (rootStatus._tag === "Working" || hasTasks)
+}
+
 function findSlotProfileForRole(
   profiles: SlotProfiles | null | undefined,
   role: string | null | undefined,
@@ -247,9 +254,6 @@ export function WorkStatusBar({
 
   const rootStatus = rootActor?.kind === "root" ? rootActor.status : null
   const chainActive = rootStatus?._tag === "Working"
-  const hasRecentWork = rootStatus?._tag === "Worked" || rootStatus?._tag === "Interrupted"
-    ? rootStatus.lastProductiveMs > 0
-    : false
   const anyActorClockRunning = Object.values(actors).some((actor) =>
     actor.kind === "worker" && isDisplayWorkerStatusClockRunning(actor.status))
 
@@ -258,7 +262,7 @@ export function WorkStatusBar({
 
   const hasTasks = rows.length > 0
 
-  if (rootStatus === null || !chainActive && !hasRecentWork && !hasTasks) return null
+  if (rootStatus === null || !isWorkStatusBarVisible(rootStatus, hasTasks)) return null
 
   const incompleteCount = tasks?.summary.incompleteCount ?? rows.filter((row) => row.status !== "completed").length
   const taskCountLabel = incompleteCount === 1 ? "1 task" : `${incompleteCount} tasks`

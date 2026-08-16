@@ -39,8 +39,13 @@ import {
   usePaginatedSessions,
   useOnboardingModelSetup,
   useModelSlots,
+  useModelSlotActions,
+  useProviderModelCatalog,
   deriveCurrentLocalModel,
   modelSlotResidentAllocation,
+  selectedSlotModel,
+  reasoningEffortControl,
+  formatReasoningEffort,
   useActiveSessionStatusesSubscription,
   activeSessionStatusesAtom,
 } from "@magnitudedev/client-common"
@@ -187,6 +192,8 @@ function SessionsSidebarContainer(props?: {
   })
 
   const handleNewSession = () => {
+    setSettingsOpen(false)
+    setModelCenterTab(null)
     startNewSession({ cwd: cwdFilter })
     if (props?.overlay && props.onCloseOverlay) props.onCloseOverlay()
   }
@@ -222,6 +229,8 @@ function SessionsSidebarContainer(props?: {
       onCwdFilterChange={setCwdFilter}
       onLoadMore={sessionPage.loadMore}
       onSelectSession={(id) => {
+        setSettingsOpen(false)
+        setModelCenterTab(null)
         resumeSession(id)
       }}
       onNewSession={handleNewSession}
@@ -439,7 +448,7 @@ function ComposerContainer({
         if (platform.quit) platform.quit()
       },
       openRecentChats: () => {
-        if (sidebarVisible === false) {
+        if (getIsNarrow() && !sidebarVisible) {
           setSidebarVisible(true)
         }
         window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
@@ -537,6 +546,8 @@ function FooterBarContainer({
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
   const setModelCenterTab = useAtomSet(modelCenterTabAtom)
   const slotsResult = useModelSlots()
+  const catalogResult = useProviderModelCatalog()
+  const slotActions = useModelSlotActions()
   const slots = Option.getOrNull(Result.value(slotsResult))
   const currentModel = deriveCurrentLocalModel(
     Option.fromNullable(slots?.slots.primary),
@@ -575,34 +586,49 @@ function FooterBarContainer({
       : null
   const cwd = sessionCwd ?? selectedCwd
 
+  const selectedModel = Option.flatMap(
+    Option.all({
+      catalog: Result.value(catalogResult),
+      slots: Result.value(slotsResult),
+    }),
+    ({ catalog, slots }) =>
+      selectedSlotModel(catalog, slots, PRIMARY_SLOT_ID),
+  )
+  const thinkingOptions = Option.match(selectedModel, {
+    onNone: () => [],
+    onSome: ({ model }) => {
+      const control = reasoningEffortControl(model)
+      return control._tag === "Available" ? control.options : []
+    },
+  })
   const thinkingLevel = profile?.reasoningEffort
-    ? profile.reasoningEffort.charAt(0).toUpperCase() +
-      profile.reasoningEffort.slice(1)
+    ? formatReasoningEffort(profile.reasoningEffort)
     : null
   const openModels = useCallback(() => {
     setSettingsOpen(false)
     setModelCenterTab("models")
   }, [setModelCenterTab, setSettingsOpen])
-  const openSettings = useCallback(() => {
-    setModelCenterTab(null)
-    setSettingsOpen(true)
+  const openHardware = useCallback(() => {
+    setSettingsOpen(false)
+    setModelCenterTab("hardware")
   }, [setModelCenterTab, setSettingsOpen])
   const modelLabel =
     currentModel._tag === "NoSelection"
       ? "Choose model"
-      : `${currentModel.displayName} · ${
-          currentModel._tag === "Running"
-            ? "Ready"
-            : currentModel._tag === "Loading"
-            ? `Loading ${currentModel.percentage}%`
-            : currentModel._tag === "Stopping"
-            ? "Stopping"
-            : currentModel._tag === "Failed"
-            ? "Failed"
-            : "Not loaded"
-        }${
-          residentBytes === null ? "" : ` · ${formatBytes(residentBytes)} mem`
-        }`
+      : currentModel.displayName
+  const modelResidency = currentModel._tag === "NoSelection"
+    ? null
+    : currentModel._tag === "Running"
+    ? "ready" as const
+    : currentModel._tag === "Loading" || currentModel._tag === "Stopping"
+    ? "loading" as const
+    : "not-ready" as const
+  const modelLoadingPercentage = currentModel._tag === "Loading"
+    ? currentModel.percentage
+    : null
+  const memoryLabel = currentModel._tag === "Running" && residentBytes !== null
+    ? `${formatBytes(residentBytes)} mem`
+    : null
 
   return (
     <FooterBar
@@ -610,9 +636,22 @@ function FooterBarContainer({
       tokenCap={tokenCap}
       cwd={cwd}
       model={modelLabel}
+      modelResidency={modelResidency}
+      modelLoadingPercentage={modelLoadingPercentage}
       thinkingLevel={thinkingLevel}
+      memoryLabel={memoryLabel}
+      thinkingEffort={profile?.reasoningEffort ?? null}
+      thinkingOptions={thinkingOptions}
+      onThinkingSelect={(effort) => {
+        const primary = slots?.slots.primary
+        if (!primary || primary._tag === "Unassigned") return
+        slotActions.assign(PRIMARY_SLOT_ID, {
+          ...primary.selection,
+          reasoningEffort: effort,
+        })
+      }}
       onModelClick={openModels}
-      onThinkingClick={openSettings}
+      onMemoryClick={openHardware}
       bashMode={bashMode}
       nextEscWillKillAll={nextEscWillKillAll}
       transcriptMode={displayMode === "transcript"}
@@ -725,26 +764,8 @@ function useInterruptAllListener(): void {
 
 /** Inner app — has display view + AgentClient context */
 function AppInner(): ReactNode {
-  const sidebarVisible = useAtomValue(sidebarVisibleAtom)
-  const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
-
   // Detect responsive mode (≤640px) — no useEffect, uses matchMedia store
   const isNarrow = useSyncExternalStore(subscribeResponsive, getIsNarrow)
-
-  // Sync sidebarVisibleAtom with responsive state:
-  // - Not narrow → null (sidebar always docked, not overlay)
-  // - Narrow → false (overlay hidden by default)
-  // This runs during render — when isNarrow changes, the atom is updated.
-  // The atom write is idempotent (only fires if value actually changes).
-  const expectedSidebar = isNarrow ? false : null
-  if (sidebarVisible !== expectedSidebar) {
-    // Only reset to false when entering narrow mode; don't clobber user's open state
-    if (!isNarrow && sidebarVisible !== null) {
-      setSidebarVisible(null)
-    } else if (isNarrow && sidebarVisible === null) {
-      setSidebarVisible(false)
-    }
-  }
 
   useMenuActions()
   useInterruptAllListener()
@@ -801,7 +822,7 @@ function AuthenticatedAppContent({
   const sidebarVisible = useAtomValue(sidebarVisibleAtom)
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
   const { profiles: slotProfiles } = useSlotProfiles()
-  const showOverlaySidebar = isNarrow && sidebarVisible === true
+  const showOverlaySidebar = isNarrow && sidebarVisible
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const modelCenterTab = useAtomValue(modelCenterTabAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
@@ -849,6 +870,7 @@ function AuthenticatedAppContent({
             the correct position across overlay navigation. */}
         <div
           style={{
+            display: "flex",
             flexDirection: "column",
             flex: 1,
             minHeight: 0,

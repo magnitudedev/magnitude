@@ -53,12 +53,14 @@ const idleTurn = () =>
 const idleCompaction = () => new CompactionIdle({ contextLimitBlocked: false, shouldCompact: false })
 
 const status = (overrides: {
+  pendingUserMessages?: number
   turn?: ForkTurnState
   compaction?: CompactionIdle | Compacting | PendingInjection
   workingAgent?: boolean
   detached?: number
 }) =>
   deriveSessionWorkStatus({
+    pendingUserMessageCount: overrides.pendingUserMessages ?? 0,
     turns: new Map([[null, overrides.turn ?? idleTurn()]]),
     agents: agents(overrides.workingAgent ?? false),
     compactions: new Map([[null, overrides.compaction ?? idleCompaction()]]),
@@ -104,6 +106,13 @@ describe('deriveSessionWorkStatus', () => {
         }),
       })._tag
     ).toBe('Working')
+  })
+
+  it('recognizes accepted user messages awaiting resolution', () => {
+    expect(status({ pendingUserMessages: 1 })).toEqual({
+      _tag: 'Working',
+      workerCount: 0,
+    })
   })
 
   it('recognizes worker, compaction policy, and live process work', () => {

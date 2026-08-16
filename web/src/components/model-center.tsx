@@ -779,36 +779,6 @@ function CatalogView(): ReactNode {
           </div>
         </section>
       )}
-      {discovery && discovery.progress.length > 0 && (
-        <ol className="progress-steps">
-          {discovery.progress.map((step, index) => (
-            <li
-              key={`${step.id}:${index}`}
-              data-state={step.status._tag.toLowerCase()}
-            >
-              <span>
-                {step.status._tag === "Completed" ? (
-                  <Check size={13} />
-                ) : step.status._tag === "Running" ? (
-                  <Loader2 className="spin" size={13} />
-                ) : step.status._tag === "Failed" ? (
-                  <AlertTriangle size={13} />
-                ) : (
-                  index + 1
-                )}
-              </span>
-              <div>
-                <strong>
-                  {step.id.charAt(0).toUpperCase() + step.id.slice(1)}
-                </strong>
-                {step.status._tag === "Failed" && (
-                  <small>{step.status.failure.message}</small>
-                )}
-              </div>
-            </li>
-          ))}
-        </ol>
-      )}
       {discovery?._tag === "Failed" && (
         <div className="model-notice danger">
           <AlertTriangle size={15} />
