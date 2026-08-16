@@ -93,7 +93,7 @@ submit
   -> restore exact reusable prefix or cold-prefill
   -> prefill / decode / sample
   -> stop, cancel, disconnect, or fail
-  -> retain committed text prefix when safe
+  -> retain committed semantic prefix when safe
   -> terminal result
 ```
 
@@ -103,6 +103,12 @@ Batch effects are staged separately from requests until that boundary. A sampled
 committed only when a later decode or speculative-verification step accepts it.
 Multimodal projector execution supports only speculative methods that can advance from embedding
 sub-batches; MTP is rejected during configuration validation.
+
+Prepared prompts use one semantic representation for text-only and multimodal requests. Text spans
+contain exact model tokens; media spans contain a stable content identity, their logical
+token cost, and their native position cost. Exact media spans can therefore reuse resident KV just
+like text while remaining indivisible. The binding exposes upstream single-chunk MTMD evaluation;
+Magnitude does not modify or recreate llama.cpp projector behavior.
 
 Lifecycle observations report queueing, preparation, prefill, and generation start. They are
 coalesced, rate-limited latest-state signals and may be replaced rather than delay inference.
@@ -127,17 +133,18 @@ planning work is idle-only.
 ## Prompt state
 
 An available native sequence carries its optional reusable prefix as one owned value. Admission
-chooses the longest exact token match and transfers the sequence into active ownership. Native KV
-never leaves llama.cpp.
+chooses the longest exact semantic match and transfers the sequence into active ownership. Native
+KV never leaves llama.cpp. Logical token counts drive capacity and progress; native positions drive
+KV trimming and continuation, including M-RoPE prompts where those values differ.
 
-Cancellation and stream disconnection do not make committed text state ambiguous. They preserve it
-when cache policy permits. See [KV state reuse](./kv.md) for invalidation rules.
+Cancellation and stream disconnection do not make committed semantic state ambiguous. They
+preserve it when cache policy permits. See [KV state reuse](./kv.md) for invalidation rules.
 
 ## Failure and shutdown
 
 | Event | Effect |
 | --- | --- |
-| Validation, cancellation, disconnection, request-local failure | Affect one request; retain its committed text prefix when eligible |
+| Validation, cancellation, disconnection, request-local failure | Affect one request; retain its committed semantic prefix when eligible |
 | Shared native batch failure | Reset target/draft context state and invalidate all prefixes in that context |
 | Sequence cleanup failure | Quarantine that sequence ID |
 | Shutdown | Reject queued work, fail active work, release state, join the executor |
