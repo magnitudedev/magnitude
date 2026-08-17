@@ -46,6 +46,17 @@ The shared setup service sequences install, assignment, load, cancellation, and 
 completion and publishes one server-derived presentation state. Web renders that state directly and
 does not maintain a second workflow or correlate operations itself.
 
+Browser and Electron bootstrap presentation observes the SDK's client ACN lifecycle before treating
+the application connection as ready. Starting phases display their latest authoritative activity;
+installation displays the lifecycle's monotonic overall progress and exact transfer size only when
+the lifecycle marks that detail exact. Indeterminate work never receives a fabricated percentage.
+Typed startup failure replaces activity with its diagnostic and available recovery actions. The
+onboarding observation may begin while startup is visible so the transition to setup or the ordinary
+shell does not introduce a redundant connection screen. Any remaining post-connection observation
+gap is identified as loading local model settings, not as connecting to inference.
+Startup surfaces use the canonical transparent Magnitude mark from shared product assets without
+placing it inside a card, badge, or manufactured background.
+
 The ordinary shell contains a dedicated Settings surface for local inference:
 
 - Models presents selected slots, installed models, active transfers, failures, and residency.
@@ -110,6 +121,7 @@ semantics.
 ## Conformance
 
 - Browser and Electron render the same React application and recover by refetching service state.
+- Browser and Electron render the same authoritative daemon phases before entering application gates.
 - No web model-management component reconstructs the deprecated candidate/offering/download model.
 - Non-local catalog entries are never rendered, selected, assigned, or counted as ready.
 - Every long-running lifecycle is rendered from server state; mutations cover command admission.

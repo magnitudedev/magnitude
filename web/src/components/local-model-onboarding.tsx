@@ -1,7 +1,7 @@
 import type { ReactNode } from "react"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { AlertTriangle, Check, Cpu, HardDrive, Loader2, X } from "lucide-react"
+import { AlertTriangle, Cpu, HardDrive, Loader2, X } from "lucide-react"
 import {
   formatLocalModelDisplayName,
   localModelConfigurationId,
@@ -22,20 +22,82 @@ import {
   transferProgress,
 } from "./local-inference-format"
 type Setup = ReturnType<typeof useOnboardingModelSetup>
-const progressIcon = (
+
+const formatDurationMs = (durationMs: number): string =>
+  durationMs < 1_000
+    ? `${(durationMs / 1_000).toFixed(1)}s`
+    : durationMs < 60_000
+      ? `${Math.round(durationMs / 1_000)}s`
+      : `${Math.floor(durationMs / 60_000)}m ${Math.round(
+          (durationMs % 60_000) / 1_000
+        )}s`
+
+const preparationLabel = (
   step: LocalModelRecommendationProgressStep,
-  index: number
-): ReactNode => {
-  switch (step.status._tag) {
-    case "Completed":
-      return <Check size={13} />
-    case "Running":
-      return <Loader2 className="animate-spin" size={13} />
-    case "Failed":
-      return <AlertTriangle size={13} />
-    case "Pending":
-      return index + 1
+  completed: boolean
+): string => {
+  if (step.id === "hardware") {
+    return completed ? "Detected hardware" : "Detecting hardware"
   }
+  if (step.id === "inventory") {
+    if (!completed) return "Checking downloaded models"
+    const count = Option.getOrElse(step.completedItems, () => 0)
+    return `Found ${count} downloaded ${count === 1 ? "model" : "models"}`
+  }
+  if (step.id === "assessment") {
+    if (!completed) return "Assessing models for this machine"
+    const count = Option.getOrElse(step.completedItems, () => 0)
+    return `Assessed ${count} models for this machine`
+  }
+  if (!completed) return "Preparing recommendations"
+  const count = Option.getOrElse(step.completedItems, () => 0)
+  return `Prepared ${count} recommendations`
+}
+
+const preparationMetadata = (
+  step: LocalModelRecommendationProgressStep
+): string | null => {
+  if (step.status._tag === "Failed") return step.status.failure.message
+  if (step.status._tag === "Completed") {
+    return step.id === "assessment" && !step.status.cached
+      ? `Completed in ${formatDurationMs(step.status.durationMs)}`
+      : null
+  }
+  if (step.status._tag !== "Running") return null
+  const count =
+    step.id === "assessment"
+      ? Option.match(step.totalItems, {
+          onNone: () => null,
+          onSome: (total) =>
+            Option.match(step.completedItems, {
+              onNone: () => `${total} models`,
+              onSome: (completed) => `${completed} of ${total} models`,
+            }),
+        })
+      : null
+  const estimate = Option.match(step.estimatedRemainingMs, {
+    onNone: () => null,
+    onSome: (remainingMs) =>
+      `About ${formatDurationMs(remainingMs)} remaining`,
+  })
+  return [count, estimate].filter((value) => value !== null).join(" · ") || null
+}
+
+const preparationFraction = (
+  step: LocalModelRecommendationProgressStep
+): number | null => {
+  if (step.status._tag !== "Running") return null
+  return Option.match(
+    Option.all({
+      completed: step.completedItems,
+      total: step.totalItems,
+    }),
+    {
+      onNone: () => null,
+      onSome: ({ completed, total }) =>
+        total <= 0 ? null : Math.max(0, Math.min(1, completed / total)),
+    }
+  )
 }
 const ModelSummary = ({ model }: { model: LocalModel }): ReactNode => {
   const context = modelContextLength(model)
@@ -79,6 +141,21 @@ export function LocalModelOnboarding({
     (operationModel?.acquisitionState._tag === "Failed"
       ? modelDownloadFailureMessage(operationModel.acquisitionState.failure)
       : null)
+  const preparationStep =
+    content._tag === "Preparation"
+      ? content.progress.find((step) => step.status._tag === "Failed") ??
+        content.progress.find((step) => step.status._tag === "Running") ??
+        [...content.progress]
+          .reverse()
+          .find((step) => step.status._tag === "Completed") ??
+        null
+      : null
+  const preparationProgress =
+    preparationStep === null ? null : preparationFraction(preparationStep)
+  const completedPreparation =
+    content._tag === "Preparation"
+      ? content.progress.filter((step) => step.status._tag === "Completed")
+      : []
   return (
     <main className="flex min-h-screen justify-center overflow-auto bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200">
       <div className="box-border w-[min(980px,100%)] px-[clamp(18px,5vw,56px)] py-[clamp(28px,6vh,70px)]">
@@ -130,42 +207,72 @@ export function LocalModelOnboarding({
         )}
 
         {content._tag === "Preparation" && (
-          <>
-            <section className="preparation-panel">
-              {content.discoveryFailure ? (
-                <AlertTriangle size={20} />
+          <section
+            aria-live="polite"
+            className="mt-7 max-w-[720px] border-t border-slate-200 pt-6 dark:border-slate-800"
+          >
+            <div className="flex items-start gap-3.5">
+              {content.discoveryFailure || preparationStep?.status._tag === "Failed" ? (
+                <AlertTriangle
+                  className="mt-0.5 shrink-0 text-red-600 dark:text-red-400"
+                  size={20}
+                />
               ) : (
-                <Loader2 className="animate-spin" size={20} />
+                <Loader2
+                  className="mt-0.5 shrink-0 animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
+                  size={20}
+                />
               )}
-              <div>
-                <h2>Preparing models for this machine</h2>
-                <p>
-                  {content.discoveryFailure?.message ??
-                    "Hardware detection and native assessment run locally."}
-                </p>
-              </div>
-            </section>
-            {content.progress.length > 0 && (
-              <ol className="progress-steps mt-[22px]">
-                {content.progress.map((step, index) => (
-                  <li
-                    key={`${step.id}:${index}`}
-                    data-state={step.status._tag.toLowerCase()}
-                  >
-                    <span>{progressIcon(step, index)}</span>
-                    <div>
-                      <strong>
-                        {step.id.charAt(0).toUpperCase() + step.id.slice(1)}
-                      </strong>
-                      {step.status._tag === "Failed" && (
-                        <small>{step.status.failure.message}</small>
+              <div className="min-w-0 flex-1">
+                <span className="block text-[10px] font-semibold uppercase tracking-[0.09em] text-slate-500">
+                  Preparing local models
+                </span>
+                <h2 className="mt-1 text-[17px] font-semibold leading-6 text-slate-900 dark:text-slate-200">
+                  {preparationStep === null
+                    ? "Reading local inference state"
+                    : preparationLabel(
+                        preparationStep,
+                        preparationStep.status._tag === "Completed"
                       )}
+                </h2>
+                <p className="mt-1 text-[12px] leading-5 text-slate-600 dark:text-slate-400">
+                  {content.discoveryFailure?.message ??
+                    (preparationStep === null
+                      ? "Waiting for hardware and model inventory."
+                      : preparationMetadata(preparationStep) ??
+                        "Hardware detection and model assessment run locally.")}
+                </p>
+                {preparationStep !== null && preparationProgress !== null && (
+                  <div className="mt-3 flex max-w-[480px] items-center gap-3">
+                    <div
+                      role="progressbar"
+                      aria-label={preparationLabel(preparationStep, false)}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={Math.round(preparationProgress * 100)}
+                      className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"
+                    >
+                      <div
+                        className="h-full rounded-full bg-blue-700 transition-[width] duration-150 motion-reduce:transition-none dark:bg-blue-500"
+                        style={{ width: `${preparationProgress * 100}%` }}
+                      />
                     </div>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </>
+                    <span className="w-9 text-right font-mono text-[11px] tabular-nums text-slate-500">
+                      {Math.round(preparationProgress * 100)}%
+                    </span>
+                  </div>
+                )}
+                {completedPreparation.length > 0 &&
+                  preparationStep?.status._tag !== "Completed" && (
+                    <p className="mt-3 text-[11px] leading-5 text-slate-500">
+                      {completedPreparation
+                        .map((step) => preparationLabel(step, true))
+                        .join(" · ")}
+                    </p>
+                  )}
+              </div>
+            </div>
+          </section>
         )}
 
         {content._tag === "Closing" && (
