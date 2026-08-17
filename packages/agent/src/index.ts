@@ -238,7 +238,7 @@ export { finishGoalTool } from './tools/goal'
 export type { AgentStateReader } from './tools/fork'
 
 // Workers
-export { TurnController } from './workers/turn-controller'
+export { TurnInitiator } from './workers/turn-initiator'
 
 export { AgentLifecycle } from './workers/agent-lifecycle'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'

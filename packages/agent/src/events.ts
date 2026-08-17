@@ -275,7 +275,7 @@ export type SafetyStopReason =
 export type UnexpectedErrorDetail =
   | { readonly _tag: 'EngineDefect'; readonly message: string }
   | { readonly _tag: 'ExecutionManagerDefect'; readonly message: string }
-  | { readonly _tag: 'CortexDefect'; readonly message: string }
+  | { readonly _tag: 'TurnExecutorDefect'; readonly message: string }
   | { readonly _tag: 'ProviderDefect'; readonly message: string }
   | { readonly _tag: 'ToolRuntimeDefect'; readonly message: string }
   | { readonly _tag: 'Unknown'; readonly message: string }

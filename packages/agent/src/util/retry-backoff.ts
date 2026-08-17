@@ -3,7 +3,7 @@
  *
  * Used by:
  *  - TurnProjection: computes `notBefore` timestamp on chain_continue triggers.
- *  - Cortex: enforces the cap by transforming the outcome before publishing.
+ *  - TurnExecutor: enforces the cap by transforming the outcome before publishing.
  *  - RetryController: sleeps until the trigger's notBefore.
  *
  * All three must agree on the timing math, so it lives here.
@@ -46,7 +46,7 @@ export const TERMINAL_RETRY_EXHAUSTED_MESSAGE =
  * up to MAX_RETRIES attempts.
  *
  * Used by Autopilot, CompactionWorker, and any other non-fork workers
- * that need self-contained retries. Cortex uses computeDelayMs +
+ * that need self-contained retries. TurnExecutor uses computeDelayMs +
  * projection triggers instead.
  */
 export const connectionRetrySchedule = Schedule.intersect(
