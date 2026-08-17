@@ -1,0 +1,305 @@
+@import "tailwindcss" source(none);
+
+@source "../";
+@source "../../../desktop/src/renderer.tsx";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+@custom-variant mac (&:where([data-desktop-platform="darwin"], [data-desktop-platform="darwin"] *));
+
+@theme inline {
+  --color-*: initial;
+  --color-transparent: transparent;
+  --color-black: #000;
+  --color-white: #fff;
+
+  --color-blue-50: var(--magnitude-blue-50);
+  --color-blue-100: var(--magnitude-blue-100);
+  --color-blue-200: var(--magnitude-blue-200);
+  --color-blue-300: var(--magnitude-blue-300);
+  --color-blue-400: var(--magnitude-blue-400);
+  --color-blue-500: var(--magnitude-blue-500);
+  --color-blue-600: var(--magnitude-blue-600);
+  --color-blue-700: var(--magnitude-blue-700);
+  --color-blue-800: var(--magnitude-blue-800);
+  --color-blue-900: var(--magnitude-blue-900);
+
+  --color-slate-50: var(--magnitude-slate-50);
+  --color-slate-100: var(--magnitude-slate-100);
+  --color-slate-150: var(--magnitude-slate-150);
+  --color-slate-200: var(--magnitude-slate-200);
+  --color-slate-250: var(--magnitude-slate-250);
+  --color-slate-300: var(--magnitude-slate-300);
+  --color-slate-400: var(--magnitude-slate-400);
+  --color-slate-450: var(--magnitude-slate-450);
+  --color-slate-500: var(--magnitude-slate-500);
+  --color-slate-600: var(--magnitude-slate-600);
+  --color-slate-700: var(--magnitude-slate-700);
+  --color-slate-750: var(--magnitude-slate-750);
+  --color-slate-800: var(--magnitude-slate-800);
+  --color-slate-875: var(--magnitude-slate-875);
+  --color-slate-900: var(--magnitude-slate-900);
+  --color-slate-925: var(--magnitude-slate-925);
+
+  --color-green-200: var(--magnitude-green-200);
+  --color-green-300: var(--magnitude-green-300);
+  --color-green-400: var(--magnitude-green-400);
+  --color-green-500: var(--magnitude-green-500);
+  --color-green-600: var(--magnitude-green-600);
+  --color-green-700: var(--magnitude-green-700);
+  --color-green-800: var(--magnitude-green-800);
+
+  --color-rose-200: var(--magnitude-rose-200);
+  --color-rose-300: var(--magnitude-rose-300);
+  --color-rose-400: var(--magnitude-rose-400);
+  --color-rose-500: var(--magnitude-rose-500);
+  --color-rose-600: var(--magnitude-rose-600);
+  --color-rose-700: var(--magnitude-rose-700);
+
+  --color-violet-200: var(--magnitude-violet-200);
+  --color-violet-300: var(--magnitude-violet-300);
+  --color-violet-400: var(--magnitude-violet-400);
+  --color-violet-500: var(--magnitude-violet-500);
+  --color-violet-600: var(--magnitude-violet-600);
+  --color-violet-700: var(--magnitude-violet-700);
+
+  --color-indigo-200: var(--magnitude-indigo-200);
+  --color-indigo-300: var(--magnitude-indigo-300);
+  --color-indigo-400: var(--magnitude-indigo-400);
+  --color-indigo-500: var(--magnitude-indigo-500);
+  --color-indigo-600: var(--magnitude-indigo-600);
+  --color-indigo-700: var(--magnitude-indigo-700);
+
+  --color-orange-200: var(--magnitude-orange-200);
+  --color-orange-300: var(--magnitude-orange-300);
+  --color-orange-400: var(--magnitude-orange-400);
+  --color-orange-500: var(--magnitude-orange-500);
+  --color-orange-600: var(--magnitude-orange-600);
+  --color-orange-700: var(--magnitude-orange-700);
+
+  --color-red-200: var(--magnitude-red-200);
+  --color-red-300: var(--magnitude-red-300);
+  --color-red-400: var(--magnitude-red-400);
+  --color-red-500: var(--magnitude-red-500);
+  --color-red-600: var(--magnitude-red-600);
+  --color-red-700: var(--magnitude-red-700);
+  --color-red-800: var(--magnitude-red-800);
+
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --animate-pulse-dot: pulse-dot 1.2s ease-in-out infinite;
+  --animate-blink: blink 1s step-end infinite;
+  --animate-context-pulse: context-pulse 900ms ease-in-out infinite;
+  --animate-shimmer: shimmer 1.5s infinite;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--magnitude-slate-50);
+    color: var(--magnitude-slate-900);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  [data-theme="dark"] body {
+    background: var(--magnitude-slate-925);
+    color: var(--magnitude-slate-200);
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--magnitude-slate-500);
+    opacity: 1;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font-family: Arial, sans-serif;
+    font-size: 13.3333px;
+    line-height: normal;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-weight: 700;
+  }
+
+  [data-theme="dark"] input::placeholder,
+  [data-theme="dark"] textarea::placeholder {
+    color: var(--magnitude-slate-600);
+  }
+
+  [data-desktop-platform="darwin"],
+  [data-desktop-platform="darwin"] body,
+  [data-desktop-platform="darwin"] #root {
+    background: transparent;
+  }
+
+  [data-desktop-platform="darwin"] button,
+  [data-desktop-platform="darwin"] input,
+  [data-desktop-platform="darwin"] select,
+  [data-desktop-platform="darwin"] textarea,
+  [data-desktop-platform="darwin"] [role="button"] {
+    -webkit-app-region: no-drag;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--magnitude-slate-300) transparent;
+  }
+
+  [data-theme="dark"] * {
+    scrollbar-color: var(--magnitude-slate-750) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--magnitude-slate-300);
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--magnitude-slate-400);
+  }
+
+  [data-theme="dark"] ::-webkit-scrollbar-thumb {
+    background: var(--magnitude-slate-750);
+  }
+
+  [data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+    background: var(--magnitude-slate-600);
+  }
+
+  button:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 1px dashed var(--magnitude-blue-700);
+    outline-offset: 1px;
+  }
+
+  [data-theme="dark"] button:focus-visible,
+  [data-theme="dark"] [tabindex]:focus-visible {
+    outline-color: var(--magnitude-blue-500);
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  51%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes context-pulse {
+  0%,
+  100% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

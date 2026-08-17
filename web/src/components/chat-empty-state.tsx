@@ -4,20 +4,31 @@
  * No session has been selected yet. The first message creates a session using
  * the agent-host working directory selected here.
  */
-import { useCallback, useMemo, useState, type ReactNode, type UIEvent } from "react"
+import {
+  useCallback,
+  useMemo,
+  useState,
+  type ReactNode,
+  type UIEvent,
+} from "react"
 import { Folder, Loader2, Search } from "lucide-react"
 import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
-import { formatCwdForDisplay, formatRelativeTime, selectedCwdAtom, useAgentClient } from "@magnitudedev/client-common"
-import type { DirectoryCandidate, SearchDirectoriesResult } from "@magnitudedev/sdk"
-
+import {
+  formatCwdForDisplay,
+  formatRelativeTime,
+  selectedCwdAtom,
+  useAgentClient,
+} from "@magnitudedev/client-common"
+import type {
+  DirectoryCandidate,
+  SearchDirectoriesResult,
+} from "@magnitudedev/sdk"
 const DIRECTORY_PAGE_SIZE = 14
-
 function directoryFallbackLabel(path: string): string {
   if (path === ".") return "Current workspace"
   const parts = path.split("/").filter(Boolean)
   return parts.at(-1) ?? path
 }
-
 function DirectoryRow({
   candidate,
   selected,
@@ -31,63 +42,43 @@ function DirectoryRow({
     <button
       type="button"
       onClick={onSelect}
-      className="hover-surface"
-      style={{
-        width: "100%",
-        minHeight: 46,
-        padding: "6px 10px",
-        border: `1px solid ${selected ? "var(--accent-primary)" : "transparent"}`,
-        borderRadius: 4,
-        background: selected ? "var(--bg-surface-elevated)" : undefined,
-        color: "var(--fg-primary)",
-        cursor: "pointer",
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        textAlign: "left",
-        fontFamily: "var(--font-sans)",
-        transition: "background 100ms",
-      }}
+      className={`${
+        selected
+          ? "border-blue-700 bg-slate-100 dark:border-blue-500 dark:bg-slate-800"
+          : "border-transparent bg-transparent hover:bg-slate-100 dark:hover:bg-slate-800"
+      } w-full min-h-[46px] border px-2.5 py-1.5 rounded text-slate-900 dark:text-slate-200 cursor-pointer flex items-center gap-2.5 text-left font-sans transition-colors duration-100`}
     >
-      <Folder size={16} style={{ color: selected ? "var(--accent-primary)" : "var(--fg-tertiary)", flexShrink: 0 }} />
-      <span style={{ minWidth: 0, flex: 1 }}>
+      <Folder
+        size={16}
+        className={`${
+          selected ? "text-blue-700 dark:text-blue-500" : "text-slate-500"
+        }  shrink-0`}
+      />
+      <span className="min-w-0 [flex:1]">
         <span
-          style={{
-            display: "block",
-            fontSize: 13,
-            fontWeight: selected ? 650 : 500,
-            color: selected ? "var(--accent-primary)" : "var(--fg-primary)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
+          className={`${selected ? "font-[650]" : "font-medium"} ${
+            selected
+              ? "text-blue-700 dark:text-blue-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  block text-[13px] overflow-hidden text-ellipsis whitespace-nowrap`}
         >
           {candidate.label}
         </span>
-        <span
-          style={{
-            display: "block",
-            marginTop: 2,
-            fontFamily: "var(--font-mono)",
-            fontSize: 11,
-            color: "var(--fg-secondary)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {formatCwdForDisplay(candidate.path, { maxLen: 70, abbreviateHome: true })}
+        <span className="block [margin-top:2px] font-mono text-[11px] text-slate-600 dark:text-slate-400 overflow-hidden text-ellipsis whitespace-nowrap">
+          {formatCwdForDisplay(candidate.path, {
+            maxLen: 70,
+            abbreviateHome: true,
+          })}
         </span>
       </span>
       {candidate.lastActivity !== undefined && (
-        <span style={{ flexShrink: 0, fontSize: 11, color: "var(--fg-tertiary)" }}>
+        <span className="shrink-0 text-[11px] text-slate-500">
           {formatRelativeTime(candidate.lastActivity)}
         </span>
       )}
     </button>
   )
 }
-
 function DirectoryPicker(): ReactNode {
   const client = useAgentClient()
   const selectedCwd = useAtomValue(selectedCwdAtom)
@@ -98,46 +89,57 @@ function DirectoryPicker(): ReactNode {
     limit: DIRECTORY_PAGE_SIZE,
   })
   const trimmedQuery = query.trim()
-  const visibleLimit = limitState.query === trimmedQuery ? limitState.limit : DIRECTORY_PAGE_SIZE
-
+  const visibleLimit =
+    limitState.query === trimmedQuery ? limitState.limit : DIRECTORY_PAGE_SIZE
   const directoriesAtom = useMemo(
-    () => client.rpc.query("SearchDirectories", {
-      query: trimmedQuery,
-      limit: visibleLimit,
-      includeRecent: true,
-    }, { reactivityKeys: ["sessions"] }),
-    [client, trimmedQuery, visibleLimit],
+    () =>
+      client.rpc.query(
+        "SearchDirectories",
+        {
+          query: trimmedQuery,
+          limit: visibleLimit,
+          includeRecent: true,
+        },
+        {
+          reactivityKeys: ["sessions"],
+        }
+      ),
+    [client, trimmedQuery, visibleLimit]
   )
   const result = useAtomValue(directoriesAtom)
   const isLoading = Result.isInitial(result)
-
   const candidates = Result.match(result, {
     onInitial: () => [] as DirectoryCandidate[],
-    onFailure: (f) => (f.previousSuccess._tag === "Some" ? (f.previousSuccess.value.value as SearchDirectoriesResult).candidates : []),
+    onFailure: (f) =>
+      f.previousSuccess._tag === "Some"
+        ? (f.previousSuccess.value.value as SearchDirectoriesResult).candidates
+        : [],
     onSuccess: (s) => (s.value as SearchDirectoriesResult).candidates,
   })
-
   const loadedLimit = Result.isSuccess(result) ? visibleLimit : 0
-  const loadingMore = isLoading && candidates.length > 0 && visibleLimit > loadedLimit
+  const loadingMore =
+    isLoading && candidates.length > 0 && visibleLimit > loadedLimit
   const hasMore = Result.isSuccess(result) && candidates.length >= visibleLimit
-
   const selectedPath = selectedCwd ?? candidates[0]?.path ?? "."
-  const selectedCandidate = candidates.find((candidate) => candidate.path === selectedPath)
-  const selectedLabel = selectedCandidate?.label ?? directoryFallbackLabel(selectedPath)
-
+  const selectedCandidate = candidates.find(
+    (candidate) => candidate.path === selectedPath
+  )
+  const selectedLabel =
+    selectedCandidate?.label ?? directoryFallbackLabel(selectedPath)
   const handleSelect = (path: string) => {
     setSelectedCwd(path)
     setQuery("")
   }
-
   const handleDirectoryScroll = useCallback(
     (event: UIEvent<HTMLDivElement>) => {
       if (!hasMore || isLoading) return
       const element = event.currentTarget
-      const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+      const distanceFromBottom =
+        element.scrollHeight - element.scrollTop - element.clientHeight
       if (distanceFromBottom < 96) {
         setLimitState((current) => {
-          const currentLimit = current.query === trimmedQuery ? current.limit : DIRECTORY_PAGE_SIZE
+          const currentLimit =
+            current.query === trimmedQuery ? current.limit : DIRECTORY_PAGE_SIZE
           return {
             query: trimmedQuery,
             limit: currentLimit + DIRECTORY_PAGE_SIZE,
@@ -145,84 +147,48 @@ function DirectoryPicker(): ReactNode {
         })
       }
     },
-    [hasMore, isLoading, trimmedQuery],
+    [hasMore, isLoading, trimmedQuery]
   )
-
   return (
-    <div
-      style={{
-        width: "min(640px, 100%)",
-        display: "flex",
-        flexDirection: "column",
-        gap: 10,
-      }}
-    >
-      <div
-        style={{
-          marginBottom: 6,
-          fontFamily: "var(--font-sans)",
-        }}
-      >
-        <div style={{ color: "var(--fg-primary)", fontSize: 18, fontWeight: 650 }}>
-          Start a new chat in <span style={{ color: "var(--accent-primary)" }}>{selectedLabel}</span>
+    <div className="[width:min(640px,_100%)] flex flex-col [gap:10px]">
+      <div className="[margin-bottom:6px] font-sans">
+        <div className="text-slate-900 dark:text-slate-200 text-[18px] font-[650]">
+          Start a new chat in{" "}
+          <span className="text-blue-700 dark:text-blue-500">
+            {selectedLabel}
+          </span>
         </div>
         {selectedPath !== "." && (
-          <div style={{ color: "var(--fg-secondary)", fontSize: 13, marginTop: 4, fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {formatCwdForDisplay(selectedPath, { maxLen: 86, abbreviateHome: true })}
+          <div className="text-slate-600 dark:text-slate-400 text-[13px] [margin-top:4px] font-mono overflow-hidden text-ellipsis whitespace-nowrap">
+            {formatCwdForDisplay(selectedPath, {
+              maxLen: 86,
+              abbreviateHome: true,
+            })}
           </div>
         )}
       </div>
 
       <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          height: 34,
-          padding: "0 2px",
-          background: "transparent",
-          borderBottom: `1px solid ${trimmedQuery ? "var(--accent-primary)" : "var(--border-default)"}`,
-        }}
+        className={`${
+          trimmedQuery
+            ? "border-blue-700 dark:border-blue-500"
+            : "border-slate-300 dark:border-slate-750"
+        } flex h-[34px] items-center gap-2 border-b bg-transparent px-0.5`}
       >
-        <Search size={16} style={{ color: "var(--fg-tertiary)", flexShrink: 0 }} />
+        <Search size={16} className="text-slate-500 shrink-0" />
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search recent directories or paste a path"
-          style={{
-            flex: 1,
-            minWidth: 0,
-            background: "transparent",
-            border: "none",
-            outline: "none",
-            color: "var(--fg-primary)",
-            fontFamily: "var(--font-mono)",
-            fontSize: 14,
-          }}
+          className="[flex:1] min-w-0 [background:transparent] border-0 [outline:none] text-slate-900 dark:text-slate-200 font-mono text-[14px]"
         />
       </div>
 
       <div
         onScroll={handleDirectoryScroll}
-        style={{
-          border: "1px solid var(--border-subtle)",
-          borderRadius: 6,
-          background: "var(--bg-surface)",
-          padding: 6,
-          height: 320,
-          overflowY: "auto",
-        }}
+        className="border border-slate-200 dark:border-slate-800 rounded-[6px] bg-white dark:bg-slate-875 [padding:6px] [height:320px] overflow-y-auto"
       >
-        <div
-          style={{
-            padding: "4px 4px 8px",
-            color: "var(--fg-tertiary)",
-            fontFamily: "var(--font-sans)",
-            fontSize: 11,
-            fontWeight: 650,
-            textTransform: "uppercase",
-          }}
-        >
+        <div className="[padding:4px_4px_8px] text-slate-500 font-sans text-[11px] font-[650] [text-transform:uppercase]">
           {trimmedQuery ? "Matching directories" : "Recent directories"}
         </div>
         {candidates.length > 0 ? (
@@ -236,29 +202,16 @@ function DirectoryPicker(): ReactNode {
               />
             ))}
             {loadingMore && (
-              <div
-                style={{
-                  height: 32,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--fg-tertiary)",
-                }}
-              >
-                <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+              <div className="[height:32px] flex items-center justify-center text-slate-500">
+                <Loader2
+                  size={14}
+                  className="[animation:spin_1s_linear_infinite]"
+                />
               </div>
             )}
           </>
         ) : (
-          <div
-            style={{
-              padding: "18px 10px",
-              color: "var(--fg-tertiary)",
-              fontFamily: "var(--font-sans)",
-              fontSize: 13,
-              textAlign: "center",
-            }}
-          >
+          <div className="[padding:18px_10px] text-slate-500 font-sans text-[13px] text-center">
             {isLoading ? "Loading directories..." : "No matching directories"}
           </div>
         )}
@@ -266,23 +219,9 @@ function DirectoryPicker(): ReactNode {
     </div>
   )
 }
-
 export function ChatEmptyState(): ReactNode {
   return (
-    <div
-      style={{
-        flex: 1,
-        width: "100%",
-        minHeight: 0,
-        boxSizing: "border-box",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "32px 24px",
-        animation: "fade-in 200ms ease-out",
-      }}
-    >
+    <div className="[flex:1] w-full min-h-0 box-border flex flex-col items-center justify-center [padding:32px_24px] [animation:fade-in_200ms_ease-out]">
       <DirectoryPicker />
     </div>
   )

@@ -10,8 +10,17 @@
  */
 import { useMemo } from "react"
 import { Effect } from "effect"
-import { Atom, useAtomSet, useAtomValue, useAtomMount } from "@effect-atom/atom-react"
-import { useDisplayViewController, usePlatform, useSessionActions } from "@magnitudedev/client-common"
+import {
+  Atom,
+  useAtomSet,
+  useAtomValue,
+  useAtomMount,
+} from "@effect-atom/atom-react"
+import {
+  useDisplayViewController,
+  usePlatform,
+  useSessionActions,
+} from "@magnitudedev/client-common"
 import { nextEscWillKillAllAtom } from "@magnitudedev/client-common"
 import { settingsTabAtom, sidebarSearchAtom } from "../state/web-atoms"
 
@@ -31,7 +40,8 @@ export function useMenuActions(): void {
   const setSearchQuery = useAtomSet(sidebarSearchAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const setNextEscWillKillAll = useAtomSet(nextEscWillKillAllAtom)
-  const { popFork, togglePresentationMode, displayMode, expandedForkStack } = useDisplayViewController()
+  const { popFork, togglePresentationMode, displayMode, expandedForkStack } =
+    useDisplayViewController()
   const settingsTab = useAtomValue(settingsTabAtom)
 
   // Menu subscription atom — subscribes on mount, unsubscribes on dispose.
@@ -49,7 +59,9 @@ export function useMenuActions(): void {
                 break
               case "toggle-sidebar-search":
                 setSearchQuery("")
-                window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
+                window.dispatchEvent(
+                  new CustomEvent("__magnitude:focus-search")
+                )
                 break
               case "toggle-transcript-mode":
                 togglePresentationMode()
@@ -63,9 +75,16 @@ export function useMenuActions(): void {
             }
           })
           yield* Effect.addFinalizer(() => Effect.sync(unsub))
-        }),
+        })
       ),
-    [platform, displayMode, startNewSession, setSearchQuery, togglePresentationMode, setSettingsTab],
+    [
+      platform,
+      displayMode,
+      startNewSession,
+      setSearchQuery,
+      togglePresentationMode,
+      setSettingsTab,
+    ]
   )
 
   // Keyboard handler atom — Esc handling (always) + browser-mode shortcuts.
@@ -97,7 +116,9 @@ export function useMenuActions(): void {
 
               if (isDoubleEsc) {
                 setNextEscWillKillAll(false)
-                window.dispatchEvent(new CustomEvent("__magnitude:interrupt-all"))
+                window.dispatchEvent(
+                  new CustomEvent("__magnitude:interrupt-all")
+                )
                 e.preventDefault()
               } else {
                 // First Esc — show hint that next Esc will interrupt all
@@ -113,7 +134,12 @@ export function useMenuActions(): void {
             // ── Browser-mode global shortcuts (spec §14.4) ──
             // Desktop mode uses Electron's application menu → onMenuAction.
             // Only intercept here in browser mode.
-            if (platform.id === "web" && isModKey(e) && !e.shiftKey && !e.altKey) {
+            if (
+              platform.id === "web" &&
+              isModKey(e) &&
+              !e.shiftKey &&
+              !e.altKey
+            ) {
               switch (e.key.toLowerCase()) {
                 case "n":
                   // Cmd/Ctrl+N → new session
@@ -125,7 +151,9 @@ export function useMenuActions(): void {
                   // Cmd/Ctrl+R → focus sidebar search
                   e.preventDefault()
                   setSearchQuery("")
-                  window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
+                  window.dispatchEvent(
+                    new CustomEvent("__magnitude:focus-search")
+                  )
                   break
                 case "t":
                   // Cmd/Ctrl+T → toggle transcript mode
@@ -142,11 +170,22 @@ export function useMenuActions(): void {
           }
           window.addEventListener("keydown", handler)
           yield* Effect.addFinalizer(() =>
-            Effect.sync(() => window.removeEventListener("keydown", handler)),
+            Effect.sync(() => window.removeEventListener("keydown", handler))
           )
-        }),
+        })
       ),
-    [expandedForkStack.length, platform.id, displayMode, settingsTab, popFork, startNewSession, setSearchQuery, togglePresentationMode, setSettingsTab, setNextEscWillKillAll],
+    [
+      expandedForkStack.length,
+      platform.id,
+      displayMode,
+      settingsTab,
+      popFork,
+      startNewSession,
+      setSearchQuery,
+      togglePresentationMode,
+      setSettingsTab,
+      setNextEscWillKillAll,
+    ]
   )
 
   useAtomMount(menuAtom)

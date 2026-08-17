@@ -4,7 +4,6 @@
  */
 import type { ReactNode } from "react"
 import { ChatTimeline } from "./chat-timeline"
-
 export interface WorkerDetailPanelProps {
   forkId: string | null
   worker: {
@@ -15,7 +14,6 @@ export interface WorkerDetailPanelProps {
   loadingTitle?: string
   loadingSubtitle?: string | null
 }
-
 export function WorkerDetailPanel({
   forkId,
   worker,
@@ -23,19 +21,8 @@ export function WorkerDetailPanel({
   loadingSubtitle,
 }: WorkerDetailPanelProps): ReactNode {
   if (!forkId) return null
-
   return (
-    <div
-      className="worker-detail-panel"
-      style={{
-        flex: 1,
-        minHeight: 0,
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-        background: "var(--bg-base)",
-      }}
-    >
+    <div className="worker-detail-panel [flex:1] min-h-0 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-925">
       <ChatTimeline
         forkId={forkId}
         loadingTitle={loadingTitle}

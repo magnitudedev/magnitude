@@ -11,13 +11,23 @@
  * - Mouse event handlers for resize (with useSyncExternalStore for resize state)
  * - useSyncExternalStore for Shiki highlighter
  */
-import React, { useMemo, useState, useSyncExternalStore, useRef, useCallback, type ReactNode } from "react"
+import React, {
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  useRef,
+  useCallback,
+  type ReactNode,
+} from "react"
 import { Copy, Check, ExternalLink, X } from "lucide-react"
 import { usePlatform } from "../hooks/use-platform"
-import { subscribeShiki, getShikiSnapshot, highlightCode } from "../stores/shiki-store"
+import {
+  subscribeShiki,
+  getShikiSnapshot,
+  highlightCode,
+} from "../stores/shiki-store"
 import { createFocusTrapHandler } from "../utils/focus-trap"
 import { MarkdownContent } from "./markdown-content"
-
 export interface FileViewerPanelProps {
   filePath: string | null
   content: string | null
@@ -33,12 +43,10 @@ export interface FileViewerPanelProps {
 let resizeActive = false
 let resizeWidth = 0
 const resizeListeners = new Set<() => void>()
-
 function startResize(initialWidth: number): void {
   resizeActive = true
   resizeWidth = initialWidth
 }
-
 function subscribeResize(cb: () => void): () => void {
   if (resizeActive) {
     const handler = (e: MouseEvent) => {
@@ -62,15 +70,12 @@ function subscribeResize(cb: () => void): () => void {
   }
   return () => {}
 }
-
 function getResizeSnapshot(): number {
   return resizeWidth
 }
-
 function isResizing(): boolean {
   return resizeActive
 }
-
 export function FileViewerPanel({
   filePath,
   content,
@@ -89,7 +94,13 @@ export function FileViewerPanel({
   // Initial width — derived during render (no effect)
   const resizeWidth = useSyncExternalStore(subscribeResize, getResizeSnapshot)
   const dragging = isResizing()
-  const defaultWidth = Math.min(600, Math.max(320, typeof window !== "undefined" ? window.innerWidth * 0.45 : 400))
+  const defaultWidth = Math.min(
+    600,
+    Math.max(
+      320,
+      typeof window !== "undefined" ? window.innerWidth * 0.45 : 400
+    )
+  )
   const panelWidth = dragging ? resizeWidth : defaultWidth
 
   // Focus trap + Esc to close
@@ -101,11 +112,13 @@ export function FileViewerPanel({
   }, [])
 
   // Resize start — mousedown handler
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault()
-    startResize(panelWidth)
-  }, [panelWidth])
-
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault()
+      startResize(panelWidth)
+    },
+    [panelWidth]
+  )
   const handleCopy = useCallback(async () => {
     if (!content) return
     if (onCopy) {
@@ -116,87 +129,44 @@ export function FileViewerPanel({
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }, [content, onCopy, platform.clipboard])
-
   const handleOpenExternal = useCallback(async () => {
     if (filePath) {
       await platform.openPath(filePath)
     }
   }, [filePath, platform])
-
   if (!filePath) return null
-
   const lang = language || filePath.split(".").pop() || "text"
   const isMarkdown = lang === "md" || lang === "markdown" || lang === "mdx"
   const isImage = ["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(lang)
-
   return (
     <div
       ref={panelRef}
-      className="file-viewer-panel"
+      className="max-[800px]:!w-full max-[800px]:!min-w-0 fixed [top:0px] [right:0px] [bottom:0px] bg-white dark:bg-slate-875 border-l border-l-slate-300 dark:border-l-slate-750 flex flex-col z-[30] [animation:slide-in-right_200ms_ease-out]"
       tabIndex={-1}
       onKeyDown={handleKeyDown}
       style={{
-        position: "fixed",
-        top: 0, right: 0, bottom: 0,
         width: panelWidth,
-        background: "var(--bg-surface)",
-        borderLeft: "1px solid var(--border-default)",
-        display: "flex",
-        flexDirection: "column",
-        zIndex: 30,
-        animation: "slide-in-right 200ms ease-out",
       }}
     >
       {/* Resize handle */}
       <div
         onMouseDown={handleMouseDown}
-        style={{
-          position: "absolute",
-          left: -3,
-          top: 0, bottom: 0,
-          width: 6,
-          cursor: "col-resize",
-          zIndex: 1,
-        }}
+        className="absolute -left-[3px] top-0 bottom-0 w-1.5 cursor-col-resize z-[1]"
       />
 
       {/* Header */}
-      <div
-        className="file-viewer-header"
-        style={{
-          height: 40,
-          padding: "0 12px",
-          borderBottom: "1px solid var(--border-subtle)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          flexShrink: 0,
-        }}
-      >
-        <div style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          overflow: "hidden",
-          fontFamily: "var(--font-mono)",
-          fontSize: 12,
-          color: "var(--fg-secondary)",
-        }}>
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <div className="file-viewer-header [height:40px] [padding:0_12px] border-b border-b-slate-200 dark:border-b-slate-800 flex items-center justify-between shrink-0">
+        <div className="flex items-center [gap:6px] overflow-hidden font-mono text-[12px] text-slate-600 dark:text-slate-400">
+          <span className="overflow-hidden text-ellipsis whitespace-nowrap">
             {filePath}
           </span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+        <div className="flex items-center [gap:4px] shrink-0">
           <button
             onClick={handleCopy}
             title="Copy"
             aria-label="Copy file content"
-            style={{
-              width: 28, height: 28,
-              display: "flex", alignItems: "center", justifyContent: "center",
-              background: "transparent", border: "none", borderRadius: 4,
-              color: "var(--fg-tertiary)", cursor: "pointer",
-            }}
+            className="[width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] text-slate-500 cursor-pointer"
           >
             {copied ? <Check size={14} /> : <Copy size={14} />}
           </button>
@@ -204,12 +174,7 @@ export function FileViewerPanel({
             onClick={handleOpenExternal}
             title="Open in editor"
             aria-label="Open in editor"
-            style={{
-              width: 28, height: 28,
-              display: "flex", alignItems: "center", justifyContent: "center",
-              background: "transparent", border: "none", borderRadius: 4,
-              color: "var(--fg-tertiary)", cursor: "pointer",
-            }}
+            className="[width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] text-slate-500 cursor-pointer"
           >
             <ExternalLink size={14} />
           </button>
@@ -217,12 +182,7 @@ export function FileViewerPanel({
             onClick={onClose}
             title="Close (Esc)"
             aria-label="Close file viewer"
-            style={{
-              width: 28, height: 28,
-              display: "flex", alignItems: "center", justifyContent: "center",
-              background: "transparent", border: "none", borderRadius: 4,
-              color: "var(--fg-tertiary)", cursor: "pointer",
-            }}
+            className="[width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] text-slate-500 cursor-pointer"
           >
             <X size={14} />
           </button>
@@ -233,42 +193,33 @@ export function FileViewerPanel({
       <div
         ref={contentRef}
         onScroll={handleScroll}
-        style={{
-          flex: 1,
-          overflow: "auto",
-          padding: 0,
-        }}
+        className="[flex:1] overflow-auto [padding:0px]"
       >
         {loading ? (
-          <div style={{ padding: 24, textAlign: "center", color: "var(--fg-tertiary)", fontFamily: "var(--font-mono)", fontSize: 13 }}>
+          <div className="[padding:24px] text-center text-slate-500 font-mono text-[13px]">
             Loading...
           </div>
         ) : error ? (
-          <div style={{ padding: 24, textAlign: "center", color: "var(--accent-error)", fontFamily: "var(--font-sans)", fontSize: 14 }}>
+          <div className="[padding:24px] text-center text-red-600 dark:text-red-500 font-sans text-[14px]">
             {error}
           </div>
         ) : isImage ? (
-          <div style={{ padding: 16, textAlign: "center" }}>
-            <img src={`data:image/${lang};base64,${content}`} alt={filePath} style={{ maxWidth: "100%", borderRadius: 4 }} />
+          <div className="[padding:16px] text-center">
+            <img
+              src={`data:image/${lang};base64,${content}`}
+              alt={filePath}
+              className="[max-width:100%] rounded-[4px]"
+            />
           </div>
         ) : (content || "").length > 50000 ? (
-          <div style={{ padding: 24, textAlign: "center", color: "var(--fg-tertiary)", fontFamily: "var(--font-sans)", fontSize: 14, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
-            <div>File is too large to display ({(content || "").length.toLocaleString()} characters).</div>
+          <div className="[padding:24px] text-center text-slate-500 font-sans text-[14px] flex flex-col items-center [gap:12px]">
+            <div>
+              File is too large to display (
+              {(content || "").length.toLocaleString()} characters).
+            </div>
             <button
               onClick={handleOpenExternal}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                background: "var(--bg-surface-elevated)",
-                border: "1px solid var(--border-default)",
-                borderRadius: 4,
-                padding: "6px 12px",
-                fontFamily: "var(--font-sans)",
-                fontSize: 13,
-                color: "var(--fg-secondary)",
-                cursor: "pointer",
-              }}
+              className="flex items-center [gap:6px] bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:6px_12px] font-sans text-[13px] text-slate-600 dark:text-slate-400 cursor-pointer"
             >
               <ExternalLink size={14} />
               Open in editor
@@ -278,12 +229,7 @@ export function FileViewerPanel({
           <MarkdownContent
             content={content || ""}
             isStreaming={isStreaming}
-            style={{
-              padding: 16,
-              fontFamily: "var(--font-sans)",
-              lineHeight: 1.6,
-              overflow: "auto",
-            }}
+            className="[padding:16px] font-sans leading-[1.6] overflow-auto"
           />
         ) : (
           <CodeBlock content={content || ""} language={lang} />
@@ -305,16 +251,20 @@ function CodeBlock({
   const highlighter = useSyncExternalStore(subscribeShiki, getShikiSnapshot)
   const html = useMemo(
     () => highlightCode(content, language || "text"),
-    [content, highlighter, language],
+    [content, highlighter, language]
   )
-
   if (!html) {
     return (
-      <pre style={{ margin: 0, padding: 12, fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--fg-primary)", background: "var(--bg-code)", overflow: "auto" }}>
+      <pre className="[margin:0px] [padding:12px] font-mono text-[13px] text-slate-900 dark:text-slate-200 bg-slate-100 dark:bg-slate-900 overflow-auto">
         <code>{content}</code>
       </pre>
     )
   }
-
-  return <div dangerouslySetInnerHTML={{ __html: html }} />
+  return (
+    <div
+      dangerouslySetInnerHTML={{
+        __html: html,
+      }}
+    />
+  )
 }

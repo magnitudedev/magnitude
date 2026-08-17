@@ -1,7 +1,6 @@
 import { useState, type ReactNode } from "react"
 import { formatTokensCompact } from "@magnitudedev/client-common"
 import type { ContextUsageDisplay } from "@magnitudedev/sdk"
-
 export interface ContextUsageIndicatorProps {
   context: ContextUsageDisplay | null
   tokenCap?: number | null
@@ -11,26 +10,29 @@ export interface ContextUsageIndicatorProps {
   tooltip?: "popover" | "native" | "none"
   tooltipPlacement?: "above-right" | "above-center"
 }
-
-function usagePercent(context: ContextUsageDisplay | null, tokenCap: number | null | undefined): number | null {
+function usagePercent(
+  context: ContextUsageDisplay | null,
+  tokenCap: number | null | undefined
+): number | null {
   const tokenEstimate = context?.tokenEstimate ?? null
   if (tokenEstimate === null || !tokenCap || tokenCap <= 0) return null
   return Math.min(100, Math.max(0, (tokenEstimate / tokenCap) * 100))
 }
-
-function tooltipText(context: ContextUsageDisplay | null, tokenCap: number | null | undefined): string {
+function tooltipText(
+  context: ContextUsageDisplay | null,
+  tokenCap: number | null | undefined
+): string {
   const tokenEstimate = context?.tokenEstimate ?? null
   if (tokenEstimate === null) return "Context window unavailable"
-
   const tokens = formatTokensCompact(tokenEstimate)
   if (tokenCap && tokenCap > 0) {
     const pct = Math.round((tokenEstimate / tokenCap) * 100)
-    return `Context window:\n${pct}% used (${100 - pct}% left)\n${tokens} / ${formatTokensCompact(tokenCap)} tokens used`
+    return `Context window:\n${pct}% used (${
+      100 - pct
+    }% left)\n${tokens} / ${formatTokensCompact(tokenCap)} tokens used`
   }
-
   return `Context window:\n${tokens} tokens used`
 }
-
 export function ContextUsageIndicator({
   context,
   tokenCap,
@@ -49,52 +51,42 @@ export function ContextUsageIndicator({
   const center = size / 2
   const circumference = 2 * Math.PI * radius
   const popoverVisible = tooltip === "popover" && hovered
-
   return (
     <span
-      className="context-usage-indicator"
+      className="context-usage-indicator relative inline-flex items-center [gap:4px] min-w-0 text-slate-600 dark:text-slate-400"
       data-compacting={isCompacting}
       title={tooltip === "native" ? title : undefined}
       aria-label={title.replace(/\n/g, " ")}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      style={{
-        position: "relative",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 4,
-        minWidth: 0,
-        color: "var(--fg-secondary)",
-      }}
     >
       <span
         aria-hidden="true"
         style={{
           width: size,
           height: size,
-          borderRadius: "50%",
-          background: "transparent",
-          boxSizing: "border-box",
-          animation: isCompacting ? "context-pulse 900ms ease-in-out infinite" : "none",
-          flexShrink: 0,
         }}
+        className={`${
+          isCompacting
+            ? "[animation:context-pulse_900ms_ease-in-out_infinite]"
+            : "[animation:none]"
+        }  rounded-full [background:transparent] box-border shrink-0`}
       >
         <svg
           viewBox={`0 0 ${size} ${size}`}
-          style={{
-            display: "block",
-            width: "100%",
-            height: "100%",
-            transform: "rotate(-90deg)",
-          }}
+          className="block w-full h-full [transform:rotate(-90deg)]"
         >
           <circle
             cx={center}
             cy={center}
             r={radius}
             fill="none"
-            stroke={hovered ? "var(--border-hover)" : "var(--border-default)"}
             strokeWidth={strokeWidth}
+            className={
+              hovered
+                ? "stroke-slate-400 dark:stroke-slate-600"
+                : "stroke-slate-300 dark:stroke-slate-750"
+            }
           />
           {pct !== null && (
             <circle
@@ -102,28 +94,18 @@ export function ContextUsageIndicator({
               cy={center}
               r={radius}
               fill="none"
-              stroke="var(--accent-primary)"
               strokeWidth={strokeWidth}
               strokeLinecap="round"
               strokeDasharray={`${circumference}`}
               strokeDashoffset={`${circumference * (1 - pct / 100)}`}
+              className="stroke-blue-700 dark:stroke-blue-500"
             />
           )}
         </svg>
       </span>
 
       {showTokenLabel && tokenEstimate !== null && tokenEstimate > 0 && (
-        <span
-          style={{
-            minWidth: 0,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            fontSize: 12,
-            color: "var(--fg-tertiary)",
-            fontVariantNumeric: "tabular-nums",
-          }}
-        >
+        <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[12px] text-slate-500 [font-variant-numeric:tabular-nums]">
           {formatTokensCompact(tokenEstimate)}
         </span>
       )}
@@ -132,23 +114,14 @@ export function ContextUsageIndicator({
         <span
           role="tooltip"
           style={{
-            position: "absolute",
             right: tooltipPlacement === "above-right" ? 0 : undefined,
             left: tooltipPlacement === "above-center" ? "50%" : undefined,
-            transform: tooltipPlacement === "above-center" ? "translateX(-50%)" : undefined,
-            bottom: "calc(100% + 8px)",
-            minWidth: 170,
-            padding: "8px 10px",
-            borderRadius: 6,
-            border: "1px solid var(--border-default)",
-            background: "var(--bg-surface-elevated)",
-            color: "var(--fg-primary)",
-            fontSize: 12,
-            lineHeight: 1.45,
-            whiteSpace: "pre-line",
-            textAlign: "center",
-            zIndex: 30,
+            transform:
+              tooltipPlacement === "above-center"
+                ? "translateX(-50%)"
+                : undefined,
           }}
+          className="absolute [bottom:calc(100%_+_8px)] [min-width:170px] [padding:8px_10px] rounded-[6px] border border-slate-300 dark:border-slate-750 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 text-[12px] leading-[1.45] whitespace-pre-line text-center z-[30]"
         >
           {title}
         </span>

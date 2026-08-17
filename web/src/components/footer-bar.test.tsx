@@ -5,10 +5,15 @@ import { formatFooterContextUsage } from "./local-inference-format"
 
 describe("formatFooterContextUsage", () => {
   it("matches the CLI token and percentage presentation", () => {
-    expect(formatFooterContextUsage({
-      tokenEstimate: 15_800,
-      isCompacting: false,
-    }, 200_000)).toBe("16k / 200k (8%)")
+    expect(
+      formatFooterContextUsage(
+        {
+          tokenEstimate: 15_800,
+          isCompacting: false,
+        },
+        200_000
+      )
+    ).toBe("16k / 200k (8%)")
   })
 
   it("shows the known capacity before the session has token usage", () => {
@@ -29,13 +34,13 @@ describe("FooterBar", () => {
         memoryLabel="16 GB mem"
         onModelClick={() => {}}
         onMemoryClick={() => {}}
-      />,
+      />
     )
 
     expect(html).toContain('aria-label="Model ready"')
-    expect(html).toContain('class="footer-action footer-model-action"')
-    expect(html).toContain('class="footer-action footer-thinking-action"')
-    expect(html).toContain('class="footer-action footer-memory-action"')
+    expect(html).toContain(">Qwen Test (Q4)</button>")
+    expect(html).toContain('aria-label="Reasoning effort: High"')
+    expect(html).toContain(">16 GB mem</button>")
 
     const model = html.indexOf("Qwen Test (Q4)")
     const thinking = html.indexOf("High")
@@ -56,10 +61,10 @@ describe("FooterBar", () => {
         model="Qwen Test"
         modelResidency="loading"
         modelLoadingPercentage={42}
-      />,
+      />
     )
     const stopped = renderToStaticMarkup(
-      <FooterBar context={null} model="Qwen Test" modelResidency="not-ready" />,
+      <FooterBar context={null} model="Qwen Test" modelResidency="not-ready" />
     )
 
     expect(loading).toContain('aria-label="Model loading · 42%"')

@@ -3,68 +3,43 @@
  *
  * Standalone divider row.
  */
-import { type CSSProperties, type ReactNode } from "react"
+import { type ReactNode } from "react"
 import { Square } from "lucide-react"
 import type { InterruptedMessage as InterruptedType } from "@magnitudedev/sdk"
-
-const DEFAULT_INTERRUPTED_TEXT = "Interrupted. What would you like to do instead?"
-
-const dividerLineStyle: CSSProperties = {
-  flex: "1 1 auto",
-  minWidth: "32px",
-  height: "1px",
-  background: "var(--border-default)",
-}
-
-const leadingDividerLineStyle: CSSProperties = {
-  ...dividerLineStyle,
-  flex: "0 0 32px",
-}
-
+const DEFAULT_INTERRUPTED_TEXT =
+  "Interrupted. What would you like to do instead?"
 function getInterruptedText(message: InterruptedType): string {
   if (message.context === "root") {
     return DEFAULT_INTERRUPTED_TEXT
   }
   return "Agent interrupted."
 }
-
 export function InterruptedDivider({
   label = DEFAULT_INTERRUPTED_TEXT,
 }: {
   label?: string
 }): ReactNode {
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: "10px",
-        width: "100%",
-        padding: "18px 0 18px 12px",
-        fontFamily: "var(--font-sans)",
-        fontSize: "12px",
-        lineHeight: "16px",
-        color: "var(--fg-tertiary)",
-      }}
-    >
-      <span aria-hidden="true" style={leadingDividerLineStyle} />
+    <div className="flex items-center [gap:10px] w-full [padding:18px_0_18px_12px] font-sans text-[12px] leading-[16px] text-slate-500">
       <span
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: "6px",
-          flex: "0 1 auto",
-          minWidth: 0,
-        }}
-      >
-        <Square size={10} fill="currentColor" style={{ flexShrink: 0 }} />
+        aria-hidden="true"
+        className="h-px w-8 shrink-0 bg-slate-300 dark:bg-slate-750"
+      />
+      <span className="inline-flex items-center [gap:6px] [flex:0_1_auto] min-w-0">
+        <Square size={10} fill="currentColor" className="shrink-0" />
         {label}
       </span>
-      <span aria-hidden="true" style={dividerLineStyle} />
+      <span
+        aria-hidden="true"
+        className="h-px min-w-8 flex-1 bg-slate-300 dark:bg-slate-750"
+      />
     </div>
   )
 }
-
-export function InterruptedMessage({ message }: { message: InterruptedType }): ReactNode {
+export function InterruptedMessage({
+  message,
+}: {
+  message: InterruptedType
+}): ReactNode {
   return <InterruptedDivider label={getInterruptedText(message)} />
 }

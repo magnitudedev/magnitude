@@ -29,7 +29,12 @@ import {
   type SlashCommandOutcome,
   slashCommandUnhandled,
 } from "@magnitudedev/client-common"
-import { useAtomValue, useAtomSet, useAtomMount, Atom } from "@effect-atom/atom-react"
+import {
+  useAtomValue,
+  useAtomSet,
+  useAtomMount,
+  Atom,
+} from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import { toGenericKeyEvent, isSendKey, isEscapeKey } from "../utils/keyboard"
 import {
@@ -39,7 +44,6 @@ import {
   composerHistoryIndexAtom,
 } from "@magnitudedev/client-common"
 import type { MentionAttachment, RawMentionOccurrence } from "@magnitudedev/sdk"
-
 export interface ComposerProps {
   /** Current role label (e.g. "Leader") */
   role?: string
@@ -70,7 +74,6 @@ export interface ComposerProps {
   /** Navigate to the action that resolves disabled submission. */
   onDisabledAction?: () => void
 }
-
 export function Composer({
   role = "Leader",
   isStreaming = false,
@@ -96,7 +99,10 @@ export function Composer({
   const [savedDraft, setSavedDraft] = useState<{
     text: string
     mentions: InputMentionSegment[]
-  }>({ text: "", mentions: [] })
+  }>({
+    text: "",
+    mentions: [],
+  })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   // Track what the user last typed so we can distinguish external restore
   // (queued input / rollback) from normal user input.
@@ -118,9 +124,9 @@ export function Composer({
               textareaRef.current.setSelectionRange(text.length, text.length)
             }
           }
-        }),
+        })
       ),
-    [text],
+    [text]
   )
   useAtomMount(restoreFocusAtom)
 
@@ -135,7 +141,10 @@ export function Composer({
       setText("")
       setAttachments([])
       setHistoryIndex(-1)
-      setSavedDraft({ text: "", mentions: [] })
+      setSavedDraft({
+        text: "",
+        mentions: [],
+      })
       setCursorPosition(0)
       lastUserTextRef.current = ""
     }
@@ -154,7 +163,6 @@ export function Composer({
       if (onMentionConfirm) onMentionConfirm(item)
     },
   })
-
   const insertMention = useCallback(
     (item: MentionFileItem) => {
       const before = text.slice(0, cursorPosition)
@@ -170,7 +178,13 @@ export function Composer({
         selectedPasteSegmentId: null,
         selectedMentionSegmentId: null,
       }
-      const next = insertMentionSegment(input, item, crypto.randomUUID(), atIdx, cursorPosition)
+      const next = insertMentionSegment(
+        input,
+        item,
+        crypto.randomUUID(),
+        atIdx,
+        cursorPosition
+      )
       setText(next.text)
       setAttachments(next.mentionSegments)
       lastUserTextRef.current = next.text
@@ -182,13 +196,11 @@ export function Composer({
         textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos)
       })
     },
-    [text, cursorPosition, attachments, setText, setAttachments],
+    [text, cursorPosition, attachments, setText, setAttachments]
   )
-
   const handleSubmit = useCallback(async () => {
     const trimmed = text.trim()
     if (!trimmed && attachments.length === 0) return
-
     if (bashMode && onRunBash) {
       const didRun = await onRunBash(trimmed)
       if (!didRun) return
@@ -197,29 +209,45 @@ export function Composer({
       lastUserTextRef.current = ""
       return
     }
-
     if (disabledReason) {
       onDisabledAction?.()
       return
     }
-
-    onSend(text, attachments.length > 0 ? attachments.map(mentionOccurrenceFromInputSegment) : undefined)
+    onSend(
+      text,
+      attachments.length > 0
+        ? attachments.map(mentionOccurrenceFromInputSegment)
+        : undefined
+    )
     // Push to message history (most recent first, dedup consecutive)
     setMessageHistory((prev: string[]) =>
-      prev[0] === trimmed ? prev : [trimmed, ...prev].slice(0, 100),
+      prev[0] === trimmed ? prev : [trimmed, ...prev].slice(0, 100)
     )
     // Reset history navigation
     setHistoryIndex(-1)
-    setSavedDraft({ text: "", mentions: [] })
+    setSavedDraft({
+      text: "",
+      mentions: [],
+    })
     setText("")
     setAttachments([])
     // Keep lastUserTextRef in sync so the restore-focus Effect doesn't
     // re-focus after submit clears text.
     lastUserTextRef.current = ""
-  }, [text, attachments, bashMode, onRunBash, disabledReason, onDisabledAction, onSend, setMessageHistory, setHistoryIndex, setText, setAttachments])
-
+  }, [
+    text,
+    attachments,
+    bashMode,
+    onRunBash,
+    disabledReason,
+    onDisabledAction,
+    onSend,
+    setMessageHistory,
+    setHistoryIndex,
+    setText,
+    setAttachments,
+  ])
   const canSend = text.trim().length > 0 || attachments.length > 0
-
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       // Update cursor position
@@ -227,14 +255,12 @@ export function Composer({
 
       // Slash command menu / file mention menu key handling
       const genericKey = toGenericKeyEvent(e.nativeEvent)
-
       if (slashState.isSlashMenuOpen) {
         if (slashState.handleKeyIntercept(genericKey)) {
           e.preventDefault()
           return
         }
       }
-
       if (mentionState.isOpen) {
         if (mentionState.handleKeyIntercept(genericKey)) {
           e.preventDefault()
@@ -247,13 +273,17 @@ export function Composer({
       // Down: when navigating history, navigate forward; exit at the end
       if (e.key === "ArrowUp" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
         // Only navigate history when at the first line (cursor at line start)
-        const atFirstLine = e.currentTarget.selectionStart === 0
-          || text.slice(0, e.currentTarget.selectionStart).indexOf("\n") === -1
+        const atFirstLine =
+          e.currentTarget.selectionStart === 0 ||
+          text.slice(0, e.currentTarget.selectionStart).indexOf("\n") === -1
         if (atFirstLine && messageHistory.length > 0) {
           e.preventDefault()
           if (historyIndex === -1) {
             // Entering history mode — save current draft
-            setSavedDraft({ text, mentions: attachments })
+            setSavedDraft({
+              text,
+              mentions: attachments,
+            })
             setAttachments([])
             setHistoryIndex(0)
             const entry = messageHistory[0]
@@ -287,7 +317,6 @@ export function Composer({
           return
         }
       }
-
       if (e.key === "ArrowDown" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
         if (historyIndex !== -1) {
           // Only navigate forward when at the last line
@@ -314,14 +343,20 @@ export function Composer({
             } else {
               // Exit history mode — restore saved draft
               setHistoryIndex(-1)
-              setSavedDraft({ text: "", mentions: [] })
+              setSavedDraft({
+                text: "",
+                mentions: [],
+              })
               setText(savedDraft.text)
               setAttachments(savedDraft.mentions)
               lastUserTextRef.current = savedDraft.text
               requestAnimationFrame(() => {
                 const ta = textareaRef.current
                 if (ta) {
-                  ta.setSelectionRange(savedDraft.text.length, savedDraft.text.length)
+                  ta.setSelectionRange(
+                    savedDraft.text.length,
+                    savedDraft.text.length
+                  )
                 }
               })
             }
@@ -348,17 +383,43 @@ export function Composer({
         return
       }
     },
-    [slashState, mentionState, canSend, isStreaming, bashMode, onInterrupt, onToggleBashMode, handleSubmit, messageHistory, historyIndex, text, attachments, savedDraft, setText, setAttachments, setHistoryIndex, setSavedDraft],
+    [
+      slashState,
+      mentionState,
+      canSend,
+      isStreaming,
+      bashMode,
+      onInterrupt,
+      onToggleBashMode,
+      handleSubmit,
+      messageHistory,
+      historyIndex,
+      text,
+      attachments,
+      savedDraft,
+      setText,
+      setAttachments,
+      setHistoryIndex,
+      setSavedDraft,
+    ]
   )
-
   const handleTextareaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const nextText = e.target.value
       let start = 0
-      while (start < text.length && start < nextText.length && text[start] === nextText[start]) start++
+      while (
+        start < text.length &&
+        start < nextText.length &&
+        text[start] === nextText[start]
+      )
+        start++
       let oldEnd = text.length
       let newEnd = nextText.length
-      while (oldEnd > start && newEnd > start && text[oldEnd - 1] === nextText[newEnd - 1]) {
+      while (
+        oldEnd > start &&
+        newEnd > start &&
+        text[oldEnd - 1] === nextText[newEnd - 1]
+      ) {
         oldEnd--
         newEnd--
       }
@@ -371,63 +432,69 @@ export function Composer({
         selectedPasteSegmentId: null,
         selectedMentionSegmentId: null,
       }
-      const next = applyTextEditWithPastesAndMentions(input, start, oldEnd, nextText.slice(start, newEnd))
+      const next = applyTextEditWithPastesAndMentions(
+        input,
+        start,
+        oldEnd,
+        nextText.slice(start, newEnd)
+      )
       lastUserTextRef.current = next.text
       setText(next.text)
       setAttachments(next.mentionSegments)
       setCursorPosition(next.cursorPosition)
       resizeTextarea(e.target)
     },
-    [text, cursorPosition, attachments, setText, setAttachments],
+    [text, cursorPosition, attachments, setText, setAttachments]
   )
-
   const handleTextareaSelect = useCallback(
     (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
       setCursorPosition(e.currentTarget.selectionStart)
     },
-    [],
+    []
   )
-
-  const removeAttachment = useCallback((index: number) => {
-    const segment = attachments[index]
-    if (!segment) return
-    const input: InputValue = {
-      text,
-      cursorPosition,
-      lastEditDueToNav: false,
-      pasteSegments: [],
-      mentionSegments: attachments,
-      selectedPasteSegmentId: null,
-      selectedMentionSegmentId: null,
-    }
-    const next = applyTextEditWithPastesAndMentions(input, segment.start, segment.end, '')
-    setText(next.text)
-    setAttachments(next.mentionSegments)
-  }, [attachments, text, cursorPosition, setText, setAttachments])
+  const removeAttachment = useCallback(
+    (index: number) => {
+      const segment = attachments[index]
+      if (!segment) return
+      const input: InputValue = {
+        text,
+        cursorPosition,
+        lastEditDueToNav: false,
+        pasteSegments: [],
+        mentionSegments: attachments,
+        selectedPasteSegmentId: null,
+        selectedMentionSegmentId: null,
+      }
+      const next = applyTextEditWithPastesAndMentions(
+        input,
+        segment.start,
+        segment.end,
+        ""
+      )
+      setText(next.text)
+      setAttachments(next.mentionSegments)
+    },
+    [attachments, text, cursorPosition, setText, setAttachments]
+  )
 
   // Placeholder text
   const placeholder = bashMode
     ? "Run a command..."
     : isStreaming
-      ? "Type to queue a message..."
-      : "Describe a task or ask a question"
-
-  // Left accent color
-  const accentColor = bashMode
-    ? "var(--line-bash)"
-    : "var(--accent-primary)"
+    ? "Type to queue a message..."
+    : "Describe a task or ask a question"
 
   return (
-    <div className="composer" data-bash-mode={bashMode} style={{ margin: docked ? 0 : "0 12px 4px" }}>
+    <div
+      className={`${docked ? "[margin:0px]" : "[margin:0_12px_4px]"}  composer`}
+      data-bash-mode={bashMode}
+    >
       <div
-        className="composer-box"
-        style={{
-          position: "relative",
-          background: "var(--bg-input)",
-          border: `1px solid ${bashMode ? accentColor : "var(--border-default)"}`,
-          borderRadius: 6,
-          padding: "10px 12px",
-        }}
+        className={`${
+          bashMode
+            ? "border-orange-700 dark:border-orange-400"
+            : "border-slate-300 dark:border-slate-750"
+        } relative rounded-md border bg-white px-3 py-2.5 dark:bg-slate-800 max-[640px]:!p-2`}
       >
         {/* Slash command menu */}
         {slashState.isSlashMenuOpen && (
@@ -452,38 +519,26 @@ export function Composer({
 
         {/* Attachment pills */}
         {attachments.length > 0 && (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
+          <div className="flex flex-wrap [gap:4px] [margin-bottom:6px]">
             {attachments.map((att, i) => (
-              <AttachmentPill key={att.id} attachment={mentionAttachmentFromSegment(att)} onRemove={() => removeAttachment(i)} />
+              <AttachmentPill
+                key={att.id}
+                attachment={mentionAttachmentFromSegment(att)}
+                onRemove={() => removeAttachment(i)}
+              />
             ))}
           </div>
         )}
 
         <textarea
           ref={textareaRef}
-          className="composer-textarea"
+          className="composer-textarea w-full box-border [padding-right:42px] font-sans text-[14px] leading-[1.5] text-slate-900 dark:text-slate-200 [background:transparent] border-0 [outline:none] [resize:none] [min-height:64px] [max-height:240px]"
           value={text}
           placeholder={placeholder}
           onChange={handleTextareaChange}
           onKeyDown={handleKeyDown}
           onSelect={handleTextareaSelect}
           onClick={(e) => setCursorPosition(e.currentTarget.selectionStart)}
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            paddingRight: 42,
-            fontFamily: "var(--font-sans)",
-            fontSize: 14,
-            lineHeight: 1.5,
-            color: "var(--fg-primary)",
-            background: "transparent",
-            border: "none",
-            outline: "none",
-            resize: "none",
-            minHeight: 64,
-            maxHeight: 240,
-          }}
-          data-placeholder-color="var(--fg-placeholder)"
           rows={3}
         />
 
@@ -496,34 +551,40 @@ export function Composer({
           }}
           disabled={!isStreaming && !canSend && !disabledReason}
           aria-disabled={!isStreaming && !!disabledReason}
-          className="composer-send-button"
+          className={`${
+            isStreaming || canSend || disabledReason
+              ? "cursor-pointer"
+              : "cursor-default"
+          } ${
+            isStreaming || canSend ? "opacity-[1]" : "opacity-[0.45]"
+          } group bg-white hover:bg-white dark:bg-slate-875 dark:hover:bg-slate-875 absolute [right:10px] [bottom:10px] [width:28px] [height:28px] rounded-[4px] border-0 flex items-center justify-center [transition:opacity_100ms]`}
           data-can-send={canSend ? "true" : "false"}
-          style={{
-            position: "absolute",
-            right: 10,
-            bottom: 10,
-            width: 28,
-            height: 28,
-            borderRadius: 4,
-            border: "none",
-            cursor: isStreaming || canSend || disabledReason ? "pointer" : "default",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            opacity: isStreaming || canSend ? 1 : 0.45,
-            transition: "opacity 100ms",
-          }}
-          title={!canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"}
-          aria-label={!canSend && isStreaming ? "Interrupt" : disabledReason ? `${disabledReason}. Open Settings` : "Send message"}
+          title={
+            !canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"
+          }
+          aria-label={
+            !canSend && isStreaming
+              ? "Interrupt"
+              : disabledReason
+              ? `${disabledReason}. Open Settings`
+              : "Send message"
+          }
         >
           {!canSend && isStreaming ? (
-            <Square size={16} fill="currentColor" style={{ color: "var(--accent-error)" }} />
+            <Square
+              size={16}
+              fill="currentColor"
+              className="text-red-600 dark:text-red-500"
+            />
           ) : (
             <ArrowUp
               size={17}
               strokeWidth={2.4}
-              className="composer-send-arrow"
-              style={{ color: canSend && !disabledReason ? "var(--accent-primary)" : "var(--fg-tertiary)" }}
+              className={`${
+                canSend && !disabledReason
+                  ? "text-blue-700 dark:text-blue-500 group-hover:text-slate-900 dark:group-hover:text-slate-200"
+                  : "text-slate-500"
+              } transition-colors duration-100`}
             />
           )}
         </button>
@@ -531,7 +592,6 @@ export function Composer({
     </div>
   )
 }
-
 function resizeTextarea(ta: HTMLTextAreaElement) {
   ta.style.height = "auto"
   ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
@@ -550,50 +610,33 @@ function SlashCommandMenu({
 }): ReactNode {
   // Find divider between built-ins and skills
   const firstSkillIdx = commands.findIndex((c) => c.source === "skill")
-
   return (
-    <div
-      className="slash-command-menu popover"
-      style={{
-        position: "absolute",
-        bottom: "100%",
-        left: 0,
-        right: 0,
-        maxHeight: 240,
-        overflowY: "auto",
-        marginBottom: 4,
-      }}
-    >
+    <div className="slash-command-menu absolute z-30 rounded-md border border-slate-300 dark:border-slate-750 bg-slate-100 dark:bg-slate-800 shadow-[0_4px_24px_rgba(0,0,0,.4)] absolute [bottom:100%] [left:0px] [right:0px] [max-height:240px] overflow-y-auto [margin-bottom:4px]">
       {commands.map((cmd, i) => (
         <div key={cmd.id}>
           {firstSkillIdx === i && i > 0 && (
-            <div style={{ height: 1, background: "var(--border-subtle)", margin: "2px 0" }} />
+            <div className="[height:1px] bg-slate-200 dark:bg-slate-800 [margin:2px_0]" />
           )}
           <div
-            className="menu-item"
+            className="flex h-8 items-center gap-2 bg-transparent px-2.5 cursor-pointer hover:bg-slate-150 data-[selected=true]:bg-slate-200 dark:hover:bg-slate-750 dark:data-[selected=true]:bg-slate-700"
             data-selected={i === selectedIndex}
             onMouseEnter={() => onSelectIndex(i)}
           >
             {cmd.source === "skill" ? (
-              <Sparkles size={14} style={{ color: "var(--fg-secondary)", flexShrink: 0 }} />
+              <Sparkles
+                size={14}
+                className="text-slate-600 dark:text-slate-400 shrink-0"
+              />
             ) : (
-              <Terminal size={14} style={{ color: "var(--fg-secondary)", flexShrink: 0 }} />
+              <Terminal
+                size={14}
+                className="text-slate-600 dark:text-slate-400 shrink-0"
+              />
             )}
-            <span style={{ color: "var(--fg-primary)", fontSize: 13, flexShrink: 0 }}>
+            <span className="text-slate-900 dark:text-slate-200 text-[13px] shrink-0">
               /{cmd.id}
             </span>
-            <span
-              style={{
-                color: "var(--fg-tertiary)",
-                fontSize: 11,
-                marginLeft: "auto",
-                minWidth: 0,
-                flex: "1 1 0",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
-            >
+            <span className="text-slate-500 text-[11px] [margin-left:auto] min-w-0 [flex:1_1_0] overflow-hidden text-ellipsis whitespace-nowrap">
               {cmd.description}
             </span>
           </div>
@@ -625,28 +668,16 @@ function FileMentionMenu({
   const flatItems = [...recentSlice, ...allItems]
   const hasRecent = recentSlice.length > 0
   const recentCount = recentSlice.length
-
   return (
-    <div
-      className="file-mention-menu popover"
-      style={{
-        position: "absolute",
-        bottom: "100%",
-        left: 0,
-        right: 0,
-        maxHeight: 240,
-        overflowY: "auto",
-        marginBottom: 4,
-      }}
-    >
+    <div className="file-mention-menu absolute z-30 rounded-md border border-slate-300 dark:border-slate-750 bg-slate-100 dark:bg-slate-800 shadow-[0_4px_24px_rgba(0,0,0,.4)] absolute [bottom:100%] [left:0px] [right:0px] [max-height:240px] overflow-y-auto [margin-bottom:4px]">
       {loading && flatItems.length === 0 && (
-        <div style={{ padding: "8px 10px", color: "var(--fg-tertiary)", fontSize: 12 }}>
+        <div className="[padding:8px_10px] text-slate-500 text-[12px]">
           Loading...
         </div>
       )}
 
       {hasRecent && (
-        <div style={{ padding: "4px 10px 2px", color: "var(--fg-tertiary)", fontSize: 11, fontWeight: 500 }}>
+        <div className="[padding:4px_10px_2px] text-slate-500 text-[11px] font-medium">
           Recent files
         </div>
       )}
@@ -660,7 +691,7 @@ function FileMentionMenu({
       ))}
 
       {allItems.length > 0 && (
-        <div style={{ padding: "4px 10px 2px", color: "var(--fg-tertiary)", fontSize: 11, fontWeight: 500 }}>
+        <div className="[padding:4px_10px_2px] text-slate-500 text-[11px] font-medium">
           Project files
         </div>
       )}
@@ -674,20 +705,19 @@ function FileMentionMenu({
       ))}
 
       {overflowCount > 0 && (
-        <div style={{ padding: "4px 10px", color: "var(--fg-tertiary)", fontSize: 11 }}>
+        <div className="[padding:4px_10px] text-slate-500 text-[11px]">
           +{overflowCount} more
         </div>
       )}
 
       {!loading && flatItems.length === 0 && (
-        <div style={{ padding: "8px 10px", color: "var(--fg-tertiary)", fontSize: 12 }}>
+        <div className="[padding:8px_10px] text-slate-500 text-[12px]">
           No files found
         </div>
       )}
     </div>
   )
 }
-
 function MentionMenuItem({
   item,
   selected,
@@ -700,31 +730,16 @@ function MentionMenuItem({
   const Icon = item.kind === "directory" ? Folder : FileText
   return (
     <div
-      className="menu-item"
+      className="flex h-8 items-center gap-2 bg-transparent px-2.5 cursor-pointer hover:bg-slate-150 data-[selected=true]:bg-slate-200 dark:hover:bg-slate-750 dark:data-[selected=true]:bg-slate-700"
       data-selected={selected}
       onMouseEnter={onHover}
     >
-      <Icon size={14} style={{ color: "var(--fg-secondary)", flexShrink: 0 }} />
-      <span
-        style={{
-          color: "var(--fg-primary)",
-          fontSize: 13,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-        }}
-      >
+      <Icon size={14} className="text-slate-600 dark:text-slate-400 shrink-0" />
+      <span className="text-slate-900 dark:text-slate-200 text-[13px] overflow-hidden text-ellipsis whitespace-nowrap">
         {item.path}
       </span>
       {item.contentType && (
-        <span
-          style={{
-            color: "var(--fg-tertiary)",
-            fontSize: 11,
-            marginLeft: "auto",
-            flexShrink: 0,
-          }}
-        >
+        <span className="text-slate-500 text-[11px] [margin-left:auto] shrink-0">
           {item.contentType}
         </span>
       )}
@@ -743,35 +758,20 @@ function AttachmentPill({
 }): ReactNode {
   const Icon = attachment.type === "mention_directory" ? Folder : FileText
   const rangeSuffix =
-    attachment.type === "mention_file_range" ? `:${attachment.startLine}-${attachment.endLine}` : ""
-
+    attachment.type === "mention_file_range"
+      ? `:${attachment.startLine}-${attachment.endLine}`
+      : ""
   return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 4,
-        background: "var(--bg-surface)",
-        border: "1px solid var(--border-default)",
-        borderRadius: 4,
-        padding: "2px 6px",
-        fontSize: 11,
-      }}
-    >
-      <Icon size={14} style={{ color: "var(--fg-secondary)" }} />
-      <span style={{ color: "var(--fg-primary)" }}>{attachment.path}</span>
-      {rangeSuffix && <span style={{ color: "var(--fg-tertiary)" }}>{rangeSuffix}</span>}
+    <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-875 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px]">
+      <Icon size={14} className="text-slate-600 dark:text-slate-400" />
+      <span className="text-slate-900 dark:text-slate-200">
+        {attachment.path}
+      </span>
+      {rangeSuffix && <span className="text-slate-500">{rangeSuffix}</span>}
       <button
         onClick={onRemove}
         aria-label="Remove attachment"
-        style={{
-          background: "transparent",
-          border: "none",
-          color: "var(--fg-tertiary)",
-          cursor: "pointer",
-          padding: 0,
-          display: "flex",
-        }}
+        className="[background:transparent] border-0 text-slate-500 cursor-pointer [padding:0px] flex"
       >
         <X size={14} />
       </button>

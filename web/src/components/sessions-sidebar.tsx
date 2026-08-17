@@ -30,7 +30,10 @@ import {
   X,
 } from "lucide-react"
 import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
-import { formatCwdForDisplay, formatRelativeTime } from "@magnitudedev/client-common"
+import {
+  formatCwdForDisplay,
+  formatRelativeTime,
+} from "@magnitudedev/client-common"
 import {
   useAgentClient,
   useSelectedSessionId,
@@ -58,7 +61,6 @@ interface SessionItemData {
   workStatus: "idle" | "working"
   activeWorkerCount: number
 }
-
 export interface SessionsSidebarProps {
   sessions?: SessionItemData[]
   loading?: boolean
@@ -87,7 +89,6 @@ interface ContextMenuState {
   y: number
   sessionId: string
 }
-
 const settingsSections = [
   {
     id: "models",
@@ -108,7 +109,6 @@ const settingsSections = [
     icon: HardDrive,
   },
 ] as const
-
 function SettingsNavigation({
   activeTab,
   onTabChange,
@@ -123,19 +123,22 @@ function SettingsNavigation({
       <button
         type="button"
         onClick={onBack}
-        className="settings-sidebar-header sidebar-header hover-surface-flat"
+        className="mac:[-webkit-app-region:no-drag] w-[calc(100%-16px)] h-9 mx-2 mt-1 mb-[5px] px-2.5 border-0 rounded-[7px] bg-transparent text-slate-600 dark:text-slate-400 flex items-center gap-2 shrink-0 text-left cursor-pointer hover:bg-white dark:hover:bg-slate-875 [&_strong]:text-slate-900 dark:[&_strong]:text-slate-200 [&_strong]:text-[14px] [&_strong]:leading-[normal] [&_strong]:font-semibold mac:[-webkit-app-region:drag]"
         aria-label="Back to sessions"
         title="Back to sessions"
       >
         <ArrowLeft size={16} aria-hidden="true" />
         <strong>Settings</strong>
       </button>
-      <nav className="settings-sidebar-nav" aria-label="Settings sections">
+      <nav
+        className="flex min-h-0 flex-1 flex-col gap-[3px] px-2 py-2.5"
+        aria-label="Settings sections"
+      >
         {settingsSections.map(({ id, label, detail, icon: Icon }) => (
           <button
             key={id}
             type="button"
-            className="settings-sidebar-item"
+            className="w-full min-h-[52px] px-2.5 py-2 border-0 rounded-[7px] bg-transparent text-slate-500 flex items-center gap-[11px] text-left cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-600 dark:hover:text-slate-400 aria-[current=page]:bg-slate-100 dark:aria-[current=page]:bg-slate-800 aria-[current=page]:text-blue-700 dark:aria-[current=page]:text-blue-500 [&>span]:min-w-0 [&>span]:flex [&>span]:flex-col [&>span]:gap-px [&_strong]:text-slate-600 dark:[&_strong]:text-slate-400 [&_strong]:text-[13px] [&_strong]:font-semibold hover:[&_strong]:text-slate-900 dark:hover:[&_strong]:text-slate-200 aria-[current=page]:[&_strong]:text-slate-900 dark:aria-[current=page]:[&_strong]:text-slate-200 [&_small]:text-slate-500 [&_small]:text-[11px]"
             aria-current={activeTab === id ? "page" : undefined}
             onClick={() => onTabChange?.(id)}
           >
@@ -150,7 +153,6 @@ function SettingsNavigation({
     </>
   )
 }
-
 function SidebarFooter({
   settingsActive,
   onOpenSettings,
@@ -160,18 +162,21 @@ function SidebarFooter({
 }): ReactNode {
   const appearance = useAppearancePreference()
   const nextAppearance =
-    appearance === "system" ? "light" : appearance === "light" ? "dark" : "system"
+    appearance === "system"
+      ? "light"
+      : appearance === "light"
+      ? "dark"
+      : "system"
   const AppearanceIcon =
     appearance === "light" ? Sun : appearance === "dark" ? Moon : Monitor
   const appearanceLabel =
     appearance === "light" ? "Light" : appearance === "dark" ? "Dark" : "System"
-
   return (
-    <div className="sidebar-account">
+    <div className="shrink-0 min-h-[49px] border-t border-slate-200 dark:border-slate-800 mac:border-slate-300/[.72] dark:mac:border-slate-800/[.68] p-2 flex items-center gap-2 mac:[-webkit-app-region:no-drag]">
       <button
         type="button"
         onClick={settingsActive ? undefined : onOpenSettings}
-        className="sidebar-footer-button hover-surface-flat"
+        className="size-8 border-0 rounded-md bg-transparent text-slate-600 dark:text-slate-400 flex items-center justify-center cursor-pointer shrink-0 hover:bg-white dark:hover:bg-slate-875 aria-[current=page]:bg-slate-100 dark:aria-[current=page]:bg-slate-800 aria-[current=page]:text-blue-700 dark:aria-[current=page]:text-blue-500"
         aria-label="Settings"
         aria-current={settingsActive ? "page" : undefined}
         title="Settings"
@@ -181,13 +186,13 @@ function SidebarFooter({
       <button
         type="button"
         onClick={() => setAppearancePreference(nextAppearance)}
-        className="sidebar-footer-button hover-surface-flat"
+        className="size-8 border-0 rounded-md bg-transparent text-slate-600 dark:text-slate-400 flex items-center justify-center cursor-pointer shrink-0 hover:bg-white dark:hover:bg-slate-875 aria-[current=page]:bg-slate-100 dark:aria-[current=page]:bg-slate-800 aria-[current=page]:text-blue-700 dark:aria-[current=page]:text-blue-500"
         aria-label={`Theme: ${appearanceLabel}. Change to ${
           nextAppearance === "system"
             ? "System"
             : nextAppearance === "light"
-              ? "Light"
-              : "Dark"
+            ? "Light"
+            : "Dark"
         }`}
         title={`Theme: ${appearanceLabel}`}
       >
@@ -209,7 +214,9 @@ function SessionContextMenu({
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const { startNewSession } = useSessionActions()
-  const deleteMutation = useAtomSet(client.rpc.mutation("DeleteSession"), { mode: "promise" })
+  const deleteMutation = useAtomSet(client.rpc.mutation("DeleteSession"), {
+    mode: "promise",
+  })
 
   // Close on any click outside — attached in onContextMenu, but we also
   // handle it with a backdrop click here
@@ -217,7 +224,9 @@ function SessionContextMenu({
     onClose()
     try {
       await deleteMutation({
-        payload: { sessionId: menu.sessionId },
+        payload: {
+          sessionId: menu.sessionId,
+        },
         reactivityKeys: ["sessions"],
       })
       if (selectedSessionId === menu.sessionId) {
@@ -226,8 +235,13 @@ function SessionContextMenu({
     } catch (err) {
       console.error("[DeleteSession] Failed:", err)
     }
-  }, [menu.sessionId, deleteMutation, selectedSessionId, startNewSession, onClose])
-
+  }, [
+    menu.sessionId,
+    deleteMutation,
+    selectedSessionId,
+    startNewSession,
+    onClose,
+  ])
   return (
     <>
       {/* Invisible backdrop to catch outside clicks */}
@@ -237,66 +251,35 @@ function SessionContextMenu({
           e.preventDefault()
           onClose()
         }}
-        style={{
-          position: "fixed",
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          zIndex: 90,
-        }}
+        className="fixed [top:0px] [left:0px] [right:0px] [bottom:0px] z-[90]"
       />
       <div
-        className="session-context-menu popover"
+        className="session-context-menu absolute z-30 rounded-md border border-slate-300 dark:border-slate-750 bg-slate-100 dark:bg-slate-800 shadow-[0_4px_24px_rgba(0,0,0,.4)] fixed rounded-[4px] z-[91] [min-width:140px] [padding:4px_0] [animation:fade-in_100ms_ease-out]"
         style={{
-          position: "fixed",
           left: menu.x,
           top: menu.y,
-          borderRadius: 4,
-          zIndex: 91,
-          minWidth: 140,
-          padding: "4px 0",
-          animation: "fade-in 100ms ease-out",
         }}
       >
         {/* Rename — placeholder, grayed out */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "6px 12px",
-            fontFamily: "var(--font-sans)",
-            fontSize: 13,
-            color: "var(--fg-tertiary)",
-            cursor: "default",
-            opacity: 0.5,
-          }}
-        >
-          <Pencil size={14} style={{ color: "var(--fg-tertiary)" }} />
+        <div className="flex items-center [gap:8px] [padding:6px_12px] font-sans text-[13px] text-slate-500 cursor-default opacity-[0.5]">
+          <Pencil size={14} className="text-slate-500" />
           <span>Rename</span>
         </div>
 
         {/* Delete */}
         <div
-          className="hover-danger"
+          className="bg-transparent hover:bg-red-200 dark:hover:bg-red-800 flex items-center [gap:8px] [padding:6px_12px] font-sans text-[13px] text-red-600 dark:text-red-500 cursor-pointer [transition:background_100ms]"
           onClick={handleDelete}
-          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleDelete() } }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault()
+              handleDelete()
+            }
+          }}
           tabIndex={0}
           role="menuitem"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "6px 12px",
-            fontFamily: "var(--font-sans)",
-            fontSize: 13,
-            color: "var(--accent-error)",
-            cursor: "pointer",
-            transition: "background 100ms",
-          }}
         >
-          <Trash2 size={14} style={{ color: "var(--accent-error)" }} />
+          <Trash2 size={14} className="text-red-600 dark:text-red-500" />
           <span>Delete</span>
         </div>
       </div>
@@ -321,80 +304,56 @@ function SessionItem({
   const isWorking = session.workStatus === "working"
   const statusLabel = isWorking
     ? session.activeWorkerCount && session.activeWorkerCount > 0
-      ? `${session.activeWorkerCount} worker${session.activeWorkerCount === 1 ? "" : "s"}`
+      ? `${session.activeWorkerCount} worker${
+          session.activeWorkerCount === 1 ? "" : "s"
+        }`
       : "Working"
     : "Idle"
-
   return (
     <div
-      className="session-item"
+      className="mb-1.5 flex cursor-pointer rounded px-2.5 py-2 bg-transparent transition-colors duration-100 hover:bg-slate-150 data-[selected=true]:bg-slate-200 dark:hover:bg-slate-800 dark:data-[selected=true]:bg-slate-750"
       data-selected={isSelected}
       data-active={isWorking}
       onClick={onSelect}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect() } }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault()
+          onSelect()
+        }
+      }}
       onContextMenu={onContextMenu}
       tabIndex={0}
       role="button"
       title={session.title ? `${session.title} — ${session.cwd}` : session.cwd}
     >
-      <div className="session-item-body" style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            minWidth: 0,
-          }}
-        >
+      <div className="session-item-body [flex:1] min-w-0 flex flex-col [gap:3px]">
+        <div className="flex items-center [gap:8px] min-w-0">
           <span
-            className="session-item-title"
-            style={{
-              fontFamily: "var(--font-sans)",
-              fontSize: 14,
-              fontWeight: 500,
-              color: session.title ? "var(--fg-primary)" : "var(--fg-tertiary)",
-              fontStyle: session.title ? "normal" : "italic",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              flex: 1,
-              minWidth: 0,
-            }}
+            className={`${
+              session.title
+                ? "text-slate-900 dark:text-slate-200"
+                : "text-slate-500"
+            } ${
+              session.title ? "not-italic" : "italic"
+            }  session-item-title font-sans text-[14px] font-medium overflow-hidden text-ellipsis whitespace-nowrap [flex:1] min-w-0`}
           >
             {title}
           </span>
-          <span
-            style={{
-              color: "var(--fg-tertiary)",
-              fontFamily: "var(--font-sans)",
-              fontSize: 12,
-              flexShrink: 0,
-            }}
-          >
+          <span className="text-slate-500 font-sans text-[12px] shrink-0">
             {formatRelativeTime(session.updatedAt)}
           </span>
         </div>
-        <div
-          className="session-item-meta"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            minWidth: 0,
-            fontFamily: "var(--font-sans)",
-            fontSize: 12,
-            color: "var(--fg-secondary)",
-          }}
-        >
-          <span style={{ fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
-            {formatCwdForDisplay(session.cwd, { maxLen: 28, abbreviateHome: true })}
+        <div className="session-item-meta flex items-center [gap:8px] min-w-0 font-sans text-[12px] text-slate-600 dark:text-slate-400">
+          <span className="font-mono overflow-hidden text-ellipsis whitespace-nowrap [flex:1] min-w-0">
+            {formatCwdForDisplay(session.cwd, {
+              maxLen: 28,
+              abbreviateHome: true,
+            })}
           </span>
           <span
-            style={{
-              flexShrink: 0,
-              color: isWorking ? "var(--accent-primary)" : "var(--fg-tertiary)",
-              fontWeight: isWorking ? 600 : 400,
-            }}
+            className={`${
+              isWorking ? "text-blue-700 dark:text-blue-500" : "text-slate-500"
+            } ${isWorking ? "font-semibold" : "font-normal"}  shrink-0`}
           >
             {statusLabel}
           </span>
@@ -433,32 +392,33 @@ export function SessionsSidebar({
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
 
   // Drag state ref — tracks active resize drag without useEffect
-  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null)
-
+  const dragRef = useRef<{
+    startX: number
+    startWidth: number
+  } | null>(null)
   const visibleCwdOptions = useMemo(() => {
     if (!cwdFilter || cwdOptions.includes(cwdFilter)) return cwdOptions
     return [cwdFilter, ...cwdOptions]
   }, [cwdFilter, cwdOptions])
-
   const handleSessionListScroll = useCallback(
     (event: React.UIEvent<HTMLDivElement>) => {
       if (!hasMore || loading || loadingMore) return
       const element = event.currentTarget
-      const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+      const distanceFromBottom =
+        element.scrollHeight - element.scrollTop - element.clientHeight
       if (distanceFromBottom < 96) {
         onLoadMore?.()
       }
     },
-    [hasMore, loading, loadingMore, onLoadMore],
+    [hasMore, loading, loadingMore, onLoadMore]
   )
-
   const handleSelect = useCallback(
     (sessionId: string) => {
       onSelectSession?.(sessionId)
       // Close overlay sidebar on selection
       if (overlay && onCloseOverlay) onCloseOverlay()
     },
-    [onSelectSession, overlay, onCloseOverlay],
+    [onSelectSession, overlay, onCloseOverlay]
   )
 
   // ── Resize handle: onMouseDown starts drag, attaches mousemove/mouseup on document ──
@@ -467,14 +427,15 @@ export function SessionsSidebar({
       e.preventDefault()
       const startX = e.clientX
       const startWidth = sidebarWidth
-      dragRef.current = { startX, startWidth }
-
+      dragRef.current = {
+        startX,
+        startWidth,
+      }
       const onMouseMove = (ev: MouseEvent) => {
         const delta = ev.clientX - startX
         const newWidth = Math.min(400, Math.max(200, startWidth + delta))
         setSidebarWidth(newWidth)
       }
-
       const onMouseUp = () => {
         dragRef.current = null
         document.removeEventListener("mousemove", onMouseMove)
@@ -482,13 +443,12 @@ export function SessionsSidebar({
         document.body.style.cursor = ""
         document.body.style.userSelect = ""
       }
-
       document.addEventListener("mousemove", onMouseMove)
       document.addEventListener("mouseup", onMouseUp)
       document.body.style.cursor = "col-resize"
       document.body.style.userSelect = "none"
     },
-    [sidebarWidth, setSidebarWidth],
+    [sidebarWidth, setSidebarWidth]
   )
 
   // ── Context menu handler ──
@@ -496,148 +456,77 @@ export function SessionsSidebar({
     (e: React.MouseEvent, sessionId: string) => {
       e.preventDefault()
       e.stopPropagation()
-      setContextMenu({ x: e.clientX, y: e.clientY, sessionId })
+      setContextMenu({
+        x: e.clientX,
+        y: e.clientY,
+        sessionId,
+      })
     },
-    [],
+    []
   )
 
   // Width: fixed 280px in overlay mode, otherwise the atom value
   const effectiveWidth = overlay ? 280 : sidebarWidth
-
-  const sidebarStyle: React.CSSProperties = overlay
-    ? {
-        position: "fixed",
-        top: 0,
-        left: 0,
-        bottom: 0,
-        width: effectiveWidth,
-        background: "var(--bg-sidebar-window, var(--bg-sidebar))",
-        borderRight: "1px solid var(--border-sidebar, var(--border-subtle))",
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-        zIndex: 80,
-        animation: "slide-in-left 200ms ease-out",
-      }
-    : {
-        width: effectiveWidth,
-        flexShrink: 0,
-        background: "var(--bg-sidebar-window, var(--bg-sidebar))",
-        borderRight: "1px solid var(--border-sidebar, var(--border-subtle))",
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-        position: "relative",
-      }
-
+  const sidebarStyle: React.CSSProperties = { width: effectiveWidth }
   return (
     <>
       {/* Overlay backdrop — click to close */}
       {overlay && (
         <div
           onClick={onCloseOverlay}
-          style={{
-            position: "fixed",
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: "var(--bg-overlay)",
-            zIndex: 79,
-          }}
+          className="fixed inset-0 z-[79] bg-black/70"
         />
       )}
 
-      <div className="sessions-sidebar" data-overlay={overlay || undefined} style={sidebarStyle}>
-        <div className="sidebar-window-drag-region" aria-hidden="true" />
+      <div
+        className={`${
+          overlay
+            ? "fixed inset-y-0 left-0 z-80 animate-[slide-in-left_200ms_ease-out]"
+            : "relative shrink-0"
+        } max-[640px]:[&:not([data-overlay])]:hidden flex flex-col overflow-hidden border-r border-slate-200 bg-slate-100 dark:border-slate-800 dark:bg-slate-875 mac:border-slate-300/[.72] mac:bg-slate-50/[.88] dark:mac:border-slate-800/[.68] dark:mac:bg-slate-875/[.86]`}
+        data-overlay={overlay || undefined}
+        style={sidebarStyle}
+      >
+        <div
+          className="hidden mac:block mac:h-[38px] mac:shrink-0 mac:[-webkit-app-region:drag]"
+          aria-hidden="true"
+        />
 
         {settingsTab !== null ? (
-          <SettingsNavigation activeTab={settingsTab} onTabChange={onSettingsTabChange} onBack={onCloseSettings} />
+          <SettingsNavigation
+            activeTab={settingsTab}
+            onTabChange={onSettingsTabChange}
+            onBack={onCloseSettings}
+          />
         ) : (
           <>
             {/* Header */}
-            <div
-              className="sidebar-header"
-              style={{
-                padding: "8px 12px 12px",
-                borderBottom: "1px solid var(--border-sidebar, var(--border-subtle))",
-                flexShrink: 0,
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-              }}
-            >
+            <div className="mac:[-webkit-app-region:drag] flex shrink-0 flex-col gap-2 border-b border-slate-200 px-3 pt-2 pb-3 dark:border-slate-800">
               <button
                 type="button"
                 onClick={onNewSession}
-                className="hover-surface-flat"
-                style={{
-                  width: "100%",
-                  height: 28,
-                  background: "var(--bg-surface)",
-                  border: "1px solid var(--border-sidebar, var(--border-subtle))",
-                  borderRadius: 5,
-                  padding: "0 8px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 7,
-                  color: "var(--fg-secondary)",
-                  fontFamily: "var(--font-sans)",
-                  fontSize: 13,
-                  fontWeight: 500,
-                  cursor: "pointer",
-                  textAlign: "left",
-                }}
+                className="flex h-7 w-full cursor-pointer items-center gap-[7px] rounded-[5px] border border-slate-300 bg-white px-2 text-left font-sans text-[13px] font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-750 dark:bg-slate-875 dark:text-slate-400 dark:hover:bg-slate-800"
               >
-                <Plus size={15} style={{ color: "inherit", flexShrink: 0 }} />
+                <Plus size={15} className="[color:inherit] shrink-0" />
                 <span>New session</span>
               </button>
 
               {/* Search input */}
-              <div
-                className="search-input-container"
-                style={{
-                  background: "var(--bg-surface)",
-                  border: "1px solid var(--border-sidebar, var(--border-subtle))",
-                  borderRadius: 5,
-                  height: 28,
-                  display: "flex",
-                  alignItems: "center",
-                  padding: "0 8px",
-                  gap: 7,
-                  transition: "border-color 100ms, background 100ms",
-                }}
-              >
-                <Search size={14} style={{ color: "var(--fg-tertiary)", flexShrink: 0 }} />
+              <div className="mac:[-webkit-app-region:no-drag] flex h-7 items-center gap-[7px] rounded-[5px] border border-slate-300 bg-white px-2 transition-colors duration-100 dark:border-slate-750 dark:bg-slate-875">
+                <Search size={14} className="text-slate-500 shrink-0" />
                 <input
                   type="text"
                   id="sidebar-search-input"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search sessions..."
-                  style={{
-                    flex: 1,
-                    background: "transparent",
-                    border: "none",
-                    outline: "none",
-                    fontFamily: "var(--font-sans)",
-                    fontSize: 13,
-                    color: "var(--fg-primary)",
-                  }}
+                  className="[flex:1] [background:transparent] border-0 [outline:none] font-sans text-[13px] text-slate-900 dark:text-slate-200"
                 />
                 {searchQuery && (
                   <button
                     onClick={() => setSearchQuery("")}
                     aria-label="Clear search"
-                    style={{
-                      background: "transparent",
-                      border: "none",
-                      cursor: "pointer",
-                      padding: 0,
-                      display: "flex",
-                      alignItems: "center",
-                      color: "var(--fg-tertiary)",
-                    }}
+                    className="[background:transparent] border-0 cursor-pointer [padding:0px] flex items-center text-slate-500"
                   >
                     <X size={13} />
                   </button>
@@ -645,32 +534,21 @@ export function SessionsSidebar({
               </div>
 
               <div
-                style={{
-                  position: "relative",
-                  height: 28,
-                  background: "var(--bg-surface)",
-                  border: "1px solid var(--border-sidebar, var(--border-subtle))",
-                  borderRadius: 5,
-                  color: cwdFilter ? "var(--fg-primary)" : "var(--fg-secondary)",
-                }}
+                className={`${
+                  cwdFilter
+                    ? "text-slate-900 dark:text-slate-200"
+                    : "text-slate-600 dark:text-slate-400"
+                } relative h-7 rounded-[5px] border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-875`}
               >
                 <select
                   value={cwdFilter ?? ""}
-                  onChange={(e) => onCwdFilterChange?.(e.target.value ? e.target.value : null)}
+                  onChange={(e) =>
+                    onCwdFilterChange?.(e.target.value ? e.target.value : null)
+                  }
                   aria-label="Filter sessions by working directory"
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    background: "transparent",
-                    border: "none",
-                    color: "inherit",
-                    fontFamily: cwdFilter ? "var(--font-mono)" : "var(--font-sans)",
-                    fontSize: 13,
-                    padding: "0 28px 0 8px",
-                    outline: "none",
-                    appearance: "none",
-                    cursor: "pointer",
-                  }}
+                  className={`${
+                    cwdFilter ? "font-mono" : "font-sans"
+                  }  w-full h-full [background:transparent] border-0 [color:inherit] text-[13px] [padding:0_28px_0_8px] [outline:none] appearance-none cursor-pointer`}
                 >
                   <option value="">All working directories</option>
                   {visibleCwdOptions.map((cwd) => (
@@ -685,27 +563,15 @@ export function SessionsSidebar({
                 <ChevronDown
                   size={15}
                   aria-hidden="true"
-                  style={{
-                    position: "absolute",
-                    right: 8,
-                    top: "50%",
-                    transform: "translateY(-50%)",
-                    color: "var(--fg-tertiary)",
-                    pointerEvents: "none",
-                  }}
+                  className="absolute [right:8px] [top:50%] [transform:translateY(-50%)] text-slate-500 pointer-events-none"
                 />
               </div>
             </div>
 
             {/* Session list */}
             <div
-              className="session-list"
+              className="mac:[-webkit-app-region:no-drag] [flex:1] overflow-y-auto [padding:8px_6px]"
               onScroll={handleSessionListScroll}
-              style={{
-                flex: 1,
-                overflowY: "auto",
-                padding: "8px 6px",
-              }}
             >
               {loading ? (
                 <SidebarLoadingState />
@@ -719,20 +585,17 @@ export function SessionsSidebar({
                       session={session}
                       isSelected={selectedSessionId === session.sessionId}
                       onSelect={() => handleSelect(session.sessionId)}
-                      onContextMenu={(e) => handleContextMenu(e, session.sessionId)}
+                      onContextMenu={(e) =>
+                        handleContextMenu(e, session.sessionId)
+                      }
                     />
                   ))}
                   {loadingMore && (
-                    <div
-                      style={{
-                        height: 32,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        color: "var(--fg-tertiary)",
-                      }}
-                    >
-                      <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+                    <div className="[height:32px] flex items-center justify-center text-slate-500">
+                      <Loader2
+                        size={14}
+                        className="[animation:spin_1s_linear_infinite]"
+                      />
                     </div>
                   )}
                 </>
@@ -741,33 +604,29 @@ export function SessionsSidebar({
           </>
         )}
 
-        <SidebarFooter settingsActive={settingsTab !== null} onOpenSettings={onOpenSettings} />
+        <SidebarFooter
+          settingsActive={settingsTab !== null}
+          onOpenSettings={onOpenSettings}
+        />
       </div>
 
       {/* Resize handle — only in docked mode, on the right edge of the sidebar */}
       {!overlay && (
         <div
-          className="sidebar-resize-handle"
+          className="absolute inset-y-0 -right-1 z-10 flex w-2 cursor-col-resize items-center justify-center mac:[-webkit-app-region:no-drag] max-[640px]:hidden"
           onMouseDown={handleResizeStart}
-          style={{
-            position: "absolute",
-            top: 0,
-            bottom: 0,
-            right: -4,
-            width: 8,
-            cursor: "col-resize",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 10,
-          }}
         >
-          <GripVertical size={8} style={{ color: "var(--fg-tertiary)", opacity: 0.3 }} />
+          <GripVertical size={8} className="text-slate-500 opacity-[0.3]" />
         </div>
       )}
 
       {/* Context menu */}
-      {contextMenu && <SessionContextMenu menu={contextMenu} onClose={() => setContextMenu(null)} />}
+      {contextMenu && (
+        <SessionContextMenu
+          menu={contextMenu}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
     </>
-  );
+  )
 }

@@ -5,13 +5,7 @@
  * limited to scrolling and DOM interaction. Visibility, grouping, and tool
  * semantics come from DisplayView.
  */
-import {
-  useCallback,
-  useMemo,
-  useRef,
-  type CSSProperties,
-  type ReactNode,
-} from "react"
+import { useCallback, useMemo, useRef, type ReactNode } from "react"
 import { Atom, useAtomMount } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import {
@@ -71,9 +65,7 @@ import { MessageDispatch } from "./messages"
 import { TimelineLoadingState } from "./timeline-loading-state"
 import { ChatEmptyState } from "./chat-empty-state"
 import { DiffHunk } from "./diff-hunk"
-
 const DEFAULT_SHELL_LINE_CAP = 8
-
 const TOOL_ICONS: Record<ToolIcon, LucideIcon> = {
   file: FileText,
   edit: FilePen,
@@ -89,76 +81,76 @@ const TOOL_ICONS: Record<ToolIcon, LucideIcon> = {
   tool: Wrench,
   image: ImageIcon,
 }
-
-function toneColor(tone: ToolTone | undefined): string {
+function toneClass(tone: ToolTone | undefined): string {
   switch (tone) {
     case "info":
-      return "var(--accent-info)"
+      return "text-blue-700 dark:text-blue-500"
     case "success":
-      return "var(--accent-success)"
+      return "text-green-700 dark:text-green-500"
     case "warning":
-      return "var(--accent-warning)"
+      return "text-orange-700 dark:text-orange-500"
     case "error":
-      return "var(--accent-error)"
+      return "text-red-600 dark:text-red-500"
     case "muted":
-      return "var(--fg-tertiary)"
+      return "text-slate-500"
     case "neutral":
     default:
-      return "var(--fg-secondary)"
+      return "text-slate-600 dark:text-slate-400"
   }
 }
-
-function PathText({ path, displayPath }: { path: string; displayPath?: string | null }): ReactNode {
+function PathText({
+  path,
+  displayPath,
+}: {
+  path: string
+  displayPath?: string | null
+}): ReactNode {
   const setFilePath = useAtomSet(selectedFilePathAtom)
   return (
     <button
       type="button"
       onClick={() => setFilePath(path)}
-      className="hover-text-accent"
-      style={{
-        border: "none",
-        background: "transparent",
-        padding: 0,
-        margin: 0,
-        color: "var(--accent-primary)",
-        font: "inherit",
-        cursor: "pointer",
-        textAlign: "left",
-      }}
+      className="hover-text-accent border-0 [background:transparent] [padding:0px] [margin:0px] text-blue-700 dark:text-blue-500 [font:inherit] cursor-pointer text-left"
     >
       {displayPath ?? path}
     </button>
   )
 }
-
-function ToolSummaryRow({ entry }: { entry: Extract<DisplayTimelineEntry, { kind: "tool_summary" }> }): ReactNode {
+function ToolSummaryRow({
+  entry,
+}: {
+  entry: Extract<
+    DisplayTimelineEntry,
+    {
+      kind: "tool_summary"
+    }
+  >
+}): ReactNode {
   const summary = entry.summary
   const Icon = TOOL_ICONS[summary.icon] ?? Wrench
   const label = toolSummaryLabel(summary)
   return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: "16px minmax(0, 1fr)",
-        gap: 7,
-        alignItems: "center",
-        fontFamily: "var(--font-sans)",
-        fontSize: 13,
-        lineHeight: "18px",
-        maxWidth: "min(860px, 100%)",
-      }}
-    >
-      <Icon size={14} style={{ color: toneColor(summary.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 7 }}>
-        <span style={{ color: summary.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(summary.tone)} block justify-self-center`}
+      />
+      <div className="min-w-0 flex items-center [gap:7px]">
+        <span
+          className={`${
+            summary.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
           {label}
         </span>
         {summary.detail.length > 0 && (
-          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
             {summary.detail.map((item, index) => (
               <span key={`${item.kind}-${index}`}>
-                {index > 0 && <span style={{ color: "var(--fg-tertiary)" }}> · </span>}
-                <span style={{ color: "var(--fg-tertiary)" }}>{item.text}</span>
+                {index > 0 && <span className="text-slate-500"> · </span>}
+                <span className="text-slate-500">{item.text}</span>
               </span>
             ))}
           </span>
@@ -167,373 +159,557 @@ function ToolSummaryRow({ entry }: { entry: Extract<DisplayTimelineEntry, { kind
     </div>
   )
 }
-
 function shellStatus(step: ShellPresentation): ReactNode {
   const exitCode = step.exitCode
-  if (step.phase === "streaming") return <span style={{ color: "var(--fg-tertiary)" }}>▍</span>
-  if (step.phase === "executing") return <span style={{ color: "var(--fg-tertiary)" }}>Running...</span>
+  if (step.phase === "streaming")
+    return <span className="text-slate-500">▍</span>
+  if (step.phase === "executing")
+    return <span className="text-slate-500">Running...</span>
   if (step.phase === "completed") {
     if (exitCode != null && exitCode !== 0) {
-      return <span style={{ color: "var(--accent-error)" }}>✗ Exit {exitCode}</span>
+      return (
+        <span className="text-red-600 dark:text-red-500">
+          ✗ Exit {exitCode}
+        </span>
+      )
     }
-    return <span style={{ color: "var(--accent-success)" }}>✓</span>
+    return <span className="text-green-700 dark:text-green-500">✓</span>
   }
-  if (step.phase === "rejected") return <span style={{ color: "var(--fg-tertiary)" }}>Rejected (Permission Policy)</span>
-  if (step.phase === "interrupted") return <span style={{ color: "var(--fg-tertiary)" }}>Interrupted</span>
-  return <span style={{ color: "var(--accent-error)" }}>✗ Error</span>
+  if (step.phase === "rejected")
+    return <span className="text-slate-500">Rejected (Permission Policy)</span>
+  if (step.phase === "interrupted")
+    return <span className="text-slate-500">Interrupted</span>
+  return <span className="text-red-600 dark:text-red-500">✗ Error</span>
 }
-
 function capLines(text: string, cap: number): string {
   const lines = text.split("\n")
   if (lines.length <= cap) return text
   const hidden = lines.length - cap
   return [...lines.slice(0, cap), `...${hidden} lines hidden`].join("\n")
 }
-
-function ShellStep({ step, mode }: { step: ShellPresentation; mode: "default" | "transcript" }): ReactNode {
+function ShellStep({
+  step,
+  mode,
+}: {
+  step: ShellPresentation
+  mode: "default" | "transcript"
+}): ReactNode {
   const command = step.command
   const stdout = step.phase === "completed" ? step.stdout : step.partialStdout
   const stderr = step.phase === "completed" ? step.stderr : step.partialStderr
-  const output = [stderr, stdout].filter(Boolean).join(stderr && stdout ? "\n" : "")
+  const output = [stderr, stdout]
+    .filter(Boolean)
+    .join(stderr && stdout ? "\n" : "")
   const failed = step.failed || (step.exitCode != null && step.exitCode !== 0)
-  const lineCap = mode === "transcript" ? TRANSCRIPT_LINE_CAP : DEFAULT_SHELL_LINE_CAP
+  const lineCap =
+    mode === "transcript" ? TRANSCRIPT_LINE_CAP : DEFAULT_SHELL_LINE_CAP
   const capped = output ? capLines(output, lineCap) : ""
-
   return (
-    <div style={{ maxWidth: "min(860px, 100%)" }}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "baseline",
-          gap: 8,
-          fontFamily: "var(--font-mono)",
-          fontSize: 13,
-          color: "var(--fg-primary)",
-        }}
-      >
-        <span style={{ color: "var(--fg-tertiary)" }}>$</span>
-        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: mode === "transcript" ? "normal" : "nowrap" }}>
+    <div className="[max-width:min(860px,_100%)]">
+      <div className="flex items-baseline [gap:8px] font-mono text-[13px] text-slate-900 dark:text-slate-200">
+        <span className="text-slate-500">$</span>
+        <span
+          className={`${
+            mode === "transcript" ? "whitespace-normal" : "whitespace-nowrap"
+          }  min-w-0 overflow-hidden text-ellipsis`}
+        >
           {command}
         </span>
-        <span style={{ flexShrink: 0 }}>{shellStatus(step)}</span>
+        <span className="shrink-0">{shellStatus(step)}</span>
       </div>
       {capped && (
         <pre
-          style={{
-            margin: "5px 0 0",
-            padding: mode === "transcript" ? "0 0 0 10px" : "0 0 0 18px",
-            borderLeft: mode === "transcript" ? "1px solid var(--border-default)" : "none",
-            background: "transparent",
-            color: failed ? "var(--accent-error)" : "var(--fg-secondary)",
-            fontFamily: "var(--font-mono)",
-            fontSize: 12,
-            lineHeight: 1.45,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-            maxHeight: mode === "transcript" ? 480 : 180,
-            overflow: "auto",
-          }}
+          className={`${
+            mode === "transcript"
+              ? "[padding:0_0_0_10px]"
+              : "[padding:0_0_0_18px]"
+          } ${
+            mode === "transcript"
+              ? "border-l border-l-slate-300 dark:border-l-slate-750"
+              : "[border-left:none]"
+          } ${
+            failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-600 dark:text-slate-400"
+          } ${
+            mode === "transcript" ? "[max-height:480px]" : "[max-height:180px]"
+          }  [margin:5px_0_0] [background:transparent] font-mono text-[12px] leading-[1.45] whitespace-pre-wrap [word-break:break-word] overflow-auto`}
         >
           {capped}
         </pre>
       )}
       {step.phase === "error" && step.errorText && (
-        <div style={{ marginTop: 4, paddingLeft: 18, color: "var(--accent-error)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+        <div className="[margin-top:4px] [padding-left:18px] text-red-600 dark:text-red-500 font-mono text-[12px]">
           {step.errorText}
         </div>
       )}
     </div>
   )
 }
-
 function FileWriteStep({ step }: { step: FileWritePresentation }): ReactNode {
   const path = step.path
   const displayPath = step.displayPath ?? step.path ?? "..."
   const lineCount = step.lineCount
   return (
-    <div style={{ maxWidth: "min(860px, 100%)", fontFamily: "var(--font-sans)", fontSize: 13 }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 6, color: step.failed ? "var(--accent-error)" : "var(--fg-primary)" }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--accent-info)" }}>{step.failed ? "✗" : "✎"}</span>
+    <div className="[max-width:min(860px,_100%)] font-sans text-[13px]">
+      <div
+        className={`${
+          step.failed
+            ? "text-red-600 dark:text-red-500"
+            : "text-slate-900 dark:text-slate-200"
+        }  flex items-baseline [gap:6px]`}
+      >
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-blue-700 dark:text-blue-500"
+          } `}
+        >
+          {step.failed ? "✗" : "✎"}
+        </span>
         <span>{step.isScratchpad ? "Write to scratchpad" : "Write"}</span>
-        {path ? <PathText path={path} displayPath={displayPath} /> : <span style={{ color: "var(--accent-primary)" }}>{displayPath}</span>}
-        {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+        {path ? (
+          <PathText path={path} displayPath={displayPath} />
         ) : (
-          <span style={{ color: "var(--accent-success)" }}>+{lineCount}</span>
+          <span className="text-blue-700 dark:text-blue-500">
+            {displayPath}
+          </span>
+        )}
+        {step.failed ? (
+          <span className="text-red-600 dark:text-red-500">· Error</span>
+        ) : (
+          <span className="text-green-700 dark:text-green-500">
+            +{lineCount}
+          </span>
         )}
       </div>
-      {!step.isScratchpad && step.diff?.hunks.map((hunk, index) => (
-        <DiffHunk
-          key={`filewrite-${index}`}
-          startLine={hunk.startLine}
-          contextBefore={hunk.contextBefore}
-          removedLines={hunk.removedLines}
-          addedLines={hunk.addedLines}
-          contextAfter={hunk.contextAfter}
-          streamingCursor={hunk.streamingCursor}
-        />
-      ))}
+      {!step.isScratchpad &&
+        step.diff?.hunks.map((hunk, index) => (
+          <DiffHunk
+            key={`filewrite-${index}`}
+            startLine={hunk.startLine}
+            contextBefore={hunk.contextBefore}
+            removedLines={hunk.removedLines}
+            addedLines={hunk.addedLines}
+            contextAfter={hunk.contextAfter}
+            streamingCursor={hunk.streamingCursor}
+          />
+        ))}
     </div>
   )
 }
-
 function FileEditStep({ step }: { step: FileEditPresentation }): ReactNode {
   const path = step.path
   const displayPath = step.displayPath ?? step.path ?? "..."
   const added = step.addedCount
   const removed = step.removedCount
   return (
-    <div style={{ maxWidth: "min(860px, 100%)", fontFamily: "var(--font-sans)", fontSize: 13 }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 6, color: step.failed ? "var(--accent-error)" : "var(--fg-primary)" }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--accent-info)" }}>{step.failed ? "✗" : "✎"}</span>
+    <div className="[max-width:min(860px,_100%)] font-sans text-[13px]">
+      <div
+        className={`${
+          step.failed
+            ? "text-red-600 dark:text-red-500"
+            : "text-slate-900 dark:text-slate-200"
+        }  flex items-baseline [gap:6px]`}
+      >
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-blue-700 dark:text-blue-500"
+          } `}
+        >
+          {step.failed ? "✗" : "✎"}
+        </span>
         <span>{step.isScratchpad ? "Edit file in scratchpad" : "Edit"}</span>
-        {path ? <PathText path={path} displayPath={displayPath} /> : <span style={{ color: "var(--accent-primary)" }}>{displayPath}</span>}
+        {path ? (
+          <PathText path={path} displayPath={displayPath} />
+        ) : (
+          <span className="text-blue-700 dark:text-blue-500">
+            {displayPath}
+          </span>
+        )}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
-        ) : (added > 0 || removed > 0) ? (
+          <span className="text-red-600 dark:text-red-500">· Error</span>
+        ) : added > 0 || removed > 0 ? (
           <span>
-            <span style={{ color: "var(--accent-success)" }}>+{added}</span>
-            <span style={{ color: "var(--fg-tertiary)" }}>/</span>
-            <span style={{ color: "var(--accent-error)" }}>-{removed}</span>
+            <span className="text-green-700 dark:text-green-500">+{added}</span>
+            <span className="text-slate-500">/</span>
+            <span className="text-red-600 dark:text-red-500">-{removed}</span>
           </span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : null}
       </div>
-      {!step.isScratchpad && step.diff?.hunks.map((hunk, index) => (
-        <DiffHunk
-          key={`fileedit-${index}`}
-          startLine={hunk.startLine}
-          contextBefore={hunk.contextBefore}
-          removedLines={hunk.removedLines}
-          addedLines={hunk.addedLines}
-          contextAfter={hunk.contextAfter}
-          streamingCursor={hunk.streamingCursor}
-        />
-      ))}
+      {!step.isScratchpad &&
+        step.diff?.hunks.map((hunk, index) => (
+          <DiffHunk
+            key={`fileedit-${index}`}
+            startLine={hunk.startLine}
+            contextBefore={hunk.contextBefore}
+            removedLines={hunk.removedLines}
+            addedLines={hunk.addedLines}
+            contextAfter={hunk.contextAfter}
+            streamingCursor={hunk.streamingCursor}
+          />
+        ))}
     </div>
   )
 }
-
 function FileReadStep({ step }: { step: FileReadPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   const path = step.path
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>Read</span>
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          Read
+        </span>
         {path && <PathText path={path} />}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : step.lineCount != null ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>{step.lineCount} lines</span>
+          <span className="text-slate-500">{step.lineCount} lines</span>
         ) : null}
       </div>
     </div>
   )
 }
-
 function FileViewStep({ step }: { step: FileViewPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   const path = step.path
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>View</span>
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          View
+        </span>
         {path && <PathText path={path} />}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : null}
       </div>
     </div>
   )
 }
-
 function FileSearchStep({ step }: { step: FileSearchPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>Search</span>
-        {step.pattern && <span style={{ color: "var(--fg-tertiary)" }}>{step.pattern}</span>}
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          Search
+        </span>
+        {step.pattern && <span className="text-slate-500">{step.pattern}</span>}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : (
-          <span style={{ color: "var(--fg-tertiary)" }}>{step.matchCount} matches in {step.fileCount} files</span>
+          <span className="text-slate-500">
+            {step.matchCount} matches in {step.fileCount} files
+          </span>
         )}
       </div>
     </div>
   )
 }
-
 function FileTreeStep({ step }: { step: FileTreePresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>List files</span>
-        {step.path && <span style={{ color: "var(--fg-tertiary)" }}>{step.path}</span>}
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          List files
+        </span>
+        {step.path && <span className="text-slate-500">{step.path}</span>}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : (
-          <span style={{ color: "var(--fg-tertiary)" }}>{step.fileCount} files, {step.dirCount} dirs</span>
+          <span className="text-slate-500">
+            {step.fileCount} files, {step.dirCount} dirs
+          </span>
         )}
       </div>
     </div>
   )
 }
-
 function WebSearchStep({ step }: { step: WebSearchPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>Web search</span>
-        {step.query && <span style={{ color: "var(--fg-tertiary)" }}>{step.query}</span>}
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          Web search
+        </span>
+        {step.query && <span className="text-slate-500">{step.query}</span>}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : (
-          <span style={{ color: "var(--fg-tertiary)" }}>{step.sourceCount} sources</span>
+          <span className="text-slate-500">{step.sourceCount} sources</span>
         )}
       </div>
     </div>
   )
 }
-
 function WebFetchStep({ step }: { step: WebFetchPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>Fetch</span>
-        {step.url && <span style={{ color: "var(--fg-tertiary)" }}>{step.url}</span>}
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          Fetch
+        </span>
+        {step.url && <span className="text-slate-500">{step.url}</span>}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : null}
       </div>
     </div>
   )
 }
-
 function SkillStep({ step }: { step: SkillPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>Skill</span>
-        {step.skillName && <span style={{ color: "var(--fg-tertiary)" }}>{step.skillName}</span>}
-        {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
-        ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
-        ) : null}
-        {step.errorText && <span style={{ color: "var(--accent-error)" }}>{step.errorText}</span>}
-      </div>
-    </div>
-  )
-}
-
-function CheckpointStep({ step }: { step: CheckpointPresentation }): ReactNode {
-  const Icon = TOOL_ICONS[step.icon]
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>
-          {step.isRollback ? "Roll back" : "Inspect changes"}
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          Skill
         </span>
+        {step.skillName && (
+          <span className="text-slate-500">{step.skillName}</span>
+        )}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
-        ) : (
-          <span style={{ color: "var(--fg-tertiary)" }}>+{step.additions} / -{step.deletions} · {step.fileCount} files</span>
+          <span className="text-slate-500">...</span>
+        ) : null}
+        {step.errorText && (
+          <span className="text-red-600 dark:text-red-500">
+            {step.errorText}
+          </span>
         )}
       </div>
     </div>
   )
 }
-
-function SpawnWorkerStep({ step }: { step: SpawnWorkerPresentation }): ReactNode {
+function CheckpointStep({ step }: { step: CheckpointPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          {step.isRollback ? "Roll back" : "Inspect changes"}
+        </span>
+        {step.failed ? (
+          <span className="text-red-600 dark:text-red-500">· Error</span>
+        ) : step.running ? (
+          <span className="text-slate-500">...</span>
+        ) : (
+          <span className="text-slate-500">
+            +{step.additions} / -{step.deletions} · {step.fileCount} files
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+function SpawnWorkerStep({
+  step,
+}: {
+  step: SpawnWorkerPresentation
+}): ReactNode {
+  const Icon = TOOL_ICONS[step.icon]
+  return (
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
           {step.role ?? "Worker"}
           {step.title ? `: ${step.title}` : ""}
         </span>
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : null}
       </div>
     </div>
   )
 }
-
 function QueryImageStep({ step }: { step: QueryImagePresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   const path = step.path
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>Inspect image</span>
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          Inspect image
+        </span>
         {path && <PathText path={path} />}
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : (
-          <span style={{ color: "var(--fg-tertiary)" }}>· Done</span>
+          <span className="text-slate-500">· Done</span>
         )}
       </div>
     </div>
   )
 }
-
 function GenericStep({ step }: { step: GenericToolPresentation }): ReactNode {
   const Icon = TOOL_ICONS[step.icon]
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", gap: 7, alignItems: "center", fontFamily: "var(--font-sans)", fontSize: 13, lineHeight: "18px", maxWidth: "min(860px, 100%)" }}>
-      <Icon size={14} style={{ color: toneColor(step.tone), display: "block", justifySelf: "center" }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ color: step.failed ? "var(--accent-error)" : "var(--fg-primary)", flexShrink: 0 }}>{step.label}</span>
+    <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">
+      <Icon
+        size={14}
+        className={`${toneClass(step.tone)} block justify-self-center`}
+      />
+      <div className="flex items-center [gap:7px] min-w-0">
+        <span
+          className={`${
+            step.failed
+              ? "text-red-600 dark:text-red-500"
+              : "text-slate-900 dark:text-slate-200"
+          }  shrink-0`}
+        >
+          {step.label}
+        </span>
         {step.failed ? (
-          <span style={{ color: "var(--accent-error)" }}>· Error</span>
+          <span className="text-red-600 dark:text-red-500">· Error</span>
         ) : step.running ? (
-          <span style={{ color: "var(--fg-tertiary)" }}>...</span>
+          <span className="text-slate-500">...</span>
         ) : null}
-        {step.errorText && <span style={{ color: "var(--accent-error)" }}>{step.errorText}</span>}
+        {step.errorText && (
+          <span className="text-red-600 dark:text-red-500">
+            {step.errorText}
+          </span>
+        )}
       </div>
     </div>
   )
 }
-
-function ToolStepView({ entry, mode }: {
-  entry: Extract<DisplayTimelineEntry, { kind: "tool_step" }>
+function ToolStepView({
+  entry,
+  mode,
+}: {
+  entry: Extract<
+    DisplayTimelineEntry,
+    {
+      kind: "tool_step"
+    }
+  >
   mode: "default" | "transcript"
 }): ReactNode {
   const step: ToolStepPresentation = entry.step
@@ -572,42 +748,49 @@ function ToolStepView({ entry, mode }: {
       return <GenericStep step={step as GenericToolPresentation} />
   }
 }
-
 function isToolEntry(entry: DisplayTimelineEntry): boolean {
   return entry.kind === "tool_summary" || entry.kind === "tool_step"
 }
-
 function getEntrySpacing(
   timeline: DisplayTimeline,
   prev: DisplayTimelineEntry | null,
-  curr: DisplayTimelineEntry,
+  curr: DisplayTimelineEntry
 ): number {
   if (!prev) return 0
   if (isToolEntry(prev) && isToolEntry(curr)) return 8
   if (isToolEntry(prev) || isToolEntry(curr)) return 12
   if (prev.kind !== "message" || curr.kind !== "message") return 12
-
   const prevMessage = messageForEntry(timeline, prev)
   const currMessage = messageForEntry(timeline, curr)
-  if (prevMessage?.type === "assistant_message" && currMessage?.type === "work_summary") {
+  if (
+    prevMessage?.type === "assistant_message" &&
+    currMessage?.type === "work_summary"
+  ) {
     return 6
   }
-  const prevSystem = prevMessage?.type === "status_indicator" || prevMessage?.type === "interrupted"
-  const currSystem = currMessage?.type === "status_indicator" || currMessage?.type === "interrupted"
+  const prevSystem =
+    prevMessage?.type === "status_indicator" ||
+    prevMessage?.type === "interrupted"
+  const currSystem =
+    currMessage?.type === "status_indicator" ||
+    currMessage?.type === "interrupted"
   if (prevSystem && currSystem) return 4
   return 16
 }
-
 function needsGutter(
   timeline: DisplayTimeline,
-  entry: DisplayTimelineEntry,
+  entry: DisplayTimelineEntry
 ): boolean {
   if (isToolEntry(entry)) return true
   if (entry.kind !== "message") return true
   const message = messageForEntry(timeline, entry)
-  return message?.type !== "user_message" && message?.type !== "queued_user_message" && message?.type !== "user_bash_command" && message?.type !== "interrupted"
+  return (
+    message?.type !== "user_message" &&
+    message?.type !== "queued_user_message" &&
+    message?.type !== "user_bash_command" &&
+    message?.type !== "interrupted"
+  )
 }
-
 function TimelineEntryView({
   timeline,
   entry,
@@ -616,8 +799,8 @@ function TimelineEntryView({
   entry: DisplayTimelineEntry
 }): ReactNode {
   if (entry.kind === "tool_summary") return <ToolSummaryRow entry={entry} />
-  if (entry.kind === "tool_step") return <ToolStepView entry={entry} mode={timeline.presentation.mode} />
-
+  if (entry.kind === "tool_step")
+    return <ToolStepView entry={entry} mode={timeline.presentation.mode} />
   const message = messageForEntry(timeline, entry)
   if (!message) return null
   return (
@@ -629,14 +812,12 @@ function TimelineEntryView({
     />
   )
 }
-
 export interface ChatTimelineProps {
   forkId?: string | null
   loadingTitle?: string
   loadingSubtitle?: string | null
   isVisible?: boolean
 }
-
 export function ChatTimeline({
   forkId = null,
   loadingTitle,
@@ -648,9 +829,9 @@ export function ChatTimeline({
   const selectedSessionId = useSelectedSessionId()
   const displaySession = useDisplayState((state) => state.session)
   const entries = timeline?.presentation.entries ?? []
-  const isSessionLoading = selectedSessionId !== null && timelineStatus._tag === "pending"
+  const isSessionLoading =
+    selectedSessionId !== null && timelineStatus._tag === "pending"
   const isEmpty = selectedSessionId === null || timelineStatus._tag === "empty"
-
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
 
@@ -680,9 +861,13 @@ export function ChatTimeline({
         const el = scrollRef.current
         if (!el) return () => {}
         const onScroll = (): void => handler("scroll")
-        el.addEventListener("scroll", onScroll, { passive: true })
+        el.addEventListener("scroll", onScroll, {
+          passive: true,
+        })
         const content = contentRef.current
-        const observer = content ? new ResizeObserver(() => handler("resize")) : null
+        const observer = content
+          ? new ResizeObserver(() => handler("resize"))
+          : null
         if (content && observer) observer.observe(content)
         return () => {
           el.removeEventListener("scroll", onScroll)
@@ -692,13 +877,11 @@ export function ChatTimeline({
       stickyThreshold: 8,
       loadThreshold: 200,
     }),
-    [],
+    []
   )
-
   const core = useDisplayViewControllerCore()
   const reader = useDisplayReader()
   const isLoadingMore = useRootHistoryLoading()
-
   const scrollControllerRef = useRef<TimelineScrollController | null>(null)
 
   // Callback ref: the scroll container's mount/unmount is the lifetime of
@@ -710,7 +893,12 @@ export function ChatTimeline({
       scrollRef.current = el
       if (el) {
         if (scrollControllerRef.current === null) {
-          const controller = new TimelineScrollController({ adapter, core, reader, forkId })
+          const controller = new TimelineScrollController({
+            adapter,
+            core,
+            reader,
+            forkId,
+          })
           controller.init()
           scrollControllerRef.current = controller
         }
@@ -719,7 +907,7 @@ export function ChatTimeline({
         scrollControllerRef.current = null
       }
     },
-    [adapter, core, reader, forkId],
+    [adapter, core, reader, forkId]
   )
 
   // Suspend/resume the scroll controller when the timeline is hidden behind
@@ -737,66 +925,55 @@ export function ChatTimeline({
           yield* Effect.addFinalizer(() =>
             Effect.sync(() => {
               controller.resume()
-            }),
+            })
           )
-        }),
+        })
       ),
-    [isVisible],
+    [isVisible]
   )
   useAtomMount(suspendResumeAtom)
-
   const centerContent = isSessionLoading || (!isSessionLoading && isEmpty)
-  const contentStyle: CSSProperties | undefined = centerContent
-    ? { flex: 1, minHeight: 0, display: "flex" }
-    : undefined
-
   return (
     <div
       ref={attachScrollContainer}
-      className="chat-timeline"
-      style={{
-        flex: 1,
-        overflowY: "auto",
-        minHeight: 0,
-        // The controller owns anchoring; native scroll anchoring would
-        // double-write (and Safari doesn't implement it — this keeps
-        // behavior uniform).
-        overflowAnchor: "none",
-        padding: "12px 12px 24px 12px",
-        background: "var(--bg-base)",
-        position: "relative",
-        display: centerContent ? "flex" : undefined,
-        flexDirection: centerContent ? "column" : undefined,
-      }}
+      className={`chat-timeline flex-1 overflow-y-auto min-h-0 [overflow-anchor:none] [padding:12px_12px_24px_12px] bg-slate-50 dark:bg-slate-925 relative ${
+        centerContent ? "flex flex-col" : ""
+      }`}
     >
-      <div ref={contentRef} style={contentStyle}>
+      <div
+        ref={contentRef}
+        className={centerContent ? "flex min-h-0 flex-1" : undefined}
+      >
         {isSessionLoading ? (
           (() => {
             const title =
               loadingTitle ??
               (forkId === null
-                ? (displaySession.title?.trim() || undefined)
+                ? displaySession.title?.trim() || undefined
                 : undefined)
             const subtitle =
               loadingSubtitle !== undefined
                 ? loadingSubtitle
                 : forkId === null
-                  ? (displaySession.cwd?.trim() || null)
-                  : null
+                ? displaySession.cwd?.trim() || null
+                : null
             return (
-              <TimelineLoadingState
-                title={title ?? ""}
-                subtitle={subtitle}
-              />
+              <TimelineLoadingState title={title ?? ""} subtitle={subtitle} />
             )
           })()
         ) : isEmpty || !timeline ? (
-          forkId === null ? <ChatEmptyState /> : <div style={{ color: "var(--fg-tertiary)", fontSize: 13 }}>No activity yet.</div>
+          forkId === null ? (
+            <ChatEmptyState />
+          ) : (
+            <div className="text-slate-500 text-[13px]">No activity yet.</div>
+          )
         ) : (
           <>
             {isLoadingMore && forkId === null && (
-              <div style={{ display: "flex", justifyContent: "center", marginBottom: "8px" }}>
-                <span style={{ fontSize: 11, color: "var(--fg-tertiary)" }}>Loading earlier messages…</span>
+              <div className="flex justify-center [margin-bottom:8px]">
+                <span className="text-[11px] text-slate-500">
+                  Loading earlier messages…
+                </span>
               </div>
             )}
             {entries.map((entry, idx) => {
@@ -806,9 +983,12 @@ export function ChatTimeline({
                   key={entry.id}
                   style={{
                     marginTop: `${getEntrySpacing(timeline, prev, entry)}px`,
-                    paddingLeft: needsGutter(timeline, entry) ? "12px" : "0",
-                    animation: "fade-in 100ms ease-out",
                   }}
+                  className={`${
+                    needsGutter(timeline, entry)
+                      ? "[padding-left:12px]"
+                      : "[padding-left:0]"
+                  }  [animation:fade-in_100ms_ease-out]`}
                 >
                   <TimelineEntryView timeline={timeline} entry={entry} />
                 </div>

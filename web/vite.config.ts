@@ -1,13 +1,20 @@
 import { defineConfig } from "vite"
 import react from "@vitejs/plugin-react"
+import tailwindcss from "@tailwindcss/vite"
 import { resolve } from "node:path"
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   resolve: {
     alias: [
-      { find: "@magnitudedev/web", replacement: resolve(__dirname, "src/index.tsx") },
-      { find: /^@magnitudedev\/sdk$/, replacement: resolve(__dirname, "../packages/sdk/src/browser.ts") },
+      {
+        find: "@magnitudedev/web",
+        replacement: resolve(__dirname, "src/index.tsx"),
+      },
+      {
+        find: /^@magnitudedev\/sdk$/,
+        replacement: resolve(__dirname, "../packages/sdk/src/browser.ts"),
+      },
     ],
   },
   define: {

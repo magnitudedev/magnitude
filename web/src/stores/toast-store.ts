@@ -35,7 +35,7 @@ let snapshot: readonly ToastEntry[] = Object.freeze([])
 
 function rebuildSnapshot(): void {
   snapshot = Object.freeze(
-    toasts.map(({ timeout: _timeout, ...entry }) => entry),
+    toasts.map(({ timeout: _timeout, ...entry }) => entry)
   )
 }
 

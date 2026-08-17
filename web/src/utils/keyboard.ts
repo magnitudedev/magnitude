@@ -19,9 +19,10 @@ export interface GenericKeyEvent {
  * used by shared hooks from client-common.
  */
 export function toGenericKeyEvent(e: KeyboardEvent): GenericKeyEvent {
-  const name = e.key === "ArrowUp"
-    ? "up"
-    : e.key === "ArrowDown"
+  const name =
+    e.key === "ArrowUp"
+      ? "up"
+      : e.key === "ArrowDown"
       ? "down"
       : e.key.toLowerCase()
   return {

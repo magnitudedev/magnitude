@@ -1,5 +1,6 @@
 import { defineConfig } from "electron-vite"
 import react from "@vitejs/plugin-react"
+import tailwindcss from "@tailwindcss/vite"
 import { resolve } from "node:path"
 
 export default defineConfig({
@@ -35,9 +36,18 @@ export default defineConfig({
     },
     resolve: {
       alias: [
-        { find: "@magnitudedev/web", replacement: resolve(__dirname, "../web/src/index.tsx") },
-        { find: /^@magnitudedev\/sdk$/, replacement: resolve(__dirname, "../packages/sdk/src/browser.ts") },
-        { find: "@web-styles", replacement: resolve(__dirname, "../web/src/styles") },
+        {
+          find: "@magnitudedev/web",
+          replacement: resolve(__dirname, "../web/src/index.tsx"),
+        },
+        {
+          find: /^@magnitudedev\/sdk$/,
+          replacement: resolve(__dirname, "../packages/sdk/src/browser.ts"),
+        },
+        {
+          find: "@web-styles",
+          replacement: resolve(__dirname, "../web/src/styles"),
+        },
       ],
     },
     server: {
@@ -45,7 +55,7 @@ export default defineConfig({
         allow: [resolve(__dirname, "..")],
       },
     },
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
     define: {
       "process.platform": JSON.stringify("browser"),
       "process.arch": JSON.stringify("browser"),

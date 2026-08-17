@@ -18,7 +18,7 @@ describe("web local-model commands", () => {
 
       expect(routeSlashCommand(`/${tab}`, context)._tag).toBe("Handled")
       expect(openModelMenu).toHaveBeenCalledWith(tab)
-    },
+    }
   )
 
   test("does not register cloud or usage commands", () => {

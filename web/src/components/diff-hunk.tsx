@@ -2,15 +2,11 @@
  * DiffHunk — spec Appendix (Diff hunks)
  *
  * Renders a unified diff hunk with added/removed/context lines.
- * Container: border 1px var(--border-default), border-radius 4px, overflow hidden.
- * Added lines: background var(--diff-added-bg), color var(--diff-added-fg), prefix +.
- * Removed lines: background var(--diff-removed-bg), color var(--diff-removed-fg), prefix -.
- * Context lines: no background, var(--fg-secondary).
- * Line numbers: 48px column, var(--fg-tertiary) text-xs, right-aligned.
+ * Compact unified-diff rows with palette-backed added/removed tones and line
+ * numbers aligned in a fixed-width gutter.
  * Streaming cursor: ▍ on last added line when streaming.
  */
-import type { CSSProperties, ReactNode } from "react"
-
+import type { ReactNode } from "react"
 export interface DiffHunkProps {
   contextBefore?: readonly string[]
   removedLines: readonly string[]
@@ -21,7 +17,6 @@ export interface DiffHunkProps {
   /** Starting line number for the hunk (1-based) */
   startLine?: number
 }
-
 interface DiffRow {
   lineNum: number
   prefix: string
@@ -29,7 +24,6 @@ interface DiffRow {
   kind: "context" | "added" | "removed"
   isStreamingLast?: boolean
 }
-
 const STREAMING_CURSOR = "\u258D" // ▍
 
 export function DiffHunk({
@@ -47,20 +41,29 @@ export function DiffHunk({
   // contextAfter → line numbers continue after addedLines
   const contextRadius = contextBefore.length
   const lineStart = startLine - contextRadius
-
   const rows: DiffRow[] = []
   let lineNum = lineStart
 
   // Context before
   for (const line of contextBefore) {
-    rows.push({ lineNum, prefix: " ", text: line, kind: "context" })
+    rows.push({
+      lineNum,
+      prefix: " ",
+      text: line,
+      kind: "context",
+    })
     lineNum++
   }
 
   // Removed lines — line numbers continue
   const addedStartLine = lineNum
   for (const line of removedLines) {
-    rows.push({ lineNum, prefix: "-", text: line, kind: "removed" })
+    rows.push({
+      lineNum,
+      prefix: "-",
+      text: line,
+      kind: "removed",
+    })
     lineNum++
   }
 
@@ -81,86 +84,54 @@ export function DiffHunk({
 
   // Context after — line numbers continue after added lines
   for (const line of contextAfter) {
-    rows.push({ lineNum, prefix: " ", text: line, kind: "context" })
+    rows.push({
+      lineNum,
+      prefix: " ",
+      text: line,
+      kind: "context",
+    })
     lineNum++
   }
-
-  const containerStyle: CSSProperties = {
-    border: "1px solid var(--border-default)",
-    borderRadius: 4,
-    overflow: "hidden",
-    fontFamily: "var(--font-mono)",
-    fontSize: 13,
-    lineHeight: 1.5,
-    marginTop: 4,
-  }
-
   return (
-    <div style={containerStyle}>
+    <div className="mt-1 overflow-hidden rounded border border-slate-300 font-mono text-[13px] leading-[1.5] dark:border-slate-750">
       {rows.map((row, index) => (
         <DiffRowView key={`row-${index}`} row={row} />
       ))}
     </div>
   )
 }
-
 function DiffRowView({ row }: { row: DiffRow }): ReactNode {
-  const lineNumStyle: CSSProperties = {
-    width: 48,
-    flexShrink: 0,
-    textAlign: "right",
-    paddingRight: 8,
-    color: "var(--fg-tertiary)",
-    fontSize: 11,
-    userSelect: "none",
-    whiteSpace: "nowrap",
-  }
-
-  let rowStyle: CSSProperties = {
-    display: "flex",
-    alignItems: "flex-start",
-  }
-
-  let contentStyle: CSSProperties = {
-    flex: 1,
-    minWidth: 0,
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    paddingRight: 8,
-  }
-
-  let prefixStyle: CSSProperties = {
-    flexShrink: 0,
-    width: 16,
-    textAlign: "center",
-    userSelect: "none",
-  }
-
+  let rowClass = ""
+  let contentClass = ""
+  let prefixClass = ""
   switch (row.kind) {
     case "added":
-      rowStyle = { ...rowStyle, background: "var(--diff-added-bg)" }
-      contentStyle = { ...contentStyle, color: "var(--diff-added-fg)" }
-      prefixStyle = { ...prefixStyle, color: "var(--diff-added-fg)" }
+      rowClass = "bg-green-200/35 dark:bg-green-800/25"
+      contentClass = prefixClass = "text-green-700 dark:text-green-400"
       break
     case "removed":
-      rowStyle = { ...rowStyle, background: "var(--diff-removed-bg)" }
-      contentStyle = { ...contentStyle, color: "var(--diff-removed-fg)" }
-      prefixStyle = { ...prefixStyle, color: "var(--diff-removed-fg)" }
+      rowClass = "bg-red-200/35 dark:bg-red-800/25"
+      contentClass = prefixClass = "text-red-700 dark:text-red-400"
       break
     case "context":
-      contentStyle = { ...contentStyle, color: "var(--fg-secondary)" }
-      prefixStyle = { ...prefixStyle, color: "transparent" }
+      contentClass = "text-slate-600 dark:text-slate-400"
+      prefixClass = "text-transparent"
       break
   }
-
   return (
-    <div style={rowStyle}>
-      <span style={lineNumStyle}>{row.lineNum}</span>
-      <span style={prefixStyle}>{row.prefix}</span>
-      <span style={contentStyle}>
+    <div className={`${rowClass} flex items-start`}>
+      <span className="w-12 shrink-0 pr-2 text-right text-[11px] whitespace-nowrap text-slate-500 select-none">
+        {row.lineNum}
+      </span>
+      <span className={`${prefixClass} w-4 shrink-0 text-center select-none`}>
+        {row.prefix}
+      </span>
+      <span
+        className={`${contentClass} min-w-0 flex-1 pr-2 whitespace-pre-wrap break-words`}
+      >
         {row.text}
         {row.isStreamingLast && (
-          <span className="animate-blink" style={{ color: "var(--accent-primary)" }}>
+          <span className="animate-blink text-blue-700 dark:text-blue-500">
             {STREAMING_CURSOR}
           </span>
         )}

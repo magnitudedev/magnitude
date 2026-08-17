@@ -5,7 +5,9 @@ import type { WorkSummaryMessage } from "@magnitudedev/sdk"
 import { workSummaryLabel } from "./work-summary"
 import { MessageDispatch } from "./index"
 
-const summary = (overrides: Partial<WorkSummaryMessage> = {}): WorkSummaryMessage => ({
+const summary = (
+  overrides: Partial<WorkSummaryMessage> = {}
+): WorkSummaryMessage => ({
   id: "work_summary:chain-1",
   type: "work_summary",
   chainId: "chain-1",
@@ -22,23 +24,31 @@ describe("workSummaryLabel", () => {
   })
 
   it("shows the model, duration, and measured decode rate", () => {
-    expect(workSummaryLabel(summary({
-      durationMs: 65_000,
-      performance: Option.some({
-        modelDisplayName: "Qwen3 Coder",
-        decodeTokensPerSecond: Option.some(20.45),
-      }),
-    }))).toBe("Qwen3 Coder worked for 1:05 · 20.4 tok/s")
+    expect(
+      workSummaryLabel(
+        summary({
+          durationMs: 65_000,
+          performance: Option.some({
+            modelDisplayName: "Qwen3 Coder",
+            decodeTokensPerSecond: Option.some(20.45),
+          }),
+        })
+      )
+    ).toBe("Qwen3 Coder worked for 1:05 · 20.4 tok/s")
   })
 
   it("keeps model and duration when decode rate is unavailable", () => {
-    expect(workSummaryLabel(summary({
-      durationMs: 1_000,
-      performance: Option.some({
-        modelDisplayName: "DeepSeek V4 Flash",
-        decodeTokensPerSecond: Option.none(),
-      }),
-    }))).toBe("DeepSeek V4 Flash worked for 1 second")
+    expect(
+      workSummaryLabel(
+        summary({
+          durationMs: 1_000,
+          performance: Option.some({
+            modelDisplayName: "DeepSeek V4 Flash",
+            decodeTokensPerSecond: Option.none(),
+          }),
+        })
+      )
+    ).toBe("DeepSeek V4 Flash worked for 1 second")
   })
 
   it("is rendered by the web timeline message dispatcher", () => {

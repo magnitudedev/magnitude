@@ -22,7 +22,7 @@ const FOCUSABLE_SELECTOR = [
  */
 export function createFocusTrapHandler(
   containerRef: { current: HTMLElement | null },
-  onEscape?: () => void,
+  onEscape?: () => void
 ): (e: KeyboardEvent) => void {
   return (e: KeyboardEvent) => {
     if (e.key === "Escape") {
@@ -38,7 +38,7 @@ export function createFocusTrapHandler(
     if (!container) return
 
     const focusable = Array.from(
-      container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+      container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
     ).filter((el) => el.offsetParent !== null) // visible only
 
     if (focusable.length === 0) {
@@ -53,13 +53,21 @@ export function createFocusTrapHandler(
 
     if (e.shiftKey) {
       // Shift+Tab: if on first element (or container), wrap to last
-      if (active === first || active === container || !container.contains(active)) {
+      if (
+        active === first ||
+        active === container ||
+        !container.contains(active)
+      ) {
         e.preventDefault()
         last.focus()
       }
     } else {
       // Tab: if on last element (or container), wrap to first
-      if (active === last || active === container || !container.contains(active)) {
+      if (
+        active === last ||
+        active === container ||
+        !container.contains(active)
+      ) {
         e.preventDefault()
         first.focus()
       }

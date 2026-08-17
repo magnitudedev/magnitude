@@ -23,7 +23,14 @@ describe("DOM keyboard normalization", () => {
   })
 
   test("preserves modifier state", () => {
-    expect(key("Enter", { ctrlKey: true, metaKey: true, shiftKey: true, altKey: true })).toMatchObject({
+    expect(
+      key("Enter", {
+        ctrlKey: true,
+        metaKey: true,
+        shiftKey: true,
+        altKey: true,
+      })
+    ).toMatchObject({
       name: "enter",
       ctrl: true,
       meta: true,

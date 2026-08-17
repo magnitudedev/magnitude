@@ -40,7 +40,9 @@ export {
  */
 export const sidebarWidthAtom = Atom.keepAlive(Atom.make(260))
 export type SettingsTab = "models" | "catalog" | "hardware"
-export const settingsTabAtom = Atom.keepAlive(Atom.make<SettingsTab | null>(null))
+export const settingsTabAtom = Atom.keepAlive(
+  Atom.make<SettingsTab | null>(null)
+)
 
 /**
  * Whether the responsive sidebar overlay is open.
@@ -57,4 +59,6 @@ export const sidebarSearchAtom = Atom.keepAlive(Atom.make(""))
  * Optional CWD filter for the sessions sidebar.
  * null = show sessions from every agent-host CWD.
  */
-export const sidebarCwdFilterAtom = Atom.keepAlive(Atom.make<string | null>(null))
+export const sidebarCwdFilterAtom = Atom.keepAlive(
+  Atom.make<string | null>(null)
+)

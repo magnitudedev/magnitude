@@ -6,60 +6,14 @@
  * + a 120px shimmer bar. Right: a 60px shimmer bar.
  */
 import type { ReactNode } from "react"
-
-const SHIMMER_BG = "linear-gradient(90deg, var(--border-subtle) 25%, var(--bg-surface) 50%, var(--border-subtle) 75%)"
-
 export function WorkStatusBarSkeleton(): ReactNode {
   return (
-    <div
-      style={{
-        margin: 0,
-        border: "1px solid var(--border-default)",
-        borderRadius: 6,
-        background: "var(--bg-surface)",
-        minHeight: 34,
-        padding: "0 10px",
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        flexShrink: 0,
-        overflow: "hidden",
-      }}
-    >
+    <div className="[margin:0px] border border-slate-300 dark:border-slate-750 rounded-[6px] bg-white dark:bg-slate-875 [min-height:34px] [padding:0_10px] flex items-center [gap:8px] shrink-0 overflow-hidden">
       {/* Left: status dot + status text bar */}
-      <div
-        style={{
-          width: 9,
-          height: 9,
-          borderRadius: "50%",
-          background: "var(--border-subtle)",
-          flexShrink: 0,
-        }}
-      />
-      <div
-        className="animate-shimmer"
-        style={{
-          width: 120,
-          height: 12,
-          borderRadius: 3,
-          background: SHIMMER_BG,
-          backgroundSize: "200% 100%",
-          flexShrink: 0,
-        }}
-      />
+      <div className="[width:9px] [height:9px] rounded-full bg-slate-200 dark:bg-slate-800 shrink-0" />
+      <div className="h-3 w-[120px] shrink-0 animate-shimmer rounded-[3px] bg-linear-to-r from-slate-200 via-white to-slate-200 bg-[length:200%_100%] dark:from-slate-800 dark:via-slate-875 dark:to-slate-800" />
       {/* Right: task count bar */}
-      <div
-        className="animate-shimmer"
-        style={{
-          marginLeft: "auto",
-          width: 60,
-          height: 12,
-          borderRadius: 3,
-          background: SHIMMER_BG,
-          backgroundSize: "200% 100%",
-          flexShrink: 0,
-        }}
-      />
+      <div className="ml-auto h-3 w-[60px] shrink-0 animate-shimmer rounded-[3px] bg-linear-to-r from-slate-200 via-white to-slate-200 bg-[length:200%_100%] dark:from-slate-800 dark:via-slate-875 dark:to-slate-800" />
     </div>
   )
 }
