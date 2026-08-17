@@ -782,12 +782,12 @@ function ChatTitleBar({
 
     return (
       <div
-        className="relative h-11 shrink-0 bg-slate-50 dark:bg-slate-875 select-none [-webkit-app-region:drag]"
+        className="relative h-11 shrink-0 bg-slate-50 dark:bg-slate-900 select-none [-webkit-app-region:drag]"
         title={title}
       >
         {!sidebarCollapsed ? (
           <div
-            className="absolute inset-y-0 left-0 flex items-center justify-end gap-1 border-r border-slate-200 bg-slate-100 px-3 dark:border-slate-800 dark:bg-slate-875"
+            className="absolute inset-y-0 left-0 flex items-center justify-end gap-1 border-r border-slate-200 bg-slate-100 px-3 dark:border-slate-800 dark:bg-slate-850"
             style={{ width: sidebarWidth }}
           >
             {titlebarActions}
@@ -815,7 +815,7 @@ function ChatTitleBar({
   }
   return (
     <div
-      className="h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-875 select-none"
+      className="h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-900 select-none"
       title={title}
     >
       {onOpenSidebar && (
@@ -910,7 +910,7 @@ function AppInner({
       }
     )
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-875 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
         <AlertTriangleIcon />
         <h1>Couldn’t load local setup</h1>
         <p>{failureDescription}</p>
@@ -926,7 +926,7 @@ function AppInner({
   }
   if (onboardingState === null) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 p-8 text-center text-slate-900 dark:bg-slate-875 dark:text-slate-200">
+      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 p-8 text-center text-slate-900 dark:bg-slate-900 dark:text-slate-200">
         <MagnitudeMark className="mb-6 h-auto w-[82px]" />
         <h1 className="text-[30px] font-semibold leading-tight tracking-[-0.025em]">
           Opening Magnitude
@@ -974,7 +974,7 @@ function AuthenticatedAppContent({
   return (
     <div
       className={`${
-        isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-875"
+        isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-900"
       } app flex h-screen flex-col overflow-hidden`}
     >
       {isDesktop ? (
@@ -997,7 +997,7 @@ function AuthenticatedAppContent({
             onCloseOverlay={() => setSidebarVisible(false)}
           />
         )}
-        <div className="chat-column [flex:1] min-w-0 flex flex-col relative bg-slate-50 dark:bg-slate-875">
+        <div className="chat-column [flex:1] min-w-0 flex flex-col relative bg-slate-50 dark:bg-slate-900">
         {/* Main chat column — always mounted, always in the layout. When a
             panel or worker detail is open, it's covered by an absolute
             overlay. Keeping it in the layout (not display:none) preserves
@@ -1013,13 +1013,13 @@ function AuthenticatedAppContent({
           <BottomDockContainer slotProfiles={slotProfiles} />
         </div>
         {(panelOpen || workerDetailOpen) && (
-          <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-875 z-[1]">
+          <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-900 z-[1]">
             {panelOpen && (
               <>
                 {isNarrow && (
                   <button
                     type="button"
-                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-875"
+                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-900"
                     aria-label="Open settings navigation"
                     title="Open settings navigation"
                     onClick={() => setSidebarVisible(true)}

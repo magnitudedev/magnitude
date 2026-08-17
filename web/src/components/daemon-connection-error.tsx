@@ -98,7 +98,7 @@ export function DaemonConnectionError({
       aria-describedby={!reconnecting ? "daemon-error-details" : undefined}
       className="fixed inset-0 z-[100] flex items-center justify-center overflow-auto bg-black/70 p-6"
     >
-      <div className="[width:min(760px,_calc(100vw_-_48px))] [max-height:calc(100vh_-_48px)] bg-white dark:bg-slate-875 border border-red-600 dark:border-red-500 rounded-[6px] border-t-[3px] border-t-red-600 dark:border-t-red-500 [padding:0px] flex flex-col items-stretch text-left [box-shadow:0_16px_64px_rgba(0,0,0,0.6)] [animation:fade-in_200ms_ease-out] overflow-hidden">
+      <div className="[width:min(760px,_calc(100vw_-_48px))] [max-height:calc(100vh_-_48px)] bg-white dark:bg-slate-850 border border-red-600 dark:border-red-500 rounded-[6px] border-t-[3px] border-t-red-600 dark:border-t-red-500 [padding:0px] flex flex-col items-stretch text-left [box-shadow:0_16px_64px_rgba(0,0,0,0.6)] [animation:fade-in_200ms_ease-out] overflow-hidden">
         <div className="flex items-start justify-between [gap:16px] [padding:18px_20px_14px] border-b border-b-slate-200 dark:border-b-slate-800 shrink-0">
           <div className="flex items-start [gap:12px] min-w-0">
             <AlertTriangle

@@ -29,9 +29,9 @@ export const slate = {
   700: '#334155',
   750: '#293548',
   800: '#1e293b',
-  875: '#16191f',
+  850: '#172131',
   900: '#0f1826',
-  925: '#101217',
+  925: '#0b1421',
 } as const
 
 export const green = {
@@ -98,9 +98,9 @@ export const red = {
 
 export const appSurface = {
   /** App background */
-  bgBase: slate[925],
+  bgBase: slate[900],
   /** Panels, composer, sidebar item hover */
-  bgSurface: slate[875],
+  bgSurface: slate[850],
   /** Selected sidebar item, menu popover, modal */
   bgSurfaceElevated: slate[800],
   /** Textarea, form inputs */

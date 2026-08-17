@@ -66,7 +66,7 @@ export function AttachmentPill({
 }): ReactNode {
   if (attachment.type === "image") {
     return (
-      <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-875 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px] text-slate-600 dark:text-slate-400">
+      <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-850 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px] text-slate-600 dark:text-slate-400">
         <ImageIcon size={14} />
         {attachment.filename}
         <span className="text-slate-500">
@@ -81,7 +81,7 @@ export function AttachmentPill({
       ? `:${attachment.startLine}-${attachment.endLine}`
       : ""
   return (
-    <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-875 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px] text-slate-600 dark:text-slate-400">
+    <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-850 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px] text-slate-600 dark:text-slate-400">
       <Icon size={14} />
       {attachment.path}
       {rangeSuffix && <span className="text-slate-500">{rangeSuffix}</span>}

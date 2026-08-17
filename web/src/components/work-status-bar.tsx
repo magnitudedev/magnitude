@@ -271,7 +271,7 @@ export function WorkStatusBar({
     incompleteCount === 1 ? "1 task" : `${incompleteCount} tasks`
   const visibleRows = rows.slice(0, 10)
   return (
-    <div className="[margin:0px] border border-slate-300 dark:border-slate-750 rounded-[6px] bg-white dark:bg-slate-875 overflow-hidden font-sans shrink-0">
+    <div className="[margin:0px] border border-slate-300 dark:border-slate-750 rounded-[6px] bg-white dark:bg-slate-850 overflow-hidden font-sans shrink-0">
       {hasTasks ? (
         <button
           type="button"

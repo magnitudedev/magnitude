@@ -562,7 +562,7 @@ export function Composer({
               : "cursor-default"
           } ${
             isStreaming || canSend ? "opacity-[1]" : "opacity-[0.45]"
-          } group bg-white hover:bg-white dark:bg-slate-875 dark:hover:bg-slate-875 absolute [right:10px] [bottom:10px] [width:28px] [height:28px] rounded-[4px] border-0 flex items-center justify-center [transition:opacity_100ms]`}
+          } group bg-white hover:bg-white dark:bg-slate-850 dark:hover:bg-slate-850 absolute [right:10px] [bottom:10px] [width:28px] [height:28px] rounded-[4px] border-0 flex items-center justify-center [transition:opacity_100ms]`}
           data-can-send={canSend ? "true" : "false"}
           title={
             !canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"
@@ -767,7 +767,7 @@ function AttachmentPill({
       ? `:${attachment.startLine}-${attachment.endLine}`
       : ""
   return (
-    <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-875 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px]">
+    <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-850 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px]">
       <Icon size={14} className="text-slate-600 dark:text-slate-400" />
       <span className="text-slate-900 dark:text-slate-200">
         {attachment.path}

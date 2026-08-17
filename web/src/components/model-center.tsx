@@ -87,7 +87,7 @@ function QueryNotice({
 }): ReactNode {
   if (Result.isFailure(result)) {
     return (
-      <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
+      <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
         <AlertTriangle size={15} />
         Unable to load {label}.
       </div>
@@ -95,7 +95,7 @@ function QueryNotice({
   }
   if (Result.isWaiting(result) && Option.isNone(Result.value(result))) {
     return (
-      <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400">
+      <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400">
         <Loader2 className="animate-spin" size={15} />
         Loading {label}…
       </div>
@@ -319,7 +319,7 @@ function RuntimeSlot({
   }
   return (
     <article
-      className="relative grid min-h-[116px] grid-cols-[minmax(220px,1.1fr)_minmax(240px,.9fr)_auto] items-center gap-[22px] px-[18px] py-5 bg-white dark:bg-slate-875 border-b border-slate-300 dark:border-slate-750 first:rounded-t-[9px] last:rounded-b-[9px] max-[1050px]:grid-cols-[minmax(200px,1fr)_minmax(230px,1fr)] max-[620px]:grid-cols-1 max-[620px]:gap-3.5"
+      className="relative grid min-h-[116px] grid-cols-[minmax(220px,1.1fr)_minmax(240px,.9fr)_auto] items-center gap-[22px] px-[18px] py-5 bg-white dark:bg-slate-850 border-b border-slate-300 dark:border-slate-750 first:rounded-t-[9px] last:rounded-b-[9px] max-[1050px]:grid-cols-[minmax(200px,1fr)_minmax(230px,1fr)] max-[620px]:grid-cols-1 max-[620px]:gap-3.5"
       data-slot={slotId}
     >
       <div className="min-w-0 [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_h3]:text-base [&_h3]:leading-[1.3]">
@@ -455,7 +455,7 @@ function RuntimeSlot({
         )}
       </div>
       {failed && (
-        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger col-span-full">
+        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger col-span-full">
           <AlertTriangle size={14} />
           The model action failed. The configured slot was not changed.
         </div>
@@ -583,7 +583,7 @@ function InstalledLibrary({
         </span>
       </div>
       {models.length === 0 ? (
-        <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 p-[26px] text-center text-[13px] text-slate-500">
+        <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
           No models are installed yet. Open Catalog to choose one for this
           machine.
         </div>
@@ -764,7 +764,7 @@ function CatalogCandidate({
   return (
     <button
       type="button"
-      className="appearance-none block min-h-[66px] w-full border-b border-slate-200 bg-transparent px-3.5 py-3 text-left text-slate-600 cursor-pointer hover:bg-white data-[selected=true]:bg-slate-100 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-875 dark:data-[selected=true]:bg-slate-800"
+      className="appearance-none block min-h-[66px] w-full border-b border-slate-200 bg-transparent px-3.5 py-3 text-left text-slate-600 cursor-pointer hover:bg-white data-[selected=true]:bg-slate-100 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-850 dark:data-[selected=true]:bg-slate-800"
       data-selected={selected}
       aria-pressed={selected}
       onClick={onSelect}
@@ -896,7 +896,7 @@ function CatalogInspector({
     </div>
   )
   return (
-    <article className="grid min-w-0 max-h-full grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-[10px] border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 max-[840px]:max-h-none max-[840px]:overflow-visible">
+    <article className="grid min-w-0 max-h-full grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-[10px] border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 max-[840px]:max-h-none max-[840px]:overflow-visible">
       <header className="flex items-start justify-between gap-6 border-b border-slate-300 dark:border-slate-750 px-[22px] py-5 max-[620px]:flex-col [&_h2]:mb-[5px] [&_h2]:text-xl [&_h2]:leading-tight [&_h2]:tracking-[-.02em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_h2]:[overflow-wrap:anywhere] [&_p]:text-[11.5px] [&_p]:leading-[1.45] [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
         <div className="min-w-0">
           <h2>{formatLocalModelDisplayName(model)}</h2>
@@ -1010,13 +1010,13 @@ function CatalogView(): ReactNode {
     <div className="box-border mx-auto flex w-full max-w-[1240px] flex-col gap-[34px] px-[clamp(18px,4vw,48px)] pt-[34px] pb-[72px] max-[640px]:pt-16 max-[620px]:px-3.5 !max-w-[1360px]">
       <QueryNotice result={catalogResult} label="local catalog" />
       {modelActions.latestInstallationFailed && (
-        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
+        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
           <AlertTriangle size={14} />
           The latest model installation or update request failed.
         </div>
       )}
       {discovery?._tag === "Loading" && (
-        <section className="flex items-center gap-3.5 rounded-lg border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 px-[18px] py-4 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+        <section className="flex items-center gap-3.5 rounded-lg border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 px-[18px] py-4 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
           <Loader2 className="animate-spin" size={20} />
           <div>
             <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
@@ -1028,7 +1028,7 @@ function CatalogView(): ReactNode {
         </section>
       )}
       {discovery?._tag === "Failed" && (
-        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
+        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
           <AlertTriangle size={15} /> {discovery.failure.message}
         </div>
       )}
@@ -1042,7 +1042,7 @@ function CatalogView(): ReactNode {
         </span>
       </div>
       {candidates.length === 0 && discovery?._tag === "Ready" ? (
-        <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 p-[26px] text-center text-[13px] text-slate-500">
+        <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
           No local catalog models are currently available.
         </div>
       ) : (
@@ -1298,7 +1298,7 @@ function HardwareView(): ReactNode {
               </span>
             </div>
             {hardware.accelerators.length === 0 ? (
-              <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 p-[26px] text-center text-[13px] text-slate-500">
+              <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
                 CPU inference · no accelerator reported
               </div>
             ) : (

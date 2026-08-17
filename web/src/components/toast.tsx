@@ -38,7 +38,7 @@ function Toast({ toast }: { toast: ToastEntry }): ReactNode {
     <div
       className={`${
         toastBorderClass[toast.kind]
-      } flex max-w-80 animate-[toast-in_150ms_ease-out] items-center gap-2 rounded-r border-l-[3px] bg-white px-3 py-2 font-sans text-sm text-slate-900 shadow-xl dark:bg-slate-875 dark:text-slate-200`}
+      } flex max-w-80 animate-[toast-in_150ms_ease-out] items-center gap-2 rounded-r border-l-[3px] bg-white px-3 py-2 font-sans text-sm text-slate-900 shadow-xl dark:bg-slate-850 dark:text-slate-200`}
     >
       {toastIcon[toast.kind]}
       <span className="[flex:1]">{toast.message}</span>

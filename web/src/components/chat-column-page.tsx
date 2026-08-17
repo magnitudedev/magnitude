@@ -16,7 +16,7 @@ export function ChatColumnPage({
 }: ChatColumnPageProps): ReactNode {
   return (
     <>
-      <div className="mac:[-webkit-app-region:drag] h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-875 border-b border-slate-200 dark:border-slate-800 select-none">
+      <div className="mac:[-webkit-app-region:drag] h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 select-none">
         <button
           type="button"
           onClick={onBack}
