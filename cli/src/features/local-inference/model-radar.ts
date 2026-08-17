@@ -1,10 +1,8 @@
 import { Option } from "effect"
-import { localModelSpeculativeMethodLabel } from "@magnitudedev/client-common"
+import { formatDecimalGigabytes, localModelSpeculativeMethodLabel } from "@magnitudedev/client-common"
 import type { LocalModel } from "@magnitudedev/sdk"
 import type { PentagonRadarAxes } from "../../components/pentagon-radar"
 import { performanceRangeSpeedLabel } from "./view-model"
-
-const GIB = 1024 ** 3
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
 
@@ -13,11 +11,6 @@ export const normalizeLocalModelRadarSpeed = (tokensPerSecond: number): number =
   if (tokensPerSecond <= 100) return 0.5 + ((tokensPerSecond - 30) / 70) * 0.4
   if (tokensPerSecond >= 1_000) return 1
   return 0.9 + 0.1 * Math.log(tokensPerSecond / 100) / Math.log(10)
-}
-
-const compactMemorySize = (bytes: number): string => {
-  const gigabytes = bytes / GIB
-  return `${gigabytes.toFixed(gigabytes >= 10 ? 0 : 1)} GB`
 }
 
 type AssessedModel = Extract<LocalModel["servingState"], { readonly _tag: "Assessed" }>
@@ -125,7 +118,7 @@ export const localModelRadarAxes = (model: LocalModel): Option.Option<PentagonRa
     {
       value: Option.some(memoryEfficiency(assessment)),
       label: "MEMORY",
-      detail: `${memoryFootprintLabel(assessment)} (${compactMemorySize(assessment.memory.totalRequiredBytes)})`,
+      detail: `${memoryFootprintLabel(assessment)} (${formatDecimalGigabytes(assessment.memory.totalRequiredBytes)})`,
     },
     {
       value: Option.match(catalog, {

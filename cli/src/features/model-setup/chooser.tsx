@@ -8,6 +8,7 @@ import {
   clampTextToVisualLines,
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
+  formatDecimalGigabytes,
   localModelConfigurationId,
   type LocalModelOption,
   type LocalInferenceHardwareResult,
@@ -34,8 +35,6 @@ import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   describeLocalHardwareSummary,
-  formatBytes,
-  formatDownloadBytes,
   localInferenceProgressLines,
   selectedInferenceIndex,
   selectionContextLabel,
@@ -202,15 +201,6 @@ const DetailRow = ({
     {children}
   </box>
 )
-
-const minimumBytesLabel = (bytes: number): string => {
-  const gib = bytes / 1024 ** 3
-  const precision = gib >= 10 ? 10 : 100
-  return `${(Math.ceil(gib * precision) / precision).toFixed(gib >= 10 ? 1 : 2)} GiB`
-}
-
-const compactMemoryLabel = (bytes: number): string =>
-  `${Math.max(0.1, bytes / 1024 ** 3).toFixed(1)} GB`
 
 const OnboardingHardwareContext = ({
   hardware,
@@ -553,7 +543,7 @@ export function OnboardingModelChooser({
     onNone: () => null,
     onSome: ({ currentHeadroomState, systemUseState }) =>
       currentHeadroomState._tag === "Insufficient"
-        ? `! Low memory: Free ${compactMemoryLabel(currentHeadroomState.minimumAdditionalAvailableBytes)} to load`
+        ? `! Low memory: Free ${formatDecimalGigabytes(currentHeadroomState.minimumAdditionalAvailableBytes, { rounding: "up" })} to load`
         : systemUseState._tag === "High"
           ? "! Heavy memory use: Limited memory remains for other apps"
           : null,
@@ -882,17 +872,17 @@ function OnboardingModelLoadingDetails({
               </text>
               <box style={{ height: 1 }} />
               <text style={{ fg: theme.text.body, width }} wrapMode="word">
-                {`Free at least ${minimumBytesLabel(failed.minimumAdditionalAvailableBytes)} and try again.`}
+                {`Free at least ${formatDecimalGigabytes(failed.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`}
               </text>
               <text style={{ fg: theme.text.supporting, width }} wrapMode="word">
                 Close memory-intensive applications or choose a smaller model.
               </text>
               <box style={{ height: 1 }} />
               <text style={{ fg: theme.text.supporting, width }}>
-                {`Needed at attempt    ${formatBytes(failed.loadBoundaryBytes)}`}
+                {`Needed at attempt    ${formatDecimalGigabytes(failed.loadBoundaryBytes)}`}
               </text>
               <text style={{ fg: theme.text.supporting, width }}>
-                {`Available at attempt ${formatBytes(failed.allocationHeadroomBytes)}`}
+                {`Available at attempt ${formatDecimalGigabytes(failed.allocationHeadroomBytes)}`}
               </text>
               <box style={{ height: 1 }} />
             </box>

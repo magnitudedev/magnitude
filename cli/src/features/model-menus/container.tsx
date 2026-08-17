@@ -14,6 +14,7 @@ import {
   deriveHardwareMemoryView,
   deriveCurrentLocalModel,
   formatLocalModelDisplayName,
+  formatDecimalGigabytes,
   formatModelDisplayName,
   modelSlotResidentAllocation,
   getDisplayWidth,
@@ -64,7 +65,6 @@ import {
 import { SingleLineInput } from "../composer/single-line-input"
 import {
   describeLocalHardware,
-  formatBytes,
   modelDownloadFailureMessage,
   localModelMaximumContextLength,
   localModelBundleKey,
@@ -808,22 +808,22 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
         ? entry.model.servingState.assessment
         : undefined
       if (assessment?._tag === "DoesNotFit") {
-        return formatBytes(assessment.totalRequiredBytes)
+        return formatDecimalGigabytes(assessment.totalRequiredBytes)
       }
       return Option.match(memoryFor(entry), {
         onNone: () => "—",
-        onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+        onSome: ({ totalRequiredBytes }) => formatDecimalGigabytes(totalRequiredBytes),
       })
     }
     const assessment = entry.model.servingState._tag === "Assessed"
       ? entry.model.servingState.assessment
       : undefined
     if (assessment?._tag === "DoesNotFit") {
-      return formatBytes(assessment.totalRequiredBytes)
+      return formatDecimalGigabytes(assessment.totalRequiredBytes)
     }
     return Option.match(memoryFor(entry), {
       onNone: () => "—",
-      onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+      onSome: ({ totalRequiredBytes }) => formatDecimalGigabytes(totalRequiredBytes),
     })
   }
   const primarySlot = Option.match(slotsSnapshot, {
@@ -1284,7 +1284,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         || model.acquisitionState._tag === "Installed"
         ? theme.accent
         : theme.text.metadata
-  const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
+  const memoryText = memoryBytes === undefined ? "—" : formatDecimalGigabytes(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
   const speculativeMethod = localModelSpeculativeMethodLabel(model)
   const speculativeText = Option.getOrElse(speculativeMethod, () => "—")
@@ -1410,10 +1410,7 @@ export const catalogInspectorActionLabel = (
       const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "Failed"
         ? "Retry download"
         : "Download"
-      const totalBytes = model.acquisitionState._tag === "Installed"
-        ? model.downloadBytes
-        : model.acquisitionState.totalBytes
-      return `${verb} (${formatBytes(totalBytes)})`
+      return verb
     }
     case "cancel": return reconciliationState._tag === "Transferring"
       ? reconciliationState.operation === "Update" ? "Cancel update" : "Cancel download"

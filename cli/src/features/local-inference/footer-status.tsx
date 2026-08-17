@@ -1,5 +1,9 @@
 import { Option } from "effect"
-import { formatLocalModelDisplayName, modelSlotResidentAllocation } from "@magnitudedev/client-common"
+import {
+  formatDecimalGigabytes,
+  formatLocalModelDisplayName,
+  modelSlotResidentAllocation,
+} from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
 import type { LocalModelsState, ModelSlot, ModelSlotsState, ProviderId, SlotId } from "@magnitudedev/sdk"
 
@@ -9,9 +13,6 @@ export interface LocalInferenceFooterView {
   readonly residency: "loaded" | "loading" | "not_loaded" | null
   readonly memoryLabel: string | null
 }
-
-const compactGiB = (bytes: number): string =>
-  (bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, "")
 
 const residentMemoryLabel = (
   slot: ModelSlot,
@@ -27,7 +28,7 @@ const residentMemoryLabel = (
           + domain.auxiliaryBytes,
         0,
       )
-      return `${compactGiB(bytes)} GB mem`
+      return `${formatDecimalGigabytes(bytes)} mem`
     },
   })
 

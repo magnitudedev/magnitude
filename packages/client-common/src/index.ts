@@ -33,6 +33,7 @@ export * from './types/menu-action'
 // Utils
 export * from './utils/format-tokens'
 export * from './utils/format-elapsed'
+export * from './utils/format-bytes'
 export * from './utils/palette'
 export * from './utils/diff-utils'
 export * from './utils/color-conversion'

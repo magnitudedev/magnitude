@@ -52,7 +52,8 @@ attached to model-download activity rather than being inferred from its message.
 When the selected local model's authoritative current-headroom state is `Insufficient`, the area
 shows `! Low memory: close memory-intensive apps (need X.Y GB) to load model` at warning priority
 and in the warning theme color. `X.Y` is the server-published minimum additional availability,
-formatted to one decimal GB. When the composer footer stacks into two rows, the same notification
+formatted in decimal GB and rounded upward to one decimal place. When the composer footer stacks
+into two rows, the same notification
 uses the compact presentation `! Low memory: Free X.Y GB to load`. The warning remains visible while
 that condition remains true. It is not an ephemeral selection acknowledgement and has no dismissal
 timer. It clears only when the selected model changes or fresh local-model state no longer reports

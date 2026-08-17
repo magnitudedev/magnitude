@@ -180,7 +180,8 @@ Client-common owns shared client infrastructure:
 - reactive query, mutation, invalidation, and subscription behavior;
 - reusable hooks and identity-safe selectors;
 - shared interaction infrastructure; and
-- presentation-neutral utilities that are genuinely common across clients.
+- reusable presentation primitives that are genuinely common across clients and contain no
+  backend policy, such as decimal byte-unit formatting.
 
 Client-common imports application contracts through the SDK. It does not redefine ACN or ICN
 domain unions, calculate backend policy, or become a second application backend in the client
@@ -212,7 +213,7 @@ entry's meaning or silently join it to superseded evidence.
 Individual clients own presentation and interaction:
 
 - wording and explanatory copy;
-- byte, duration, and number formatting;
+- choosing and composing shared byte, duration, and number presentation primitives;
 - colors, layout, icons, and responsive behavior;
 - local ephemeral interaction state; and
 - submitting typed application operations.
