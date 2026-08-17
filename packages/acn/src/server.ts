@@ -91,6 +91,8 @@ import { OnboardingLive } from "./onboarding"
 import { CustomEndpointsLive } from "./custom-endpoints"
 import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { SessionStoreLive } from "./session-store"
+import { ProjectRegistryLive } from "./project-registry"
+import { ProjectsLive } from "./projects"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import {
@@ -325,10 +327,15 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
 
   const storageLayer = StorageLive.pipe(Layer.provide(storageBase))
 
+  const withProjectRegistry = Layer.provideMerge(
+    ProjectRegistryLive,
+    storageLayer,
+  )
+
   const storageServices = Layer.mergeAll(
     SessionStoreLive,
     SessionRuntimeOptionsStoreLive
-  ).pipe(Layer.provideMerge(storageLayer))
+  ).pipe(Layer.provideMerge(withProjectRegistry))
 
   const withActivity = Layer.provideMerge(
     AcnActivityTrackerLive,
@@ -444,9 +451,10 @@ const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
   const withClientLeases = Layer.provideMerge(ClientLeaseManagerLive, withDemand)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withClientLeases)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
+  const withProjects = Layer.provideMerge(ProjectsLive, withLifecycle)
   const withActiveSessionStatuses = Layer.provideMerge(
     ActiveSessionStatusesLive,
-    withLifecycle
+    withProjects
   )
   const withStreams = Layer.provideMerge(
     DisplayViewStreamsLive,

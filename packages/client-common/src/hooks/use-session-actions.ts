@@ -2,14 +2,17 @@ import { useCallback } from "react"
 import { useAtomSet } from "@effect-atom/atom-react"
 import {
   selectedCwdAtom,
+  selectedProjectIdAtom,
   pendingUserSubmitAtom,
 } from "../state/session-atoms"
+import type { ProjectId } from "@magnitudedev/sdk"
 import { clearSystemMessages } from "../stores/system-message-store"
 import { useDisplayViewControllerCore } from "../display-view-controller/hooks"
 import { useDisplaySpeculator } from "../sync/index"
 
 export interface StartNewSessionOptions {
   readonly cwd?: string | null
+  readonly projectId?: ProjectId | null
 }
 
 export interface SessionActions {
@@ -27,6 +30,7 @@ export function useSessionActions(): SessionActions {
   const controller = useDisplayViewControllerCore()
   const displaySpeculator = useDisplaySpeculator()
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
+  const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
 
   const resetSessionLocalState = useCallback(() => {
@@ -43,8 +47,11 @@ export function useSessionActions(): SessionActions {
     if (options && "cwd" in options) {
       setSelectedCwd(options.cwd ?? null)
     }
+    if (options && "projectId" in options) {
+      setSelectedProjectId(options.projectId ?? null)
+    }
     controller.clearSession()
-  }, [controller, resetSessionLocalState, setSelectedCwd])
+  }, [controller, resetSessionLocalState, setSelectedCwd, setSelectedProjectId])
 
   const resumeSession = useCallback((sessionId: string) => {
     resetSessionLocalState()

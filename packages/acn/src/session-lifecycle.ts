@@ -11,6 +11,7 @@ import {
   type SessionCwdSummary,
   type SessionMetadata as ProtocolSessionMetadata,
   type SessionOptions,
+  type ProjectId,
 } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import { SessionDrafts } from "./session-drafts"
@@ -27,23 +28,36 @@ export interface SessionLifecycleApi {
     initial?: CreateSessionInitial,
     options?: SessionOptions,
     draftOwnerId?: string | null,
+    projectId?: ProjectId,
   ) => Effect.Effect<CreateSessionResult, SessionError>
   readonly preloadSession: (
     cwd: string,
     options?: SessionOptions,
     draftOwnerId?: string | null,
+    projectId?: ProjectId,
   ) => Effect.Effect<{ readonly sessionId: string }, SessionError>
   readonly releaseSessionPreload: (
     cwd: string,
+    sessionId: string,
     options?: SessionOptions,
     draftOwnerId?: string | null,
+    projectId?: ProjectId,
   ) => Effect.Effect<void, SessionError>
   readonly listSessions: (
-    options?: { readonly cwd?: string; readonly query?: string; readonly cursor?: string; readonly limit?: number }
+    options?: {
+      readonly cwd?: string
+      readonly projectId?: ProjectId
+      readonly includeClosed?: boolean
+      readonly query?: string
+      readonly cursor?: string
+      readonly limit?: number
+    }
   ) => Effect.Effect<ListSessionsResult, SessionError>
   readonly listSessionCwds: () => Effect.Effect<ReadonlyArray<SessionCwdSummary>, SessionError>
   readonly getSessionInfo: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
   readonly deleteSession: (sessionId: string) => Effect.Effect<void, SessionError>
+  readonly closeSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
+  readonly reopenSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
   readonly getSessionExecutionContext: (sessionId: string) => Effect.Effect<SessionExecutionContext, SessionError>
   readonly getSessionCwd: (sessionId: string) => Effect.Effect<string, SessionError>
 }
@@ -53,14 +67,16 @@ export class SessionLifecycle extends Context.Tag("SessionLifecycle")<
   SessionLifecycleApi
 >() {}
 
-const toMetadata = (entry: ResidentSessionSnapshot, stored: ProtocolSessionMetadata | null): ProtocolSessionMetadata => ({
+const toMetadata = (entry: ResidentSessionSnapshot, stored: ProtocolSessionMetadata): ProtocolSessionMetadata => ({
   sessionId: entry.sessionId,
+  projectId: stored.projectId,
   title: entry.title,
   cwd: entry.cwd,
+  sidebarOpen: stored.sidebarOpen,
   createdAt: entry.createdAt,
-  updatedAt: stored?.updatedAt ?? entry.updatedAt,
-  messageCount: stored?.messageCount ?? 0,
-  lastMessage: stored?.lastMessage ?? null,
+  updatedAt: stored.updatedAt,
+  messageCount: stored.messageCount,
+  lastMessage: stored.lastMessage,
 })
 
 export const SessionLifecycleLive: Layer.Layer<
@@ -71,17 +87,24 @@ export const SessionLifecycleLive: Layer.Layer<
   Layer.effect(
     SessionLifecycle,
     Effect.gen(function* () {
-    const runtime = yield* AgentRuntime
+      const runtime = yield* AgentRuntime
       const commands = yield* SessionCommands
       const drafts = yield* SessionDrafts
-    const store = yield* SessionStore
+      const store = yield* SessionStore
 
-    const residentSnapshot = (sessionId: string) =>
-      runtime.residentSessions.pipe(
-        Effect.map((sessions) => sessions.find((session) => session.sessionId === sessionId)),
-      )
+      const residentSnapshot = (sessionId: string) =>
+        runtime.residentSessions.pipe(
+          Effect.map((sessions) => sessions.find((session) => session.sessionId === sessionId)),
+        )
       return {
-        createSession: Effect.fn("acn.session-lifecycle.create-session")(function* (cwd, sessionId, initial, options, draftOwnerId) {
+        createSession: Effect.fn("acn.session-lifecycle.create-session")(function* (
+          cwd,
+          sessionId,
+          initial,
+          options,
+          draftOwnerId,
+          projectId,
+        ) {
           if (initial?._tag === "message" && !initial.content.trim()) {
             return yield* new SessionStartFailed({
               sessionId: sessionId ?? "draft",
@@ -114,6 +137,7 @@ export const SessionLifecycleLive: Layer.Layer<
             return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
               const claim = yield* restore(drafts.claim({
                 cwd: cwd ? resolve(cwd) : process.cwd(),
+                projectId,
                 sessionId,
                 options,
                 ownerId: draftOwnerId ?? null,
@@ -146,6 +170,7 @@ export const SessionLifecycleLive: Layer.Layer<
           return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
             const claim = yield* restore(drafts.claim({
               cwd: cwd ? resolve(cwd) : process.cwd(),
+              projectId,
               sessionId,
               options,
               ownerId: draftOwnerId ?? null,
@@ -194,16 +219,19 @@ export const SessionLifecycleLive: Layer.Layer<
             return { _tag: "created" as const, metadata: promoteResult.value }
           }))
         }),
-        preloadSession: Effect.fn("acn.session-lifecycle.preload-session")(function* (cwd, options, draftOwnerId) {
+        preloadSession: Effect.fn("acn.session-lifecycle.preload-session")(function* (cwd, options, draftOwnerId, projectId) {
           return yield* drafts.preload({
             cwd,
+            projectId,
             options,
             ownerId: draftOwnerId ?? null,
           })
         }),
-        releaseSessionPreload: Effect.fn("acn.session-lifecycle.release-session-preload")(function* (cwd, options, draftOwnerId) {
+        releaseSessionPreload: Effect.fn("acn.session-lifecycle.release-session-preload")(function* (cwd, sessionId, options, draftOwnerId, projectId) {
           return yield* drafts.release({
             cwd,
+            sessionId,
+            projectId,
             options,
             ownerId: draftOwnerId ?? null,
           })
@@ -227,6 +255,8 @@ export const SessionLifecycleLive: Layer.Layer<
           if (!live && !meta) return yield* new SessionNotFound({ sessionId })
           yield* runtime.deleteSession(sessionId, store.deleteSessionFiles(sessionId))
         }),
+        closeSession: (sessionId) => store.setSidebarOpen(sessionId, false),
+        reopenSession: (sessionId) => store.setSidebarOpen(sessionId, true),
         getSessionExecutionContext: Effect.fn("acn.session-lifecycle.get-session-execution-context")(function* (sessionId) {
           const live = yield* residentSnapshot(sessionId)
           if (live) {

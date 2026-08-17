@@ -18,8 +18,10 @@ import {
   EMPTY_ONBOARDING_STATE,
   ModelStateSchema,
   OnboardingStateSchema,
+  ProjectStateSchema,
   type ModelState,
   type OnboardingState,
+  type ProjectState,
 } from './types'
 import { makeStateDocument, type StateDocumentError, type StateHandle } from './state'
 
@@ -31,6 +33,7 @@ export interface MagnitudeStorageShape {
   readonly logs: LogStorageShape
   readonly models: StateHandle<ModelState, StateDocumentError>
   readonly onboarding: StateHandle<OnboardingState, StateDocumentError>
+  readonly projects: StateHandle<ProjectState, StateDocumentError>
 }
 
 export class MagnitudeStorage extends Context.Tag('MagnitudeStorage')<
@@ -55,6 +58,12 @@ export const StorageLive = Layer.effect(
       initial: () => EMPTY_ONBOARDING_STATE,
       equivalence: Schema.equivalence(OnboardingStateSchema),
     })
+    const projects = yield* makeStateDocument({
+      path: global.paths.projectsFile,
+      schema: ProjectStateSchema,
+      initial: () => ({ projects: [] }),
+      equivalence: Schema.equivalence(ProjectStateSchema),
+    })
     return MagnitudeStorage.of({
       sessions: yield* makeSessionStorage(),
       auth: yield* makeAuthStorage(),
@@ -63,6 +72,7 @@ export const StorageLive = Layer.effect(
       logs: yield* makeLogStorage(),
       models,
       onboarding,
+      projects,
     })
   })
 )

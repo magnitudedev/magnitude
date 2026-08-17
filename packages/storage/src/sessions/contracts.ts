@@ -2,7 +2,13 @@ import type { PlatformError } from '@effect/platform/Error'
 import { Context, Effect, Schema } from 'effect'
 
 import type { JsonError, JsonLinesError } from '../io/storage'
-import type { CwdIndex, MemoryExtractionJobRecord, StoredSessionMeta } from '../types'
+import type {
+  CwdIndex,
+  LegacyStoredSessionProjectRecord,
+  MemoryExtractionJobRecord,
+  ProjectId,
+  StoredSessionMeta,
+} from '../types'
 
 export interface StoredEventCursor {
   readonly index: number
@@ -60,6 +66,16 @@ export interface SessionStorageShape {
     sessionId: string,
     updater: (current: StoredSessionMeta | null) => StoredSessionMeta
   ) => Effect.Effect<StoredSessionMeta, PlatformError | JsonError>
+
+  readonly listProjectMigrationRecords: () => Effect.Effect<
+    LegacyStoredSessionProjectRecord[],
+    PlatformError | JsonError
+  >
+
+  readonly assignProjectId: (
+    sessionId: string,
+    projectId: ProjectId
+  ) => Effect.Effect<void, PlatformError | JsonError>
 
   readonly deleteSession: (
     sessionId: string

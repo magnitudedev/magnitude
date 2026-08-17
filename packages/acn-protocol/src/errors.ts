@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { ProjectIdSchema } from "./schemas/project"
 import { SlotIdSchema } from "./schemas/model-state"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
@@ -40,6 +41,46 @@ export const SessionError = Schema.Union(
   InvalidSessionPath
 )
 export type SessionError = Schema.Schema.Type<typeof SessionError>
+
+export class ProjectNotFound extends Schema.TaggedError<ProjectNotFound>()(
+  "ProjectNotFound",
+  { projectId: ProjectIdSchema },
+) {}
+
+export class InvalidProjectName extends Schema.TaggedError<InvalidProjectName>()(
+  "InvalidProjectName",
+  { name: Schema.String },
+) {}
+
+export class InvalidProjectSource extends Schema.TaggedError<InvalidProjectSource>()(
+  "InvalidProjectSource",
+  { path: Schema.String, reason: Schema.String },
+) {}
+
+export class ProjectSourceAlreadyRegistered extends Schema.TaggedError<ProjectSourceAlreadyRegistered>()(
+  "ProjectSourceAlreadyRegistered",
+  { projectId: ProjectIdSchema, path: Schema.String },
+) {}
+
+export class ProjectBusy extends Schema.TaggedError<ProjectBusy>()(
+  "ProjectBusy",
+  { projectId: ProjectIdSchema },
+) {}
+
+export class ProjectOperationFailed extends Schema.TaggedError<ProjectOperationFailed>()(
+  "ProjectOperationFailed",
+  { operation: Schema.String, reason: Schema.String },
+) {}
+
+export const ProjectError = Schema.Union(
+  ProjectNotFound,
+  InvalidProjectName,
+  InvalidProjectSource,
+  ProjectSourceAlreadyRegistered,
+  ProjectBusy,
+  ProjectOperationFailed,
+)
+export type ProjectError = Schema.Schema.Type<typeof ProjectError>
 
 export class LocalModelMutationFailed extends Schema.TaggedError<LocalModelMutationFailed>()(
   "LocalModelMutationFailed",

@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { RawImageAttachment, RawMentionOccurrence } from "./attachments"
+import { ProjectIdSchema } from "./project"
 export {
   RawClipboardImageAttachment,
   DisplayAttachment,
@@ -53,8 +54,10 @@ export type PreloadSessionResult = Schema.Schema.Type<typeof PreloadSessionResul
 
 export const SessionMetadata = Schema.Struct({
   sessionId: Schema.String,
+  projectId: ProjectIdSchema,
   title: Schema.Union(Schema.String, Schema.Null),
   cwd: Schema.String,
+  sidebarOpen: Schema.Boolean,
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
   messageCount: Schema.Number,

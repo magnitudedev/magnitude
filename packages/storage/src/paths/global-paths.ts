@@ -13,6 +13,7 @@ export interface GlobalStoragePaths {
   readonly stateRoot: string
   readonly modelsFile: string
   readonly onboardingFile: string
+  readonly projectsFile: string
 
   readonly sessionsRoot: string
   readonly indexRoot: string
@@ -85,6 +86,7 @@ export function makeGlobalStoragePaths(root: string): GlobalStoragePaths {
     stateRoot,
     modelsFile: join(stateRoot, 'models.json'),
     onboardingFile: join(stateRoot, 'onboarding.json'),
+    projectsFile: join(stateRoot, 'projects.json'),
 
     sessionsRoot,
     indexRoot,

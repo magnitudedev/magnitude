@@ -1,13 +1,16 @@
 import { Effect, Schema } from 'effect'
 
 import { Version } from '../services/version'
+import { ProjectIdSchema } from '@magnitudedev/acn-protocol'
 
 const RawStoredSessionMetaSchema = Schema.Struct({
   sessionId: Schema.String,
+  projectId: ProjectIdSchema,
   created: Schema.String,
   updated: Schema.String,
   chatName: Schema.String,
   workingDirectory: Schema.String,
+  sidebarOpen: Schema.optionalWith(Schema.Boolean, { default: () => true }),
   visibility: Schema.optionalWith(Schema.Union(Schema.Literal('draft'), Schema.Literal('visible')), { default: () => 'visible' }),
   initialVersion: Schema.optional(Schema.String),
   lastActiveVersion: Schema.optional(Schema.String),
@@ -19,10 +22,12 @@ const RawStoredSessionMetaSchema = Schema.Struct({
 
 const DecodedStoredSessionMetaSchema = Schema.Struct({
   sessionId: Schema.String,
+  projectId: ProjectIdSchema,
   created: Schema.String,
   updated: Schema.String,
   chatName: Schema.String,
   workingDirectory: Schema.String,
+  sidebarOpen: Schema.Boolean,
   visibility: Schema.Union(Schema.Literal('draft'), Schema.Literal('visible')),
   initialVersion: Schema.String,
   lastActiveVersion: Schema.String,
@@ -42,6 +47,7 @@ export function makeStoredSessionMetaSchema(version: string) {
     RawStoredSessionMetaSchema,
     DecodedStoredSessionMetaSchema,
     {
+      strict: true,
       decode: (raw) =>
         Effect.succeed({
           ...raw,
@@ -51,7 +57,7 @@ export function makeStoredSessionMetaSchema(version: string) {
           firstUserMessage: raw.firstUserMessage ?? null,
           lastMessage: raw.lastMessage ?? null,
         }),
-      encode: (meta) => Effect.succeed({ ...meta }),
+      encode: (_encoded, _options, _ast, meta) => Effect.succeed({ ...meta }),
     }
   )
 }
@@ -61,6 +67,7 @@ export const StoredSessionMetaSchema = Schema.transformOrFail(
   RawStoredSessionMetaSchema,
   DecodedStoredSessionMetaSchema,
   {
+    strict: true,
     decode: (raw) =>
       Effect.map(Version, (version) => ({
         ...raw,
@@ -70,10 +77,18 @@ export const StoredSessionMetaSchema = Schema.transformOrFail(
         firstUserMessage: raw.firstUserMessage ?? null,
         lastMessage: raw.lastMessage ?? null,
       })),
-    encode: (meta) => Effect.succeed({ ...meta }),
+    encode: (_encoded, _options, _ast, meta) => Effect.succeed({ ...meta }),
   }
 )
 export type StoredSessionMeta = Schema.Schema.Type<typeof StoredSessionMetaSchema>
+
+export const LegacyStoredSessionProjectRecordSchema = Schema.Struct({
+  sessionId: Schema.String,
+  workingDirectory: Schema.String,
+  projectId: Schema.optionalWith(ProjectIdSchema, { as: 'Option', exact: true }),
+})
+export type LegacyStoredSessionProjectRecord =
+  Schema.Schema.Type<typeof LegacyStoredSessionProjectRecordSchema>
 
 export const MemoryExtractionJobRecordSchema = Schema.Struct({
   jobId: Schema.String,

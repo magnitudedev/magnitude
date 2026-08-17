@@ -5,6 +5,7 @@ import {
   composerTextAtom,
   messageHistoryAtom,
   selectedCwdAtom,
+  selectedProjectIdAtom,
   sessionCreateOptionsAtom,
 } from "./session-atoms"
 
@@ -12,6 +13,7 @@ describe("registry-lifetime client state", () => {
   it("declares state that must survive consumer gaps as keep-alive", () => {
     expect([
       selectedCwdAtom,
+      selectedProjectIdAtom,
       messageHistoryAtom,
       composerTextAtom,
       composerAttachmentsAtom,

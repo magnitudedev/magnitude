@@ -21,7 +21,7 @@ import type {
   SessionWorkStatus,
 } from "@magnitudedev/agent"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
-import { SessionOperationFailed } from "@magnitudedev/acn-protocol"
+import { ProjectIdSchema, SessionOperationFailed } from "@magnitudedev/acn-protocol"
 import {
   AcnServiceLifecycle,
   type AcnServiceLifecycleApi,
@@ -101,6 +101,8 @@ const makeMeta = (sessionId: string, cwd = "/repo"): StoredSessionMeta => {
   const now = new Date().toISOString()
   return {
     sessionId,
+    projectId: ProjectIdSchema.make("project-a"),
+    sidebarOpen: true,
     created: now,
     updated: now,
     chatName: "Session",
@@ -117,7 +119,7 @@ const makeMeta = (sessionId: string, cwd = "/repo"): StoredSessionMeta => {
 
 const request = (sessionId: string): RuntimeStartRequest => ({
   sessionId,
-  cwd: "/repo",
+  projectId: ProjectIdSchema.make("project-a"),
   options: normalizeSessionRuntimeOptions(),
   visibility: "visible",
 })
@@ -132,6 +134,7 @@ const makeLayer = (input: {
   readonly retirementAdmissionTimeout?: Duration.DurationInput
   readonly retirementShutdownTimeout?: Duration.DurationInput
   readonly lifecycle?: AcnServiceLifecycleApi
+  readonly projectSource?: Effect.Effect<string>
 }) => {
   const dependencies = Layer.mergeAll(
     Layer.succeed(AgentFactory, input.factory),
@@ -149,11 +152,20 @@ const makeLayer = (input: {
           promoteDraft: () => Effect.die("unused"),
           listDraftSessionIds: () => Effect.die("unused"),
           listProtocolMetas: () => Effect.die("unused"),
+          listAllProtocolMetas: () => Effect.die("unused"),
           listSessionCwds: () => Effect.die("unused"),
           deleteSessionFiles: () => Effect.die("unused"),
           validateCwd: Effect.succeed,
           getScratchpadPath: (sessionId) => Effect.succeed(`/tmp/${sessionId}/scratchpad`),
-          getExecutionContext: () => Effect.die("unused"),
+          getExecutionContext: (sessionId) => Effect.succeed({
+            cwd: "/repo",
+            projectRoot: "/repo",
+            scratchpadPath: `/tmp/${sessionId}/scratchpad`,
+          }),
+          ensureProjectForCwd: () => Effect.die("unused"),
+          resolveProjectSource: () => input.projectSource ?? Effect.succeed("/repo"),
+          setSidebarOpen: () => Effect.die("unused"),
+          changes: Stream.never,
         } satisfies SessionStoreApi
       }),
     ),
@@ -185,6 +197,45 @@ const makeLayer = (input: {
 }
 
 describe("AgentRuntime", () => {
+  it("restarts initialization against the authoritative source when a project is rebound", async () => {
+    const program = Effect.gen(function* () {
+      const source = yield* Ref.make("/old")
+      const entered = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const calls = yield* Ref.make<string[]>([])
+      const layer = makeLayer({
+        projectSource: Ref.get(source),
+        factory: {
+          createSession: (input) => Ref.update(calls, (all) => [...all, input.cwd]).pipe(
+            Effect.zipRight(
+              input.cwd === "/old"
+                ? Deferred.succeed(entered, undefined).pipe(
+                    Effect.zipRight(Deferred.await(resume)),
+                  )
+                : Effect.void,
+            ),
+            Effect.as(idleSession),
+          ),
+        },
+      })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        const use = yield* runtime.withSessionRequest(
+          request("rebound"),
+          "use",
+          (entry) => Effect.succeed(entry.cwd),
+        ).pipe(Effect.fork)
+        yield* Deferred.await(entered)
+        yield* Ref.set(source, "/new")
+        yield* Deferred.succeed(resume, undefined)
+        expect(yield* Fiber.join(use)).toBe("/new")
+        expect(yield* Ref.get(calls)).toEqual(["/old", "/new"])
+        expect(yield* residentCount(runtime)).toBe(1)
+      }).pipe(Effect.provide(layer))
+    })
+    await Effect.runPromise(program)
+  })
+
   it("single-flights startup and publishes one generation", async () => {
     const program = Effect.gen(function* () {
       const calls = yield* Ref.make(0)

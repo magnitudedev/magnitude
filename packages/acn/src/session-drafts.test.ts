@@ -12,6 +12,9 @@ import {
   type SessionRuntimeOptionsStoreApi,
 } from "./session-runtime-options"
 import type { RuntimeEntry } from "./session-types"
+import { ProjectIdSchema } from "@magnitudedev/acn-protocol"
+
+const TEST_PROJECT_ID = ProjectIdSchema.make("project-a")
 
 const unusedSession = {
   on: { restoreQueuedMessages: Stream.never },
@@ -45,6 +48,8 @@ const makeMeta = (
   const now = new Date().toISOString()
   return {
     sessionId,
+    projectId: TEST_PROJECT_ID,
+    sidebarOpen: true,
     created: now,
     updated: now,
     chatName: "New Chat",
@@ -76,7 +81,7 @@ const makeSetup = Effect.gen(function* () {
     return {
       id: request.sessionId,
       title: "New Chat",
-      cwd: request.cwd,
+      cwd: String(request.projectId),
       createdAt: Date.now(),
       updatedAt: Date.now(),
       scratchpadPath: `/tmp/${request.sessionId}/scratchpad`,
@@ -104,7 +109,7 @@ const makeSetup = Effect.gen(function* () {
           yield* Ref.update(metas, (all) =>
             new Map(all).set(
               request.sessionId,
-              makeMeta(request.sessionId, request.cwd, request.visibility),
+              makeMeta(request.sessionId, String(request.projectId), request.visibility),
             ),
           )
         }
@@ -145,8 +150,10 @@ const makeSetup = Effect.gen(function* () {
           return meta
             ? {
                 sessionId,
+                projectId: meta.projectId,
                 title: meta.chatName,
                 cwd: meta.workingDirectory,
+                sidebarOpen: meta.sidebarOpen,
                 createdAt: Date.parse(meta.created),
                 updatedAt: Date.parse(meta.updated),
                 messageCount: meta.messageCount,
@@ -164,6 +171,7 @@ const makeSetup = Effect.gen(function* () {
       }),
     listDraftSessionIds: () => Effect.succeed([]),
     listProtocolMetas: () => Effect.die("unused"),
+    listAllProtocolMetas: () => Effect.die("unused"),
     listSessionCwds: () => Effect.die("unused"),
     deleteSessionFiles: (sessionId) =>
       Ref.update(destroyed, (all) => [...all, sessionId]).pipe(
@@ -178,6 +186,10 @@ const makeSetup = Effect.gen(function* () {
     validateCwd: Effect.succeed,
     getScratchpadPath: (sessionId) => Effect.succeed(`/tmp/${sessionId}/scratchpad`),
     getExecutionContext: () => Effect.die("unused"),
+    ensureProjectForCwd: (cwd) => Effect.succeed(ProjectIdSchema.make(cwd)),
+    resolveProjectSource: (projectId) => Effect.succeed(String(projectId)),
+    setSidebarOpen: () => Effect.die("unused"),
+    changes: Stream.never,
   }
 
   const optionStore: SessionRuntimeOptionsStoreApi = {
@@ -227,11 +239,69 @@ describe("SessionDrafts", () => {
       const id = yield* Effect.gen(function* () {
         const drafts = yield* SessionDrafts
         const preload = yield* drafts.preload({ cwd: "/repo", ownerId: "owner" })
-        yield* drafts.release({ cwd: "/repo", ownerId: "owner" })
+        yield* drafts.release({ cwd: "/repo", sessionId: preload.sessionId, ownerId: "owner" })
         return preload.sessionId
       }).pipe(Effect.provide(setup.layer))
       expect(yield* Ref.get(setup.refs.destroyed)).toEqual([id])
       expect((yield* Ref.get(setup.refs.metas)).has(id)).toBe(false)
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("uses stable project identity instead of a copied source path", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      const id = yield* Effect.gen(function* () {
+        const drafts = yield* SessionDrafts
+        const preload = yield* drafts.preload({
+          cwd: "/stale-before-edit",
+          projectId: TEST_PROJECT_ID,
+          ownerId: "owner",
+        })
+        yield* drafts.release({
+          cwd: "/different-stale-path",
+          projectId: TEST_PROJECT_ID,
+          sessionId: preload.sessionId,
+          ownerId: "owner",
+        })
+        return preload.sessionId
+      }).pipe(Effect.provide(setup.layer))
+
+      expect(yield* Ref.get(setup.refs.destroyed)).toEqual([id])
+      expect(yield* Ref.get(setup.refs.startRequests)).toEqual([
+        expect.objectContaining({ projectId: TEST_PROJECT_ID }),
+      ])
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("does not let a stale preload release destroy its replacement", async () => {
+    const program = Effect.gen(function* () {
+      const setup = yield* makeSetup
+      const result = yield* Effect.gen(function* () {
+        const drafts = yield* SessionDrafts
+        const first = yield* drafts.preload({
+          cwd: "/repo",
+          projectId: TEST_PROJECT_ID,
+          ownerId: "owner",
+        })
+        expect(yield* drafts.releaseProject(TEST_PROJECT_ID)).toBe(true)
+        const replacement = yield* drafts.preload({
+          cwd: "/repo",
+          projectId: TEST_PROJECT_ID,
+          ownerId: "owner",
+        })
+        yield* drafts.release({
+          cwd: "/repo",
+          projectId: TEST_PROJECT_ID,
+          sessionId: first.sessionId,
+          ownerId: "owner",
+        })
+        return { first, replacement }
+      }).pipe(Effect.provide(setup.layer))
+
+      expect(yield* Ref.get(setup.refs.destroyed)).toEqual([result.first.sessionId])
+      expect((yield* Ref.get(setup.refs.metas)).has(result.replacement.sessionId)).toBe(true)
     })
     await Effect.runPromise(program)
   })
@@ -245,7 +315,7 @@ describe("SessionDrafts", () => {
         const drafts = yield* SessionDrafts
         const claiming = yield* drafts.claim({ cwd: "/repo", ownerId: "owner" }).pipe(Effect.fork)
         yield* Deferred.await(setup.refs.startEntered)
-        yield* drafts.release({ cwd: "/repo", ownerId: "owner" })
+        yield* drafts.release({ cwd: "/repo", sessionId: "draft-0", ownerId: "owner" })
         yield* Deferred.succeed(releaseStart, undefined)
         const claim = yield* claiming
         yield* drafts.promote(claim)

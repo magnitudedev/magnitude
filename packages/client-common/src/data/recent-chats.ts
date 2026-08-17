@@ -8,11 +8,13 @@
 
 export interface RecentChat {
   id: string
+  projectId: import("@magnitudedev/sdk").ProjectId
   title: string
   lastMessage: string
   timestamp: number
   messageCount: number
   workingDirectory: string
+  sidebarOpen: boolean
 }
 
 export interface RecentChatsPage {
@@ -77,10 +79,12 @@ import type { SessionMetadata } from "@magnitudedev/sdk"
 export function sessionsToRecentChats(sessions: readonly SessionMetadata[]): RecentChat[] {
   return sessions.map((session) => ({
     id: session.sessionId,
+    projectId: session.projectId,
     title: session.title ?? "Untitled",
     lastMessage: session.lastMessage ?? "",
     timestamp: session.updatedAt,
     messageCount: session.messageCount,
     workingDirectory: session.cwd,
+    sidebarOpen: session.sidebarOpen,
   }))
 }

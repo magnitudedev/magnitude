@@ -16,10 +16,12 @@ import { GlobalStorage } from "../services";
 import { Version } from "../services/version";
 import {
   makeStoredSessionMetaSchema,
+  LegacyStoredSessionProjectRecordSchema,
   MemoryExtractionJobRecordSchema,
   type CwdIndex,
   type MemoryExtractionJobRecord,
   type SessionDiscoveryOptions,
+  type LegacyStoredSessionProjectRecord,
   type StoredSessionMeta,
 } from "../types/session";
 import type {
@@ -204,6 +206,58 @@ export function makeSessionStorage(): Effect.Effect<
             yield* upsertCwdIndex(next);
             return next;
           })
+        ),
+
+      listProjectMigrationRecords: () =>
+        Effect.gen(function* () {
+          const entries = yield* io.listDirectory(g.sessionsRoot);
+          const records: LegacyStoredSessionProjectRecord[] = [];
+          for (const entry of entries) {
+            if (!entry.isDirectory) continue;
+            const filePath = g.sessionMetaFile(entry.name);
+            const record = yield* Effect.gen(function* () {
+              const exists = yield* io.pathExists(filePath);
+              if (!exists) return null;
+              const raw = yield* io.readJsonFile<unknown>(filePath);
+              return yield* Schema.decodeUnknown(
+                LegacyStoredSessionProjectRecordSchema,
+              )(raw).pipe(
+                Effect.mapError(
+                  (error) =>
+                    new SchemaDecodeError({ path: filePath, message: String(error) }),
+                ),
+              );
+            }).pipe(
+              Effect.catchAll((error) =>
+                Effect.logWarning("Skipping unreadable session metadata during project migration").pipe(
+                  Effect.annotateLogs({ sessionId: entry.name, error: String(error) }),
+                  Effect.as(null),
+                ),
+              ),
+            );
+            if (record !== null) records.push(record);
+          }
+          return records;
+        }),
+
+      assignProjectId: (sessionId, projectId) =>
+        io.withPathLock(
+          g.sessionMetaFile(sessionId),
+          Effect.gen(function* () {
+            const filePath = g.sessionMetaFile(sessionId);
+            const raw = yield* io.readJsonFile<Record<string, unknown>>(filePath);
+            const next = yield* Schema.decodeUnknown(metaSchema)({
+              ...raw,
+              projectId,
+            }).pipe(
+              Effect.mapError(
+                (error) =>
+                  new SchemaDecodeError({ path: filePath, message: String(error) }),
+              ),
+            );
+            yield* io.writeJsonFile(filePath, next);
+            yield* upsertCwdIndex(next);
+          }),
         ),
 
       deleteSession: (sessionId) =>

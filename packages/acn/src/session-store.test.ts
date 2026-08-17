@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, test, beforeEach, afterEach } from "vitest"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Stream } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import {
   GlobalStorage,
@@ -15,6 +15,8 @@ import {
   type StoredSessionMeta,
 } from "@magnitudedev/storage"
 import { SessionStore, SessionStoreLive } from "./session-store"
+import { ProjectIdSchema, type ProjectRecord } from "@magnitudedev/acn-protocol"
+import { ProjectRegistry, type ProjectRegistryApi } from "./project-registry"
 
 const VERSION = "0.0.1"
 
@@ -34,7 +36,32 @@ function makeTestLayer(root: string) {
     })),
   )
   const storageLayer = StorageLive.pipe(Layer.provide(base))
-  return Layer.provideMerge(SessionStoreLive, storageLayer)
+  const record = (sourceDirectory: string): ProjectRecord => ({
+    projectId: ProjectIdSchema.make(sourceDirectory),
+    name: sourceDirectory.split("/").at(-1) || sourceDirectory,
+    sourceDirectory,
+    registrationState: "active",
+    createdAt: 1,
+    updatedAt: 1,
+  })
+  const projects: ProjectRegistryApi = {
+    list: () => Effect.succeed([
+      { ...record("/repo"), name: "Magnitude Workspace" },
+      record("/other"),
+    ]),
+    get: (projectId) => Effect.succeed(record(String(projectId))),
+    resolveSourceDirectory: (projectId) => Effect.succeed(String(projectId)),
+    create: () => Effect.die("unused"),
+    edit: () => Effect.die("unused"),
+    remove: () => Effect.die("unused"),
+    restore: () => Effect.die("unused"),
+    ensureForSourceDirectory: (sourceDirectory) => Effect.succeed(record(sourceDirectory)),
+    changes: Stream.never,
+  }
+  return Layer.provideMerge(
+    SessionStoreLive,
+    Layer.merge(storageLayer, Layer.succeed(ProjectRegistry, projects)),
+  )
 }
 
 const run = <A, E>(eff: Effect.Effect<A, E, SessionStore | MagnitudeStorage>, root: string) =>
@@ -47,6 +74,8 @@ const meta = (
   visibility: StoredSessionMeta["visibility"] = "visible",
 ): StoredSessionMeta => ({
   sessionId,
+  projectId: ProjectIdSchema.make(workingDirectory),
+  sidebarOpen: true,
   chatName: sessionId,
   workingDirectory,
   visibility,
@@ -116,6 +145,37 @@ describe("SessionStore", () => {
     })
   })
 
+  test("searches active project names and can include closed sessions", async () => {
+    await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage
+        yield* storage.sessions.writeMeta(
+          "mqa00000",
+          { ...meta("mqa00000", "2026-01-02T00:00:00.000Z", "/repo"), sidebarOpen: false },
+        )
+        yield* storage.sessions.writeMeta(
+          "mqa00001",
+          meta("mqa00001", "2026-01-03T00:00:00.000Z", "/other"),
+        )
+
+        const store = yield* SessionStore
+        const hidden = yield* store.listProtocolMetas({
+          query: "magnitude",
+          includeClosed: false,
+        })
+        const searchable = yield* store.listProtocolMetas({
+          query: "magnitude",
+          includeClosed: true,
+        })
+        return { hidden, searchable }
+      }),
+      tmpDir,
+    ).then(({ hidden, searchable }) => {
+      expect(hidden.items).toEqual([])
+      expect(searchable.items.map((session) => session.sessionId)).toEqual(["mqa00000"])
+    })
+  })
+
   test("skips an unreadable session without hiding valid sessions", async () => {
     const paths = makeGlobalStoragePaths(tmpDir)
     await mkdir(paths.sessionDir("mqa00001"), { recursive: true })
@@ -180,6 +240,32 @@ describe("SessionStore", () => {
       // Visibility filtering belongs in the session list, not in readProtocolMeta.
       expect(draftMeta?.sessionId).toBe("mqa00001")
       expect([...draftIds].sort()).toEqual(["mqa00001", "mqa00002"])
+    })
+  })
+
+  test("closes and reopens sidebar membership without deleting the session", async () => {
+    await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage
+        yield* storage.sessions.writeMeta(
+          "mqa00000",
+          meta("mqa00000", "2026-01-02T00:00:00.000Z"),
+        )
+        const store = yield* SessionStore
+        const closed = yield* store.setSidebarOpen("mqa00000", false)
+        const hidden = yield* store.listProtocolMetas({ includeClosed: false })
+        const complete = yield* store.listProtocolMetas({ includeClosed: true })
+        const reopened = yield* store.setSidebarOpen("mqa00000", true)
+        return { closed, hidden, complete, reopened }
+      }),
+      tmpDir,
+    ).then(({ closed, hidden, complete, reopened }) => {
+      expect(closed.sidebarOpen).toBe(false)
+      expect(closed.updatedAt).toBe(Date.parse("2026-01-02T00:00:00.000Z"))
+      expect(hidden.items).toEqual([])
+      expect(complete.items.map((session) => session.sessionId)).toEqual(["mqa00000"])
+      expect(reopened.sidebarOpen).toBe(true)
+      expect(reopened.updatedAt).toBe(Date.parse("2026-01-02T00:00:00.000Z"))
     })
   })
 })

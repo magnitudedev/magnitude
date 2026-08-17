@@ -10,11 +10,14 @@ import {
   SessionMetadata,
   SessionOptions,
 } from "../schemas/session"
+import { ProjectIdSchema } from "../schemas/project"
 import { makeAcnSubscriptionRpc } from "./subscription"
 import { SessionError } from "../errors"
 
 const ListSessionsPayloadFields = {
   cwd: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
+  includeClosed: Schema.optionalWith(Schema.Boolean, { default: () => true }),
   query: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   cursor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   limit: Schema.optionalWith(Schema.Number, { default: () => 50 })
@@ -41,6 +44,7 @@ export const StreamActiveSessionStatuses = makeAcnSubscriptionRpc("StreamActiveS
 export const CreateSession = Rpc.make("CreateSession", {
   payload: Schema.Struct({
     cwd: Schema.String,
+    projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
     sessionId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
     initial: Schema.optionalWith(CreateSessionInitial, { as: "Option", exact: true }),
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
@@ -53,6 +57,7 @@ export const CreateSession = Rpc.make("CreateSession", {
 export const PreloadSession = Rpc.make("PreloadSession", {
   payload: Schema.Struct({
     cwd: Schema.String,
+    projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
     draftOwnerId: Schema.optionalWith(Schema.String, { as: "Option", exact: true })
   }),
@@ -63,6 +68,8 @@ export const PreloadSession = Rpc.make("PreloadSession", {
 export const ReleaseSessionPreload = Rpc.make("ReleaseSessionPreload", {
   payload: Schema.Struct({
     cwd: Schema.String,
+    projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
+    sessionId: Schema.String,
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
     draftOwnerId: Schema.optionalWith(Schema.String, { as: "Option", exact: true })
   }),
@@ -80,4 +87,16 @@ export const DeleteSession = Rpc.make("DeleteSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: Schema.Struct({}),
   error: SessionError
+})
+
+export const CloseSession = Rpc.make("CloseSession", {
+  payload: Schema.Struct({ sessionId: Schema.String }),
+  success: SessionMetadata,
+  error: SessionError,
+})
+
+export const ReopenSession = Rpc.make("ReopenSession", {
+  payload: Schema.Struct({ sessionId: Schema.String }),
+  success: SessionMetadata,
+  error: SessionError,
 })

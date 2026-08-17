@@ -55,7 +55,7 @@ export function useMenuActions(): void {
             switch (action._tag) {
               case "new-session":
                 setSettingsTab(null)
-                startNewSession()
+                startNewSession({ cwd: null, projectId: null })
                 break
               case "toggle-sidebar-search":
                 setSearchQuery("")
@@ -145,7 +145,7 @@ export function useMenuActions(): void {
                   // Cmd/Ctrl+N → new session
                   e.preventDefault()
                   setSettingsTab(null)
-                  startNewSession()
+                  startNewSession({ cwd: null, projectId: null })
                   break
                 case "r":
                   // Cmd/Ctrl+R → focus sidebar search

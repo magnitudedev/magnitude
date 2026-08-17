@@ -58,6 +58,8 @@ describe("session storage", () => {
 
   const baseMeta = {
     sessionId,
+    projectId: "project-1",
+    sidebarOpen: true,
     chatName: "Chat",
     workingDirectory: "/repo",
     visibility: "visible",

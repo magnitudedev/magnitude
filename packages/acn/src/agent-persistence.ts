@@ -8,12 +8,14 @@ import {
 } from "@magnitudedev/agent"
 import type { EventCursor, Timestamped } from "@magnitudedev/event-core"
 import type { MagnitudeStorageShape, StoredSessionMeta } from "@magnitudedev/storage"
+import type { ProjectId } from "@magnitudedev/acn-protocol"
 import { defaultStoredMeta } from "./session-store"
 
 export class AcnChatPersistence implements ChatPersistenceService {
   constructor(
     private readonly storage: MagnitudeStorageShape,
     private readonly workingDirectory: string,
+    private readonly projectId: ProjectId,
     private readonly sessionId: string,
     private readonly version: string,
     private readonly initialVisibility: StoredSessionMeta["visibility"] = "visible",
@@ -32,7 +34,14 @@ export class AcnChatPersistence implements ChatPersistenceService {
   }
 
   private buildMetadata(now: string): StoredSessionMeta {
-    return defaultStoredMeta(this.sessionId, this.workingDirectory, this.version, now, this.initialVisibility)
+    return defaultStoredMeta(
+      this.sessionId,
+      this.workingDirectory,
+      this.projectId,
+      this.version,
+      now,
+      this.initialVisibility,
+    )
   }
 
   private updateSummaryFromEvents(metadata: StoredSessionMeta, events: readonly Timestamped<AppEvent>[]): StoredSessionMeta {

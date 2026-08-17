@@ -1,3 +1,5 @@
+/// <reference types="vite/client" />
+
 /**
  * Global type augmentation for the desktop preload bridge.
  *

@@ -2,6 +2,7 @@ import { RpcGroup } from "@effect/rpc"
 import { Context } from "effect"
 import * as Agent from "./agent"
 import * as Session from "./session"
+import * as Project from "./project"
 import * as Connection from "./connection"
 import * as Config from "./config"
 import * as Files from "./files"
@@ -32,6 +33,7 @@ const AcnSubscriptions = RpcGroup.make(
   Stream.StreamDisplayView,
   WatchMirroredStates,
   Session.StreamActiveSessionStatuses,
+  Project.StreamProjectChanges,
   Files.WatchFile,
 )
 
@@ -40,6 +42,13 @@ const ReplaySafeDemandRpcs = RpcGroup.make(
   Session.ListSessions,
   Session.ListSessionCwds,
   Session.GetSession,
+  Session.CloseSession,
+  Session.ReopenSession,
+  Project.ListProjects,
+  Project.CreateProject,
+  Project.EditProject,
+  Project.RemoveProject,
+  Project.RestoreProject,
   Config.UpdateProviderAuth,
   Config.GetProviderAuth,
   Config.ListProviderAuth,
@@ -71,6 +80,7 @@ const AtMostOnceDemandRpcs = RpcGroup.make(
   Session.PreloadSession,
   Session.CreateSession,
   Session.DeleteSession,
+  Project.RevealProjectSource,
   Agent.SendMessage,
   Agent.StartGoal,
   Agent.Interrupt,

@@ -1,6 +1,7 @@
 export { MagnitudeRpcs, acnRpcRecoveryPolicy } from "./group"
 export * from "./agent"
 export * from "./session"
+export * from "./project"
 export * from "./connection"
 export * from "./config"
 export * from "./files"

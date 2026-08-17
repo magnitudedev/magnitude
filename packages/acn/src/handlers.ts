@@ -48,6 +48,7 @@ import { LocalModelConfigurationCoordinator } from "./local-model-configuration-
 import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver";
 import { localCatalogProviderModelId } from "./local-provider-model-id";
 import { IcnModels } from "@magnitudedev/icn";
+import { Projects } from "./projects";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -61,6 +62,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const lifecycle = yield* AcnServiceLifecycle;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
+    const projects = yield* Projects;
     const providerCredentials = yield* ProviderCredentials;
     const providerModelCatalog = yield* ProviderModelCatalog;
     const modelSlots = yield* ModelSlotController;
@@ -231,29 +233,32 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       ReleaseClientLease: ({ clientId }) => clientLeases.release(clientId),
 
       // Session lifecycle
-      PreloadSession: ({ cwd, options, draftOwnerId }) =>
+      PreloadSession: ({ cwd, projectId, options, draftOwnerId }) =>
         observeRpcDefects(
           "PreloadSession",
           sessionLifecycle.preloadSession(
             cwd,
             Option.getOrUndefined(options),
-            Option.getOrNull(draftOwnerId)
+            Option.getOrNull(draftOwnerId),
+            Option.getOrUndefined(projectId)
           )
         ),
 
-      ReleaseSessionPreload: ({ cwd, options, draftOwnerId }) =>
+      ReleaseSessionPreload: ({ cwd, projectId, sessionId, options, draftOwnerId }) =>
         observeRpcDefects(
           "ReleaseSessionPreload",
           sessionLifecycle
             .releaseSessionPreload(
               cwd,
+              sessionId,
               Option.getOrUndefined(options),
-              Option.getOrNull(draftOwnerId)
+              Option.getOrNull(draftOwnerId),
+              Option.getOrUndefined(projectId)
             )
             .pipe(Effect.as({}))
         ),
 
-      CreateSession: ({ cwd, sessionId, initial, options, draftOwnerId }) =>
+      CreateSession: ({ cwd, projectId, sessionId, initial, options, draftOwnerId }) =>
         observeRpcDefects(
           "CreateSession",
           sessionLifecycle.createSession(
@@ -261,7 +266,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             Option.getOrUndefined(sessionId),
             Option.getOrUndefined(initial),
             Option.getOrUndefined(options),
-            Option.getOrNull(draftOwnerId)
+            Option.getOrNull(draftOwnerId),
+            Option.getOrUndefined(projectId)
           )
         ),
 
@@ -273,6 +279,11 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
               onNone: () => ({}),
               onSome: (cwd) => ({ cwd }),
             }),
+            ...Option.match(payload.projectId, {
+              onNone: () => ({}),
+              onSome: (projectId) => ({ projectId }),
+            }),
+            includeClosed: payload.includeClosed,
             ...Option.match(payload.query, {
               onNone: () => ({}),
               onSome: (query) => ({ query }),
@@ -304,6 +315,36 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           "DeleteSession",
           sessionLifecycle.deleteSession(sessionId).pipe(Effect.as({}))
         ),
+
+      CloseSession: ({ sessionId }) =>
+        observeRpcDefects("CloseSession", sessionLifecycle.closeSession(sessionId)),
+
+      ReopenSession: ({ sessionId }) =>
+        observeRpcDefects("ReopenSession", sessionLifecycle.reopenSession(sessionId)),
+
+      ListProjects: ({ includeRemoved }) =>
+        observeRpcDefects("ListProjects", projects.list(includeRemoved)),
+
+      CreateProject: (payload) =>
+        observeRpcDefects("CreateProject", projects.create(payload)),
+
+      EditProject: (payload) =>
+        observeRpcDefects("EditProject", projects.edit(payload)),
+
+      RemoveProject: ({ projectId }) =>
+        observeRpcDefects("RemoveProject", projects.remove(projectId)),
+
+      RestoreProject: ({ projectId }) =>
+        observeRpcDefects("RestoreProject", projects.restore(projectId)),
+
+      RevealProjectSource: ({ projectId }) =>
+        observeRpcDefects(
+          "RevealProjectSource",
+          projects.revealSource(projectId).pipe(Effect.as({})),
+        ),
+
+      StreamProjectChanges: () =>
+        observeRpcStreamDefects("StreamProjectChanges", projects.changes),
 
       // Agent control
       SendMessage: (payload) =>

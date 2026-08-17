@@ -18,17 +18,11 @@ import type {
   Dialogs,
 } from "@magnitudedev/client-common"
 
-// Experimental File System Access API — only available in Chromium browsers.
-// This is a client-host capability, not agent-host filesystem access.
-interface FileSystemDirectoryHandle {
-  readonly name: string
-}
 interface FileSystemFileHandle {
   readonly name: string
 }
 
 interface WindowWithFSAccess extends Window {
-  showDirectoryPicker?(): Promise<FileSystemDirectoryHandle>
   showOpenFilePicker?(opts: {
     multiple?: boolean
   }): Promise<FileSystemFileHandle[]>
@@ -106,14 +100,9 @@ const browserNotifications: Notification = {
 
 const browserDialogs: Dialogs = {
   async openDirectory(): Promise<string | null> {
-    const picker = (window as WindowWithFSAccess).showDirectoryPicker
-    if (!picker) return null
-    try {
-      const handle = await picker.call(window)
-      return handle.name
-    } catch {
-      return null
-    }
+    // Browsers cannot obtain an absolute agent-host path from a directory
+    // handle. Project forms accept an explicit agent-host path instead.
+    return null
   },
   async openFile(options?: { multiple?: boolean }): Promise<string[] | null> {
     const picker = (window as WindowWithFSAccess).showOpenFilePicker

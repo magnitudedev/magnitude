@@ -11,7 +11,7 @@
  */
 import { Atom } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import type { SessionOptions } from "@magnitudedev/sdk"
+import type { ProjectId, SessionOptions } from "@magnitudedev/sdk"
 import type { InputMentionSegment } from "../types/store"
 
 /**
@@ -19,6 +19,12 @@ import type { InputMentionSegment } from "../types/store"
  * null = no working directory selected yet.
  */
 export const selectedCwdAtom = Atom.keepAlive(Atom.make<string | null>(null))
+
+/**
+ * Stable identity of the Project selected for a new session.
+ * null is used by clients, such as the CLI, that select only a working directory.
+ */
+export const selectedProjectIdAtom = Atom.keepAlive(Atom.make<ProjectId | null>(null))
 
 /**
  * Settings panel open flag.
