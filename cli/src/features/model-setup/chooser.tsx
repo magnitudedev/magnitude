@@ -43,7 +43,10 @@ import {
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
 import { localModelRadarAxes } from "../local-inference/model-radar"
-import { formatModelClassification } from "../local-inference/model-classification"
+import {
+  formatModelClassification,
+  formatModelReleaseRecency,
+} from "../local-inference/model-classification"
 import { discoveredModelLocation } from "./discovered-model"
 import {
   OnboardingModelDownloadProgress,
@@ -563,6 +566,10 @@ export function OnboardingModelChooser({
       : discoveredLocation === null
         ? ""
         : `DISCOVERED MODEL · ${discoveredLocation}`
+  const modelReleaseRecency = detailModel?.catalogMembershipState._tag === "InCatalog"
+    && detailModel.servingState._tag === "Assessed"
+    ? formatModelReleaseRecency(detailModel.catalogMembershipState.catalogData.releaseDate)
+    : null
   const recommendationBodyRows = Math.max(
     1,
     RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
@@ -600,7 +607,13 @@ export function OnboardingModelChooser({
         overflow: "hidden",
       }}>
         <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
-          {truncateToDisplayWidth(modelSummary, detailWidth)}
+          {modelReleaseRecency !== null && (
+            <span fg={theme.text.detail}>{`${modelReleaseRecency} · `}</span>
+          )}
+          {truncateToDisplayWidth(
+            modelSummary,
+            Math.max(0, detailWidth - (modelReleaseRecency === null ? 0 : `${modelReleaseRecency} · `.length)),
+          )}
         </text>
       </box>
       <box style={{ height: 1, flexShrink: 0 }} />

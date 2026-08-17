@@ -76,6 +76,40 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
+  it("shows catalog release recency before compact model facts", async () => {
+    const catalog = makeCatalogModel()
+    if (catalog.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    const model = {
+      ...catalog,
+      servingState: {
+        ...catalog.servingState,
+        recommendations: [makeRecommendation()],
+      },
+    }
+    const state = makeView({ models: [model], ready: false })
+    const options = buildLocalInferenceSelections(state.models, state.slots)
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(state.hardware)}
+        options={options}
+        width={120}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toMatch(/\d+ days ago · Dense \(8B\) · Text only/)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
   it("describes the Enter action from the selected model state", () => {
     expect(onboardingSelectionEnterAction("recommendation")).toBe("download")
     expect(onboardingSelectionEnterAction("stored")).toBe("load")
