@@ -152,12 +152,12 @@ async function requestWithFetch(config: EndpointConfiguration, request: PlannedR
     tool_choice: request.tools.length > 0 ? "required" : undefined,
     parallel_tool_calls: true,
     max_tokens: request.maxOutputTokens,
-    temperature: 0,
-    top_p: 1,
-    seed: 42,
+    temperature: request.temperature ?? 0,
+    top_p: request.topP ?? 1,
+    seed: request.seed ?? 42,
     stream: true,
     stream_options: { include_usage: true },
-    chat_template_kwargs: { enable_thinking: false },
+    chat_template_kwargs: { enable_thinking: request.enableThinking ?? false },
   }
   const events: { atMs: number; payload: unknown }[] = []
   const toolCalls = new Map<number, MutableToolCall>()

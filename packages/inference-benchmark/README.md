@@ -11,56 +11,69 @@ bun benchmark corpus fetch
 bun benchmark corpus status
 ```
 
-List or prefetch an immutable model profile:
+Experiments are TypeScript modules that bind immutable model artifacts to engines. Inspect and
+prepare one before running it:
 
 ```sh
-bun benchmark models list
-bun benchmark models fetch qwen3.6-35b-a3b
+bun benchmark experiments list
+bun benchmark experiments show packages/inference-benchmark/experiments/qwen36-q8-mlx-lm-vs-llama-cpp.experiment.ts
+bun benchmark prepare packages/inference-benchmark/experiments/qwen36-q8-mlx-lm-vs-llama-cpp.experiment.ts
 ```
 
 Model downloads use the standard Hugging Face cache (`$HF_HOME/hub`, otherwise
-`~/.cache/huggingface/hub`) and are reused by Magnitude. The built-in profile pins the repository,
-commit, GGUF file, byte size, and SHA-256. `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` is used for gated
-repositories.
+`~/.cache/huggingface/hub`) and are reused by Magnitude. Reusable TypeScript model definitions pin
+the logical upstream model and every engine-loadable artifact. GGUF artifacts pin the repository,
+commit, filename, byte size, and SHA-256; multi-file MLX artifacts use a committed complete-file
+lock. `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` is used for gated repositories.
+
+Create a complete MLX lock when registering a new artifact:
+
+```sh
+bun benchmark models lock-mlx <repository> <revision> <bits> <group-size> <output.lock.json>
+bun benchmark models lock-mlx-unquantized <repository> <revision> <bfloat16|float16> <output.lock.json>
+```
 
 Inspect the deterministic workload without running inference:
 
 ```sh
-bun benchmark explain agent-core qwen3.6-35b-a3b \
-  --profile standard \
-  --context 32768
+bun benchmark plan packages/inference-benchmark/experiments/qwen36-q8-mlx-lm-vs-llama-cpp.experiment.ts
 ```
 
-Run one existing endpoint:
+Run the prepared experiment and inspect its immutable evidence:
 
 ```sh
-bun benchmark run agent-core qwen3.6-35b-a3b \
-  --endpoint http://127.0.0.1:8080 \
-  --context 32768 \
-  --profile smoke
+bun benchmark run packages/inference-benchmark/experiments/qwen36-q8-mlx-lm-vs-llama-cpp.experiment.ts
+bun benchmark runs list
+bun benchmark runs show <run-id>
+bun benchmark runs watch <run-id>
 ```
 
-Compare managed ICN and llama.cpp:
+Start the local dashboard over those same experiments and run files:
 
 ```sh
-bun benchmark compare agent-core qwen3.6-35b-a3b \
-  --icn-executable inference/target/benchmark-release/bin/magnitude-icn \
-  --llama-executable /path/to/llama-server \
-  --profile standard
+bun benchmark dashboard
 ```
 
-`compare` resolves the profile, downloads it once if necessary, verifies it, and identifies the
-same GGUF for ICN and llama.cpp by SHA-256. A direct immutable Hugging Face resolve URL can be used in
-place of a profile. `--model-path /models/model.gguf` remains an optional offline/development
-override; it is not part of the normal workflow.
+The dashboard is served at `http://127.0.0.1:5187`; its API is at
+`http://127.0.0.1:4897`. It has no separate configuration or database.
 
-Both managed targets use the same port sequentially, so only one model is loaded at once. The model
-stays loaded throughout that target's entire evaluation. Memory is sampled from the managed process
-tree; no server metrics or memory endpoint is used.
+Experiment variants support managed ICN, managed llama.cpp, the UV-frozen MLX-LM adapter, and
+conforming existing endpoints. MTP experiments additionally use a UV-frozen MLX-VLM adapter because
+released MLX-LM cannot load the Qwen or Gemma MTP architectures used here. Managed targets use the
+same port sequentially, so only one model is loaded at once. The model stays loaded throughout that
+target's entire evaluation. Memory is sampled from the managed process tree; no server metrics or
+memory endpoint is used.
 
-`--context` is logical context per sequence and `--sequences` is the serving capacity. Both values
-are part of the plan digest. The llama.cpp adapter multiplies them for its shared `--ctx-size`;
-ICN's reported allocation must match them before measurement starts.
+Speculative decoding is an explicit engine setting. Comparable variants must all declare the same
+mode: either `{ kind: "none" }` or MTP with an immutable drafter artifact and a shared candidate-token
+limit. MTP runs are rejected unless every request returns native drafted and accepted-token counters
+and the target demonstrates nonzero drafting. This prevents launch configuration from being mistaken
+for evidence that speculation actually ran.
+
+`requestPolicy.contextTokensPerSequence` is logical context per sequence and
+`requestPolicy.parallelSequences` is serving capacity. Both values are part of the plan digest. The
+llama.cpp adapter multiplies them for its shared `--ctx-size`; ICN's reported allocation must match
+them before measurement starts.
 
 Every target must return standard terminal usage, including cached prompt tokens, and the
 llama.cpp-compatible `timings` object. The benchmark rejects missing or inconsistent evidence; it
@@ -79,39 +92,56 @@ comparison if corresponding requests render different prompt-token counts.
 | Forked concurrency | Branch TTFT | Prefix reuse and uncached rate | Branch decode rate | Prefix and branch footprint | Throughput and fairness |
 | Concurrency pressure | TTFT by concurrency | Prefill degradation | Decode degradation | Footprint by concurrency | Saturation and tails |
 | Memory pressure | TTFT with resident histories | Prefill under memory load | Decode under memory load | Peak and retained scaling | OOM and failure onset |
+| Context scaling | TTFT by prompt size | Full-prompt rate by size | Decode by size | Peak by size | Long-context degradation |
 
-For a local GGUF, the trained context limit and chat-template digest are read directly from model
-metadata. `--context` is an optional upper bound. Existing endpoints still require the exact GGUF
-through the model profile or `--model-path`; it establishes artifact identity and must match the
-artifact served by the endpoint.
+For a focused long-context comparison, a `context-sweep` suite stacks canonical completed BFCL
+interactions until the shared serialized messages and tools are closest to each configured character
+target. Token targets use a declared approximation such as 3.5 characters per token; both engines
+receive exactly the same content, and reports use each engine's terminal prompt-token count as the
+actual context length. Context-scaling reports keep BFCL correctness separate from measurement:
+semantically invalid completions remain visibly invalid, but complete native timing evidence is
+still summarized. Protocol and transport failures are never measured.
 
-For reproducible custom target sets, use a JSON configuration:
+Experiments may set `requestPolicy.requestTimeoutMs` for trials expected to exceed the five-minute
+default, such as 200K-context prefills.
 
-```json
-{
-  "suite": "agent-core",
-  "profile": "standard",
-  "model": {
-    "id": "qwen3.6-35b-a3b",
-    "artifactPath": "/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
-    "contextLimit": 32768
+For a GGUF artifact, the trained context limit and chat-template digest are read directly from model
+metadata. The experiment's context policy is an upper bound. Existing endpoints still reference an
+exact artifact in the TypeScript experiment; that artifact establishes the claimed model identity.
+
+Reusable model definitions separate a logical model from its concrete artifacts. Experiments import
+those artifacts and bind each one to an engine:
+
+```ts
+export default defineExperiment({
+  id: "qwen36-q4-engine-comparison",
+  title: "Qwen3.6 35B-A3B 4-bit engine comparison",
+  suite: agentCore({ profile: "standard" }),
+  requestPolicy: {
+    contextTokensPerSequence: 32768,
+    parallelSequences: 4,
+    maxOutputTokens: 256,
+    temperature: 0,
+    topP: 1,
+    seed: 42,
+    enableThinking: false,
   },
-  "targets": [
+  variants: [
     {
-      "kind": "existing",
-      "id": "local-server",
-      "endpoint": "http://127.0.0.1:8080",
-      "servedModel": "qwen3.6-35b-a3b",
-      "parallelSequences": 4
-    }
+      id: "llama-cpp-q4",
+      artifact: qwen36.artifacts.llamaQ4,
+      engine: llamaCpp({ /* engine-only settings */ }),
+    },
+    {
+      id: "mlx-lm-q4",
+      artifact: qwen36.artifacts.mlx4,
+      engine: mlxLm({ /* engine-only settings */ }),
+    },
   ],
-  "output": "benchmark-results/result.json"
-}
-```
-
-```sh
-bun benchmark execute benchmark.json
+  execution: { blocks: 2, variantOrder: "balanced" },
+})
 ```
 
 The public library exports `prepareCorpus`, `compileTrialPlan`, `evaluate`, `compare`, target
-builders, analysis functions, and report renderers from `src/index.ts`.
+builders, analysis functions, report renderers, experiment builders, preparation, and run lifecycle
+operations from `src/index.ts`.

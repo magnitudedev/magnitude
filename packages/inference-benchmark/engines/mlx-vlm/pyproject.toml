@@ -1,0 +1,11 @@
+[project]
+name = "magnitude-mlx-vlm-mtp-engine"
+version = "0.1.0"
+description = "Frozen MLX-VLM MTP engine for Magnitude inference benchmarks"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mlx-vlm==0.6.13",
+]
+
+[dependency-groups]
+dev = []

@@ -82,8 +82,31 @@ describe("BFCL corpus and trial planning", () => {
     ]))
     expect(first.digest).toBe(second.digest)
     expect(first.trials.every((trial) => trial.criteria.length === 5)).toBe(true)
-    expect(first.servingPolicy).toEqual({ contextTokensPerSequence: 32_768, parallelSequences: 1 })
+    expect(first.servingPolicy).toEqual({
+      contextTokensPerSequence: 32_768,
+      parallelSequences: 1,
+      temperature: 0,
+      topP: 1,
+      seed: 42,
+      enableThinking: false,
+    })
     expect(compileTrialPlanSync(corpus, model, { profile: "smoke", parallelSequences: 4 }).digest)
       .not.toBe(first.digest)
+  })
+
+  it("selects deterministic BFCL histories near character-based context targets", async () => {
+    const corpus = await fixtureCorpus()
+    const model = { id: "test-model", contextLimit: 8_192 }
+    const options = {
+      contextSweep: { checkpoints: [500, 1_000], charactersPerToken: 1, samplesPerCheckpoint: 1 },
+    } as const
+    const first = compileTrialPlanSync(corpus, model, options)
+    const second = compileTrialPlanSync(corpus, model, options)
+    expect(first.profile).toBe("context-sweep")
+    expect(first.digest).toBe(second.digest)
+    expect(first.trials.map(({ pattern }) => pattern)).toEqual(["context-scaling", "context-scaling"])
+    expect(first.trials.map(({ contextTarget }) => contextTarget?.tokens)).toEqual([500, 1_000])
+    expect(first.trials.every(({ requests, state }) => requests.length === 1 && state === "cache-disjoint")).toBe(true)
+    expect(first.trials.every(({ contextTarget }) => (contextTarget?.plannedCharacters ?? 0) > 0)).toBe(true)
   })
 })
