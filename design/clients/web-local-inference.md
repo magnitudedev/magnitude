@@ -80,9 +80,11 @@ discarding the attempt.
 
 The chat footer follows the CLI's runtime-information structure without combining independent
 facts into the model label. It presents residency, model identity, reasoning effort, resident
-memory, context usage with percentage, and working directory in that order. Model identity routes
-to Models, resident memory routes to Hardware, and reasoning choices expand inline. Interactive
-labels are underlined only while hovered; reasoning retains its violet semantic color.
+memory, context usage with percentage, and working directory in that order. Model identity opens an
+upward chooser containing selectable installed model names, reasoning effort opens the same form of
+upward chooser containing the selected model's supported levels, and resident memory routes to
+Hardware. The two choosers are mutually exclusive and keyboard operable. Interactive labels are
+underlined only while hovered; reasoning retains its violet semantic color.
 
 ## Appearance
 
@@ -113,6 +115,7 @@ semantics.
 - Every long-running lifecycle is rendered from server state; mutations cover command admission.
 - Settings is a first-class application surface with Models, Catalog, and Hardware destinations.
 - Wide and narrow layouts preserve access to every model-management view and action.
+- Footer model and reasoning choices remain available without navigating away from the chat.
 - Catalog keeps the selected model's primary action visible while its evidence scrolls, labels
   radar axes directly, and does not repeat radar evidence in candidate rows or metric tiles.
 - Slash commands and host menu actions route to the corresponding web-native surface.

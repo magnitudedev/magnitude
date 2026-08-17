@@ -3,14 +3,24 @@
  *
  * Bottom dock status row matching the CLI's model-runtime footer.
  */
-import { useState } from "react"
-import { LoaderCircle } from "lucide-react"
+import { useId, useRef, useState } from "react"
+import { ChevronUp, LoaderCircle } from "lucide-react"
 import {
   formatCwdForDisplay,
   type ReasoningEffortOption,
 } from "@magnitudedev/client-common"
-import type { ContextUsageDisplay, ReasoningEffort } from "@magnitudedev/sdk"
+import type {
+  ContextUsageDisplay,
+  ProviderModelId,
+  ReasoningEffort,
+} from "@magnitudedev/sdk"
 import { formatFooterContextUsage } from "./local-inference-format"
+
+export interface FooterModelOption {
+  readonly value: ProviderModelId
+  readonly label: string
+}
+
 export interface FooterBarProps {
   /** Context usage info from timeline */
   context: ContextUsageDisplay | null
@@ -34,8 +44,12 @@ export interface FooterBarProps {
   nextEscWillKillAll?: boolean
   /** Transcript mode active */
   transcriptMode?: boolean
-  /** Click handler for model name (opens the Models settings tab) */
-  onModelClick?: () => void
+  /** Installed models available for primary-slot selection. */
+  modelOptions?: readonly FooterModelOption[]
+  /** Currently selected provider-model identity. */
+  selectedModelId?: ProviderModelId | null
+  /** Applies an installed model to the primary model slot. */
+  onModelSelect?: (providerModelId: ProviderModelId) => void
   /** Click handler for resident memory (opens Hardware) */
   onMemoryClick?: () => void
   /** Reasoning efforts supported by the selected model. */
@@ -45,6 +59,174 @@ export interface FooterBarProps {
   /** Applies a reasoning effort to the primary model slot. */
   onThinkingSelect?: (effort: ReasoningEffort) => void
 }
+
+interface FooterDropdownOption<Value extends string> {
+  readonly value: Value
+  readonly label: string
+}
+
+function FooterDropdown<Value extends string>({
+  label,
+  value,
+  options,
+  open,
+  tone,
+  onOpenChange,
+  onSelect,
+}: {
+  readonly label: string
+  readonly value: Value | null
+  readonly options: readonly FooterDropdownOption<Value>[]
+  readonly open: boolean
+  readonly tone: "model" | "reasoning"
+  readonly onOpenChange: (open: boolean) => void
+  readonly onSelect: (value: Value) => void
+}): React.ReactNode {
+  const menuId = useId()
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const enabled = options.length > 0
+  const selectedIndex = Math.max(
+    0,
+    options.findIndex((option) => option.value === value)
+  )
+
+  const focusOption = (index: number): void => {
+    optionRefs.current[index]?.focus()
+  }
+  const openAndFocus = (index: number): void => {
+    onOpenChange(true)
+    requestAnimationFrame(() => focusOption(index))
+  }
+  const closeAndFocusTrigger = (): void => {
+    onOpenChange(false)
+    triggerRef.current?.focus()
+  }
+
+  return (
+    <span
+      className="relative inline-flex min-w-0"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) {
+          onOpenChange(false)
+        }
+      }}
+    >
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-label={`${
+          tone === "model" ? "Model" : "Thinking level"
+        }: ${label}`}
+        aria-controls={open ? menuId : undefined}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        disabled={!enabled}
+        onClick={() => onOpenChange(!open)}
+        onKeyDown={(event) => {
+          if (!enabled) return
+          if (open) {
+            if (event.key === "Escape") {
+              event.preventDefault()
+              onOpenChange(false)
+            } else if (event.key === "ArrowUp") {
+              event.preventDefault()
+              focusOption(options.length - 1)
+            } else if (event.key === "ArrowDown") {
+              event.preventDefault()
+              focusOption(selectedIndex)
+            }
+            return
+          }
+          if (event.key === "ArrowUp") {
+            event.preventDefault()
+            openAndFocus(options.length - 1)
+          } else if (event.key === "ArrowDown") {
+            event.preventDefault()
+            openAndFocus(selectedIndex)
+          }
+        }}
+        className={`group inline-flex min-w-0 cursor-pointer items-center gap-0.5 border-0 bg-transparent p-0 font-sans text-[13px] leading-[inherit] whitespace-nowrap no-underline disabled:cursor-default ${
+          tone === "reasoning"
+            ? "text-violet-700 enabled:hover:text-violet-600 dark:text-violet-500 dark:enabled:hover:text-violet-400"
+            : "text-slate-900 enabled:hover:text-blue-700 dark:text-slate-200 dark:enabled:hover:text-blue-500"
+        }`}
+      >
+        <span className="overflow-hidden text-ellipsis group-enabled:group-hover:underline group-enabled:group-hover:underline-offset-2">
+          {label}
+        </span>
+        {enabled && (
+          <ChevronUp
+            size={12}
+            strokeWidth={1.75}
+            aria-hidden="true"
+            className={`shrink-0 transition-transform duration-150 ${
+              open ? "rotate-180" : ""
+            }`}
+          />
+        )}
+      </button>
+
+      {open && enabled && (
+        <span
+          id={menuId}
+          role="listbox"
+          aria-label={tone === "model" ? "Installed models" : "Thinking level"}
+          className={`absolute bottom-[calc(100%+8px)] left-0 z-50 box-border flex max-h-[min(320px,calc(100vh-48px))] max-w-[calc(100vw-24px)] flex-col gap-0.5 overflow-y-auto rounded-lg border border-slate-300 bg-slate-50 p-1.5 shadow-[0_10px_32px_rgba(0,0,0,.18)] dark:border-slate-750 dark:bg-slate-875 dark:shadow-[0_10px_32px_rgba(0,0,0,.45)] ${
+            tone === "model" ? "w-max min-w-[260px]" : "w-[168px]"
+          }`}
+        >
+          {options.map((option, index) => {
+            const selected = option.value === value
+            return (
+              <button
+                key={option.value}
+                ref={(element) => {
+                  optionRefs.current[index] = element
+                }}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                onClick={() => {
+                  if (!selected) onSelect(option.value)
+                  closeAndFocusTrigger()
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault()
+                    closeAndFocusTrigger()
+                  } else if (event.key === "ArrowDown") {
+                    event.preventDefault()
+                    focusOption((index + 1) % options.length)
+                  } else if (event.key === "ArrowUp") {
+                    event.preventDefault()
+                    focusOption((index - 1 + options.length) % options.length)
+                  } else if (event.key === "Home") {
+                    event.preventDefault()
+                    focusOption(0)
+                  } else if (event.key === "End") {
+                    event.preventDefault()
+                    focusOption(options.length - 1)
+                  }
+                }}
+                className={`w-full cursor-pointer rounded-md border-0 px-2.5 py-2 text-left font-sans text-[12px] leading-[1.35] ${
+                  selected
+                    ? tone === "reasoning"
+                      ? "bg-violet-200 text-violet-700 dark:bg-violet-700 dark:text-violet-200"
+                      : "bg-blue-200 text-slate-900 dark:bg-blue-700 dark:text-slate-50"
+                    : "bg-transparent text-slate-700 hover:bg-slate-150 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                }`}
+              >
+                {option.label}
+              </button>
+            )
+          })}
+        </span>
+      )}
+    </span>
+  )
+}
+
 function ModelResidencyIndicator({
   residency,
   loadingPercentage,
@@ -93,13 +275,17 @@ export function FooterBar({
   memoryLabel,
   nextEscWillKillAll,
   transcriptMode,
-  onModelClick,
+  modelOptions = [],
+  selectedModelId,
+  onModelSelect,
   onMemoryClick,
   thinkingOptions = [],
   thinkingEffort,
   onThinkingSelect,
 }: FooterBarProps): React.ReactNode {
-  const [thinkingOpen, setThinkingOpen] = useState(false)
+  const [openDropdown, setOpenDropdown] = useState<
+    "model" | "reasoning" | null
+  >(null)
   const cwdText = cwd
     ? formatCwdForDisplay(cwd, {
         maxLen: 80,
@@ -135,71 +321,28 @@ export function FooterBar({
           />
         )}
         {!bashMode && model && (
-          <button
-            type="button"
-            onClick={onModelClick}
-            disabled={!onModelClick}
-            className="cursor-pointer border-0 bg-transparent p-0 font-sans text-[13px] leading-[inherit] whitespace-nowrap text-slate-900 no-underline disabled:cursor-default enabled:hover:text-blue-700 enabled:hover:underline enabled:hover:underline-offset-2 dark:text-slate-200 dark:enabled:hover:text-blue-500"
-          >
-            {model}
-          </button>
+          <FooterDropdown
+            label={model}
+            value={selectedModelId ?? null}
+            options={onModelSelect ? modelOptions : []}
+            open={openDropdown === "model"}
+            tone="model"
+            onOpenChange={(open) => setOpenDropdown(open ? "model" : null)}
+            onSelect={(providerModelId) => onModelSelect?.(providerModelId)}
+          />
         )}
         {!bashMode && thinkingLevel && (
-          <button
-            type="button"
-            onClick={() => {
-              if (thinkingOptions.length > 0 && onThinkingSelect) {
-                setThinkingOpen((open) => !open)
-              }
-            }}
-            aria-expanded={
-              thinkingOptions.length > 0 ? thinkingOpen : undefined
-            }
-            aria-label={`Reasoning effort: ${thinkingLevel}`}
-            disabled={thinkingOptions.length === 0 || !onThinkingSelect}
-            className="p-0 border-0 bg-transparent text-slate-900 dark:text-slate-200 font-sans text-[13px] leading-[inherit] no-underline whitespace-nowrap cursor-pointer disabled:cursor-default enabled:hover:text-blue-700 dark:enabled:hover:text-blue-500 enabled:hover:underline enabled:hover:underline-offset-2 !text-violet-700 dark:!text-violet-500"
-          >
-            {thinkingLevel}
-          </button>
+          <FooterDropdown
+            label={thinkingLevel}
+            value={thinkingEffort ?? null}
+            options={onThinkingSelect ? thinkingOptions : []}
+            open={openDropdown === "reasoning"}
+            tone="reasoning"
+            onOpenChange={(open) => setOpenDropdown(open ? "reasoning" : null)}
+            onSelect={(effort) => onThinkingSelect?.(effort)}
+          />
         )}
-        {!bashMode && thinkingOpen && (
-          <div
-            role="listbox"
-            aria-label="Reasoning effort"
-            className="flex items-center [gap:10px] min-w-0"
-          >
-            <span aria-hidden="true" className="text-slate-500">
-              &gt;
-            </span>
-            {thinkingOptions.map((option) => {
-              const selected = option.value === thinkingEffort
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="option"
-                  aria-selected={selected}
-                  onClick={() => {
-                    if (!selected) onThinkingSelect?.(option.value)
-                    setThinkingOpen(false)
-                  }}
-                  className={`${
-                    selected
-                      ? "text-violet-700 dark:text-violet-500"
-                      : "text-slate-600 dark:text-slate-400"
-                  } ${
-                    selected
-                      ? "[text-decoration:underline]"
-                      : "[text-decoration:none]"
-                  } border-0 bg-transparent p-0 font-sans text-[13px] whitespace-nowrap cursor-pointer`}
-                >
-                  {option.label}
-                </button>
-              )
-            })}
-          </div>
-        )}
-        {!bashMode && !thinkingOpen && (
+        {!bashMode && (
           <>
             {memoryLabel && (
               <button

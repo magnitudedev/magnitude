@@ -38,10 +38,13 @@ import {
   useSessionActions,
   usePaginatedSessions,
   useOnboardingModelSetup,
+  useLocalModels,
   useModelSlots,
-  useModelSlotActions,
+  useModelConfig,
   useProviderModelCatalog,
   deriveCurrentLocalModel,
+  installedLocalModels,
+  formatLocalModelDisplayName,
   modelSlotResidentAllocation,
   selectedSlotModel,
   reasoningEffortControl,
@@ -88,6 +91,7 @@ import {
 import {
   isRoleId,
   PRIMARY_SLOT_ID,
+  ProviderIdSchema,
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
@@ -545,9 +549,10 @@ function FooterBarContainer({
   const nextEscWillKillAll = useAtomValue(nextEscWillKillAllAtom)
   const { displayMode } = useDisplayViewController()
   const setSettingsTab = useAtomSet(settingsTabAtom)
+  const localModelsResult = useLocalModels()
   const slotsResult = useModelSlots()
   const catalogResult = useProviderModelCatalog()
-  const slotActions = useModelSlotActions()
+  const modelConfig = useModelConfig()
   const slots = Option.getOrNull(Result.value(slotsResult))
   const currentModel = deriveCurrentLocalModel(
     Option.fromNullable(slots?.slots.primary)
@@ -606,12 +611,34 @@ function FooterBarContainer({
   const thinkingLevel = profile?.reasoningEffort
     ? formatReasoningEffort(profile.reasoningEffort)
     : null
-  const openModels = useCallback(() => {
-    setSettingsTab("models")
-  }, [setSettingsTab])
   const openHardware = useCallback(() => {
     setSettingsTab("hardware")
   }, [setSettingsTab])
+  const modelOptions = Option.match(Result.value(localModelsResult), {
+    onNone: () => [],
+    onSome: (state) =>
+      installedLocalModels(state)
+        .flatMap((model) => {
+          if (
+            model.servingState._tag !== "Assessed" ||
+            model.servingState.availabilityState._tag !== "Selectable"
+          ) {
+            return []
+          }
+          return [
+            {
+              value: model.servingState.availabilityState.providerModelId,
+              label: formatLocalModelDisplayName(model),
+            },
+          ]
+        })
+        .sort((left, right) => left.label.localeCompare(right.label)),
+  })
+  const primarySlot = slots?.slots.primary
+  const selectedModelId =
+    primarySlot && primarySlot._tag !== "Unassigned"
+      ? primarySlot.selection.providerModelId
+      : null
   const modelLabel =
     currentModel._tag === "NoSelection"
       ? "Choose model"
@@ -642,15 +669,18 @@ function FooterBarContainer({
       memoryLabel={memoryLabel}
       thinkingEffort={profile?.reasoningEffort ?? null}
       thinkingOptions={thinkingOptions}
-      onThinkingSelect={(effort) => {
-        const primary = slots?.slots.primary
-        if (!primary || primary._tag === "Unassigned") return
-        slotActions.assign(PRIMARY_SLOT_ID, {
-          ...primary.selection,
-          reasoningEffort: effort,
-        })
+      modelOptions={modelOptions}
+      selectedModelId={selectedModelId}
+      onModelSelect={(providerModelId) => {
+        modelConfig.updateSlotModel(
+          PRIMARY_SLOT_ID,
+          ProviderIdSchema.make("local"),
+          providerModelId
+        )
       }}
-      onModelClick={openModels}
+      onThinkingSelect={(effort) => {
+        modelConfig.updateSlotReasoning(PRIMARY_SLOT_ID, effort)
+      }}
       onMemoryClick={openHardware}
       bashMode={bashMode}
       nextEscWillKillAll={nextEscWillKillAll}
