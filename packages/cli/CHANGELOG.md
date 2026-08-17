@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.6
+
+### Patch Changes
+
+- [`f9eb747`](https://github.com/magnitudedev/magnitude/commit/f9eb747e260acc35cd5695f779c067911bc0f7e7) Thanks [@anerli](https://github.com/anerli)! - better onboarding view, better model catalog view
+
+- [`f9eb747`](https://github.com/magnitudedev/magnitude/commit/f9eb747e260acc35cd5695f779c067911bc0f7e7) Thanks [@anerli](https://github.com/anerli)! - fix: support multimodal projectors properly and fix multimodal interactions with dflash/dspark
+
 ## 0.0.5
 
 ### Patch Changes
