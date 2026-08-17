@@ -72,11 +72,11 @@ const discoveredAccuracyLabel = (bits: Option.Option<number>): string => Option.
 
 const memoryFootprintLabel = (assessment: ModelAssessment): string => {
   const use = memoryUseRatio(assessment)
-  if (use <= 0.2) return "Light"
-  if (use <= 0.4) return "Moderate"
-  if (use <= 0.6) return "Substantial"
+  if (use <= 0.2) return "Tiny"
+  if (use <= 0.4) return "Light"
+  if (use <= 0.6) return "Medium"
   if (use <= 0.8) return "Heavy"
-  return "Near capacity"
+  return "Tight"
 }
 
 export const localModelRadarAxes = (model: LocalModel): Option.Option<PentagonRadarAxes> => {
