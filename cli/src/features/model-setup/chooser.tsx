@@ -43,7 +43,7 @@ import {
   selectionProviderModelId,
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
-import { localModelRadarAxes } from "../local-inference/model-radar"
+import { localModelRadarAxes } from "@magnitudedev/client-common"
 import { formatModelClassification } from "../local-inference/model-classification"
 import { discoveredModelLocation } from "./discovered-model"
 import {
