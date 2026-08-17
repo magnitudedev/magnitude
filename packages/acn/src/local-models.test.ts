@@ -6,6 +6,7 @@ import {
   ModelDownloadIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
+  ModelReleaseDateSchema,
   ModelVariantLabelSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
@@ -84,6 +85,7 @@ const catalogModel = (configuration: ModelServingConfiguration): RecommendableMo
   displayName: configuration.id,
   variantLabel: ModelVariantLabelSchema.make("Q4"),
   description: "test",
+  releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
   license: "test",
   capabilities: {
     vision: false,

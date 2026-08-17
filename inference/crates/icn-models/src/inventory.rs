@@ -1963,8 +1963,8 @@ mod tests {
     use icn_contracts::models::{
         CatalogModelId, CatalogVariantId, InstalledModelPackages, ModelCapabilities, ModelFile,
         ModelFileId, ModelFileRole, ModelPackageInspection, ModelPackageProperties,
-        ModelReasoningCapabilities, ModelServingConfiguration, ModelServingConfigurationId,
-        RecommendableModel, ServableModelBundle, ServingProfile,
+        ModelReasoningCapabilities, ModelReleaseDate, ModelServingConfiguration,
+        ModelServingConfigurationId, RecommendableModel, ServableModelBundle, ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
@@ -1981,6 +1981,7 @@ mod tests {
             display_name: "Catalog model".to_owned(),
             variant_label: "Q4".to_owned(),
             description: String::new(),
+            release_date: ModelReleaseDate::new("2026-01-01").expect("valid test date"),
             license: "test".to_owned(),
             capabilities: ModelCapabilities {
                 vision: false,

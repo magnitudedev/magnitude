@@ -5,6 +5,7 @@ import {
   CatalogVariantIdSchema,
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
+  ModelReleaseDateSchema,
   ModelVariantLabelSchema,
   type LocalProviderOffering,
   type ModelPackageEntry,
@@ -83,6 +84,7 @@ describe("local provider offering projection", () => {
       displayName: "Catalog model",
       variantLabel: ModelVariantLabelSchema.make("Q4"),
       description: "test",
+      releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
       license: "test",
       capabilities: {
         vision: false,

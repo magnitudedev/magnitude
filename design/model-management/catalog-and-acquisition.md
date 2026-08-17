@@ -34,7 +34,10 @@ Catalog attribution across exact artifact or drafter changes follows
 
 The release catalog is immutable release data. Human-reviewed declarations identify each artifact
 variant by its stable format-qualified variant ID, exact upstream format selector, short variant label, fidelity rank, and
-quantization-aware-training fact. Each entry publishes one exact default
+quantization-aware-training fact. Each model declaration records the calendar date on which the
+represented upstream model or material named revision was first publicly released. Artifact
+conversions, quantizations, quantization-aware packaging, and provider publication do not change
+that date; every artifact variant inherits the model declaration's date. Each entry publishes one exact default
 `ModelServingConfiguration`, required package components, presentation, and recommendation
 evidence. Reviewed model parameterization states whether the architecture is dense or
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
@@ -230,6 +233,7 @@ already issued provider-model identity.
 - Removing every derived cache changes cost only, never package presence or user intent.
 - Catalog and standard configurations are not copied into durable model state.
 - Issued catalog configurations remain resolvable after deprecation.
+- Every catalog variant publishes the valid ISO calendar date inherited from its model declaration.
 - Standard configuration identity remains stable for a given package identity.
 - Installed inventory is derived without network access or hardware assessment.
 - Partial, unsafe, invalid, or digest-mismatched content is not installed.

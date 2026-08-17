@@ -206,6 +206,7 @@ export const CatalogModel = S.Struct({
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,
   quantizationAware: S.Boolean,
+  releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
   variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
   variantLabel: S.String,
 })
@@ -1657,6 +1658,10 @@ export const ModelReasoningCapabilities = S.Struct({
 export type ModelReasoningCapabilities = S.Schema.Type<typeof ModelReasoningCapabilities>
 export type ModelReasoningCapabilitiesEncoded = S.Schema.Encoded<typeof ModelReasoningCapabilities>
 
+export const ModelReleaseDate = S.String
+export type ModelReleaseDate = S.Schema.Type<typeof ModelReleaseDate>
+export type ModelReleaseDateEncoded = S.Schema.Encoded<typeof ModelReleaseDate>
+
 export const ModelReleaseReason = S.Union(
   S.Literal("user_stop"),
   S.Literal("idle_timeout"),
@@ -1804,6 +1809,7 @@ export const RecommendableModel = S.Struct({
   qualityScore: S.Number,
   qualityScoreProvenance: S.String,
   quantizationAware: S.Boolean,
+  releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
   variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
   variantLabel: S.String,
 })
