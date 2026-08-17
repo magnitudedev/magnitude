@@ -12,12 +12,14 @@
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
+import { Effect } from "effect"
 import {
   App,
   PlatformProvider,
   createAgentClient,
   AgentClientProvider,
   initializeAppearance,
+  MagnitudeMark,
   stopDisplayViewController,
 } from "@magnitudedev/web"
 import { DaemonConnectionError } from "@magnitudedev/web"
@@ -36,8 +38,15 @@ document.documentElement.dataset.desktopPlatform = desktopApi.platform
 
 function renderLoading() {
   root.render(
-    <div className="flex h-screen items-center justify-center bg-slate-50 font-sans text-[14px] text-slate-600 dark:bg-slate-925 dark:text-slate-400">
-      Connecting to Magnitude daemon...
+    <div className="flex h-screen flex-col items-center justify-center bg-slate-50 font-sans text-slate-900 dark:bg-slate-875 dark:text-slate-200">
+      <MagnitudeMark className="mb-6 h-auto w-[82px]" />
+      <div className="text-[30px] font-semibold leading-tight tracking-[-0.025em]">
+        Opening Magnitude
+      </div>
+      <div className="mt-5 flex items-center gap-2.5 text-[16px] leading-7 text-slate-600 dark:text-slate-300">
+        <div className="size-[17px] rounded-full border-2 border-slate-300 border-t-blue-700 animate-spin motion-reduce:animate-none dark:border-slate-750 dark:border-t-blue-500" />
+        <span>Initializing desktop services…</span>
+      </div>
     </div>
   )
 }
@@ -61,12 +70,15 @@ function renderDaemonError(message: string) {
 async function renderApp() {
   const platform = await createDesktopPlatform(desktopApi)
   activePlatform = platform
+  const initialAcnLifecycle = await Effect.runPromise(
+    platform.acnStartup.prepare
+  )
   const agentClientTag = createAgentClient(platform.protocolLayer)
   root.render(
     <PlatformProvider platform={platform}>
       <RegistryProvider defaultIdleTTL={5000}>
         <AgentClientProvider tag={agentClientTag}>
-          <App />
+          <App initialAcnLifecycle={initialAcnLifecycle} />
         </AgentClientProvider>
       </RegistryProvider>
     </PlatformProvider>

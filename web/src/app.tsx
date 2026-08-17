@@ -16,7 +16,7 @@ import {
   type ReactNode,
 } from "react"
 import { Menu } from "lucide-react"
-import { Option, Effect } from "effect"
+import { Cause, Option, Effect } from "effect"
 import {
   useAtomValue,
   useAtomSet,
@@ -38,6 +38,7 @@ import {
   useSessionActions,
   usePaginatedSessions,
   useOnboardingModelSetup,
+  useAcnLifecycle,
   useLocalModels,
   useModelSlots,
   useModelConfig,
@@ -79,6 +80,8 @@ import {
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
+import { AcnBootstrapScreen } from "./components/acn-bootstrap-screen"
+import { MagnitudeMark } from "./components/magnitude-mark"
 import { ToastContainer } from "./components/toast"
 import { showToast } from "./stores/toast-store"
 import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
@@ -96,6 +99,7 @@ import {
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
 import type {
+  AcnLifecycleState,
   DisplayActor,
   ReadFileResult,
   SessionCwdSummary,
@@ -791,19 +795,50 @@ function useInterruptAllListener(): void {
 }
 
 /** Inner app — has display view + AgentClient context */
-function AppInner(): ReactNode {
+function AppInner({
+  initialAcnLifecycle,
+}: {
+  readonly initialAcnLifecycle: AcnLifecycleState
+}): ReactNode {
   // Detect responsive mode (≤640px) — no useEffect, uses matchMedia store
   const isNarrow = useSyncExternalStore(subscribeResponsive, getIsNarrow)
   useMenuActions()
   useInterruptAllListener()
+  const platform = usePlatform()
+  const acnLifecycle = useAcnLifecycle(initialAcnLifecycle)
   const onboarding = useOnboardingModelSetup()
+  if (acnLifecycle.state._tag !== "Ready") {
+    return (
+      <AcnBootstrapScreen
+        state={acnLifecycle.state}
+        onRetry={acnLifecycle.retry}
+        {...(platform.quit === undefined ? {} : { onQuit: platform.quit })}
+      />
+    )
+  }
   const onboardingState = Option.getOrNull(Result.value(onboarding.view))
   if (Result.isFailure(onboarding.view)) {
+    const failureDescription = Option.match(
+      Cause.failureOption(onboarding.view.cause),
+      {
+        onNone: () => "Local model settings are temporarily unavailable.",
+        onSome: (failure) => {
+          switch (failure.source) {
+            case "onboarding":
+              return "Magnitude couldn’t read onboarding status from the daemon."
+            case "local-models":
+              return "Magnitude couldn’t load the local model catalog."
+            case "model-slots":
+              return "Magnitude couldn’t read the configured local model."
+          }
+        },
+      }
+    )
     return (
       <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
         <AlertTriangleIcon />
         <h1>Couldn’t load local setup</h1>
-        <p>The daemon did not return onboarding state.</p>
+        <p>{failureDescription}</p>
         <button
           className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
           type="button"
@@ -816,10 +851,15 @@ function AppInner(): ReactNode {
   }
   if (onboardingState === null) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-        <div className="size-[26px] rounded-full border-2 border-slate-300 border-t-blue-700 animate-spin dark:border-slate-750 dark:border-t-blue-500" />
-        <h1>Connecting to local inference</h1>
-        <p>Reading the current daemon state…</p>
+      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 p-8 text-center text-slate-900 dark:bg-slate-875 dark:text-slate-200">
+        <MagnitudeMark className="mb-6 h-auto w-[82px]" />
+        <h1 className="text-[30px] font-semibold leading-tight tracking-[-0.025em]">
+          Opening Magnitude
+        </h1>
+        <div className="mt-5 flex items-center gap-2.5 text-[16px] leading-7 text-slate-600 dark:text-slate-300">
+          <div className="size-[17px] rounded-full border-2 border-slate-300 border-t-blue-700 animate-spin motion-reduce:animate-none dark:border-slate-750 dark:border-t-blue-500" />
+          <p>Loading local model settings…</p>
+        </div>
       </div>
     )
   }
@@ -932,10 +972,14 @@ function AuthenticatedAppContent({
     </div>
   )
 }
-export function App(): ReactNode {
+export function App({
+  initialAcnLifecycle,
+}: {
+  readonly initialAcnLifecycle: AcnLifecycleState
+}): ReactNode {
   return (
     <DisplayViewControllerProvider>
-      <AppInner />
+      <AppInner initialAcnLifecycle={initialAcnLifecycle} />
     </DisplayViewControllerProvider>
   )
 }

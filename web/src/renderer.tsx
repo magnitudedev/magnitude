@@ -7,6 +7,7 @@
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
+import { Effect } from "effect"
 import {
   App,
   PlatformProvider,
@@ -24,13 +25,16 @@ const root = createRoot(document.getElementById("root")!)
 
 async function main() {
   const platform = await createBrowserPlatform("")
+  const initialAcnLifecycle = await Effect.runPromise(
+    platform.acnStartup.prepare
+  )
   const agentClientTag = createAgentClient(platform.protocolLayer)
 
   root.render(
     <PlatformProvider platform={platform}>
       <RegistryProvider defaultIdleTTL={5000}>
         <AgentClientProvider tag={agentClientTag}>
-          <App />
+          <App initialAcnLifecycle={initialAcnLifecycle} />
         </AgentClientProvider>
       </RegistryProvider>
     </PlatformProvider>

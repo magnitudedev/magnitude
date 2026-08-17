@@ -21,5 +21,6 @@ export {
 } from "@magnitudedev/client-common"
 export { createBrowserPlatform } from "./platform/browser"
 export { DaemonConnectionError } from "./components/daemon-connection-error"
+export { MagnitudeMark } from "./components/magnitude-mark"
 export { initializeAppearance } from "./stores/appearance-store"
 export { DiffHunk, type DiffHunkProps } from "./components/diff-hunk"
