@@ -51,7 +51,7 @@ describe("catalog radar", () => {
       },
     }))
 
-    expect(axes[3].detail).toBe("Light (3.7 GB)")
+    expect(axes[3].detail).toBe("Tiny (3.7 GB)")
   })
 
   test("uses cubic ease-out and clamps interpolation", () => {
