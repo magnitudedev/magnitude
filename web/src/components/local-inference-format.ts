@@ -1,9 +1,5 @@
 import { Option } from "effect"
-import type {
-  ContextUsageDisplay,
-  LocalModel,
-  ModelSlot,
-} from "@magnitudedev/sdk"
+import type { LocalModel, ModelSlot } from "@magnitudedev/sdk"
 
 export const formatBytes = (bytes: number): string => {
   if (bytes <= 0) return "0 B"
@@ -22,28 +18,6 @@ export const formatContext = (tokens: number): string =>
     : tokens >= 1_000
     ? `${Math.round(tokens / 1_000)}K`
     : String(tokens)
-
-const formatContextTokens = (tokens: number): string =>
-  tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : `${Math.round(tokens)}`
-
-export const formatFooterContextUsage = (
-  context: ContextUsageDisplay | null,
-  tokenCap: number | null | undefined
-): string => {
-  const tokenUsage =
-    context && context.tokenEstimate > 0 ? context.tokenEstimate : null
-  if (tokenUsage === null) {
-    return tokenCap && tokenCap > 0
-      ? `— / ${formatContextTokens(tokenCap)}`
-      : "—"
-  }
-  const used = formatContextTokens(tokenUsage)
-  return tokenCap && tokenCap > 0
-    ? `${used} / ${formatContextTokens(tokenCap)} (${Math.round(
-        (tokenUsage / tokenCap) * 100
-      )}%)`
-    : used
-}
 
 export const transferProgress = (transfer: {
   readonly completedBytes: number

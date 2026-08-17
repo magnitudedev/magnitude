@@ -1,20 +1,16 @@
 /**
  * FooterBar — spec §9.7
  *
- * Bottom dock status row matching the CLI's model-runtime footer.
+ * Compact runtime controls rendered inside the bottom of the composer.
  */
 import { useId, useRef, useState } from "react"
-import { ChevronUp, LoaderCircle } from "lucide-react"
-import {
-  formatCwdForDisplay,
-  type ReasoningEffortOption,
-} from "@magnitudedev/client-common"
+import { type ReasoningEffortOption } from "@magnitudedev/client-common"
 import type {
   ContextUsageDisplay,
   ProviderModelId,
   ReasoningEffort,
 } from "@magnitudedev/sdk"
-import { formatFooterContextUsage } from "./local-inference-format"
+import { ContextUsageIndicator } from "./context-usage-indicator"
 
 export interface FooterModelOption {
   readonly value: ProviderModelId
@@ -28,14 +24,8 @@ export interface FooterBarProps {
   tokenCap?: number | null
   /** Bash mode active */
   bashMode?: boolean
-  /** Current agent-host working directory */
-  cwd?: string | null
   /** Current model label */
   model?: string | null
-  /** Current local-model residency presentation. */
-  modelResidency?: "ready" | "loading" | "not-ready" | null
-  /** Loading percentage, when projected by the selected slot. */
-  modelLoadingPercentage?: number | null
   /** Thinking level label (e.g. "High", "Medium") */
   thinkingLevel?: string | null
   /** Resident model allocation label. */
@@ -146,25 +136,15 @@ function FooterDropdown<Value extends string>({
             openAndFocus(selectedIndex)
           }
         }}
-        className={`group inline-flex min-w-0 cursor-pointer items-center gap-0.5 border-0 bg-transparent p-0 font-sans text-[13px] leading-[inherit] whitespace-nowrap no-underline disabled:cursor-default ${
+        className={`inline-flex min-w-0 cursor-pointer items-center rounded px-1.5 py-1 border-0 bg-transparent font-sans text-[14px] leading-5 whitespace-nowrap no-underline transition-colors duration-100 disabled:cursor-default ${
           tone === "reasoning"
-            ? "text-violet-700 enabled:hover:text-violet-600 dark:text-violet-500 dark:enabled:hover:text-violet-400"
-            : "text-slate-900 enabled:hover:text-blue-700 dark:text-slate-200 dark:enabled:hover:text-blue-500"
+            ? "text-violet-700 enabled:hover:bg-slate-100 dark:text-violet-400 dark:enabled:hover:bg-slate-750"
+            : "text-slate-700 enabled:hover:bg-slate-100 dark:text-slate-300 dark:enabled:hover:bg-slate-750"
         }`}
       >
-        <span className="overflow-hidden text-ellipsis group-enabled:group-hover:underline group-enabled:group-hover:underline-offset-2">
+        <span className="overflow-hidden text-ellipsis">
           {label}
         </span>
-        {enabled && (
-          <ChevronUp
-            size={12}
-            strokeWidth={1.75}
-            aria-hidden="true"
-            className={`shrink-0 transition-transform duration-150 ${
-              open ? "rotate-180" : ""
-            }`}
-          />
-        )}
       </button>
 
       {open && enabled && (
@@ -172,7 +152,7 @@ function FooterDropdown<Value extends string>({
           id={menuId}
           role="listbox"
           aria-label={tone === "model" ? "Installed models" : "Thinking level"}
-          className={`absolute bottom-[calc(100%+8px)] left-0 z-50 box-border flex max-h-[min(320px,calc(100vh-48px))] max-w-[calc(100vw-24px)] flex-col gap-0.5 overflow-y-auto rounded-lg border border-slate-300 bg-slate-50 p-1.5 shadow-[0_10px_32px_rgba(0,0,0,.18)] dark:border-slate-750 dark:bg-slate-875 dark:shadow-[0_10px_32px_rgba(0,0,0,.45)] ${
+          className={`absolute bottom-[calc(100%+9px)] left-0 z-50 box-border flex max-h-[min(320px,calc(100vh-48px))] max-w-[calc(100vw-24px)] flex-col gap-0.5 overflow-y-auto rounded-lg border border-slate-300 bg-white p-1.5 shadow-[0_8px_24px_rgba(0,0,0,.16)] dark:border-slate-600 dark:bg-slate-750 dark:shadow-[0_8px_24px_rgba(0,0,0,.36)] ${
             tone === "model" ? "w-max min-w-[260px]" : "w-[168px]"
           }`}
         >
@@ -214,7 +194,7 @@ function FooterDropdown<Value extends string>({
                     ? tone === "reasoning"
                       ? "bg-violet-200 text-violet-700 dark:bg-violet-700 dark:text-violet-200"
                       : "bg-blue-200 text-slate-900 dark:bg-blue-700 dark:text-slate-50"
-                    : "bg-transparent text-slate-700 hover:bg-slate-150 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                    : "bg-transparent text-slate-700 hover:bg-slate-150 dark:text-slate-200 dark:hover:bg-slate-700"
                 }`}
               >
                 {option.label}
@@ -227,50 +207,11 @@ function FooterDropdown<Value extends string>({
   )
 }
 
-function ModelResidencyIndicator({
-  residency,
-  loadingPercentage,
-}: {
-  readonly residency: NonNullable<FooterBarProps["modelResidency"]>
-  readonly loadingPercentage?: number | null
-}): React.ReactNode {
-  if (residency === "loading") {
-    const label =
-      loadingPercentage === null || loadingPercentage === undefined
-        ? "Model loading"
-        : `Model loading · ${loadingPercentage}%`
-    return (
-      <span
-        className="inline-flex w-3 h-4 items-center justify-center shrink-0 font-sans text-xs leading-none [&.ready]:text-green-700 dark:[&.ready]:text-green-500 [&.not-ready]:text-slate-500 [&.loading]:text-orange-700 dark:[&.loading]:text-orange-500 loading"
-        aria-label={label}
-        title={label}
-      >
-        <LoaderCircle className="animate-spin" size={12} aria-hidden="true" />
-      </span>
-    )
-  }
-  const ready = residency === "ready"
-  const label = ready ? "Model ready" : "Model not ready"
-  return (
-    <span
-      className={`inline-flex w-3 h-4 items-center justify-center shrink-0 font-sans text-xs leading-none [&.ready]:text-green-700 dark:[&.ready]:text-green-500 [&.not-ready]:text-slate-500 [&.loading]:text-orange-700 dark:[&.loading]:text-orange-500 ${
-        ready ? "ready" : "not-ready"
-      }`}
-      aria-label={label}
-      title={label}
-    >
-      <span aria-hidden="true">{ready ? "●" : "○"}</span>
-    </span>
-  )
-}
 export function FooterBar({
   context,
   tokenCap,
   bashMode,
-  cwd,
   model,
-  modelResidency,
-  modelLoadingPercentage,
   thinkingLevel,
   memoryLabel,
   nextEscWillKillAll,
@@ -286,18 +227,9 @@ export function FooterBar({
   const [openDropdown, setOpenDropdown] = useState<
     "model" | "reasoning" | null
   >(null)
-  const cwdText = cwd
-    ? formatCwdForDisplay(cwd, {
-        maxLen: 80,
-        abbreviateHome: true,
-      })
-    : ""
-  const contextLabel = formatFooterContextUsage(context, tokenCap)
   return (
-    <div className="flex min-h-[26px] shrink-0 items-center justify-between bg-transparent px-0.5 font-sans">
-      {/* Model controls mirror the CLI footer: model and reasoning on the
-          left, environment on the right. */}
-      <div className="flex items-center flex-wrap [gap:8px] min-w-0">
+    <div className="flex min-h-7 shrink-0 items-center bg-transparent pr-9 font-sans">
+      <div className="flex min-w-0 flex-wrap items-center gap-1">
         {bashMode && (
           <span className="text-[11px] text-orange-700 dark:text-orange-500 shrink-0">
             Bash mode
@@ -314,12 +246,6 @@ export function FooterBar({
           </span>
         )}
 
-        {!bashMode && modelResidency && (
-          <ModelResidencyIndicator
-            residency={modelResidency}
-            loadingPercentage={modelLoadingPercentage}
-          />
-        )}
         {!bashMode && model && (
           <FooterDropdown
             label={model}
@@ -349,32 +275,25 @@ export function FooterBar({
                 type="button"
                 onClick={onMemoryClick}
                 disabled={!onMemoryClick}
-                className="p-0 border-0 bg-transparent text-slate-900 dark:text-slate-200 font-sans text-[13px] leading-[inherit] no-underline whitespace-nowrap cursor-pointer disabled:cursor-default enabled:hover:text-blue-700 dark:enabled:hover:text-blue-500 enabled:hover:underline enabled:hover:underline-offset-2 !text-slate-500"
+                className="cursor-pointer whitespace-nowrap rounded border-0 bg-transparent px-1.5 py-1 font-sans text-[12px] leading-none text-slate-500 no-underline transition-colors duration-100 enabled:hover:bg-slate-100 disabled:cursor-default dark:enabled:hover:bg-slate-750"
               >
                 {memoryLabel}
               </button>
             )}
-            <span
-              className="!text-slate-500 font-sans text-xs leading-[normal] tabular-nums whitespace-nowrap data-[compacting=true]:animate-context-pulse"
-              data-compacting={context?.isCompacting ?? false}
-              title="Context usage"
-            >
-              {contextLabel}
+            <span className="inline-flex px-1.5 py-1">
+              <ContextUsageIndicator
+                context={context}
+                tokenCap={tokenCap}
+                size={18}
+                strokeWidth={2}
+                tooltip="popover"
+                tooltipPlacement="above-center"
+              />
             </span>
           </>
         )}
       </div>
 
-      <div className="flex items-center justify-end min-w-0 [max-width:40%] [margin-left:12px]">
-        {cwdText && (
-          <span
-            title={cwd ?? undefined}
-            className="text-slate-600 dark:text-slate-400 font-mono text-[13px] min-w-0 overflow-hidden text-ellipsis whitespace-nowrap"
-          >
-            {cwdText}
-          </span>
-        )}
-      </div>
     </div>
   )
 }

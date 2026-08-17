@@ -40,7 +40,7 @@ function renderLoading() {
   root.render(
     <div className="flex h-screen flex-col items-center justify-center bg-slate-50 font-sans text-slate-900 dark:bg-slate-875 dark:text-slate-200">
       <MagnitudeMark className="mb-6 h-auto w-[82px]" />
-      <div className="text-[30px] font-semibold leading-tight tracking-[-0.025em]">
+      <div className="font-heading text-[30px] font-semibold leading-tight tracking-[-0.025em]">
         Opening Magnitude
       </div>
       <div className="mt-5 flex items-center gap-2.5 text-[16px] leading-7 text-slate-600 dark:text-slate-300">
