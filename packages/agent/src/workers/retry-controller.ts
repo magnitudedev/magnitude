@@ -4,13 +4,13 @@
  * Drives the retry-after-delay path for ConnectionFailure outcomes.
  *
  * Flow:
- *   1. Cortex publishes a turn_outcome with _tag='ConnectionFailure'.
+ *   1. TurnExecutor publishes a turn_outcome with _tag='ConnectionFailure'.
  *   2. TurnProjection enqueues a chain_continue trigger with notBefore set to
  *      the future timestamp at which the next retry is allowed.
  *   3. This worker observes the same turn_outcome event, reads the trigger's
  *      notBefore from the projection, sleeps until that moment, then publishes
  *      a wake event. The wake causes onProjectionsSettled to re-evaluate, at
- *      which point TurnController sees the trigger is now due and fires
+ *      which point TurnInitiator sees the trigger is now due and fires
  *      turn_started.
  *
  * Cancellation:
@@ -19,8 +19,8 @@
  *   on agent_killed / worker_user_killed / worker_idle_closed via
  *   forkLifecycle.completeOn.
  *
- * The cap (MAX_RETRIES) is enforced in Cortex by transforming the outcome
- * before publishing — see workers/cortex.ts. This worker only ever sees
+ * The cap (MAX_RETRIES) is enforced in TurnExecutor by transforming the outcome
+ * before publishing — see workers/turn-executor.ts. This worker only ever sees
  * pre-cap ConnectionFailure outcomes, so it always sleeps and wakes.
  */
 

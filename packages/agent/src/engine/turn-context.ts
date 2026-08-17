@@ -1,7 +1,7 @@
 /**
  * TurnContextService — provides current turn metadata to tools during execution.
  *
- * Cortex provides this layer around each turn so tools can access turn identity.
+ * TurnExecutor provides this layer around each turn so tools can access turn identity.
  */
 
 import { Context } from 'effect'

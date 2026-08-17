@@ -16,7 +16,7 @@ The package is split into three layers:
 ┌─────────────────────────────────────────────────────────────┐
 │  Agent Layer (in packages/agent)                             │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ vcs-tools.ts │  │ vcs-models.ts│  │ Cortex (turn     │   │
+│  │ vcs-tools.ts │  │ vcs-models.ts│  │ TurnExecutor (turn     │   │
 │  │ checkpoint_  │  │ state models │  │ boundaries)      │   │
 │  │ rollback /   │  │ for UI       │  │ auto-record()    │   │
 │  │ checkpoint_  │  │ rendering    │  │                  │   │
@@ -111,7 +111,7 @@ These tools are wired into the agent harness via:
 - `packages/agent/src/tools/vcs-tools.ts` — tool definitions and Effect implementations
 - `packages/agent/src/models/vcs-models.ts` — state models for tool execution lifecycle
 - `packages/agent/src/tools/toolkits.ts` — `vcsToolkit`, assigned to the `leader` role
-- `packages/agent/src/workers/cortex.ts` — auto-records a checkpoint at every turn boundary
+- `packages/agent/src/workers/turn-executor.ts` — auto-records a checkpoint at every turn boundary
 
 The VCS package itself is agnostic to agent concepts (turns, tool call IDs, workers). It stores opaque commit messages. The agent layer assigns meaning to those messages by joining the commit stream with the event stream at query time.
 
