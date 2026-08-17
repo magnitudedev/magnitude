@@ -86,7 +86,7 @@ import {
   retargetPentagonRadar,
   type PentagonRadarTransition,
 } from "../../components/pentagon-radar"
-import { localModelRadarAxes } from "../local-inference/model-radar"
+import { localModelRadarAxes } from "@magnitudedev/client-common"
 import { formatModelClassification } from "../local-inference/model-classification"
 import { CatalogRadarView } from "./catalog-radar-view"
 import {

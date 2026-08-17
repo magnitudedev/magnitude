@@ -10,7 +10,7 @@ import {
   retargetPentagonRadar,
   type PentagonRadarValues,
 } from "../../components/pentagon-radar"
-import { localModelRadarAxes } from "../local-inference/model-radar"
+import { localModelRadarAxes } from "@magnitudedev/client-common"
 import { makeCatalogOnlyModel } from "../local-inference/test-fixtures"
 
 const zero: PentagonRadarValues = [0, 0, 0, 0, 0].map(Option.some) as unknown as PentagonRadarValues
@@ -31,6 +31,27 @@ describe("catalog radar", () => {
       "MEMORY",
       "ACCURACY",
     ])
+  })
+
+  test("omits the profile when assessment has no performance samples", () => {
+    const model = makeCatalogOnlyModel()
+    if (
+      model.servingState._tag !== "Assessed" ||
+      model.servingState.assessment._tag !== "Fits"
+    ) {
+      throw new Error("Expected an assessed catalog fixture")
+    }
+    const withoutPerformance = {
+      ...model,
+      servingState: {
+        ...model.servingState,
+        assessment: {
+          ...model.servingState.assessment,
+          performance: [],
+        },
+      },
+    }
+    expect(Option.isNone(localModelRadarAxes(withoutPerformance))).toBe(true)
   })
 
   test("uses cubic ease-out and clamps interpolation", () => {
