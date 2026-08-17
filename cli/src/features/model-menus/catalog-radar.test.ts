@@ -33,6 +33,27 @@ describe("catalog radar", () => {
     ])
   })
 
+  test("displays memory as the actual decimal gigabyte value", () => {
+    const model = makeCatalogOnlyModel()
+    if (model.servingState._tag !== "Assessed"
+      || model.servingState.assessment._tag !== "Fits") {
+      throw new Error("Catalog radar fixture must have a fitting assessment")
+    }
+    const assessed = model.servingState.assessment
+    const axes = Option.getOrThrow(localModelRadarAxes({
+      ...model,
+      servingState: {
+        ...model.servingState,
+        assessment: {
+          ...assessed,
+          memory: { ...assessed.memory, totalRequiredBytes: 3.4 * 1024 ** 3 },
+        },
+      },
+    }))
+
+    expect(axes[3].detail).toBe("Light (3.7 GB)")
+  })
+
   test("uses cubic ease-out and clamps interpolation", () => {
     expect(pentagonRadarEase(0)).toBe(0)
     expect(pentagonRadarEase(0.5)).toBeCloseTo(0.875)

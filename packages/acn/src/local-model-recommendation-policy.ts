@@ -241,10 +241,10 @@ const describeLightweight = (
   const capabilityTradeoff = candidate.capabilityScore < balanced.capabilityScore
     ? " It is less capable on difficult coding tasks."
     : ""
-  const memory = Math.round(candidate.estimatedLoadedBytes / 1024 ** 3)
+  const memory = (candidate.estimatedLoadedBytes / 1_000_000_000).toFixed(1)
   const memorySummary = loadedMemoryReduction > 0
     ? `Uses ${loadedMemoryReduction}% less memory while loaded than Balanced`
-    : `Prioritizes low loaded memory at about ${memory} GiB`
+    : `Prioritizes low loaded memory at about ${memory} GB`
   return `${memorySummary} and is easier to keep on this machine.${capabilityTradeoff}${speedTradeoff}${shorterContextTradeoff(candidate, balanced)} ${qualitySentence(candidate)}`
 }
 

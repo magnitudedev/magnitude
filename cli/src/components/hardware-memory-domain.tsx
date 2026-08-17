@@ -1,12 +1,7 @@
-import type { HardwareMemoryDomainView } from '@magnitudedev/client-common'
+import { formatDecimalGigabytes, type HardwareMemoryDomainView } from '@magnitudedev/client-common'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
 import { StackedBar } from './stacked-bar'
-
-const formatMemoryBytes = (bytes: number): string => {
-  const gib = bytes / 1024 ** 3
-  return gib >= 1 ? `${gib.toFixed(1)} GiB` : `${Math.round(bytes / 1024 ** 2)} MiB`
-}
 
 interface HardwareMemoryDomainProps {
   readonly domain: HardwareMemoryDomainView
@@ -48,8 +43,8 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
       <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{domain.label}</text>
       <text style={{ fg: theme.text.body }}>
         {domain.usedBytes === null
-          ? `${formatMemoryBytes(domain.totalBytes)} total`
-          : `${formatMemoryBytes(domain.usedBytes)} / ${formatMemoryBytes(domain.totalBytes)} used`}
+          ? `${formatDecimalGigabytes(domain.totalBytes)} total`
+          : `${formatDecimalGigabytes(domain.usedBytes)} / ${formatDecimalGigabytes(domain.totalBytes)} used`}
       </text>
       {barSegments.length > 0 && (
         <StackedBar
@@ -61,10 +56,10 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
       )}
       {complete ? (
         <box style={{ flexDirection: 'column' }}>
-          <text style={{ fg: theme.text.body }}><span fg={theme.text.body}>■</span>{` Weights       ${formatMemoryBytes(domain.fixedBytes)}`}</text>
-          <text style={{ fg: theme.text.body }}><span fg={theme.accent}>■</span>{` KV cache      ${formatMemoryBytes(domain.kvCacheBytes)}`}</text>
-          <text style={{ fg: theme.text.body }}><span fg={theme.status.warning}>■</span>{` System & apps ${formatMemoryBytes(domain.systemAndAppsBytes)}`}</text>
-          <text style={{ fg: theme.text.body }}><span fg={theme.border.standard}>□</span>{` Free          ${formatMemoryBytes(domain.freeBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.text.body}>■</span>{` Weights       ${formatDecimalGigabytes(domain.fixedBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.accent}>■</span>{` KV cache      ${formatDecimalGigabytes(domain.kvCacheBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.status.warning}>■</span>{` System & apps ${formatDecimalGigabytes(domain.systemAndAppsBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.border.standard}>□</span>{` Free          ${formatDecimalGigabytes(domain.freeBytes)}`}</text>
         </box>
       ) : domain.notice ? (
         <text style={{ fg: theme.text.supporting }}><span attributes={TextAttributes.DIM}>{domain.notice}</span></text>
@@ -72,5 +67,3 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
     </box>
   )
 }
-
-export { formatMemoryBytes }
