@@ -410,6 +410,27 @@ describe("ModelSlotController load admission", () => {
     })))
   })
 
+  it("admits an authoritative selected offering while unrelated local discovery remains unsettled", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        localOfferingsReady: false,
+        initialOfferings: [offering],
+        installed: true,
+      })
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+
+        expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          availability: { _tag: "Available" },
+          actions: ["Load"],
+        })
+        expect((yield* controller.agentModelConfiguration).bySlot.primary._tag)
+          .toBe("Ready")
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("keeps agent configuration pending until installed-package inventory is authoritative", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness({

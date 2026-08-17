@@ -121,7 +121,6 @@ export const localModelSlotAvailability = (
   },
 ): ModelSlotAvailability => {
   if (input.catalogIdentityPending
-    || !input.offeringsReady
     || input.inventory._tag === "Initializing") {
     return { _tag: "Pending" }
   }
@@ -129,6 +128,7 @@ export const localModelSlotAvailability = (
     return { _tag: "Unavailable", failure: input.inventory.failure }
   }
   if (!input.offeringExists) {
+    if (!input.offeringsReady) return { _tag: "Pending" }
     return {
       _tag: "Unavailable",
       failure: {
