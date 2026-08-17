@@ -1,7 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
+import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { FooterBar } from "./footer-bar"
 import { formatFooterContextUsage } from "./local-inference-format"
+
+const selectedModelId = ProviderModelIdSchema.make("qwen-test-q4")
+const high = ReasoningEffortSchema.make("high")
 
 describe("formatFooterContextUsage", () => {
   it("matches the CLI token and percentage presentation", () => {
@@ -32,14 +36,22 @@ describe("FooterBar", () => {
         modelResidency="ready"
         thinkingLevel="High"
         memoryLabel="16 GB mem"
-        onModelClick={() => {}}
+        modelOptions={[{ value: selectedModelId, label: "Qwen Test (Q4)" }]}
+        selectedModelId={selectedModelId}
+        onModelSelect={() => {}}
+        thinkingOptions={[{ value: high, label: "High" }]}
+        thinkingEffort={high}
+        onThinkingSelect={() => {}}
         onMemoryClick={() => {}}
       />
     )
 
     expect(html).toContain('aria-label="Model ready"')
-    expect(html).toContain(">Qwen Test (Q4)</button>")
-    expect(html).toContain('aria-label="Reasoning effort: High"')
+    expect(html).toContain('aria-label="Model: Qwen Test (Q4)"')
+    expect(html).toContain('aria-label="Thinking level: High"')
+    expect(html).toContain("Qwen Test (Q4)")
+    expect(html.match(/aria-haspopup="listbox"/g)).toHaveLength(2)
+    expect(html.match(/aria-expanded="false"/g)).toHaveLength(2)
     expect(html).toContain(">16 GB mem</button>")
 
     const model = html.indexOf("Qwen Test (Q4)")
