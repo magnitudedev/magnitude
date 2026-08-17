@@ -63,7 +63,7 @@ export function AcnBootstrapScreen({
 }): ReactNode {
   if (state._tag === "Failed") {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-50 px-6 py-10 text-slate-900 dark:bg-slate-875 dark:text-slate-200">
+      <main className="flex min-h-screen items-center justify-center bg-slate-50 px-6 py-10 text-slate-900 dark:bg-slate-850 dark:text-slate-200">
         <section
           role="alert"
           aria-labelledby="acn-bootstrap-title"
@@ -132,7 +132,7 @@ export function AcnBootstrapScreen({
       : startingPhaseLabel(state.phase)
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-50 px-6 py-10 text-slate-900 dark:bg-slate-875 dark:text-slate-200">
+    <main className="flex min-h-screen items-center justify-center bg-slate-50 px-6 py-10 text-slate-900 dark:bg-slate-850 dark:text-slate-200">
       <section
         aria-labelledby="acn-bootstrap-title"
         aria-describedby="acn-bootstrap-phase"

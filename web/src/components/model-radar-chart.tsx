@@ -83,7 +83,7 @@ export function ModelRadarChart({
           return (
             <circle
               key={axes[index].label}
-              className="fill-white stroke-violet-700 stroke-2 [vector-effect:non-scaling-stroke] dark:fill-slate-875 dark:stroke-violet-500"
+              className="fill-white stroke-violet-700 stroke-2 [vector-effect:non-scaling-stroke] dark:fill-slate-850 dark:stroke-violet-500"
               cx={point.x}
               cy={point.y}
               r="3.2"

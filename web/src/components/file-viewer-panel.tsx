@@ -141,7 +141,7 @@ export function FileViewerPanel({
   return (
     <div
       ref={panelRef}
-      className="max-[800px]:!w-full max-[800px]:!min-w-0 fixed [top:0px] [right:0px] [bottom:0px] bg-white dark:bg-slate-875 border-l border-l-slate-300 dark:border-l-slate-750 flex flex-col z-[30] [animation:slide-in-right_200ms_ease-out]"
+      className="max-[800px]:!w-full max-[800px]:!min-w-0 fixed [top:0px] [right:0px] [bottom:0px] bg-white dark:bg-slate-850 border-l border-l-slate-300 dark:border-l-slate-750 flex flex-col z-[30] [animation:slide-in-right_200ms_ease-out]"
       tabIndex={-1}
       onKeyDown={handleKeyDown}
       style={{

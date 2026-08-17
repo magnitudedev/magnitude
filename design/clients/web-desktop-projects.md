@@ -49,8 +49,9 @@ than adding a second toolbar inside the sidebar. While expanded, the sidebar bac
 border continue through the full title-bar height and the two actions sit at the right edge of that
 region; the current session title starts in the main pane. When collapsed, the sidebar region and
 border disappear and those actions move beside the native window controls, followed by the session
-title. The sidebar uses an opaque palette color on every desktop platform; native vibrancy does not
-alter its rendered color. macOS reserves the configured traffic-light region. Linux and Windows use Electron's Window
+title. In dark mode the main pane uses slate-900 and the sidebar uses opaque slate-850 on every
+desktop platform; native vibrancy does not alter the sidebar's rendered color. macOS reserves the
+configured traffic-light region. Linux and Windows use Electron's Window
 Controls Overlay safe-area variables because native controls may appear on either side according to
 the desktop environment. A collapsed Electron sidebar has no residual rail: the main pane takes the
 available width and Settings and appearance controls float at bottom-left. The composer keeps the

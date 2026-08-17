@@ -375,7 +375,7 @@ export function SessionsSidebar({
       <aside
         data-overlay={overlay || undefined}
         style={{ width: effectiveWidth }}
-        className={`${overlay ? "fixed inset-y-0 left-0 z-80 animate-[slide-in-left_200ms_ease-out]" : "relative shrink-0"} max-[640px]:[&:not([data-overlay])]:hidden flex flex-col overflow-hidden border-r border-slate-200 bg-slate-100 transition-[width] duration-150 dark:border-slate-800 dark:bg-slate-875`}
+        className={`${overlay ? "fixed inset-y-0 left-0 z-80 animate-[slide-in-left_200ms_ease-out]" : "relative shrink-0"} max-[640px]:[&:not([data-overlay])]:hidden flex flex-col overflow-hidden border-r border-slate-200 bg-slate-100 transition-[width] duration-150 dark:border-slate-800 dark:bg-slate-850`}
       >
         {settingsTab !== null ? (
           <SettingsNavigation activeTab={settingsTab} onTabChange={onSettingsTabChange} onBack={onCloseSettings} />

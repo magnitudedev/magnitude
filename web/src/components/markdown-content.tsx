@@ -57,7 +57,7 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
   const highlighted = useCodeHighlight(code, lang)
   return (
     <div className="code-block [margin:8px_0_12px] rounded-[4px] overflow-hidden">
-      <div className="code-block-header flex items-center justify-between bg-white dark:bg-slate-875 border-b border-b-slate-300 dark:border-b-slate-750 [padding:4px_10px] font-sans text-[11px] text-slate-600 dark:text-slate-400">
+      <div className="code-block-header flex items-center justify-between bg-white dark:bg-slate-850 border-b border-b-slate-300 dark:border-b-slate-750 [padding:4px_10px] font-sans text-[11px] text-slate-600 dark:text-slate-400">
         <span>{lang || "text"}</span>
         <CopyButton text={code} />
       </div>
@@ -191,7 +191,7 @@ function MarkdownContentImpl({
           className="border border-slate-300 dark:border-slate-750 border-collapse w-full [margin:8px_0_12px] text-[13px]"
         />
       ),
-      thead: (p) => <thead {...p} className="bg-white dark:bg-slate-875" />,
+      thead: (p) => <thead {...p} className="bg-white dark:bg-slate-850" />,
       th: (p) => (
         <th
           {...p}
