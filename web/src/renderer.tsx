@@ -16,8 +16,7 @@ import {
   createBrowserPlatform,
   stopDisplayViewController,
 } from "@magnitudedev/web"
-import "./styles/vars.css"
-import "./styles/globals.css"
+import "./styles/tailwind.css"
 
 initializeAppearance()
 
@@ -34,7 +33,7 @@ async function main() {
           <App />
         </AgentClientProvider>
       </RegistryProvider>
-    </PlatformProvider>,
+    </PlatformProvider>
   )
 }
 

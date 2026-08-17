@@ -21,6 +21,5 @@ export {
 } from "@magnitudedev/client-common"
 export { createBrowserPlatform } from "./platform/browser"
 export { DaemonConnectionError } from "./components/daemon-connection-error"
-export { injectCssVars, generateCssVars, generateCssVarsString } from "./styles/generate-css-vars"
 export { initializeAppearance } from "./stores/appearance-store"
 export { DiffHunk, type DiffHunkProps } from "./components/diff-hunk"

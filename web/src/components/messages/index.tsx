@@ -82,5 +82,5 @@ export const MessageDispatch = memo(
     prev.message === next.message &&
     prev.isStreaming === next.isStreaming &&
     prev.isInterrupted === next.isInterrupted &&
-    prev.mode === next.mode,
+    prev.mode === next.mode
 )

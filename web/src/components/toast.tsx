@@ -2,7 +2,7 @@
  * Toast & ToastContainer — spec §10
  *
  * Position: bottom-right of chat column, 12px from edges.
- * Background --bg-surface, border-left 3px solid message color,
+ * Background --bg-surface, border-l 3px solid message color,
  * padding 8px 12px, border-radius 0 4px 4px 0.
  * font-sans text-sm --fg-primary. Auto-dismiss 5s.
  *
@@ -20,16 +20,15 @@ import {
 
 // ── Toast color mapping ──
 
-const toastBorder: Record<ToastKind, string> = {
-  success: "var(--accent-success)",
-  error: "var(--accent-error)",
-  info: "var(--accent-info)",
+const toastBorderClass: Record<ToastKind, string> = {
+  success: "border-l-green-700 dark:border-l-green-500",
+  error: "border-l-red-600 dark:border-l-red-500",
+  info: "border-l-blue-700 dark:border-l-blue-500",
 }
-
 const toastIcon: Record<ToastKind, ReactNode> = {
-  success: <Check size={14} style={{ color: "var(--accent-success)" }} />,
-  error: <AlertCircle size={14} style={{ color: "var(--accent-error)" }} />,
-  info: <Info size={14} style={{ color: "var(--accent-info)" }} />,
+  success: <Check size={14} className="text-green-700 dark:text-green-500" />,
+  error: <AlertCircle size={14} className="text-red-600 dark:text-red-500" />,
+  info: <Info size={14} className="text-blue-700 dark:text-blue-500" />,
 }
 
 // ── Single toast ──
@@ -37,35 +36,16 @@ const toastIcon: Record<ToastKind, ReactNode> = {
 function Toast({ toast }: { toast: ToastEntry }): ReactNode {
   return (
     <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        background: "var(--bg-surface)",
-        borderLeft: `3px solid ${toastBorder[toast.kind]}`,
-        padding: "8px 12px",
-        borderRadius: "0 4px 4px 0",
-        fontFamily: "var(--font-sans)",
-        fontSize: 14,
-        color: "var(--fg-primary)",
-        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
-        animation: "toast-in 150ms ease-out",
-        maxWidth: 320,
-      }}
+      className={`${
+        toastBorderClass[toast.kind]
+      } flex max-w-80 animate-[toast-in_150ms_ease-out] items-center gap-2 rounded-r border-l-[3px] bg-white px-3 py-2 font-sans text-sm text-slate-900 shadow-xl dark:bg-slate-875 dark:text-slate-200`}
     >
       {toastIcon[toast.kind]}
-      <span style={{ flex: 1 }}>{toast.message}</span>
+      <span className="[flex:1]">{toast.message}</span>
       <button
         onClick={() => dismissToast(toast.id)}
         aria-label="Dismiss toast"
-        style={{
-          background: "transparent",
-          border: "none",
-          cursor: "pointer",
-          padding: 0,
-          display: "flex",
-          color: "var(--fg-tertiary)",
-        }}
+        className="[background:transparent] border-0 cursor-pointer [padding:0px] flex text-slate-500"
       >
         <X size={14} />
       </button>
@@ -76,23 +56,14 @@ function Toast({ toast }: { toast: ToastEntry }): ReactNode {
 // ── Container ──
 
 export function ToastContainer(): ReactNode {
-  const toasts = useSyncExternalStore(subscribeToast, getToastSnapshot, getToastSnapshot)
-
+  const toasts = useSyncExternalStore(
+    subscribeToast,
+    getToastSnapshot,
+    getToastSnapshot
+  )
   if (toasts.length === 0) return null
-
   return (
-    <div
-      style={{
-        position: "absolute",
-        bottom: 12,
-        right: 12,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        zIndex: 40,
-        pointerEvents: "auto",
-      }}
-    >
+    <div className="absolute [bottom:12px] [right:12px] flex flex-col [gap:8px] z-[40] pointer-events-auto">
       {toasts.map((toast) => (
         <Toast key={toast.id} toast={toast} />
       ))}

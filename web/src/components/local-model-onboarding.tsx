@@ -21,9 +21,7 @@ import {
   transferLabel,
   transferProgress,
 } from "./local-inference-format"
-
 type Setup = ReturnType<typeof useOnboardingModelSetup>
-
 const progressIcon = (
   step: LocalModelRecommendationProgressStep,
   index: number
@@ -32,14 +30,13 @@ const progressIcon = (
     case "Completed":
       return <Check size={13} />
     case "Running":
-      return <Loader2 className="spin" size={13} />
+      return <Loader2 className="animate-spin" size={13} />
     case "Failed":
       return <AlertTriangle size={13} />
     case "Pending":
       return index + 1
   }
 }
-
 const ModelSummary = ({ model }: { model: LocalModel }): ReactNode => {
   const context = modelContextLength(model)
   return (
@@ -55,7 +52,6 @@ const ModelSummary = ({ model }: { model: LocalModel }): ReactNode => {
     </div>
   )
 }
-
 export function LocalModelOnboarding({
   setup,
 }: {
@@ -64,7 +60,6 @@ export function LocalModelOnboarding({
   const hardware = Option.getOrNull(Result.value(setup.hardware))
   const state = Option.getOrNull(Result.value(setup.view))
   if (state === null || state._tag === "Closed") return null
-
   const notice = Option.match(state.notice, {
     onNone: () => null,
     onSome: onboardingModelSetupFailureMessage,
@@ -84,16 +79,17 @@ export function LocalModelOnboarding({
     (operationModel?.acquisitionState._tag === "Failed"
       ? modelDownloadFailureMessage(operationModel.acquisitionState.failure)
       : null)
-
   return (
-    <main className="onboarding-page">
-      <div className="onboarding-shell">
-        <header className="onboarding-header">
-          <div className="onboarding-mark">
+    <main className="flex min-h-screen justify-center overflow-auto bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200">
+      <div className="box-border w-[min(980px,100%)] px-[clamp(18px,5vw,56px)] py-[clamp(28px,6vh,70px)]">
+        <header className="flex max-w-[760px] items-start gap-4 [&_h1]:mb-[9px] [&_h1]:text-[clamp(24px,4vw,34px)] [&_h1]:tracking-[-.025em] [&_p]:text-sm [&_p]:leading-[1.55] [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+          <div className="grid size-[50px] shrink-0 place-items-center rounded-[13px] border border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-800 dark:bg-blue-900 dark:text-blue-400">
             <Cpu size={26} />
           </div>
           <div>
-            <span className="eyebrow">Local inference setup</span>
+            <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
+              Local inference setup
+            </span>
             <h1>Choose the model that powers Magnitude</h1>
             <p>
               Everything runs on this machine. Magnitude assessed these
@@ -103,7 +99,7 @@ export function LocalModelOnboarding({
         </header>
 
         {hardware && (
-          <div className="onboarding-hardware">
+          <div className="my-6 flex flex-wrap items-center gap-x-4 gap-y-[7px] rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-[13px] py-2.5 text-slate-600 dark:text-slate-400 text-[11px]">
             <Cpu size={16} />
             <span>
               {Option.getOrElse(hardware.productName, () =>
@@ -121,13 +117,13 @@ export function LocalModelOnboarding({
         )}
 
         {notice && (
-          <div className="model-notice danger">
+          <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
             <AlertTriangle size={16} />
             {notice}
           </div>
         )}
         {Result.isFailure(setup.hardware) && (
-          <div className="model-notice danger">
+          <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
             <AlertTriangle size={16} />
             Hardware details are unavailable.
           </div>
@@ -139,7 +135,7 @@ export function LocalModelOnboarding({
               {content.discoveryFailure ? (
                 <AlertTriangle size={20} />
               ) : (
-                <Loader2 className="spin" size={20} />
+                <Loader2 className="animate-spin" size={20} />
               )}
               <div>
                 <h2>Preparing models for this machine</h2>
@@ -150,7 +146,7 @@ export function LocalModelOnboarding({
               </div>
             </section>
             {content.progress.length > 0 && (
-              <ol className="progress-steps onboarding-progress">
+              <ol className="progress-steps mt-[22px]">
                 {content.progress.map((step, index) => (
                   <li
                     key={`${step.id}:${index}`}
@@ -173,10 +169,12 @@ export function LocalModelOnboarding({
         )}
 
         {content._tag === "Closing" && (
-          <section className="onboarding-operation">
-            <Loader2 className="spin" size={24} />
+          <section className="mt-[26px] flex items-center gap-[15px] rounded-[11px] border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 p-5 text-blue-700 dark:text-blue-500 max-[760px]:flex-col max-[760px]:items-start [&>div:nth-child(2)]:min-w-0 [&>div:nth-child(2)]:flex-1 [&_h2]:mb-1 [&_h2]:text-[17px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+            <Loader2 className="animate-spin" size={24} />
             <div>
-              <span className="eyebrow">Finishing</span>
+              <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
+                Finishing
+              </span>
               <h2>Saving setup</h2>
               <p>Preparing the workspace…</p>
             </div>
@@ -184,7 +182,7 @@ export function LocalModelOnboarding({
         )}
 
         {operationModel && operation && (
-          <section className="onboarding-operation">
+          <section className="mt-[26px] flex items-center gap-[15px] rounded-[11px] border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 p-5 text-blue-700 dark:text-blue-500 max-[760px]:flex-col max-[760px]:items-start [&>div:nth-child(2)]:min-w-0 [&>div:nth-child(2)]:flex-1 [&_h2]:mb-1 [&_h2]:text-[17px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
             {operation._tag === "Loading" && operation.phase === "Failed" ? (
               <AlertTriangle size={24} />
             ) : (
@@ -192,13 +190,13 @@ export function LocalModelOnboarding({
                 className={
                   operation._tag === "Loading" && operation.phase === "Ready"
                     ? ""
-                    : "spin"
+                    : "animate-spin"
                 }
                 size={24}
               />
             )}
             <div>
-              <span className="eyebrow">
+              <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
                 {operation._tag === "Loading"
                   ? operation.phase
                   : operation._tag}
@@ -224,7 +222,7 @@ export function LocalModelOnboarding({
               {operation._tag === "Loading" && operation.phase === "Failed" && (
                 <button
                   type="button"
-                  className="primary-button"
+                  className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
                   onClick={() => setup.select(operation.configurationId)}
                 >
                   Retry
@@ -236,7 +234,7 @@ export function LocalModelOnboarding({
                 ) && (
                   <button
                     type="button"
-                    className="secondary-button"
+                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 dark:hover:bg-slate-750"
                     onClick={setup.cancel}
                     disabled={"cancelling" in operation && operation.cancelling}
                   >
@@ -251,7 +249,7 @@ export function LocalModelOnboarding({
         )}
 
         {content._tag === "Chooser" && operation === null && (
-          <section className="onboarding-choices">
+          <section className="mt-[22px] grid grid-cols-2 gap-[11px] max-[760px]:grid-cols-1">
             {content.options.map((option) => {
               const configurationId = Option.getOrNull(
                 localModelConfigurationId(option.model)
@@ -259,7 +257,7 @@ export function LocalModelOnboarding({
               return (
                 <button
                   type="button"
-                  className="onboarding-choice"
+                  className="appearance-none rounded-[10px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-875 p-[17px] text-left cursor-pointer font-[inherit] hover:border-blue-400 hover:bg-slate-100 dark:hover:border-blue-600 dark:hover:bg-slate-800 [&_h3]:mb-[5px] [&_h3]:text-[15px] [&_h3]:leading-[1.3] [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_p]:my-1.5 [&_p]:text-[12.5px] [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400"
                   key={option.id}
                   onClick={() =>
                     configurationId && setup.select(configurationId)
@@ -302,17 +300,21 @@ export function LocalModelOnboarding({
               )
             })}
             {content.options.length === 0 && (
-              <div className="empty-panel">
+              <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-875 p-[26px] text-center text-[13px] text-slate-500">
                 No compatible model choices are available yet.
               </div>
             )}
           </section>
         )}
 
-        <footer className="onboarding-footer">
+        <footer className="mt-6 flex items-center justify-between gap-4 text-[11px] text-slate-500 max-[760px]:flex-col max-[760px]:items-start">
           <span>Model files and inference stay on this machine.</span>
           {content._tag !== "Closing" && operation === null && (
-            <button type="button" className="text-button" onClick={setup.exit}>
+            <button
+              type="button"
+              className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
+              onClick={setup.exit}
+            >
               {state.exitKind === "Skip"
                 ? "Continue without loading a model"
                 : "Close"}

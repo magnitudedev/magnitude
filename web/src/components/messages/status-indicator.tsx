@@ -5,16 +5,13 @@
  */
 import { type ReactNode } from "react"
 import type { StatusIndicatorMessage as StatusIndicatorType } from "@magnitudedev/sdk"
-
-export function StatusIndicator({ message }: { message: StatusIndicatorType }): ReactNode {
+export function StatusIndicator({
+  message,
+}: {
+  message: StatusIndicatorType
+}): ReactNode {
   return (
-    <div
-      style={{
-        color: "var(--fg-secondary)",
-        fontSize: "13px",
-        fontFamily: "var(--font-mono)",
-      }}
-    >
+    <div className="text-slate-600 dark:text-slate-400 text-[13px] font-mono">
       {message.message}
     </div>
   )

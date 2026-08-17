@@ -9,20 +9,18 @@ import type { AssistantMessage as AssistantMessageType } from "@magnitudedev/sdk
 import { stripTrailingLineBreaks } from "@magnitudedev/client-common"
 import { MarkdownContent } from "../markdown-content"
 import { InterruptedDivider } from "./interrupted"
-
 export interface AssistantMessageProps {
   message: AssistantMessageType
   isStreaming?: boolean
   isInterrupted?: boolean
 }
-
 export function AssistantMessage({
   message,
   isStreaming = false,
   isInterrupted = false,
 }: AssistantMessageProps): ReactNode {
   return (
-    <div style={{ paddingLeft: "12px", paddingTop: "2px", paddingBottom: "2px", maxWidth: "min(860px, 100%)" }}>
+    <div className="[padding-left:12px] [padding-top:2px] [padding-bottom:2px] [max-width:min(860px,_100%)]">
       <MarkdownContent
         content={stripTrailingLineBreaks(message.content)}
         isStreaming={isStreaming}

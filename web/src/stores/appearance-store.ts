@@ -1,6 +1,6 @@
 import { Either, Schema } from "effect"
 import { useSyncExternalStore } from "react"
-import { injectCssVars } from "../styles/generate-css-vars"
+import { injectPaletteCssVars } from "../styles/palette-css-vars"
 
 export const AppearancePreferenceSchema = Schema.Literal(
   "system",
@@ -40,7 +40,6 @@ const applyAppearance = (): void => {
   const resolved = getResolvedAppearance()
   document.documentElement.dataset.theme = resolved
   document.documentElement.style.colorScheme = resolved
-  injectCssVars(resolved)
 }
 
 const publish = (): void => {
@@ -51,6 +50,7 @@ const publish = (): void => {
 export const initializeAppearance = (): void => {
   if (initialized) return
   initialized = true
+  injectPaletteCssVars()
   preference = readStoredPreference()
   mediaQuery = matchMedia("(prefers-color-scheme: dark)")
   mediaQuery.addEventListener("change", () => {

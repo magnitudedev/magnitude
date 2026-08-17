@@ -1,66 +1,41 @@
-import type { CSSProperties, ReactNode } from "react"
+import type { ReactNode } from "react"
 import { ArrowLeft } from "lucide-react"
-
 export interface ChatColumnPageProps {
   title: ReactNode
   backLabel?: string
   onBack: () => void
   children: ReactNode
   actions?: ReactNode
-  bodyStyle?: CSSProperties
 }
-
 export function ChatColumnPage({
   title,
   backLabel = "Back to session",
   onBack,
   children,
   actions,
-  bodyStyle,
 }: ChatColumnPageProps): ReactNode {
   return (
     <>
-      <div className="chat-title-bar">
+      <div className="mac:[-webkit-app-region:drag] h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-925 border-b border-slate-200 dark:border-slate-800 select-none">
         <button
           type="button"
           onClick={onBack}
           aria-label={backLabel}
           title={backLabel}
-          className="hover-surface hover-fg"
-          style={{
-            width: 28,
-            height: 28,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            background: "transparent",
-            border: "none",
-            borderRadius: 4,
-            cursor: "pointer",
-            flexShrink: 0,
-            marginRight: 8,
-          }}
+          className="bg-transparent hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 [width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] cursor-pointer shrink-0 [margin-right:8px]"
         >
           <ArrowLeft size={16} />
         </button>
-        <span className="chat-title-bar-title">{title}</span>
+        <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
+          {title}
+        </span>
         {actions ? (
-          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="[margin-left:auto] flex items-center [gap:8px]">
             {actions}
           </div>
         ) : null}
       </div>
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          display: "flex",
-          flexDirection: "column",
-          ...bodyStyle,
-        }}
-      >
-        {children}
-      </div>
+      <div className="flex min-h-0 flex-1 flex-col">{children}</div>
     </>
   )
 }

@@ -1,12 +1,10 @@
 import { Option } from "effect"
 import type { ReactNode } from "react"
 import type { LocalModelRadarAxes } from "@magnitudedev/client-common"
-
 interface Point {
   readonly x: number
   readonly y: number
 }
-
 const pointOnAxis = (
   index: number,
   value: number,
@@ -20,7 +18,6 @@ const pointOnAxis = (
     y: centerY + Math.sin(angle) * radius * value,
   }
 }
-
 export const radarPolygonPoints = (
   values: readonly number[],
   scale = 1
@@ -29,7 +26,6 @@ export const radarPolygonPoints = (
     .map((value, index) => pointOnAxis(index, value * scale))
     .map(({ x, y }) => `${x.toFixed(2)},${y.toFixed(2)}`)
     .join(" ")
-
 export function ModelRadarChart({
   axes,
 }: {
@@ -50,11 +46,10 @@ export function ModelRadarChart({
       )
       .map(({ x, y }) => `${x.toFixed(2)},${y.toFixed(2)}`)
       .join(" ")
-
   return (
-    <div className="mc-radar">
+    <div className="mt-2">
       <svg
-        className="mc-radar-plot"
+        className="h-auto max-h-[340px] w-full overflow-visible max-[1050px]:max-h-[220px]"
         viewBox="0 0 360 320"
         role="img"
         aria-label={`Model comparison profile. ${description}`}
@@ -62,7 +57,7 @@ export function ModelRadarChart({
         {[0.25, 0.5, 0.75, 1].map((scale) => (
           <polygon
             key={scale}
-            className="mc-radar-grid"
+            className="fill-none stroke-slate-300 stroke-1 [vector-effect:non-scaling-stroke] dark:stroke-slate-750"
             points={chartPoints([1, 1, 1, 1, 1], scale)}
           />
         ))}
@@ -71,7 +66,7 @@ export function ModelRadarChart({
           return (
             <line
               key={index}
-              className="mc-radar-grid"
+              className="fill-none stroke-slate-300 stroke-1 [vector-effect:non-scaling-stroke] dark:stroke-slate-750"
               x1={centerX}
               y1={centerY}
               x2={outer.x}
@@ -80,7 +75,7 @@ export function ModelRadarChart({
           )
         })}
         <polygon
-          className="mc-radar-profile"
+          className="fill-blue-700/20 stroke-blue-700 stroke-2 [stroke-linejoin:round] [vector-effect:non-scaling-stroke] dark:fill-blue-500/20 dark:stroke-blue-500"
           points={chartPoints(values)}
         />
         {values.map((value, index) => {
@@ -88,7 +83,7 @@ export function ModelRadarChart({
           return (
             <circle
               key={axes[index].label}
-              className="mc-radar-point"
+              className="fill-white stroke-violet-700 stroke-2 [vector-effect:non-scaling-stroke] dark:fill-slate-875 dark:stroke-violet-500"
               cx={point.x}
               cy={point.y}
               r="3.2"
@@ -96,24 +91,32 @@ export function ModelRadarChart({
           )
         })}
         {axes.map(({ label, detail, value }, index) => {
+          const unavailable = Option.isNone(value)
           const point = pointOnAxis(index, 1, centerX, centerY, labelRadius)
           const anchor =
             point.x < centerX - 10
               ? "end"
               : point.x > centerX + 10
-                ? "start"
-                : "middle"
+              ? "start"
+              : "middle"
           return (
             <text
               key={label}
-              className="mc-radar-axis-label"
-              data-unavailable={Option.isNone(value)}
+              className="fill-slate-600 font-sans text-[9px] font-[650] leading-[normal] tracking-[.055em] dark:fill-slate-400"
               x={point.x}
               y={point.y}
               textAnchor={anchor}
             >
               <tspan x={point.x}>{label}</tspan>
-              <tspan className="mc-radar-axis-detail" x={point.x} dy="14">
+              <tspan
+                className={`${
+                  unavailable
+                    ? "fill-slate-500"
+                    : "fill-slate-900 dark:fill-slate-200"
+                } font-mono text-[10px] font-normal leading-[normal] tracking-normal`}
+                x={point.x}
+                dy="14"
+              >
                 {detail}
               </tspan>
             </text>

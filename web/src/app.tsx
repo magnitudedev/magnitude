@@ -99,9 +99,7 @@ import type {
 } from "@magnitudedev/sdk"
 import type { SlotId } from "@magnitudedev/sdk"
 import { registerWebCommands } from "./commands/register"
-
 registerWebCommands()
-
 function formatRoleLabel(role: string | null | undefined): string {
   if (!role) return "Leader"
   return role.charAt(0).toUpperCase() + role.slice(1)
@@ -113,21 +111,20 @@ function formatRoleLabel(role: string | null | undefined): string {
  */
 function findSlotProfileForRole(
   profiles: SlotProfiles | null,
-  role: string | null | undefined,
+  role: string | null | undefined
 ): SlotProfile | null {
   if (!profiles || !role || !isRoleId(role)) return null
   const slotId =
     ROLE_TO_SLOT[role] === "primary" ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
   return Option.getOrNull(findSlotProfile(profiles, slotId))
 }
-
 function useRootSlotProfile(slotProfiles: SlotProfiles | null): {
   roleId: string
   roleLabel: string
   profile: SlotProfile | null
 } {
   const rootRole = useDisplayState(
-    (state) => state.actors["root"]?.role ?? null,
+    (state) => state.actors["root"]?.role ?? null
   )
   const roleId = rootRole ?? "leader"
   return {
@@ -150,11 +147,18 @@ function SessionsSidebarContainer(props?: {
   const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
   const settingsTab = useAtomValue(settingsTabAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
-
   const trimmedSearchQuery = searchQuery.trim()
   const sessionPage = usePaginatedSessions({
-    ...(cwdFilter ? { cwd: cwdFilter } : {}),
-    ...(trimmedSearchQuery ? { query: trimmedSearchQuery } : {}),
+    ...(cwdFilter
+      ? {
+          cwd: cwdFilter,
+        }
+      : {}),
+    ...(trimmedSearchQuery
+      ? {
+          query: trimmedSearchQuery,
+        }
+      : {}),
     pageSize: 50,
   })
 
@@ -170,17 +174,22 @@ function SessionsSidebarContainer(props?: {
           window.addEventListener("__magnitude:focus-search", handler)
           yield* Effect.addFinalizer(() =>
             Effect.sync(() =>
-              window.removeEventListener("__magnitude:focus-search", handler),
-            ),
+              window.removeEventListener("__magnitude:focus-search", handler)
+            )
           )
-        }),
+        })
       ),
-    [],
+    []
   )
   useAtomMount(focusSearchAtom)
-
   const cwdOptionsResult = useAtomValue(
-    client.rpc.query("ListSessionCwds", {}, { reactivityKeys: ["sessions"] }),
+    client.rpc.query(
+      "ListSessionCwds",
+      {},
+      {
+        reactivityKeys: ["sessions"],
+      }
+    )
   )
   const cwdOptions = Result.match(cwdOptionsResult, {
     onInitial: () => [] as string[],
@@ -188,13 +197,13 @@ function SessionsSidebarContainer(props?: {
     onSuccess: (result) =>
       (result.value as SessionCwdSummary[]).map((summary) => summary.cwd),
   })
-
   const handleNewSession = () => {
     setSettingsTab(null)
-    startNewSession({ cwd: cwdFilter })
+    startNewSession({
+      cwd: cwdFilter,
+    })
     if (props?.overlay && props.onCloseOverlay) props.onCloseOverlay()
   }
-
   return (
     <SessionsSidebar
       loading={sessionPage.loading}
@@ -255,7 +264,7 @@ function FileViewerPanelContainer(): ReactNode {
   // Determine format based on file extension — images need base64
   const isImageFile = filePath
     ? ["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(
-        filePath.split(".").pop() ?? "",
+        filePath.split(".").pop() ?? ""
       )
     : false
 
@@ -272,10 +281,12 @@ function FileViewerPanelContainer(): ReactNode {
               path: filePath,
               format: isImageFile ? "base64" : "text",
             },
-            { reactivityKeys: ["files"] },
+            {
+              reactivityKeys: ["files"],
+            }
           )
         : Atom.make(() => null),
-    [client, selectedCwd, filePath, isImageFile],
+    [client, selectedCwd, filePath, isImageFile]
   )
   const result = useAtomValue(readFileAtom)
 
@@ -291,7 +302,6 @@ function FileViewerPanelContainer(): ReactNode {
     filePath && result !== null && Result.isSuccess(result)
       ? (result.value as ReadFileResult).content
       : null
-
   return (
     <FileViewerPanel
       filePath={filePath}
@@ -312,7 +322,6 @@ function WorkerDetailPanelContainer({
   const { topForkId } = useDisplayViewController()
   const actors = useDisplayState((state) => state.actors)
   const tasks = useDisplayState((state) => state.tasks)
-
   const actor = topForkId ? actors[topForkId] ?? null : null
   const worker = topForkId ? deriveWorkerInfo(topForkId, actors) : null
   const taskTitle = actor?.taskId
@@ -320,7 +329,6 @@ function WorkerDetailPanelContainer({
     : null
   const profile = findSlotProfileForRole(slotProfiles, actor?.role)
   const modelDisplayName = profile?.modelDisplayName ?? null
-
   return (
     <WorkerDetailPanel
       forkId={topForkId}
@@ -330,7 +338,6 @@ function WorkerDetailPanelContainer({
     />
   )
 }
-
 function WorkerDetailPageContainer({
   slotProfiles,
 }: {
@@ -344,7 +351,6 @@ function WorkerDetailPageContainer({
   const title = worker
     ? `${formatRoleLabel(worker.role)}: ${worker.name}`
     : "Worker"
-
   return (
     <ChatColumnPage
       title={title}
@@ -367,14 +373,21 @@ function WorkerDetailPageContainer({
     </ChatColumnPage>
   )
 }
-
 function deriveWorkerInfo(
   forkId: string,
-  actors: Record<string, DisplayActor>,
-): { forkId: string; role: string; name: string } | null {
+  actors: Record<string, DisplayActor>
+): {
+  forkId: string
+  role: string
+  name: string
+} | null {
   const actor = actors[forkId]
   if (!actor || actor.kind !== "worker") return null
-  return { forkId, role: actor.role, name: actor.name }
+  return {
+    forkId,
+    role: actor.role,
+    name: actor.name,
+  }
 }
 
 /** Work status container — timer + active task table above composer */
@@ -395,7 +408,6 @@ function WorkStatusBarContainer({
   if (rootActor === null && selectedSessionId !== null) {
     return <WorkStatusBarSkeleton />
   }
-
   return (
     <WorkStatusBar
       rootActor={rootActor}
@@ -406,7 +418,6 @@ function WorkStatusBarContainer({
     />
   )
 }
-
 function ComposerContainer({
   docked = false,
 }: {
@@ -433,7 +444,6 @@ function ComposerContainer({
     : Result.isFailure(slotsResult)
     ? "Model runtime state is unavailable"
     : "Load a local model before sending"
-
   const commandContext: CommandContext = useMemo(
     () => ({
       resetConversation: () => startNewSession(),
@@ -451,7 +461,7 @@ function ComposerContainer({
       activateSkill: (
         skillName: string,
         _skillPath: string | undefined,
-        args: string,
+        args: string
       ) => {
         const content = args.trim()
           ? `/${skillName} ${args.trim()}`
@@ -461,7 +471,7 @@ function ComposerContainer({
       initProject: () => {
         showToast(
           "info",
-          "Project initialization is not available in the web app yet.",
+          "Project initialization is not available in the web app yet."
         )
       },
       openSettings: () => setSettingsTab("models"),
@@ -483,26 +493,25 @@ function ComposerContainer({
       setBashMode,
       setSettingsTab,
       onboarding.open,
-    ],
+    ]
   )
-
   const composer = useComposerState(commandContext)
   sendRef.current = (text: string) => composer.handleSend(text)
-
   const handleMentionConfirm = useCallback(
     (item: { path: string }) => {
       setFilePath(item.path)
     },
-    [setFilePath],
+    [setFilePath]
   )
-
   return (
     <Composer
       role={composer.roleLabel}
       isStreaming={composer.isStreaming}
       bashMode={composer.bashMode}
       onSend={(text, mentions) => {
-        void composer.handleSend(text, { mentions })
+        void composer.handleSend(text, {
+          mentions,
+        })
       }}
       onInterrupt={composer.handleInterrupt}
       onRunBash={composer.handleRunBash}
@@ -528,7 +537,7 @@ function FooterBarContainer({
   const selectedSessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const context = useDisplayState(
-    (state) => state.actors["root"]?.context ?? null,
+    (state) => state.actors["root"]?.context ?? null
   )
   const { profile } = useRootSlotProfile(slotProfiles)
   const tokenCap = profile?.contextWindow ?? null
@@ -541,7 +550,7 @@ function FooterBarContainer({
   const slotActions = useModelSlotActions()
   const slots = Option.getOrNull(Result.value(slotsResult))
   const currentModel = deriveCurrentLocalModel(
-    Option.fromNullable(slots?.slots.primary),
+    Option.fromNullable(slots?.slots.primary)
   )
   const allocation = slots
     ? modelSlotResidentAllocation(slots.slots.primary)
@@ -556,7 +565,7 @@ function FooterBarContainer({
           domain.contextBytes +
           domain.computeBytes +
           domain.auxiliaryBytes,
-        0,
+        0
       ),
   })
   const selectedSessionAtom = useMemo(
@@ -564,11 +573,15 @@ function FooterBarContainer({
       selectedSessionId
         ? client.rpc.query(
             "GetSession",
-            { sessionId: selectedSessionId },
-            { reactivityKeys: ["sessions"] },
+            {
+              sessionId: selectedSessionId,
+            },
+            {
+              reactivityKeys: ["sessions"],
+            }
           )
         : Atom.make(() => null),
-    [client, selectedSessionId],
+    [client, selectedSessionId]
   )
   const selectedSessionResult = useAtomValue(selectedSessionAtom)
   const sessionCwd =
@@ -576,14 +589,12 @@ function FooterBarContainer({
       ? (selectedSessionResult.value as SessionMetadata).cwd
       : null
   const cwd = sessionCwd ?? selectedCwd
-
   const selectedModel = Option.flatMap(
     Option.all({
       catalog: Result.value(catalogResult),
       slots: Result.value(slotsResult),
     }),
-    ({ catalog, slots }) =>
-      selectedSlotModel(catalog, slots, PRIMARY_SLOT_ID),
+    ({ catalog, slots }) => selectedSlotModel(catalog, slots, PRIMARY_SLOT_ID)
   )
   const thinkingOptions = Option.match(selectedModel, {
     onNone: () => [],
@@ -605,20 +616,20 @@ function FooterBarContainer({
     currentModel._tag === "NoSelection"
       ? "Choose model"
       : currentModel.displayName
-  const modelResidency = currentModel._tag === "NoSelection"
-    ? null
-    : currentModel._tag === "Running"
-    ? "ready" as const
-    : currentModel._tag === "Loading" || currentModel._tag === "Stopping"
-    ? "loading" as const
-    : "not-ready" as const
-  const modelLoadingPercentage = currentModel._tag === "Loading"
-    ? currentModel.percentage
-    : null
-  const memoryLabel = currentModel._tag === "Running" && residentBytes !== null
-    ? `${formatBytes(residentBytes)} mem`
-    : null
-
+  const modelResidency =
+    currentModel._tag === "NoSelection"
+      ? null
+      : currentModel._tag === "Running"
+      ? ("ready" as const)
+      : currentModel._tag === "Loading" || currentModel._tag === "Stopping"
+      ? ("loading" as const)
+      : ("not-ready" as const)
+  const modelLoadingPercentage =
+    currentModel._tag === "Loading" ? currentModel.percentage : null
+  const memoryLabel =
+    currentModel._tag === "Running" && residentBytes !== null
+      ? `${formatBytes(residentBytes)} mem`
+      : null
   return (
     <FooterBar
       context={context}
@@ -647,29 +658,19 @@ function FooterBarContainer({
     />
   )
 }
-
 function BottomDockContainer({
   slotProfiles,
 }: {
   slotProfiles: SlotProfiles | null
 }): ReactNode {
   return (
-    <div
-      style={{
-        margin: "14px 12px 14px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        flexShrink: 0,
-      }}
-    >
+    <div className="[margin:14px_12px_14px] flex flex-col [gap:8px] shrink-0">
       <WorkStatusBarContainer slotProfiles={slotProfiles} />
       <ComposerContainer docked />
       <FooterBarContainer slotProfiles={slotProfiles} />
     </div>
   )
 }
-
 function ChatTitleBar({
   onOpenSidebar,
 }: {
@@ -683,11 +684,15 @@ function ChatTitleBar({
       selectedSessionId
         ? client.rpc.query(
             "GetSession",
-            { sessionId: selectedSessionId },
-            { reactivityKeys: ["sessions"] },
+            {
+              sessionId: selectedSessionId,
+            },
+            {
+              reactivityKeys: ["sessions"],
+            }
           )
         : Atom.make(() => null),
-    [client, selectedSessionId],
+    [client, selectedSessionId]
   )
   const selectedSessionResult = useAtomValue(selectedSessionAtom)
   const metadataTitle =
@@ -699,13 +704,15 @@ function ChatTitleBar({
   const title = selectedSessionId
     ? (streamedTitle ?? metadataTitle)?.trim() || "Untitled session"
     : "New session"
-
   return (
-    <div className="chat-title-bar" title={title}>
+    <div
+      className="mac:[-webkit-app-region:drag] h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-925 border-b border-slate-200 dark:border-slate-800 select-none"
+      title={title}
+    >
       {onOpenSidebar && (
         <button
           type="button"
-          className="icon-button mobile-sidebar-button"
+          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 shrink-0 mr-2.5"
           aria-label="Open sessions"
           title="Open sessions"
           onClick={onOpenSidebar}
@@ -713,7 +720,9 @@ function ChatTitleBar({
           <Menu size={17} />
         </button>
       )}
-      <span className="chat-title-bar-title">{title}</span>
+      <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
+        {title}
+      </span>
     </div>
   )
 }
@@ -723,7 +732,6 @@ function useInterruptAllListener(): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const interruptMutation = useAtomSet(client.rpc.mutation("Interrupt"))
-
   const interruptAtom = useMemo(
     () =>
       Atom.make(
@@ -733,21 +741,22 @@ function useInterruptAllListener(): void {
             interruptMutation({
               payload: {
                 sessionId: selectedSessionId,
-                target: { _tag: "all" },
+                target: {
+                  _tag: "all",
+                },
               },
             })
           }
           window.addEventListener("__magnitude:interrupt-all", handler)
           yield* Effect.addFinalizer(() =>
             Effect.sync(() =>
-              window.removeEventListener("__magnitude:interrupt-all", handler),
-            ),
+              window.removeEventListener("__magnitude:interrupt-all", handler)
+            )
           )
-        }),
+        })
       ),
-    [selectedSessionId, interruptMutation],
+    [selectedSessionId, interruptMutation]
   )
-
   useAtomMount(interruptAtom)
 }
 
@@ -755,21 +764,18 @@ function useInterruptAllListener(): void {
 function AppInner(): ReactNode {
   // Detect responsive mode (≤640px) — no useEffect, uses matchMedia store
   const isNarrow = useSyncExternalStore(subscribeResponsive, getIsNarrow)
-
   useMenuActions()
   useInterruptAllListener()
-
   const onboarding = useOnboardingModelSetup()
   const onboardingState = Option.getOrNull(Result.value(onboarding.view))
-
   if (Result.isFailure(onboarding.view)) {
     return (
-      <div className="full-page-state">
+      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
         <AlertTriangleIcon />
         <h1>Couldn’t load local setup</h1>
         <p>The daemon did not return onboarding state.</p>
         <button
-          className="primary-button"
+          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
           type="button"
           onClick={onboarding.retry}
         >
@@ -780,8 +786,8 @@ function AppInner(): ReactNode {
   }
   if (onboardingState === null) {
     return (
-      <div className="full-page-state">
-        <div className="state-spinner" />
+      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+        <div className="size-[26px] rounded-full border-2 border-slate-300 border-t-blue-700 animate-spin dark:border-slate-750 dark:border-t-blue-500" />
         <h1>Connecting to local inference</h1>
         <p>Reading the current daemon state…</p>
       </div>
@@ -792,11 +798,13 @@ function AppInner(): ReactNode {
   }
   return <AuthenticatedAppContent isNarrow={isNarrow} />
 }
-
 function AlertTriangleIcon(): ReactNode {
-  return <span className="state-error-icon">!</span>
+  return (
+    <span className="size-[30px] rounded-full grid place-items-center text-red-700 bg-red-200 font-extrabold dark:text-red-300 dark:bg-red-800">
+      !
+    </span>
+  )
 }
-
 function AuthenticatedAppContent({
   isNarrow,
 }: {
@@ -804,7 +812,6 @@ function AuthenticatedAppContent({
 }): ReactNode {
   useSessionPreload()
   useActiveSessionStatusesSubscription()
-
   const connectionError = useDisplayConnectionError()
   const platform = usePlatform()
   const isDesktop = platform.id === "desktop"
@@ -815,19 +822,13 @@ function AuthenticatedAppContent({
   const settingsTab = useAtomValue(settingsTabAtom)
   const controller = useDisplayViewController()
   const forkStack = controller.expandedForkStack
-
   const panelOpen = settingsTab !== null
   const workerDetailOpen = !panelOpen && forkStack.length > 0
-
   return (
     <div
-      className="app"
-      style={{
-        display: "flex",
-        height: "100vh",
-        overflow: "hidden",
-        background: isDesktop ? "transparent" : "var(--bg-base)",
-      }}
+      className={`${
+        isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-925"
+      }  app flex [height:100vh] overflow-hidden`}
     >
       {/* Docked sidebar — hidden by CSS when narrow */}
       {!isNarrow && <SessionsSidebarContainer />}
@@ -838,30 +839,13 @@ function AuthenticatedAppContent({
           onCloseOverlay={() => setSidebarVisible(false)}
         />
       )}
-      <div
-        className="chat-column"
-        style={{
-          flex: 1,
-          minWidth: 0,
-          display: "flex",
-          flexDirection: "column",
-          position: "relative",
-          background: "var(--bg-base)",
-        }}
-      >
+      <div className="chat-column [flex:1] min-w-0 flex flex-col relative bg-slate-50 dark:bg-slate-925">
         {/* Main chat column — always mounted, always in the layout. When a
             panel or worker detail is open, it's covered by an absolute
             overlay. Keeping it in the layout (not display:none) preserves
             scroll metrics so the scroll controller can capture and restore
             the correct position across overlay navigation. */}
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            flex: 1,
-            minHeight: 0,
-          }}
-        >
+        <div className="flex flex-col [flex:1] min-h-0">
           <ChatTitleBar
             onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
           />
@@ -869,22 +853,13 @@ function AuthenticatedAppContent({
           <BottomDockContainer slotProfiles={slotProfiles} />
         </div>
         {(panelOpen || workerDetailOpen) && (
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              display: "flex",
-              flexDirection: "column",
-              background: "var(--bg-base)",
-              zIndex: 1,
-            }}
-          >
+          <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-925 z-[1]">
             {panelOpen && (
               <>
                 {isNarrow && (
                   <button
                     type="button"
-                    className="icon-button settings-mobile-navigation-button"
+                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-925"
                     aria-label="Open settings navigation"
                     title="Open settings navigation"
                     onClick={() => setSidebarVisible(true)}
@@ -927,7 +902,6 @@ function AuthenticatedAppContent({
     </div>
   )
 }
-
 export function App(): ReactNode {
   return (
     <DisplayViewControllerProvider>

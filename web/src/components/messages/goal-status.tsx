@@ -8,19 +8,25 @@ import { type ReactNode } from "react"
 import { Option } from "effect"
 import { Target, CheckCircle2 } from "lucide-react"
 import type { GoalStatusMessage as GoalStatusType } from "@magnitudedev/sdk"
-
-export function GoalStatus({ message }: { message: GoalStatusType }): ReactNode {
+export function GoalStatus({
+  message,
+}: {
+  message: GoalStatusType
+}): ReactNode {
   const objective = Option.getOrNull(message.objective)
   const evidence = Option.getOrNull(message.evidence)
   if (message.status === "started") {
     return (
-      <div style={{ display: "flex", alignItems: "center", gap: "6px", padding: "2px 0" }}>
-        <Target size={14} style={{ color: "var(--accent-success)", flexShrink: 0 }} />
-        <span style={{ fontFamily: "var(--font-sans)", fontSize: "13px", color: "var(--accent-success)" }}>
+      <div className="flex items-center [gap:6px] [padding:2px_0]">
+        <Target
+          size={14}
+          className="text-green-700 dark:text-green-500 shrink-0"
+        />
+        <span className="font-sans text-[13px] text-green-700 dark:text-green-500">
           Goal started
         </span>
         {objective && (
-          <span style={{ fontFamily: "var(--font-sans)", fontSize: "13px", color: "var(--fg-secondary)" }}>
+          <span className="font-sans text-[13px] text-slate-600 dark:text-slate-400">
             · {objective}
           </span>
         )}
@@ -29,13 +35,16 @@ export function GoalStatus({ message }: { message: GoalStatusType }): ReactNode 
   }
   // finished
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "6px", padding: "2px 0" }}>
-      <CheckCircle2 size={14} style={{ color: "var(--accent-success)", flexShrink: 0 }} />
-      <span style={{ fontFamily: "var(--font-sans)", fontSize: "13px", color: "var(--accent-success)" }}>
+    <div className="flex items-center [gap:6px] [padding:2px_0]">
+      <CheckCircle2
+        size={14}
+        className="text-green-700 dark:text-green-500 shrink-0"
+      />
+      <span className="font-sans text-[13px] text-green-700 dark:text-green-500">
         Goal finished
       </span>
       {evidence && (
-        <span style={{ fontFamily: "var(--font-sans)", fontSize: "13px", color: "var(--fg-secondary)" }}>
+        <span className="font-sans text-[13px] text-slate-600 dark:text-slate-400">
           · {evidence}
         </span>
       )}

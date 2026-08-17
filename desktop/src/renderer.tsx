@@ -12,32 +12,31 @@
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
-import { App, PlatformProvider, createAgentClient, AgentClientProvider, initializeAppearance, stopDisplayViewController } from "@magnitudedev/web"
+import {
+  App,
+  PlatformProvider,
+  createAgentClient,
+  AgentClientProvider,
+  initializeAppearance,
+  stopDisplayViewController,
+} from "@magnitudedev/web"
 import { DaemonConnectionError } from "@magnitudedev/web"
 import { createDesktopPlatform } from "./platform"
-import "@web-styles/vars.css"
-import "@web-styles/globals.css"
+import "@web-styles/tailwind.css"
 
 initializeAppearance()
 
 const desktopApi = window.__magnitudeDesktop
 const root = createRoot(document.getElementById("root")!)
-let activePlatform: Awaited<ReturnType<typeof createDesktopPlatform>> | undefined
+let activePlatform:
+  | Awaited<ReturnType<typeof createDesktopPlatform>>
+  | undefined
 
 document.documentElement.dataset.desktopPlatform = desktopApi.platform
 
 function renderLoading() {
   root.render(
-    <div style={{
-      display: "flex",
-      height: "100vh",
-      alignItems: "center",
-      justifyContent: "center",
-      background: "var(--bg-base)",
-      color: "var(--fg-secondary)",
-      fontFamily: "var(--font-sans)",
-      fontSize: 14,
-    }}>
+    <div className="flex h-screen items-center justify-center bg-slate-50 font-sans text-[14px] text-slate-600 dark:bg-slate-925 dark:text-slate-400">
       Connecting to Magnitude daemon...
     </div>
   )
@@ -70,7 +69,7 @@ async function renderApp() {
           <App />
         </AgentClientProvider>
       </RegistryProvider>
-    </PlatformProvider>,
+    </PlatformProvider>
   )
 }
 

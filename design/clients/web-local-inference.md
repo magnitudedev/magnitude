@@ -91,10 +91,19 @@ Web and Electron share one renderer-owned appearance preference: `system`, `ligh
 An explicit light or dark choice is persisted in renderer-local storage. This preference is local
 presentation state and does not belong in ACN, SDK, or client-common.
 
-The resolved appearance selects semantic CSS variables and a matching syntax-highlighting theme.
-Components consume semantic variables and must not branch on appearance or introduce raw
-mode-specific colors. The terminal appearance detector and `CliTheme` remain CLI-owned because
-terminal palette discovery and transparent terminal backgrounds are not browser semantics.
+The resolved appearance sets the document theme selector and selects a matching
+syntax-highlighting theme. Components express appearance with direct Tailwind palette utilities and
+`dark:` variants. The Tailwind color namespace contains only the canonical Magnitude palette plus
+explicit black, white, and transparent values; components do not introduce raw colors, arbitrary
+palette-color utilities, runtime palette mixing, or a parallel semantic color-token layer. Literal
+black alpha is reserved for shadows and overlays. Repeated visual behavior is shared through
+meaningful React components rather than CSS component classes.
+
+Static presentation uses Tailwind utilities. Inline styles are reserved for values derived from
+runtime data, such as measured dimensions, progress values, and SVG geometry, or for third-party
+renderer output that cannot consume classes. The terminal appearance detector and `CliTheme` remain
+CLI-owned because terminal palette discovery and transparent terminal backgrounds are not browser
+semantics.
 
 ## Conformance
 
@@ -109,3 +118,5 @@ terminal palette discovery and transparent terminal backgrounds are not browser 
 - Slash commands and host menu actions route to the corresponding web-native surface.
 - System appearance is the default, explicit overrides persist locally, and code highlighting tracks
   the resolved theme.
+- Browser and Electron builds compile the same direct Tailwind treatments from the approved
+  Magnitude palette; unauthorized colors and handwritten feature CSS are mechanically rejected.

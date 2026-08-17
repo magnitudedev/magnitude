@@ -47,7 +47,8 @@ describe("appearance preference", () => {
     dark = false
     changeListeners[0]?.()
     expect(appearance.getResolvedAppearance()).toBe("light")
-    expect(style.get("--fg-primary")).toBeDefined()
+    expect(style.get("--magnitude-slate-900")).toBeDefined()
+    expect(style.get("--magnitude-blue-700")).toBeDefined()
 
     appearance.setAppearancePreference("dark")
     expect(storage.get("magnitude.appearance")).toBe("dark")

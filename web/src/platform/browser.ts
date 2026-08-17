@@ -10,16 +10,28 @@ import {
   makeAcnJitRuntime,
   makeRemoteAcnInstanceManager,
 } from "@magnitudedev/sdk"
-import type { Platform, Storage, Clipboard, Notification, Dialogs } from "@magnitudedev/client-common"
+import type {
+  Platform,
+  Storage,
+  Clipboard,
+  Notification,
+  Dialogs,
+} from "@magnitudedev/client-common"
 
 // Experimental File System Access API — only available in Chromium browsers.
 // This is a client-host capability, not agent-host filesystem access.
-interface FileSystemDirectoryHandle { readonly name: string }
-interface FileSystemFileHandle { readonly name: string }
+interface FileSystemDirectoryHandle {
+  readonly name: string
+}
+interface FileSystemFileHandle {
+  readonly name: string
+}
 
 interface WindowWithFSAccess extends Window {
   showDirectoryPicker?(): Promise<FileSystemDirectoryHandle>
-  showOpenFilePicker?(opts: { multiple?: boolean }): Promise<FileSystemFileHandle[]>
+  showOpenFilePicker?(opts: {
+    multiple?: boolean
+  }): Promise<FileSystemFileHandle[]>
 }
 
 const STORAGE_KEY_PREFIX = "magnitude:"
@@ -79,7 +91,10 @@ const browserClipboard: Clipboard = {
 
 const browserNotifications: Notification = {
   show(title: string, body: string): void {
-    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+    if (
+      typeof Notification !== "undefined" &&
+      Notification.permission === "granted"
+    ) {
       try {
         new Notification(title, { body })
       } catch {
@@ -104,7 +119,9 @@ const browserDialogs: Dialogs = {
     const picker = (window as WindowWithFSAccess).showOpenFilePicker
     if (!picker) return null
     try {
-      const handles = await picker.call(window, { multiple: options?.multiple ?? false })
+      const handles = await picker.call(window, {
+        multiple: options?.multiple ?? false,
+      })
       return handles.map((h) => h.name)
     } catch {
       return null
@@ -113,27 +130,34 @@ const browserDialogs: Dialogs = {
 }
 
 export async function createBrowserPlatform(
-  proxyUrl: string = window.location.origin,
+  proxyUrl: string = window.location.origin
 ): Promise<Platform> {
   const manager = await Effect.runPromise(
-    makeRemoteAcnInstanceManager(proxyUrl).pipe(Effect.provide(FetchHttpClient.layer)),
+    makeRemoteAcnInstanceManager(proxyUrl).pipe(
+      Effect.provide(FetchHttpClient.layer)
+    )
   )
   const acnScope = await Effect.runPromise(Scope.make())
   const acn = await Effect.runPromise(
     makeAcnJitRuntime().pipe(
       Effect.provideService(AcnInstanceManager, manager),
       Effect.provideService(Scope.Scope, acnScope),
-      Effect.provide(FetchHttpClient.layer),
-    ),
+      Effect.provide(FetchHttpClient.layer)
+    )
   )
   window.addEventListener("pagehide", (event) => {
     if (event.persisted) return
-    Effect.runFork(acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))))
+    Effect.runFork(
+      acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void)))
+    )
   })
-  const protocolLayer = acn.protocolLayer.pipe(Layer.provide(FetchHttpClient.layer))
-  const shutdown = () => Effect.runPromise(
-    acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+  const protocolLayer = acn.protocolLayer.pipe(
+    Layer.provide(FetchHttpClient.layer)
   )
+  const shutdown = () =>
+    Effect.runPromise(
+      acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void)))
+    )
   return {
     id: "web",
     protocolLayer,
