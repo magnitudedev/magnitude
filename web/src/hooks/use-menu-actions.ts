@@ -12,11 +12,8 @@ import { useMemo } from "react"
 import { Effect } from "effect"
 import { Atom, useAtomSet, useAtomValue, useAtomMount } from "@effect-atom/atom-react"
 import { useDisplayViewController, usePlatform, useSessionActions } from "@magnitudedev/client-common"
-import {
-  settingsOpenAtom,
-  nextEscWillKillAllAtom,
-} from "@magnitudedev/client-common"
-import { modelCenterTabAtom, sidebarSearchAtom } from "../state/web-atoms"
+import { nextEscWillKillAllAtom } from "@magnitudedev/client-common"
+import { settingsTabAtom, sidebarSearchAtom } from "../state/web-atoms"
 
 /** Check if the platform uses Cmd (macOS) vs Ctrl (other). */
 function isModKey(e: KeyboardEvent): boolean {
@@ -32,12 +29,10 @@ export function useMenuActions(): void {
   const platform = usePlatform()
   const { startNewSession } = useSessionActions()
   const setSearchQuery = useAtomSet(sidebarSearchAtom)
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
+  const setSettingsTab = useAtomSet(settingsTabAtom)
   const setNextEscWillKillAll = useAtomSet(nextEscWillKillAllAtom)
   const { popFork, togglePresentationMode, displayMode, expandedForkStack } = useDisplayViewController()
-  const settingsOpen = useAtomValue(settingsOpenAtom)
-  const modelCenterTab = useAtomValue(modelCenterTabAtom)
+  const settingsTab = useAtomValue(settingsTabAtom)
 
   // Menu subscription atom — subscribes on mount, unsubscribes on dispose.
   // Only present in desktop mode (platform.onMenuAction is undefined in browser).
@@ -49,6 +44,7 @@ export function useMenuActions(): void {
           const unsub = platform.onMenuAction((action) => {
             switch (action._tag) {
               case "new-session":
+                setSettingsTab(null)
                 startNewSession()
                 break
               case "toggle-sidebar-search":
@@ -59,8 +55,7 @@ export function useMenuActions(): void {
                 togglePresentationMode()
                 break
               case "open-settings":
-                setModelCenterTab(null)
-                setSettingsOpen(true)
+                setSettingsTab("models")
                 break
               case "quit":
                 platform.quit?.()
@@ -70,7 +65,7 @@ export function useMenuActions(): void {
           yield* Effect.addFinalizer(() => Effect.sync(unsub))
         }),
       ),
-    [platform, displayMode, startNewSession, setSearchQuery, togglePresentationMode, setSettingsOpen, setModelCenterTab],
+    [platform, displayMode, startNewSession, setSearchQuery, togglePresentationMode, setSettingsTab],
   )
 
   // Keyboard handler atom — Esc handling (always) + browser-mode shortcuts.
@@ -88,9 +83,8 @@ export function useMenuActions(): void {
               const isDoubleEsc = now - lastEscTime < 400
               lastEscTime = now
 
-              if (settingsOpen || modelCenterTab !== null) {
-                setSettingsOpen(false)
-                setModelCenterTab(null)
+              if (settingsTab !== null) {
+                setSettingsTab(null)
                 e.preventDefault()
                 return
               }
@@ -124,6 +118,7 @@ export function useMenuActions(): void {
                 case "n":
                   // Cmd/Ctrl+N → new session
                   e.preventDefault()
+                  setSettingsTab(null)
                   startNewSession()
                   break
                 case "r":
@@ -140,8 +135,7 @@ export function useMenuActions(): void {
                 case ",":
                   // Cmd/Ctrl+, → open settings
                   e.preventDefault()
-                  setModelCenterTab(null)
-                  setSettingsOpen(true)
+                  setSettingsTab("models")
                   break
               }
             }
@@ -152,7 +146,7 @@ export function useMenuActions(): void {
           )
         }),
       ),
-    [expandedForkStack.length, platform.id, displayMode, settingsOpen, modelCenterTab, popFork, startNewSession, setSearchQuery, togglePresentationMode, setSettingsOpen, setModelCenterTab, setNextEscWillKillAll],
+    [expandedForkStack.length, platform.id, displayMode, settingsTab, popFork, startNewSession, setSearchQuery, togglePresentationMode, setSettingsTab, setNextEscWillKillAll],
   )
 
   useAtomMount(menuAtom)

@@ -8,7 +8,6 @@
 import { Atom } from "@effect-atom/atom-react"
 import {
   selectedCwdAtom,
-  settingsOpenAtom,
   selectedFilePathAtom,
   composerTextAtom,
   composerAttachmentsAtom,
@@ -23,7 +22,6 @@ import {
 // Re-export all shared atoms so existing web imports keep working
 export {
   selectedCwdAtom,
-  settingsOpenAtom,
   selectedFilePathAtom,
   composerTextAtom,
   composerAttachmentsAtom,
@@ -41,8 +39,8 @@ export {
  * Sidebar width in pixels.
  */
 export const sidebarWidthAtom = Atom.keepAlive(Atom.make(260))
-export type ModelCenterTab = "models" | "catalog" | "hardware"
-export const modelCenterTabAtom = Atom.keepAlive(Atom.make<ModelCenterTab | null>(null))
+export type SettingsTab = "models" | "catalog" | "hardware"
+export const settingsTabAtom = Atom.keepAlive(Atom.make<SettingsTab | null>(null))
 
 /**
  * Whether the responsive sidebar overlay is open.

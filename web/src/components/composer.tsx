@@ -514,7 +514,7 @@ export function Composer({
             transition: "opacity 100ms",
           }}
           title={!canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"}
-          aria-label={!canSend && isStreaming ? "Interrupt" : disabledReason ? `${disabledReason}. Open Model Center` : "Send message"}
+          aria-label={!canSend && isStreaming ? "Interrupt" : disabledReason ? `${disabledReason}. Open Settings` : "Send message"}
         >
           {!canSend && isStreaming ? (
             <Square size={16} fill="currentColor" style={{ color: "var(--accent-error)" }} />

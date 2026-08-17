@@ -35,7 +35,7 @@ export interface FooterBarProps {
   nextEscWillKillAll?: boolean
   /** Transcript mode active */
   transcriptMode?: boolean
-  /** Click handler for model name (opens Model Center) */
+  /** Click handler for model name (opens the Models settings tab) */
   onModelClick?: () => void
   /** Click handler for resident memory (opens Hardware) */
   onMemoryClick?: () => void
