@@ -6,6 +6,7 @@
  * CLI counterpart.
  */
 import { Atom } from "@effect-atom/atom-react"
+import type { ProjectId } from "@magnitudedev/sdk"
 import {
   selectedCwdAtom,
   selectedFilePathAtom,
@@ -39,6 +40,10 @@ export {
  * Sidebar width in pixels.
  */
 export const sidebarWidthAtom = Atom.keepAlive(Atom.make(260))
+export const sidebarCollapsedAtom = Atom.keepAlive(Atom.make(false))
+export const collapsedProjectIdsAtom = Atom.keepAlive(
+  Atom.make<ReadonlySet<ProjectId>>(new Set<ProjectId>()),
+)
 export type SettingsTab = "models" | "catalog" | "hardware"
 export const settingsTabAtom = Atom.keepAlive(
   Atom.make<SettingsTab | null>(null)
@@ -54,11 +59,3 @@ export const sidebarVisibleAtom = Atom.make(false)
  * Sidebar search query.
  */
 export const sidebarSearchAtom = Atom.keepAlive(Atom.make(""))
-
-/**
- * Optional CWD filter for the sessions sidebar.
- * null = show sessions from every agent-host CWD.
- */
-export const sidebarCwdFilterAtom = Atom.keepAlive(
-  Atom.make<string | null>(null)
-)

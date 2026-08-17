@@ -19,6 +19,7 @@
     "@magnitudedev/client-common": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
+    "@phosphor-icons/react": "^2.1.10",
     "effect": "^3.21.2",
     "lucide-react": "^0.460.0",
     "react": "^19.0.0",

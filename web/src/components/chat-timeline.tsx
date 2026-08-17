@@ -936,7 +936,7 @@ export function ChatTimeline({
   return (
     <div
       ref={attachScrollContainer}
-      className={`chat-timeline flex-1 overflow-y-auto min-h-0 [overflow-anchor:none] [padding:12px_12px_24px_12px] bg-slate-50 dark:bg-slate-925 relative ${
+      className={`chat-timeline flex-1 overflow-y-auto min-h-0 [overflow-anchor:none] [padding:12px_12px_24px_12px] bg-slate-50 dark:bg-slate-875 relative ${
         centerContent ? "flex flex-col" : ""
       }`}
     >

@@ -16,6 +16,7 @@ import {
   type ReactNode,
 } from "react"
 import { Menu } from "lucide-react"
+import { NotePencil, SidebarSimple } from "@phosphor-icons/react"
 import { Cause, Option, Effect } from "effect"
 import {
   useAtomValue,
@@ -52,6 +53,7 @@ import {
   formatReasoningEffort,
   useActiveSessionStatusesSubscription,
   activeSessionStatusesAtom,
+  useProjects,
 } from "@magnitudedev/client-common"
 import { SessionsSidebar } from "./components/sessions-sidebar"
 import { ChatTimeline } from "./components/chat-timeline"
@@ -68,13 +70,15 @@ import { formatBytes } from "./components/local-inference-format"
 import { ChatColumnPage } from "./components/chat-column-page"
 import {
   selectedCwdAtom,
+  selectedProjectIdAtom,
   selectedFilePathAtom,
   bashModeAtom,
   nextEscWillKillAllAtom,
 } from "@magnitudedev/client-common"
 import {
   sidebarSearchAtom,
-  sidebarCwdFilterAtom,
+  sidebarCollapsedAtom,
+  sidebarWidthAtom,
   sidebarVisibleAtom,
   settingsTabAtom,
 } from "./state/web-atoms"
@@ -102,7 +106,6 @@ import type {
   AcnLifecycleState,
   DisplayActor,
   ReadFileResult,
-  SessionCwdSummary,
   SessionMetadata,
 } from "@magnitudedev/sdk"
 import type { SlotId } from "@magnitudedev/sdk"
@@ -146,22 +149,22 @@ function useRootSlotProfile(slotProfiles: SlotProfiles | null): {
 function SessionsSidebarContainer(props?: {
   overlay?: boolean
   onCloseOverlay?: () => void
+  titlebarIntegrated?: boolean
 }): ReactNode {
   const client = useAgentClient()
   const { startNewSession, resumeSession } = useSessionActions()
-  const cwdFilter = useAtomValue(sidebarCwdFilterAtom)
-  const setCwdFilter = useAtomSet(sidebarCwdFilterAtom)
+  const selectedSessionId = useSelectedSessionId()
   const searchQuery = useAtomValue(sidebarSearchAtom)
   const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
   const settingsTab = useAtomValue(settingsTabAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const trimmedSearchQuery = searchQuery.trim()
+  const projects = useProjects()
+  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
+  const setSelectedCwd = useAtomSet(selectedCwdAtom)
+  const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
   const sessionPage = usePaginatedSessions({
-    ...(cwdFilter
-      ? {
-          cwd: cwdFilter,
-        }
-      : {}),
+    includeClosed: trimmedSearchQuery.length > 0,
     ...(trimmedSearchQuery
       ? {
           query: trimmedSearchQuery,
@@ -190,63 +193,100 @@ function SessionsSidebarContainer(props?: {
     []
   )
   useAtomMount(focusSearchAtom)
-  const cwdOptionsResult = useAtomValue(
-    client.rpc.query(
-      "ListSessionCwds",
-      {},
-      {
-        reactivityKeys: ["sessions"],
-      }
-    )
-  )
-  const cwdOptions = Result.match(cwdOptionsResult, {
-    onInitial: () => [] as string[],
-    onFailure: () => [] as string[],
-    onSuccess: (result) =>
-      (result.value as SessionCwdSummary[]).map((summary) => summary.cwd),
+  const closeSessionAtom = useMemo(() => client.rpc.mutation("CloseSession"), [client])
+  const reopenSessionAtom = useMemo(() => client.rpc.mutation("ReopenSession"), [client])
+  const revealProjectAtom = useMemo(() => client.rpc.mutation("RevealProjectSource"), [client])
+  const closeSession = useAtomSet(closeSessionAtom, {
+    mode: "promise",
   })
-  const handleNewSession = () => {
+  const reopenSession = useAtomSet(reopenSessionAtom, { mode: "promise" })
+  const revealProject = useAtomSet(revealProjectAtom, { mode: "promise" })
+  const handleCompose = () => {
     setSettingsTab(null)
-    startNewSession({
-      cwd: cwdFilter,
-    })
+    startNewSession()
     if (props?.overlay && props.onCloseOverlay) props.onCloseOverlay()
   }
   return (
     <SessionsSidebar
-      loading={sessionPage.loading}
+      projects={projects.projects}
+      revealKind={projects.revealKind}
+      loading={projects.loading || sessionPage.loading}
       sessions={sessionPage.sessions.map((s) => {
         const liveStatus = activeSessionStatuses[s.id]
         const statusFields = liveStatus
           ? {
               updatedAt: liveStatus.lastMessageAt,
               workStatus: liveStatus.workStatus,
-              activeWorkerCount: liveStatus.activeWorkerCount,
             }
           : {
               updatedAt: s.timestamp,
               workStatus: "idle" as const,
-              activeWorkerCount: 0,
             }
         return {
           sessionId: s.id,
+          projectId: s.projectId,
           title: s.title,
           cwd: s.workingDirectory,
-          messageCount: s.messageCount,
+          sidebarOpen: s.sidebarOpen,
           ...statusFields,
         }
       })}
-      cwdFilter={cwdFilter}
-      cwdOptions={cwdOptions}
       loadingMore={sessionPage.loadingMore}
       hasMore={sessionPage.hasMore}
-      onCwdFilterChange={setCwdFilter}
       onLoadMore={sessionPage.loadMore}
-      onSelectSession={(id) => {
+      onSelectSession={(session) => {
         setSettingsTab(null)
-        resumeSession(id)
+        const select = () => {
+          setSelectedProjectId(session.projectId)
+          setSelectedCwd(session.cwd)
+          resumeSession(session.sessionId)
+        }
+        if (session.sidebarOpen) {
+          select()
+          return
+        }
+        void reopenSession({
+          payload: { sessionId: session.sessionId },
+          reactivityKeys: ["sessions", "projects"],
+        }).then(select).catch(() => showToast("error", "Could not reopen this session."))
       }}
-      onNewSession={handleNewSession}
+      onCloseSession={(sessionId) => {
+        void closeSession({
+          payload: { sessionId },
+          reactivityKeys: ["sessions", "projects"],
+        }).then(() => {
+          if (sessionId !== selectedSessionId) return
+          const closed = sessionPage.sessions.find((session) => session.id === sessionId)
+          startNewSession(closed
+            ? { cwd: closed.workingDirectory, projectId: closed.projectId }
+            : { cwd: null, projectId: null })
+        }).catch(() => showToast("error", "Could not close this session."))
+      }}
+      onCompose={handleCompose}
+      onRevealProject={(projectId) => {
+        void revealProject({
+          payload: { projectId },
+          reactivityKeys: [],
+        }).catch(() => showToast("error", "Could not reveal this project folder."))
+      }}
+      onCreateProject={(project) => {
+        setSettingsTab(null)
+        startNewSession({ cwd: project.sourceDirectory, projectId: project.projectId })
+        props?.onCloseOverlay?.()
+      }}
+      onEditProject={(project) => {
+        if (selectedProjectId !== project.projectId) return
+        setSelectedCwd(project.sourceDirectory)
+      }}
+      onRemoveProject={(project) => {
+        if (selectedProjectId !== project.projectId) return
+        const next = projects.projects.find(
+          (summary) => summary.project.projectId !== project.projectId,
+        )?.project
+        startNewSession(next
+          ? { cwd: next.sourceDirectory, projectId: next.projectId }
+          : { cwd: null, projectId: null })
+      }}
       onOpenSettings={() => {
         setSettingsTab("models")
       }}
@@ -258,6 +298,7 @@ function SessionsSidebarContainer(props?: {
       onCloseSettings={() => setSettingsTab(null)}
       overlay={props?.overlay}
       onCloseOverlay={props?.onCloseOverlay}
+      titlebarIntegrated={props?.titlebarIntegrated}
     />
   )
 }
@@ -664,7 +705,7 @@ function BottomDockContainer({
   slotProfiles: SlotProfiles | null
 }): ReactNode {
   return (
-    <div className="[margin:14px_12px_14px] flex flex-col [gap:8px] shrink-0">
+    <div className="mx-auto my-[14px] flex w-[calc(100%-24px)] max-w-[800px] shrink-0 flex-col gap-2">
       <WorkStatusBarContainer slotProfiles={slotProfiles} />
       <ComposerContainer
         docked
@@ -675,8 +716,14 @@ function BottomDockContainer({
 }
 function ChatTitleBar({
   onOpenSidebar,
+  desktop = false,
+  onCompose,
+  showTitle = true,
 }: {
   onOpenSidebar?: () => void
+  desktop?: boolean
+  onCompose?: () => void
+  showTitle?: boolean
 }): ReactNode {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
@@ -706,9 +753,69 @@ function ChatTitleBar({
   const title = selectedSessionId
     ? (streamedTitle ?? metadataTitle)?.trim() || "Untitled session"
     : "New session"
+  const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
+  const sidebarWidth = useAtomValue(sidebarWidthAtom)
+  const setSidebarCollapsed = useAtomSet(sidebarCollapsedAtom)
+  if (desktop) {
+    const titlebarActions = (
+      <>
+        <button
+          type="button"
+          onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
+          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          <SidebarSimple size={18} />
+        </button>
+        <button
+          type="button"
+          onClick={onCompose}
+          className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
+          aria-label="New chat"
+          title="New chat"
+        >
+          <NotePencil size={18} />
+        </button>
+      </>
+    )
+
+    return (
+      <div
+        className="relative h-11 shrink-0 bg-slate-50 dark:bg-slate-875 select-none [-webkit-app-region:drag]"
+        title={title}
+      >
+        {!sidebarCollapsed ? (
+          <div
+            className="absolute inset-y-0 left-0 flex items-center justify-end gap-1 border-r border-slate-200 bg-slate-100 px-3 dark:border-slate-800 dark:bg-slate-875"
+            style={{ width: sidebarWidth }}
+          >
+            {titlebarActions}
+          </div>
+        ) : (
+          <div className="ml-[env(titlebar-area-x,_0px)] flex h-full w-[env(titlebar-area-width,_100%)] items-center gap-1 px-3 mac:pl-[84px]">
+            {titlebarActions}
+            {showTitle ? (
+              <span className="ml-3 min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap font-sans text-[15px] font-medium text-slate-900 dark:text-slate-200">
+                {title}
+              </span>
+            ) : null}
+          </div>
+        )}
+        {showTitle && !sidebarCollapsed ? (
+          <span
+            className="absolute top-0 flex h-11 min-w-0 max-w-[60%] items-center overflow-hidden text-ellipsis whitespace-nowrap font-sans text-[15px] font-medium text-slate-900 dark:text-slate-200"
+            style={{ left: sidebarWidth + 16 }}
+          >
+            {title}
+          </span>
+        ) : null}
+      </div>
+    )
+  }
   return (
     <div
-      className="mac:[-webkit-app-region:drag] h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-925 border-b border-slate-200 dark:border-slate-800 select-none"
+      className="h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-875 select-none"
       title={title}
     >
       {onOpenSidebar && (
@@ -803,7 +910,7 @@ function AppInner({
       }
     )
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-875 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
         <AlertTriangleIcon />
         <h1>Couldn’t load local setup</h1>
         <p>{failureDescription}</p>
@@ -858,6 +965,8 @@ function AuthenticatedAppContent({
   const { profiles: slotProfiles } = useSlotProfiles()
   const showOverlaySidebar = isNarrow && sidebarVisible
   const settingsTab = useAtomValue(settingsTabAtom)
+  const setSettingsTab = useAtomSet(settingsTabAtom)
+  const { startNewSession } = useSessionActions()
   const controller = useDisplayViewController()
   const forkStack = controller.expandedForkStack
   const panelOpen = settingsTab !== null
@@ -865,39 +974,52 @@ function AuthenticatedAppContent({
   return (
     <div
       className={`${
-        isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-925"
-      }  app flex [height:100vh] overflow-hidden`}
+        isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-875"
+      } app flex h-screen flex-col overflow-hidden`}
     >
-      {/* Docked sidebar — hidden by CSS when narrow */}
-      {!isNarrow && <SessionsSidebarContainer />}
-      {/* Overlay sidebar — shown when narrow + visible */}
-      {showOverlaySidebar && (
-        <SessionsSidebarContainer
-          overlay
-          onCloseOverlay={() => setSidebarVisible(false)}
+      {isDesktop ? (
+        <ChatTitleBar
+          desktop
+          showTitle={!panelOpen}
+          onCompose={() => {
+            setSettingsTab(null)
+            startNewSession()
+          }}
         />
-      )}
-      <div className="chat-column [flex:1] min-w-0 flex flex-col relative bg-slate-50 dark:bg-slate-925">
+      ) : null}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* Docked sidebar — hidden by CSS when narrow */}
+        {!isNarrow && <SessionsSidebarContainer titlebarIntegrated={isDesktop} />}
+        {/* Overlay sidebar — shown when narrow + visible */}
+        {showOverlaySidebar && (
+          <SessionsSidebarContainer
+            overlay
+            onCloseOverlay={() => setSidebarVisible(false)}
+          />
+        )}
+        <div className="chat-column [flex:1] min-w-0 flex flex-col relative bg-slate-50 dark:bg-slate-875">
         {/* Main chat column — always mounted, always in the layout. When a
             panel or worker detail is open, it's covered by an absolute
             overlay. Keeping it in the layout (not display:none) preserves
             scroll metrics so the scroll controller can capture and restore
             the correct position across overlay navigation. */}
         <div className="flex flex-col [flex:1] min-h-0">
-          <ChatTitleBar
-            onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
-          />
+          {!isDesktop ? (
+            <ChatTitleBar
+              onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
+            />
+          ) : null}
           <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
           <BottomDockContainer slotProfiles={slotProfiles} />
         </div>
         {(panelOpen || workerDetailOpen) && (
-          <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-925 z-[1]">
+          <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-875 z-[1]">
             {panelOpen && (
               <>
                 {isNarrow && (
                   <button
                     type="button"
-                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-925"
+                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-875"
                     aria-label="Open settings navigation"
                     title="Open settings navigation"
                     onClick={() => setSidebarVisible(true)}
@@ -914,29 +1036,30 @@ function AuthenticatedAppContent({
           </div>
         )}
         <ToastContainer />
+        </div>
+        {!panelOpen && <FileViewerPanelContainer />}
+        {connectionError && (
+          <DaemonConnectionError
+            message={connectionError.message}
+            reconnecting={connectionError.reconnecting}
+            invariantViolation={connectionError.invariantViolation}
+            onRetry={() => {
+              const retried = controller.retry()
+              if (!retried) {
+                controller.clearSession()
+              }
+            }}
+            onQuit={() => {
+              // If the platform supports quit (desktop), quit the app
+              if (platform.quit) {
+                platform.quit()
+              } else {
+                controller.clearSession()
+              }
+            }}
+          />
+        )}
       </div>
-      {!panelOpen && <FileViewerPanelContainer />}
-      {connectionError && (
-        <DaemonConnectionError
-          message={connectionError.message}
-          reconnecting={connectionError.reconnecting}
-          invariantViolation={connectionError.invariantViolation}
-          onRetry={() => {
-            const retried = controller.retry()
-            if (!retried) {
-              controller.clearSession()
-            }
-          }}
-          onQuit={() => {
-            // If the platform supports quit (desktop), quit the app
-            if (platform.quit) {
-              platform.quit()
-            } else {
-              controller.clearSession()
-            }
-          }}
-        />
-      )}
     </div>
   )
 }

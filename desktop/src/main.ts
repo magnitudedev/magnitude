@@ -362,16 +362,16 @@ function createWindow(): void {
     // both safe and more reliable than waiting on ready-to-show for a
     // transparent macOS window.
     show: true,
+    titleBarStyle: "hidden",
     ...(isMac
       ? {
-          titleBarStyle: "hidden" as const,
           trafficLightPosition: { x: 16, y: 16 },
           vibrancy: "sidebar" as const,
           visualEffectState: "active" as const,
           transparent: true,
           backgroundColor: "#00000000",
         }
-      : {}),
+      : { titleBarOverlay: { height: 44 } }),
     webPreferences: {
       preload: nodePath.join(__dirname, "../preload/preload.mjs"),
       contextIsolation: true,
@@ -495,7 +495,10 @@ const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
   StorageRemove: ({ key }) => Effect.sync(() => storageRemove(key)).pipe(Effect.as({})),
   DialogOpenDirectory: () =>
     promiseRpc(async () => {
-      const result = await dialog.showOpenDialog({ properties: ["openDirectory"] })
+      const result = await dialog.showOpenDialog({
+        defaultPath: app.getPath("home"),
+        properties: ["openDirectory"],
+      })
       if (result.canceled || result.filePaths.length === 0) return null
       return result.filePaths[0]!
     }),

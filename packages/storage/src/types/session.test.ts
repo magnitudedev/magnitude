@@ -39,6 +39,7 @@ describe('StoredSessionMetaSchema', () => {
     const result = await Effect.runPromise(
       Schema.decodeUnknown(schema)({
         sessionId: 'session-1',
+        projectId: 'project-1',
         created: '2026-01-01T00:00:00.000Z',
         updated: '2026-01-01T00:00:00.000Z',
         chatName: 'Chat',
@@ -61,6 +62,7 @@ describe('StoredSessionMetaSchema', () => {
     const result = await Effect.runPromise(
       Schema.decodeUnknown(schema)({
         sessionId: 'session-1',
+        projectId: 'project-1',
         created: '2026-01-01T00:00:00.000Z',
         updated: '2026-01-01T00:00:00.000Z',
         chatName: 'Chat',
@@ -81,6 +83,7 @@ describe('StoredSessionMetaSchema', () => {
     const result = await Effect.runPromise(
       Schema.decodeUnknown(schema)({
         sessionId: 'session-1',
+        projectId: 'project-1',
         created: '2026-01-01T00:00:00.000Z',
         updated: '2026-01-01T00:00:00.000Z',
         chatName: 'Chat',
@@ -102,6 +105,7 @@ describe('StoredSessionMetaSchema', () => {
         paths.sessionMetaFile(sessionId),
         JSON.stringify({
           sessionId,
+          projectId: 'project-1',
           created: '2026-01-01T00:00:00.000Z',
           updated: '2026-01-01T00:00:00.000Z',
           chatName: 'Chat',

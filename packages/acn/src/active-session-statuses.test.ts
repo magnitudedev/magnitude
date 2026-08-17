@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Layer, PubSub, Ref, Stream } from "effect"
-import type { SessionMetadata } from "@magnitudedev/acn-protocol"
+import { ProjectIdSchema, type SessionMetadata } from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type AgentRuntimeApi, type ResidentSessionSnapshot } from "./agent-runtime"
 import { ActiveSessionStatusesLive, ActiveSessionStatusesService } from "./active-session-statuses"
 import { SessionStore, type SessionStoreApi } from "./session-store"
@@ -32,8 +32,10 @@ const resident = (
 
 const protocolMeta = (sessionId: string, updatedAt: number): SessionMetadata => ({
   sessionId,
+  projectId: ProjectIdSchema.make("project-a"),
   title: "Session",
   cwd: "/tmp",
+  sidebarOpen: true,
   createdAt: 1,
   updatedAt,
   messageCount: 0,
@@ -63,11 +65,16 @@ const makeSetup = Effect.gen(function* () {
     promoteDraft: () => Effect.die("unused"),
     listDraftSessionIds: () => Effect.die("unused"),
     listProtocolMetas: () => Effect.die("unused"),
+    listAllProtocolMetas: () => Effect.die("unused"),
     listSessionCwds: () => Effect.die("unused"),
     deleteSessionFiles: () => Effect.die("unused"),
     validateCwd: () => Effect.die("unused"),
     getScratchpadPath: () => Effect.die("unused"),
     getExecutionContext: () => Effect.die("unused"),
+    ensureProjectForCwd: () => Effect.die("unused"),
+    resolveProjectSource: () => Effect.die("unused"),
+    setSidebarOpen: () => Effect.die("unused"),
+    changes: Stream.never,
   }
   return {
     residents,

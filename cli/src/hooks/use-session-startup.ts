@@ -65,6 +65,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
     () =>
       sessionStart._tag === 'latest' && Result.isSuccess(runtimeResult)
         ? client.rpc.query('ListSessions', {
+            projectId: Option.none(),
             cwd: Option.some(process.cwd()),
             query: Option.none(),
             cursor: Option.none(),
@@ -196,6 +197,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
             : createSessionMutation({
                 payload: {
                   cwd: selectedCwd ?? process.cwd(),
+                  projectId: Option.none(),
                   sessionId: Option.none(),
                   initial: Option.some(initial),
                   options: sessionCreateOptions,

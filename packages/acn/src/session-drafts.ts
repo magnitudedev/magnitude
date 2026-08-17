@@ -7,6 +7,7 @@ import {
   type SessionError,
   type SessionMetadata as ProtocolSessionMetadata,
   type SessionOptions,
+  type ProjectId,
 } from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type RuntimeStartRequest } from "./agent-runtime"
 import { sessionErrorMessage } from "./session-errors"
@@ -21,6 +22,7 @@ type DraftPhase = "preloading" | "ready" | "claiming"
 interface DraftEntry {
   readonly key: string
   readonly cwd: string
+  readonly projectId: ProjectId
   readonly options: SessionRuntimeOptions
   readonly ownerId: string | null
   readonly sessionId: string
@@ -29,7 +31,7 @@ interface DraftEntry {
   readonly phase: DraftPhase
 }
 
-type DraftIdentity = Pick<DraftEntry, "key" | "cwd" | "options" | "ownerId">
+type DraftIdentity = Pick<DraftEntry, "key" | "cwd" | "projectId" | "options" | "ownerId">
 
 export interface DraftClaim {
   readonly key: string
@@ -39,22 +41,28 @@ export interface DraftClaim {
 export interface SessionDraftsApi {
   readonly preload: (input: {
     readonly cwd: string
+    readonly projectId?: ProjectId
     readonly options?: SessionOptions
     readonly ownerId?: string | null
   }) => Effect.Effect<{ readonly sessionId: string }, SessionError>
   readonly release: (input: {
     readonly cwd: string
+    readonly projectId?: ProjectId
+    readonly sessionId: string
     readonly options?: SessionOptions
     readonly ownerId?: string | null
   }) => Effect.Effect<void, SessionError>
   readonly claim: (input: {
     readonly cwd: string
+    readonly projectId?: ProjectId
     readonly sessionId?: string
     readonly options?: SessionOptions
     readonly ownerId?: string | null
   }) => Effect.Effect<DraftClaim, SessionError>
   readonly promote: (claim: DraftClaim) => Effect.Effect<ProtocolSessionMetadata, SessionError>
   readonly releaseClaim: (claim: DraftClaim) => Effect.Effect<void, SessionError>
+  /** Releases every unclaimed draft owned by a project. Returns false while a claim is in flight. */
+  readonly releaseProject: (projectId: ProjectId) => Effect.Effect<boolean, SessionError>
 }
 
 export class SessionDrafts extends Context.Tag("SessionDrafts")<
@@ -63,7 +71,7 @@ export class SessionDrafts extends Context.Tag("SessionDrafts")<
 >() {}
 
 const makeDraftKey = (input: {
-  readonly cwd: string
+  readonly projectId: ProjectId
   readonly options: SessionRuntimeOptions
   readonly ownerId: string | null
 }): string => JSON.stringify(input)
@@ -88,21 +96,35 @@ export const SessionDraftsLive: Layer.Layer<
 
     const deriveKey = (input: {
       readonly cwd: string
+      readonly projectId?: ProjectId
       readonly options?: SessionOptions
       readonly ownerId?: string | null
-    }) =>
-      store.validateCwd(resolve(input.cwd)).pipe(
-        Effect.map((cwd) => {
+    }) => {
+      const projectId = input.projectId
+      return (projectId
+        ? store.resolveProjectSource(projectId).pipe(
+            Effect.flatMap(store.validateCwd),
+            Effect.map((cwd) => ({ cwd, projectId })),
+          )
+        : store.validateCwd(resolve(input.cwd)).pipe(
+            Effect.flatMap((cwd) =>
+              store.ensureProjectForCwd(cwd).pipe(Effect.map((projectId) => ({ cwd, projectId }))),
+            ),
+          )
+      ).pipe(
+        Effect.map(({ cwd, projectId }) => {
           const options = runtimeOptions.normalize(input.options)
           const ownerId = input.ownerId ?? null
           return {
-            key: makeDraftKey({ cwd, options, ownerId }),
+            key: makeDraftKey({ projectId, options, ownerId }),
             cwd,
+            projectId,
             options,
             ownerId,
           }
         }),
       )
+    }
 
     const removeExact = (entry: DraftEntry, allowed: ReadonlySet<DraftPhase>) =>
       Ref.modify(entries, (current) => {
@@ -147,6 +169,7 @@ export const SessionDraftsLive: Layer.Layer<
     const ensureRecord = Effect.fn("acn.session-drafts.ensure-record")(function* (
       input: {
         readonly cwd: string
+        readonly projectId?: ProjectId
         readonly sessionId?: string
         readonly options?: SessionOptions
         readonly ownerId?: string | null
@@ -175,7 +198,7 @@ export const SessionDraftsLive: Layer.Layer<
 
     const startRequest = (entry: DraftEntry): RuntimeStartRequest => ({
       sessionId: entry.sessionId,
-      cwd: entry.cwd,
+      projectId: entry.projectId,
       options: entry.options,
       visibility: "draft",
     })
@@ -217,6 +240,7 @@ export const SessionDraftsLive: Layer.Layer<
 
     const preload = Effect.fn("acn.session-drafts.preload")(function (input: {
       readonly cwd: string
+      readonly projectId?: ProjectId
       readonly options?: SessionOptions
       readonly ownerId?: string | null
     }) {
@@ -238,12 +262,14 @@ export const SessionDraftsLive: Layer.Layer<
 
     const release = Effect.fn("acn.session-drafts.release")(function* (input: {
       readonly cwd: string
+      readonly projectId?: ProjectId
+      readonly sessionId: string
       readonly options?: SessionOptions
       readonly ownerId?: string | null
     }) {
       const { key } = yield* deriveKey(input)
       const current = (yield* Ref.get(entries)).get(key)
-      if (!current) return
+      if (!current || current.sessionId !== input.sessionId) return
       const removed = yield* removeExact(current, new Set<DraftPhase>(["preloading", "ready"]))
       if (Option.isNone(removed)) return
       if (!(yield* cleanupEmptyDraft(removed.value))) {
@@ -255,6 +281,7 @@ export const SessionDraftsLive: Layer.Layer<
 
     const claim = Effect.fn("acn.session-drafts.claim")(function (input: {
       readonly cwd: string
+      readonly projectId?: ProjectId
       readonly sessionId?: string
       readonly options?: SessionOptions
       readonly ownerId?: string | null
@@ -316,6 +343,31 @@ export const SessionDraftsLive: Layer.Layer<
       }
     })
 
+    const releaseProject = Effect.fn("acn.session-drafts.release-project")(function* (
+      projectId: ProjectId,
+    ) {
+      const removed = yield* Ref.modify(entries, (current) => {
+        const projectEntries = [...current.values()].filter(
+          (entry) => entry.projectId === projectId,
+        )
+        if (projectEntries.some((entry) => entry.phase === "claiming")) {
+          return [Option.none<ReadonlyArray<DraftEntry>>(), current] as const
+        }
+        const next = new Map(current)
+        for (const entry of projectEntries) next.delete(entry.key)
+        return [Option.some<ReadonlyArray<DraftEntry>>(projectEntries), next] as const
+      })
+      if (Option.isNone(removed)) return false
+      for (const entry of removed.value) {
+        if (!(yield* cleanupEmptyDraft(entry))) {
+          yield* Ref.update(entries, (current) =>
+            current.has(entry.key) ? current : new Map(current).set(entry.key, entry),
+          )
+        }
+      }
+      return true
+    })
+
     yield* Effect.forever(
       Effect.sleep(SWEEP_INTERVAL).pipe(
         Effect.zipRight(sweepExpiredDrafts()),
@@ -329,6 +381,7 @@ export const SessionDraftsLive: Layer.Layer<
       claim,
       promote,
       releaseClaim: restoreClaim,
+      releaseProject,
     } satisfies SessionDraftsApi
   }),
 )

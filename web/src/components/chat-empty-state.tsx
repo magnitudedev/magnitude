@@ -1,228 +1,185 @@
-/**
- * ChatEmptyState
- *
- * No session has been selected yet. The first message creates a session using
- * the agent-host working directory selected here.
- */
+import { useMemo, useState, type ReactNode } from "react"
+import { Effect } from "effect"
 import {
-  useCallback,
-  useMemo,
-  useState,
-  type ReactNode,
-  type UIEvent,
-} from "react"
-import { Folder, Loader2, Search } from "lucide-react"
-import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+  Atom,
+  useAtomMount,
+  useAtomSet,
+  useAtomValue,
+} from "@effect-atom/atom-react"
 import {
-  formatCwdForDisplay,
-  formatRelativeTime,
+  Check,
+  FolderPlus,
+  MagnifyingGlass,
+} from "@phosphor-icons/react"
+import {
   selectedCwdAtom,
-  useAgentClient,
+  selectedProjectIdAtom,
+  useProjects,
 } from "@magnitudedev/client-common"
-import type {
-  DirectoryCandidate,
-  SearchDirectoriesResult,
-} from "@magnitudedev/sdk"
-const DIRECTORY_PAGE_SIZE = 14
-function directoryFallbackLabel(path: string): string {
-  if (path === ".") return "Current workspace"
-  const parts = path.split("/").filter(Boolean)
-  return parts.at(-1) ?? path
-}
-function DirectoryRow({
-  candidate,
-  selected,
-  onSelect,
-}: {
-  candidate: DirectoryCandidate
-  selected: boolean
-  onSelect: () => void
-}): ReactNode {
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`${
-        selected
-          ? "border-blue-700 bg-slate-100 dark:border-blue-500 dark:bg-slate-800"
-          : "border-transparent bg-transparent hover:bg-slate-100 dark:hover:bg-slate-800"
-      } w-full min-h-[46px] border px-2.5 py-1.5 rounded text-slate-900 dark:text-slate-200 cursor-pointer flex items-center gap-2.5 text-left font-sans transition-colors duration-100`}
-    >
-      <Folder
-        size={16}
-        className={`${
-          selected ? "text-blue-700 dark:text-blue-500" : "text-slate-500"
-        }  shrink-0`}
-      />
-      <span className="min-w-0 [flex:1]">
-        <span
-          className={`${selected ? "font-[650]" : "font-medium"} ${
-            selected
-              ? "text-blue-700 dark:text-blue-500"
-              : "text-slate-900 dark:text-slate-200"
-          }  block text-[13px] overflow-hidden text-ellipsis whitespace-nowrap`}
-        >
-          {candidate.label}
-        </span>
-        <span className="block [margin-top:2px] font-mono text-[11px] text-slate-600 dark:text-slate-400 overflow-hidden text-ellipsis whitespace-nowrap">
-          {formatCwdForDisplay(candidate.path, {
-            maxLen: 70,
-            abbreviateHome: true,
-          })}
-        </span>
-      </span>
-      {candidate.lastActivity !== undefined && (
-        <span className="shrink-0 text-[11px] text-slate-500">
-          {formatRelativeTime(candidate.lastActivity)}
-        </span>
-      )}
-    </button>
-  )
-}
-function DirectoryPicker(): ReactNode {
-  const client = useAgentClient()
-  const selectedCwd = useAtomValue(selectedCwdAtom)
+import type { ProjectSummary } from "@magnitudedev/sdk"
+import { MagnitudeMark } from "./magnitude-mark"
+import { ProjectFormDialog } from "./project-dialogs"
+import { collapsedProjectIdsAtom } from "../state/web-atoms"
+
+const isAvailable = (summary: ProjectSummary): boolean =>
+  summary.directoryState._tag === "available"
+
+export function ChatEmptyState(): ReactNode {
+  const { projects, loading, error } = useProjects()
+  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
+  const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
+  const setCollapsedProjects = useAtomSet(collapsedProjectIdsAtom)
+  const [chooserOpen, setChooserOpen] = useState(false)
   const [query, setQuery] = useState("")
-  const [limitState, setLimitState] = useState({
-    query: "",
-    limit: DIRECTORY_PAGE_SIZE,
-  })
-  const trimmedQuery = query.trim()
-  const visibleLimit =
-    limitState.query === trimmedQuery ? limitState.limit : DIRECTORY_PAGE_SIZE
-  const directoriesAtom = useMemo(
-    () =>
-      client.rpc.query(
-        "SearchDirectories",
-        {
-          query: trimmedQuery,
-          limit: visibleLimit,
-          includeRecent: true,
-        },
-        {
-          reactivityKeys: ["sessions"],
-        }
-      ),
-    [client, trimmedQuery, visibleLimit]
+  const [creatingProject, setCreatingProject] = useState(false)
+
+  const selectedById = projects.find(
+    ({ project }) => project.projectId === selectedProjectId,
   )
-  const result = useAtomValue(directoriesAtom)
-  const isLoading = Result.isInitial(result)
-  const candidates = Result.match(result, {
-    onInitial: () => [] as DirectoryCandidate[],
-    onFailure: (f) =>
-      f.previousSuccess._tag === "Some"
-        ? (f.previousSuccess.value.value as SearchDirectoriesResult).candidates
-        : [],
-    onSuccess: (s) => (s.value as SearchDirectoriesResult).candidates,
-  })
-  const loadedLimit = Result.isSuccess(result) ? visibleLimit : 0
-  const loadingMore =
-    isLoading && candidates.length > 0 && visibleLimit > loadedLimit
-  const hasMore = Result.isSuccess(result) && candidates.length >= visibleLimit
-  const selectedPath = selectedCwd ?? candidates[0]?.path ?? "."
-  const selectedCandidate = candidates.find(
-    (candidate) => candidate.path === selectedPath
+  const selected = selectedById && isAvailable(selectedById)
+    ? selectedById
+    : projects.find(isAvailable) ?? null
+
+  const initializeDraftProjectAtom = useMemo(
+    () => Atom.make(Effect.sync(() => {
+      if (selected === null || selectedProjectId === selected.project.projectId) return
+      setSelectedProjectId(selected.project.projectId)
+      setSelectedCwd(selected.project.sourceDirectory)
+    })),
+    [selected, selectedProjectId, setSelectedCwd, setSelectedProjectId],
   )
-  const selectedLabel =
-    selectedCandidate?.label ?? directoryFallbackLabel(selectedPath)
-  const handleSelect = (path: string) => {
-    setSelectedCwd(path)
+  useAtomMount(initializeDraftProjectAtom)
+
+  const selectProject = (project: ProjectSummary["project"]) => {
+    setSelectedProjectId(project.projectId)
+    setSelectedCwd(project.sourceDirectory)
+    setChooserOpen(false)
     setQuery("")
   }
-  const handleDirectoryScroll = useCallback(
-    (event: UIEvent<HTMLDivElement>) => {
-      if (!hasMore || isLoading) return
-      const element = event.currentTarget
-      const distanceFromBottom =
-        element.scrollHeight - element.scrollTop - element.clientHeight
-      if (distanceFromBottom < 96) {
-        setLimitState((current) => {
-          const currentLimit =
-            current.query === trimmedQuery ? current.limit : DIRECTORY_PAGE_SIZE
-          return {
-            query: trimmedQuery,
-            limit: currentLimit + DIRECTORY_PAGE_SIZE,
-          }
-        })
-      }
-    },
-    [hasMore, isLoading, trimmedQuery]
-  )
+
+  const visibleProjects = useMemo(() => {
+    const normalized = query.trim().toLowerCase()
+    return projects.filter((summary) =>
+      isAvailable(summary) && (
+        !normalized ||
+        summary.project.name.toLowerCase().includes(normalized) ||
+        summary.project.sourceDirectory.toLowerCase().includes(normalized)
+      ),
+    )
+  }, [projects, query])
+
   return (
-    <div className="[width:min(640px,_100%)] flex flex-col [gap:10px]">
-      <div className="[margin-bottom:6px] font-sans">
-        <h1 className="text-slate-900 dark:text-slate-200 text-[18px] font-[650]">
-          Start a new chat in{" "}
-          <span className="text-blue-700 dark:text-blue-500">
-            {selectedLabel}
-          </span>
-        </h1>
-        {selectedPath !== "." && (
-          <div className="text-slate-600 dark:text-slate-400 text-[13px] [margin-top:4px] font-mono overflow-hidden text-ellipsis whitespace-nowrap">
-            {formatCwdForDisplay(selectedPath, {
-              maxLen: 86,
-              abbreviateHome: true,
-            })}
-          </div>
-        )}
-      </div>
-
-      <div
-        className={`${
-          trimmedQuery
-            ? "border-blue-700 dark:border-blue-500"
-            : "border-slate-300 dark:border-slate-750"
-        } flex h-[34px] items-center gap-2 border-b bg-transparent px-0.5`}
-      >
-        <Search size={16} className="text-slate-500 shrink-0" />
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search recent directories or paste a path"
-          className="[flex:1] min-w-0 [background:transparent] border-0 [outline:none] text-slate-900 dark:text-slate-200 font-mono text-[14px]"
-        />
-      </div>
-
-      <div
-        onScroll={handleDirectoryScroll}
-        className="border border-slate-200 dark:border-slate-800 rounded-[6px] bg-white dark:bg-slate-875 [padding:6px] [height:320px] overflow-y-auto"
-      >
-        <div className="[padding:4px_4px_8px] text-slate-500 font-sans text-[11px] font-[650] [text-transform:uppercase]">
-          {trimmedQuery ? "Matching directories" : "Recent directories"}
-        </div>
-        {candidates.length > 0 ? (
-          <>
-            {candidates.map((candidate) => (
-              <DirectoryRow
-                key={`${candidate.source}:${candidate.path}`}
-                candidate={candidate}
-                selected={candidate.path === selectedPath}
-                onSelect={() => handleSelect(candidate.path)}
-              />
-            ))}
-            {loadingMore && (
-              <div className="[height:32px] flex items-center justify-center text-slate-500">
-                <Loader2
-                  size={14}
-                  className="[animation:spin_1s_linear_infinite]"
+    <div className="flex min-h-0 w-full flex-1 flex-col items-center justify-center px-6 py-8 [animation:fade-in_200ms_ease-out]">
+      <div className="flex w-full max-w-[520px] flex-col items-center text-center">
+        <MagnitudeMark className="mb-6 h-auto w-[68px]" />
+        <div className="relative">
+          {selected ? (
+            <>
+              {chooserOpen ? (
+                <button
+                  type="button"
+                  aria-label="Close project chooser"
+                  onClick={() => setChooserOpen(false)}
+                  className="fixed inset-0 z-20 cursor-default border-0 bg-transparent"
                 />
-              </div>
-            )}
-          </>
-        ) : (
-          <div className="[padding:18px_10px] text-slate-500 font-sans text-[13px] text-center">
-            {isLoading ? "Loading directories..." : "No matching directories"}
-          </div>
-        )}
+              ) : null}
+              <h1 className="font-mono text-[24px] font-semibold leading-[1.4] text-slate-900 dark:text-slate-100">
+                What would you like to do in{" "}
+                <button
+                  type="button"
+                  aria-haspopup="listbox"
+                  aria-expanded={chooserOpen}
+                  onClick={() => setChooserOpen((open) => !open)}
+                  className="relative z-30 -mx-1 rounded border-0 bg-transparent px-1 py-0.5 [font:inherit] text-inherit underline decoration-current decoration-1 underline-offset-4 hover:bg-slate-150 dark:hover:bg-slate-800"
+                >
+                  {selected.project.name}
+                </button>
+                ?
+              </h1>
+              {chooserOpen ? (
+                <div className="absolute bottom-[calc(100%+12px)] left-1/2 z-30 w-[min(360px,calc(100vw-32px))] -translate-x-1/2 rounded-lg border border-slate-300 bg-white p-1.5 text-left shadow-[0_8px_24px_rgba(0,0,0,.16)] dark:border-slate-600 dark:bg-slate-750 dark:shadow-[0_8px_24px_rgba(0,0,0,.36)]">
+                  <div className="mb-1 flex h-9 items-center gap-2 border-b border-slate-200 px-2 dark:border-slate-600">
+                    <MagnifyingGlass size={16} className="shrink-0 text-slate-500" />
+                    <input
+                      autoFocus
+                      value={query}
+                      onChange={(event) => setQuery(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") setChooserOpen(false)
+                      }}
+                      placeholder="Search projects"
+                      className="min-w-0 flex-1 border-0 bg-transparent font-sans text-[13px] text-slate-900 outline-none placeholder:text-slate-500 dark:text-slate-100"
+                    />
+                  </div>
+                  <div role="listbox" aria-label="Projects" className="max-h-[240px] overflow-y-auto">
+                    {visibleProjects.length === 0 ? (
+                      <div className="px-3 py-6 text-center font-sans text-[12px] text-slate-500">
+                        No matching projects.
+                      </div>
+                    ) : visibleProjects.map((summary) => {
+                      const active = summary.project.projectId === selected.project.projectId
+                      return (
+                        <button
+                          key={summary.project.projectId}
+                          type="button"
+                          role="option"
+                          aria-selected={active}
+                          onClick={() => selectProject(summary.project)}
+                          className="flex h-9 w-full items-center gap-2 rounded-md border-0 bg-transparent px-2.5 text-left font-sans text-[13px] text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700"
+                        >
+                          <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                            {summary.project.name}
+                          </span>
+                          {active ? <Check size={15} className="shrink-0 text-blue-600 dark:text-blue-400" /> : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </>
+          ) : loading ? (
+            <>
+              <h1 className="font-mono text-[24px] font-semibold leading-[1.4] text-slate-900 dark:text-slate-100">
+                What would you like to do?
+              </h1>
+              <span className="mt-4 block font-sans text-[14px] text-slate-500">Loading projects…</span>
+            </>
+          ) : error ? (
+            <>
+              <h1 className="font-mono text-[24px] font-semibold leading-[1.4] text-slate-900 dark:text-slate-100">
+                What would you like to do?
+              </h1>
+              <span className="mt-4 block font-sans text-[13px] text-red-600 dark:text-red-400">{error}</span>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setCreatingProject(true)}
+              className="flex h-9 items-center justify-center gap-2 rounded-md border border-blue-700 bg-blue-700 px-3 font-sans text-[13px] font-semibold text-white hover:bg-blue-800 dark:border-blue-500 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
+            >
+              <FolderPlus size={16} /> New project
+            </button>
+          )}
+        </div>
       </div>
-    </div>
-  )
-}
-export function ChatEmptyState(): ReactNode {
-  return (
-    <div className="[flex:1] w-full min-h-0 box-border flex flex-col items-center justify-center [padding:32px_24px] [animation:fade-in_200ms_ease-out]">
-      <DirectoryPicker />
+
+      {creatingProject ? (
+        <ProjectFormDialog
+          onDismiss={() => setCreatingProject(false)}
+          onSaved={(project) => {
+            setCreatingProject(false)
+            setCollapsedProjects((current) => {
+              if (!current.has(project.projectId)) return current
+              const next = new Set(current)
+              next.delete(project.projectId)
+              return next
+            })
+            selectProject(project)
+          }}
+        />
+      ) : null}
     </div>
   )
 }

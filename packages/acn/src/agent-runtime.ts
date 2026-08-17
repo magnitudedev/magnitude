@@ -17,6 +17,7 @@ import {
   SessionNotFound,
   SessionOperationFailed,
   type SessionError,
+  type ProjectId,
 } from "@magnitudedev/acn-protocol"
 import type { StoredSessionMeta } from "@magnitudedev/storage"
 import { AcnServiceLifecycle } from "./service-lifecycle"
@@ -38,7 +39,7 @@ import type { RuntimeEntry } from "./session-types"
 
 export interface RuntimeStartRequest {
   readonly sessionId: string
-  readonly cwd: string
+  readonly projectId: ProjectId
   readonly options: SessionRuntimeOptions
   readonly visibility: StoredSessionMeta["visibility"]
 }
@@ -273,7 +274,7 @@ export const makeAgentRuntimeLive = (
           return { workStatus, reconcileWork }
         })
 
-      const startResident = Effect.fn("acn.agent-runtime.start")(function* (
+      const startResidentAttempt = Effect.fn("acn.agent-runtime.start-attempt")(function* (
         request: RuntimeStartRequest,
       ) {
         const generation = yield* nextGeneration(request.sessionId)
@@ -287,11 +288,14 @@ export const makeAgentRuntimeLive = (
         const releaseStartup = yield* gate.acquire("session-start").pipe(Effect.orDie)
 
         return yield* Effect.gen(function* () {
-          const requestedCwd = yield* store.validateCwd(request.cwd)
+          const requestedCwd = yield* store.resolveProjectSource(request.projectId).pipe(
+            Effect.flatMap(store.validateCwd),
+          )
           yield* runtimeOptions.write(request.sessionId, request.options)
           const session = yield* factory.createSession({
             sessionId: request.sessionId,
             cwd: requestedCwd,
+            projectId: request.projectId,
             scope: generationScope,
             options: request.options,
             visibility: request.visibility,
@@ -329,7 +333,13 @@ export const makeAgentRuntimeLive = (
           }
           yield* Ref.update(entries, (current) => new Map(current).set(request.sessionId, resident))
           yield* publishChange
-          return { resident, releaseStartup }
+          const currentCwd = yield* store.resolveProjectSource(request.projectId)
+          if (currentCwd !== requestedCwd) {
+            yield* releaseStartup
+            yield* resident.gate.retireNow("project-source-changed-during-start")
+            return { _tag: "retry" as const }
+          }
+          return { _tag: "ready" as const, resident, releaseStartup }
         }).pipe(
           Effect.onExit((exit) =>
             Exit.isSuccess(exit)
@@ -337,6 +347,15 @@ export const makeAgentRuntimeLive = (
               : releaseStartup.pipe(Effect.zipRight(Scope.close(generationScope, Exit.void))),
           ),
         )
+      })
+
+      const startResident = Effect.fn("acn.agent-runtime.start")(function* (
+        request: RuntimeStartRequest,
+      ) {
+        while (true) {
+          const attempt = yield* startResidentAttempt(request)
+          if (attempt._tag === "ready") return attempt
+        }
       })
 
       const claimStart = (sessionId: string) =>
@@ -366,7 +385,7 @@ export const makeAgentRuntimeLive = (
           if (!meta) return yield* new SessionNotFound({ sessionId })
           return {
             sessionId,
-            cwd: meta.workingDirectory,
+            projectId: meta.projectId,
             options: (yield* runtimeOptions.read(sessionId)) ?? normalizeSessionRuntimeOptions(),
             visibility: meta.visibility,
           } satisfies RuntimeStartRequest

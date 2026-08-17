@@ -13,11 +13,14 @@ import { useAgentClient } from "../state/agent-client-context"
 import { useSessionsList, type UseSessionsListParams } from "./use-sessions-list"
 import { sessionsToRecentChats } from "../data/recent-chats"
 import type { SessionMetadata } from "@magnitudedev/sdk"
+import type { ProjectId } from "@magnitudedev/sdk"
 import type { RecentChat } from "../data/recent-chats"
 
 export interface UsePaginatedSessionsParams {
   /** Filter by CWD. */
   cwd?: string
+  projectId?: ProjectId
+  includeClosed?: boolean
   /** Search title and working directory. */
   query?: string
   /** Number of items per page. */
@@ -89,6 +92,8 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
 
   const firstPage = useSessionsList({
     cwd: params?.cwd,
+    projectId: params?.projectId,
+    includeClosed: params?.includeClosed,
     query: params?.query,
     limit: params?.pageSize ?? 50,
   })
@@ -100,7 +105,7 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
         nextCursor: firstPage.nextCursor,
         hasMore: firstPage.hasMore,
       }),
-    [params?.cwd, params?.query],
+    [params?.cwd, params?.projectId, params?.includeClosed, params?.query],
   )
   const [accumulation, setAccumulation] = useAtom(accumulationAtom)
   const nextCursor = accumulation.extraSessions.length === 0
@@ -118,6 +123,10 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
     void listSessionsMutation({
       payload: {
         cwd: params?.cwd !== undefined ? Option.some(params.cwd) : Option.none(),
+        projectId: params?.projectId !== undefined
+          ? Option.some(params.projectId)
+          : Option.none(),
+        includeClosed: params?.includeClosed ?? true,
         query: params?.query !== undefined ? Option.some(params.query) : Option.none(),
         cursor: Option.some(cursor),
         ...(params?.pageSize !== undefined ? { limit: params.pageSize } : {}),
@@ -142,6 +151,8 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
     hasMore,
     nextCursor,
     params?.cwd,
+    params?.projectId,
+    params?.includeClosed,
     params?.query,
     params?.pageSize,
     setAccumulation,

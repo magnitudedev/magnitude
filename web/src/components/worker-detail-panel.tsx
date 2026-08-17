@@ -22,7 +22,7 @@ export function WorkerDetailPanel({
 }: WorkerDetailPanelProps): ReactNode {
   if (!forkId) return null
   return (
-    <div className="worker-detail-panel [flex:1] min-h-0 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-925">
+    <div className="worker-detail-panel [flex:1] min-h-0 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-875">
       <ChatTimeline
         forkId={forkId}
         loadingTitle={loadingTitle}
