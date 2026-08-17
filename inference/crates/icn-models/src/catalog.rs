@@ -9,10 +9,10 @@ use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
     CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage,
-    ModelPackageInspection, ModelPackageSource, ModelParameterization, ModelServingConfiguration,
-    RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    ResolvedServableModelBundle, ServableModelBundle, ServableModelBundleKey, ServingProfile,
-    SpeculativeDraftSource, SpeculativeMethod,
+    ModelPackageInspection, ModelPackageSource, ModelParameterization, ModelReleaseDate,
+    ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, ResolvedServableModelBundle, ServableModelBundle,
+    ServableModelBundleKey, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -53,6 +53,7 @@ struct CatalogModel {
     id: String,
     display_name: String,
     description: String,
+    release_date: ModelReleaseDate,
     parameterization: ModelParameterization,
     repository: String,
     variants: Vec<CatalogVariant>,
@@ -1254,6 +1255,7 @@ fn recommendable_model(
         display_name: declaration.display_name.clone(),
         variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
+        release_date: declaration.release_date.clone(),
         license: declaration.license.clone(),
         capabilities,
         parameterization: declaration.parameterization.clone(),
@@ -1928,6 +1930,32 @@ mod tests {
                 .models
                 .iter()
                 .all(|model| valid_parameterization(&model.parameterization))
+        );
+    }
+
+    #[test]
+    fn authored_catalog_declares_the_reviewed_release_date_for_every_model() {
+        let source = catalog_source().expect("catalog source should be valid");
+        assert_eq!(source.models.len(), 21);
+        assert_eq!(
+            source
+                .models
+                .iter()
+                .find(|model| model.id == "qwen3.8-27b")
+                .expect("Qwen3.8 catalog model")
+                .release_date
+                .as_str(),
+            "2026-08-13"
+        );
+        assert_eq!(
+            source
+                .models
+                .iter()
+                .find(|model| model.id == "deepseek-v4-flash")
+                .expect("DeepSeek V4 Flash catalog model")
+                .release_date
+                .as_str(),
+            "2026-07-31"
         );
     }
 
