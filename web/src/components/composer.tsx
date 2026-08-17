@@ -73,6 +73,8 @@ export interface ComposerProps {
   disabledReason?: string | null
   /** Navigate to the action that resolves disabled submission. */
   onDisabledAction?: () => void
+  /** Runtime controls displayed inside the composer's lower edge. */
+  footer?: ReactNode
 }
 export function Composer({
   role = "Leader",
@@ -89,6 +91,7 @@ export function Composer({
   docked = false,
   disabledReason = null,
   onDisabledAction,
+  footer,
 }: ComposerProps): ReactNode {
   const text = useAtomValue(composerTextAtom)
   const setText = useAtomSet(composerTextAtom)
@@ -541,6 +544,8 @@ export function Composer({
           onClick={(e) => setCursorPosition(e.currentTarget.selectionStart)}
           rows={3}
         />
+
+        {footer}
 
         {/* Submit / Stop button */}
         <button

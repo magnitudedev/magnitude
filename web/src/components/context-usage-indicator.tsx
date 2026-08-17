@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react"
 import { formatTokensCompact } from "@magnitudedev/client-common"
 import type { ContextUsageDisplay } from "@magnitudedev/sdk"
+
 export interface ContextUsageIndicatorProps {
   context: ContextUsageDisplay | null
   tokenCap?: number | null
@@ -10,7 +11,7 @@ export interface ContextUsageIndicatorProps {
   tooltip?: "popover" | "native" | "none"
   tooltipPlacement?: "above-right" | "above-center"
 }
-function usagePercent(
+export function contextUsagePercent(
   context: ContextUsageDisplay | null,
   tokenCap: number | null | undefined
 ): number | null {
@@ -18,20 +19,38 @@ function usagePercent(
   if (tokenEstimate === null || !tokenCap || tokenCap <= 0) return null
   return Math.min(100, Math.max(0, (tokenEstimate / tokenCap) * 100))
 }
-function tooltipText(
+export function contextUsageTooltipLines(
   context: ContextUsageDisplay | null,
   tokenCap: number | null | undefined
-): string {
+): readonly [string, string, string] {
   const tokenEstimate = context?.tokenEstimate ?? null
-  if (tokenEstimate === null) return "Context window unavailable"
-  const tokens = formatTokensCompact(tokenEstimate)
-  if (tokenCap && tokenCap > 0) {
-    const pct = Math.round((tokenEstimate / tokenCap) * 100)
-    return `Context window:\n${pct}% used (${
-      100 - pct
-    }% left)\n${tokens} / ${formatTokensCompact(tokenCap)} tokens used`
-  }
-  return `Context window:\n${tokens} tokens used`
+  const heading = context?.isCompacting ? "Compacting..." : "Context"
+  const hasCap = tokenCap !== null && tokenCap !== undefined && tokenCap > 0
+  const tokens = `${
+    tokenEstimate === null ? "-" : formatTokensCompact(tokenEstimate)
+  } / ${hasCap ? formatTokensCompact(tokenCap) : "-"} tokens`
+  const remaining =
+    tokenEstimate === null
+      ? "100% remaining"
+      : hasCap
+      ? `${Math.max(
+          0,
+          Math.min(100, 100 - Math.round((tokenEstimate / tokenCap) * 100))
+        )}% remaining`
+      : "--% remaining"
+  return [heading, tokens, remaining]
+}
+
+export function contextUsageStrokeClass(
+  percent: number | null,
+  isCompacting: boolean
+): string {
+  if (isCompacting) return "stroke-violet-700 dark:stroke-violet-400"
+  if (percent !== null && percent >= 90)
+    return "stroke-red-600 dark:stroke-red-400"
+  if (percent !== null && percent >= 70)
+    return "stroke-orange-700 dark:stroke-orange-400"
+  return "stroke-blue-700 dark:stroke-blue-500"
 }
 export function ContextUsageIndicator({
   context,
@@ -42,23 +61,27 @@ export function ContextUsageIndicator({
   tooltip = "popover",
   tooltipPlacement = "above-right",
 }: ContextUsageIndicatorProps): ReactNode {
-  const [hovered, setHovered] = useState(false)
+  const [active, setActive] = useState(false)
   const isCompacting = context?.isCompacting ?? false
   const tokenEstimate = context?.tokenEstimate ?? null
-  const pct = usagePercent(context, tokenCap)
-  const title = tooltipText(context, tokenCap)
+  const pct = contextUsagePercent(context, tokenCap)
+  const tooltipLines = contextUsageTooltipLines(context, tokenCap)
+  const accessibleLabel = tooltipLines.join(" ")
   const radius = Math.max(1, (size - strokeWidth * 2 - 2) / 2)
   const center = size / 2
   const circumference = 2 * Math.PI * radius
-  const popoverVisible = tooltip === "popover" && hovered
+  const popoverVisible = tooltip === "popover" && active
   return (
     <span
-      className="context-usage-indicator relative inline-flex items-center [gap:4px] min-w-0 text-slate-600 dark:text-slate-400"
+      className="context-usage-indicator relative inline-flex min-w-0 items-center gap-1 text-slate-600 outline-none dark:text-slate-400"
       data-compacting={isCompacting}
-      title={tooltip === "native" ? title : undefined}
-      aria-label={title.replace(/\n/g, " ")}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      title={tooltip === "native" ? accessibleLabel : undefined}
+      aria-label={accessibleLabel}
+      tabIndex={tooltip === "popover" ? 0 : undefined}
+      onMouseEnter={() => setActive(true)}
+      onMouseLeave={() => setActive(false)}
+      onFocus={() => setActive(true)}
+      onBlur={() => setActive(false)}
     >
       <span
         aria-hidden="true"
@@ -66,11 +89,7 @@ export function ContextUsageIndicator({
           width: size,
           height: size,
         }}
-        className={`${
-          isCompacting
-            ? "[animation:context-pulse_900ms_ease-in-out_infinite]"
-            : "[animation:none]"
-        }  rounded-full [background:transparent] box-border shrink-0`}
+        className="box-border shrink-0 rounded-full bg-transparent"
       >
         <svg
           viewBox={`0 0 ${size} ${size}`}
@@ -83,7 +102,7 @@ export function ContextUsageIndicator({
             fill="none"
             strokeWidth={strokeWidth}
             className={
-              hovered
+              active
                 ? "stroke-slate-400 dark:stroke-slate-600"
                 : "stroke-slate-300 dark:stroke-slate-750"
             }
@@ -98,7 +117,11 @@ export function ContextUsageIndicator({
               strokeLinecap="round"
               strokeDasharray={`${circumference}`}
               strokeDashoffset={`${circumference * (1 - pct / 100)}`}
-              className="stroke-blue-700 dark:stroke-blue-500"
+              className={`${contextUsageStrokeClass(pct, isCompacting)} ${
+                isCompacting
+                  ? "[transform-box:fill-box] [transform-origin:center] [animation:context-rewind_1.1s_linear_infinite] motion-reduce:[animation:none]"
+                  : ""
+              } transition-[stroke,stroke-dashoffset] duration-200`}
             />
           )}
         </svg>
@@ -121,9 +144,17 @@ export function ContextUsageIndicator({
                 ? "translateX(-50%)"
                 : undefined,
           }}
-          className="absolute [bottom:calc(100%_+_8px)] [min-width:170px] [padding:8px_10px] rounded-[6px] border border-slate-300 dark:border-slate-750 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 text-[12px] leading-[1.45] whitespace-pre-line text-center z-[30]"
+          className="absolute bottom-[calc(100%+9px)] z-30 min-w-[190px] rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-left text-slate-900 shadow-[0_8px_24px_rgba(0,0,0,.16)] dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100 dark:shadow-[0_8px_24px_rgba(0,0,0,.36)]"
         >
-          {title}
+          <span className="block whitespace-nowrap font-sans text-[12px] font-semibold leading-4">
+            {tooltipLines[0]}
+          </span>
+          <span className="mt-1 block whitespace-nowrap font-sans text-[11px] leading-4 text-slate-600 dark:text-slate-200">
+            {tooltipLines[1]}
+          </span>
+          <span className="block whitespace-nowrap font-sans text-[11px] leading-4 text-slate-500 dark:text-slate-300">
+            {tooltipLines[2]}
+          </span>
         </span>
       )}
     </span>

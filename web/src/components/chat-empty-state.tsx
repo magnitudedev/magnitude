@@ -152,12 +152,12 @@ function DirectoryPicker(): ReactNode {
   return (
     <div className="[width:min(640px,_100%)] flex flex-col [gap:10px]">
       <div className="[margin-bottom:6px] font-sans">
-        <div className="text-slate-900 dark:text-slate-200 text-[18px] font-[650]">
+        <h1 className="text-slate-900 dark:text-slate-200 text-[18px] font-[650]">
           Start a new chat in{" "}
           <span className="text-blue-700 dark:text-blue-500">
             {selectedLabel}
           </span>
-        </div>
+        </h1>
         {selectedPath !== "." && (
           <div className="text-slate-600 dark:text-slate-400 text-[13px] [margin-top:4px] font-mono overflow-hidden text-ellipsis whitespace-nowrap">
             {formatCwdForDisplay(selectedPath, {

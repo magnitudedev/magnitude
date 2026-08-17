@@ -71,7 +71,8 @@ same navigation is presented in the existing sidebar overlay rather than as hori
 Settings destinations take over the main pane directly and do not reuse the session chat title bar;
 each destination's own heading is the page heading.
 
-The chat footer is the sole compact runtime-information surface outside Settings. The sidebar,
+The composer footer is the sole compact runtime-information surface outside Settings. It is
+rendered inside the composer border at the lower left. The sidebar,
 title bar, and other application chrome do not duplicate model identity, residency, allocation, or
 context information.
 
@@ -89,13 +90,22 @@ Chat readiness requires an available local slot whose residency is `Ready`. Sele
 readiness. When submission is unavailable, the composer routes the user to Settings instead of
 discarding the attempt.
 
-The chat footer follows the CLI's runtime-information structure without combining independent
-facts into the model label. It presents residency, model identity, reasoning effort, resident
-memory, context usage with percentage, and working directory in that order. Model identity opens an
+The composer footer follows the CLI's runtime-information structure without combining independent
+facts into the model label. It presents model identity, reasoning effort, resident memory, and
+context usage with percentage. Residency continues to gate submission but is not
+rendered as a dot or readiness label in the composer. Model identity opens an
 upward chooser containing selectable installed model names, reasoning effort opens the same form of
 upward chooser containing the selected model's supported levels, and resident memory routes to
-Hardware. The two choosers are mutually exclusive and keyboard operable. Interactive labels are
-underlined only while hovered; reasoning retains its violet semantic color.
+Hardware. The two choosers are mutually exclusive and keyboard operable. Their triggers have no
+caret, underline, or hover text-color shift; hover is communicated with a restrained background
+change. Reasoning retains its violet semantic color.
+
+Context usage is normally a compact circular meter rather than persistent text. Its arc is blue
+below 70 percent usage, orange from 70 through 89 percent, and red at 90 percent or above. Hover or
+keyboard focus reveals a fixed three-line tooltip containing the state label, token count, and
+percent remaining. While the authoritative root actor context reports compaction, the label becomes
+`Compacting...` and the same-length arc turns violet and rotates counterclockwise; the client does
+not infer compaction from token movement or fabricate a reduced usage value.
 
 ## Appearance
 
@@ -111,6 +121,10 @@ explicit black, white, and transparent values; components do not introduce raw c
 palette-color utilities, runtime palette mixing, or a parallel semantic color-token layer. Literal
 black alpha is reserved for shadows and overlays. Repeated visual behavior is shared through
 meaningful React components rather than CSS component classes.
+
+Web and Electron bundle their typography rather than depending on host-installed fonts. Inter is
+the body and interface family, including form controls. Martian Mono is the heading family. The
+ordinary monospace stack remains reserved for code and technical data rather than page headings.
 
 Static presentation uses Tailwind utilities. Inline styles are reserved for values derived from
 runtime data, such as measured dimensions, progress values, and SVG geometry, or for third-party

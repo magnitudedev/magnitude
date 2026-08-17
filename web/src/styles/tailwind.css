@@ -1,3 +1,6 @@
+@import "@fontsource-variable/inter/wght.css";
+@import "@fontsource-variable/inter/wght-italic.css";
+@import "@fontsource-variable/martian-mono/wght.css";
 @import "tailwindcss" source(none);
 
 @source "../";
@@ -84,14 +87,14 @@
   --color-red-700: var(--magnitude-red-700);
   --color-red-800: var(--magnitude-red-800);
 
-  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    sans-serif;
+  --font-sans: "Inter Variable", Inter, system-ui, sans-serif;
+  --font-heading: "Martian Mono Variable", "Martian Mono", ui-monospace,
+    monospace;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", monospace;
 
   --animate-pulse-dot: pulse-dot 1.2s ease-in-out infinite;
   --animate-blink: blink 1s step-end infinite;
-  --animate-context-pulse: context-pulse 900ms ease-in-out infinite;
   --animate-shimmer: shimmer 1.5s infinite;
 }
 
@@ -136,7 +139,7 @@
   input,
   select,
   textarea {
-    font-family: Arial, sans-serif;
+    font-family: var(--font-sans);
     font-size: 13.3333px;
     line-height: normal;
   }
@@ -147,6 +150,7 @@
   h4,
   h5,
   h6 {
+    font-family: var(--font-heading);
     font-weight: 700;
   }
 
@@ -237,13 +241,9 @@
   }
 }
 
-@keyframes context-pulse {
-  0%,
-  100% {
-    opacity: 0.7;
-  }
-  50% {
-    opacity: 1;
+@keyframes context-rewind {
+  to {
+    transform: rotate(-360deg);
   }
 }
 

@@ -428,8 +428,10 @@ function WorkStatusBarContainer({
 }
 function ComposerContainer({
   docked = false,
+  footer,
 }: {
   docked?: boolean
+  footer?: ReactNode
 }): ReactNode {
   const platform = usePlatform()
   const setBashMode = useAtomSet(bashModeAtom)
@@ -531,6 +533,7 @@ function ComposerContainer({
       docked={docked}
       disabledReason={disabledReason}
       onDisabledAction={() => setSettingsTab("models")}
+      footer={footer}
     />
   )
 }
@@ -541,9 +544,6 @@ function FooterBarContainer({
 }: {
   slotProfiles: SlotProfiles | null
 }): ReactNode {
-  const client = useAgentClient()
-  const selectedSessionId = useSelectedSessionId()
-  const selectedCwd = useAtomValue(selectedCwdAtom)
   const context = useDisplayState(
     (state) => state.actors["root"]?.context ?? null
   )
@@ -577,27 +577,6 @@ function FooterBarContainer({
         0
       ),
   })
-  const selectedSessionAtom = useMemo(
-    () =>
-      selectedSessionId
-        ? client.rpc.query(
-            "GetSession",
-            {
-              sessionId: selectedSessionId,
-            },
-            {
-              reactivityKeys: ["sessions"],
-            }
-          )
-        : Atom.make(() => null),
-    [client, selectedSessionId]
-  )
-  const selectedSessionResult = useAtomValue(selectedSessionAtom)
-  const sessionCwd =
-    selectedSessionResult !== null && Result.isSuccess(selectedSessionResult)
-      ? (selectedSessionResult.value as SessionMetadata).cwd
-      : null
-  const cwd = sessionCwd ?? selectedCwd
   const selectedModel = Option.flatMap(
     Option.all({
       catalog: Result.value(catalogResult),
@@ -647,16 +626,6 @@ function FooterBarContainer({
     currentModel._tag === "NoSelection"
       ? "Choose model"
       : currentModel.displayName
-  const modelResidency =
-    currentModel._tag === "NoSelection"
-      ? null
-      : currentModel._tag === "Running"
-      ? ("ready" as const)
-      : currentModel._tag === "Loading" || currentModel._tag === "Stopping"
-      ? ("loading" as const)
-      : ("not-ready" as const)
-  const modelLoadingPercentage =
-    currentModel._tag === "Loading" ? currentModel.percentage : null
   const memoryLabel =
     currentModel._tag === "Running" && residentBytes !== null
       ? `${formatBytes(residentBytes)} mem`
@@ -665,10 +634,7 @@ function FooterBarContainer({
     <FooterBar
       context={context}
       tokenCap={tokenCap}
-      cwd={cwd}
       model={modelLabel}
-      modelResidency={modelResidency}
-      modelLoadingPercentage={modelLoadingPercentage}
       thinkingLevel={thinkingLevel}
       memoryLabel={memoryLabel}
       thinkingEffort={profile?.reasoningEffort ?? null}
@@ -700,8 +666,10 @@ function BottomDockContainer({
   return (
     <div className="[margin:14px_12px_14px] flex flex-col [gap:8px] shrink-0">
       <WorkStatusBarContainer slotProfiles={slotProfiles} />
-      <ComposerContainer docked />
-      <FooterBarContainer slotProfiles={slotProfiles} />
+      <ComposerContainer
+        docked
+        footer={<FooterBarContainer slotProfiles={slotProfiles} />}
+      />
     </div>
   )
 }

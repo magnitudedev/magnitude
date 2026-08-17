@@ -127,37 +127,37 @@ function MarkdownContentImpl({
       h1: (p) => (
         <h1
           {...p}
-          className="font-sans font-[650] text-slate-900 dark:text-slate-200 text-[18px] [margin:16px_0_8px]"
+          className="font-[650] text-slate-900 dark:text-slate-200 text-[18px] [margin:16px_0_8px]"
         />
       ),
       h2: (p) => (
         <h2
           {...p}
-          className="font-sans font-[650] text-slate-900 dark:text-slate-200 text-[16px] [margin:14px_0_8px]"
+          className="font-[650] text-slate-900 dark:text-slate-200 text-[16px] [margin:14px_0_8px]"
         />
       ),
       h3: (p) => (
         <h3
           {...p}
-          className="font-sans font-[650] text-slate-900 dark:text-slate-200 text-[15px] [margin:12px_0_6px]"
+          className="font-[650] text-slate-900 dark:text-slate-200 text-[15px] [margin:12px_0_6px]"
         />
       ),
       h4: (p) => (
         <h4
           {...p}
-          className="font-sans font-[650] text-slate-900 dark:text-slate-200 text-[14px] [margin:10px_0_6px]"
+          className="font-[650] text-slate-900 dark:text-slate-200 text-[14px] [margin:10px_0_6px]"
         />
       ),
       h5: (p) => (
         <h5
           {...p}
-          className="font-sans font-[650] text-slate-900 dark:text-slate-200 text-[13px] [margin:10px_0_4px]"
+          className="font-[650] text-slate-900 dark:text-slate-200 text-[13px] [margin:10px_0_4px]"
         />
       ),
       h6: (p) => (
         <h6
           {...p}
-          className="font-sans font-semibold text-slate-600 dark:text-slate-400 text-[13px] [margin:10px_0_4px]"
+          className="font-semibold text-slate-600 dark:text-slate-400 text-[13px] [margin:10px_0_4px]"
         />
       ),
       p: (p) => <p {...p} className="[margin:0_0_12px] leading-[1.55]" />,
