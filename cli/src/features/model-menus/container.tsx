@@ -87,7 +87,10 @@ import {
   type PentagonRadarTransition,
 } from "../../components/pentagon-radar"
 import { localModelRadarAxes } from "../local-inference/model-radar"
-import { formatModelClassification } from "../local-inference/model-classification"
+import {
+  formatModelClassification,
+  formatModelReleaseRecency,
+} from "../local-inference/model-classification"
 import { CatalogRadarView } from "./catalog-radar-view"
 import {
   modelMenusLocalModelsStateEquivalent,
@@ -1510,6 +1513,10 @@ const CatalogInspector = memo(function CatalogInspector({
         model.servingState.capabilities.vision,
       )
     : ""
+  const releaseRecency = model.catalogMembershipState._tag === "InCatalog"
+    && model.servingState._tag === "Assessed"
+    ? formatModelReleaseRecency(model.catalogMembershipState.catalogData.releaseDate)
+    : null
 
   return (
     <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
@@ -1523,7 +1530,13 @@ const CatalogInspector = memo(function CatalogInspector({
             || model.upgradeState._tag === "Failed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
         </box>
         <text style={{ fg: theme.text.supporting }} wrapMode="none">
-          {truncateToDisplayWidth(classification, contentWidth)}
+          {releaseRecency !== null && (
+            <span fg={theme.text.detail}>{`${releaseRecency} · `}</span>
+          )}
+          {truncateToDisplayWidth(
+            classification,
+            Math.max(0, contentWidth - (releaseRecency === null ? 0 : `${releaseRecency} · `.length)),
+          )}
         </text>
         <text> </text>
       </box>
