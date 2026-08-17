@@ -40,38 +40,47 @@ export function analyzeTrial(observation: TrialObservation): TrialAnalysis {
   }
   for (const request of observation.requests) outcomes[request.outcome]++
   const valid = observation.requests.filter((request) => request.outcome === "valid")
-  const ttft = valid.flatMap((request) => request.ttftMs === undefined ? [] : [request.ttftMs])
-  const prefill = valid.flatMap((request) => {
+  // Context scaling measures engine performance at a selected depth. A model can
+  // produce a semantically invalid BFCL answer while still returning complete,
+  // internally consistent terminal timing evidence. Preserve that evidence while
+  // continuing to report semantic validity separately.
+  const measured = observation.trial.pattern === "context-scaling"
+    ? observation.requests.filter((request) =>
+        (request.outcome === "valid" || request.outcome === "invalid") && request.terminal !== undefined)
+    : valid
+  const ttft = measured.flatMap((request) => request.ttftMs === undefined ? [] : [request.ttftMs])
+  const prefill = measured.flatMap((request) => {
     const timings = request.terminal?.timings
     return timings && timings.evaluatedPromptTokens > 0 && timings.promptMs > 0
       ? [1_000 * timings.evaluatedPromptTokens / timings.promptMs]
       : []
   })
-  const decode = valid.flatMap((request) => {
+  const decode = measured.flatMap((request) => {
     const timings = request.terminal?.timings
     return timings && timings.generatedTokens > 0 && timings.generationMs > 0
       ? [1_000 * timings.generatedTokens / timings.generationMs]
       : []
   })
-  const cacheReuse = valid.flatMap((request) => {
+  const cacheReuse = measured.flatMap((request) => {
     const usage = request.terminal?.usage
     return usage && usage.promptTokens > 0 ? [usage.cachedPromptTokens / usage.promptTokens] : []
   })
-  const promptTokenCounts = valid.flatMap((request) => request.terminal ? [request.terminal.usage.promptTokens] : [])
-  const completionTokenCounts = valid.flatMap((request) => request.terminal ? [request.terminal.usage.completionTokens] : [])
-  const completion = valid.map((request) => request.completedMs)
+  const promptTokenCounts = measured.flatMap((request) => request.terminal ? [request.terminal.usage.promptTokens] : [])
+  const completionTokenCounts = measured.flatMap((request) => request.terminal ? [request.terminal.usage.completionTokens] : [])
+  const completion = measured.map((request) => request.completedMs)
   const measuredSeconds = observation.makespanMs / 1_000
-  const completionTokens = valid.reduce((sum, request) => sum + (request.terminal?.usage.completionTokens ?? 0), 0)
+  const completionTokens = measured.reduce((sum, request) => sum + (request.terminal?.usage.completionTokens ?? 0), 0)
   return {
     trialId: observation.trial.id,
     pattern: observation.trial.pattern,
+    measuredRequests: measured.length,
     validRequests: valid.length,
     outcomes,
     responsivenessMs: summarize(ttft),
     prefillTokensPerSecond: summarize(prefill),
     decodeTokensPerSecond: summarize(decode),
     completionMs: summarize(completion),
-    achievedRequestsPerSecond: measuredSeconds > 0 ? valid.length / measuredSeconds : undefined,
+    achievedRequestsPerSecond: measuredSeconds > 0 ? measured.length / measuredSeconds : undefined,
     achievedCompletionTokensPerSecond: measuredSeconds > 0 ? completionTokens / measuredSeconds : undefined,
     cacheReuseRatio: summarize(cacheReuse),
     promptTokens: summarize(promptTokenCounts),

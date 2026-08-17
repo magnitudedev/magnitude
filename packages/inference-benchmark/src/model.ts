@@ -13,6 +13,7 @@ export class ModelIdentityError extends Data.TaggedError("ModelIdentityError")<{
 export interface ResolveModelOptions {
   readonly id: string
   readonly artifactPath: string
+  readonly verifiedArtifactSha256?: string
   readonly maxContextTokens?: number
 }
 
@@ -23,7 +24,7 @@ function metadataValue(
   return metadata[key]?.value
 }
 
-const hashFile = (
+export const hashFileSha256 = (
   path: string,
 ): Effect.Effect<string, ModelIdentityError, FileSystem.FileSystem> =>
   Effect.gen(function* () {
@@ -78,7 +79,7 @@ export const resolveModelIdentity = (
     return {
       id: options.id,
       artifactPath: options.artifactPath,
-      artifactSha256: yield* hashFile(options.artifactPath),
+      artifactSha256: options.verifiedArtifactSha256 ?? (yield* hashFileSha256(options.artifactPath)),
       contextLimit: options.maxContextTokens && options.maxContextTokens > 0
         ? Math.min(trainedContext, options.maxContextTokens)
         : trainedContext,

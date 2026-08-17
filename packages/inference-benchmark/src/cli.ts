@@ -1,82 +1,26 @@
 #!/usr/bin/env bun
-import { Args, Command, Options } from "@effect/cli"
+import { Args, Command } from "@effect/cli"
+import * as PlatformCommand from "@effect/platform/Command"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Console, Data, Effect, Layer } from "effect"
-import { dirname, resolve } from "node:path"
-import { compare, evaluate } from "./benchmark"
-import { loadConfiguration } from "./configuration"
+import { Console, Data, Effect, Layer, Schema } from "effect"
+import { join, resolve } from "node:path"
 import { corpusStatus, prepareCorpus } from "./corpus"
-import type { ModelIdentity, ProfileName } from "./domain"
-import { resolveModelIdentity } from "./model"
-import { listModelProfiles, resolveModelArtifact } from "./model-source"
+import { discoverExperiments, loadExperiment, resolveExperimentPaths } from "./experiment"
 import { compileTrialPlan, explainPlan } from "./plan"
-import { renderBenchmarkMarkdown, renderComparisonMarkdown, writeReport } from "./report"
-import {
-  existingTarget,
-  managedIcnTarget,
-  managedLlamaCppTarget,
-  resolveIcnExecutable,
-  resolveLlamaCppExecutable,
-  TargetLauncherLive,
-} from "./target"
+import { createMlxArtifactLock, loadPreparedExperiment, prepareExperiment } from "./preparation"
+import { activeRunLockPath, listRuns, runDirectory, runExperiment } from "./run"
+import { TargetLauncherLive } from "./target"
 import { EndpointClientLive } from "./transport"
 
-const profile = Options.choice("profile", ["smoke", "standard", "full"] as const).pipe(
-  Options.withDefault("standard" as const),
-)
-const context = Options.integer("context").pipe(Options.withDefault(0))
-const output = Options.text("output").pipe(Options.withDefault("benchmark-results/result.json"))
-const modelPath = Options.text("model-path").pipe(
-  Options.withDescription("Optional offline GGUF override"),
-  Options.withDefault(""),
-)
-const apiKey = Options.text("api-key").pipe(Options.withDefault(""))
-const modelReference = Args.text({ name: "model" })
-
-class CliError extends Data.TaggedError("CliError")<{
-  readonly message: string
-}> {}
-
+class CliError extends Data.TaggedError("CliError")<{ readonly message: string }> {}
 const operation = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, CliError, R> =>
-  effect.pipe(Effect.mapError((error) => new CliError({
-    message: error instanceof Error ? error.message : String(error),
-  })))
+  effect.pipe(Effect.mapError((error) => new CliError({ message: error instanceof Error ? error.message : String(error) })))
 
-const requireSuite = (suite: string) => suite === "agent-core"
-  ? Effect.void
-  : Effect.fail(new CliError({ message: `Unknown suite ${suite}; expected agent-core` }))
-
-const ensureOutputDirectory = (outputPath: string) =>
-  Effect.flatMap(FileSystem.FileSystem, (fs) => fs.makeDirectory(dirname(outputPath), { recursive: true }))
-
-const managedModel = (
-  reference: string,
-  localPath: string,
-  contextLimit: number,
-): Effect.Effect<ModelIdentity, CliError, FileSystem.FileSystem> =>
-  operation(Effect.gen(function* () {
-    const artifact = yield* resolveModelArtifact({
-      reference,
-      localPath: localPath || undefined,
-      onDownload: (message) => console.error(message),
-    })
-    const identity = yield* resolveModelIdentity({
-      id: artifact.id,
-      artifactPath: artifact.path,
-      maxContextTokens: contextLimit || undefined,
-    })
-    const expected = artifact.source.kind === "huggingface"
-      ? artifact.source.expectedSha256
-      : undefined
-    if (expected && identity.artifactSha256 !== expected) {
-      return yield* new CliError({
-        message: `Model digest mismatch for ${reference}: expected ${expected}, received ${identity.artifactSha256}`,
-      })
-    }
-    return identity
-  }))
+const experimentFile = Args.file({ name: "experiment", exists: "yes" })
+const runId = Args.text({ name: "run-id" })
+const RunProcessManifest = Schema.Struct({ runId: Schema.String, pid: Schema.Int })
 
 const corpusFetch = Command.make("fetch", {}, () => operation(Effect.gen(function* () {
   const prepared = yield* prepareCorpus()
@@ -93,148 +37,161 @@ const corpus = Command.make("corpus", {}).pipe(
   Command.withSubcommands([corpusFetch, corpusStatusCommand]),
 )
 
-const modelsList = Command.make("list", {}, () => Console.log(
-  listModelProfiles().map((entry) => [
-    entry.id,
-    entry.displayName,
-    `${(entry.sizeBytes / 1_000_000_000).toFixed(1)} GB`,
-    `${entry.repository}/resolve/${entry.revision}/${entry.file}`,
-  ].join("\t")).join("\n"),
-)).pipe(Command.withDescription("List built-in immutable model profiles"))
+const experimentsList = Command.make("list", {}, () => operation(Effect.gen(function* () {
+  const entries = yield* discoverExperiments()
+  for (const entry of entries) {
+    const experiment = yield* loadExperiment(entry.path)
+    yield* Console.log(`${experiment.id}\t${experiment.title}\t${entry.path}`)
+  }
+}))).pipe(Command.withDescription("List TypeScript experiment definitions"))
 
-const modelsFetch = Command.make(
-  "fetch",
-  { model: modelReference, modelPath },
-  ({ model, modelPath }) => operation(Effect.gen(function* () {
-    const identity = yield* managedModel(model, modelPath, 0)
-    yield* Console.log(`model: ${identity.artifactPath}\nsha256: ${identity.artifactSha256}`)
-  })),
-).pipe(Command.withDescription("Resolve, download, cache, and verify a model"))
+const experimentsShow = Command.make("show", { experiment: experimentFile }, ({ experiment }) => operation(Effect.gen(function* () {
+  const loaded = yield* loadExperiment(experiment)
+  const encoded = yield* Schema.encode(Schema.parseJson(Schema.Unknown, { space: 2 }))(resolveExperimentPaths(loaded, experiment))
+  yield* Console.log(encoded)
+}))).pipe(Command.withDescription("Validate and display a resolved experiment"))
 
-const models = Command.make("models", {}).pipe(
-  Command.withDescription("Manage benchmark model artifacts"),
-  Command.withSubcommands([modelsList, modelsFetch]),
+const experiments = Command.make("experiments", {}).pipe(
+  Command.withSubcommands([experimentsList, experimentsShow]),
+  Command.withDescription("Inspect benchmark experiments"),
 )
 
-const explain = Command.make(
-  "explain",
-  { suite: Args.text({ name: "suite" }), model: modelReference, modelPath, context, profile },
-  ({ suite, model, modelPath, context, profile }) => operation(Effect.gen(function* () {
-    yield* requireSuite(suite)
-    const prepared = yield* prepareCorpus()
-    const identity = yield* managedModel(model, modelPath, context)
-    const plan = yield* compileTrialPlan(prepared, identity, { profile: profile as ProfileName })
-    yield* Console.log(explainPlan(plan))
-  })),
-).pipe(Command.withDescription("Compile and explain an immutable benchmark plan"))
+const modelsLockMlx = Command.make("lock-mlx", {
+  repository: Args.text({ name: "repository" }),
+  revision: Args.text({ name: "revision" }),
+  bits: Args.integer({ name: "bits" }),
+  groupSize: Args.integer({ name: "group-size" }),
+  output: Args.text({ name: "output" }),
+}, ({ repository, revision, bits, groupSize, output }) => operation(Effect.gen(function* () {
+  const locked = yield* createMlxArtifactLock({ repository, revision, bits, groupSize, output })
+  yield* Console.log(`locked: ${locked.output}\nfiles: ${locked.files}\ncache: ${locked.root}`)
+}))).pipe(Command.withDescription("Download and write a complete immutable lock for an MLX artifact"))
 
-const endpoint = Options.text("endpoint")
-const targetId = Options.text("target").pipe(Options.withDefault("endpoint"))
-const maxSequences = Options.integer("sequences").pipe(Options.withDefault(4))
+const modelsLockMlxUnquantized = Command.make("lock-mlx-unquantized", {
+  repository: Args.text({ name: "repository" }),
+  revision: Args.text({ name: "revision" }),
+  dtype: Args.text({ name: "dtype" }),
+  output: Args.text({ name: "output" }),
+}, ({ repository, revision, dtype, output }) => operation(Effect.gen(function* () {
+  if (dtype !== "bfloat16" && dtype !== "float16") return yield* new CliError({ message: "dtype must be bfloat16 or float16" })
+  const locked = yield* createMlxArtifactLock({ repository, revision, dtype, output })
+  yield* Console.log(`locked: ${locked.output}\nfiles: ${locked.files}\ncache: ${locked.root}`)
+}))).pipe(Command.withDescription("Download and lock an unquantized MLX artifact"))
 
-const run = Command.make(
-  "run",
-  { suite: Args.text({ name: "suite" }), model: modelReference, modelPath, endpoint, targetId, apiKey, context, profile, output, maxSequences },
-  ({ suite, model, modelPath, endpoint, targetId, apiKey, context, profile, output, maxSequences }) => operation(Effect.gen(function* () {
-    yield* requireSuite(suite)
-    const prepared = yield* prepareCorpus()
-    const identity = yield* managedModel(model, modelPath, context)
-    const plan = yield* compileTrialPlan(prepared, identity, {
-      profile: profile as ProfileName,
-      parallelSequences: maxSequences,
-    })
-    const result = yield* evaluate(
-      plan,
-      existingTarget(targetId, endpoint, model, apiKey || undefined, maxSequences),
-    )
-    const destination = resolve(output)
-    yield* ensureOutputDirectory(destination)
-    yield* writeReport(destination, result)
-    yield* Console.log(`${renderBenchmarkMarkdown(result)}\n\nJSON: ${destination}`)
-  })),
-).pipe(Command.withDescription("Evaluate one conforming chat-completions endpoint"))
+const models = Command.make("models", {}).pipe(
+  Command.withSubcommands([modelsLockMlx, modelsLockMlxUnquantized]),
+  Command.withDescription("Create immutable model artifact locks"),
+)
 
-const icnExecutable = Options.text("icn-executable").pipe(Options.withDefault(""))
-const llamaExecutable = Options.text("llama-executable").pipe(Options.withDefault(""))
-const port = Options.integer("port").pipe(Options.withDefault(8091))
+const prepare = Command.make("prepare", { experiment: experimentFile }, ({ experiment }) => operation(Effect.gen(function* () {
+  const prepared = yield* prepareExperiment(experiment)
+  yield* Console.log([
+    `prepared: ${prepared.experiment.id}`,
+    `digest: ${prepared.digest}`,
+    ...prepared.artifacts.map((artifact) => `${artifact.variantId} (${artifact.role}): ${artifact.path}`),
+  ].join("\n"))
+}))).pipe(Command.withDescription("Download, verify, and freeze everything required by an experiment"))
 
-const compareCommand = Command.make(
-  "compare",
-  {
-    suite: Args.text({ name: "suite" }), model: modelReference, modelPath,
-    icnExecutable, llamaExecutable, port, maxSequences, context, profile, output,
-  },
-  ({ suite, model, modelPath, icnExecutable, llamaExecutable, port, maxSequences, context, profile, output }) =>
-    operation(Effect.gen(function* () {
-      yield* requireSuite(suite)
-      const identity = yield* managedModel(model, modelPath, context)
-      const prepared = yield* prepareCorpus()
-      const plan = yield* compileTrialPlan(prepared, identity, {
-        profile: profile as ProfileName,
-        parallelSequences: maxSequences,
-      })
-      const resolvedIcn = yield* resolveIcnExecutable(icnExecutable || undefined)
-      const resolvedLlama = yield* resolveLlamaCppExecutable(llamaExecutable || undefined)
-      const options = {
-        model: identity,
-        icnExecutable: resolvedIcn,
-        llamaExecutable: resolvedLlama,
-        port,
-        maxSequences,
-      }
-      const result = yield* compare(plan, [managedIcnTarget(options), managedLlamaCppTarget(options)])
-      const destination = resolve(output)
-      yield* ensureOutputDirectory(destination)
-      yield* writeReport(destination, result)
-      yield* Console.log(`${renderComparisonMarkdown(result)}\n\nJSON: ${destination}`)
-    })),
-).pipe(Command.withDescription("Compare managed ICN and llama.cpp with equal declared capacity"))
+const plan = Command.make("plan", { experiment: experimentFile }, ({ experiment }) => operation(Effect.gen(function* () {
+  const loaded = resolveExperimentPaths(yield* loadExperiment(experiment), experiment)
+  const prepared = yield* loadPreparedExperiment(loaded.id)
+  const corpus = yield* prepareCorpus({ root: prepared.corpusRoot, offline: true })
+  const compiled = yield* compileTrialPlan(corpus, prepared.planModel, {
+    ...(loaded.suite.kind === "agent-core"
+      ? { profile: loaded.suite.profile }
+      : { contextSweep: loaded.suite }),
+    maxContextTokens: loaded.requestPolicy.contextTokensPerSequence,
+    parallelSequences: loaded.requestPolicy.parallelSequences,
+    maxOutputTokens: loaded.requestPolicy.maxOutputTokens,
+    temperature: loaded.requestPolicy.temperature,
+    topP: loaded.requestPolicy.topP,
+    seed: loaded.requestPolicy.seed,
+    enableThinking: loaded.requestPolicy.enableThinking,
+  })
+  yield* Console.log(`${explainPlan(compiled)}\nblocks: ${loaded.execution.blocks}\norder: ${loaded.execution.variantOrder}`)
+}))).pipe(Command.withDescription("Compile and display the immutable workload plan"))
 
-const execute = Command.make(
-  "execute",
-  { config: Args.file({ name: "config", exists: "yes" }) },
-  ({ config }) => operation(Effect.gen(function* () {
-    const configuration = yield* loadConfiguration(config)
-    const prepared = yield* prepareCorpus({ root: configuration.corpusCache })
-    const model = yield* resolveModelIdentity({
-      id: configuration.model.id,
-      artifactPath: resolve(configuration.model.artifactPath),
-      maxContextTokens: configuration.model.contextLimit,
-    })
-    if (configuration.model.artifactSha256 && model.artifactSha256 !== configuration.model.artifactSha256) {
-      return yield* new CliError({
-        message: `Model digest mismatch: expected ${configuration.model.artifactSha256}, received ${model.artifactSha256}`,
-      })
-    }
-    const capacities = new Set(configuration.targets.map((target) => target.parallelSequences))
-    if (capacities.size !== 1) {
-      return yield* new CliError({ message: "all configured targets must declare the same parallelSequences" })
-    }
-    const plan = yield* compileTrialPlan(prepared, model, {
-      profile: configuration.profile,
-      parallelSequences: configuration.targets[0]!.parallelSequences,
-    })
-    const destination = resolve(configuration.output)
-    yield* ensureOutputDirectory(destination)
-    if (configuration.targets.length === 1) {
-      const result = yield* evaluate(plan, configuration.targets[0]!)
-      yield* writeReport(destination, result)
-      yield* Console.log(renderBenchmarkMarkdown(result))
-    } else {
-      const result = yield* compare(plan, configuration.targets)
-      yield* writeReport(destination, result)
-      yield* Console.log(renderComparisonMarkdown(result))
-    }
-    yield* Console.log(`\nJSON: ${destination}`)
-  })),
-).pipe(Command.withDescription("Execute a JSON benchmark configuration"))
+const run = Command.make("run", { experiment: experimentFile }, ({ experiment }) => operation(Effect.gen(function* () {
+  const result = yield* runExperiment(experiment)
+  yield* Console.log(`completed: ${result.runId}\nresult: ${join(runDirectory(result.runId), "result.json")}`)
+}))).pipe(Command.withDescription("Execute a prepared experiment"))
+
+const runsList = Command.make("list", {}, () => operation(Effect.gen(function* () {
+  const entries = yield* listRuns()
+  yield* Console.log(entries.map((entry) => `${entry.runId}\t${entry.state}\t${entry.experimentId}\t${entry.startedAt}`).join("\n"))
+})))
+
+const runsShow = Command.make("show", { runId }, ({ runId }) => operation(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const directory = runDirectory(runId)
+  const result = join(directory, "result.json")
+  const path = (yield* fs.exists(result)) ? result : join(directory, "manifest.json")
+  yield* Console.log(yield* fs.readFileString(path))
+})))
+
+const runsWatch = Command.make("watch", { runId }, ({ runId }) => operation(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const eventsPath = join(runDirectory(runId), "events.jsonl")
+  let delivered = 0
+  while (true) {
+    const text = yield* fs.readFileString(eventsPath)
+    const lines = text.trim().length > 0 ? text.trimEnd().split("\n") : []
+    for (const line of lines.slice(delivered)) yield* Console.log(line)
+    delivered = lines.length
+    if (lines.some((line) => /"type":"run-(completed|failed|cancelled)"/.test(line))) return
+    yield* Effect.sleep("500 millis")
+  }
+})))
+
+const runsCancel = Command.make("cancel", { runId }, ({ runId }) => operation(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const manifest = yield* Schema.decodeUnknown(Schema.parseJson(RunProcessManifest))(
+    yield* fs.readFileString(join(runDirectory(runId), "manifest.json")),
+  )
+  const lock = yield* Schema.decodeUnknown(Schema.parseJson(RunProcessManifest))(
+    yield* fs.readFileString(activeRunLockPath()),
+  )
+  if (manifest.runId !== runId || lock.runId !== runId || lock.pid !== manifest.pid) {
+    return yield* new CliError({ message: "run manifest does not contain a valid matching PID" })
+  }
+  yield* Effect.try({
+    try: () => process.kill(manifest.pid, "SIGINT"),
+    catch: (error) => new CliError({ message: error instanceof Error ? error.message : String(error) }),
+  })
+  yield* Console.log(`cancellation requested for ${runId}`)
+})))
+
+const runs = Command.make("runs", {}).pipe(
+  Command.withSubcommands([runsList, runsShow, runsWatch, runsCancel]),
+  Command.withDescription("Inspect and control benchmark runs"),
+)
+
+const dashboard = Command.make("dashboard", {}, () => operation(Effect.gen(function* () {
+  yield* Console.log("Inference benchmark dashboard: http://127.0.0.1:5187\nDashboard API: http://127.0.0.1:4897\nPress Ctrl+C to stop.")
+  const child = PlatformCommand.make(
+    "bunx", "concurrently", "--kill-others-on-fail", "bunx vite", "bun run src/server.ts",
+  ).pipe(
+    PlatformCommand.workingDirectory(resolve("packages/inference-benchmark-dashboard")),
+    PlatformCommand.stdin("inherit"),
+    PlatformCommand.stdout("inherit"),
+    PlatformCommand.stderr("inherit"),
+  )
+  let interrupted = false
+  const onInterrupt = () => { interrupted = true }
+  const code = yield* Effect.acquireUseRelease(
+    Effect.sync(() => process.on("SIGINT", onInterrupt)),
+    () => PlatformCommand.exitCode(child),
+    () => Effect.sync(() => process.off("SIGINT", onInterrupt)),
+  )
+  if (code !== 0 && !interrupted) return yield* new CliError({ message: `dashboard exited with ${code}` })
+}))).pipe(Command.withDescription("Start the local benchmark dashboard"))
 
 const benchmark = Command.make("benchmark", {}).pipe(
   Command.withDescription("Magnitude inference benchmark"),
-  Command.withSubcommands([run, compareCommand, execute, explain, corpus, models]),
+  Command.withSubcommands([corpus, models, experiments, prepare, plan, run, runs, dashboard]),
 )
 
-const cli = Command.run(benchmark, { name: "Magnitude inference benchmark", version: "0.1.0" })
+const cli = Command.run(benchmark, { name: "Magnitude inference benchmark", version: "0.2.0" })
 const RuntimeLive = TargetLauncherLive.pipe(
   Layer.provideMerge(EndpointClientLive),
   Layer.provideMerge(FetchHttpClient.layer),

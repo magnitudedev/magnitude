@@ -4,13 +4,13 @@ import type { PreparedCorpus } from "./corpus"
 import type {
   Criterion,
   Fixture,
-  ModelIdentity,
+  LogicalModelIdentity,
   PlannedRequest,
   ProfileName,
   TrialDefinition,
   TrialPlan,
 } from "./domain"
-import { digestObject } from "./hash"
+import { digestObject, stableStringify } from "./hash"
 
 export class PlanError extends Data.TaggedError("PlanError")<{
   readonly message: string
@@ -85,6 +85,11 @@ function cumulativeRequest(
     readonly prefixGroup?: string
     readonly releaseOffsetMs?: number
     readonly dependsOn?: readonly string[]
+    readonly maxOutputTokens?: number
+    readonly temperature?: number
+    readonly topP?: number
+    readonly seed?: number
+    readonly enableThinking?: false
   } = {},
 ): PlannedRequest {
   const current = fixtures[currentIndex]
@@ -105,13 +110,22 @@ function cumulativeRequest(
     expected: current.expected,
     releaseOffsetMs: options.releaseOffsetMs ?? 0,
     dependsOn: options.dependsOn ?? [],
-    maxOutputTokens: 128,
+    maxOutputTokens: options.maxOutputTokens ?? 128,
+    temperature: options.temperature,
+    topP: options.topP,
+    seed: options.seed,
+    enableThinking: options.enableThinking,
     sessionId: options.sessionId,
     prefixGroup: options.prefixGroup,
   }
 }
 
-function isolatedRequest(id: string, fixture: Fixture, releaseOffsetMs = 0): PlannedRequest {
+function isolatedRequest(
+  id: string,
+  fixture: Fixture,
+  releaseOffsetMs = 0,
+  requestPolicy: Pick<PlannedRequest, "maxOutputTokens" | "temperature" | "topP" | "seed" | "enableThinking"> = { maxOutputTokens: 128 },
+): PlannedRequest {
   return {
     id,
     fixtureId: fixture.id,
@@ -126,25 +140,100 @@ function isolatedRequest(id: string, fixture: Fixture, releaseOffsetMs = 0): Pla
     expected: fixture.expected,
     releaseOffsetMs,
     dependsOn: [],
-    maxOutputTokens: 128,
+    ...requestPolicy,
   }
 }
 
 export interface CompilePlanOptions {
   readonly profile?: ProfileName
+  readonly contextSweep?: {
+    readonly checkpoints: readonly number[]
+    readonly charactersPerToken: number
+    readonly samplesPerCheckpoint: number
+  }
   readonly maxContextTokens?: number
   readonly parallelSequences?: number
+  readonly maxOutputTokens?: number
+  readonly temperature?: number
+  readonly topP?: number
+  readonly seed?: number
+  readonly enableThinking?: false
+}
+
+type RequestPolicy = Pick<PlannedRequest, "maxOutputTokens" | "temperature" | "topP" | "seed" | "enableThinking">
+
+function contextRequestCharacters(request: PlannedRequest): number {
+  return [...stableStringify({ messages: request.messages, tools: request.tools })].length
+}
+
+function contextRequestAtTarget(
+  id: string,
+  fixtures: readonly Fixture[],
+  targetCharacters: number,
+  requestPolicy: RequestPolicy,
+): { readonly request: PlannedRequest; readonly characters: number; readonly depth: number } {
+  let previous: { readonly request: PlannedRequest; readonly characters: number; readonly depth: number } | undefined
+  for (let index = 0; index < fixtures.length; index++) {
+    const request = cumulativeRequest(id, fixtures, index, { prefixGroup: id, ...requestPolicy })
+    const candidate = { request, characters: contextRequestCharacters(request), depth: index + 1 }
+    if (candidate.characters >= targetCharacters) {
+      if (!previous || candidate.characters - targetCharacters < targetCharacters - previous.characters) return candidate
+      return previous
+    }
+    previous = candidate
+  }
+  throw new PlanError({
+    message: `BFCL corpus reaches only ${previous?.characters ?? 0} canonical characters; cannot satisfy context target ${targetCharacters}`,
+  })
+}
+
+function compileContextSweepTrials(
+  fixtures: readonly Fixture[],
+  sweep: NonNullable<CompilePlanOptions["contextSweep"]>,
+  requestPolicy: RequestPolicy,
+): readonly TrialDefinition[] {
+  return sweep.checkpoints.flatMap((tokens) => {
+    const characters = Math.round(tokens * sweep.charactersPerToken)
+    return Array.from({ length: sweep.samplesPerCheckpoint }, (_, repetition) => {
+      const id = `context-t${tokens}-r${repetition}`
+      const selected = contextRequestAtTarget(`${id}-q0`, fixtures, characters, requestPolicy)
+      return {
+        id,
+        pattern: "context-scaling" as const,
+        criteria: allCriteria,
+        checkpoint: `~${tokens}-tokens`,
+        repetition,
+        state: "cache-disjoint" as const,
+        requests: [selected.request],
+        contextTarget: {
+          tokens,
+          characters,
+          plannedCharacters: selected.characters,
+          semanticDepth: selected.depth,
+        },
+      }
+    })
+  })
 }
 
 export function compileTrialPlanSync(
   corpus: PreparedCorpus,
-  modelInput: ModelIdentity,
+  modelInput: LogicalModelIdentity,
   options: CompilePlanOptions = {},
 ): TrialPlan {
-  const profileName = options.profile ?? "standard"
-  const profile = profiles[profileName]
+  if (options.profile !== undefined && options.contextSweep !== undefined) {
+    throw new PlanError({ message: "choose either an agent-core profile or a context sweep" })
+  }
+  const profileName = options.contextSweep ? "context-sweep" as const : options.profile ?? "standard"
+  const requestPolicy = {
+    maxOutputTokens: options.maxOutputTokens ?? 128,
+    temperature: options.temperature ?? 0,
+    topP: options.topP ?? 1,
+    seed: options.seed ?? 42,
+    enableThinking: options.enableThinking ?? false,
+  }
   const model = {
-    ...modelInput,
+    id: modelInput.id,
     contextLimit: Math.min(
       modelInput.contextLimit,
       options.maxContextTokens ?? modelInput.contextLimit,
@@ -155,11 +244,15 @@ export function compileTrialPlanSync(
   }
 
   const fixtures = corpus.fixtures
-  const warmup = isolatedRequest("warmup", fixtures[0]!)
+  const warmup = isolatedRequest("warmup", fixtures[0]!, 0, requestPolicy)
   const trials: TrialDefinition[] = []
   let cursor = 0
 
-  for (let repetition = 0; repetition < profile.repetitions; repetition++) {
+  if (options.contextSweep) {
+    trials.push(...compileContextSweepTrials(fixtures, options.contextSweep, requestPolicy))
+  } else {
+    const profile = profiles[options.profile ?? "standard"]
+    for (let repetition = 0; repetition < profile.repetitions; repetition++) {
     const single = fixtures[cursor++ % fixtures.length]!
     trials.push({
       id: `single-r${repetition}`,
@@ -168,7 +261,7 @@ export function compileTrialPlanSync(
       checkpoint: "one-turn",
       repetition,
       state: "cache-disjoint",
-      requests: [isolatedRequest(`single-r${repetition}-q0`, single)],
+      requests: [isolatedRequest(`single-r${repetition}-q0`, single, 0, requestPolicy)],
     })
 
     const sequentialFixtures = Array.from(
@@ -192,6 +285,7 @@ export function compileTrialPlanSync(
             sessionId: `sequential-r${repetition}`,
             dependsOn:
               depth === 0 ? [] : [`sequential-r${repetition}-q${depth - 1}`],
+            ...requestPolicy,
           },
         )),
     })
@@ -210,7 +304,7 @@ export function compileTrialPlanSync(
         repetition,
         state: "cache-disjoint",
         requests: selected.map((fixture, index) =>
-          isolatedRequest(`independent-c${concurrency}-r${repetition}-q${index}`, fixture)),
+          isolatedRequest(`independent-c${concurrency}-r${repetition}-q${index}`, fixture, 0, requestPolicy)),
       })
     }
 
@@ -229,6 +323,7 @@ export function compileTrialPlanSync(
         {
           sessionId: `forked-r${repetition}-parent`,
           prefixGroup: `forked-r${repetition}`,
+          ...requestPolicy,
         },
       ),
       phase: "setup" as const,
@@ -238,7 +333,7 @@ export function compileTrialPlanSync(
         `forked-r${repetition}-q${index}`,
         [...prefix, fixture],
         prefix.length,
-        { prefixGroup: `forked-r${repetition}`, dependsOn: [setupId] },
+        { prefixGroup: `forked-r${repetition}`, dependsOn: [setupId], ...requestPolicy },
       ),
       phase: "measure" as const,
     }))
@@ -266,7 +361,7 @@ export function compileTrialPlanSync(
         repetition,
         state: "cache-disjoint",
         requests: selected.map((fixture, index) =>
-          isolatedRequest(`concurrency-pressure-c${concurrency}-r${repetition}-q${index}`, fixture)),
+          isolatedRequest(`concurrency-pressure-c${concurrency}-r${repetition}-q${index}`, fixture, 0, requestPolicy)),
       })
     }
 
@@ -285,6 +380,7 @@ export function compileTrialPlanSync(
           {
             sessionId: `memory-s${session}-r${repetition}`,
             releaseOffsetMs: session * 25,
+            ...requestPolicy,
           },
         )
       })
@@ -298,12 +394,17 @@ export function compileTrialPlanSync(
         requests,
       })
     }
-    cursor += profile.memorySessions * maximumDepth
+      cursor += profile.memorySessions * maximumDepth
+    }
   }
 
   const servingPolicy = {
     contextTokensPerSequence: model.contextLimit,
     parallelSequences: options.parallelSequences ?? 1,
+    temperature: requestPolicy.temperature,
+    topP: requestPolicy.topP,
+    seed: requestPolicy.seed,
+    enableThinking: requestPolicy.enableThinking,
   }
   const identity = { profile: profileName, model, servingPolicy, corpusDigest: corpus.digest, warmup, trials }
   return {
@@ -315,7 +416,7 @@ export function compileTrialPlanSync(
 
 export const compileTrialPlan = (
   corpus: PreparedCorpus,
-  model: ModelIdentity,
+  model: LogicalModelIdentity,
   options: CompilePlanOptions = {},
 ): Effect.Effect<TrialPlan, PlanError> =>
   Effect.try({
@@ -340,5 +441,8 @@ export function explainPlan(plan: TrialPlan): string {
     `corpus: ${plan.corpusDigest}`,
     `trials: ${plan.trials.length}`,
     ...[...counts].map(([pattern, count]) => `  ${pattern}: ${count}`),
+    ...plan.trials.flatMap((trial) => trial.contextTarget ? [
+      `  ${trial.id}: target=${trial.contextTarget.tokens} tokens (${trial.contextTarget.characters} chars), planned=${trial.contextTarget.plannedCharacters} chars, depth=${trial.contextTarget.semanticDepth}`,
+    ] : []),
   ].join("\n")
 }
