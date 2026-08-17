@@ -9,7 +9,7 @@ beforeAll(registerWebCommands)
 
 describe("web local-model commands", () => {
   test.each(["models", "catalog", "hardware"] as const)(
-    "routes /%s to its Model Center tab",
+    "routes /%s to its Settings tab",
     (tab) => {
       const openModelMenu = vi.fn()
       const context = {

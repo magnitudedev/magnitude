@@ -46,14 +46,21 @@ The shared setup service sequences install, assignment, load, cancellation, and 
 completion and publishes one server-derived presentation state. Web renders that state directly and
 does not maintain a second workflow or correlate operations itself.
 
-The ordinary shell contains a dedicated Model Center:
+The ordinary shell contains a dedicated Settings surface for local inference:
 
 - Models presents selected slots, installed models, active transfers, failures, and residency.
 - Catalog presents the unified assessed local catalog and recommendation evidence.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside
   resident allocations. Internal admission thresholds are not exposed as end-user concepts.
 
-The chat footer is the sole compact runtime-information surface outside Model Center. The sidebar,
+Opening Settings changes the application sidebar from session navigation to Settings navigation.
+Models, Catalog, and Hardware are vertical sidebar destinations; the main pane renders only the
+selected destination. Returning from Settings restores the session sidebar. On narrow layouts the
+same navigation is presented in the existing sidebar overlay rather than as horizontal content tabs.
+Settings destinations take over the main pane directly and do not reuse the session chat title bar;
+each destination's own heading is the page heading.
+
+The chat footer is the sole compact runtime-information surface outside Settings. The sidebar,
 title bar, and other application chrome do not duplicate model identity, residency, allocation, or
 context information.
 
@@ -68,7 +75,7 @@ running state is always rendered from refreshed service queries, while mutation 
 only local invocation admission.
 
 Chat readiness requires an available local slot whose residency is `Ready`. Selection alone is not
-readiness. When submission is unavailable, the composer routes the user to Model Center instead of
+readiness. When submission is unavailable, the composer routes the user to Settings instead of
 discarding the attempt.
 
 The chat footer follows the CLI's runtime-information structure without combining independent
@@ -95,7 +102,7 @@ terminal palette discovery and transparent terminal backgrounds are not browser 
 - No web model-management component reconstructs the deprecated candidate/offering/download model.
 - Non-local catalog entries are never rendered, selected, assigned, or counted as ready.
 - Every long-running lifecycle is rendered from server state; mutations cover command admission.
-- Model Center is a first-class application surface rather than a Settings subsection.
+- Settings is a first-class application surface with Models, Catalog, and Hardware destinations.
 - Wide and narrow layouts preserve access to every model-management view and action.
 - Catalog keeps the selected model's primary action visible while its evidence scrolls, labels
   radar axes directly, and does not repeat radar evidence in candidate rows or metric tiles.

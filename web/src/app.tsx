@@ -58,15 +58,13 @@ import { FileViewerPanel } from "./components/file-viewer-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
-import { SettingsPanel } from "./components/settings-panel"
-import { ModelCenter } from "./components/model-center"
+import { SettingsCenter } from "./components/model-center"
 import { LocalModelOnboarding } from "./components/local-model-onboarding"
 import { formatBytes } from "./components/local-inference-format"
 import { ChatColumnPage } from "./components/chat-column-page"
 import {
   selectedCwdAtom,
   selectedFilePathAtom,
-  settingsOpenAtom,
   bashModeAtom,
   nextEscWillKillAllAtom,
 } from "@magnitudedev/client-common"
@@ -74,7 +72,7 @@ import {
   sidebarSearchAtom,
   sidebarCwdFilterAtom,
   sidebarVisibleAtom,
-  modelCenterTabAtom,
+  settingsTabAtom,
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
@@ -150,8 +148,8 @@ function SessionsSidebarContainer(props?: {
   const setCwdFilter = useAtomSet(sidebarCwdFilterAtom)
   const searchQuery = useAtomValue(sidebarSearchAtom)
   const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
+  const settingsTab = useAtomValue(settingsTabAtom)
+  const setSettingsTab = useAtomSet(settingsTabAtom)
 
   const trimmedSearchQuery = searchQuery.trim()
   const sessionPage = usePaginatedSessions({
@@ -192,8 +190,7 @@ function SessionsSidebarContainer(props?: {
   })
 
   const handleNewSession = () => {
-    setSettingsOpen(false)
-    setModelCenterTab(null)
+    setSettingsTab(null)
     startNewSession({ cwd: cwdFilter })
     if (props?.overlay && props.onCloseOverlay) props.onCloseOverlay()
   }
@@ -229,21 +226,19 @@ function SessionsSidebarContainer(props?: {
       onCwdFilterChange={setCwdFilter}
       onLoadMore={sessionPage.loadMore}
       onSelectSession={(id) => {
-        setSettingsOpen(false)
-        setModelCenterTab(null)
+        setSettingsTab(null)
         resumeSession(id)
       }}
       onNewSession={handleNewSession}
       onOpenSettings={() => {
-        setModelCenterTab(null)
-        setSettingsOpen(true)
+        setSettingsTab("models")
+      }}
+      settingsTab={settingsTab}
+      onSettingsTabChange={(tab) => {
+        setSettingsTab(tab)
         props?.onCloseOverlay?.()
       }}
-      onOpenModels={() => {
-        setSettingsOpen(false)
-        setModelCenterTab("models")
-        props?.onCloseOverlay?.()
-      }}
+      onCloseSettings={() => setSettingsTab(null)}
       overlay={props?.overlay}
       onCloseOverlay={props?.onCloseOverlay}
     />
@@ -419,8 +414,7 @@ function ComposerContainer({
 }): ReactNode {
   const platform = usePlatform()
   const setBashMode = useAtomSet(bashModeAtom)
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
+  const setSettingsTab = useAtomSet(settingsTabAtom)
   const setFilePath = useAtomSet(selectedFilePathAtom)
   const sidebarVisible = useAtomValue(sidebarVisibleAtom)
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
@@ -470,12 +464,11 @@ function ComposerContainer({
           "Project initialization is not available in the web app yet.",
         )
       },
-      openSettings: () => setSettingsOpen(true),
+      openSettings: () => setSettingsTab("models"),
       openSetup: onboarding.open,
       openModelMenu: (menu) => {
         if (menu === "models" || menu === "catalog" || menu === "hardware") {
-          setSettingsOpen(false)
-          setModelCenterTab(menu)
+          setSettingsTab(menu)
         }
       },
       toggleAutopilot: () => {
@@ -488,8 +481,7 @@ function ComposerContainer({
       sidebarVisible,
       setSidebarVisible,
       setBashMode,
-      setSettingsOpen,
-      setModelCenterTab,
+      setSettingsTab,
       onboarding.open,
     ],
   )
@@ -521,7 +513,7 @@ function ComposerContainer({
       cwd={composer.cwd}
       docked={docked}
       disabledReason={disabledReason}
-      onDisabledAction={() => setModelCenterTab("models")}
+      onDisabledAction={() => setSettingsTab("models")}
     />
   )
 }
@@ -543,8 +535,7 @@ function FooterBarContainer({
   const bashMode = useAtomValue(bashModeAtom)
   const nextEscWillKillAll = useAtomValue(nextEscWillKillAllAtom)
   const { displayMode } = useDisplayViewController()
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
+  const setSettingsTab = useAtomSet(settingsTabAtom)
   const slotsResult = useModelSlots()
   const catalogResult = useProviderModelCatalog()
   const slotActions = useModelSlotActions()
@@ -605,13 +596,11 @@ function FooterBarContainer({
     ? formatReasoningEffort(profile.reasoningEffort)
     : null
   const openModels = useCallback(() => {
-    setSettingsOpen(false)
-    setModelCenterTab("models")
-  }, [setModelCenterTab, setSettingsOpen])
+    setSettingsTab("models")
+  }, [setSettingsTab])
   const openHardware = useCallback(() => {
-    setSettingsOpen(false)
-    setModelCenterTab("hardware")
-  }, [setModelCenterTab, setSettingsOpen])
+    setSettingsTab("hardware")
+  }, [setSettingsTab])
   const modelLabel =
     currentModel._tag === "NoSelection"
       ? "Choose model"
@@ -823,14 +812,11 @@ function AuthenticatedAppContent({
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
   const { profiles: slotProfiles } = useSlotProfiles()
   const showOverlaySidebar = isNarrow && sidebarVisible
-  const settingsOpen = useAtomValue(settingsOpenAtom)
-  const modelCenterTab = useAtomValue(modelCenterTabAtom)
-  const setSettingsOpen = useAtomSet(settingsOpenAtom)
-  const setModelCenterTab = useAtomSet(modelCenterTabAtom)
+  const settingsTab = useAtomValue(settingsTabAtom)
   const controller = useDisplayViewController()
   const forkStack = controller.expandedForkStack
 
-  const panelOpen = settingsOpen || modelCenterTab !== null
+  const panelOpen = settingsTab !== null
   const workerDetailOpen = !panelOpen && forkStack.length > 0
 
   return (
@@ -894,28 +880,20 @@ function AuthenticatedAppContent({
             }}
           >
             {panelOpen && (
-              <ChatColumnPage
-                title={modelCenterTab !== null ? "Model Center" : "Settings"}
-                backLabel="Back to session"
-                onBack={() => {
-                  setSettingsOpen(false)
-                  setModelCenterTab(null)
-                }}
-              >
-                {modelCenterTab !== null ? (
-                  <ModelCenter
-                    tab={modelCenterTab}
-                    onTabChange={setModelCenterTab}
-                  />
-                ) : (
-                  <SettingsPanel
-                    onOpenModels={() => {
-                      setSettingsOpen(false)
-                      setModelCenterTab("models")
-                    }}
-                  />
+              <>
+                {isNarrow && (
+                  <button
+                    type="button"
+                    className="icon-button settings-mobile-navigation-button"
+                    aria-label="Open settings navigation"
+                    title="Open settings navigation"
+                    onClick={() => setSidebarVisible(true)}
+                  >
+                    <Menu size={17} />
+                  </button>
                 )}
-              </ChatColumnPage>
+                <SettingsCenter tab={settingsTab} />
+              </>
             )}
             {workerDetailOpen && (
               <WorkerDetailPageContainer slotProfiles={slotProfiles} />
@@ -924,7 +902,7 @@ function AuthenticatedAppContent({
         )}
         <ToastContainer />
       </div>
-      <FileViewerPanelContainer />
+      {!panelOpen && <FileViewerPanelContainer />}
       {connectionError && (
         <DaemonConnectionError
           message={connectionError.message}

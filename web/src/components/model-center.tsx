@@ -8,7 +8,6 @@ import {
   Cpu,
   Download,
   Gauge,
-  HardDrive,
   Heart,
   Layers3,
   Loader2,
@@ -16,7 +15,6 @@ import {
   PackageOpen,
   Play,
   RefreshCw,
-  SlidersHorizontal,
   Square,
   Trash2,
   X,
@@ -51,7 +49,7 @@ import {
   type ModelSlotsState,
   type SlotId,
 } from "@magnitudedev/sdk"
-import type { ModelCenterTab } from "../state/web-atoms"
+import type { SettingsTab } from "../state/web-atoms"
 import {
   formatBytes,
   formatContext,
@@ -1062,34 +1060,13 @@ function HardwareView(): ReactNode {
   )
 }
 
-const tabs = [
-  { id: "models", label: "Models", detail: "Runtime & storage", icon: Layers3 },
-  { id: "catalog", label: "Catalog", detail: "Compare & choose", icon: SlidersHorizontal },
-  { id: "hardware", label: "Hardware", detail: "Capacity & compute", icon: HardDrive },
-] as const
-
-export function ModelCenter({
+export function SettingsCenter({
   tab,
-  onTabChange,
 }: {
-  readonly tab: ModelCenterTab
-  readonly onTabChange: (tab: ModelCenterTab) => void
+  readonly tab: SettingsTab
 }): ReactNode {
   return (
     <div className="model-center">
-      <nav className="model-center-tabs" aria-label="Model Center sections">
-        {tabs.map(({ id, label, detail, icon: Icon }) => (
-          <button
-            key={id}
-            type="button"
-            aria-current={tab === id ? "page" : undefined}
-            onClick={() => onTabChange(id)}
-          >
-            <Icon size={16} aria-hidden="true" />
-            <span><strong>{label}</strong><small>{detail}</small></span>
-          </button>
-        ))}
-      </nav>
       {tab === "models" ? (
         <ModelsView />
       ) : tab === "catalog" ? (

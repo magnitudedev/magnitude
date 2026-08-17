@@ -11,7 +11,24 @@
  * - Responsive overlay mode (§12): ≤640px sidebar becomes overlay
  */
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react"
-import { ChevronDown, Cpu, Loader2, Plus, Search, X, GripVertical, Pencil, Trash2, Settings } from "lucide-react"
+import {
+  ArrowLeft,
+  ChevronDown,
+  GripVertical,
+  HardDrive,
+  Layers3,
+  Loader2,
+  Monitor,
+  Moon,
+  Pencil,
+  Plus,
+  Search,
+  Settings,
+  SlidersHorizontal,
+  Sun,
+  Trash2,
+  X,
+} from "lucide-react"
 import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import { formatCwdForDisplay, formatRelativeTime } from "@magnitudedev/client-common"
 import {
@@ -22,8 +39,13 @@ import {
 import {
   sidebarSearchAtom,
   sidebarWidthAtom,
+  type SettingsTab,
 } from "../state/web-atoms"
 import { SidebarEmptyState, SidebarLoadingState } from "./sidebar-states"
+import {
+  setAppearancePreference,
+  useAppearancePreference,
+} from "../stores/appearance-store"
 
 // ── Types ──
 
@@ -49,7 +71,9 @@ export interface SessionsSidebarProps {
   onNewSession?: () => void
   onLoadMore?: () => void
   onOpenSettings?: () => void
-  onOpenModels?: () => void
+  settingsTab?: SettingsTab | null
+  onSettingsTabChange?: (tab: SettingsTab) => void
+  onCloseSettings?: () => void
   /** Overlay mode — sidebar is an overlay (responsive ≤640px) */
   overlay?: boolean
   /** Close overlay sidebar (used in overlay mode) */
@@ -62,6 +86,115 @@ interface ContextMenuState {
   x: number
   y: number
   sessionId: string
+}
+
+const settingsSections = [
+  {
+    id: "models",
+    label: "Models",
+    detail: "Runtime & storage",
+    icon: Layers3,
+  },
+  {
+    id: "catalog",
+    label: "Catalog",
+    detail: "Compare & choose",
+    icon: SlidersHorizontal,
+  },
+  {
+    id: "hardware",
+    label: "Hardware",
+    detail: "Capacity & compute",
+    icon: HardDrive,
+  },
+] as const
+
+function SettingsNavigation({
+  activeTab,
+  onTabChange,
+  onBack,
+}: {
+  activeTab: SettingsTab
+  onTabChange?: (tab: SettingsTab) => void
+  onBack?: () => void
+}): ReactNode {
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onBack}
+        className="settings-sidebar-header sidebar-header hover-surface-flat"
+        aria-label="Back to sessions"
+        title="Back to sessions"
+      >
+        <ArrowLeft size={16} aria-hidden="true" />
+        <strong>Settings</strong>
+      </button>
+      <nav className="settings-sidebar-nav" aria-label="Settings sections">
+        {settingsSections.map(({ id, label, detail, icon: Icon }) => (
+          <button
+            key={id}
+            type="button"
+            className="settings-sidebar-item"
+            aria-current={activeTab === id ? "page" : undefined}
+            onClick={() => onTabChange?.(id)}
+          >
+            <Icon size={17} aria-hidden="true" />
+            <span>
+              <strong>{label}</strong>
+              <small>{detail}</small>
+            </span>
+          </button>
+        ))}
+      </nav>
+    </>
+  )
+}
+
+function SidebarFooter({
+  settingsActive,
+  onOpenSettings,
+}: {
+  settingsActive: boolean
+  onOpenSettings?: () => void
+}): ReactNode {
+  const appearance = useAppearancePreference()
+  const nextAppearance =
+    appearance === "system" ? "light" : appearance === "light" ? "dark" : "system"
+  const AppearanceIcon =
+    appearance === "light" ? Sun : appearance === "dark" ? Moon : Monitor
+  const appearanceLabel =
+    appearance === "light" ? "Light" : appearance === "dark" ? "Dark" : "System"
+
+  return (
+    <div className="sidebar-account">
+      <button
+        type="button"
+        onClick={settingsActive ? undefined : onOpenSettings}
+        className="sidebar-footer-button hover-surface-flat"
+        aria-label="Settings"
+        aria-current={settingsActive ? "page" : undefined}
+        title="Settings"
+      >
+        <Settings size={16} />
+      </button>
+      <button
+        type="button"
+        onClick={() => setAppearancePreference(nextAppearance)}
+        className="sidebar-footer-button hover-surface-flat"
+        aria-label={`Theme: ${appearanceLabel}. Change to ${
+          nextAppearance === "system"
+            ? "System"
+            : nextAppearance === "light"
+              ? "Light"
+              : "Dark"
+        }`}
+        title={`Theme: ${appearanceLabel}`}
+      >
+        <AppearanceIcon size={16} />
+      </button>
+    </div>
+  )
 }
 
 // ── Context Menu ──
@@ -285,7 +418,9 @@ export function SessionsSidebar({
   onNewSession,
   onLoadMore,
   onOpenSettings,
-  onOpenModels,
+  settingsTab = null,
+  onSettingsTabChange,
+  onCloseSettings,
   overlay = false,
   onCloseOverlay,
 }: SessionsSidebarProps): ReactNode {
@@ -294,7 +429,6 @@ export function SessionsSidebar({
   const setSearchQuery = useAtomSet(sidebarSearchAtom)
   const sidebarWidth = useAtomValue(sidebarWidthAtom)
   const setSidebarWidth = useAtomSet(sidebarWidthAtom)
-
   // Context menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
 
@@ -414,251 +548,200 @@ export function SessionsSidebar({
         />
       )}
 
-      <div
-        className="sessions-sidebar"
-        data-overlay={overlay || undefined}
-        style={sidebarStyle}
-      >
+      <div className="sessions-sidebar" data-overlay={overlay || undefined} style={sidebarStyle}>
         <div className="sidebar-window-drag-region" aria-hidden="true" />
 
-        {/* Header */}
-        <div
-          className="sidebar-header"
-          style={{
-            padding: "8px 12px 12px",
-            borderBottom: "1px solid var(--border-sidebar, var(--border-subtle))",
-            flexShrink: 0,
-            display: "flex",
-            flexDirection: "column",
-            gap: 8,
-          }}
-        >
-          <button
-            type="button"
-            onClick={onNewSession}
-            className="hover-surface-flat"
-            style={{
-              width: "100%",
-              height: 28,
-              background: "var(--bg-surface)",
-              border: "1px solid var(--border-sidebar, var(--border-subtle))",
-              borderRadius: 5,
-              padding: "0 8px",
-              display: "flex",
-              alignItems: "center",
-              gap: 7,
-              color: "var(--fg-secondary)",
-              fontFamily: "var(--font-sans)",
-              fontSize: 13,
-              fontWeight: 500,
-              cursor: "pointer",
-              textAlign: "left",
-            }}
-          >
-            <Plus size={15} style={{ color: "inherit", flexShrink: 0 }} />
-            <span>New session</span>
-          </button>
-
-          {/* Search input */}
-          <div
-            className="search-input-container"
-            style={{
-              background: "var(--bg-surface)",
-              border: "1px solid var(--border-sidebar, var(--border-subtle))",
-              borderRadius: 5,
-              height: 28,
-              display: "flex",
-              alignItems: "center",
-              padding: "0 8px",
-              gap: 7,
-              transition: "border-color 100ms, background 100ms",
-            }}
-          >
-            <Search size={14} style={{ color: "var(--fg-tertiary)", flexShrink: 0 }} />
-            <input
-              type="text"
-              id="sidebar-search-input"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search sessions..."
+        {settingsTab !== null ? (
+          <SettingsNavigation activeTab={settingsTab} onTabChange={onSettingsTabChange} onBack={onCloseSettings} />
+        ) : (
+          <>
+            {/* Header */}
+            <div
+              className="sidebar-header"
               style={{
-                flex: 1,
-                background: "transparent",
-                border: "none",
-                outline: "none",
-                fontFamily: "var(--font-sans)",
-                fontSize: 13,
-                color: "var(--fg-primary)",
-              }}
-            />
-            {searchQuery && (
-              <button
-                onClick={() => setSearchQuery("")}
-                aria-label="Clear search"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  cursor: "pointer",
-                  padding: 0,
-                  display: "flex",
-                  alignItems: "center",
-                  color: "var(--fg-tertiary)",
-                }}
-              >
-                <X size={13} />
-              </button>
-            )}
-          </div>
-
-          <div
-            style={{
-              position: "relative",
-              height: 28,
-              background: "var(--bg-surface)",
-              border: "1px solid var(--border-sidebar, var(--border-subtle))",
-              borderRadius: 5,
-              color: cwdFilter ? "var(--fg-primary)" : "var(--fg-secondary)",
-            }}
-          >
-            <select
-              value={cwdFilter ?? ""}
-              onChange={(e) => onCwdFilterChange?.(e.target.value ? e.target.value : null)}
-              aria-label="Filter sessions by working directory"
-              style={{
-                width: "100%",
-                height: "100%",
-                background: "transparent",
-                border: "none",
-                color: "inherit",
-                fontFamily: cwdFilter ? "var(--font-mono)" : "var(--font-sans)",
-                fontSize: 13,
-                padding: "0 28px 0 8px",
-                outline: "none",
-                appearance: "none",
-                cursor: "pointer",
+                padding: "8px 12px 12px",
+                borderBottom: "1px solid var(--border-sidebar, var(--border-subtle))",
+                flexShrink: 0,
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
               }}
             >
-              <option value="">All working directories</option>
-              {visibleCwdOptions.map((cwd) => (
-                <option key={cwd} value={cwd}>
-                  {formatCwdForDisplay(cwd, { maxLen: 34, abbreviateHome: true })}
-                </option>
-              ))}
-            </select>
-            <ChevronDown
-              size={15}
-              aria-hidden="true"
-              style={{
-                position: "absolute",
-                right: 8,
-                top: "50%",
-                transform: "translateY(-50%)",
-                color: "var(--fg-tertiary)",
-                pointerEvents: "none",
-              }}
-            />
-          </div>
-        </div>
+              <button
+                type="button"
+                onClick={onNewSession}
+                className="hover-surface-flat"
+                style={{
+                  width: "100%",
+                  height: 28,
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border-sidebar, var(--border-subtle))",
+                  borderRadius: 5,
+                  padding: "0 8px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  color: "var(--fg-secondary)",
+                  fontFamily: "var(--font-sans)",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  textAlign: "left",
+                }}
+              >
+                <Plus size={15} style={{ color: "inherit", flexShrink: 0 }} />
+                <span>New session</span>
+              </button>
 
-        {/* Session list */}
-        <div
-          className="session-list"
-          onScroll={handleSessionListScroll}
-          style={{
-            flex: 1,
-            overflowY: "auto",
-            padding: "8px 6px",
-          }}
-        >
-          {loading ? (
-            <SidebarLoadingState />
-          ) : sessions.length === 0 ? (
-            <SidebarEmptyState searchQuery={searchQuery} />
-          ) : (
-            <>
-              {sessions.map((session) => (
-                <SessionItem
-                  key={session.sessionId}
-                  session={session}
-                  isSelected={selectedSessionId === session.sessionId}
-                  onSelect={() => handleSelect(session.sessionId)}
-                  onContextMenu={(e) => handleContextMenu(e, session.sessionId)}
-                />
-              ))}
-              {loadingMore && (
-                <div
+              {/* Search input */}
+              <div
+                className="search-input-container"
+                style={{
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border-sidebar, var(--border-subtle))",
+                  borderRadius: 5,
+                  height: 28,
+                  display: "flex",
+                  alignItems: "center",
+                  padding: "0 8px",
+                  gap: 7,
+                  transition: "border-color 100ms, background 100ms",
+                }}
+              >
+                <Search size={14} style={{ color: "var(--fg-tertiary)", flexShrink: 0 }} />
+                <input
+                  type="text"
+                  id="sidebar-search-input"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search sessions..."
                   style={{
-                    height: 32,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    color: "var(--fg-tertiary)",
+                    flex: 1,
+                    background: "transparent",
+                    border: "none",
+                    outline: "none",
+                    fontFamily: "var(--font-sans)",
+                    fontSize: 13,
+                    color: "var(--fg-primary)",
+                  }}
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery("")}
+                    aria-label="Clear search"
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      cursor: "pointer",
+                      padding: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      color: "var(--fg-tertiary)",
+                    }}
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+
+              <div
+                style={{
+                  position: "relative",
+                  height: 28,
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border-sidebar, var(--border-subtle))",
+                  borderRadius: 5,
+                  color: cwdFilter ? "var(--fg-primary)" : "var(--fg-secondary)",
+                }}
+              >
+                <select
+                  value={cwdFilter ?? ""}
+                  onChange={(e) => onCwdFilterChange?.(e.target.value ? e.target.value : null)}
+                  aria-label="Filter sessions by working directory"
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    background: "transparent",
+                    border: "none",
+                    color: "inherit",
+                    fontFamily: cwdFilter ? "var(--font-mono)" : "var(--font-sans)",
+                    fontSize: 13,
+                    padding: "0 28px 0 8px",
+                    outline: "none",
+                    appearance: "none",
+                    cursor: "pointer",
                   }}
                 >
-                  <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
-                </div>
+                  <option value="">All working directories</option>
+                  {visibleCwdOptions.map((cwd) => (
+                    <option key={cwd} value={cwd}>
+                      {formatCwdForDisplay(cwd, {
+                        maxLen: 34,
+                        abbreviateHome: true,
+                      })}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown
+                  size={15}
+                  aria-hidden="true"
+                  style={{
+                    position: "absolute",
+                    right: 8,
+                    top: "50%",
+                    transform: "translateY(-50%)",
+                    color: "var(--fg-tertiary)",
+                    pointerEvents: "none",
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Session list */}
+            <div
+              className="session-list"
+              onScroll={handleSessionListScroll}
+              style={{
+                flex: 1,
+                overflowY: "auto",
+                padding: "8px 6px",
+              }}
+            >
+              {loading ? (
+                <SidebarLoadingState />
+              ) : sessions.length === 0 ? (
+                <SidebarEmptyState searchQuery={searchQuery} />
+              ) : (
+                <>
+                  {sessions.map((session) => (
+                    <SessionItem
+                      key={session.sessionId}
+                      session={session}
+                      isSelected={selectedSessionId === session.sessionId}
+                      onSelect={() => handleSelect(session.sessionId)}
+                      onContextMenu={(e) => handleContextMenu(e, session.sessionId)}
+                    />
+                  ))}
+                  {loadingMore && (
+                    <div
+                      style={{
+                        height: 32,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "var(--fg-tertiary)",
+                      }}
+                    >
+                      <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+                    </div>
+                  )}
+                </>
               )}
-            </>
-          )}
-        </div>
+            </div>
+          </>
+        )}
 
-        <div
-          className="sidebar-account"
-          style={{
-            flexShrink: 0,
-            borderTop: "1px solid var(--border-sidebar, var(--border-subtle))",
-            padding: "8px",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
-        >
-          <button
-            type="button"
-            onClick={onOpenModels}
-            className="hover-surface-flat"
-            aria-label="Model Center"
-            title="Model Center"
-            style={{
-              width: 32,
-              height: 32,
-              border: "none",
-              borderRadius: 6,
-              background: "transparent",
-              color: "var(--fg-secondary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              flexShrink: 0,
-            }}
-          >
-            <Cpu size={16} />
-          </button>
-
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            className="hover-surface-flat"
-            aria-label="Settings"
-            title="Settings"
-            style={{
-              width: 32,
-              height: 32,
-              border: "none",
-              borderRadius: 6,
-              background: "transparent",
-              color: "var(--fg-secondary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              flexShrink: 0,
-            }}
-          >
-            <Settings size={16} />
-          </button>
-        </div>
+        <SidebarFooter settingsActive={settingsTab !== null} onOpenSettings={onOpenSettings} />
       </div>
 
       {/* Resize handle — only in docked mode, on the right edge of the sidebar */}
@@ -684,12 +767,7 @@ export function SessionsSidebar({
       )}
 
       {/* Context menu */}
-      {contextMenu && (
-        <SessionContextMenu
-          menu={contextMenu}
-          onClose={() => setContextMenu(null)}
-        />
-      )}
+      {contextMenu && <SessionContextMenu menu={contextMenu} onClose={() => setContextMenu(null)} />}
     </>
-  )
+  );
 }
