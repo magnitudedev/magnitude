@@ -944,7 +944,9 @@ export function ChatTimeline({
     >
       <div
         ref={contentRef}
-        className={centerContent ? "flex min-h-0 flex-1" : undefined}
+        className={`mx-auto w-full max-w-[800px] ${
+          centerContent ? "flex min-h-0 flex-1" : ""
+        }`}
       >
         {isSessionLoading ? (
           (() => {

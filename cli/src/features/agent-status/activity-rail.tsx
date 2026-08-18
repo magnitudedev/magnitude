@@ -51,7 +51,9 @@ export const ActivityRail = memo(function ActivityRail({
   const pulseAnimated = modelResidency?._tag === 'Stopping'
     || (active && modelResidency?._tag !== 'Loading')
   const animationTime = useAnimationTime(pulseAnimated)
-  const loadingSpinnerStep = useAnimationStep(modelResidency?._tag === 'Loading', 80)
+  const modelLoading = modelResidency?._tag === 'Requested'
+    || modelResidency?._tag === 'Loading'
+  const loadingSpinnerStep = useAnimationStep(modelLoading, 80)
   const pulseProgress = animationPulse(animationTime, ACTIVE_PULSE_DURATION_MS)
   const pulseColor = theme.neutralPulse[Math.min(
     theme.neutralPulse.length - 1,
@@ -81,10 +83,12 @@ export const ActivityRail = memo(function ActivityRail({
         </box>
       )
     }
-    if (modelResidency._tag === 'Loading') {
-      const percentage = Math.min(100, Math.max(0, Math.round(
-        Option.getOrElse(modelResidency.progress, () => 0) * 100,
-      )))
+    if (modelResidency._tag === 'Requested' || modelResidency._tag === 'Loading') {
+      const percentage = modelResidency._tag === 'Requested'
+        ? 0
+        : Math.min(100, Math.max(0, Math.round(
+            Option.getOrElse(modelResidency.progress, () => 0) * 100,
+          )))
       return (
         <box style={{ height: 1, flexShrink: 0, flexDirection: 'row' }}>
           <text>

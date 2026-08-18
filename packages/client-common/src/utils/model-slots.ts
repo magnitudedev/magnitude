@@ -48,7 +48,8 @@ export function deriveLocalModelLoadActivity(
 ) {
   const slot = slots.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
   if (slot._tag !== "ConfiguredLocal") return null
-  return slot.residency._tag === "Loading"
+  return slot.residency._tag === "Requested"
+    || slot.residency._tag === "Loading"
     || slot.residency._tag === "Stopping"
     || slot.residency._tag === "Failed" && slot.residency.failure.code === "low_memory"
     ? slot

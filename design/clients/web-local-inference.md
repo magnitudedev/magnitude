@@ -86,14 +86,21 @@ to a slot. Load and stop address the slot; the daemon owns the physical instance
 running state is always rendered from refreshed service queries, while mutation state represents
 only local invocation admission.
 
-Chat readiness requires an available local slot whose residency is `Ready`. Selection alone is not
-readiness. When submission is unavailable, the composer routes the user to Settings instead of
-discarding the attempt.
+Chat submission requires a selected local model. When no model is selected, the composer routes the
+user to Models in Settings instead of discarding the attempt. A selected model does not need to be
+resident before submission: request preparation acquires it through the authoritative slot
+lifecycle, whose `Requested` and `Loading` states provide loading status while the message waits.
+The client must not preempt that lifecycle by treating a selected unloaded, loading, stopping, or
+failed model as though no model were selected. If model-slot state is temporarily unavailable, the
+client likewise must not infer that selection is absent.
+While acquisition is requested or loading, the work-status surface gives model loading priority
+over the generic waiting detail and renders `Loading model`, a spinner, and authoritative progress
+when available.
 
 The composer footer follows the CLI's runtime-information structure without combining independent
 facts into the model label. It presents model identity, reasoning effort, resident memory, and
-context usage with percentage. Residency continues to gate submission but is not
-rendered as a dot or readiness label in the composer. Model identity opens an
+context usage with percentage. Residency is not rendered as a dot or readiness label in the
+composer. Model identity opens an
 upward chooser containing selectable installed model names, reasoning effort opens the same form of
 upward chooser containing the selected model's supported levels, and resident memory routes to
 Hardware. The two choosers are mutually exclusive and keyboard operable. Their triggers have no

@@ -53,6 +53,8 @@ const instanceId = ModelInstanceIdSchema.make('test-instance')
 const configurationId = ModelServingConfigurationIdSchema.make('test-configuration')
 
 const localActivity = (lifecycle: {
+  readonly _tag: 'Requested'
+} | {
   readonly _tag: 'Loading'
   readonly stage: 'loading'
   readonly progress: Option.Option<number>
@@ -73,7 +75,7 @@ const localActivity = (lifecycle: {
   residency: lifecycle._tag === 'Loading'
     ? { ...lifecycle, instanceId, configurationId }
     : lifecycle,
-  actions: lifecycle._tag === 'Loading' ? ['Stop'] : [],
+  actions: lifecycle._tag === 'Loading' || lifecycle._tag === 'Requested' ? ['Stop'] : [],
 })
 
 describe('activity rail', () => {
@@ -88,6 +90,14 @@ describe('activity rail', () => {
         plannedAllocation: Option.none(),
       })}
     />)).toBe('⠋ Loading model · 42% · Stop')
+  })
+
+  it('shows an admitted load request as loading rather than waiting', () => {
+    expect(text(<ActivityRail
+      status={working({ _tag: 'WaitingForModel', turnStartedAt: 1_000 })}
+      width={100}
+      modelLoadActivity={localActivity({ _tag: 'Requested' })}
+    />)).toBe('⠋ Loading model · 0% · Stop')
   })
 
   it('shows the durable low-memory message without a spinner', () => {
