@@ -55,23 +55,36 @@ server.listen(0, "127.0.0.1", () => writeFileSync(portPath, String(server.addres
 `
 
 // The fake native CLI proves which version ran by writing a file, and
-// implements \`update\` the way the real updater does: by executing the
-// package manager's ordinary global install (npm resolves \`latest\` from the
-// registry in its environment).
+// updates the way the real updater does: by executing the package manager's
+// ordinary global install (npm resolves \`latest\` from the registry in its
+// environment). TEST_TRIGGER_UPDATE=<version> plays the prompt path's accepted
+// offer on a plain launch: only the named version updates, then exits with the
+// relaunch code on a protocol match exactly like the real CLI, so the
+// relaunched newer version falls through to a normal run.
 const fakeCliSource = (version: string) => `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process")
 if (process.argv[2] === "--version") {
   console.log(${JSON.stringify(version)})
   process.exit(0)
 }
+const runNpmUpdate = () =>
+  spawnSync("npm", ["install", "-g", "@magnitudedev/cli"], { stdio: "inherit" }).status
 if (process.argv[2] === "update") {
-  const result = spawnSync("npm", ["install", "-g", "@magnitudedev/cli"], { stdio: "inherit" })
-  process.exit(result.status ?? 1)
+  process.exit(runNpmUpdate() ?? 1)
+}
+if (process.env.TEST_TRIGGER_UPDATE === ${JSON.stringify(version)}) {
+  const status = runNpmUpdate()
+  if (status === 0 && process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION === "1") process.exit(75)
+  process.exit(status ?? 1)
+}
+if (process.env.TEST_RELAUNCH_WITHOUT_UPDATE === ${JSON.stringify(version)}) {
+  process.exit(process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION === "1" ? 75 : 1)
 }
 require("node:fs").writeFileSync(process.env.TEST_MAGNITUDE_OUTPUT, JSON.stringify({
   version: ${JSON.stringify(version)},
   managedBy: process.env.MAGNITUDE_MANAGED_BY,
   packageRoot: process.env.MAGNITUDE_MANAGED_PACKAGE_ROOT,
+  launchProtocolVersion: process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION,
 }))
 `
 
@@ -148,11 +161,12 @@ const packumentVersion = (version: string, tarball: Buffer) => ({
 })
 
 const runInstalledLauncher = (
-  ...cliArguments: string[]
+  cliArguments: ReadonlyArray<string> = [],
+  environment: Readonly<Record<string, string>> = {},
 ): SpawnSyncReturns<string> => spawnSync(
   join(prefix, "bin", "magnitude"),
-  cliArguments,
-  { encoding: "utf8", env: childEnvironment },
+  [...cliArguments],
+  { encoding: "utf8", env: { ...childEnvironment, ...environment } },
 )
 
 beforeAll(async () => {
@@ -247,16 +261,20 @@ describe("npm launcher end to end", () => {
     expect(report.version).toBe(V1)
     expect(report.managedBy).toBe("npm")
     expect(report.packageRoot).toContain("node_modules/@magnitudedev/cli")
+    expect(report.launchProtocolVersion).toBe("1")
   }, 30000)
 
-  it("updates to latest through the package manager and relaunches the new version", async () => {
-    const update = runInstalledLauncher("update")
-    expect(update.status, update.stderr).toBe(0)
-
-    const run = runInstalledLauncher()
+  it("relaunches into the new version within one invocation after a prompt-path update", async () => {
+    const run = runInstalledLauncher([], { TEST_TRIGGER_UPDATE: V1 })
     expect(run.status, run.stderr).toBe(0)
     const report = JSON.parse(await readFile(outputPath, "utf8"))
     expect(report.version).toBe(V2)
     expect(report.managedBy).toBe("npm")
+  }, 30000)
+
+  it("refuses the relaunch with the floor message when the installation did not change", async () => {
+    const run = runInstalledLauncher([], { TEST_RELAUNCH_WITHOUT_UPDATE: V2 })
+    expect(run.status, run.stderr).toBe(0)
+    expect(run.stderr).toContain("Update installed — run `magnitude` to start the new version.")
   }, 30000)
 })

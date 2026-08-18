@@ -53,7 +53,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          test "$(node -p "require('./packages/cli/package.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./packages/launcher/package.json').version")" = "$RELEASE_VERSION"
           test "$(git rev-parse "@magnitudedev/cli@${RELEASE_VERSION}^{commit}")" = "$(git rev-parse HEAD)"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - run: bun run packages/release/scripts/verify-public-release.ts

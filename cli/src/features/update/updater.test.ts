@@ -64,7 +64,7 @@ describe("CLI updater", () => {
     })
   })
 
-  it("refreshes in the background, verifies the native release, and honors dismissal", async () => {
+  it("checks on every launch, verifies the native release, and honors dismissal", async () => {
     const root = await mkdtemp(join(tmpdir(), "magnitude-updater-"))
     roots.push(root)
     let latestVersion = "0.0.1-alpha.35"
@@ -108,43 +108,33 @@ describe("CLI updater", () => {
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
 
-      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
-        .toBe(true)
+      // Cold cache: nothing known, this launch's check delivers the answer.
+      const first = await runScoped(scope, updater.discover)
+      expect(Option.isNone(first.known)).toBe(true)
+      expect(Option.getOrNull(await Effect.runPromise(first.fresh)))
+        .toBe(latestVersion)
 
+      // The cache keeps only the last known answer.
       const cachePath = join(root, "version.json")
-      await expect.poll(async () => {
-        try {
-          return JSON.parse(await readFile(cachePath, "utf8")).latestVersion
-        } catch {
-          return null
-        }
-      }).toBe(latestVersion)
+      expect(JSON.parse(await readFile(cachePath, "utf8")))
+        .toEqual({ latestVersion })
 
-      expect(Option.getOrNull(
-        await runScoped(scope, updater.getUpgradeVersion),
-      )).toBe(latestVersion)
+      // Next launch knows the answer without the network.
+      const second = await runScoped(scope, updater.discover)
+      expect(Option.getOrNull(second.known)).toBe(latestVersion)
 
+      // Dismissal suppresses both the known and the fresh answer.
       await Effect.runPromise(updater.dismissVersion(latestVersion))
-      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
-        .toBe(true)
+      const third = await runScoped(scope, updater.discover)
+      expect(Option.isNone(third.known)).toBe(true)
+      expect(Option.isNone(await Effect.runPromise(third.fresh))).toBe(true)
 
-      await writeFile(cachePath, JSON.stringify({
-        latestVersion,
-        lastCheckedAt: new Date(0).toISOString(),
-      }))
+      // A newer version is eligible again despite the dismissal.
       latestVersion = "0.0.1-alpha.36"
-      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
-        .toBe(true)
-      await expect.poll(async () => {
-        try {
-          return JSON.parse(await readFile(cachePath, "utf8")).latestVersion
-        } catch {
-          return null
-        }
-      }).toBe(latestVersion)
-      expect(Option.getOrNull(
-        await runScoped(scope, updater.getUpgradeVersion),
-      )).toBe(latestVersion)
+      const fourth = await runScoped(scope, updater.discover)
+      expect(Option.isNone(fourth.known)).toBe(true)
+      expect(Option.getOrNull(await Effect.runPromise(fourth.fresh)))
+        .toBe(latestVersion)
     } finally {
       await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
@@ -168,21 +158,7 @@ describe("CLI updater", () => {
 
     const scope = await Effect.runPromise(Scope.make())
     try {
-      const newerUpdater = await Effect.runPromise(
-        makeCliUpdater({
-          currentVersion: "2.0.0",
-          dataDir: root,
-          environment: { MAGNITUDE_MANAGED_BY: "npm" },
-          npmPackageUrl: `${server.url}registry`,
-          releaseBaseUrl: server.url.toString(),
-        }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
-      )
-      expect(Option.isNone(
-        await runScoped(scope, newerUpdater.getUpgradeVersion),
-      )).toBe(true)
-      await expect.poll(() => releaseRequests).toBe(1)
-
-      const olderUpdater = await Effect.runPromise(
+      const updater = await Effect.runPromise(
         makeCliUpdater({
           currentVersion: "1.0.0",
           dataDir: root,
@@ -191,9 +167,13 @@ describe("CLI updater", () => {
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
-      expect(Option.isNone(
-        await runScoped(scope, olderUpdater.getUpgradeVersion),
-      )).toBe(true)
+      const discovery = await runScoped(scope, updater.discover)
+      expect(Option.isNone(await Effect.runPromise(discovery.fresh))).toBe(true)
+      expect(releaseRequests).toBe(1)
+
+      // The failed readiness check never wrote a cache entry.
+      const next = await runScoped(scope, updater.discover)
+      expect(Option.isNone(next.known)).toBe(true)
     } finally {
       await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
@@ -227,8 +207,9 @@ describe("CLI updater", () => {
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
-      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
-        .toBe(true)
+      const discovery = await runScoped(scope, updater.discover)
+      expect(Option.isNone(discovery.known)).toBe(true)
+      expect(Option.isNone(await Effect.runPromise(discovery.fresh))).toBe(true)
       expect(requests).toBe(0)
     } finally {
       await Effect.runPromise(Scope.close(scope, Exit.void))

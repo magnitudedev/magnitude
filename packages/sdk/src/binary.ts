@@ -276,6 +276,35 @@ const ensureAcn = (
     return { path: executable, acquired };
   });
 
+/**
+ * Whether an installed ACN build for this version is present locally: the
+ * published pointer names a digest whose executable exists. A pure file probe
+ * with no subprocess validation, so the ensure pipeline remains the authority
+ * — a corrupted build can answer true and still be reinstalled, a running
+ * daemon whose files were removed can answer false and still be adopted.
+ * Callers use it to schedule around a likely installation, not to decide one.
+ */
+export const acnInstallationPresent = (
+  version: string,
+  dataDir: string = defaultDataDir()
+): Effect.Effect<boolean, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const digest = yield* fs.readFileString(pointerPath(dataDir, version)).pipe(
+      Effect.map((value) => value.trim()),
+      Effect.orElseSucceed(() => "")
+    );
+    if (!/^[a-f0-9]{64}$/.test(digest)) return false;
+    const executable = path.join(
+      acnRoot(dataDir, version),
+      digest,
+      "bin",
+      executableName()
+    );
+    return yield* fs.exists(executable).pipe(Effect.orElseSucceed(() => false));
+  });
+
 export const downloadAcn = (
   version: string,
   dataDir: string

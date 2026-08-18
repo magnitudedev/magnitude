@@ -5,8 +5,14 @@ import {
   updateCommandString,
   type UpdateAction,
 } from "@magnitudedev/release"
+import { Button } from "../../components/button"
 import { updateReleaseNotesUrl } from "./updater"
 import { useTheme } from "../../hooks/use-theme"
+
+const openExternalLink = (url: string): void => {
+  const opener = process.platform === "darwin" ? "open" : "xdg-open"
+  Bun.spawn([opener, url])
+}
 
 export type UpdatePromptOutcome =
   | { readonly _tag: "Update" }
@@ -58,7 +64,9 @@ export const UpdatePrompt = memo(function UpdatePrompt({
 }) {
   const theme = useTheme()
   const [highlighted, setHighlighted] = useState<UpdateSelection>("Update")
+  const [releaseNotesHovered, setReleaseNotesHovered] = useState(false)
   const command = updateCommandString(action)
+  const releaseNotesUrl = updateReleaseNotesUrl(latestVersion)
 
   const choose = useCallback((selection: UpdateSelection) => {
     onSelect({ _tag: selection })
@@ -124,12 +132,21 @@ export const UpdatePrompt = memo(function UpdatePrompt({
           <span>{latestVersion}</span>
         </text>
         <box style={{ height: 1 }} />
-        <text style={{ fg: theme.text.supporting }}>
-          Release notes:{" "}
-          <span attributes={TextAttributes.UNDERLINE}>
-            {updateReleaseNotesUrl(latestVersion)}
-          </span>
-        </text>
+        <text style={{ fg: theme.text.supporting }}>Release notes:</text>
+        <Button
+          onClick={() => { openExternalLink(releaseNotesUrl) }}
+          onMouseOver={() => setReleaseNotesHovered(true)}
+          onMouseOut={() => setReleaseNotesHovered(false)}
+        >
+          <text wrapMode="none">
+            <span
+              fg={releaseNotesHovered ? theme.link : theme.text.supporting}
+              attributes={TextAttributes.UNDERLINE}
+            >
+              {releaseNotesUrl}↗
+            </span>
+          </text>
+        </Button>
         <box style={{ height: 1 }} />
         {selections.map((selection, index) => (
           <text

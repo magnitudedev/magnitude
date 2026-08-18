@@ -196,19 +196,11 @@ const writeRegistry = (
     )
     await writeFile(publishedPackument, packumentFor(PUBLISHED_VERSION))
     await writeFile(publishedDistTags, distTagsFor(PUBLISHED_VERSION))
-    const updateCache = resolve(paths.home, ".magnitude", "version.json")
     await writeFile(paths.publishScript, [
       "#!/bin/sh",
       `cp ${JSON.stringify(publishedPackument)} ${JSON.stringify(packumentPath)}`,
       `cp ${JSON.stringify(publishedDistTags)} ${JSON.stringify(distTagsPath)}`,
       `echo "Published ${PUBLISHED_VERSION}: the registry's latest now points at it."`,
-      // Publishing compresses days into an instant, so the simulated time skip
-      // must age the update cache too — discovery only re-runs when the last
-      // check is older than its TTL.
-      `if [ -f ${JSON.stringify(updateCache)} ]; then`,
-      `  node -e 'const path = process.argv[1]; const fs = require("node:fs"); const cache = JSON.parse(fs.readFileSync(path, "utf8")); cache.lastCheckedAt = new Date(0).toISOString(); fs.writeFileSync(path, JSON.stringify(cache))' ${JSON.stringify(updateCache)}`,
-      `  echo "Aged the update cache (simulates the days since the last check)."`,
-      "fi",
       "",
     ].join("\n"))
     await chmod(paths.publishScript, 0o755)
@@ -246,7 +238,13 @@ const subshellEnvironment = (
 ): Record<string, string> => {
   const inherited: Record<string, string> = {}
   for (const [name, value] of Object.entries(process.env)) {
-    if (value !== undefined) inherited[name] = value
+    if (value === undefined) continue
+    // Script-runner leakage: this process runs under `bun run`, which sets
+    // npm_* variables (user agent, execpath, lifecycle) for its children, and
+    // BUN_INSTALL would aim `bun install -g` at the real ~/.bun. A real user's
+    // shell has none of these, and the subshell must match a real shell.
+    if (name.startsWith("npm_") || name === "BUN_INSTALL") continue
+    inherited[name] = value
   }
   return {
     ...inherited,

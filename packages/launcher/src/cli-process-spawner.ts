@@ -1,6 +1,8 @@
 import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import {
+  LAUNCH_PROTOCOL_VERSION,
+  LAUNCH_PROTOCOL_VERSION_VARIABLE,
   MANAGED_BY_VARIABLE,
   MANAGED_PACKAGE_ROOT_VARIABLE,
   type PackageManager,
@@ -60,6 +62,7 @@ const childEnvironment = (
     (): PackageManager => "npm",
   ),
   [MANAGED_PACKAGE_ROOT_VARIABLE]: installation.root,
+  [LAUNCH_PROTOCOL_VERSION_VARIABLE]: String(LAUNCH_PROTOCOL_VERSION),
 })
 
 export const cliProcessSpawnerLayer = (

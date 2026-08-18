@@ -4,12 +4,21 @@ import {
   RegistryContext,
   scheduleTask,
 } from "@effect-atom/atom-react"
+import { AcnLifecycleStateSchema } from "@magnitudedev/sdk"
 import { testRender } from "@opentui/react/test-utils"
+import { Schema } from "effect"
 import { describe, expect, it, vi } from "vitest"
 
 vi.mock("../../hooks/use-theme", () => ({
   useTheme: () => ({
     accent: "blue",
+    link: "blue",
+    background: {
+      canvas: "black",
+    },
+    status: {
+      failure: "red",
+    },
     text: {
       body: "white",
       supporting: "gray",
@@ -57,15 +66,16 @@ describe("UpdatePrompt", () => {
 
   it("transitions through the stable CLI root without leaving prompt keyboard handlers", async () => {
     const onSelect = vi.fn()
+    const onDaemonRetry = vi.fn()
+    const onDaemonQuit = vi.fn()
     const reactTestEnvironment = globalThis as typeof globalThis & {
       IS_REACT_ACT_ENVIRONMENT?: boolean
     }
     const actEnvironment = reactTestEnvironment.IS_REACT_ACT_ENVIRONMENT
     reactTestEnvironment.IS_REACT_ACT_ENVIRONMENT = true
     const registry = Registry.make({ scheduleTask, defaultIdleTTL: 5_000 })
-    const stateAtom = makeCliRootStateAtom()
-    registry.set(stateAtom, {
-      _tag: "UpdateAvailable",
+    const stateAtom = makeCliRootStateAtom({
+      _tag: "UpdatePrompt",
       currentVersion: "0.0.1-alpha.34",
       latestVersion: "0.0.1-alpha.35",
       action: {
@@ -76,7 +86,12 @@ describe("UpdatePrompt", () => {
     })
     const view = await testRender(
       <RegistryContext.Provider value={registry}>
-        <CliStartupRoot stateAtom={stateAtom} onUpdateSelect={onSelect} />
+        <CliStartupRoot
+          stateAtom={stateAtom}
+          onUpdateSelect={onSelect}
+          onDaemonRetry={onDaemonRetry}
+          onDaemonQuit={onDaemonQuit}
+        />
       </RegistryContext.Provider>,
       { width: 100, height: 24 },
     )
@@ -87,15 +102,21 @@ describe("UpdatePrompt", () => {
       await act(async () => view.mockInput.pressEnter())
       expect(onSelect).toHaveBeenCalledWith({ _tag: "Skip" })
 
-      await act(async () => registry.set(
-        stateAtom,
-        { _tag: "Starting", stage: "Platform" },
-      ))
+      await act(async () => registry.set(stateAtom, {
+        _tag: "DaemonStartup",
+        lifecycle: Schema.decodeUnknownSync(AcnLifecycleStateSchema)({
+          _tag: "Starting",
+          phase: "PreparingAcn",
+        }),
+      }))
       expect(view.captureCharFrame()).toContain("Update available!")
       await act(view.renderOnce)
-      expect(view.captureCharFrame()).toContain("Starting local services…")
-      await act(async () => view.mockInput.pressCtrlC())
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Starting Magnitude...")
+      expect(frame).toContain("Preparing background server")
 
+      await act(async () => view.mockInput.pressCtrlC())
+      expect(onDaemonQuit).toHaveBeenCalledTimes(1)
       expect(onSelect).toHaveBeenCalledTimes(1)
     } finally {
       await act(async () => view.renderer.destroy())
