@@ -35,7 +35,7 @@ function preferredPeakMemory(analysis: TrialAnalysis): number | undefined {
 
 function analysisRow(analysis: TrialAnalysis): string {
   const nonValid = Object.entries(analysis.outcomes).filter(([outcome]) => outcome !== "valid").reduce((sum, [, count]) => sum + count, 0)
-  return `| ${analysis.trialId} | ${analysis.pattern} | ${analysis.validRequests} | ${nonValid} | ${median(analysis.promptTokens)} | ${median(analysis.completionTokens)} | ${median(analysis.responsivenessMs)} | ${number(analysis.responsivenessMs?.p95)} | ${median(analysis.prefillTokensPerSecond)} | ${median(analysis.decodeTokensPerSecond)} | ${number(analysis.achievedCompletionTokensPerSecond)} | ${number(analysis.cacheReuseRatio?.median, 3)} | ${number(analysis.completionMs?.p95)} | ${bytes(preferredPeakMemory(analysis))} |`
+  return `| ${analysis.trialId} | ${analysis.pattern} | ${analysis.measuredRequests} | ${analysis.validRequests} | ${nonValid} | ${median(analysis.promptTokens)} | ${median(analysis.completionTokens)} | ${median(analysis.responsivenessMs)} | ${number(analysis.responsivenessMs?.p95)} | ${median(analysis.prefillTokensPerSecond)} | ${median(analysis.decodeTokensPerSecond)} | ${number(analysis.achievedCompletionTokensPerSecond)} | ${number(analysis.cacheReuseRatio?.median, 3)} | ${number(analysis.completionMs?.p95)} | ${bytes(preferredPeakMemory(analysis))} |`
 }
 
 export function renderBenchmarkMarkdown(result: BenchmarkResult): string {
@@ -44,8 +44,8 @@ export function renderBenchmarkMarkdown(result: BenchmarkResult): string {
     "",
     `Plan: \`${result.planDigest}\``,
     "",
-    "| Trial | Pattern | Valid | Non-valid | Actual input p50 (tokens) | Actual output p50 (tokens) | TTFT p50 (ms) | TTFT p95 (ms) | Native prefill p50 (tok/s) | Native decode p50 (tok/s) | Achieved output (tok/s) | Cache reuse | Completion p95 (ms) | Peak attributed footprint |",
-    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Trial | Pattern | Measured | Semantically valid | Non-valid | Actual input p50 (tokens) | Actual output p50 (tokens) | TTFT p50 (ms) | TTFT p95 (ms) | Native prefill p50 (tok/s) | Native decode p50 (tok/s) | Achieved output (tok/s) | Cache reuse | Completion p95 (ms) | Peak attributed footprint |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ...result.analyses.map(analysisRow),
     "",
     ...(result.warnings.length > 0 ? ["## Warnings", "", ...result.warnings.map((warning) => `- ${warning}`), ""] : []),

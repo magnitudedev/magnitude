@@ -7,6 +7,7 @@ import {
   ModelPackageIdSchema,
   ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
+  ModelReleaseDateSchema,
   ModelVariantLabelSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
@@ -99,6 +100,7 @@ const candidate = (input: {
       displayName: input.id,
       variantLabel: ModelVariantLabelSchema.make(`Q${fidelity}`),
       description: "Test fixture",
+      releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
       license: "test",
       capabilities: {
         vision: false,

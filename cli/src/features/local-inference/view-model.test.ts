@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest"
 import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
-  formatDownloadBytes,
   installedLocalModels,
   modelDownloadFailureMessage,
   localModelBundleKey,
@@ -31,10 +30,6 @@ describe("unified local inference projection", () => {
       requiredBytes: 37_923_968_128,
       availableBytes: 33_440_665_600,
     })).toBe("Not enough disk space. Free at least 4.48 GB and try again.")
-  })
-
-  it("formats model artifacts in decimal gigabytes", () => {
-    expect(formatDownloadBytes(30 * GIB)).toBe("32.2 GB")
   })
 
   it("references the canonical installed model without copying it", () => {

@@ -6,6 +6,7 @@ import type {
   AcnLifecycleState,
   AcnStartingPhase,
 } from "@magnitudedev/sdk";
+import { formatStorageSize } from "@magnitudedev/client-common";
 import { ProgressBar } from "../../components/progress-bar";
 import { useTheme } from "../../hooks/use-theme";
 
@@ -30,11 +31,6 @@ const startingPhaseLabel = (phase: AcnStartingPhase): string =>
 const INSTALLATION_PANEL_WIDTH = 64;
 const PROGRESS_BAR_WIDTH = 36;
 const PERCENTAGE_WIDTH = 5;
-
-const formatBytes = (bytes: number): string => {
-  const mebibytes = bytes / (1024 * 1024);
-  return `${mebibytes.toFixed(1)} MiB`;
-};
 
 export function AcnBootstrapScreen({
   state,
@@ -114,7 +110,7 @@ export function AcnBootstrapScreen({
     state.detailIsExact &&
     Option.isSome(state.detail) &&
     state.detail.value.unit === "Bytes"
-      ? ` · ${formatBytes(state.detail.value.completed)} of ${formatBytes(
+      ? ` · ${formatStorageSize(state.detail.value.completed)} of ${formatStorageSize(
           state.detail.value.totalBytes
         )}`
       : "";

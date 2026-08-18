@@ -1,8 +1,7 @@
 import { Option } from "effect"
 import type { LocalModel } from "@magnitudedev/sdk"
+import { formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
-
-const GIB = 1024 ** 3
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
 
@@ -25,11 +24,6 @@ export const normalizeLocalModelRadarSpeed = (tokensPerSecond: number): number =
   if (tokensPerSecond <= 100) return 0.5 + ((tokensPerSecond - 30) / 70) * 0.4
   if (tokensPerSecond >= 1_000) return 1
   return 0.9 + (0.1 * Math.log(tokensPerSecond / 100)) / Math.log(10)
-}
-
-const compactMemorySize = (bytes: number): string => {
-  const gigabytes = bytes / GIB
-  return `${gigabytes.toFixed(gigabytes >= 10 ? 0 : 1)} GB`
 }
 
 type AssessedModel = Extract<LocalModel["servingState"], { readonly _tag: "Assessed" }>
@@ -94,11 +88,11 @@ const discoveredAccuracyLabel = (bits: Option.Option<number>): string =>
 
 const memoryFootprintLabel = (assessment: ModelAssessment): string => {
   const use = memoryUseRatio(assessment)
-  if (use <= 0.2) return "Light"
-  if (use <= 0.4) return "Moderate"
-  if (use <= 0.6) return "Substantial"
+  if (use <= 0.2) return "Tiny"
+  if (use <= 0.4) return "Light"
+  if (use <= 0.6) return "Medium"
   if (use <= 0.8) return "Heavy"
-  return "Near capacity"
+  return "Tight"
 }
 
 const performanceRangeSpeedLabel = (model: LocalModel): string => {
@@ -186,7 +180,7 @@ export const localModelRadarAxes = (
     {
       value: Option.some(1 - memoryUseRatio(assessment)),
       label: "MEMORY",
-      detail: `${memoryFootprintLabel(assessment)} (${compactMemorySize(
+      detail: `${memoryFootprintLabel(assessment)} (${formatMemorySize(
         assessment.memory.totalRequiredBytes
       )})`,
     },

@@ -1,4 +1,4 @@
-import { Data, Effect, Option } from "effect"
+import { Context, Data, Effect, Option } from "effect"
 import { analyzeTrial } from "./analysis"
 import type {
   BenchmarkResult,
@@ -18,6 +18,22 @@ export class EvaluationError extends Data.TaggedError("EvaluationError")<{
   readonly operation: string
   readonly message: string
 }> {}
+
+export interface EvaluationProgressEvent {
+  readonly type: "target-ready" | "warmup-completed" | "trial-started" | "trial-completed"
+  readonly targetId: string
+  readonly trialId?: string
+  readonly at: string
+}
+
+export class EvaluationReporter extends Context.Tag("@magnitudedev/inference-benchmark/EvaluationReporter")<
+  EvaluationReporter,
+  { readonly emit: (event: EvaluationProgressEvent) => Effect.Effect<void> }
+>() {}
+
+const emitProgress = (event: EvaluationProgressEvent) => Effect.serviceOption(EvaluationReporter).pipe(
+  Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: (reporter) => reporter.emit(event) })),
+)
 
 const evaluationError = (targetId: string, operation: string, error: unknown) =>
   new EvaluationError({
@@ -58,8 +74,10 @@ const executeTrial = (
   trial: TrialDefinition,
   endpoint: EndpointConfiguration,
   rootPid: Option.Option<number>,
+  targetId: string,
 ): Effect.Effect<TrialObservation, EvaluationError, EndpointClient> =>
   Effect.gen(function* () {
+    yield* emitProgress({ type: "trial-started", targetId, trialId: trial.id, at: new Date().toISOString() })
     const observations = new Map<string, RequestObservation>()
     const setup = trial.requests.filter((request) => request.phase === "setup")
     for (const request of setup) {
@@ -100,7 +118,7 @@ const executeTrial = (
     const memory = Option.isSome(memoryProbe)
       ? Option.some(yield* memoryProbe.value.stop)
       : Option.none()
-    return {
+    const observation = {
       trial,
       startedAt,
       makespanMs: performance.now() - started,
@@ -108,6 +126,8 @@ const executeTrial = (
       setupRequests: setup.map((request) => observations.get(request.id)!),
       memory: Option.getOrUndefined(memory),
     }
+    yield* emitProgress({ type: "trial-completed", targetId, trialId: trial.id, at: new Date().toISOString() })
+    return observation
   })
 
 export const evaluate = (
@@ -123,6 +143,7 @@ export const evaluate = (
     const session = yield* openTarget(target).pipe(
       Effect.mapError((error) => evaluationError(target.id, "open-target", error)),
     )
+    yield* emitProgress({ type: "target-ready", targetId: target.id, at: new Date().toISOString() })
     if (session.target.parallelSequences !== plan.servingPolicy.parallelSequences) {
       return yield* new EvaluationError({
         targetId: target.id,
@@ -139,10 +160,11 @@ export const evaluate = (
         message: warmup.error ?? "warmup did not return conforming terminal evidence",
       })
     }
+    yield* emitProgress({ type: "warmup-completed", targetId: target.id, at: new Date().toISOString() })
 
     const trials = yield* Effect.forEach(
       plan.trials,
-      (trial) => executeTrial(trial, session.endpoint, session.rootPid),
+      (trial) => executeTrial(trial, session.endpoint, session.rootPid, target.id),
       { concurrency: 1 },
     )
     return {
@@ -163,6 +185,19 @@ function comparisonDifferences(
   const differences: string[] = []
   const capacities = new Set(results.map(({ target }) => target.parallelSequences))
   if (capacities.size !== 1) differences.push("parallel serving capacity differs")
+
+  const artifacts = results.flatMap(({ target }) => target.artifact ? [target.artifact] : [])
+  if (artifacts.length === results.length && artifacts.length > 1) {
+    const reference = artifacts[0]!
+    for (let index = 1; index < artifacts.length; index++) {
+      const artifact = artifacts[index]!
+      if (artifact.kind !== reference.kind) differences.push("model artifact formats differ")
+      if (artifact.repository !== reference.repository || artifact.revision !== reference.revision) {
+        differences.push("model artifact repositories or revisions differ")
+      }
+      if (artifact.quantization !== reference.quantization) differences.push("model artifact quantizations differ")
+    }
+  }
 
   if (results.some(({ planDigest }) => planDigest !== plan.digest)) {
     differences.push("result plan digests differ")

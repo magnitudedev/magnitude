@@ -14,6 +14,7 @@ import {
   deriveHardwareMemoryView,
   deriveCurrentLocalModel,
   formatLocalModelDisplayName,
+  formatMemorySize,
   formatModelDisplayName,
   modelSlotResidentAllocation,
   getDisplayWidth,
@@ -64,7 +65,6 @@ import {
 import { SingleLineInput } from "../composer/single-line-input"
 import {
   describeLocalHardware,
-  formatBytes,
   modelDownloadFailureMessage,
   localModelMaximumContextLength,
   localModelBundleKey,
@@ -87,7 +87,10 @@ import {
   type PentagonRadarTransition,
 } from "../../components/pentagon-radar"
 import { localModelRadarAxes } from "@magnitudedev/client-common"
-import { formatModelClassification } from "../local-inference/model-classification"
+import {
+  formatModelClassification,
+  formatModelReleaseRecency,
+} from "../local-inference/model-classification"
 import { CatalogRadarView } from "./catalog-radar-view"
 import {
   modelMenusLocalModelsStateEquivalent,
@@ -808,22 +811,22 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
         ? entry.model.servingState.assessment
         : undefined
       if (assessment?._tag === "DoesNotFit") {
-        return formatBytes(assessment.totalRequiredBytes)
+        return formatMemorySize(assessment.totalRequiredBytes)
       }
       return Option.match(memoryFor(entry), {
         onNone: () => "—",
-        onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+        onSome: ({ totalRequiredBytes }) => formatMemorySize(totalRequiredBytes),
       })
     }
     const assessment = entry.model.servingState._tag === "Assessed"
       ? entry.model.servingState.assessment
       : undefined
     if (assessment?._tag === "DoesNotFit") {
-      return formatBytes(assessment.totalRequiredBytes)
+      return formatMemorySize(assessment.totalRequiredBytes)
     }
     return Option.match(memoryFor(entry), {
       onNone: () => "—",
-      onSome: ({ totalRequiredBytes }) => formatBytes(totalRequiredBytes),
+      onSome: ({ totalRequiredBytes }) => formatMemorySize(totalRequiredBytes),
     })
   }
   const primarySlot = Option.match(slotsSnapshot, {
@@ -1284,7 +1287,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         || model.acquisitionState._tag === "Installed"
         ? theme.accent
         : theme.text.metadata
-  const memoryText = memoryBytes === undefined ? "—" : formatBytes(memoryBytes)
+  const memoryText = memoryBytes === undefined ? "—" : formatMemorySize(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
   const speculativeMethod = localModelSpeculativeMethodLabel(model)
   const speculativeText = Option.getOrElse(speculativeMethod, () => "—")
@@ -1410,10 +1413,7 @@ export const catalogInspectorActionLabel = (
       const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "Failed"
         ? "Retry download"
         : "Download"
-      const totalBytes = model.acquisitionState._tag === "Installed"
-        ? model.downloadBytes
-        : model.acquisitionState.totalBytes
-      return `${verb} (${formatBytes(totalBytes)})`
+      return verb
     }
     case "cancel": return reconciliationState._tag === "Transferring"
       ? reconciliationState.operation === "Update" ? "Cancel update" : "Cancel download"
@@ -1513,6 +1513,10 @@ const CatalogInspector = memo(function CatalogInspector({
         model.servingState.capabilities.vision,
       )
     : ""
+  const releaseRecency = model.catalogMembershipState._tag === "InCatalog"
+    && model.servingState._tag === "Assessed"
+    ? formatModelReleaseRecency(model.catalogMembershipState.catalogData.releaseDate)
+    : null
 
   return (
     <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
@@ -1526,7 +1530,13 @@ const CatalogInspector = memo(function CatalogInspector({
             || model.upgradeState._tag === "Failed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
         </box>
         <text style={{ fg: theme.text.supporting }} wrapMode="none">
-          {truncateToDisplayWidth(classification, contentWidth)}
+          {releaseRecency !== null && (
+            <span fg={theme.text.detail}>{`${releaseRecency} · `}</span>
+          )}
+          {truncateToDisplayWidth(
+            classification,
+            Math.max(0, contentWidth - (releaseRecency === null ? 0 : `${releaseRecency} · `.length)),
+          )}
         </text>
         <text> </text>
       </box>

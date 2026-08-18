@@ -1407,6 +1407,7 @@
           "displayName",
           "variantLabel",
           "description",
+          "releaseDate",
           "license",
           "capabilities",
           "parameterization",
@@ -1435,6 +1436,9 @@
           },
           "description": {
             "type": "string"
+          },
+          "releaseDate": {
+            "$ref": "#/components/schemas/ModelReleaseDate"
           },
           "license": {
             "type": "string"
@@ -5068,6 +5072,10 @@
         },
         "additionalProperties": false
       },
+      "ModelReleaseDate": {
+        "type": "string",
+        "format": "date"
+      },
       "ModelReleaseReason": {
         "type": "string",
         "enum": [
@@ -5358,6 +5366,7 @@
           "displayName",
           "variantLabel",
           "description",
+          "releaseDate",
           "license",
           "capabilities",
           "parameterization",
@@ -5385,6 +5394,9 @@
           },
           "description": {
             "type": "string"
+          },
+          "releaseDate": {
+            "$ref": "#/components/schemas/ModelReleaseDate"
           },
           "license": {
             "type": "string"

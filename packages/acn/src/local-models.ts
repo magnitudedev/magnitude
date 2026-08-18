@@ -189,21 +189,22 @@ export const deriveCatalogUpgradeState = (
 type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availability">
 
 export const availabilityFromProviderProjection = (
-  providerModelId: ProviderModelId | undefined,
+  providerModelId: Option.Option<ProviderModelId>,
   providerEntries: ReadonlyMap<ProviderModelId, ProviderAvailabilityProjection>,
   projectionCurrent: boolean,
   providerProjectionFailure: Option.Option<ModelFailure>,
 ): LocalModelAvailabilityState => {
-  if (providerModelId === undefined) return { _tag: "Installable" }
-  if (!projectionCurrent) return { _tag: "Preparing", providerModelId }
-  const providerEntry = providerEntries.get(providerModelId)
+  if (Option.isNone(providerModelId)) return { _tag: "Installable" }
+  const resolvedProviderModelId = providerModelId.value
+  if (!projectionCurrent) return { _tag: "Preparing", providerModelId: resolvedProviderModelId }
+  const providerEntry = providerEntries.get(resolvedProviderModelId)
   if (providerEntry?.availability._tag === "Available") {
-    return { _tag: "Selectable", providerModelId }
+    return { _tag: "Selectable", providerModelId: resolvedProviderModelId }
   }
   if (providerEntry?.availability._tag === "Disabled") {
     return {
       _tag: "Unavailable",
-      providerModelId: Option.some(providerModelId),
+      providerModelId,
       failure: {
         code: providerEntry.availability.reason,
         message: providerEntry.availability.reason === "insufficient_resources"
@@ -216,19 +217,19 @@ export const availabilityFromProviderProjection = (
   if (Option.isSome(providerProjectionFailure)) {
     return {
       _tag: "Unavailable",
-      providerModelId: Option.some(providerModelId),
+      providerModelId,
       failure: providerProjectionFailure.value,
     }
   }
-  return { _tag: "Preparing", providerModelId }
+  return { _tag: "Preparing", providerModelId: resolvedProviderModelId }
 }
 
 const unavailableAssessment = (
   assessment: Exclude<LocalModelAssessment, { readonly _tag: "Fits" }>,
-  providerModelId: ProviderModelId | undefined,
+  providerModelId: Option.Option<ProviderModelId>,
 ): LocalModelAvailabilityState => ({
   _tag: "Unavailable",
-  providerModelId: Option.fromNullable(providerModelId),
+  providerModelId,
   failure: assessment._tag === "Incompatible"
     ? assessment.failure
     : {
@@ -514,21 +515,20 @@ export const LocalModelsLive: Layer.Layer<
       })
       const bundleEntries = servableModelBundlePackages(bundle).map((modelPackage) =>
         packageEntries.get(modelPackage.id))
-      const inspectionFailure = bundleEntries.flatMap((entry) =>
+      const primaryPackage = bundle._tag === "Standalone" ? bundle.package : bundle.target
+      const dependencyEntries = bundleEntries.filter((entry) =>
+        entry?.package.id !== primaryPackage.id)
+      const dependencyInspectionFailure = Option.fromNullable(dependencyEntries.flatMap((entry) =>
         entry?.inspection._tag === "Invalid" || entry?.inspection._tag === "Incompatible"
           ? [entry.inspection.failure]
-          : [])[0]
-      const primaryPackage = bundle._tag === "Standalone" ? bundle.package : bundle.target
-      const primaryInspection = packageEntries.get(primaryPackage.id)?.inspection
-      const inspectionComplete = acquisitionState._tag !== "Installed"
-        || bundleEntries.every((entry) => entry?.inspection._tag === "Inspected")
-      const resolved = resolvedConfigurations.get(identity)
-      const configuration = resolved?.servingConfiguration
-      const coordinatedAssessment = resolved === undefined
-        ? undefined
-        : Option.getOrUndefined(resolved.assessment)
-      const capabilities = curated?.capabilities
-        ?? (primaryInspection?._tag === "Inspected" ? primaryInspection.capabilities : undefined)
+          : [])[0])
+      const dependencyInspectionComplete = acquisitionState._tag !== "Installed"
+        || dependencyEntries.every((entry) => entry?.inspection._tag === "Inspected")
+      const resolution = Option.fromNullable(resolvedConfigurations.get(identity))
+      const configuration = Option.map(
+        resolution,
+        ({ servingConfiguration }) => servingConfiguration,
+      )
       const attribution = packageEntries.get(primaryPackage.id)?.catalogAttribution
       const catalogMembershipState: LocalModel["catalogMembershipState"] = curated === undefined
         ? attribution?._tag === "Failed"
@@ -539,6 +539,7 @@ export const LocalModelsLive: Layer.Layer<
             catalogData: {
               modelId: curated.modelId,
               variantId: curated.variantId,
+              releaseDate: curated.releaseDate,
               parameterization: curated.parameterization,
               intelligenceScore: curated.qualityScore,
               intelligenceScoreSource: curated.qualityScoreProvenance,
@@ -549,13 +550,13 @@ export const LocalModelsLive: Layer.Layer<
           }
 
       let servingState: LocalModel["servingState"]
-      if (inspectionFailure !== undefined) {
+      if (Option.isSome(dependencyInspectionFailure)) {
         servingState = {
           _tag: "Failed",
-          configuration: Option.fromNullable(configuration),
-          failure: inspectionFailure,
+          configuration,
+          failure: dependencyInspectionFailure.value,
         }
-      } else if (configuration === undefined) {
+      } else if (Option.isNone(resolution)) {
         servingState = localModelAssessmentProfiles(bundle).length === 0
           ? {
               _tag: "Failed",
@@ -567,70 +568,81 @@ export const LocalModelsLive: Layer.Layer<
               },
             }
           : { _tag: "Resolving" }
-      } else if (!inspectionComplete || coordinatedAssessment === undefined
-        || coordinatedAssessment._tag === "Assessing") {
-        servingState = { _tag: "Assessing", configuration }
-      } else if (coordinatedAssessment._tag === "Failed") {
-        servingState = {
-          _tag: "Failed",
-          configuration: Option.some(configuration),
-          failure: coordinatedAssessment.failure,
-        }
       } else {
-        if (capabilities === undefined) {
-          throw new Error(`Assessed local model ${configuration.id} has no capabilities`)
-        }
-        const assessment: LocalModelAssessment = coordinatedAssessment._tag === "Fits"
-          ? {
-              _tag: "Fits",
-              assessmentId: coordinatedAssessment.assessment.assessmentId,
-              environmentId: coordinatedAssessment.assessment.environmentId,
-              profile: coordinatedAssessment.assessment.profile,
-              memory: projectLocalModelMemory(
-                coordinatedAssessment.assessment.memory,
-                hardwareState,
-                instanceState,
-              ),
-              performance: coordinatedAssessment.assessment.performance,
-            }
-          : coordinatedAssessment._tag === "DoesNotFit"
+        const resolvedConfiguration = resolution.value
+        const servingConfiguration = resolvedConfiguration.servingConfiguration
+        const targetInspection = resolvedConfiguration.targetInspection
+        const coordinatedAssessment = resolvedConfiguration.assessment
+        if (targetInspection._tag === "Invalid" || targetInspection._tag === "Incompatible") {
+          servingState = {
+            _tag: "Failed",
+            configuration: Option.some(servingConfiguration),
+            failure: targetInspection.failure,
+          }
+        } else if (targetInspection._tag === "Pending"
+          || !dependencyInspectionComplete
+          || coordinatedAssessment._tag === "Assessing") {
+          servingState = { _tag: "Assessing", configuration: servingConfiguration }
+        } else if (coordinatedAssessment._tag === "Failed") {
+          servingState = {
+            _tag: "Failed",
+            configuration,
+            failure: coordinatedAssessment.failure,
+          }
+        } else {
+          const assessment: LocalModelAssessment = coordinatedAssessment._tag === "Fits"
             ? {
-                _tag: "DoesNotFit",
-                assessmentId: coordinatedAssessment.assessmentId,
-                environmentId: coordinatedAssessment.environmentId,
-                memoryDomains: coordinatedAssessment.memory,
-                totalRequiredBytes: coordinatedAssessment.totalRequiredBytes,
-                deficitBytes: coordinatedAssessment.deficitBytes,
-                limitingResource: coordinatedAssessment.limitingResource,
+                _tag: "Fits",
+                assessmentId: coordinatedAssessment.assessment.assessmentId,
+                environmentId: coordinatedAssessment.assessment.environmentId,
+                profile: coordinatedAssessment.assessment.profile,
+                memory: projectLocalModelMemory(
+                  coordinatedAssessment.assessment.memory,
+                  hardwareState,
+                  instanceState,
+                ),
+                performance: coordinatedAssessment.assessment.performance,
               }
-            : {
-                _tag: "Incompatible",
-                environmentId: coordinatedAssessment.environmentId,
-                failure: coordinatedAssessment.failure,
-              }
-        const providerModelId = providerIdByConfiguration.get(configuration.id)
-          ?? (acquisitionState._tag === "Installed"
-            ? curated === undefined
-              ? localProviderModelId(configuration.id)
-              : localCatalogProviderModelId(curated)
-            : undefined)
-        const availabilityState = assessment._tag !== "Fits"
-          ? unavailableAssessment(assessment, providerModelId)
-          : acquisitionState._tag !== "Installed" || providerModelId === undefined
-            ? { _tag: "Installable" as const }
-            : availabilityFromProviderProjection(
-                providerModelId,
-                providerEntries,
-                providerProjectionCurrent,
-                providerProjectionFailure,
-              )
-        servingState = {
-          _tag: "Assessed",
-          configuration,
-          capabilities,
-          assessment,
-          availabilityState,
-          recommendations: recommendationsByTarget.get(identity) ?? [],
+            : coordinatedAssessment._tag === "DoesNotFit"
+              ? {
+                  _tag: "DoesNotFit",
+                  assessmentId: coordinatedAssessment.assessmentId,
+                  environmentId: coordinatedAssessment.environmentId,
+                  memoryDomains: coordinatedAssessment.memory,
+                  totalRequiredBytes: coordinatedAssessment.totalRequiredBytes,
+                  deficitBytes: coordinatedAssessment.deficitBytes,
+                  limitingResource: coordinatedAssessment.limitingResource,
+                }
+              : {
+                  _tag: "Incompatible",
+                  environmentId: coordinatedAssessment.environmentId,
+                  failure: coordinatedAssessment.failure,
+                }
+          const providerModelId = Option.fromNullable(
+            providerIdByConfiguration.get(servingConfiguration.id),
+          ).pipe(Option.orElse(() => acquisitionState._tag === "Installed"
+            ? Option.some(curated === undefined
+                ? localProviderModelId(servingConfiguration.id)
+                : localCatalogProviderModelId(curated))
+            : Option.none()))
+          const availabilityState = assessment._tag !== "Fits"
+            ? unavailableAssessment(assessment, providerModelId)
+            : acquisitionState._tag !== "Installed" || Option.isNone(providerModelId)
+              ? { _tag: "Installable" as const }
+              : availabilityFromProviderProjection(
+                  providerModelId,
+                  providerEntries,
+                  providerProjectionCurrent,
+                  providerProjectionFailure,
+                )
+          servingState = {
+            _tag: "Assessed",
+            configuration: servingConfiguration,
+            capabilities: targetInspection.capabilities,
+            assessment,
+            availabilityState,
+            recommendations: recommendationsByTarget.get(identity) ?? [],
+          }
         }
       }
       return {

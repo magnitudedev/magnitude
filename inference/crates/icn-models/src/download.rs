@@ -1761,7 +1761,7 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::inventory::InventoryConfig;
-    use crate::package_service::package_from_resolved;
+    use crate::package_service::inspected_package_from_resolved;
     use icn_contracts::models::{
         ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelPackageId,
         ModelPackageProperties, ModelPackageSource,
@@ -2012,7 +2012,9 @@ mod tests {
                 .expect("resolved components"),
             model: model.clone(),
         };
-        let package = package_from_resolved(&resolved).expect("installed package");
+        let package = inspected_package_from_resolved(&resolved)
+            .expect("installed package")
+            .package;
 
         let mut streams = manager
             .start_target_downloads(vec![package])

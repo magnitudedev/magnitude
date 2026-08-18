@@ -112,7 +112,7 @@ export interface ExecutionManagerService {
   /**
    * Returns the cached fork-scoped Layer (built by initFork). Includes
    * WorkingDirectory, all reader
-   * services, ToolInterceptor, etc. Used by Cortex to provide tool-execution
+   * services, ToolInterceptor, etc. Used by TurnExecutor to provide tool-execution
    * context for the native paradigm.
    */
   readonly getForkLayer: (forkId: string | null) => ForkLayer | undefined

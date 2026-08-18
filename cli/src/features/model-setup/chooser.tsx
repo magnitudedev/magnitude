@@ -8,6 +8,7 @@ import {
   clampTextToVisualLines,
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
+  formatMemorySize,
   localModelConfigurationId,
   type LocalModelOption,
   type LocalInferenceHardwareResult,
@@ -34,8 +35,6 @@ import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
 import {
   describeLocalHardwareSummary,
-  formatBytes,
-  formatDownloadBytes,
   localInferenceProgressLines,
   selectedInferenceIndex,
   selectionContextLabel,
@@ -44,7 +43,10 @@ import {
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
 import { localModelRadarAxes } from "@magnitudedev/client-common"
-import { formatModelClassification } from "../local-inference/model-classification"
+import {
+  formatModelClassification,
+  formatModelReleaseRecency,
+} from "../local-inference/model-classification"
 import { discoveredModelLocation } from "./discovered-model"
 import {
   OnboardingModelDownloadProgress,
@@ -202,15 +204,6 @@ const DetailRow = ({
     {children}
   </box>
 )
-
-const minimumBytesLabel = (bytes: number): string => {
-  const gib = bytes / 1024 ** 3
-  const precision = gib >= 10 ? 10 : 100
-  return `${(Math.ceil(gib * precision) / precision).toFixed(gib >= 10 ? 1 : 2)} GiB`
-}
-
-const compactMemoryLabel = (bytes: number): string =>
-  `${Math.max(0.1, bytes / 1024 ** 3).toFixed(1)} GB`
 
 const OnboardingHardwareContext = ({
   hardware,
@@ -553,7 +546,7 @@ export function OnboardingModelChooser({
     onNone: () => null,
     onSome: ({ currentHeadroomState, systemUseState }) =>
       currentHeadroomState._tag === "Insufficient"
-        ? `! Low memory: Free ${compactMemoryLabel(currentHeadroomState.minimumAdditionalAvailableBytes)} to load`
+        ? `! Low memory: Free ${formatMemorySize(currentHeadroomState.minimumAdditionalAvailableBytes, { rounding: "up" })} to load`
         : systemUseState._tag === "High"
           ? "! Heavy memory use: Limited memory remains for other apps"
           : null,
@@ -573,6 +566,10 @@ export function OnboardingModelChooser({
       : discoveredLocation === null
         ? ""
         : `DISCOVERED MODEL · ${discoveredLocation}`
+  const modelReleaseRecency = detailModel?.catalogMembershipState._tag === "InCatalog"
+    && detailModel.servingState._tag === "Assessed"
+    ? formatModelReleaseRecency(detailModel.catalogMembershipState.catalogData.releaseDate)
+    : null
   const recommendationBodyRows = Math.max(
     1,
     RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
@@ -610,7 +607,13 @@ export function OnboardingModelChooser({
         overflow: "hidden",
       }}>
         <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
-          {truncateToDisplayWidth(modelSummary, detailWidth)}
+          {modelReleaseRecency !== null && (
+            <span fg={theme.text.detail}>{`${modelReleaseRecency} · `}</span>
+          )}
+          {truncateToDisplayWidth(
+            modelSummary,
+            Math.max(0, detailWidth - (modelReleaseRecency === null ? 0 : `${modelReleaseRecency} · `.length)),
+          )}
         </text>
       </box>
       <box style={{ height: 1, flexShrink: 0 }} />
@@ -882,17 +885,17 @@ function OnboardingModelLoadingDetails({
               </text>
               <box style={{ height: 1 }} />
               <text style={{ fg: theme.text.body, width }} wrapMode="word">
-                {`Free at least ${minimumBytesLabel(failed.minimumAdditionalAvailableBytes)} and try again.`}
+                {`Free at least ${formatMemorySize(failed.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`}
               </text>
               <text style={{ fg: theme.text.supporting, width }} wrapMode="word">
                 Close memory-intensive applications or choose a smaller model.
               </text>
               <box style={{ height: 1 }} />
               <text style={{ fg: theme.text.supporting, width }}>
-                {`Needed at attempt    ${formatBytes(failed.loadBoundaryBytes)}`}
+                {`Needed at attempt    ${formatMemorySize(failed.loadBoundaryBytes)}`}
               </text>
               <text style={{ fg: theme.text.supporting, width }}>
-                {`Available at attempt ${formatBytes(failed.allocationHeadroomBytes)}`}
+                {`Available at attempt ${formatMemorySize(failed.allocationHeadroomBytes)}`}
               </text>
               <box style={{ height: 1 }} />
             </box>

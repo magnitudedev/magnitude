@@ -2,17 +2,13 @@ import { useCallback, useMemo, useState, type ReactNode } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
+import {
+  formatStorageSize,
+  formatTransferRate,
+} from "@magnitudedev/client-common"
 import type { LocalModel, ModelDownloadId } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
-import { formatDownloadBytes } from "../local-inference/view-model"
-
-const MIB = 1024 ** 2
-
-const formatRate = (bytesPerSecond: number): string => {
-  const mebibytes = bytesPerSecond / MIB
-  return `${mebibytes >= 10 ? Math.round(mebibytes) : mebibytes.toFixed(1)} MB/s`
-}
 
 const formatEta = (remainingBytes: number, bytesPerSecond: number): string => {
   const minutes = Math.max(1, Math.ceil(remainingBytes / bytesPerSecond / 60))
@@ -70,16 +66,16 @@ export function OnboardingModelDownloadProgress({
     if (activeDownload.stage === "verifying" || activeDownload.stage === "publishing") {
       return "Verifying download…"
     }
-    const transferred = `${formatDownloadBytes(activeDownload.completedBytes)} / ${formatDownloadBytes(activeDownload.totalBytes)}`
+    const transferred = `${formatStorageSize(activeDownload.completedBytes)} / ${formatStorageSize(activeDownload.totalBytes)}`
     if (rate === null || rate <= 0) return `${transferred} · Estimating time remaining…`
-    return `${transferred} · ${formatRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
+    return `${transferred} · ${formatTransferRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
   }, [activeDownload, cancelling, rate, starting])
   const status = starting
-    ? `Starting download (${formatDownloadBytes(totalBytes)})…`
+    ? `Starting download (${formatStorageSize(totalBytes)})…`
     : cancelling
       ? "Cancelling download…"
       : downloading
-        ? `Downloading (${formatDownloadBytes(totalBytes)})`
+        ? `Downloading (${formatStorageSize(totalBytes)})`
         : null
   const declineCancellation = useCallback(() => {
     setConfirmationDownloadId(null)

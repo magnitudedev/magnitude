@@ -160,7 +160,7 @@ describe("unified models menu projection", () => {
       _tag: "Starting",
       operation: "Install",
     })).toEqual([])
-    expect(catalogInspectorActionLabel("primary", available)).toBe("Download (16.0 GiB)")
+    expect(catalogInspectorActionLabel("primary", available)).toBe("Download")
     expect(catalogInspectorActionLabel("primary", update)).toBe("Update")
     expect(catalogInspectorActionLabel("select", installed)).toBe("Select model")
     expect(catalogInspectorActionLabel("cancel", downloading)).toBe("Cancel download")

@@ -38,6 +38,6 @@ export type ForkLayerServices =
   | ShadowVcs
 
 /**
- * The fork-scoped layer type used by execution manager and cortex.
+ * The fork-scoped layer type used by execution manager and turn executor.
  */
 export type ForkLayer = Layer.Layer<ForkLayerServices>

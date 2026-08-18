@@ -44,8 +44,8 @@ import { GoalProjection } from './projections/goal'
 
 
 // Workers
-import { TurnController } from './workers/turn-controller'
-import { Cortex } from './workers/cortex'
+import { TurnInitiator } from './workers/turn-initiator'
+import { TurnExecutor } from './workers/turn-executor'
 import { AgentLifecycle } from './workers/agent-lifecycle'
 import { RetryController } from './workers/retry-controller'
 import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
@@ -169,8 +169,8 @@ export const CodingAgent = EventEngine.make<AppEvent>()({
   ],
 
   workers: [
-    TurnController,
-    Cortex,
+    TurnInitiator,
+    TurnExecutor,
     AgentLifecycle,
     RetryController,
     LifecycleCoordinator,

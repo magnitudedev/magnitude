@@ -9,10 +9,10 @@ use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
     CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage,
-    ModelPackageSource, ModelParameterization, ModelServingConfiguration, RecommendableModel,
-    RecommendableModelCatalog, RecommendableModelCatalogProvider, ResolvedServableModelBundle,
-    ServableModelBundle, ServableModelBundleKey, ServingProfile, SpeculativeDraftSource,
-    SpeculativeMethod,
+    ModelPackageInspection, ModelPackageSource, ModelParameterization, ModelReleaseDate,
+    ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
+    RecommendableModelCatalogProvider, ResolvedServableModelBundle, ServableModelBundle,
+    ServableModelBundleKey, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -23,11 +23,10 @@ use icn_contracts::{
 use serde::{Deserialize, Serialize};
 
 use crate::cache::ModelBlobKind;
-use crate::capabilities::model_capabilities;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
-    package_from_resolved, servable_model_bundle_key_for_bundle, serving_configuration_id,
-    serving_configuration_identity_is_valid,
+    inspected_package_from_resolved, servable_model_bundle_key_for_bundle,
+    serving_configuration_id, serving_configuration_identity_is_valid,
 };
 use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
 use crate::preview::PreparedPreview;
@@ -54,6 +53,7 @@ struct CatalogModel {
     id: String,
     display_name: String,
     description: String,
+    release_date: ModelReleaseDate,
     parameterization: ModelParameterization,
     repository: String,
     variants: Vec<CatalogVariant>,
@@ -154,6 +154,7 @@ struct ReleasePlannerInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerPackage {
     package: ModelPackage,
+    inspection: ModelPackageInspection,
     properties: InventoryProperties,
     primary_gguf: PathBuf,
     components: Vec<ReleasePlannerComponent>,
@@ -1191,6 +1192,7 @@ fn recommendable_model(
     target: ModelPackage,
     draft: Option<ModelPackage>,
     properties: &InventoryProperties,
+    capabilities: icn_contracts::models::ModelCapabilities,
 ) -> Result<RecommendableModel, InventoryError> {
     let has_draft = draft.is_some();
     let bundle = match &declaration.speculative_decoding {
@@ -1253,8 +1255,9 @@ fn recommendable_model(
         display_name: declaration.display_name.clone(),
         variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
+        release_date: declaration.release_date.clone(),
         license: declaration.license.clone(),
-        capabilities: model_capabilities(properties),
+        capabilities,
         parameterization: declaration.parameterization.clone(),
         quality_score: declaration.quality_score,
         quality_score_provenance: declaration.quality_score_provenance.clone(),
@@ -1262,6 +1265,21 @@ fn recommendable_model(
         quantization_aware: variant.quantization_aware,
         quality_evidence: declaration.quality_evidence.clone(),
     })
+}
+
+fn catalog_package_capabilities(
+    inspection: ModelPackageInspection,
+) -> Result<icn_contracts::models::ModelCapabilities, InventoryError> {
+    match inspection {
+        ModelPackageInspection::Inspected { capabilities } => Ok(capabilities),
+        ModelPackageInspection::Pending => Err(InventoryError::Integrity(
+            "catalog package inspection remained pending".to_owned(),
+        )),
+        ModelPackageInspection::Invalid { failure }
+        | ModelPackageInspection::Incompatible { failure } => Err(InventoryError::Integrity(
+            format!("catalog package inspection failed: {}", failure.message),
+        )),
+    }
 }
 
 fn catalog_from_planner_inputs(
@@ -1296,6 +1314,7 @@ fn catalog_from_planner_inputs(
                 input.target.package.clone(),
                 input.draft.as_ref().map(|draft| draft.package.clone()),
                 &input.target.properties,
+                catalog_package_capabilities(input.target.inspection.clone())?,
             )?;
             if !inputs.contains_key(&recommendable_model_bundle_key(&model)) {
                 return Err(InventoryError::Integrity(format!(
@@ -1457,6 +1476,7 @@ impl ResolvingRecommendableCatalog {
             target.package.clone(),
             draft.as_ref().map(|draft| draft.package.clone()),
             &target.properties,
+            catalog_package_capabilities(target.inspection.clone())?,
         )?;
         let planner = ReleasePlannerInput {
             model_id: model.model_id.clone(),
@@ -1479,7 +1499,7 @@ impl ResolvingRecommendableCatalog {
         ),
         InventoryError,
     > {
-        let package = package_from_resolved(&prepared.model)?;
+        let inspected = inspected_package_from_resolved(&prepared.model)?;
         let headers = prepared
             .headers
             .iter()
@@ -1575,7 +1595,8 @@ impl ResolvingRecommendableCatalog {
             })
             .collect::<Result<Vec<_>, InventoryError>>()?;
         let planner = ReleasePlannerPackage {
-            package,
+            package: inspected.package,
+            inspection: inspected.inspection,
             properties: prepared.model.model.properties.clone(),
             primary_gguf: primary.to_path_buf(),
             components,
@@ -1909,6 +1930,32 @@ mod tests {
                 .models
                 .iter()
                 .all(|model| valid_parameterization(&model.parameterization))
+        );
+    }
+
+    #[test]
+    fn authored_catalog_declares_the_reviewed_release_date_for_every_model() {
+        let source = catalog_source().expect("catalog source should be valid");
+        assert_eq!(source.models.len(), 21);
+        assert_eq!(
+            source
+                .models
+                .iter()
+                .find(|model| model.id == "qwen3.8-27b")
+                .expect("Qwen3.8 catalog model")
+                .release_date
+                .as_str(),
+            "2026-08-13"
+        );
+        assert_eq!(
+            source
+                .models
+                .iter()
+                .find(|model| model.id == "deepseek-v4-flash")
+                .expect("DeepSeek V4 Flash catalog model")
+                .release_date
+                .as_str(),
+            "2026-07-31"
         );
     }
 

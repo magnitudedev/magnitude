@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{DownloadFailure, DownloadStage, InventoryError, ResolvedModel};
 
@@ -27,6 +27,105 @@ string_id!(AssessmentEnvironmentId);
 string_id!(CatalogModelId);
 string_id!(CatalogVariantId);
 string_id!(ModelInstanceId);
+
+#[cfg_attr(
+    feature = "openapi",
+    derive(utoipa::ToSchema),
+    schema(value_type = String, format = Date)
+)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelReleaseDate(String);
+
+impl ModelReleaseDate {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if is_valid_iso_date(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "invalid model release date {value:?}; expected YYYY-MM-DD"
+            ))
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for ModelReleaseDate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelReleaseDate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+fn is_valid_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+
+    let year = value[0..4].parse::<u32>().expect("validated date digits");
+    let month = value[5..7].parse::<u32>().expect("validated date digits");
+    let day = value[8..10].parse::<u32>().expect("validated date digits");
+    if year == 0 {
+        return false;
+    }
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    day > 0 && day <= days_in_month
+}
+
+#[cfg(test)]
+mod model_release_date_tests {
+    use super::ModelReleaseDate;
+
+    #[test]
+    fn accepts_real_iso_calendar_dates() {
+        let date: ModelReleaseDate =
+            serde_json::from_str(r#""2024-02-29""#).expect("deserialize leap-day release date");
+        assert_eq!(date.as_str(), "2024-02-29");
+        assert_eq!(
+            serde_json::to_string(&date).expect("serialize date"),
+            r#""2024-02-29""#
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_and_impossible_dates() {
+        for value in ["2026-8-13", "2026-02-29", "2026-13-01", "0000-01-01"] {
+            assert!(ModelReleaseDate::new(value).is_err(), "accepted {value}");
+        }
+    }
+}
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,6 +565,7 @@ pub struct RecommendableModel {
     pub display_name: String,
     pub variant_label: String,
     pub description: String,
+    pub release_date: ModelReleaseDate,
     pub license: String,
     pub capabilities: ModelCapabilities,
     pub parameterization: ModelParameterization,
@@ -546,6 +646,7 @@ pub struct CatalogModel {
     pub display_name: String,
     pub variant_label: String,
     pub description: String,
+    pub release_date: ModelReleaseDate,
     pub license: String,
     pub capabilities: ModelCapabilities,
     pub parameterization: ModelParameterization,

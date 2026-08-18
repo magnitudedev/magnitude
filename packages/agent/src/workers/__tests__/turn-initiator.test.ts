@@ -7,10 +7,10 @@ import { AgentLifecycleProjection } from '../../projections/agent-lifecycle'
 import { AgentRoutingProjection } from '../../projections/agent-routing'
 import { UserMessageResolutionProjection } from '../../projections/user-message-resolution'
 import { CompactionProjection } from '../../projections/compaction'
-import { TurnController } from '../turn-controller'
+import { TurnInitiator } from '../turn-initiator'
 
 const TestAgent = EventEngine.make<AppEvent>()({
-  name: 'TurnControllerTestAgent',
+  name: 'TurnInitiatorTestAgent',
   schemaVersion: 'test',
   projections: [
     TurnProjection,
@@ -19,7 +19,7 @@ const TestAgent = EventEngine.make<AppEvent>()({
     UserMessageResolutionProjection,
     CompactionProjection,
   ],
-  workers: [TurnController],
+  workers: [TurnInitiator],
 })
 
 const emptyRequirements = Layer.empty as Parameters<typeof TestAgent.createClient>[0]
@@ -44,8 +44,8 @@ async function initSession(client: Awaited<ReturnType<typeof TestAgent.createCli
   })
 }
 
-describe('TurnController', () => {
-  // NOTE: These tests verify TurnController logic correctly but bun:test reports
+describe('TurnInitiator', () => {
+  // NOTE: These tests verify TurnInitiator logic correctly but bun:test reports
   // false timeout failures due to leaked Effect fibers from client.dispose().
   // The assertions pass — the timeout is a bun test runner limitation.
 

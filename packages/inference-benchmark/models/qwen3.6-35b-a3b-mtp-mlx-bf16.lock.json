@@ -1,0 +1,45 @@
+{
+  "repository": "mlx-community/Qwen3.6-35B-A3B-MTP-bf16",
+  "revision": "e931b93eed744eae16049d4ebeddf636ef5b90f2",
+  "quantization": {
+    "family": "mlx-unquantized",
+    "dtype": "bfloat16"
+  },
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sizeBytes": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    },
+    {
+      "path": "README.md",
+      "sizeBytes": 1878,
+      "sha256": "adaf2fe00e412ac7a6b375a2252a4c9372d6dc790f09e39f43bf52bdd58f3dec"
+    },
+    {
+      "path": "config.json",
+      "sizeBytes": 2505,
+      "sha256": "5b68ffacec91fb326910f57aa330731ae8c8d8c40f0422b63bf6a49be9bf01a2"
+    },
+    {
+      "path": "model.safetensors",
+      "sizeBytes": 1689283752,
+      "sha256": "414eab99ffb1fe2c852c86d849206719a41b12c47f30f253234b1638414e8e0d"
+    },
+    {
+      "path": "tokenizer.json",
+      "sizeBytes": 12807982,
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "sizeBytes": 16718,
+      "sha256": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b"
+    },
+    {
+      "path": "vocab.json",
+      "sizeBytes": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    }
+  ]
+}
