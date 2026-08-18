@@ -21,6 +21,23 @@ const FiniteNonNegative = Schema.Number.pipe(Schema.finite(), Schema.nonNegative
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
 const Sha256Digest = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/))
 
+const isRealIsoCalendarDate = (value: string): boolean => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (match === null) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1]!
+}
+
+export const ModelReleaseDateSchema = Schema.String.pipe(
+  Schema.filter(isRealIsoCalendarDate, { message: () => "model release date must be a real YYYY-MM-DD calendar date" }),
+  Schema.brand("ModelReleaseDate"),
+)
+export type ModelReleaseDate = typeof ModelReleaseDateSchema.Type
+
 export const SlotIdSchema = Schema.Literal("primary", "secondary").pipe(Schema.brand("SlotId"))
 export type SlotId = typeof SlotIdSchema.Type
 
@@ -453,6 +470,7 @@ export const RecommendableModelSchema = Schema.Struct({
   displayName: NonEmptyString,
   variantLabel: ModelVariantLabelSchema,
   description: Schema.String,
+  releaseDate: ModelReleaseDateSchema,
   license: NonEmptyString,
   capabilities: RecommendableModelCapabilitiesSchema,
   parameterization: ModelParameterizationSchema,
@@ -621,6 +639,7 @@ export type LocalModelConfigurationAssessment =
 
 export const LocalModelCatalogDataSchema = Schema.Struct({
   ...CatalogIdentitySchema.fields,
+  releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
   intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
   intelligenceScoreSource: NonEmptyString,

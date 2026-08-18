@@ -65,6 +65,17 @@ ACN enriches the ICN model snapshot with assessment, provider publication, recom
 live memory observations. Clients consume one `LocalModel` row and do not correlate parallel
 collections.
 
+The configuration resolver carries the target's `ModelPackageInspection` with the exact effective
+configuration. An installed target uses its package inspection. An uninstalled desired catalog
+configuration uses the successful release-bound inspection of that same immutable package.
+Capabilities exist only in the inspection's `Inspected` state; `Pending`, `Invalid`, and
+`Incompatible` remain explicit states and are never collapsed into optional capability data.
+Desired catalog capabilities are never substituted for a different installed fallback package or
+for an installed package whose inspection has not succeeded. The local-model projection maps those
+inspection states into its serving stages, and the provider publishes only inspected targets.
+The resolver likewise carries the assessment state directly: absence before an assessment result is
+represented by `Assessing`, not by an optional assessment beside the state machine.
+
 `acquisitionState` describes first acquisition. `upgradeState` is `NotApplicable`, `Current`,
 `Available`, `Upgrading`, or `Failed`. An installed model may remain selectable while its upgrade
 state is `Available` or `Upgrading`. Installed acquisition carries the exact package identity,
@@ -85,3 +96,4 @@ derived and never persisted.
 - Catalog or attribution failure cannot hide an installed target.
 - Clients consume acquisition, reconciliation, serving, and recommendation state from one row.
 - Every installed row carries the exact current filesystem location of every bundle package.
+- Every assessed row and provider offering carries capabilities for its exact effective target.

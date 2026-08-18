@@ -72,9 +72,10 @@ records to correlate a result.
 
 The rejection proof compares exact, content-deduplicated tensor storage with aggregate stable
 physical capacity. Uncertain bundles proceed. File/download size is not rejection evidence.
-GGUF-derived identity, capabilities, and tensor storage share one optimistic inspection cache per
-immutable component. An absent or malformed cache entry reparses the component and cannot change
-artifact presence.
+GGUF-derived identity and tensor storage share one optimistic inspection cache per immutable
+component. Package capabilities compose the inspected primary artifact with exact component roles,
+relationships, and native projector inspection. An absent or malformed cache entry reparses the
+component and cannot change artifact presence.
 
 ## Assessment service
 

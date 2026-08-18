@@ -10,6 +10,12 @@ import { localCatalogProviderModelId } from "./local-provider-model-id"
 const COMPARISON_CONTEXT_LENGTH = 50_000
 const LINEAR_SPEED_UTILITY_LIMIT = 40
 const SPEED_UTILITY_CEILING = 100
+const BINARY_GIGABYTE = 1024 ** 3
+
+const formatMemorySize = (bytes: number): string => {
+  const rendered = (bytes / BINARY_GIGABYTE).toFixed(1)
+  return rendered.endsWith(".0") ? rendered.slice(0, -2) : rendered
+}
 
 export type RecommendationIntent = RecommendationSelection["intent"]
 
@@ -241,10 +247,10 @@ const describeLightweight = (
   const capabilityTradeoff = candidate.capabilityScore < balanced.capabilityScore
     ? " It is less capable on difficult coding tasks."
     : ""
-  const memory = Math.round(candidate.estimatedLoadedBytes / 1024 ** 3)
+  const memory = formatMemorySize(candidate.estimatedLoadedBytes)
   const memorySummary = loadedMemoryReduction > 0
     ? `Uses ${loadedMemoryReduction}% less memory while loaded than Balanced`
-    : `Prioritizes low loaded memory at about ${memory} GiB`
+    : `Prioritizes low loaded memory at about ${memory} GB`
   return `${memorySummary} and is easier to keep on this machine.${capabilityTradeoff}${speedTradeoff}${shorterContextTradeoff(candidate, balanced)} ${qualitySentence(candidate)}`
 }
 

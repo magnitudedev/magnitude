@@ -30,8 +30,8 @@ describe("launcher installation progress", () => {
     await Effect.runPromise(progress.succeeded)
 
     expect(writes).toEqual([
-      "\r\u001b[2KDownloading Magnitude CLI... 0% (1 KiB / 10.0 MiB)",
-      "\r\u001b[2KDownloading Magnitude CLI... 50% (5.0 MiB / 10.0 MiB)",
+      "\r\u001b[2KDownloading Magnitude CLI... 0% (1 KB / 10.5 MB)",
+      "\r\u001b[2KDownloading Magnitude CLI... 50% (5.2 MB / 10.5 MB)",
       "\r\u001b[2K",
     ])
   })

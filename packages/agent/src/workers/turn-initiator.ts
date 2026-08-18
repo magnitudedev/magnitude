@@ -1,5 +1,5 @@
 /**
- * TurnController Worker
+ * TurnInitiator Worker
  *
  * Evaluates turn readiness after projections settle and publishes turn_started.
  */
@@ -51,8 +51,8 @@ function startTurnForFork(
   })
 }
 
-export const TurnController = Worker.define<AppEvent>()({
-  name: 'TurnController',
+export const TurnInitiator = Worker.define<AppEvent>()({
+  name: 'TurnInitiator',
 
   onProjectionsSettled: ({ publish, read }) =>
     Effect.gen(function* () {

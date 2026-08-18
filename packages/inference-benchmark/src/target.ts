@@ -6,6 +6,7 @@ import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
 import { Chunk, Context, Data, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { createWriteStream } from "node:fs"
 import type {
   ExistingTarget,
   ManagedTarget,
@@ -232,7 +233,7 @@ const acquireTarget = (
       endpoint: target.endpoint,
       servedModel: target.servedModel,
       apiKey: target.apiKey,
-      timeoutMs: 300_000,
+      timeoutMs: target.requestTimeoutMs ?? 300_000,
       requestBody: target.requestBody,
     }
     if (target.kind === "existing") {
@@ -250,20 +251,29 @@ const acquireTarget = (
     const output = yield* Ref.make("")
     const command = Command.make(target.executable, ...target.args).pipe(
       Command.env({ ...process.env, ...target.env }),
+      target.cwd ? Command.workingDirectory(target.cwd) : (value) => value,
     )
     const processHandle = yield* Command.start(command).pipe(
       Effect.mapError((error) => targetError(target.id, "launch", error)),
     )
+    const log = target.logPath ? createWriteStream(target.logPath, { flags: "a" }) : undefined
+    if (log) yield* Effect.addFinalizer(() => Effect.async<void>((resume) => {
+      log.end(() => resume(Effect.void))
+    }))
     yield* Effect.addFinalizer(() => stopProcess(target, processHandle))
     yield* processHandle.stdout.pipe(
       Stream.decodeText(),
-      Stream.runForEach((chunk) => appendBounded(output, chunk)),
+      Stream.runForEach((chunk) => appendBounded(output, chunk).pipe(
+        Effect.tap(() => Effect.sync(() => { log?.write(chunk) })),
+      )),
       Effect.ignore,
       Effect.forkScoped,
     )
     yield* processHandle.stderr.pipe(
       Stream.decodeText(),
-      Stream.runForEach((chunk) => appendBounded(output, chunk)),
+      Stream.runForEach((chunk) => appendBounded(output, chunk).pipe(
+        Effect.tap(() => Effect.sync(() => { log?.write(chunk) })),
+      )),
       Effect.ignore,
       Effect.forkScoped,
     )

@@ -8,6 +8,7 @@ import type {
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { localModelProviderModelId } from "../local-models/projection"
+import { formatMemorySize } from "../utils/format-bytes"
 
 export const NotificationIdSchema = Schema.NonEmptyString.pipe(
   Schema.brand("NotificationId"),
@@ -195,16 +196,16 @@ export const deriveSelectedModelLowMemoryNotificationStateByProviderModelId = (
   const currentHeadroomState =
     selectedModel.servingState.assessment.memory.currentHeadroomState
   if (currentHeadroomState._tag !== "Insufficient") return null
-  const additionalGigabytes = Math.max(
-    0.1,
-    currentHeadroomState.minimumAdditionalAvailableBytes / 1024 ** 3,
-  ).toFixed(1)
+  const additionalMemory = formatMemorySize(
+    currentHeadroomState.minimumAdditionalAvailableBytes,
+    { rounding: "up" },
+  )
   return persistentNotificationState(
     "selected-local-model-low-memory",
-    `Low memory: close memory-intensive apps (need ${additionalGigabytes} GB) to load model`,
+    `Low memory: close memory-intensive apps (need ${additionalMemory}) to load model`,
     "warning",
     Option.none(),
-    Option.some(`Low memory: Free ${additionalGigabytes} GB to load`),
+    Option.some(`Low memory: Free ${additionalMemory} to load`),
   )
 }
 

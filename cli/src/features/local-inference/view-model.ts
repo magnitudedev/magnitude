@@ -7,7 +7,8 @@ import {
   localModelBundleKey,
   localModelOptions,
   localModelSpeculativeMethodLabel,
-  formatDownloadBytes,
+  formatStorageSize,
+  formatMemorySize,
   type LocalModelOption,
 } from "@magnitudedev/client-common"
 export {
@@ -16,7 +17,6 @@ export {
   localModelConfigurationId,
   localModelProviderModelId,
   localModelBundleKey,
-  formatDownloadBytes,
   modelDownloadFailureMessage,
 } from "@magnitudedev/client-common"
 import {
@@ -85,11 +85,6 @@ export const selectionAssessmentId = (
   && selection.model.servingState.assessment._tag !== "Incompatible"
     ? Option.some(selection.model.servingState.assessment.assessmentId)
     : Option.none()
-
-export const formatBytes = (bytes: number): string => {
-  const gib = bytes / 1024 ** 3
-  return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
-}
 
 export const formatContext = (tokens: number): string => tokens < 1_000
   ? String(tokens)
@@ -232,8 +227,6 @@ export interface LocalHardwareSummaryRow {
 const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 
-const compactBytes = (bytes: number): string => formatBytes(bytes).replace(/\.0+(?= )/, "")
-
 const localHardwareTopology = (hardware: LocalInferenceHardware) => {
   const unified = hardware.memoryDomains.filter((domain) =>
     domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
@@ -274,8 +267,8 @@ export const describeLocalHardwareSummary = (
     `${platform} ${architecture}`,
     `${hardware.logicalCores} ${hardware.logicalCores === 1 ? "core" : "cores"}`,
     unified.length > 0
-      ? `${compactBytes(hardware.totalSystemMemoryBytes)} unified`
-      : `${compactBytes(hardware.totalSystemMemoryBytes)} RAM`,
+      ? `${formatMemorySize(hardware.totalSystemMemoryBytes)} unified`
+      : `${formatMemorySize(hardware.totalSystemMemoryBytes)} RAM`,
     ...unifiedBackends,
     ...(unified.length === 0 && discrete.length === 0 ? ["CPU inference"] : []),
   ]
@@ -286,7 +279,7 @@ export const describeLocalHardwareSummary = (
       const backends = backendsFor(domain.memoryDomainId)
       return {
         name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: [`${compactBytes(domain.totalBytes)} VRAM`, ...backends],
+        details: [`${formatMemorySize(domain.totalBytes)} VRAM`, ...backends],
       }
     }),
   ]
@@ -308,7 +301,7 @@ export const describeLocalHardware = (
       name: systemName,
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
-        `${formatBytes(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
+        `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
       ],
     },
     accelerators: discrete.map((domain) => {
@@ -316,7 +309,7 @@ export const describeLocalHardware = (
       const backends = backendsFor(domain.memoryDomainId)
       return {
         name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: `${formatBytes(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
+        details: `${formatMemorySize(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
       }
     }),
   }
@@ -341,7 +334,7 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
   const { model } = selection
   const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
   return [
-    formatDownloadBytes(model.downloadBytes),
+    formatStorageSize(model.downloadBytes),
     Option.map(selectionContextLabel(selection), (context) => `${context} ctx`).pipe(Option.getOrNull),
     speculativeMethod,
   ].filter((value): value is string => value !== null).join(" · ")

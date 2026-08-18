@@ -204,8 +204,8 @@ mod multimodal {
 
 use multimodal::{MultimodalPrompt, MultimodalRuntime};
 use scheduler::{
-    ActiveSequence, BatchPlanner, BatchWork, PromptCheckpoint, ReusablePrefix, SequencePool,
-    WorkCandidate, WorkKind,
+    ActiveSequence, BatchPlanner, BatchWork, PromptCheckpoint, PromptCheckpointState,
+    ReusablePrefix, SequencePool, WorkCandidate, WorkKind,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -303,17 +303,28 @@ enum ExecutorItem {
 
 struct QueuedCompletion {
     request: ChatRequest,
+    prepared: Option<PreparedInput>,
     events: SyncSender<ExecutorItem>,
     cancelled: Arc<AtomicBool>,
     queued_at: Instant,
     span: tracing::Span,
 }
 
+struct PreparedInput {
+    chat: PreparedChat,
+    prompt: TokenizedPrompt,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestPhase {
     Prefill,
-    ReadyToSample { batch_index: i32 },
-    Decode { token: LlamaToken, position: i32 },
+    ReadyToSample {
+        batch_index: i32,
+    },
+    Decode {
+        token: LlamaToken,
+        position: scheduler::PromptBoundary,
+    },
     Terminal,
 }
 
@@ -321,7 +332,7 @@ enum RequestPhase {
 /// Assembly records effects here so active requests never expose staged prompt progress.
 struct BatchCommit {
     started_at: Instant,
-    prompt_ends: Vec<(i32, usize)>,
+    prompt_ends: Vec<(i32, scheduler::PromptBoundary)>,
     speculative_indices: Vec<(i32, Vec<i32>)>,
     logits: Vec<(i32, i32)>,
 }
@@ -336,7 +347,11 @@ impl BatchCommit {
         }
     }
 
-    fn prompt_start(&self, sequence_id: i32, committed: usize) -> usize {
+    fn prompt_start(
+        &self,
+        sequence_id: i32,
+        committed: scheduler::PromptBoundary,
+    ) -> scheduler::PromptBoundary {
         self.prompt_ends
             .iter()
             .rev()
@@ -344,7 +359,7 @@ impl BatchCommit {
             .unwrap_or(committed)
     }
 
-    fn advance_prompt(&mut self, sequence_id: i32, end: usize) {
+    fn advance_prompt(&mut self, sequence_id: i32, end: scheduler::PromptBoundary) {
         if let Some((_, current)) = self
             .prompt_ends
             .iter_mut()
@@ -365,12 +380,13 @@ impl BatchCommit {
     }
 
     fn apply(self, active: &mut [ActiveRequest<'_>]) -> Result<(), InferenceError> {
-        for (sequence_id, processed_prompt_tokens) in self.prompt_ends {
+        for (sequence_id, boundary) in self.prompt_ends {
             let request = request_by_sequence(active, sequence_id)?;
             request.prompt_started_at.get_or_insert(self.started_at);
-            request.processed_prompt_tokens = processed_prompt_tokens;
+            request.processed_prompt_tokens = boundary.logical_tokens;
+            request.next_boundary = boundary;
             request.pending_progress = Some(InferenceProgress::Prefill {
-                completed_tokens: processed_prompt_tokens,
+                completed_tokens: boundary.logical_tokens,
                 total_tokens: request.prompt_tokens,
                 cached_tokens: request.cached_prompt_tokens,
             });
@@ -398,7 +414,7 @@ struct ActiveRequest<'model> {
     pending_progress: Option<InferenceProgress>,
     last_progress_emitted_at: Option<Instant>,
     phase: RequestPhase,
-    prompt: Vec<LlamaToken>,
+    prompt_layout: scheduler::PromptLayout,
     /// Full logical prompt followed by generated tokens committed to target KV. During prefill,
     /// `processed_prompt_tokens`, rather than this history, is the resident prompt boundary.
     token_history: Vec<LlamaToken>,
@@ -406,8 +422,8 @@ struct ActiveRequest<'model> {
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
     prompt_checkpoints: Vec<PromptCheckpoint>,
-    pending_checkpoint_prefixes: VecDeque<usize>,
-    next_position: i32,
+    pending_checkpoint_prefixes: VecDeque<scheduler::PromptBoundary>,
+    next_boundary: scheduler::PromptBoundary,
     multimodal_prompt: Option<MultimodalPrompt>,
     generation_limit: usize,
     generated_tokens: usize,
@@ -437,8 +453,7 @@ struct ActiveRequest<'model> {
 
 struct TokenizedPrompt {
     text_tokens: Vec<LlamaToken>,
-    total_tokens: usize,
-    next_position: i32,
+    layout: scheduler::PromptLayout,
     multimodal: Option<MultimodalPrompt>,
 }
 
@@ -1699,6 +1714,7 @@ fn handle_command(
                 }));
                 queued.push_back(QueuedCompletion {
                     request,
+                    prepared: None,
                     events,
                     cancelled,
                     queued_at,
@@ -1760,23 +1776,41 @@ fn admit_requests<'model>(
                 .try_send(ExecutorItem::Failed(InferenceError::Cancelled));
             continue;
         }
-        let matching_prompt = queued.front().and_then(|queued| {
-            (queued.request.cache_prompt && request_images(&queued.request.template).is_empty())
-                .then(|| {
-                    prepare_chat(
-                        chat_templates,
-                        &queued.request.template,
-                        multimodal.map(multimodal_marker),
-                    )
-                    .and_then(|prepared| plain_prompt(model, &prepared))
-                    .map(|prompt| prompt.text_tokens)
-                    .ok()
-                })
-                .flatten()
-        });
-        let acquired = match matching_prompt.as_deref() {
-            Some(prompt) => sequence_pool.acquire_matching(prompt),
-            None => sequence_pool.acquire(),
+        if sequence_pool.is_empty() {
+            break;
+        }
+        if queued
+            .front()
+            .is_some_and(|queued| queued.prepared.is_none())
+        {
+            let pending = queued.front_mut().expect("queue front exists");
+            let _ = pending
+                .events
+                .try_send(ExecutorItem::Event(InferenceStreamEvent {
+                    delta: InferenceEvent::Progress(InferenceProgress::Preparing),
+                    timings: None,
+                }));
+            match prepare_input(model, chat_templates, multimodal, &pending.request) {
+                Ok(prepared) => pending.prepared = Some(prepared),
+                Err(error) => {
+                    let failed = queued.pop_front().expect("queue front exists");
+                    let _ = failed.events.try_send(ExecutorItem::Failed(error));
+                    continue;
+                }
+            }
+        }
+        let queued_front = queued.front().expect("queue front exists");
+        let acquired = if queued_front.request.cache_prompt {
+            sequence_pool.acquire_matching(
+                &queued_front
+                    .prepared
+                    .as_ref()
+                    .expect("request was prepared")
+                    .prompt
+                    .layout,
+            )
+        } else {
+            sequence_pool.acquire()
         };
         let Some(mut acquired) = acquired else {
             break;
@@ -1793,16 +1827,8 @@ fn admit_requests<'model>(
             continue;
         }
         let available_prefix = acquired.reusable_prefix.as_ref();
-        let _ = queued_request
-            .events
-            .try_send(ExecutorItem::Event(InferenceStreamEvent {
-                delta: InferenceEvent::Progress(InferenceProgress::Preparing),
-                timings: None,
-            }));
         match ActiveRequest::admit(
             model,
-            chat_templates,
-            multimodal,
             shared_context_capacity,
             context.n_batch() as usize,
             context.n_ubatch() as usize,
@@ -1812,15 +1838,15 @@ fn admit_requests<'model>(
             Ok(mut request) => {
                 let reusable_prefix = acquired.reusable_prefix.take();
                 let sequence = acquired.activate();
-                let requested_start = request.processed_prompt_tokens;
+                let requested_start = request.next_boundary;
                 let partial = clear_sequence_range(
                     context,
                     speculative.as_deref_mut(),
                     sequence_id,
-                    i32::try_from(requested_start).unwrap_or(i32::MAX),
-                    -1,
+                    requested_start,
+                    None,
                 );
-                if partial.is_err() && requested_start == 0 {
+                if partial.is_err() && requested_start.logical_tokens == 0 {
                     let _ = request
                         .events
                         .try_send(ExecutorItem::Failed(InferenceError::Backend(format!(
@@ -1831,23 +1857,24 @@ fn admit_requests<'model>(
                 }
                 if partial.is_err() {
                     let checkpoint = reusable_prefix.as_ref().and_then(|prefix| {
-                        prefix
-                            .checkpoints
-                            .iter()
-                            .rev()
-                            .find(|checkpoint| checkpoint.prefix <= requested_start)
+                        prefix.checkpoints.iter().rev().find(|checkpoint| {
+                            checkpoint.boundary.logical_tokens <= requested_start.logical_tokens
+                        })
                     });
                     let restored = checkpoint.is_some_and(|checkpoint| {
                         restore_prompt_checkpoint(
                             context,
                             draft_context.as_deref_mut(),
+                            speculative.as_deref_mut(),
                             sequence_id,
                             checkpoint,
                         )
                     });
-                    request.processed_prompt_tokens = checkpoint
+                    let restored_boundary = checkpoint
                         .filter(|_| restored)
-                        .map_or(0, |value| value.prefix);
+                        .map_or_else(scheduler::PromptBoundary::default, |value| value.boundary);
+                    request.processed_prompt_tokens = restored_boundary.logical_tokens;
+                    request.next_boundary = restored_boundary;
                     request.cached_prompt_tokens = request.processed_prompt_tokens;
                     request.pending_progress = Some(InferenceProgress::Prefill {
                         completed_tokens: request.processed_prompt_tokens,
@@ -1858,8 +1885,8 @@ fn admit_requests<'model>(
                         context,
                         speculative.as_deref_mut(),
                         sequence_id,
-                        i32::try_from(request.processed_prompt_tokens).unwrap_or(i32::MAX),
-                        -1,
+                        request.next_boundary,
+                        None,
                     )
                     .is_err()
                     {
@@ -1936,7 +1963,7 @@ fn sample_ready_requests<'model>(
 fn decode_batch<'model>(
     model: &'model LlamaModel,
     context: &mut LlamaContext<'model>,
-    mut draft_context: Option<&mut LlamaContext<'model>>,
+    draft_context: Option<&mut LlamaContext<'model>>,
     mut speculative: Option<&mut SpeculativeOperations<'_>>,
     multimodal: &mut Option<MultimodalRuntime<'model>>,
     planner: &mut BatchPlanner,
@@ -1951,39 +1978,47 @@ fn decode_batch<'model>(
     if can_checkpoint_prompt {
         for request in active.iter_mut().filter(|request| {
             request.cache_prompt
-                && request.multimodal_prompt.is_none()
                 && matches!(request.phase, RequestPhase::Prefill)
                 && request.pending_checkpoint_prefixes.front().copied()
-                    == Some(request.processed_prompt_tokens)
+                    == Some(scheduler::PromptBoundary {
+                        logical_tokens: request.processed_prompt_tokens,
+                        native_position: request.next_boundary.native_position,
+                    })
         }) {
-            let prefix = request
+            let boundary = request
                 .pending_checkpoint_prefixes
                 .pop_front()
                 .expect("checkpoint position was matched");
             let sequence_id = request
                 .sequence_id()
                 .expect("prefill request owns a sequence");
-            let target_checkpoint = context
-                .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
-                .ok()
-                .filter(|checkpoint| !checkpoint.is_empty());
-            let draft_checkpoint = draft_context.as_deref_mut().and_then(|draft_context| {
-                draft_context
+            let state = match speculative.as_deref_mut() {
+                Some(operations) => draft_context.as_deref().and_then(|draft_context| {
+                    match operations.capture_prompt_state(context, draft_context, sequence_id) {
+                        Ok(state) => Some(PromptCheckpointState::Speculative(state)),
+                        Err(error) => {
+                            tracing::warn!(
+                                sequence_id,
+                                error = %error,
+                                "failed to capture speculative prompt checkpoint"
+                            );
+                            None
+                        }
+                    }
+                }),
+                None => context
                     .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
                     .ok()
                     .filter(|checkpoint| !checkpoint.is_empty())
-            });
-            if let Some(target) = target_checkpoint
-                && (speculative.is_none() || draft_checkpoint.is_some())
-            {
-                request.prompt_checkpoints.push(PromptCheckpoint {
-                    target,
-                    draft: draft_checkpoint,
-                    prefix,
-                });
+                    .map(PromptCheckpointState::Target),
+            };
+            if let Some(state) = state {
                 request
                     .prompt_checkpoints
-                    .sort_by_key(|checkpoint| checkpoint.prefix);
+                    .push(PromptCheckpoint { state, boundary });
+                request
+                    .prompt_checkpoints
+                    .sort_by_key(|checkpoint| checkpoint.boundary.logical_tokens);
                 if request.prompt_checkpoints.len() > 32 {
                     request.prompt_checkpoints.remove(0);
                 }
@@ -2037,7 +2072,15 @@ fn decode_batch<'model>(
                 .sequence_id()
                 .expect("selected request owns sequence");
             operations
-                .prepare_draft(sequence_id, position, token, &request.token_history, n_max)
+                .prepare_draft(
+                    sequence_id,
+                    position.speculative_position().ok_or_else(|| {
+                        InferenceError::Backend("draft position exceeded i32::MAX".into())
+                    })?,
+                    token,
+                    &request.token_history,
+                    n_max,
+                )
                 .map_err(backend_error)?;
             extra_budget -= n_max;
             drafted_sequences.push(sequence_id);
@@ -2077,11 +2120,21 @@ fn decode_batch<'model>(
                         .map_or_else(
                             || {
                                 request
-                                    .prompt
-                                    .len()
-                                    .saturating_sub(request.processed_prompt_tokens)
+                                    .prompt_layout
+                                    .text_tokens_at(request.processed_prompt_tokens)
+                                    .map_or(0, <[LlamaToken]>::len)
                             },
-                            |prefix| prefix.saturating_sub(request.processed_prompt_tokens),
+                            |boundary| {
+                                boundary
+                                    .logical_tokens
+                                    .saturating_sub(request.processed_prompt_tokens)
+                                    .min(
+                                        request
+                                            .prompt_layout
+                                            .text_tokens_at(request.processed_prompt_tokens)
+                                            .map_or(0, <[LlamaToken]>::len),
+                                    )
+                            },
                         ),
                 },
                 RequestPhase::Decode { .. } => WorkKind::Decode,
@@ -2098,6 +2151,7 @@ fn decode_batch<'model>(
         return Ok(false);
     }
     batch.clear();
+    let mut draft_positions = Vec::new();
     let batch_started = Instant::now();
     let mut commit = BatchCommit::new(batch_started);
 
@@ -2111,23 +2165,29 @@ fn decode_batch<'model>(
                     )));
                 };
                 batch
-                    .add(token, position, &[sequence_id], true)
+                    .add(token, position.native_position, &[sequence_id], true)
                     .map_err(backend_error)?;
+                draft_positions.push(i32::try_from(position.logical_tokens).map_err(|_| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?);
                 if request.speculative_draft.is_empty() {
                     commit.record_logits(sequence_id, batch.n_tokens() - 1);
                 } else {
                     let mut indices = vec![batch.n_tokens() - 1];
                     for (offset, draft) in request.speculative_draft.iter().copied().enumerate() {
-                        let draft_position = position
-                            .checked_add(i32::try_from(offset + 1).map_err(backend_error)?)
-                            .ok_or_else(|| {
-                                InferenceError::Backend(
-                                    "speculative position exceeded i32::MAX".into(),
-                                )
-                            })?;
+                        let draft_position = position.advance(offset + 1).ok_or_else(|| {
+                            InferenceError::Backend(
+                                "speculative position exceeded its numeric range".into(),
+                            )
+                        })?;
                         batch
-                            .add(draft, draft_position, &[sequence_id], true)
+                            .add(draft, draft_position.native_position, &[sequence_id], true)
                             .map_err(backend_error)?;
+                        draft_positions.push(
+                            i32::try_from(draft_position.logical_tokens).map_err(|_| {
+                                InferenceError::Backend("draft position exceeded i32::MAX".into())
+                            })?,
+                        );
                         indices.push(batch.n_tokens() - 1);
                     }
                     commit.record_speculative_indices(sequence_id, indices);
@@ -2138,24 +2198,64 @@ fn decode_batch<'model>(
                 tokens,
             } => {
                 let request = request_by_sequence(active, sequence_id)?;
-                let start = commit.prompt_start(sequence_id, request.processed_prompt_tokens);
-                let end = start + tokens;
-                for (relative, token) in request.prompt[start..end].iter().enumerate() {
-                    let absolute = start + relative;
-                    let final_prompt_token = absolute + 1 == request.prompt.len();
+                let start = commit.prompt_start(
+                    sequence_id,
+                    scheduler::PromptBoundary {
+                        logical_tokens: request.processed_prompt_tokens,
+                        native_position: request.next_boundary.native_position,
+                    },
+                );
+                let prompt_tokens = request
+                    .prompt_layout
+                    .text_tokens_at(start.logical_tokens)
+                    .ok_or_else(|| {
+                        InferenceError::Backend(format!(
+                            "scheduler selected text prefill at non-text token {}",
+                            start.logical_tokens
+                        ))
+                    })?;
+                if tokens > prompt_tokens.len() {
+                    return Err(InferenceError::Backend(
+                        "scheduler selected text prefill across a media boundary".into(),
+                    ));
+                }
+                for (relative, token) in prompt_tokens[..tokens].iter().enumerate() {
+                    let absolute = start.logical_tokens + relative;
+                    let final_prompt_token = absolute + 1 == request.prompt_tokens;
                     batch
                         .add(
                             *token,
-                            i32::try_from(absolute).map_err(backend_error)?,
+                            start
+                                .native_position
+                                .checked_add(i32::try_from(relative).map_err(backend_error)?)
+                                .ok_or_else(|| {
+                                    InferenceError::Backend(
+                                        "prompt position exceeded i32::MAX".into(),
+                                    )
+                                })?,
                             &[sequence_id],
                             final_prompt_token,
                         )
                         .map_err(backend_error)?;
+                    draft_positions.push(i32::try_from(absolute).map_err(|_| {
+                        InferenceError::Backend("draft position exceeded i32::MAX".into())
+                    })?);
                     if final_prompt_token {
                         commit.record_logits(sequence_id, batch.n_tokens() - 1);
                     }
                 }
-                commit.advance_prompt(sequence_id, end);
+                commit.advance_prompt(
+                    sequence_id,
+                    scheduler::PromptBoundary {
+                        logical_tokens: start.logical_tokens + tokens,
+                        native_position: start
+                            .native_position
+                            .checked_add(i32::try_from(tokens).map_err(backend_error)?)
+                            .ok_or_else(|| {
+                                InferenceError::Backend("prompt position exceeded i32::MAX".into())
+                            })?,
+                    },
+                );
             }
         }
     }
@@ -2163,7 +2263,9 @@ fn decode_batch<'model>(
     let verification_started = Instant::now();
     context.decode(batch).map_err(backend_error)?;
     if let Some(operations) = speculative.as_mut() {
-        operations.process(batch).map_err(backend_error)?;
+        operations
+            .process(batch, &draft_positions)
+            .map_err(backend_error)?;
     }
     commit.apply(active)?;
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1_000.0;
@@ -2214,13 +2316,19 @@ fn verify_speculative_batch<'model>(
         }
         let accepted_drafts = accepted.len() - 1;
         let next_position = verification_start_position
-            .checked_add(1)
-            .and_then(|position| position.checked_add(i32::try_from(accepted_drafts).ok()?))
+            .advance(1_usize.saturating_add(accepted_drafts))
             .ok_or_else(|| {
-                InferenceError::Backend("speculative position exceeded i32::MAX".into())
+                InferenceError::Backend("speculative position exceeded its numeric range".into())
             })?;
         let resolution = operations
-            .resolve_verification(sequence_id, proposed_drafts, accepted_drafts, next_position)
+            .resolve_verification(
+                sequence_id,
+                proposed_drafts,
+                accepted_drafts,
+                next_position.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?,
+            )
             .map_err(backend_error)?;
         if resolution == SpeculativeVerificationResolution::Replay {
             request
@@ -2263,8 +2371,8 @@ fn verify_speculative_batch<'model>(
                 token: continuation,
                 position: next_position,
             };
-            request.next_position = next_position.checked_add(1).ok_or_else(|| {
-                InferenceError::Backend("generation position exceeded i32::MAX".into())
+            request.next_boundary = next_position.advance(1).ok_or_else(|| {
+                InferenceError::Backend("generation position exceeded its numeric range".into())
             })?;
         }
     }
@@ -2281,22 +2389,16 @@ fn decode_multimodal_prefill<'model>(
     let Some(index) = active.iter().position(|request| {
         request.multimodal_prompt.is_some()
             && matches!(request.phase, RequestPhase::Prefill)
+            && request
+                .prompt_layout
+                .media_at(request.processed_prompt_tokens)
+                .is_some()
             && request.sequence_id().is_some()
             && request.outbound.is_empty()
             && !request.cancelled.load(Ordering::Acquire)
     }) else {
         return Ok(false);
     };
-    if active
-        .iter()
-        .filter(|request| request.sequence_id().is_some())
-        .count()
-        != 1
-    {
-        return Err(InferenceError::Backend(
-            "multimodal evaluation cannot share a context with another resident sequence".into(),
-        ));
-    }
     let runtime = multimodal.as_mut().ok_or_else(|| {
         InferenceError::Backend("multimodal request was admitted without a projector".into())
     })?;
@@ -2308,12 +2410,16 @@ fn decode_multimodal_prefill<'model>(
     let started = Instant::now();
     request.prompt_started_at.get_or_insert(started);
     context.install_abort_callback_with_flag(Arc::clone(&request.cancelled));
-    let result = runtime.evaluate_prompt(
+    let result = runtime.evaluate_media(
         request
             .multimodal_prompt
             .as_ref()
             .expect("multimodal request was selected"),
         context,
+        scheduler::PromptBoundary {
+            logical_tokens: request.processed_prompt_tokens,
+            native_position: request.next_boundary.native_position,
+        },
         sequence_id,
         batch_size,
         speculative,
@@ -2322,15 +2428,14 @@ fn decode_multimodal_prefill<'model>(
     if request.cancelled.load(Ordering::Acquire) {
         return Err(InferenceError::Cancelled);
     }
-    let next_position = result?;
-    request.next_position = next_position;
-    request.processed_prompt_tokens = request.prompt.len();
+    let boundary = result?;
+    request.next_boundary = boundary;
+    request.processed_prompt_tokens = boundary.logical_tokens;
     request.pending_progress = Some(InferenceProgress::Prefill {
-        completed_tokens: request.prompt_tokens,
+        completed_tokens: request.processed_prompt_tokens,
         total_tokens: request.prompt_tokens,
         cached_tokens: request.cached_prompt_tokens,
     });
-    request.phase = RequestPhase::ReadyToSample { batch_index: -1 };
     Ok(true)
 }
 
@@ -2366,28 +2471,32 @@ fn request_by_sequence<'a, 'model>(
         })
 }
 
-fn common_token_prefix(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
 fn restore_prompt_checkpoint(
     context: &mut LlamaContext<'_>,
     draft_context: Option<&mut LlamaContext<'_>>,
+    speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
     checkpoint: &PromptCheckpoint,
 ) -> bool {
-    if let Some(draft_context) = draft_context {
-        let Some(draft_checkpoint) = checkpoint.draft.as_ref() else {
-            return false;
-        };
-        if !draft_context.restore_sequence_state(draft_checkpoint, sequence_id) {
-            return false;
+    match (&checkpoint.state, draft_context, speculative) {
+        (PromptCheckpointState::Target(state), None, None) => {
+            context.restore_sequence_state(state, sequence_id)
         }
+        (PromptCheckpointState::Speculative(state), Some(draft), Some(operations)) => {
+            match operations.restore_prompt_state(context, draft, sequence_id, state) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        sequence_id,
+                        error = %error,
+                        "failed to restore speculative prompt checkpoint"
+                    );
+                    false
+                }
+            }
+        }
+        _ => false,
     }
-    context.restore_sequence_state(&checkpoint.target, sequence_id)
 }
 
 fn cleanup_requests(
@@ -2542,27 +2651,46 @@ fn clear_sequence(
     speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
 ) -> Result<(), InferenceError> {
-    clear_sequence_range(context, speculative, sequence_id, 0, -1)
+    clear_sequence_range(
+        context,
+        speculative,
+        sequence_id,
+        scheduler::PromptBoundary::default(),
+        None,
+    )
 }
 
 fn clear_sequence_range(
     context: &mut LlamaContext<'_>,
     speculative: Option<&mut SpeculativeOperations<'_>>,
     sequence_id: i32,
-    start: i32,
-    end: i32,
+    start: scheduler::PromptBoundary,
+    end: Option<scheduler::PromptBoundary>,
 ) -> Result<(), InferenceError> {
     if let Some(speculative) = speculative {
+        let draft_end = end
+            .map(|boundary| {
+                boundary.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })
+            })
+            .transpose()?;
         return speculative
-            .remove_sequence_range(sequence_id, start, end)
+            .remove_sequence_range(
+                sequence_id,
+                start.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?,
+                draft_end,
+            )
             .map_err(backend_error);
     }
     let sequence = u32::try_from(sequence_id).map_err(backend_error)?;
     let removed = context
         .clear_kv_cache_seq(
             Some(sequence),
-            (start > 0).then_some(start as u32),
-            (end >= 0).then_some(end as u32),
+            (start.native_position > 0).then_some(start.native_position as u32),
+            end.map(|boundary| boundary.native_position as u32),
         )
         .map_err(backend_error)?;
     if removed {
@@ -2745,12 +2873,6 @@ fn validate_projector_config(
             projector.path.display()
         )));
     }
-    if config.max_sequences != 1 {
-        return Err(InferenceError::InvalidConfig(
-            "multimodal projector mode currently requires max_sequences=1 because llama.cpp's mtmd helper performs direct decode calls outside ICN's shared batch"
-                .into(),
-        ));
-    }
     if matches!(
         config.speculative,
         icn_contracts::SpeculativeDecodingConfig::Enabled {
@@ -2811,10 +2933,21 @@ fn warm_up(
         batch.add(token, 0, &[0], false).map_err(backend_error)?;
         context.decode(&mut batch).map_err(backend_error)?;
         if let Some(speculative) = speculative {
-            speculative.process(&batch).map_err(backend_error)?;
+            speculative.process(&batch, &[0]).map_err(backend_error)?;
+            speculative
+                .remove_sequence_range(
+                    0,
+                    llama_cpp_2::speculative::SpeculativePosition {
+                        target: 0,
+                        draft: 0,
+                    },
+                    None,
+                )
+                .map_err(backend_error)?;
+        } else {
+            context.clear_kv_cache();
         }
         context.synchronize();
-        context.clear_kv_cache();
     }
     context.reset_timings();
     Ok(())
@@ -2940,6 +3073,23 @@ fn request_images(request: &ChatTemplateRequest) -> Vec<ImageInput> {
         .collect()
 }
 
+fn prepare_input(
+    model: &LlamaModel,
+    chat_templates: &CommonChatTemplates,
+    multimodal: Option<&MultimodalRuntime<'_>>,
+    request: &ChatRequest,
+) -> Result<PreparedInput, InferenceError> {
+    validate_request(request)?;
+    let images = request_images(&request.template);
+    let chat = prepare_chat(
+        chat_templates,
+        &request.template,
+        multimodal.map(multimodal_marker),
+    )?;
+    let prompt = tokenize_prepared_prompt(model, &chat, multimodal, &images)?;
+    Ok(PreparedInput { chat, prompt })
+}
+
 fn plain_prompt(
     model: &LlamaModel,
     prepared: &PreparedChat,
@@ -2947,11 +3097,10 @@ fn plain_prompt(
     let text_tokens = model
         .str_to_token(prepared.prompt(), AddBos::Always)
         .map_err(backend_error)?;
-    let total_tokens = text_tokens.len();
+    let layout = scheduler::PromptLayout::text(text_tokens.clone());
     Ok(TokenizedPrompt {
         text_tokens,
-        total_tokens,
-        next_position: i32::try_from(total_tokens).map_err(backend_error)?,
+        layout,
         multimodal: None,
     })
 }
@@ -2972,10 +3121,10 @@ fn tokenize_prepared_prompt(
         )
     })?;
     let prompt = runtime.prepare_prompt(prepared.prompt().to_owned(), images)?;
+    let layout = prompt.layout().clone();
     Ok(TokenizedPrompt {
-        text_tokens: prompt.text_tokens().to_vec(),
-        total_tokens: prompt.total_tokens(),
-        next_position: 0,
+        text_tokens: layout.text_tokens(),
+        layout,
         multimodal: Some(prompt),
     })
 }
@@ -3035,8 +3184,6 @@ impl<'model> ActiveRequest<'model> {
     #[allow(clippy::too_many_arguments)]
     fn admit(
         model: &'model LlamaModel,
-        chat_templates: &CommonChatTemplates,
-        multimodal: Option<&MultimodalRuntime<'model>>,
         context_capacity: usize,
         batch_size: usize,
         ubatch_size: usize,
@@ -3045,6 +3192,7 @@ impl<'model> ActiveRequest<'model> {
     ) -> Result<Self, (SyncSender<ExecutorItem>, InferenceError)> {
         let QueuedCompletion {
             request,
+            prepared,
             events,
             cancelled,
             queued_at,
@@ -3053,14 +3201,13 @@ impl<'model> ActiveRequest<'model> {
         let entered_span = span.clone();
         let _entered = entered_span.enter();
         let result = (|| {
-            validate_request(&request)?;
+            let PreparedInput {
+                chat: prepared,
+                prompt: tokenized,
+            } = prepared.ok_or_else(|| {
+                InferenceError::Backend("request reached admission without preparation".into())
+            })?;
             let admitted_at = Instant::now();
-            let images = request_images(&request.template);
-            let prepared = prepare_chat(
-                chat_templates,
-                &request.template,
-                multimodal.map(multimodal_marker),
-            )?;
             let parser = prepared
                 .stream_parser(ChatParserOptions {
                     parse_tool_calls: !request.template.tools.is_empty()
@@ -3068,13 +3215,12 @@ impl<'model> ActiveRequest<'model> {
                     ..ChatParserOptions::default()
                 })
                 .map_err(backend_error)?;
-            let tokenized = tokenize_prepared_prompt(model, &prepared, multimodal, &images)?;
             if tokenized.text_tokens.is_empty() {
                 return Err(InferenceError::InvalidConfig(
                     "the prepared prompt tokenized to an empty sequence".into(),
                 ));
             }
-            let prompt_tokens = tokenized.total_tokens;
+            let prompt_tokens = tokenized.layout.logical_tokens();
             validate_prompt_capacity(prompt_tokens, context_capacity)?;
 
             let mut sampler = make_sampler(model, &request, &prepared)?;
@@ -3083,40 +3229,41 @@ impl<'model> ActiveRequest<'model> {
                 .map_err(backend_error)?;
             let mut stops = request.stop.clone();
             stops.extend(prepared.additional_stops().iter().cloned());
-            let mut cached_prompt_tokens = if request.cache_prompt && tokenized.multimodal.is_none()
-            {
-                reusable_prefix.map_or(0, |prefix| {
-                    common_token_prefix(&prefix.tokens, &tokenized.text_tokens)
+            let mut cached_boundary = if request.cache_prompt {
+                reusable_prefix.map_or_else(scheduler::PromptBoundary::default, |prefix| {
+                    prefix.layout.common_prefix(&tokenized.layout)
                 })
             } else {
-                0
+                scheduler::PromptBoundary::default()
             };
             // The last prompt token must be evaluated to obtain logits for the first sample.
-            if cached_prompt_tokens == tokenized.text_tokens.len() {
-                cached_prompt_tokens = cached_prompt_tokens.saturating_sub(1);
+            if cached_boundary.logical_tokens == prompt_tokens {
+                cached_boundary = tokenized
+                    .layout
+                    .boundary_before_final_text_token()
+                    .unwrap_or_default();
             }
+            let cached_prompt_tokens = cached_boundary.logical_tokens;
             let prompt_checkpoints = reusable_prefix.map_or_else(Vec::new, |prefix| {
                 prefix
                     .checkpoints
                     .iter()
-                    .filter(|checkpoint| checkpoint.prefix <= cached_prompt_tokens)
+                    .filter(|checkpoint| checkpoint.boundary.logical_tokens <= cached_prompt_tokens)
                     .cloned()
                     .collect()
             });
-            // Match llama-server's two bounded-memory prompt checkpoints: one micro-batch
-            // before the end and one four tokens before the end. The former permits an exact
-            // rollback across a changed prompt tail; the latter makes identical prompts cheap.
-            let mut pending_checkpoint_prefixes = [4_usize.saturating_add(ubatch_size), 4]
+            // Keep two bounded-memory prompt checkpoints: one micro-batch before the logits
+            // token for changed prompt tails, and one immediately before it for exact reuse.
+            // Hybrid recurrent models cannot partially erase native state, so the latter is
+            // what lets an identical request replay only the final token needed to refresh
+            // logits instead of falling back to an arbitrary multi-token tail.
+            let mut pending_checkpoint_prefixes = [1_usize.saturating_add(ubatch_size), 1]
                 .into_iter()
-                .map(|offset| {
-                    tokenized
-                        .text_tokens
-                        .len()
-                        .saturating_sub(offset.min(batch_size))
-                })
+                .map(|offset| prompt_tokens.saturating_sub(offset.min(batch_size)))
                 .filter(|prefix| *prefix > cached_prompt_tokens && *prefix > 0)
+                .filter_map(|prefix| tokenized.layout.boundary_at_or_after(prefix))
                 .collect::<Vec<_>>();
-            pending_checkpoint_prefixes.sort_unstable();
+            pending_checkpoint_prefixes.sort_unstable_by_key(|boundary| boundary.logical_tokens);
             pending_checkpoint_prefixes.dedup();
 
             Ok(Self {
@@ -3133,13 +3280,13 @@ impl<'model> ActiveRequest<'model> {
                 last_progress_emitted_at: None,
                 phase: RequestPhase::Prefill,
                 token_history: tokenized.text_tokens.clone(),
-                prompt: tokenized.text_tokens,
+                prompt_layout: tokenized.layout,
                 processed_prompt_tokens: cached_prompt_tokens,
                 prompt_tokens,
                 cached_prompt_tokens,
                 prompt_checkpoints,
                 pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
-                next_position: tokenized.next_position,
+                next_boundary: cached_boundary,
                 multimodal_prompt: tokenized.multimodal,
                 generation_limit: (request.max_tokens as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
@@ -3172,20 +3319,23 @@ impl<'model> ActiveRequest<'model> {
     }
 
     fn take_reusable_prefix(&mut self) -> Option<ReusablePrefix> {
-        if !self.cache_prompt || self.multimodal_prompt.is_some() {
+        if !self.cache_prompt {
             return None;
         }
-        let tokens = self.prompt.get(..self.processed_prompt_tokens)?.to_vec();
-        if tokens.is_empty() {
+        let boundary = self
+            .prompt_layout
+            .boundary_at(self.processed_prompt_tokens)?;
+        let layout = self.prompt_layout.prefix(boundary)?;
+        if boundary.logical_tokens == 0 {
             return None;
         }
         debug_assert!(
-            self.prompt_checkpoints
-                .iter()
-                .all(|checkpoint| checkpoint.prefix <= self.processed_prompt_tokens)
+            self.prompt_checkpoints.iter().all(
+                |checkpoint| checkpoint.boundary.logical_tokens <= self.processed_prompt_tokens
+            )
         );
         Some(ReusablePrefix {
-            tokens,
+            layout,
             checkpoints: std::mem::take(&mut self.prompt_checkpoints),
         })
     }
@@ -3207,9 +3357,9 @@ impl<'model> ActiveRequest<'model> {
             return Ok(Some(reason));
         }
 
-        let position = self.next_position;
-        self.next_position = self.next_position.checked_add(1).ok_or_else(|| {
-            InferenceError::Backend("generation position exceeded i32::MAX".into())
+        let position = self.next_boundary;
+        self.next_boundary = self.next_boundary.advance(1).ok_or_else(|| {
+            InferenceError::Backend("generation position exceeded its numeric range".into())
         })?;
         self.phase = RequestPhase::Decode { token, position };
         Ok(None)
@@ -3995,11 +4145,15 @@ mod tests {
     #[test]
     fn batch_commit_keeps_repeated_prompt_quanta_local_until_apply() {
         let mut commit = BatchCommit::new(Instant::now());
-        assert_eq!(commit.prompt_start(2, 7), 7);
-        commit.advance_prompt(2, 9);
-        assert_eq!(commit.prompt_start(2, 7), 9);
-        commit.advance_prompt(2, 11);
-        assert_eq!(commit.prompt_ends, vec![(2, 11)]);
+        let boundary = |value| scheduler::PromptBoundary {
+            logical_tokens: value,
+            native_position: i32::try_from(value).unwrap(),
+        };
+        assert_eq!(commit.prompt_start(2, boundary(7)), boundary(7));
+        commit.advance_prompt(2, boundary(9));
+        assert_eq!(commit.prompt_start(2, boundary(7)), boundary(9));
+        commit.advance_prompt(2, boundary(11));
+        assert_eq!(commit.prompt_ends, vec![(2, boundary(11))]);
     }
 
     struct NoopLoadObserver;
@@ -4093,6 +4247,309 @@ mod tests {
         );
         assert_eq!(completed.cached_prompt_tokens, observed_cached_tokens);
         assert!(completed.generated_tokens > 0);
+    }
+
+    #[test]
+    #[ignore = "loads an installed vision model selected through ICN_VISION_TEST_* variables"]
+    fn multimodal_prompt_reuse_with_real_model() {
+        disable_native_diagnostics();
+        let model_path = PathBuf::from(
+            std::env::var_os("ICN_VISION_TEST_MODEL")
+                .expect("ICN_VISION_TEST_MODEL must name an installed GGUF"),
+        );
+        let projector_path = PathBuf::from(
+            std::env::var_os("ICN_VISION_TEST_PROJECTOR")
+                .expect("ICN_VISION_TEST_PROJECTOR must name its projector GGUF"),
+        );
+        let image_path = PathBuf::from(
+            std::env::var_os("ICN_VISION_TEST_IMAGE")
+                .expect("ICN_VISION_TEST_IMAGE must name the cache probe image"),
+        );
+        let expected_text =
+            std::env::var("ICN_VISION_TEST_EXPECTED").unwrap_or_else(|_| "7429".into());
+        assert!(model_path.is_file(), "missing {}", model_path.display());
+        assert!(
+            projector_path.is_file(),
+            "missing {}",
+            projector_path.display()
+        );
+        let image = std::fs::read(&image_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", image_path.display()));
+
+        let native = NativeBackend::initialize().expect("initialize native backend");
+        let hardware = native.discover_hardware(
+            icn_hardware::CapacityPolicy::default(),
+            "real-multimodal-cache-test",
+            Vec::new(),
+        );
+        let mut defaults = model_plan_defaults();
+        defaults.context_size = 8192;
+        defaults.physical_context_size = 8192;
+        defaults.batch_size = 512;
+        defaults.ubatch_size = 512;
+        defaults.max_sequences = 1;
+        defaults.prefill_quantum = 128;
+        let intent = execution_intent(model_path, Some(projector_path), &defaults);
+        let prepared = native
+            .prepare_load(
+                "installed-vision-cache-test",
+                intent,
+                icn_contracts::SpeculativeDecodingConfig::default(),
+                hardware,
+            )
+            .expect("prepare vision model load");
+        let backend = prepared
+            .execute(Arc::new(NoopLoadObserver))
+            .expect("load vision model");
+
+        let mut completion = request();
+        completion.template.messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: Some(ChatContent::Parts(vec![
+                ChatContentPart::Image(ImageInput::new("image/png", image)),
+                ChatContentPart::Text {
+                    text: "Transcribe the large verification code in this image. Reply with only the code."
+                        .into(),
+                },
+            ])),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+        completion.max_tokens = 128;
+
+        let first = backend
+            .complete(completion.clone(), &mut |_| Ok(()))
+            .expect("complete initial vision request");
+        let perceived = format!("{} {}", first.reasoning, first.text);
+        eprintln!(
+            "cold vision response={perceived:?} prompt_tokens={} cached_tokens={} prompt_ms={:.2}",
+            first.prompt_tokens, first.cached_prompt_tokens, first.metrics.prompt_ms
+        );
+        assert!(
+            perceived.contains(&expected_text),
+            "model did not perceive expected image text {expected_text:?}: {perceived:?}"
+        );
+        assert_eq!(first.cached_prompt_tokens, 0);
+
+        let mut observed_cached_tokens = 0usize;
+        let second = backend
+            .complete(completion, &mut |event| {
+                if let InferenceEvent::Progress(InferenceProgress::Prefill {
+                    cached_tokens, ..
+                }) = event.delta
+                {
+                    observed_cached_tokens = observed_cached_tokens.max(cached_tokens);
+                }
+                Ok(())
+            })
+            .expect("complete cached vision request");
+
+        eprintln!(
+            "cached vision response={:?} prompt_tokens={} cached_tokens={} prompt_ms={:.2}",
+            format!("{} {}", second.reasoning, second.text),
+            second.prompt_tokens,
+            second.cached_prompt_tokens,
+            second.metrics.prompt_ms
+        );
+
+        assert_eq!(
+            second.cached_prompt_tokens,
+            second.prompt_tokens.saturating_sub(1),
+            "identical multimodal prompt did not reuse every token except the logits token"
+        );
+        assert_eq!(second.cached_prompt_tokens, observed_cached_tokens);
+        assert!(
+            second.metrics.prompt_ms < first.metrics.prompt_ms,
+            "cached prefill ({:.2} ms) was not faster than cold prefill ({:.2} ms)",
+            second.metrics.prompt_ms,
+            first.metrics.prompt_ms
+        );
+    }
+
+    #[test]
+    #[ignore = "loads an installed vision model selected through ICN_VISION_TEST_* variables"]
+    fn multimodal_multiturn_cache_and_speculation_with_real_model() {
+        disable_native_diagnostics();
+        let required_path = |name: &str| {
+            let path = PathBuf::from(
+                std::env::var_os(name).unwrap_or_else(|| panic!("{name} must name a local file")),
+            );
+            assert!(path.is_file(), "missing {}", path.display());
+            path
+        };
+        let model_path = required_path("ICN_VISION_TEST_MODEL");
+        let projector_path = required_path("ICN_VISION_TEST_PROJECTOR");
+        let first_image = std::fs::read(required_path("ICN_VISION_TEST_IMAGE"))
+            .expect("read first vision test image");
+        let second_image = std::fs::read(required_path("ICN_VISION_TEST_IMAGE_2"))
+            .expect("read second vision test image");
+        let first_expected =
+            std::env::var("ICN_VISION_TEST_EXPECTED").unwrap_or_else(|_| "7429".into());
+        let second_expected =
+            std::env::var("ICN_VISION_TEST_EXPECTED_2").unwrap_or_else(|_| "3816".into());
+
+        let speculative = match std::env::var("ICN_VISION_TEST_SPECULATIVE_METHOD")
+            .unwrap_or_else(|_| "none".into())
+            .as_str()
+        {
+            "none" => icn_contracts::SpeculativeDecodingConfig::default(),
+            method @ ("dflash" | "dspark") => {
+                let draft = required_path("ICN_VISION_TEST_DRAFT");
+                let threshold = std::env::var("ICN_VISION_TEST_SPECULATIVE_THRESHOLD")
+                    .ok()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(0.1);
+                let method = if method == "dflash" {
+                    icn_contracts::SpeculativeMethodConfig::DFlash {
+                        min_sample_probability: threshold,
+                    }
+                } else {
+                    icn_contracts::SpeculativeMethodConfig::DSpark {
+                        acceptance_threshold: threshold,
+                    }
+                };
+                icn_contracts::SpeculativeDecodingConfig::Enabled {
+                    source: icn_contracts::SpeculativeDraftSource::Separate { model_path: draft },
+                    method,
+                    n_max: 3,
+                    n_min: 0,
+                    cache_type_k: CacheType::F16,
+                    cache_type_v: CacheType::F16,
+                }
+            }
+            method => panic!("unsupported ICN_VISION_TEST_SPECULATIVE_METHOD {method:?}"),
+        };
+        let speculative_enabled = matches!(
+            speculative,
+            icn_contracts::SpeculativeDecodingConfig::Enabled { .. }
+        );
+
+        let native = NativeBackend::initialize().expect("initialize native backend");
+        let hardware = native.discover_hardware(
+            icn_hardware::CapacityPolicy::default(),
+            "real-multimodal-speculative-test",
+            Vec::new(),
+        );
+        let mut defaults = model_plan_defaults();
+        defaults.context_size = 32_768;
+        defaults.physical_context_size = 32_768;
+        defaults.batch_size = 512;
+        defaults.ubatch_size = 512;
+        defaults.max_sequences = 1;
+        defaults.prefill_quantum = 128;
+        let mut intent = execution_intent(model_path, Some(projector_path), &defaults);
+        intent.speculative = speculative.clone();
+        let prepared = native
+            .prepare_load(
+                "installed-vision-multiturn-test",
+                intent,
+                speculative,
+                hardware,
+            )
+            .expect("prepare vision model load");
+        let backend = prepared
+            .execute(Arc::new(NoopLoadObserver))
+            .expect("load vision model");
+
+        fn image_message(bytes: Vec<u8>) -> ChatMessage {
+            ChatMessage {
+                role: ChatRole::User,
+                content: Some(ChatContent::Parts(vec![
+                    ChatContentPart::Image(ImageInput::new("image/png", bytes)),
+                    ChatContentPart::Text {
+                        text: "Transcribe the large verification code in this image. Reply with only the four-digit code."
+                            .into(),
+                    },
+                ])),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }
+        }
+        let run = |messages: Vec<ChatMessage>| {
+            let mut completion = request();
+            completion.template.messages = messages;
+            completion.template.reasoning = ReasoningControl::Disabled;
+            completion.max_tokens = 64;
+            backend
+                .complete(completion, &mut |_| Ok(()))
+                .expect("complete multimodal turn")
+        };
+
+        let first_message = image_message(first_image);
+        let first = run(vec![first_message.clone()]);
+        let first_text = format!("{} {}", first.reasoning, first.text);
+        assert!(
+            first_text.contains(&first_expected),
+            "first image was not perceived: {first_text:?}"
+        );
+
+        let second_message = image_message(second_image);
+        let conversation = vec![
+            first_message,
+            ChatMessage::text(ChatRole::Assistant, first.text.clone()),
+            second_message,
+        ];
+        let second = run(conversation.clone());
+        let second_text = format!("{} {}", second.reasoning, second.text);
+        assert!(
+            second_text.contains(&second_expected),
+            "second image was not perceived: {second_text:?}"
+        );
+        assert!(
+            second.cached_prompt_tokens > 0,
+            "the second turn did not reuse the first image prefix"
+        );
+
+        let repeated = run(conversation);
+        let repeated_text = format!("{} {}", repeated.reasoning, repeated.text);
+        assert!(
+            repeated_text.contains(&second_expected),
+            "cached second image was not perceived: {repeated_text:?}"
+        );
+        assert_eq!(
+            repeated.cached_prompt_tokens,
+            repeated.prompt_tokens.saturating_sub(1),
+            "the repeated multimodal turn did not reuse both images"
+        );
+        assert!(
+            repeated.metrics.prompt_ms < second.metrics.prompt_ms,
+            "exact cached prefill ({:.2} ms) was not faster than the extended turn ({:.2} ms)",
+            repeated.metrics.prompt_ms,
+            second.metrics.prompt_ms
+        );
+        if speculative_enabled {
+            let drafted = first.metrics.draft_tokens
+                + second.metrics.draft_tokens
+                + repeated.metrics.draft_tokens;
+            let accepted = first.metrics.accepted_draft_tokens
+                + second.metrics.accepted_draft_tokens
+                + repeated.metrics.accepted_draft_tokens;
+            assert!(
+                drafted > 0,
+                "the configured speculative method produced no drafts"
+            );
+            assert!(
+                accepted > 0,
+                "the configured speculative method accepted no draft tokens"
+            );
+        }
+        eprintln!(
+            "vision multiturn first_cached={} second_cached={} repeated_cached={} first_ms={:.2} second_ms={:.2} repeated_ms={:.2} drafted={} accepted={}",
+            first.cached_prompt_tokens,
+            second.cached_prompt_tokens,
+            repeated.cached_prompt_tokens,
+            first.metrics.prompt_ms,
+            second.metrics.prompt_ms,
+            repeated.metrics.prompt_ms,
+            first.metrics.draft_tokens
+                + second.metrics.draft_tokens
+                + repeated.metrics.draft_tokens,
+            first.metrics.accepted_draft_tokens
+                + second.metrics.accepted_draft_tokens
+                + repeated.metrics.accepted_draft_tokens,
+        );
     }
 
     #[test]
@@ -4240,10 +4697,8 @@ mod tests {
 
     #[cfg(feature = "mtmd")]
     #[test]
-    fn projector_mode_truthfully_rejects_continuous_batching() {
-        let error = validate_model_config(&model_config_with_projector(2)).unwrap_err();
-        assert!(error.to_string().contains("requires max_sequences=1"));
-        validate_model_config(&model_config_with_projector(1)).unwrap();
+    fn projector_mode_accepts_continuous_batching() {
+        validate_model_config(&model_config_with_projector(4)).unwrap();
     }
 
     #[cfg(feature = "mtmd")]

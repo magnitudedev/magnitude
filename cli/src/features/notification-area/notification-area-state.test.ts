@@ -45,7 +45,7 @@ describe("notification area model projections", () => {
                 abortReserveBytes: 2,
                 loadBoundaryBytes: 22,
               },
-              minimumAdditionalAvailableBytes: 13,
+              minimumAdditionalAvailableBytes: 2 * 1024 ** 3 + 1,
             },
           },
         },
@@ -57,8 +57,8 @@ describe("notification area model projections", () => {
       lowMemoryView.models,
       lowMemoryView.slots,
     )).toMatchObject({
-      message: "Low memory: close memory-intensive apps (need 0.1 GB) to load model",
-      compactMessage: Option.some("Low memory: Free 0.1 GB to load"),
+      message: "Low memory: close memory-intensive apps (need 2.1 GB) to load model",
+      compactMessage: Option.some("Low memory: Free 2.1 GB to load"),
       priority: "warning",
     })
 

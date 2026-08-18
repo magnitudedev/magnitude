@@ -201,7 +201,7 @@
     },
     "packages/cli": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.5",
+      "version": "0.0.6",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
@@ -341,6 +341,25 @@
       "devDependencies": {
         "@types/bun": "latest",
         "vitest": "^3.2.4",
+      },
+    },
+    "packages/inference-benchmark-dashboard": {
+      "name": "@magnitudedev/inference-benchmark-dashboard",
+      "version": "0.0.1",
+      "dependencies": {
+        "@magnitudedev/inference-benchmark": "workspace:*",
+        "effect": "3.21.2",
+      },
+      "devDependencies": {
+        "@sveltejs/vite-plugin-svelte": "^5.0.3",
+        "@tailwindcss/vite": "^4.1.4",
+        "@types/bun": "latest",
+        "concurrently": "^9.1.2",
+        "svelte": "^5.28.2",
+        "svelte-check": "^4.2.1",
+        "tailwindcss": "^4.1.4",
+        "typescript": "^5.8.3",
+        "vite": "^6.3.2",
       },
     },
     "packages/logger": {
@@ -904,6 +923,8 @@
     "@magnitudedev/inference": ["@magnitudedev/inference@workspace:inference"],
 
     "@magnitudedev/inference-benchmark": ["@magnitudedev/inference-benchmark@workspace:packages/inference-benchmark"],
+
+    "@magnitudedev/inference-benchmark-dashboard": ["@magnitudedev/inference-benchmark-dashboard@workspace:packages/inference-benchmark-dashboard"],
 
     "@magnitudedev/logger": ["@magnitudedev/logger@workspace:packages/logger"],
 

@@ -1,18 +1,12 @@
 import type { ModelDownloadFailure } from "@magnitudedev/sdk"
 import type { OnboardingModelSetupFailure } from "./setup-state"
-
-export const formatDownloadBytes = (bytes: number): string => {
-  const gigabytes = bytes / 1_000_000_000
-  return gigabytes >= 1
-    ? `${gigabytes.toFixed(gigabytes >= 10 ? 1 : 2)} GB`
-    : `${(bytes / 1_000_000).toFixed(0)} MB`
-}
+import { formatStorageSize } from "../utils/format-bytes"
 
 export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): string => {
   switch (failure._tag) {
     case "Interrupted": return "The download was interrupted. Try again to continue."
     case "InsufficientDiskSpace":
-      return `Not enough disk space. Free at least ${formatDownloadBytes(
+      return `Not enough disk space. Free at least ${formatStorageSize(
         Math.max(0, failure.requiredBytes - failure.availableBytes),
       )} and try again.`
     case "SourceUnavailable": return "This model is not available from its source."

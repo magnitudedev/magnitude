@@ -1,0 +1,28 @@
+{
+  "repository": "mlx-community/Qwen3.6-35B-A3B-8bit",
+  "revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0",
+  "quantization": { "family": "mlx-affine", "bits": 8, "groupSize": 64 },
+  "files": [
+    { "path": ".gitattributes", "sizeBytes": 1570, "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930" },
+    { "path": "README.md", "sizeBytes": 724, "sha256": "7a228e82ead2765523661536a3f5ca8da62812ffde0df61519ab09575818328e" },
+    { "path": "chat_template.jinja", "sizeBytes": 7764, "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259" },
+    { "path": "config.json", "sizeBytes": 23591, "sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296" },
+    { "path": "configuration.json", "sizeBytes": 58, "sha256": "c1b09db419119513247e9b8b912c4b9897106c9b20c6cada7e107d993c5435eb" },
+    { "path": "generation_config.json", "sizeBytes": 202, "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e" },
+    { "path": "model-00001-of-00008.safetensors", "sizeBytes": 5329915945, "sha256": "ae1ced7360792820cfc12f2e0c8e1ca4d95c712c122e08ebb474b197dee3edaf" },
+    { "path": "model-00002-of-00008.safetensors", "sizeBytes": 5365574072, "sha256": "b8fdc3700f7339dc29d0e8504d15bc61e9beda7dc69eea037084cfa4067f1b26" },
+    { "path": "model-00003-of-00008.safetensors", "sizeBytes": 5358684778, "sha256": "8a7851d9152dd39369026ab0ac7c369e4e62ce67ea1e3836862ff0c651176675" },
+    { "path": "model-00004-of-00008.safetensors", "sizeBytes": 5365574256, "sha256": "3ad6623bb7ff4ddf39ee3854d473d66543ea8fdffc48f03ae4a1dc866da34b36" },
+    { "path": "model-00005-of-00008.safetensors", "sizeBytes": 5358684632, "sha256": "ec9d987a3c499146e6e8edd92afb3943dfd35c908a3de0685346c1ea6901e383" },
+    { "path": "model-00006-of-00008.safetensors", "sizeBytes": 5365574102, "sha256": "9a843214e1e72bfbae1d2c61283e25ee5930b5ccdbe15dccc7d72fba3a5812c4" },
+    { "path": "model-00007-of-00008.safetensors", "sizeBytes": 5037050550, "sha256": "0a1ed4b82de64955eefb212b2eda57acfa1c2330a4258448e5c7f0f8aaf3649a" },
+    { "path": "model-00008-of-00008.safetensors", "sizeBytes": 540344667, "sha256": "41a1d955de1a9a97de3abebc40b5519b02d542adf266fefbd33b24dc674aef39" },
+    { "path": "model.safetensors.index.json", "sizeBytes": 215755, "sha256": "3db12edeebeb65cab9a6eeb63cd74be4e0c74139a75f672701290b98230501cf" },
+    { "path": "preprocessor_config.json", "sizeBytes": 390, "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516" },
+    { "path": "processor_config.json", "sizeBytes": 1312, "sha256": "51c5f33646392e0bf1ed3e96be02504da47406c21c6cb86925d8908d1a6c4da7" },
+    { "path": "tokenizer.json", "sizeBytes": 19989343, "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4" },
+    { "path": "tokenizer_config.json", "sizeBytes": 1139, "sha256": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182" },
+    { "path": "video_preprocessor_config.json", "sizeBytes": 385, "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13" },
+    { "path": "vocab.json", "sizeBytes": 6722759, "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003" }
+  ]
+}

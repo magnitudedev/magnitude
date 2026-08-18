@@ -7,10 +7,12 @@ import {
   type LocalInferenceError,
   type CatalogIdentity,
   type ModelPackage,
+  type ModelPackageEntry,
+  type ModelPackageId,
+  type ModelPackageInspection,
   type ModelServingConfiguration,
   type ModelServingConfigurationId,
   type RecommendableModel,
-  type InstalledCatalogAttribution,
 } from "@magnitudedev/acn-protocol"
 import { IcnModels } from "@magnitudedev/icn"
 import {
@@ -28,7 +30,8 @@ import { localCatalogProviderModelId } from "./local-provider-model-id"
 export interface ResolvedLocalModelConfiguration {
   readonly servingConfiguration: ModelServingConfiguration
   readonly catalogModel: Option.Option<RecommendableModel>
-  readonly assessment: Option.Option<CoordinatedLocalModelAssessment["assessment"]>
+  readonly assessment: CoordinatedLocalModelAssessment["assessment"]
+  readonly targetInspection: ModelPackageInspection
 }
 
 const LocalModelTargetIdentitySchema = Schema.String.pipe(
@@ -84,17 +87,16 @@ export const resolveLocalModelConfigurations = (input: {
     readonly configuration: ModelServingConfiguration
   }[]
   readonly assessed: ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>
-  readonly installedPackageIds: ReadonlySet<string>
-  readonly catalogAttributionByPackageId?: ReadonlyMap<string, InstalledCatalogAttribution>
+  readonly packageEntries: ReadonlyMap<ModelPackageId, ModelPackageEntry>
 }): ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration> => {
   const configurations = new Map<LocalModelTargetIdentity, ModelServingConfiguration>()
   for (const { configuration, origin } of input.assessed.values()) {
     if (origin === "Standard" && servableModelBundlePackageIds(configuration.bundle).every(
-      (packageId) => input.installedPackageIds.has(packageId),
+      (packageId) => input.packageEntries.get(packageId)?.localState._tag === "Installed",
     )) {
-      const attribution = input.catalogAttributionByPackageId?.get(
+      const attribution = input.packageEntries.get(
         servableModelBundleTargetPackageId(configuration.bundle),
-      )
+      )?.catalogAttribution
       if (attribution?._tag !== "Attributed") {
         configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
       }
@@ -116,15 +118,25 @@ export const resolveLocalModelConfigurations = (input: {
   }
   return new Map([...configurations].map(([identity, servingConfiguration]) => {
     const assessed = input.assessed.get(servingConfiguration.id)
-    const assessment = assessed !== undefined
+    const assessment: CoordinatedLocalModelAssessment["assessment"] = assessed !== undefined
       && sameConfiguration(assessed.configuration, servingConfiguration)
-      ? Option.some(assessed.assessment)
-      : Option.none()
+      ? assessed.assessment
+      : { _tag: "Assessing" }
     const catalogModel = catalogByIdentity.get(identity)
+    const targetEntry = input.packageEntries.get(
+      servableModelBundleTargetPackageId(servingConfiguration.bundle),
+    )
+    const targetInspection: ModelPackageInspection = targetEntry?.localState._tag === "Installed"
+      ? targetEntry.inspection
+      : catalogModel !== undefined
+        && sameConfiguration(catalogModel.configuration, servingConfiguration)
+        ? { _tag: "Inspected", capabilities: catalogModel.capabilities }
+        : { _tag: "Pending" }
     return [identity, {
       servingConfiguration,
       catalogModel: Option.fromNullable(catalogModel),
       assessment,
+      targetInspection,
     }] as const
   }))
 }
@@ -171,15 +183,12 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
         ? [{ identity: entry.value[0], configuration: entry.value[1] }]
         : [])
     const packageState = (yield* packages.snapshot).state
+    const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     return resolveLocalModelConfigurations({
       catalog: catalogModels,
       effectiveCatalogConfigurations,
       assessed: yield* assessor.state,
-      installedPackageIds: yield* packages.installedPackageIds,
-      catalogAttributionByPackageId: new Map(packageState.entries.map((entry) => [
-        entry.package.id,
-        entry.catalogAttribution,
-      ])),
+      packageEntries,
     })
   }).pipe(Effect.mapError(failure))
 

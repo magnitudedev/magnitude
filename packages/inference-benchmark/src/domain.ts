@@ -10,6 +10,7 @@ export const WORKLOAD_PATTERNS = [
   "forked-concurrency",
   "concurrency-pressure",
   "memory-pressure",
+  "context-scaling",
 ] as const
 export type WorkloadPattern = typeof WORKLOAD_PATTERNS[number]
 
@@ -47,6 +48,10 @@ export interface PlannedRequest {
   readonly releaseOffsetMs: number
   readonly dependsOn: readonly string[]
   readonly maxOutputTokens: number
+  readonly temperature?: number
+  readonly topP?: number
+  readonly seed?: number
+  readonly enableThinking?: false
   readonly sessionId?: string
   readonly prefixGroup?: string
   readonly phase?: "setup" | "measure"
@@ -60,11 +65,17 @@ export interface TrialDefinition {
   readonly repetition: number
   readonly state: "cache-disjoint" | "resident-prefix"
   readonly requests: readonly PlannedRequest[]
+  readonly contextTarget?: {
+    readonly tokens: number
+    readonly characters: number
+    readonly plannedCharacters: number
+    readonly semanticDepth: number
+  }
 }
 
 export interface TrialPlan {
-  readonly profile: ProfileName
-  readonly model: ModelIdentity
+  readonly profile: ProfileName | "context-sweep"
+  readonly model: LogicalModelIdentity
   readonly servingPolicy: ServingPolicy
   readonly corpusDigest: string
   readonly createdAt: string
@@ -76,13 +87,20 @@ export interface TrialPlan {
 export interface ServingPolicy {
   readonly contextTokensPerSequence: number
   readonly parallelSequences: number
+  readonly temperature?: number
+  readonly topP?: number
+  readonly seed?: number
+  readonly enableThinking?: false
 }
 
-export interface ModelIdentity {
+export interface LogicalModelIdentity {
   readonly id: string
+  readonly contextLimit: number
+}
+
+export interface ModelIdentity extends LogicalModelIdentity {
   readonly artifactPath: string
   readonly artifactSha256: string
-  readonly contextLimit: number
   readonly chatTemplateDigest: string
 }
 
@@ -93,12 +111,19 @@ export interface ExistingTarget {
   readonly servedModel: string
   readonly apiKey?: string
   readonly requestBody?: Readonly<Record<string, unknown>>
+  readonly requestTimeoutMs?: number
   readonly parallelSequences: number
+  readonly artifact?: {
+    readonly kind: "gguf" | "mlx"
+    readonly repository: string
+    readonly revision: string
+    readonly quantization: string
+  }
 }
 
 export interface ManagedTarget {
   readonly kind: "managed"
-  readonly engine: "icn" | "llama.cpp" | "vllm" | "sglang" | "generic"
+  readonly engine: "icn" | "llama.cpp" | "mlx-lm" | "mlx-vlm" | "vllm" | "sglang" | "generic"
   readonly id: string
   readonly executable: string
   readonly args: readonly string[]
@@ -106,6 +131,7 @@ export interface ManagedTarget {
   readonly servedModel: string
   readonly apiKey?: string
   readonly requestBody?: Readonly<Record<string, unknown>>
+  readonly requestTimeoutMs?: number
   readonly env?: Readonly<Record<string, string>>
   readonly readinessPath?: string
   readonly cwd?: string
@@ -115,6 +141,13 @@ export interface ManagedTarget {
     readonly instanceId: string
   }
   readonly parallelSequences: number
+  readonly artifact?: {
+    readonly kind: "gguf" | "mlx"
+    readonly repository: string
+    readonly revision: string
+    readonly quantization: string
+  }
+  readonly logPath?: string
 }
 
 export type TargetConfiguration = ExistingTarget | ManagedTarget
@@ -212,6 +245,7 @@ export interface MetricSummary {
 export interface TrialAnalysis {
   readonly trialId: string
   readonly pattern: WorkloadPattern
+  readonly measuredRequests: number
   readonly validRequests: number
   readonly outcomes: Readonly<Record<Outcome, number>>
   readonly responsivenessMs?: MetricSummary
@@ -241,4 +275,18 @@ export interface ComparisonResult {
   readonly differences: readonly string[]
   readonly plan: TrialPlan
   readonly results: readonly BenchmarkResult[]
+}
+
+export interface EvaluationBlock {
+  readonly index: number
+  readonly variantOrder: readonly string[]
+  readonly comparison: ComparisonResult
+}
+
+export interface ExperimentRunResult {
+  readonly runId: string
+  readonly experimentId: string
+  readonly startedAt: string
+  readonly completedAt: string
+  readonly blocks: readonly EvaluationBlock[]
 }

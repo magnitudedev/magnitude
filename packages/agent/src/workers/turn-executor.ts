@@ -1,5 +1,5 @@
 /**
- * Cortex Worker (Forked) — Harness Paradigm
+ * TurnExecutor Worker (Forked) — Harness Paradigm
  *
  * Thin orchestrator: resolve model → build harness → run turn → publish events → publish outcome.
  *
@@ -63,7 +63,7 @@ import { ImageQueryTarget } from '../tools/query-image'
 import { SessionOptionsAmbient } from '../ambient/session-ambient'
 import { ToolUniverseAmbient } from '../ambient/tool-universe-ambient'
 
-function cortexDefectMessage(
+function turnExecutorDefectMessage(
   title: string,
   context: {
     readonly forkId: string | null
@@ -100,8 +100,8 @@ export function buildObserverEscalationRunOptions(turnState: ForkTurnState | und
 // Worker
 // =============================================================================
 
-export const Cortex = Worker.defineForked<AppEvent>()({
-  name: 'Cortex',
+export const TurnExecutor = Worker.defineForked<AppEvent>()({
+  name: 'TurnExecutor',
 
   forkLifecycle: {
     activateOn: 'agent_created',
@@ -204,15 +204,15 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const toolkit = materializeAgentToolkit(universe, toolkitState.toolKeys)
         if (!forkLayer) {
           const message = [
-            'Cortex defect: fork layer not initialized',
+            'TurnExecutor defect: fork layer not initialized',
             `forkId: ${forkId}`,
             `turnId: ${turnId}`,
           ].join('\n')
-          logger.error({ forkId, turnId, message }, '[Cortex] Fork layer not initialized')
+          logger.error({ forkId, turnId, message }, '[TurnExecutor] Fork layer not initialized')
           yield* publish({
             type: 'turn_outcome', forkId, turnId, chainId,
             strategyId: 'native',
-            outcome: { _tag: 'UnexpectedError', detail: { _tag: 'CortexDefect', message }, requestId: null },
+            outcome: { _tag: 'UnexpectedError', detail: { _tag: 'TurnExecutorDefect', message }, requestId: null },
             commitPolicy: { _tag: 'commitErrorOnly' },
             inputTokens: null, outputTokens: null,
             cacheReadTokens: null, cacheWriteTokens: null,
@@ -231,14 +231,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // Record turn-start checkpoint — captures state at the turn boundary
         // so checkpoint_rollback can restore to "before this turn".
-        logger.info({ forkId, turnId }, '[Cortex] Recording turn-start checkpoint')
+        logger.info({ forkId, turnId }, '[TurnExecutor] Recording turn-start checkpoint')
         yield* Effect.gen(function* () {
           const vcs = yield* ShadowVcs
           yield* vcs.record({ message: `turn-start:${turnId}` })
         }).pipe(
           Effect.provide(turnLayer),
           Effect.catchAllCause((cause) => {
-            logger.error({ forkId, turnId, cause }, '[Cortex] turn-start checkpoint failed')
+            logger.error({ forkId, turnId, cause }, '[TurnExecutor] turn-start checkpoint failed')
             return Effect.void
           }),
         )
@@ -335,7 +335,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const liveTurn = yield* harness.runTurn(prompt, runTurnOptions).pipe(
           Effect.provide(turnLayer),
           Effect.catchAll((err: AgentModelStartFailure) => Effect.gen(function* () {
-            logger.error({ forkId, turnId, err }, '[Cortex] Pre-stream failure')
+            logger.error({ forkId, turnId, err }, '[TurnExecutor] Pre-stream failure')
             const turnFork = yield* read(TurnProjection, forkId)
             const decision = finalizeAgentModelStartFailure({
               failure: err,
@@ -368,14 +368,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // ──────────────────────────────────────────────────────────────────────
         // 9.5 Record turn-end checkpoint
         // ──────────────────────────────────────────────────────────────────────
-        logger.info({ forkId, turnId }, '[Cortex] Recording turn-end checkpoint')
+        logger.info({ forkId, turnId }, '[TurnExecutor] Recording turn-end checkpoint')
         yield* Effect.gen(function* () {
           const vcs = yield* ShadowVcs
           yield* vcs.record({ message: `turn-end:${turnId}` })
         }).pipe(
           Effect.provide(turnLayer),
           Effect.catchAllCause((cause) => {
-            logger.error({ forkId, turnId, cause }, '[Cortex] turn-end checkpoint failed')
+            logger.error({ forkId, turnId, cause }, '[TurnExecutor] turn-end checkpoint failed')
             return Effect.void
           }),
         )
@@ -412,12 +412,12 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           yield* publish(turnOutcome)
         }).pipe(Effect.orDie)),
         Effect.catchAllCause((cause) => Effect.gen(function* () {
-          const message = cortexDefectMessage('Cortex defect while handling turn_started', { forkId, turnId }, Cause.pretty(cause))
-          logger.error({ context: 'Cortex', forkId, turnId, message, cause: Cause.pretty(cause) }, '[Cortex] Unexpected error in turn_started')
+          const message = turnExecutorDefectMessage('TurnExecutor defect while handling turn_started', { forkId, turnId }, Cause.pretty(cause))
+          logger.error({ context: 'TurnExecutor', forkId, turnId, message, cause: Cause.pretty(cause) }, '[TurnExecutor] Unexpected error in turn_started')
           yield* publish({
             type: 'turn_outcome', forkId, turnId, chainId,
             strategyId: 'native',
-            outcome: { _tag: 'UnexpectedError', detail: { _tag: 'CortexDefect', message }, requestId: null },
+            outcome: { _tag: 'UnexpectedError', detail: { _tag: 'TurnExecutorDefect', message }, requestId: null },
             commitPolicy: { _tag: 'commitErrorOnly' },
             inputTokens: null, outputTokens: null,
             cacheReadTokens: null, cacheWriteTokens: null,

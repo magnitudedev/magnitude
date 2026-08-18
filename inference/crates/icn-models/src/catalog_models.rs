@@ -309,6 +309,7 @@ fn catalog_model(
         display_name: definition.display_name.clone(),
         variant_label: definition.variant_label.clone(),
         description: definition.description.clone(),
+        release_date: definition.release_date.clone(),
         license: definition.license.clone(),
         capabilities: definition.capabilities.clone(),
         parameterization: definition.parameterization.clone(),
@@ -387,7 +388,7 @@ mod tests {
     use icn_contracts::models::{
         CatalogModelId, CatalogPackageAffiliation, CatalogVariantId, ModelCapabilities,
         ModelPackage, ModelPackageInspection, ModelPackageInstallationOrigin,
-        ModelPackageProperties, ModelPackageSource, ModelReasoningCapabilities,
+        ModelPackageProperties, ModelPackageSource, ModelReasoningCapabilities, ModelReleaseDate,
         ModelServingConfigurationId, ServingProfile,
     };
 
@@ -425,6 +426,7 @@ mod tests {
             display_name: "Catalog".to_owned(),
             variant_label: "Q4".to_owned(),
             description: String::new(),
+            release_date: ModelReleaseDate::new("2026-01-01").expect("valid test date"),
             license: "test".to_owned(),
             capabilities: ModelCapabilities {
                 vision: false,
@@ -474,6 +476,7 @@ mod tests {
         }];
 
         let projected = catalog_model(&definition(desired.clone()), &present, &affiliations);
+        assert_eq!(projected.release_date.as_str(), "2026-01-01");
         assert!(superseded_packages_ready_for_removal(&projected).is_empty());
         let CatalogModelLocalState::Installed {
             installation,
