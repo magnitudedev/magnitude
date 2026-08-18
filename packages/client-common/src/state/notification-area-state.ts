@@ -8,7 +8,7 @@ import type {
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { localModelProviderModelId } from "../local-models/projection"
-import { formatDecimalGigabytes } from "../utils/format-bytes"
+import { formatMemorySize } from "../utils/format-bytes"
 
 export const NotificationIdSchema = Schema.NonEmptyString.pipe(
   Schema.brand("NotificationId"),
@@ -196,7 +196,7 @@ export const deriveSelectedModelLowMemoryNotificationStateByProviderModelId = (
   const currentHeadroomState =
     selectedModel.servingState.assessment.memory.currentHeadroomState
   if (currentHeadroomState._tag !== "Insufficient") return null
-  const additionalMemory = formatDecimalGigabytes(
+  const additionalMemory = formatMemorySize(
     currentHeadroomState.minimumAdditionalAvailableBytes,
     { rounding: "up" },
   )

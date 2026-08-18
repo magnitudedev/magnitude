@@ -8,7 +8,7 @@ import {
   clampTextToVisualLines,
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
-  formatDecimalGigabytes,
+  formatMemorySize,
   localModelConfigurationId,
   type LocalModelOption,
   type LocalInferenceHardwareResult,
@@ -546,7 +546,7 @@ export function OnboardingModelChooser({
     onNone: () => null,
     onSome: ({ currentHeadroomState, systemUseState }) =>
       currentHeadroomState._tag === "Insufficient"
-        ? `! Low memory: Free ${formatDecimalGigabytes(currentHeadroomState.minimumAdditionalAvailableBytes, { rounding: "up" })} to load`
+        ? `! Low memory: Free ${formatMemorySize(currentHeadroomState.minimumAdditionalAvailableBytes, { rounding: "up" })} to load`
         : systemUseState._tag === "High"
           ? "! Heavy memory use: Limited memory remains for other apps"
           : null,
@@ -885,17 +885,17 @@ function OnboardingModelLoadingDetails({
               </text>
               <box style={{ height: 1 }} />
               <text style={{ fg: theme.text.body, width }} wrapMode="word">
-                {`Free at least ${formatDecimalGigabytes(failed.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`}
+                {`Free at least ${formatMemorySize(failed.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`}
               </text>
               <text style={{ fg: theme.text.supporting, width }} wrapMode="word">
                 Close memory-intensive applications or choose a smaller model.
               </text>
               <box style={{ height: 1 }} />
               <text style={{ fg: theme.text.supporting, width }}>
-                {`Needed at attempt    ${formatDecimalGigabytes(failed.loadBoundaryBytes)}`}
+                {`Needed at attempt    ${formatMemorySize(failed.loadBoundaryBytes)}`}
               </text>
               <text style={{ fg: theme.text.supporting, width }}>
-                {`Available at attempt ${formatDecimalGigabytes(failed.allocationHeadroomBytes)}`}
+                {`Available at attempt ${formatMemorySize(failed.allocationHeadroomBytes)}`}
               </text>
               <box style={{ height: 1 }} />
             </box>

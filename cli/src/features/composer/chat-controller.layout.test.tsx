@@ -288,7 +288,7 @@ test('shows resident memory three spaces after context and links it to hardware'
   )
 
   expect(html).toContain(
-    `5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:${theme.text.supporting}"><span attributes="0">17.2 GB mem`,
+    `5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:${theme.text.supporting}"><span attributes="0">16 GB mem`,
   )
 
   let view!: ReturnType<typeof create>
@@ -308,11 +308,11 @@ test('shows resident memory three spaces after context and links it to hardware'
     .join('')
   const memoryButton = view.root.findAll(
     (node) => typeof node.props.onClick === 'function',
-  ).find((node) => textOf(node) === '17.2 GB mem')
+  ).find((node) => textOf(node) === '16 GB mem')
   expect(memoryButton).toBeDefined()
   act(() => { (memoryButton!.props.onMouseOver as () => void)() })
   const hoveredMemory = view.root.findAll(
-    (node) => node.type === 'text' && textOf(node) === '17.2 GB mem',
+    (node) => node.type === 'text' && textOf(node) === '16 GB mem',
   )[0]!
   expect(hoveredMemory.props.style).toEqual({ fg: theme.accent })
   expect(hoveredMemory.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
@@ -477,7 +477,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
 
   const clickableLabels = clickable().map(textOf)
   expect(clickableLabels).toContain('high')
-  expect(JSON.stringify(view.toJSON())).toContain('17.2 GB mem')
+  expect(JSON.stringify(view.toJSON())).toContain('16 GB mem')
   const effort = clickable().find((node) => textOf(node) === 'high')
   expect(effort).toBeDefined()
   act(() => { (effort!.props.onClick as () => void)() })
@@ -487,7 +487,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
   expect(openText).toContain('Medium')
   expect(openText).toContain('Select reasoning level...')
   expect(openText).not.toContain('5k / 100k (5%)')
-  expect(openText).not.toContain('17.2 GB mem')
+  expect(openText).not.toContain('16 GB mem')
   expect(openText).toContain('/tmp/default')
 
   const low = clickable().find((node) => textOf(node) === 'Low')
@@ -496,7 +496,7 @@ test('clicking effort opens the footer selector and clicking an option commits i
 
   expect(applied).toEqual(['low'])
   expect(JSON.stringify(view.toJSON())).toContain('5k / 100k (5%)')
-  expect(JSON.stringify(view.toJSON())).toContain('17.2 GB mem')
+  expect(JSON.stringify(view.toJSON())).toContain('16 GB mem')
   act(() => { view.unmount() })
 })
 
@@ -546,7 +546,7 @@ test('disables footer settings controls while onboarding downloads a model', () 
   const expectedColors = new Map([
     ['model', theme.text.body],
     ['high', defaultCliThemes.dark.planAccent],
-    ['17.2 GB mem', theme.text.supporting],
+    ['16 GB mem', theme.text.supporting],
   ])
   for (const label of expectedColors.keys()) {
     const control = view.root.findAll((node) => textOf(node) === label)

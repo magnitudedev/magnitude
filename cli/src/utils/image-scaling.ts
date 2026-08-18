@@ -111,7 +111,7 @@ export async function autoScaleImageAttachmentIfNeeded(input: ImagePayload): Pro
           height: bestCandidate.height,
           quality: bestCandidate.quality,
         },
-        'Image autoscaling could not reduce under 5MB; attaching best-effort JPEG candidate',
+        'Image autoscaling could not reduce under 5 MiB; attaching best-effort JPEG candidate',
       )
 
       return {

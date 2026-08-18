@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { formatDecimalGigabytes, localModelSpeculativeMethodLabel } from "@magnitudedev/client-common"
+import { formatMemorySize, localModelSpeculativeMethodLabel } from "@magnitudedev/client-common"
 import type { LocalModel } from "@magnitudedev/sdk"
 import type { PentagonRadarAxes } from "../../components/pentagon-radar"
 import { performanceRangeSpeedLabel } from "./view-model"
@@ -118,7 +118,7 @@ export const localModelRadarAxes = (model: LocalModel): Option.Option<PentagonRa
     {
       value: Option.some(memoryEfficiency(assessment)),
       label: "MEMORY",
-      detail: `${memoryFootprintLabel(assessment)} (${formatDecimalGigabytes(assessment.memory.totalRequiredBytes)})`,
+      detail: `${memoryFootprintLabel(assessment)} (${formatMemorySize(assessment.memory.totalRequiredBytes)})`,
     },
     {
       value: Option.match(catalog, {

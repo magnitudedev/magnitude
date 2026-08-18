@@ -144,6 +144,7 @@ test("renders exactly one empty row between the installation title and bar", asy
 
     expect(barRow - titleRow).toBe(2)
     expect(lines[titleRow + 1]?.trim()).toBe("")
+    expect(view.captureCharFrame()).toContain("19.9 MB of 20.7 MB")
   } finally {
     await act(async () => view.renderer.destroy())
   }

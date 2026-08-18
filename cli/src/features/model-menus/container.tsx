@@ -14,7 +14,7 @@ import {
   deriveHardwareMemoryView,
   deriveCurrentLocalModel,
   formatLocalModelDisplayName,
-  formatDecimalGigabytes,
+  formatMemorySize,
   formatModelDisplayName,
   modelSlotResidentAllocation,
   getDisplayWidth,
@@ -811,22 +811,22 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
         ? entry.model.servingState.assessment
         : undefined
       if (assessment?._tag === "DoesNotFit") {
-        return formatDecimalGigabytes(assessment.totalRequiredBytes)
+        return formatMemorySize(assessment.totalRequiredBytes)
       }
       return Option.match(memoryFor(entry), {
         onNone: () => "—",
-        onSome: ({ totalRequiredBytes }) => formatDecimalGigabytes(totalRequiredBytes),
+        onSome: ({ totalRequiredBytes }) => formatMemorySize(totalRequiredBytes),
       })
     }
     const assessment = entry.model.servingState._tag === "Assessed"
       ? entry.model.servingState.assessment
       : undefined
     if (assessment?._tag === "DoesNotFit") {
-      return formatDecimalGigabytes(assessment.totalRequiredBytes)
+      return formatMemorySize(assessment.totalRequiredBytes)
     }
     return Option.match(memoryFor(entry), {
       onNone: () => "—",
-      onSome: ({ totalRequiredBytes }) => formatDecimalGigabytes(totalRequiredBytes),
+      onSome: ({ totalRequiredBytes }) => formatMemorySize(totalRequiredBytes),
     })
   }
   const primarySlot = Option.match(slotsSnapshot, {
@@ -1287,7 +1287,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
         || model.acquisitionState._tag === "Installed"
         ? theme.accent
         : theme.text.metadata
-  const memoryText = memoryBytes === undefined ? "—" : formatDecimalGigabytes(memoryBytes)
+  const memoryText = memoryBytes === undefined ? "—" : formatMemorySize(memoryBytes)
   const speedText = performanceRangeSpeedLabel(model, "t/s")
   const speculativeMethod = localModelSpeculativeMethodLabel(model)
   const speculativeText = Option.getOrElse(speculativeMethod, () => "—")

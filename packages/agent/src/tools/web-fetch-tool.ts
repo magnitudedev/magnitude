@@ -9,7 +9,7 @@ import { defineHarnessTool } from '@magnitudedev/harness'
 import { extractHtml } from '@magnitudedev/dom-extract'
 import { ToolErrorSchema } from './errors'
 
-const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
+const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5 MiB
 const TIMEOUT_MS = 30_000
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
@@ -41,12 +41,12 @@ const fetchPage = (url: string) =>
 
         const contentLength = response.headers.get('content-length')
         if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
-          throw new Error('Response too large (exceeds 5MB limit)')
+          throw new Error('Response too large (exceeds 5 MiB limit)')
         }
 
         const raw = await response.text()
         if (raw.length > MAX_RESPONSE_SIZE) {
-          throw new Error('Response too large (exceeds 5MB limit)')
+          throw new Error('Response too large (exceeds 5 MiB limit)')
         }
 
         const contentType = response.headers.get('content-type') || ''

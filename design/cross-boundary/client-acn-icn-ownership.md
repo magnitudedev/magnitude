@@ -181,7 +181,7 @@ Client-common owns shared client infrastructure:
 - reusable hooks and identity-safe selectors;
 - shared interaction infrastructure; and
 - reusable presentation primitives that are genuinely common across clients and contain no
-  backend policy, such as decimal byte-unit formatting.
+  backend policy, such as memory, storage, and transfer byte-unit formatting.
 
 Client-common imports application contracts through the SDK. It does not redefine ACN or ICN
 domain unions, calculate backend policy, or become a second application backend in the client

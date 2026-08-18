@@ -1,4 +1,4 @@
-import { formatDecimalGigabytes, type HardwareMemoryDomainView } from '@magnitudedev/client-common'
+import { formatMemorySize, type HardwareMemoryDomainView } from '@magnitudedev/client-common'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
 import { StackedBar } from './stacked-bar'
@@ -43,8 +43,8 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
       <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{domain.label}</text>
       <text style={{ fg: theme.text.body }}>
         {domain.usedBytes === null
-          ? `${formatDecimalGigabytes(domain.totalBytes)} total`
-          : `${formatDecimalGigabytes(domain.usedBytes)} / ${formatDecimalGigabytes(domain.totalBytes)} used`}
+          ? `${formatMemorySize(domain.totalBytes)} total`
+          : `${formatMemorySize(domain.usedBytes)} / ${formatMemorySize(domain.totalBytes)} used`}
       </text>
       {barSegments.length > 0 && (
         <StackedBar
@@ -56,10 +56,10 @@ export const HardwareMemoryDomain = ({ domain, width = 48 }: HardwareMemoryDomai
       )}
       {complete ? (
         <box style={{ flexDirection: 'column' }}>
-          <text style={{ fg: theme.text.body }}><span fg={theme.text.body}>■</span>{` Weights       ${formatDecimalGigabytes(domain.fixedBytes)}`}</text>
-          <text style={{ fg: theme.text.body }}><span fg={theme.accent}>■</span>{` KV cache      ${formatDecimalGigabytes(domain.kvCacheBytes)}`}</text>
-          <text style={{ fg: theme.text.body }}><span fg={theme.status.warning}>■</span>{` System & apps ${formatDecimalGigabytes(domain.systemAndAppsBytes)}`}</text>
-          <text style={{ fg: theme.text.body }}><span fg={theme.border.standard}>□</span>{` Free          ${formatDecimalGigabytes(domain.freeBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.text.body}>■</span>{` Weights       ${formatMemorySize(domain.fixedBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.accent}>■</span>{` KV cache      ${formatMemorySize(domain.kvCacheBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.status.warning}>■</span>{` System & apps ${formatMemorySize(domain.systemAndAppsBytes)}`}</text>
+          <text style={{ fg: theme.text.body }}><span fg={theme.border.standard}>□</span>{` Free          ${formatMemorySize(domain.freeBytes)}`}</text>
         </box>
       ) : domain.notice ? (
         <text style={{ fg: theme.text.supporting }}><span attributes={TextAttributes.DIM}>{domain.notice}</span></text>

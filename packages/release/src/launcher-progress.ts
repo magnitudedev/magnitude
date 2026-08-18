@@ -15,12 +15,13 @@ export interface LauncherInstallationProgress {
   readonly failed: Effect.Effect<void>
 }
 
-const MEBIBYTE = 1024 ** 2
+const DECIMAL_MEGABYTE = 1_000_000
+const DECIMAL_KILOBYTE = 1_000
 
 const formatBytes = (bytes: number): string =>
-  bytes < MEBIBYTE
-    ? `${Math.round(bytes / 1024)} KiB`
-    : `${(bytes / MEBIBYTE).toFixed(1)} MiB`
+  bytes < DECIMAL_MEGABYTE
+    ? `${Math.round(bytes / DECIMAL_KILOBYTE)} KB`
+    : `${(bytes / DECIMAL_MEGABYTE).toFixed(1)} MB`
 
 const eventProgress = (
   event: ArtifactInstallationEvent,
