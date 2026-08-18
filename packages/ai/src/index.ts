@@ -1,6 +1,8 @@
 // Namespaces
 export { Model } from "./model/define"
-export { NativeChatCompletions } from "./protocol/native-chat-completions"
+export {
+  NativeChatCompletions,
+} from "./protocol/native-chat-completions"
 export { Auth, type AuthApplicator } from "./auth/auth"
 export { Option } from "./options/option"
 
@@ -123,12 +125,34 @@ export type {
 } from "./errors/failure"
 
 // Wire types
-export { ChatCompletionsStreamChunk } from "./wire/chat-completions"
-export type { ChatCompletionsRequest, ChatToolChoice, ChatNamedFunctionToolChoice, ChatAllowedToolsToolChoice } from "./wire/chat-completions"
+export {
+  ChatChunkDeltaSchema,
+  ChatCompletionsStreamChunk,
+  chatCompletionsStreamChunkFields,
+} from "./wire/chat-completions"
+export type {
+  ChatCompletionsRequest,
+  ChatMessage,
+  ChatTool,
+  ChatToolCall,
+  ChatToolChoice,
+  ChatNamedFunctionToolChoice,
+  ChatAllowedToolsToolChoice,
+} from "./wire/chat-completions"
 
 // Codec
 export type { Codec } from "./codec/codec"
 export { nativeChatCompletionsCodec } from "./codec/native-chat-completions/index"
+export {
+  normalizeChatCompletionsChunk,
+  type NormalizedChatCompletionsStreamChunk,
+} from "./codec/native-chat-completions/chunk"
+export {
+  decodeChatCompletionsJson,
+  decodeChatCompletionsPayload,
+  standardChatCompletionChunkDecoder,
+  type ChatCompletionChunkDecoder,
+} from "./codec/native-chat-completions/chunk-decoder"
 export { makeNativeToolParametersJsonSchema } from "./codec/native-chat-completions/tool-json-schema"
 
 // Trace

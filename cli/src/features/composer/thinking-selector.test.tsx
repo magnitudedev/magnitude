@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { ReasoningEffortSchema } from '@magnitudedev/sdk'
+import { defaultCliThemes } from '../../utils/theme'
 import {
   moveThinkingPreview,
   thinkingSelectorWidth,
@@ -8,7 +9,7 @@ import {
 } from './thinking-selector'
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => ({ foreground: '#ffffff', muted: '#888888' }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 vi.mock('@opentui/react', () => ({
@@ -30,7 +31,7 @@ describe('thinking selector', () => {
     expect(moveThinkingPreview(0, -1, 4)).toBe(3)
   })
 
-  it('renders the preview in violet with an underline and no primary blue', () => {
+  it('renders the preview with the established violet highlight and an underline', () => {
     const html = renderToStaticMarkup(
       <ThinkingSelector
         options={options}
@@ -40,8 +41,7 @@ describe('thinking selector', () => {
       />,
     )
 
-    expect(html).toContain('fg:#ddd6fe')
+    expect(html).toContain(`fg:${defaultCliThemes.dark.highlightAccent}`)
     expect(html).toMatch(/attributes="8"[^>]*>Medium/)
-    expect(html).not.toContain('#0ea5e9')
   })
 })

@@ -81,7 +81,7 @@ The ICN package owns:
 
 The package owns exact hardware, recommendable-catalog, installed-package, and download observation
 plus the local provider adaptation because those capabilities compose the one generated ICN client.
-It does not own recommendation policy, durable offerings, user selection, ACN RPC state, cloud
+It does not own recommendation policy, user selection, ACN RPC state, cloud
 provider routing, or client presentation. It does not independently inspect hardware or GGUF files
 in Bun; it obtains those facts through generated ICN operations. It contains no fallback
 implementation of an ICN operation and no hand-written HTTP client, SSE parser, wire schema, or
@@ -182,10 +182,10 @@ External caches or directories participate only when they are supplied explicitl
 import/source roots. ACN supplies no such roots for the product-managed ICN.
 
 Per-request context length belongs to an explicit model serving configuration supplied to
-assessment and load. ACN persists that configuration inside a provider offering; ICN owns
-its identity and ephemeral residency. Serving configuration is not an installation-manifest, cache,
-or process-launch field. Native sequence capacity, physical context allocation, batching, GPU
-placement, KV policy, projector, draft, and MTP selection are ICN-owned plan resolution. This
+assessment and load. ACN resolves that configuration from catalog or standard-profile authorities
+and projects its provider offering without persisting either. ICN owns configuration identity and
+ephemeral residency. Native sequence capacity, physical context allocation, batching, GPU
+placement, KV policy, projector, and speculative-decoding selection are ICN-owned plan resolution. This
 separation lets one ICN live for one ACN lifetime while models and configurations change
 independently.
 
@@ -346,7 +346,7 @@ not an ICN resource.
 Model load accepts one exact model serving configuration plus the branded model-instance identity
 created by ACN before admission. The configuration contains the target
 and per-request context length; ICN owns its stable identity and ACN passes it unchanged from the
-selected provider offering. After proving the exact one-sequence baseline, load selects the largest
+current configuration resolved through the provider offering. After proving the exact one-sequence baseline, load selects the largest
 native sequence capacity from one through four whose full-context allocation fits stable and live
 memory policy. That resolved capacity belongs to residency execution evidence and may differ across
 cold loads of the same configuration.
@@ -419,14 +419,21 @@ discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
 
 ## Failure semantics
 
-Lifecycle errors are typed by phase and preserve a safe cause plus bounded diagnostic evidence:
+The lifecycle error channel is a union of existing upstream typed errors and semantic ICN tagged
+errors. Filesystem, command, schema, generated-client, and release-installation errors propagate
+unchanged. The lifecycle creates a new tagged error only when it discovers a new domain fact, such
+as an absent or non-executable binary, incompatible identity, bounded timeout, non-loopback origin,
+premature exit, or unexpected exit.
 
-- resolution and executable verification;
-- spawn and startup protocol;
-- readiness timeout or incompatible identity;
-- unexpected exit;
-- graceful-shutdown timeout, forced termination, or reap failure; and
-- startup-probe protocol failures mapped from the generated client with their safe cause retained.
+Each lifecycle tag names one failure variant and carries only the facts belonging to that variant.
+Human messages are derived from those facts. There is no generic phase/reason/message/diagnostic
+envelope and no wrapper whose primary payload is another error. Bounded native output is owned only
+by variants for which process output is relevant, including startup timeout and process exit.
+
+ACN observes ordinary startup failure with the typed Effect error channel, logs that error value
+directly, commits `Stopping(startup-failed)`, and lets the same error continue unchanged. It does not
+convert typed errors to `Cause` or render them through `Cause.pretty`. Defects remain defects and
+propagate to the process runtime; scoped finalizers, rather than error taps, guarantee cleanup.
 
 Generated client failures distinguish invalid local input, transport failure, a declared remote
 failure, undeclared or invalid response, incomplete stream, and cancellation. Declared ICN error

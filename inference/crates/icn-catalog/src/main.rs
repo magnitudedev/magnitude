@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use icn_contracts::{EffectiveTemplateInputs, TemplateAssessment, TemplateAssessor};
 use icn_engine::NativeBackend;
 use icn_models::{
-    InventoryConfig, ModelManager, ResolvingRecommendableCatalog, advance_model_catalog_lock,
+    InventoryConfig, ManagedModelStore, ResolvingRecommendableCatalog, advance_model_catalog_lock,
     load_release_catalog,
 };
 
@@ -100,14 +100,14 @@ async fn open_catalog_models(
     model_store: PathBuf,
     cache_root: PathBuf,
     hf_caches: Vec<PathBuf>,
-) -> anyhow::Result<Arc<ModelManager>> {
+) -> anyhow::Result<Arc<ManagedModelStore>> {
     icn_engine::disable_native_diagnostics();
     let backend = NativeBackend::initialize().context("failed to initialize native backend")?;
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog-build inventory configuration")?;
     config.hf_cache_dirs.extend(hf_caches);
     Ok(Arc::new(
-        ModelManager::open_with_template_assessor(
+        ManagedModelStore::open_with_template_assessor(
             config,
             Some(Arc::new(NativeTemplateAssessor::new(backend))),
         )
@@ -117,13 +117,9 @@ async fn open_catalog_models(
 
 fn ensure_catalog_resolved(generated: &icn_models::GeneratedReleaseCatalog) -> anyhow::Result<()> {
     for diagnostic in &generated.catalog.diagnostics {
-        let entry = diagnostic
-            .entry_id
-            .as_ref()
-            .map_or("unknown", |entry| entry.0.as_str());
         eprintln!(
-            "Catalog resolution failed for {entry}: {}",
-            diagnostic.failure.message
+            "Catalog resolution failed for {} variant {}: {}",
+            diagnostic.model_id.0, diagnostic.variant_id.0, diagnostic.failure.message
         );
     }
     anyhow::ensure!(

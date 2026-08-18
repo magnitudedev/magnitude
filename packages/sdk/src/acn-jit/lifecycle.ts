@@ -13,9 +13,8 @@ import type { AcnEnsuranceError } from "./errors";
 
 export const AcnStartingPhaseSchema = Schema.Union(
   Schema.Literal(
-    "Discovering",
+    "PreparingAcn",
     "WaitingForOwner",
-    "LaunchingAcn",
     "ResolvingLocalInference",
     "LaunchingLocalInference"
   ),
@@ -268,7 +267,7 @@ const renderState = (
     : Effect.succeed(internal);
 
 const failureStage = (state: InternalState): AcnFailureStage => {
-  if (state._tag === "Starting" && state.phase === "LaunchingAcn") {
+  if (state._tag === "Starting" && state.phase === "PreparingAcn") {
     return "LaunchDaemon";
   }
   if (state._tag === "Installing") {

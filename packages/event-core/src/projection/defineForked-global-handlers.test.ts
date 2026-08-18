@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { Effect, Schema } from 'effect'
+import { Chunk, Effect, Schema, Stream } from 'effect'
 import { make as makeEventEngine } from '../event-engine'
 import { define } from './define'
 import { defineForked, type ForkableEvent, type ForkedState } from './defineForked'
@@ -13,6 +13,39 @@ const ValueStateSchema = Schema.Struct({ value: Schema.Number })
 const CountStateSchema = Schema.Struct({ count: Schema.Number })
 
 describe('defineForked global handlers + cross-fork read', () => {
+  test('changesForFork emits the current fork and only its subsequent changes', async () => {
+    const Projection = defineForked<TestEvent & ForkableEvent>()({
+      name: 'ForkChanges',
+      forkState: ValueStateSchema,
+      initialFork: { value: 0 },
+      eventHandlers: {
+        seed: ({ event }) => ({ value: event.value }),
+      },
+    })
+    const TestEventEngine = makeEventEngine<TestEvent & ForkableEvent>()({
+      name: 'ForkChangesAgent',
+      schemaVersion: 'test',
+      projections: [Projection],
+      workers: [],
+    })
+    const client = await TestEventEngine.createClient()
+    try {
+      const observed = client.runEffect(Effect.gen(function* () {
+        const projection = yield* Projection.Tag
+        return yield* projection.changesForFork('a').pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.map(Chunk.toReadonlyArray),
+        )
+      }))
+      await client.send({ type: 'seed', forkId: 'b', value: 1 })
+      await client.send({ type: 'seed', forkId: 'a', value: 2 })
+      expect(await observed).toEqual([{ value: 0 }, { value: 2 }])
+    } finally {
+      await client.dispose()
+    }
+  })
+
   test('global event handler receives full forks map', async () => {
     const seenSizes: number[] = []
 

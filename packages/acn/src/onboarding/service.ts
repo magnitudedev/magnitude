@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Schema, Stream } from "effect"
 import {
   OnboardingError,
   OnboardingMirror,
@@ -6,14 +6,14 @@ import {
   type OnboardingState,
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
-import type { ConfigStorageShape } from "@magnitudedev/storage"
+import type { StateHandle } from "@magnitudedev/storage"
 import { makeMirroredState, MirroredStateChanges } from "../mirrored-state"
 
 export interface OnboardingApi {
   readonly state: Effect.Effect<OnboardingState, OnboardingError>
   readonly snapshot: Effect.Effect<MirroredSnapshot<OnboardingState>>
   readonly changes: Stream.Stream<MirroredSnapshot<OnboardingState>>
-  readonly update: (completed: boolean) => Effect.Effect<void, OnboardingError>
+  readonly complete: Effect.Effect<void, OnboardingError>
 }
 
 export class Onboarding extends Context.Tag("Onboarding")<Onboarding, OnboardingApi>() {}
@@ -24,28 +24,20 @@ const onboardingError = (operation: string, cause: unknown): OnboardingError =>
     message: cause instanceof Error ? cause.message : String(cause),
   })
 
-type OnboardingStorage = Pick<
-  ConfigStorageShape,
-  "getOnboardingConfig" | "updateOnboardingState"
->
+type OnboardingStorage = Pick<StateHandle<OnboardingState, unknown>, "get" | "update">
 
 type OnboardingPersistenceApi = Omit<OnboardingApi, "snapshot" | "changes">
 
 export const makeOnboarding = (storage: OnboardingStorage): OnboardingPersistenceApi => {
-  const state = storage.getOnboardingConfig().pipe(
-    Effect.map((config): OnboardingState => ({
-      completed: Option.match(config, {
-        onNone: () => false,
-        onSome: (value) => value.completed,
-      }),
-    })),
+  const state = storage.get.pipe(
     Effect.mapError((cause) => onboardingError("read onboarding state", cause)),
   )
 
   return {
     state,
-    update: (completed) => storage.updateOnboardingState(completed).pipe(
-      Effect.mapError((cause) => onboardingError("update onboarding state", cause)),
+    complete: storage.update((current) => current.completed ? current : { completed: true }).pipe(
+      Effect.asVoid,
+      Effect.mapError((cause) => onboardingError("complete onboarding", cause)),
     ),
   }
 }
@@ -58,7 +50,7 @@ export const OnboardingLive: Layer.Layer<
   Onboarding,
   Effect.gen(function* () {
     const storage = yield* MagnitudeStorage
-    const persisted = makeOnboarding(storage.config)
+    const persisted = makeOnboarding(storage.onboarding)
     const initial = yield* persisted.state.pipe(Effect.orDie)
     const mirror = yield* makeMirroredState(OnboardingMirror, initial)
     const refresh = persisted.state.pipe(
@@ -72,7 +64,7 @@ export const OnboardingLive: Layer.Layer<
       state: mirror.get.pipe(Effect.map(({ state }) => state)),
       snapshot: mirror.get,
       changes: mirror.changes,
-      update: (completed) => persisted.update(completed).pipe(Effect.zipRight(refresh)),
+      complete: persisted.complete.pipe(Effect.zipRight(refresh)),
     })
   }),
 )

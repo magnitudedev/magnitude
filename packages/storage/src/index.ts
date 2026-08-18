@@ -3,6 +3,7 @@ export * from './services'
 export * from './storage'
 
 export * from './io'
+export * from './state'
 
 export * from './types'
 

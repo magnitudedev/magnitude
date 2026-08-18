@@ -3,6 +3,7 @@ import { KeyEvent } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { Option } from "effect"
 import { expect, test, vi } from "vitest"
+import { defaultCliThemes } from "../../utils/theme"
 
 const keyboard = vi.hoisted(
   (): { handler: ((key: KeyEvent) => void) | undefined } => ({
@@ -18,21 +19,14 @@ vi.mock("@opentui/react", async (importOriginal) => ({
 }))
 
 vi.mock("../../hooks/use-theme", () => ({
-  useTheme: () => ({
-    primary: "blue",
-    foreground: "white",
-    muted: "gray",
-    error: "red",
-    background: "black",
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { AcnBootstrapScreen } = await import("./acn-bootstrap")
 
 test.each([
-  ["Discovering", "Looking for Magnitude"],
+  ["PreparingAcn", "Preparing background server"],
   ["WaitingForOwner", "Waiting for previous Magnitude process"],
-  ["LaunchingAcn", "Starting Magnitude"],
   ["ResolvingLocalInference", "Preparing local inference"],
   ["LaunchingLocalInference", "Starting local inference"],
 ] as const)("renders the %s startup phase", async (phase, label) => {
@@ -150,6 +144,7 @@ test("renders exactly one empty row between the installation title and bar", asy
 
     expect(barRow - titleRow).toBe(2)
     expect(lines[titleRow + 1]?.trim()).toBe("")
+    expect(view.captureCharFrame()).toContain("19.9 MB of 20.7 MB")
   } finally {
     await act(async () => view.renderer.destroy())
   }
@@ -159,7 +154,7 @@ test("quits on Ctrl-C during startup without consuming unrelated keys", async ()
   const onQuit = vi.fn()
   const view = await testRender(
     <AcnBootstrapScreen
-      state={{ _tag: "Starting", phase: "LaunchingAcn" }}
+      state={{ _tag: "Starting", phase: "PreparingAcn" }}
       onRetry={() => undefined}
       onQuit={onQuit}
     />,

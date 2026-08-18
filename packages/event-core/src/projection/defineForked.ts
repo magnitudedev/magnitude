@@ -13,7 +13,7 @@
  * When reading another forked projection, automatically resolves to the same forkId.
  */
 
-import { Effect, SubscriptionRef, Context, Layer, PubSub, Schema } from 'effect'
+import { Effect, SubscriptionRef, Context, Layer, PubSub, Schema, Stream } from 'effect'
 import type { ParseResult } from 'effect'
 import type { EnforceJsonSafe } from '@magnitudedev/utils/schema'
 import { withProjectionBusReadLock, ProjectionBusTag, type ProjectionBusService, type AddressedStateInfo } from '../core/projection-bus'
@@ -82,6 +82,10 @@ export interface ForkedProjectionInstance<
 > {
   /** Get state for a specific fork */
   readonly getFork: (forkId: string | null) => Effect.Effect<Schema.Schema.Type<TForkStateSchema>>
+  /** Observe the current state for a specific fork and every subsequent change. */
+  readonly changesForFork: (
+    forkId: string | null
+  ) => Stream.Stream<Schema.Schema.Type<TForkStateSchema>>
   /** Get all forks */
   readonly getAllForks: () => Effect.Effect<Map<string | null, Schema.Schema.Type<TForkStateSchema>>>
   /** Addressed collections scoped by fork. */
@@ -777,14 +781,20 @@ export function defineForked<TEvent extends ForkableEvent>() {
           } satisfies ProjectionRestorePlan
         })
 
+        const getFork = (forkId: string | null) => withProjectionBusReadLock(
+          bus,
+          Effect.gen(function* () {
+            const state = yield* SubscriptionRef.get(stateRef)
+            return state.forks.get(forkId) ?? config.initialFork
+          }),
+        )
+
         // Return instance with fork-aware accessors
         const instance: ForkedProjectionInstance<TForkStateSchema, TAddressed> = {
-          getFork: (forkId) => withProjectionBusReadLock(
-            bus,
-            Effect.gen(function* () {
-              const state = yield* SubscriptionRef.get(stateRef)
-              return state.forks.get(forkId) ?? config.initialFork
-            }),
+          getFork,
+          changesForFork: (forkId) => stateRef.changes.pipe(
+            Stream.mapEffect(() => getFork(forkId)),
+            Stream.changes,
           ),
           getAllForks: () => withProjectionBusReadLock(
             bus,

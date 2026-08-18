@@ -52,12 +52,12 @@ export function useSettingsState(): UseSettingsStateResult {
   const client = useAgentClient()
 
   const queryAtom = useMemo(
-    () => client.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
+    () => client.rpc.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
     [client],
   )
   const result = useAtomValue(queryAtom)
 
-  const updateProviderAuthAtom = useMemo(() => client.mutation("UpdateProviderAuth"), [client])
+  const updateProviderAuthAtom = useMemo(() => client.rpc.mutation("UpdateProviderAuth"), [client])
   const updateProviderAuthResult = useAtomValue(updateProviderAuthAtom)
   const updateProviderAuth = useAtomSet(updateProviderAuthAtom)
 

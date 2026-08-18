@@ -103,11 +103,11 @@ function TabBar({ value, onChange }: TabBarProps) {
       {PERIODS.map((p, idx) => {
         const isActive = p.id === value
         const isHovered = hovered === p.id
-        const fg = isActive ? theme.primary : isHovered ? theme.foreground : theme.muted
+        const fg = isActive ? theme.accent : isHovered ? theme.text.body : theme.text.metadata
         const attrs = isActive ? TextAttributes.BOLD | TextAttributes.UNDERLINE : undefined
         return (
           <box key={p.id} style={{ flexDirection: 'row' }}>
-            {idx > 0 && <text style={{ fg: theme.border }}>{' · '}</text>}
+            {idx > 0 && <text style={{ fg: theme.border.standard }}>{' · '}</text>}
             <Button
               onClick={() => onChange(p.id)}
               onMouseOver={() => setHovered(p.id)}
@@ -118,8 +118,8 @@ function TabBar({ value, onChange }: TabBarProps) {
           </box>
         )
       })}
-      <text style={{ fg: theme.muted }}>{'   '}</text>
-      <text style={{ fg: theme.border }} attributes={TextAttributes.DIM}>
+      <text style={{ fg: theme.text.metadata }}>{'   '}</text>
+      <text style={{ fg: theme.border.standard }} attributes={TextAttributes.DIM}>
         Tab / Shift+Tab to switch
       </text>
     </box>
@@ -137,12 +137,12 @@ function DailyUsageRow({ date, inputTokens, outputTokens, topModel }: DailyUsage
   const theme = useTheme()
   return (
     <box style={{ flexDirection: 'row' }}>
-      <text style={{ fg: theme.muted }}>{formatDate(date)}{'  '}</text>
-      <text style={{ fg: theme.foreground }}>
+      <text style={{ fg: theme.text.metadata }}>{formatDate(date)}{'  '}</text>
+      <text style={{ fg: theme.text.body }}>
         {formatTokens(inputTokens)} in / {formatTokens(outputTokens)} out
       </text>
       {topModel && (
-        <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+        <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>
           {`  · ${topModel}`}
         </text>
       )}
@@ -162,19 +162,19 @@ function UsageLimitBar({ label, limitCents, usedCents, remainingMs }: UsageLimit
   const percentLeft = usagePercentLeft(usedCents, limitCents)
   const filled = Math.round(percentLeft / 100 * USAGE_LIMIT_BAR_WIDTH)
   const empty = USAGE_LIMIT_BAR_WIDTH - filled
-  const activeColor = percentLeft === 0 ? theme.error : theme.primary
+  const activeColor = percentLeft === 0 ? theme.status.failure : theme.accent
 
   return (
     <box style={{ flexDirection: 'row' }}>
-      <text style={{ fg: theme.foreground }}>{label.padEnd(9)}</text>
+      <text style={{ fg: theme.text.body }}>{label.padEnd(9)}</text>
       <text>
         <span fg={activeColor}>{'▇'.repeat(filled)}</span>
-        <span fg={theme.border}>{'·'.repeat(empty)}</span>
+        <span fg={theme.border.standard}>{'·'.repeat(empty)}</span>
       </text>
-      <text style={{ fg: percentLeft === 0 ? theme.error : theme.foreground }}>
+      <text style={{ fg: percentLeft === 0 ? theme.status.failure : theme.text.body }}>
         {`  ${String(percentLeft).padStart(3)}% left`}
       </text>
-      <text style={{ fg: theme.muted }}>
+      <text style={{ fg: theme.text.metadata }}>
         {` · resets in ${formatReset(remainingMs)}`}
       </text>
     </box>
@@ -186,7 +186,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   const client = useAgentClient()
   const settings = useSettingsState()
   const authSource = useAtomValue(authSourceAtom)
-  const runtimeResult = useAtomValue(client.runtime)
+  const runtimeResult = useAtomValue(client.rpc.runtime)
   const [period, setPeriod] = useState<UsagePeriod>('7d')
 
   const tz = useMemo(getLocalTimeZone, [])
@@ -195,7 +195,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
 
   const usageAtom = useMemo(
     () => isVisible && runtimeReady && cloudConfigured
-      ? client.query('GetCloudUsage', { period, days: DAILY_DAYS, tz })
+      ? client.rpc.query('GetCloudUsage', { period, days: DAILY_DAYS, tz })
       : Atom.make<Result.Result<CloudUsageResponse, never>>(() => Result.initial()),
     [client, cloudConfigured, isVisible, period, runtimeReady, tz],
   )
@@ -232,30 +232,30 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
     <box style={{ flexDirection: 'column', height: '100%' }}>
       {/* Header */}
       <box style={{ flexDirection: 'row', paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.primary, flexGrow: 1 }}>
+        <text style={{ fg: theme.accent, flexGrow: 1 }}>
           <span attributes={TextAttributes.BOLD}>Usage</span>
         </text>
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.metadata }}>
           <span attributes={TextAttributes.DIM}>Esc to close</span>
         </text>
       </box>
 
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
+        <text style={{ fg: theme.border.standard }}>{'─'.repeat(60)}</text>
       </box>
 
       {/* Body */}
       <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column', flexGrow: 1 }}>
         {!cloudConfigured && (
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.metadata }}>
             Connect cloud models in /settings to view cloud usage.
           </text>
         )}
         {cloudConfigured && error && (
-          <text style={{ fg: theme.error }}>Failed to load usage: {error}</text>
+          <text style={{ fg: theme.status.failure }}>Failed to load usage: {error}</text>
         )}
         {cloudConfigured && !error && !data && (
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.metadata }}>
             <span attributes={TextAttributes.DIM}>Loading{'.'.repeat((loadingStep % 3) + 1)}</span>
           </text>
         )}
@@ -294,20 +294,20 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
     <box style={{ flexDirection: 'column' }}>
       {/* Cloud subscription and current limit windows */}
       <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-        <text style={{ fg: theme.foreground }}>
+        <text style={{ fg: theme.text.body }}>
           <span attributes={TextAttributes.BOLD}>Cloud plan: </span>
-          <span fg={subscription.status === 'active' ? theme.primary : theme.muted}>
+          <span fg={subscription.status === 'active' ? theme.accent : theme.text.metadata}>
             {subscription.status === 'active' ? subscription.plan.label : 'Not subscribed'}
           </span>
         </text>
         {subscription.status !== 'active' && (
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.metadata }}>
             Magnitude Pro is required to use cloud models.
           </text>
         )}
         {subscription.status === 'active' && (
           <box style={{ flexDirection: 'column', paddingTop: 1 }}>
-            <text style={{ fg: theme.foreground }}>
+            <text style={{ fg: theme.text.body }}>
               <span attributes={TextAttributes.BOLD}>Usage limits</span>
             </text>
             {usageLimitRows.map(({ key, label }) => {
@@ -327,7 +327,7 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
       </box>
 
       <box style={{ paddingBottom: 1 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(60)}</text>
+        <text style={{ fg: theme.border.standard }}>{'─'.repeat(60)}</text>
       </box>
 
       {/* Period tabs */}
@@ -337,38 +337,38 @@ function UsageBody({ data, period, onPeriodChange, loading }: UsageBodyProps) {
 
       {/* Period summary */}
       <box style={{ flexDirection: 'row', paddingBottom: 1 }}>
-        <text style={{ fg: loading ? theme.muted : theme.foreground }}>
+        <text style={{ fg: loading ? theme.text.metadata : theme.text.body }}>
           {formatUsageSummary(usage.totals)}
         </text>
         {loading && (
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{'  (loading…)'}</text>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>{'  (loading…)'}</text>
         )}
       </box>
 
       {/* Top models */}
       <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-        <text style={{ fg: theme.foreground }}>
+        <text style={{ fg: theme.text.body }}>
           <span attributes={TextAttributes.BOLD}>Top models</span>
         </text>
         {topModels.length === 0 && (
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>No usage in this period</text>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>No usage in this period</text>
         )}
         {topModels.map(m => (
           <box key={m.model} style={{ flexDirection: 'row' }}>
-            <text style={{ fg: theme.foreground }}>{m.model.padEnd(28).slice(0, 28)}</text>
-            <text style={{ fg: theme.muted }}>{'  '}</text>
-            <text style={{ fg: theme.foreground }}>{formatModelUsage(m)}</text>
+            <text style={{ fg: theme.text.body }}>{m.model.padEnd(28).slice(0, 28)}</text>
+            <text style={{ fg: theme.text.metadata }}>{'  '}</text>
+            <text style={{ fg: theme.text.body }}>{formatModelUsage(m)}</text>
           </box>
         ))}
       </box>
 
       {/* Daily chart */}
       <box style={{ flexDirection: 'column' }}>
-        <text style={{ fg: theme.foreground }}>
+        <text style={{ fg: theme.text.body }}>
           <span attributes={TextAttributes.BOLD}>Daily tokens (last {DAILY_DAYS} days)</span>
         </text>
         {usage.dailyTokens.length === 0 && (
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>No daily activity</text>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.DIM}>No daily activity</text>
         )}
         {usage.dailyTokens.map(d => (
           <DailyUsageRow

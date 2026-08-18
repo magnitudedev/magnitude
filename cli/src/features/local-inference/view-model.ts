@@ -1,165 +1,58 @@
 import { Option } from "effect"
 import {
-  ProviderModelCatalogLifecycle,
-  ProviderIdSchema,
+  installedLocalModels,
+  localModelConfigurationId,
+  localModelProviderModelId,
+  formatLocalModelDisplayName,
+  localModelBundleKey,
+  localModelOptions,
+  localModelSpeculativeMethodLabel,
+  formatStorageSize,
+  formatMemorySize,
+  type LocalModelOption,
+} from "@magnitudedev/client-common"
+export {
+  installedLocalModels,
+  findLocalModelByConfigurationId,
+  localModelConfigurationId,
+  localModelProviderModelId,
+  localModelBundleKey,
+  modelDownloadFailureMessage,
+} from "@magnitudedev/client-common"
+import {
   type LocalInferenceHardware,
   type LocalInferenceMemoryDomainId,
   type LocalModel,
-  type LocalModelCatalogCandidate,
   type LocalModelsState,
-  type LocalModelRecommendation,
-  type ModelServingConfigurationId,
   type LocalModelRecommendationProgressStep,
+  type ModelAssessmentId,
+  type ModelServingConfigurationId,
   type ModelSlotsState,
-  type ProviderModelCatalogState,
   type ProviderModelId,
   type ReasoningEffort,
+  servableModelBundlePackages,
 } from "@magnitudedev/sdk"
 
-const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
+export type LocalInferenceSelection = LocalModelOption
 
-type LocalInferenceSelectionBase = {
-  readonly id: string
-  readonly model: LocalModel
-  readonly contextLength: number
-  readonly providerModelId: Option.Option<ProviderModelId>
-  readonly reasoningEffort: Option.Option<ReasoningEffort>
+const modelPackages = (model: LocalModel) => servableModelBundlePackages(model.bundle)
+
+export const localModelMaximumContextLength = (model: LocalModel): Option.Option<number> => {
+  const known = modelPackages(model).flatMap(({ properties }) =>
+    Option.match(properties.maximumContextLength, {
+      onNone: () => [],
+      onSome: (maximum) => [maximum],
+    }))
+  return known.length === 0 ? Option.none() : Option.some(Math.min(...known))
 }
 
-export type LocalInferenceSelection = LocalInferenceSelectionBase & (
-  | {
-      readonly kind: "running" | "stored"
-      readonly configurationId: ModelServingConfigurationId
-      readonly recommendation: { readonly _tag: "None" }
-    }
-  | {
-      readonly kind: "recommendation"
-      readonly recommendation:
-        | { readonly _tag: "None" }
-        | { readonly _tag: "Recommended"; readonly value: LocalModelRecommendation }
-    }
-)
-
-const selectionKindOrder: Record<LocalInferenceSelection["kind"], number> = {
-  running: 0,
-  stored: 1,
-  recommendation: 2,
-}
-
-const recommendationIntentOrder = {
-  balanced: 0,
-  best_quality: 1,
-  fastest: 2,
-  lightweight: 3,
-} as const
-
-const compareSelections = (
-  left: LocalInferenceSelection,
-  right: LocalInferenceSelection,
-): number => selectionKindOrder[left.kind] - selectionKindOrder[right.kind]
-  || (left.kind === "recommendation" && right.kind === "recommendation"
-    ? (left.recommendation._tag === "Recommended"
-      ? recommendationIntentOrder[left.recommendation.value.intent]
-      : 4) - (right.recommendation._tag === "Recommended"
-      ? recommendationIntentOrder[right.recommendation.value.intent]
-      : 4)
-    : 0)
-  || left.model.displayName.localeCompare(right.model.displayName)
+export const localModelDownloadBytes = (model: LocalModel): number =>
+  model.downloadBytes
 
 export const buildLocalInferenceSelections = (
   models: LocalModelsState,
-  catalog: ProviderModelCatalogState,
   slots: ModelSlotsState,
-): readonly LocalInferenceSelection[] => {
-  const running = new Set([slots.slots.primary, slots.slots.secondary].flatMap((slot) =>
-    slot._tag === "ConfiguredLocal"
-      && Option.exists(slot.instance, (instance) => instance.lifecycle._tag === "Ready")
-      ? [slot.selection.providerModelId]
-      : []))
-  const catalogModels = ProviderModelCatalogLifecycle.match(catalog, {
-    Loading: () => [],
-    Ready: ({ models }) => models,
-    Refreshing: ({ models }) => models,
-    Degraded: ({ models }) => models,
-    Unavailable: () => [],
-  })
-  const localProviderIds = new Set(catalogModels
-    .filter(({ providerId, availability }) =>
-      providerId === LOCAL_PROVIDER_ID && availability._tag === "Available")
-    .map(({ providerModelId }) => providerModelId))
-  const installedCandidates = models.recommendations._tag === "Ready"
-    ? models.recommendations.catalog.reduce((selected, candidate) => {
-        if (candidate.download._tag !== "Downloaded"
-          || candidate.availability._tag !== "Available") return selected
-        if (!selected.has(candidate.targetId)) {
-          selected.set(candidate.targetId, candidate)
-        }
-        return selected
-      }, new Map<string, LocalModelCatalogCandidate>())
-    : new Map<string, LocalModelCatalogCandidate>()
-  const installed = models.models.flatMap((model): readonly LocalInferenceSelection[] => {
-    if (model.download._tag !== "Downloaded") return []
-    const candidate = installedCandidates.get(model.targetId)
-    const availableOfferings = model.offerings.filter(({ providerModelId }) =>
-      localProviderIds.has(providerModelId))
-    const offering = availableOfferings.find(({ providerModelId }) => running.has(providerModelId))
-      ?? availableOfferings.find(({ configurationId }) =>
-        configurationId === candidate?.configurationId)
-      ?? (candidate === undefined ? availableOfferings[0] : undefined)
-    if (offering === undefined && candidate === undefined) return []
-    const providerModelId = Option.fromNullable(offering?.providerModelId)
-    const configurationId = offering?.configurationId ?? candidate!.configurationId
-    const providerModel = offering === undefined
-      ? undefined
-      : catalogModels.find(({ providerModelId }) => providerModelId === offering.providerModelId)
-    return [{
-      id: `installed:${model.targetId}`,
-      kind: Option.exists(providerModelId, (id) => running.has(id)) ? "running" : "stored",
-      model,
-      configurationId,
-      recommendation: { _tag: "None" },
-      providerModelId,
-      contextLength: providerModel?.contextWindow
-        ?? candidate?.profile.contextLength
-        ?? model.maximumContextLength,
-      reasoningEffort: providerModel?.capabilities.reasoning.defaultEffort
-        ?? candidate?.capabilities.reasoning.defaultEffort
-        ?? Option.none(),
-    }]
-  })
-  const recommendations = models.recommendations._tag === "Ready"
-    ? models.recommendations.entries.flatMap((recommendation): readonly LocalInferenceSelection[] => {
-        const model = models.models.find(({ targetId }) =>
-          targetId === recommendation.candidate.targetId)
-        if (!model || model.download._tag === "Downloaded") return []
-        return [{
-          id: `recommendation:${recommendation.id}`,
-          kind: "recommendation",
-          model,
-          recommendation: { _tag: "Recommended", value: recommendation },
-          contextLength: recommendation.candidate.profile.contextLength,
-          providerModelId: Option.none(),
-          reasoningEffort: recommendation.candidate.capabilities.reasoning.defaultEffort,
-        }]
-      })
-    : []
-  const representedModelIds = new Set(recommendations.map(({ model }) => model.targetId))
-  const transientDownloads = models.models
-    .filter((model) =>
-      (model.download._tag === "Downloading" || model.download._tag === "Failed")
-      && !representedModelIds.has(model.targetId))
-    .map((model): LocalInferenceSelection => ({
-      id: `download:${model.targetId}`,
-      kind: "recommendation",
-      model,
-      recommendation: { _tag: "None" },
-      contextLength: model.maximumContextLength,
-      providerModelId: Option.fromNullable(model.offerings[0]?.providerModelId),
-      reasoningEffort: Option.none(),
-    }))
-  return [...installed, ...recommendations, ...transientDownloads]
-    .sort(compareSelections)
-}
+): readonly LocalInferenceSelection[] => localModelOptions(models, slots)
 
 export const selectedInferenceIndex = (
   selections: readonly LocalInferenceSelection[],
@@ -172,17 +65,26 @@ export const selectedInferenceIndex = (
   return index >= 0 ? index : 0
 }
 
-export const formatBytes = (bytes: number): string => {
-  const gib = bytes / 1024 ** 3
-  return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
-}
+export const selectionConfigurationId = (
+  selection: LocalInferenceSelection,
+): Option.Option<ModelServingConfigurationId> => localModelConfigurationId(selection.model)
 
-export const formatDownloadBytes = (bytes: number): string => {
-  const gigabytes = bytes / 1_000_000_000
-  return gigabytes >= 1
-    ? `${gigabytes.toFixed(gigabytes >= 10 ? 1 : 2)} GB`
-    : `${(bytes / 1_000_000).toFixed(0)} MB`
-}
+export const selectionProviderModelId = (
+  selection: LocalInferenceSelection,
+): Option.Option<ProviderModelId> => localModelProviderModelId(selection.model)
+
+export const selectionReasoningEffort = (
+  selection: LocalInferenceSelection,
+): Option.Option<ReasoningEffort> => selection.model.servingState._tag === "Assessed"
+  ? selection.model.servingState.capabilities.reasoning.defaultEffort
+  : Option.none()
+
+export const selectionAssessmentId = (
+  selection: LocalInferenceSelection,
+): Option.Option<ModelAssessmentId> => selection.model.servingState._tag === "Assessed"
+  && selection.model.servingState.assessment._tag !== "Incompatible"
+    ? Option.some(selection.model.servingState.assessment.assessmentId)
+    : Option.none()
 
 export const formatContext = (tokens: number): string => tokens < 1_000
   ? String(tokens)
@@ -191,18 +93,23 @@ export const formatContext = (tokens: number): string => tokens < 1_000
     : `${Math.round(tokens / 1_000)}K`
 
 export const performanceRange = (
-  candidate: LocalModelCatalogCandidate,
+  model: LocalModel,
 ): {
   readonly lowerContext: number
   readonly upperContext: number
   readonly lowerTokensPerSecond: number
   readonly upperTokensPerSecond: number
 } => {
-  const lowerContext = Math.min(25_000, candidate.profile.contextLength)
-  const upperContext = Math.min(75_000, candidate.profile.contextLength)
-  const lowerSample = candidate.performance.find(({ contextTokens }) =>
+  if (model.servingState._tag !== "Assessed"
+    || model.servingState.assessment._tag !== "Fits") {
+    throw new Error("Performance requires a fitting assessed local model")
+  }
+  const { assessment } = model.servingState
+  const lowerContext = Math.min(25_000, assessment.profile.contextLength)
+  const upperContext = Math.min(75_000, assessment.profile.contextLength)
+  const lowerSample = assessment.performance.find(({ contextTokens }) =>
     contextTokens === lowerContext)!
-  const upperSample = candidate.performance.find(({ contextTokens }) =>
+  const upperSample = assessment.performance.find(({ contextTokens }) =>
     contextTokens === upperContext)!
   return {
     lowerContext,
@@ -219,10 +126,10 @@ export const performanceRange = (
 }
 
 export const performanceRangeSpeedLabel = (
-  candidate: LocalModelCatalogCandidate,
+  model: LocalModel,
   unit = "tok/s",
 ): string => {
-  const range = performanceRange(candidate)
+  const range = performanceRange(model)
   return Math.round(range.lowerTokensPerSecond) === Math.round(range.upperTokensPerSecond)
     ? `~${Math.round(range.lowerTokensPerSecond)} ${unit}`
     : `~${Math.round(range.lowerTokensPerSecond)}–${Math.round(range.upperTokensPerSecond)} ${unit}`
@@ -320,8 +227,6 @@ export interface LocalHardwareSummaryRow {
 const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 
-const compactBytes = (bytes: number): string => formatBytes(bytes).replace(/\.0+(?= )/, "")
-
 const localHardwareTopology = (hardware: LocalInferenceHardware) => {
   const unified = hardware.memoryDomains.filter((domain) =>
     domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
@@ -362,8 +267,8 @@ export const describeLocalHardwareSummary = (
     `${platform} ${architecture}`,
     `${hardware.logicalCores} ${hardware.logicalCores === 1 ? "core" : "cores"}`,
     unified.length > 0
-      ? `${compactBytes(hardware.totalSystemMemoryBytes)} unified`
-      : `${compactBytes(hardware.totalSystemMemoryBytes)} RAM`,
+      ? `${formatMemorySize(hardware.totalSystemMemoryBytes)} unified`
+      : `${formatMemorySize(hardware.totalSystemMemoryBytes)} RAM`,
     ...unifiedBackends,
     ...(unified.length === 0 && discrete.length === 0 ? ["CPU inference"] : []),
   ]
@@ -374,7 +279,7 @@ export const describeLocalHardwareSummary = (
       const backends = backendsFor(domain.memoryDomainId)
       return {
         name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: [`${compactBytes(domain.totalBytes)} VRAM`, ...backends],
+        details: [`${formatMemorySize(domain.totalBytes)} VRAM`, ...backends],
       }
     }),
   ]
@@ -396,7 +301,7 @@ export const describeLocalHardware = (
       name: systemName,
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
-        `${formatBytes(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
+        `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
       ],
     },
     accelerators: discrete.map((domain) => {
@@ -404,22 +309,40 @@ export const describeLocalHardware = (
       const backends = backendsFor(domain.memoryDomainId)
       return {
         name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: `${formatBytes(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
+        details: `${formatMemorySize(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
       }
     }),
   }
 }
 
-export const selectionTitle = ({ model }: LocalInferenceSelection): string => model.displayName
+export const selectionTitle = ({ model }: LocalInferenceSelection): string =>
+  formatLocalModelDisplayName(model)
 
-export const selectionMetadata = ({ model, contextLength }: LocalInferenceSelection): string =>
-  `${model.quantization} · ${formatDownloadBytes(model.downloadBytes)} · ${formatContext(
-    contextLength,
-  )} ctx`
+export const selectionContextLabel = ({ model }: LocalInferenceSelection): Option.Option<string> => {
+  const configuration = model.servingState._tag === "Resolving"
+    ? Option.none()
+    : model.servingState._tag === "Failed"
+      ? model.servingState.configuration
+      : Option.some(model.servingState.configuration)
+  return Option.match(configuration, {
+    onNone: () => localModelMaximumContextLength(model),
+    onSome: ({ profile }) => Option.some(profile.contextLength),
+  }).pipe(Option.map(formatContext))
+}
 
-export const selectionCapacityWarning = ({ recommendation }: LocalInferenceSelection): string | null =>
-  recommendation._tag === "Recommended"
-    && recommendation.value.candidate.availability._tag === "Unavailable"
-    && recommendation.value.candidate.availability.failure.code === "insufficient_resources"
-    ? recommendation.value.candidate.availability.failure.message
+export const selectionMetadata = (selection: LocalInferenceSelection): string => {
+  const { model } = selection
+  const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
+  return [
+    formatStorageSize(model.downloadBytes),
+    Option.map(selectionContextLabel(selection), (context) => `${context} ctx`).pipe(Option.getOrNull),
+    speculativeMethod,
+  ].filter((value): value is string => value !== null).join(" · ")
+}
+
+export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>
+  model.servingState._tag === "Assessed"
+    && model.servingState.availabilityState._tag === "Unavailable"
+    && model.servingState.availabilityState.failure.code === "insufficient_resources"
+    ? model.servingState.availabilityState.failure.message
     : null

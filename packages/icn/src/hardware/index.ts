@@ -54,7 +54,8 @@ export const makeIcnHardware = (
       const assessmentChanges = observed.changes.pipe(Stream.changesWith((previous, next) =>
         previous.state.native_build === next.state.native_build
         && previous.state.topology_fingerprint === next.state.topology_fingerprint
-        && previous.state.system_memory.total_bytes === next.state.system_memory.total_bytes
+        && previous.state.system_memory.physical_capacity_bytes
+          === next.state.system_memory.physical_capacity_bytes
         && previous.state.system_memory.assess_reserve_bytes
           === next.state.system_memory.assess_reserve_bytes
         && previous.state.enabled_backends.length === next.state.enabled_backends.length

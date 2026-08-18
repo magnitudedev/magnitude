@@ -9,6 +9,6 @@
     "generate": "bun run scripts/generate-version.ts",
     "generate:dev": "bun run scripts/generate-version.ts --dev",
     "test": "bunx --bun vitest run",
-    "typecheck": "bun run scripts/generate-version.ts && tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   }
 }

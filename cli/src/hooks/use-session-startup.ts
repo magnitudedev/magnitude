@@ -56,7 +56,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const sessionCreateOptions = useAtomValue(sessionCreateOptionsAtom)
   const hasReceivedDisplay = useHasReceivedDisplay()
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
-  const runtimeResult = useAtomValue(client.runtime)
+  const runtimeResult = useAtomValue(client.rpc.runtime)
   const sessionTitle = useDisplayState((state) => state.session.title)
   useTerminalTitle(renderer, sessionId, sessionTitle)
 
@@ -64,7 +64,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const latestSessionAtom = useMemo(
     () =>
       sessionStart._tag === 'latest' && Result.isSuccess(runtimeResult)
-        ? client.query('ListSessions', {
+        ? client.rpc.query('ListSessions', {
             cwd: Option.some(process.cwd()),
             query: Option.none(),
             cursor: Option.none(),
@@ -111,7 +111,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const skillsAtom = useMemo(
     () =>
       selectedCwd && Result.isSuccess(runtimeResult)
-        ? client.query('ListSkills', { cwd: selectedCwd }, { reactivityKeys: ['skills'] })
+        ? client.rpc.query('ListSkills', { cwd: selectedCwd }, { reactivityKeys: ['skills'] })
         : idleAtom,
     [client, selectedCwd, runtimeResult],
   )
@@ -144,9 +144,9 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   useAtomMount(skillRegistrationAtom)
 
   // ── 3. One-shot --prompt / --goal — true mutations needing return value
-  const startGoalAtom = useMemo(() => client.mutation('StartGoal'), [client])
-  const sendMessageAtom = useMemo(() => client.mutation('SendMessage'), [client])
-  const createSessionAtom = useMemo(() => client.mutation('CreateSession'), [client])
+  const startGoalAtom = useMemo(() => client.rpc.mutation('StartGoal'), [client])
+  const sendMessageAtom = useMemo(() => client.rpc.mutation('SendMessage'), [client])
+  const createSessionAtom = useMemo(() => client.rpc.mutation('CreateSession'), [client])
   const startGoalMutation = useAtomSet(startGoalAtom, { mode: 'promise' })
   const sendMessageMutation = useAtomSet(sendMessageAtom, { mode: 'promise' })
   const createSessionMutation = useAtomSet(createSessionAtom, { mode: 'promise' })
@@ -240,4 +240,3 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   )
   useAtomMount(initialWorkAtom)
 }
-

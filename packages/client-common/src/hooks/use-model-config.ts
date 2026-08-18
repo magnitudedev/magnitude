@@ -1,5 +1,5 @@
 import { useMemo } from "react"
-import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   ModelSlotsMirror,
@@ -8,7 +8,6 @@ import {
   ProviderModelCatalogMirror,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
-  type ModelSlotsState,
   type ProviderId,
   type ProviderModelIdentity,
   type ProviderModelId,
@@ -17,34 +16,27 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
+import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
 import { useMirroredState } from "./use-mirrored-state"
-
-const selectionAt = (state: ModelSlotsState, slotId: SlotId): Option.Option<SlotSelection> => {
-  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  return slot._tag === "Unassigned" ? Option.none() : Option.some(slot.selection)
-}
 
 export function useModelConfig() {
   const client = useAgentClient()
   const catalog = useMirroredState(ProviderModelCatalogMirror)
-  const slots = useMirroredState(ModelSlotsMirror)
-  const assignAtom = useMemo(() => client.mutation("AssignSlot"), [client])
-  const clearAtom = useMemo(() => client.mutation("ClearSlot"), [client])
-  const refreshAtom = useMemo(() => client.mutation("RefreshModelCatalog"), [client])
-  const favoriteAtom = useMemo(() => client.mutation("SetModelFavorite"), [client])
-  const slotUpdate = useAtomValue(assignAtom)
-  const slotClear = useAtomValue(clearAtom)
+  const slotService = useMemo(() => client.effectQuery.runtime.atom(ModelSlots), [client])
+  const slotState = useMemo(() => Atom.make((get) => Result.flatMap(
+    get(slotService),
+    (slots) => get(slots.state),
+  )), [slotService])
+  const slotSelections = useMemo(() => Atom.make((get) => Result.flatMap(
+    get(slotService),
+    (slots) => get(slots.selections),
+  )), [slotService])
+  const slotMutations = useModelSlotMutations()
+  const slots = useAtomValue(slotState)
+  const refreshAtom = useMemo(() => client.rpc.mutation("RefreshModelCatalog"), [client])
   const catalogRefresh = useAtomValue(refreshAtom)
-  const favoriteUpdate = useAtomValue(favoriteAtom)
-  const assign = useAtomSet(assignAtom)
-  const clear = useAtomSet(clearAtom)
+  const selections = Result.value(useAtomValue(slotSelections))
   const refresh = useAtomSet(refreshAtom)
-  const setFavoriteMutation = useAtomSet(favoriteAtom)
-
-  const selections = Option.map(Result.value(slots), ({ state }) => ({
-    primary: selectionAt(state, PRIMARY_SLOT_ID),
-    secondary: selectionAt(state, SECONDARY_SLOT_ID),
-  }))
 
   const catalogModels = Option.flatMap(Result.value(catalog), ({ state }) =>
     ProviderModelCatalogLifecycle.match(state, {
@@ -59,15 +51,9 @@ export function useModelConfig() {
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
   ): void => Option.match(selection, {
-    onNone: () => clear({
-      payload: { slotId },
-      reactivityKeys: [ModelSlotsMirror.id],
-    }),
-    onSome: (value) => assign({
-      payload: { slotId, selection: value },
-      reactivityKeys: [ModelSlotsMirror.id],
-    }),
-  }), [assign, clear])
+    onNone: () => slotMutations.clear(slotId),
+    onSome: (value) => slotMutations.assign(slotId, value),
+  }), [slotMutations.assign, slotMutations.clear])
 
   const selectionFor = useMemo(() => (
     slotId: SlotId,
@@ -126,18 +112,16 @@ export function useModelConfig() {
   const setModelFavorite = useMemo(() => (
     model: ProviderModelIdentity,
     favorite: boolean,
-  ): void => setFavoriteMutation({
-    payload: { model, favorite },
-    reactivityKeys: [ModelSlotsMirror.id],
-  }), [setFavoriteMutation])
+  ): void => slotMutations.setFavorite(model, favorite), [slotMutations.setFavorite])
 
   return {
     catalog,
     slots,
-    slotUpdate,
-    slotClear,
+    slotUpdate: slotMutations.assignResult,
+    slotClear: slotMutations.clearResult,
+    selections,
     catalogRefresh,
-    favoriteUpdate,
+    favoriteUpdate: slotMutations.favoriteResult,
     favoriteModels,
     setModelFavorite,
     updateSlotModel,

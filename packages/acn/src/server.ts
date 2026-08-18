@@ -10,7 +10,6 @@ import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
 import {
-  Cause,
   Context,
   Data,
   Deferred,
@@ -21,7 +20,6 @@ import {
   Option,
   Ref,
   Runtime,
-  Schedule,
   Schema,
   Scope,
 } from "effect"
@@ -41,11 +39,8 @@ import {
   ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
-  makeAcnRevisionStore,
-  COORDINATION_POLL_INTERVAL,
-  type AcnProcessStoreError,
+  type AcnOwnerStoreError,
   type AcnOwnerStore,
-  type AcnRevisionStore,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/coordination"
 import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bun"
@@ -79,17 +74,22 @@ import { SessionCommandsLive } from "./session-commands"
 import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
-import { makeModelConfigurationLayer } from "./model-configuration"
+import { ModelSelectionLive } from "./model-selection"
+import { LocalModelConfigurationCoordinatorLive } from "./local-model-configuration-coordinator"
 import { makeAcnIcn } from "./icn"
 import { LocalModelAssessmentsLive } from "./local-model-assessments"
+import { LocalModelAssessorLive } from "./local-model-assessor"
+import { LocalModelConfigurationResolverLive } from "./local-model-configuration-resolver"
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
-import { LocalProviderOfferingProjectionLive } from "./local-provider-offering-projection"
+import { installAcnOwnershipMonitor } from "./ownership-monitor"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
+import { CustomEndpointsLive } from "./custom-endpoints"
+import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { SessionStoreLive } from "./session-store"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
@@ -123,10 +123,10 @@ type ParentBindingState = "Pending" | "Admitted" | "Lost"
 const makeParentBinding = (
   enabled: boolean,
 ): Effect.Effect<{
-  readonly admit: <A>(
-    effect: Effect.Effect<A, AcnProcessStoreError>,
+  readonly admit: <A, E>(
+    effect: Effect.Effect<A, E>,
     admitted: (value: A) => boolean,
-  ) => Effect.Effect<A, AcnProcessStoreError | AcnBootstrapRejected>
+  ) => Effect.Effect<A, E | AcnBootstrapRejected>
 }, never, Scope.Scope> => Effect.gen(function* () {
   if (!enabled) return { admit: (effect) => effect }
   const state = yield* Ref.make<ParentBindingState>("Pending")
@@ -153,18 +153,30 @@ const makeParentBinding = (
     Effect.forkScoped,
   )
   return {
-    admit: (effect, isAdmitted) => lock.withPermits(1)(Effect.gen(function* () {
-      const lossObserved = Option.isSome(yield* Deferred.poll(lost))
-      if ((yield* Ref.get(state)) === "Lost" || lossObserved) {
-        yield* Ref.set(state, "Lost")
-        return yield* new AcnBootstrapRejected({
-          reason: "ACN spawning parent exited before admission",
-        })
-      }
-      const value = yield* effect
-      if (isAdmitted(value)) yield* Ref.set(state, "Admitted")
-      return value
-    }).pipe(Effect.uninterruptible)),
+    admit: (effect, isAdmitted) => lock.withPermits(1)(Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if ((yield* Ref.get(state)) === "Lost" || Option.isSome(yield* Deferred.poll(lost))) {
+          yield* Ref.set(state, "Lost")
+          return yield* new AcnBootstrapRejected({
+            reason: "ACN spawning parent exited before admission",
+          })
+        }
+        const value = yield* restore(Effect.raceFirst(
+          effect,
+          Deferred.await(lost).pipe(Effect.flatMap(() => Effect.fail(new AcnBootstrapRejected({
+            reason: "ACN spawning parent exited before admission",
+          })))),
+        ))
+        if (Option.isSome(yield* Deferred.poll(lost))) {
+          yield* Ref.set(state, "Lost")
+          return yield* new AcnBootstrapRejected({
+            reason: "ACN spawning parent exited before admission",
+          })
+        }
+        if (isAdmitted(value)) yield* Ref.set(state, "Admitted")
+        return value
+      }),
+    )),
   }
 })
 
@@ -354,9 +366,13 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ModelSlotControllerLive,
     withCloudUsage
   )
+  const withCustomEndpointReconciliation = Layer.provideMerge(
+    CustomEndpointReconcilerLive,
+    withModelSlots,
+  )
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withModelSlots
+    withCustomEndpointReconciliation
   )
   const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
   const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
@@ -372,30 +388,42 @@ const addLocalInferenceServices = <A, E, R>(
     ModelResidencyPolicyLive,
     withIcn,
   )
-  const withConfiguration = Layer.provideMerge(
-    makeModelConfigurationLayer(),
+  const withSelection = Layer.provideMerge(
+    ModelSelectionLive,
     withResidencyPolicy
+  )
+  const withConfigurationCoordinator = Layer.provideMerge(
+    LocalModelConfigurationCoordinatorLive,
+    withSelection,
+  )
+  const withCustomEndpoints = Layer.provideMerge(
+    CustomEndpointsLive,
+    withConfigurationCoordinator,
   )
   const withHardware = Layer.provideMerge(
     LocalInferenceHardwareLive,
-    withConfiguration
+    withCustomEndpoints
   )
   const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
   const withAssessments = Layer.provideMerge(
     LocalModelAssessmentsLive,
     withPackages
   )
+  const withAssessor = Layer.provideMerge(
+    LocalModelAssessorLive,
+    withAssessments,
+  )
+  const withConfigurationResolver = Layer.provideMerge(
+    LocalModelConfigurationResolverLive,
+    withAssessor,
+  )
   const withOfferings = Layer.provideMerge(
     LocalProviderOfferingsLive,
-    withAssessments
-  )
-  const withOfferingProjection = Layer.provideMerge(
-    LocalProviderOfferingProjectionLive,
-    withOfferings
+    withConfigurationResolver
   )
   const withRecommendations = Layer.provideMerge(
     makeLocalModelRecommendationsLive(),
-    withOfferingProjection
+    withOfferings
   )
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withRecommendations)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
@@ -471,21 +499,12 @@ const makeAcnInfrastructure = (
  * Runs one ACN process until its lifecycle enters Stopping. Scope
  * closure then stops HTTP, disposes sessions, and reaps the private ICN.
  */
-const retryCoordination = <A>(
-  effect: Effect.Effect<A, AcnProcessStoreError | AcnBootstrapRejected>,
+const rejectCoordinationFailure = <A>(
+  effect: Effect.Effect<A, AcnOwnerStoreError | AcnBootstrapRejected>,
 ): Effect.Effect<A, AcnBootstrapRejected> => effect.pipe(
-  Effect.retry({
-    schedule: Schedule.spaced(Duration.millis(25)),
-    while: (error) => error._tag !== "AcnBootstrapRejected"
-      && error._tag !== "AcnProcessStoreInvalid",
-  }),
-  Effect.timeoutFail({
-    duration: Duration.seconds(30),
-    onTimeout: () => new AcnBootstrapRejected({ reason: "ACN coordination timed out" }),
-  }),
   Effect.mapError((error) => error instanceof AcnBootstrapRejected
     ? error
-    : new AcnBootstrapRejected({ reason: `${error._tag}: ${"message" in error ? error.message : "busy"}` })),
+    : new AcnBootstrapRejected({ reason: `${error._tag}: ${error.message}` })),
 )
 
 const predecessorAbsent = (
@@ -504,13 +523,9 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     const debug = options.debug === true
     const parentBinding = yield* makeParentBinding(options.parentBound === true)
 
-    const revisionStore = yield* makeAcnRevisionStore(dataDir).pipe(
-      Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
-    )
     const ownerStore = yield* makeAcnOwnerStore(dataDir).pipe(
       Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
     )
-    yield* retryCoordination(revisionStore.register(ACN_REVISION))
 
     const currentProcess = yield* ExactProcessController.pipe(
       Effect.flatMap((processes) => processes.current),
@@ -556,36 +571,28 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     ))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
 
-    const expectedOwner = yield* retryCoordination(ownerStore.current)
+    const expectedOwner = yield* rejectCoordinationFailure(ownerStore.current)
     if (!(yield* predecessorAbsent(Option.map(expectedOwner, (owner) => ({
       pid: owner.pid,
       processStartIdentity: owner.processStartIdentity,
     }))))) return
+    const admittedOwner = { ...currentProcess, port: address.port }
     const admission = yield* parentBinding.admit(
       ownerStore.replaceOwner(
         expectedOwner,
-        { ...currentProcess, port: address.port },
-        ACN_REVISION,
+        admittedOwner,
       ),
       (result) => result._tag === "Replaced",
-    ).pipe(retryCoordination)
+    ).pipe(rejectCoordinationFailure)
     if (admission._tag !== "Replaced") return
+
+    yield* installAcnOwnershipMonitor(ownerStore, admittedOwner, lifecycle).pipe(
+      Effect.provideService(Scope.Scope, applicationScope),
+    )
 
     yield* Layer.buildWithScope(AcnProcessHandlersLive, applicationScope).pipe(
       Effect.provide(infrastructure),
     )
-
-    const observeReplacement = revisionStore.selected.pipe(
-      Effect.flatMap((selected) => Option.exists(selected, (revision) => revision > ACN_REVISION)
-        ? lifecycle.beginStopping({ reason: "replacement" }).pipe(Effect.asVoid)
-        : Effect.sleep(COORDINATION_POLL_INTERVAL)),
-      Effect.catchAll((error) =>
-        Effect.logWarning("ACN revision selection is indeterminate").pipe(
-          Effect.annotateLogs({ error: error._tag, path: error.path }),
-          Effect.zipRight(Effect.sleep(COORDINATION_POLL_INTERVAL)),
-        )),
-    )
-    yield* Effect.forever(observeReplacement).pipe(Effect.forkIn(applicationScope))
 
     yield* lifecycle.reportStarting("Resolving", Option.none())
     const application = Effect.gen(function* () {
@@ -634,12 +641,10 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
 
     const startup = application.pipe(
       Effect.timeout(Duration.minutes(5)),
-      Effect.tapErrorCause((cause) => lifecycle.beginStopping({
+      Effect.tapError((error) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: "Magnitude could not prepare local inference",
-      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed").pipe(
-        Effect.annotateLogs({ cause: Cause.pretty(cause) }),
-      )))),
+      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", error)))),
     )
     const started = yield* Effect.raceFirst(
       startup.pipe(Effect.disconnect, Effect.map(Option.some)),

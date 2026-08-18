@@ -5,6 +5,7 @@ import { testRender } from "@opentui/react/test-utils"
 import { act } from "react"
 import { LocalInferenceAcceleratorIdSchema, LocalInferenceMemoryDomainIdSchema } from "@magnitudedev/sdk"
 import { GIB, makeHardware, makeView } from "../local-inference/test-fixtures"
+import { defaultCliThemes } from "../../utils/theme"
 
 const textPosition = (frame: string, needle: string) => {
   const lines = frame.split("\n")
@@ -59,19 +60,7 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
 }))
 
 vi.mock("../../hooks/use-theme", () => ({
-  useTheme: () => ({
-    primary: "blue",
-    foreground: "white",
-    muted: "gray",
-    success: "green",
-    error: "red",
-    warning: "yellow",
-    border: "gray",
-    secondary: "gray",
-    info: "cyan",
-    link: "blue",
-    terminalDetectedBg: "black",
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const { SettingsOverlay } = await import("./settings")
@@ -104,11 +93,11 @@ test("settings starts with detected hardware followed by explicit Magnitude Clou
     expect(frame).toContain("Apple M4 Max")
     expect(frame).toContain("Metal acceleration")
     expect(frame).toContain("Apple M4 Max · Unified memory")
-    expect(frame).toContain("52.0 GiB / 64.0 GiB used")
-    expect(frame).toContain("Weights       29.0 GiB")
-    expect(frame).toContain("KV cache      6.0 GiB")
-    expect(frame).toContain("System & apps 17.0 GiB")
-    expect(frame).toContain("Free          12.0 GiB")
+    expect(frame).toContain("52 GB / 64 GB used")
+    expect(frame).toContain("Weights       29 GB")
+    expect(frame).toContain("KV cache      6 GB")
+    expect(frame).toContain("System & apps 17 GB")
+    expect(frame).toContain("Free          12 GB")
     expect(frame).toContain("Magnitude Cloud")
     expect(frame).toContain("○ Not connected")
     expect(frame).not.toContain("No Magnitude Cloud API key · No cloud model access")

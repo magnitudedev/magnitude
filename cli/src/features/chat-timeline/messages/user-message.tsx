@@ -93,10 +93,10 @@ export const UserMessage = memo(function UserMessage({ content, timestamp, taskM
       onMouseOut={handleMouseOut}
     >
       <UserMessageFrame
-        borderColor={taskMode ? theme.modePlan : theme.primary}
-        backgroundColor={isHovered ? theme.userMessageHoverBg : theme.userMessageBg}
+        borderColor={taskMode ? theme.planAccent : theme.accent}
+        backgroundColor={isHovered ? theme.background.hovered : theme.background.selected}
       >
-        <text style={{ fg: theme.foreground, wrapMode: 'word', flexGrow: 1 }}>
+        <text style={{ fg: theme.text.body, wrapMode: 'word', flexGrow: 1 }}>
 {content}
         </text>
       </UserMessageFrame>
@@ -106,12 +106,12 @@ export const UserMessage = memo(function UserMessage({ content, timestamp, taskM
         <box style={{ position: 'absolute', bottom: -1, left: 1, right: 0, flexDirection: 'row' }}>
           <box style={{ flexDirection: 'row' }}>
             {attachmentText.length > 0 && (
-              <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+              <text style={{ fg: theme.text.supporting }} attributes={TextAttributes.DIM}>
                 {attachmentText}
               </text>
             )}
             {attachmentSuffix.length > 0 && (
-              <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+              <text style={{ fg: theme.text.supporting }} attributes={TextAttributes.DIM}>
                 {attachmentSuffix}
               </text>
             )}
@@ -122,10 +122,10 @@ export const UserMessage = memo(function UserMessage({ content, timestamp, taskM
           <box style={{ flexDirection: 'row' }}>
             {metadataVisible && (
               <>
-                <text style={{ fg: isCopied ? theme.success : theme.muted }} attributes={TextAttributes.DIM}>
+                <text style={{ fg: isCopied ? theme.status.success : theme.text.supporting }} attributes={TextAttributes.DIM}>
                   {copyText}
                 </text>
-                <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+                <text style={{ fg: theme.text.supporting }} attributes={TextAttributes.DIM}>
                   {timestampText}
                 </text>
               </>

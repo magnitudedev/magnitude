@@ -4,7 +4,8 @@ import {
   SessionOperationFailed,
   ModelSlotMutationRejected,
   type DisplayViewShape,
-  type ModelOfferingTargetId,
+  type ModelServingConfigurationId,
+  ModelDownloadIdSchema,
   type SessionError,
 } from "@magnitudedev/acn-protocol";
 import { Cause, Chunk, Effect, Option, Stream } from "effect";
@@ -41,10 +42,12 @@ import { MirroredStateChanges } from "./mirrored-state";
 import { LocalInferenceHardware } from "./local-inference-hardware";
 import { LocalModelPackages } from "./local-model-packages";
 import { LocalModels } from "./local-models";
-import { LocalProviderOfferings } from "./local-provider-offerings";
-import { LocalModelRecommendations } from "./local-model-recommendations";
-import { modelOfferingTargetPackageIds } from "@magnitudedev/acn-protocol";
+import { servableModelBundlePackageIds } from "@magnitudedev/acn-protocol";
 import { ClientLeaseManager } from "./client-lease-manager";
+import { LocalModelConfigurationCoordinator } from "./local-model-configuration-coordinator";
+import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver";
+import { localCatalogProviderModelId } from "./local-provider-model-id";
+import { IcnModels } from "@magnitudedev/icn";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -69,8 +72,9 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const localHardware = yield* LocalInferenceHardware;
     const localModelPackages = yield* LocalModelPackages;
     const localModels = yield* LocalModels;
-    const localProviderOfferings = yield* LocalProviderOfferings;
-    const localModelRecommendations = yield* LocalModelRecommendations;
+    const icnModels = yield* IcnModels;
+    const localModelConfigurations = yield* LocalModelConfigurationResolver;
+    const modelConfigurationCoordinator = yield* LocalModelConfigurationCoordinator;
     const clientLeases = yield* ClientLeaseManager;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
@@ -148,46 +152,75 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
         onSome: (introspector) => introspector.resync(sessionId, viewId),
       });
 
-    const deleteLocalModel = (targetId: ModelOfferingTargetId) => Effect.gen(function* () {
-      const target = yield* localModels.resolveTarget(targetId);
-      if (!target) {
+    const deleteLocalModel = (configurationId: ModelServingConfigurationId) =>
+      modelConfigurationCoordinator.exclusive(Effect.gen(function* () {
+      const configuration = yield* localModelConfigurations.resolve(configurationId);
+      if (Option.isNone(configuration)) {
         return yield* new LocalModelMutationFailed({
           code: "local_model_not_found",
-          message: `Local model ${targetId} was not found`,
+          message: `Local model configuration ${configurationId} was not found`,
           retryable: false,
         });
       }
-      const targetOfferings = (yield* localProviderOfferings.list)
-        .filter((offering) => offering.targetId === targetId);
-      const targetProviderModelIds = new Set(
-        targetOfferings.map((offering) => offering.providerModelId),
+      const catalogIdentity = Option.map(
+        configuration.value.catalogModel,
+        ({ modelId, variantId }) => ({ modelId, variantId }),
       );
+      const providerModelId = Option.match(catalogIdentity, {
+        onNone: () => configuration.value.servingConfiguration.id,
+        onSome: localCatalogProviderModelId,
+      });
       const slots = (yield* modelSlots.snapshot).state.slots;
       for (const slot of [slots.primary, slots.secondary]) {
         if (slot._tag === "ConfiguredLocal"
-          && targetProviderModelIds.has(slot.selection.providerModelId)
-          && Option.isSome(slot.instance)
-          && (slot.instance.value.lifecycle._tag === "Loading"
-            || slot.instance.value.lifecycle._tag === "Stopping")) {
+          && String(slot.selection.providerModelId) === String(providerModelId)
+          && (slot.residency._tag === "Loading"
+            || slot.residency._tag === "Stopping")) {
           return yield* new ModelSlotMutationRejected({
             slotId: slot.slotId,
             message: "The local model cannot be deleted while loading or unloading",
           });
         }
         if (slot._tag === "ConfiguredLocal"
-          && targetProviderModelIds.has(slot.selection.providerModelId)
-          && Option.isSome(slot.instance)
-          && slot.instance.value.lifecycle._tag === "Ready") {
-          yield* modelSlots.stopModel(slot.instance.value.id);
+          && String(slot.selection.providerModelId) === String(providerModelId)
+          && slot.residency._tag === "Ready") {
+          yield* modelSlots.stopModel(slot.slotId);
         }
       }
-      const retainedOfferings = (yield* localProviderOfferings.list)
-        .filter((offering) => offering.targetId !== targetId);
-      const retainedPackageIds = new Set(retainedOfferings.flatMap((offering) =>
-        modelOfferingTargetPackageIds(offering.configuration.target)));
-      yield* localModelPackages.removeTargetPackages(target, retainedPackageIds);
+      const installedPackageIds = yield* localModelPackages.installedPackageIds;
+      const referencedPackageIds = new Set(
+        [...(yield* localModelConfigurations.get).values()]
+          .map(({ servingConfiguration }) => servingConfiguration)
+          .filter((candidate) => candidate.id !== configurationId)
+          .filter((candidate) => servableModelBundlePackageIds(candidate.bundle)
+            .every((packageId) => installedPackageIds.has(packageId)))
+          .flatMap((candidate) => servableModelBundlePackageIds(candidate.bundle)),
+      );
+      yield* localModelPackages.removeBundlePackages(
+        configuration.value.servingConfiguration.bundle,
+        referencedPackageIds,
+      );
+      if (Option.isSome(catalogIdentity)) {
+        const packageState = (yield* localModelPackages.snapshot).state;
+        const activePackageIds = new Set(
+          servableModelBundlePackageIds(configuration.value.servingConfiguration.bundle),
+        );
+        for (const entry of packageState.entries) {
+          if (entry.localState._tag !== "Installed"
+            || entry.catalogAttribution._tag !== "Attributed"
+            || entry.catalogAttribution.modelId !== catalogIdentity.value.modelId
+            || entry.catalogAttribution.variantId !== catalogIdentity.value.variantId
+            || activePackageIds.has(entry.package.id)) {
+            continue;
+          }
+          yield* localModelPackages.removeBundlePackages(
+            { _tag: "Standalone", package: entry.package },
+            referencedPackageIds,
+          );
+        }
+      }
       return {};
-    });
+      }));
 
     return {
       // Connection
@@ -384,79 +417,59 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           mirroredStateChanges.stream,
         ),
 
-      CreateLocalModelOffering: ({ configurationId }) =>
+      ReconcileCatalogModel: ({ modelId, variantId }) =>
         observeRpcDefects(
-          "CreateLocalModelOffering",
-          Effect.gen(function* () {
-            const selected = yield* localModelRecommendations
-              .getCatalogByConfigurationId(configurationId)
-            if (Option.isNone(selected)) {
-              return yield* new LocalModelMutationFailed({
-                code: "local_model_configuration_not_found",
-                message: `Local model configuration ${configurationId} was not found`,
-                retryable: false,
-              })
-            }
-            const offering = yield* localProviderOfferings.save(
-              selected.value.candidate.targetId,
-              selected.value.configuration,
-            )
-            return offering.providerModelId
-          }),
+          "ReconcileCatalogModel",
+          icnModels.reconcileCatalogModel(modelId, variantId).pipe(
+            Effect.mapError((error) => new LocalModelMutationFailed({
+              code: "catalog_model_reconciliation_failed",
+              message: String(error),
+              retryable: true,
+            })),
+            Effect.map((admission) => {
+              const providerModelId = localCatalogProviderModelId({ modelId, variantId });
+              return admission._tag === "Current"
+                ? { _tag: "Current" as const, providerModelId }
+                : {
+                    _tag: "DownloadAdmitted" as const,
+                    providerModelId,
+                    downloadId: ModelDownloadIdSchema.make(admission.downloadId),
+                  };
+            }),
+            Effect.tap(() => localModels.refresh),
+          ),
         ),
 
-      DownloadModel: ({ targetId }) =>
-        observeRpcDefects(
-          "DownloadModel",
-          Effect.gen(function* () {
-            const target = yield* localModels.resolveTarget(targetId)
-            if (target === undefined) {
-              return yield* new LocalModelMutationFailed({
-                code: "local_model_target_not_found",
-                message: `Local model target ${targetId} was not found`,
-                retryable: false,
-              })
-            }
-            return yield* localModelPackages.admitTarget(
-              targetId,
-              target,
-            )
-          }),
-        ),
-
-      CancelModelDownload: ({ attemptIds }) =>
+      CancelModelDownload: ({ downloadId }) =>
         observeRpcDefects(
           "CancelModelDownload",
-          localModelPackages.cancelAttempts(attemptIds).pipe(Effect.as({})),
+          localModelPackages.cancelDownload(downloadId).pipe(
+            Effect.zipRight(localModels.refresh),
+            Effect.as({}),
+          ),
         ),
 
-      DismissModelDownloadFailure: ({ targetId }) =>
+      DismissModelDownloadFailure: ({ downloadId }) =>
         observeRpcDefects(
           "DismissModelDownloadFailure",
-          Effect.gen(function* () {
-            const target = yield* localModels.resolveTarget(targetId)
-            if (!target) {
-              return yield* new LocalModelMutationFailed({
-                code: "local_model_not_found",
-                message: `Local model ${targetId} was not found`,
-                retryable: false,
-              })
-            }
-            yield* localModelPackages.dismissTargetFailure(target)
-            return {}
-          }),
+          localModelPackages.acknowledgeFailure(downloadId).pipe(
+            Effect.zipRight(localModels.refresh),
+            Effect.as({}),
+          ),
         ),
 
-      DeleteLocalModel: ({ targetId }) =>
+      DeleteLocalModel: ({ configurationId }) =>
         observeRpcDefects(
           "DeleteLocalModel",
-          deleteLocalModel(targetId),
+          deleteLocalModel(configurationId).pipe(
+            Effect.tap(() => localModels.refresh),
+          ),
         ),
 
       LoadModel: ({ slotId }) =>
         observeRpcDefects(
           "LoadModel",
-          modelSlots.admitModelLoad(slotId),
+          modelSlots.loadModel(slotId).pipe(Effect.as({})),
         ),
 
       PreviewModelLoad: ({ slotId }) =>
@@ -465,10 +478,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           modelSlots.previewModelLoad(slotId),
         ),
 
-      StopModel: ({ instanceId }) =>
+      StopModel: ({ slotId }) =>
         observeRpcDefects(
           "StopModel",
-          modelSlots.stopModel(instanceId).pipe(Effect.as({})),
+          modelSlots.stopModel(slotId).pipe(Effect.as({})),
         ),
 
       GetOnboardingState: () =>
@@ -477,10 +490,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           onboarding.snapshot,
         ),
 
-      UpdateOnboardingState: ({ completed }) =>
+      CompleteOnboarding: () =>
         observeRpcDefects(
-          "UpdateOnboardingState",
-          onboarding.update(completed).pipe(Effect.as({})),
+          "CompleteOnboarding",
+          onboarding.complete.pipe(Effect.as({})),
         ),
 
       // Server-side operations

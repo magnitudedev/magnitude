@@ -77,7 +77,7 @@ export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
         }
       },
       catch: (cause) => spawnFailure(
-        `Failed to send ${signal} to ACN candidate tree ${child.pid}`,
+        `Failed to send ${signal} to Magnitude daemon process tree ${child.pid}`,
         cause,
       ),
     }).pipe(
@@ -90,7 +90,7 @@ export const BunDetachedChildProcessSpawner: ChildProcessSpawner = {
       yield* signalTree("SIGKILL")
       if (!(yield* waitForTreeAbsence(Duration.seconds(2)))) {
         return yield* new AcnEnsuranceFailed({
-          reason: `ACN candidate tree ${child.pid} did not exit after SIGKILL`,
+          reason: `Magnitude daemon process tree ${child.pid} did not exit after SIGKILL`,
         })
       }
     })

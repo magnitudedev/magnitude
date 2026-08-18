@@ -1,5 +1,5 @@
 /**
- * Shared harness hooks used by Cortex and CompactionWorker.
+ * Shared harness hooks used by TurnExecutor and CompactionWorker.
  *
  * Centralises beforeExecute (policy gate) and afterExecute (result persistence).
  * Formatting has moved to the agent's prompt construction layer.

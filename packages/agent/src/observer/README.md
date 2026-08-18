@@ -34,7 +34,7 @@ Worker observation is disabled today, so this path is dormant.
 
 Observer publishes `observer_outcome` with `escalate=true`.
 
-TurnProjection handles that event by appending a root inbound communication marked `requiresAdvisor: true` and ensuring a communication trigger exists. The next root `turn_started` is the single claim point: it consumes pending inbound communications and records `requiresAdvisor` on that exact active turn. Cortex reads TurnProjection for the active turn and requires `message_advisor` only when that same turn claimed the requirement.
+TurnProjection handles that event by appending a root inbound communication marked `requiresAdvisor: true` and ensuring a communication trigger exists. The next root `turn_started` is the single claim point: it consumes pending inbound communications and records `requiresAdvisor` on that exact active turn. TurnExecutor reads TurnProjection for the active turn and requires `message_advisor` only when that same turn claimed the requirement.
 
 Observer scheduling also reads TurnProjection. While a root advisor requirement is still pending, observer evaluation is deferred so an unrelated observer outcome cannot clear or race the requirement.
 
@@ -57,11 +57,11 @@ turn_outcome ──→ ObserverWorker ──→ observeOnce()
                                   append requiresAdvisor communication
                                   + ensure communication trigger
                                         │
-                                  TurnController sees idle fork + due trigger
+                                  TurnInitiator sees idle fork + due trigger
                                         │
                                   turn_started claims pending communication
                                         │
-                                  Cortex requires message_advisor
+                                  TurnExecutor requires message_advisor
                                         │
                                   turn_outcome ──→ GOTO top
 ```
@@ -84,7 +84,7 @@ There is no separate observer-owned notification gate. TurnProjection is the sou
 
 - Pending root inbound communication with `requiresAdvisor: true` means the leader has not seen the escalation yet.
 - Root `turn_started` atomically claims that requirement and records it on the active turn.
-- Cortex requires `message_advisor` only for the claimed active turn.
+- TurnExecutor requires `message_advisor` only for the claimed active turn.
 - ObserverWorker defers root evaluation while TurnProjection still has a pending advisor requirement.
 
 ```

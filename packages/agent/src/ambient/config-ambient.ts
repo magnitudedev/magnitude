@@ -1,7 +1,12 @@
 import { Ambient } from '@magnitudedev/event-core'
 import { Effect, Schema } from 'effect'
+import { formatModelDisplayName } from '@magnitudedev/acn-protocol'
 
-import type { ModelSlotsState, ProviderModelCatalogEntry } from '@magnitudedev/sdk'
+import {
+  ModelFailureSchema,
+  type ModelSlotsState,
+  type ProviderModelCatalogEntry,
+} from '@magnitudedev/sdk'
 import { type SlotId } from '@magnitudedev/roles'
 import {
   ProviderIdSchema,
@@ -36,15 +41,23 @@ export const SlotConfigSchema = Schema.Struct({
 export type SlotConfig = typeof SlotConfigSchema.Type
 
 export const AgentSlotStateSchema = Schema.Union(
+  Schema.TaggedStruct('Unassigned', {
+    slotId: Schema.Literal('primary', 'secondary'),
+  }),
+  Schema.TaggedStruct('Pending', {
+    slotId: Schema.Literal('primary', 'secondary'),
+  }),
   Schema.TaggedStruct('Ready', {
     config: SlotConfigSchema,
   }),
   Schema.TaggedStruct('Unavailable', {
     slotId: Schema.Literal('primary', 'secondary'),
-    reason: Schema.String,
+    failure: ModelFailureSchema,
   }),
 )
 export type AgentSlotState = typeof AgentSlotStateSchema.Type
+export type UnassignedAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unassigned' }>
+export type PendingAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Pending' }>
 export type ReadyAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Ready' }>
 export type UnavailableAgentSlot = Extract<AgentSlotState, { readonly _tag: 'Unavailable' }>
 
@@ -53,7 +66,6 @@ export const ConfigStateSchema = Schema.Struct({
     primary: AgentSlotStateSchema,
     secondary: AgentSlotStateSchema,
   }),
-  catalogLoaded: Schema.Boolean,
 })
 export type ConfigState = typeof ConfigStateSchema.Type
 
@@ -64,7 +76,7 @@ export const sameConfigStateValue = (left: ConfigState, right: ConfigState): boo
 
 export function getSlotConfig(state: ConfigState, slotId: SlotId): SlotConfig {
   const slot = state.bySlot[slotId]
-  if (slot._tag === 'Unavailable') throw new NoModelForSlotError(slotId)
+  if (slot._tag !== 'Ready') throw new NoModelForSlotError(slotId)
   return slot.config
 }
 
@@ -76,6 +88,10 @@ export function getSlotConfigOrNull(state: ConfigState, slotId: SlotId): SlotCon
 export function getSlotConfigForRole(state: ConfigState, roleId: RoleId): SlotConfig {
   const slotId = ROLE_TO_SLOT[roleId]
   return getSlotConfig(state, slotId)
+}
+
+export function getSlotStateForRole(state: ConfigState, roleId: RoleId): AgentSlotState {
+  return state.bySlot[ROLE_TO_SLOT[roleId]]
 }
 
 export class NoModelForSlotError extends Error {
@@ -91,10 +107,9 @@ export const ConfigAmbient = Ambient.define<ConfigState, never>({
   name: 'Config',
   initial: Effect.succeed({
     bySlot: {
-      primary: { _tag: 'Unavailable', slotId: 'primary', reason: 'not_loaded' },
-      secondary: { _tag: 'Unavailable', slotId: 'secondary', reason: 'not_loaded' },
+      primary: { _tag: 'Pending', slotId: 'primary' },
+      secondary: { _tag: 'Pending', slotId: 'secondary' },
     },
-    catalogLoaded: false,
   }),
 })
 
@@ -106,12 +121,26 @@ export function buildConfigStateFromSlots(
   const buildSlot = (slotId: SlotId): AgentSlotState => {
     const slot = slots[slotId]
     if (slot._tag === 'Unassigned') {
-      return { _tag: 'Unavailable', slotId, reason: slot._tag }
+      return { _tag: 'Unassigned', slotId }
+    }
+    if (slot.availability._tag === 'Pending') {
+      return { _tag: 'Pending', slotId }
+    }
+    if (slot.availability._tag === 'Unavailable') {
+      return { _tag: 'Unavailable', slotId, failure: slot.availability.failure }
     }
     const selectedModel = catalogModels.find((model) => model.providerId === slot.selection.providerId
       && model.providerModelId === slot.selection.providerModelId)
     if (!selectedModel) {
-      return { _tag: 'Unavailable', slotId, reason: 'catalog_model_missing' }
+      return {
+        _tag: 'Unavailable',
+        slotId,
+        failure: {
+          code: 'catalog_model_missing',
+          message: 'The selected model is not available in the provider catalog.',
+          retryable: false,
+        },
+      }
     }
     const hardCap = selectedModel.contextWindow - OUTPUT_TOKEN_RESERVE
     const { softCap } = computeContextLimits(hardCap, policy)
@@ -121,7 +150,10 @@ export function buildConfigStateFromSlots(
         slotId,
         providerId: slot.selection.providerId,
         providerModelId: slot.selection.providerModelId,
-        modelDisplayName: selectedModel.displayName,
+        modelDisplayName: formatModelDisplayName(
+          selectedModel.displayName,
+          selectedModel.variantLabel,
+        ),
         profile: {
           contextWindow: selectedModel.contextWindow,
           maxOutputTokens: selectedModel.maxOutputTokens,
@@ -140,6 +172,5 @@ export function buildConfigStateFromSlots(
       primary: buildSlot('primary'),
       secondary: buildSlot('secondary'),
     },
-    catalogLoaded: true,
   }
 }

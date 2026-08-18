@@ -1,0 +1,27 @@
+[project]
+name = "magnitude-mlx-benchmark-server"
+version = "0.1.0"
+description = "Instrumented MLX-LM adapter for Magnitude inference benchmarks"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mlx-lm==0.31.3",
+  "starlette==0.47.3",
+  "uvicorn==0.35.0",
+]
+
+[project.scripts]
+magnitude-mlx-benchmark-server = "magnitude_mlx_benchmark_server.__main__:main"
+magnitude-mlx-benchmark-qualify = "magnitude_mlx_benchmark_server.qualify:main"
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

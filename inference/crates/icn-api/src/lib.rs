@@ -21,13 +21,15 @@ use icn_contracts::bootstrap_protocol::{
     VulkanEligibility,
 };
 use icn_contracts::models::{
-    AssessModelsRequest, AssessModelsResponse, DownloadAttempt, DownloadAttemptId,
-    InstalledModelPackages, InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor,
-    ModelDownloads, ModelDownloadsResponse, ModelInstance, ModelInstanceAllocation,
-    ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadEvent, ModelLoadPlan, ModelPackageId, ModelServingConfigurationId,
-    PreviewModelLoadRequest, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    RemoveInstalledModelPackageResponse, StartModelDownloadRequest, StartModelDownloadResponse,
+    AssessModelsRequest, AssessModelsResponse, CatalogModels, InstalledModelPackages,
+    InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor, ModelDownload,
+    ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance,
+    ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
+    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelPackageId,
+    ModelServingConfigurationId, ModelsResponse, PreviewModelLoadRequest,
+    RecommendableModelCatalog, RecommendableModelCatalogProvider, ReconcileCatalogModelRequest,
+    ReconcileCatalogModelResponse, RemoveInstalledModelPackageResponse, StartModelDownloadRequest,
+    StartModelDownloadResponse,
 };
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
@@ -71,6 +73,7 @@ const fn default_true() -> bool {
 
 #[derive(Clone)]
 pub struct AppState {
+    catalog_models: Option<Arc<dyn CatalogModels>>,
     installed_packages: Option<Arc<dyn InstalledModelPackages>>,
     recommendable_catalog: Option<Arc<dyn RecommendableModelCatalogProvider>>,
     model_assessor: Option<Arc<dyn ModelAssessor>>,
@@ -162,6 +165,7 @@ impl AppState {
     /// Construct API state from a backend shared with another server-owned service.
     pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
         Self {
+            catalog_models: None,
             installed_packages: None,
             recommendable_catalog: None,
             model_assessor: None,
@@ -177,6 +181,7 @@ impl AppState {
 
     pub fn model_free() -> Self {
         Self {
+            catalog_models: None,
             installed_packages: None,
             recommendable_catalog: None,
             model_assessor: None,
@@ -205,6 +210,11 @@ impl AppState {
         installed_packages: Arc<dyn InstalledModelPackages>,
     ) -> Self {
         self.installed_packages = Some(installed_packages);
+        self
+    }
+
+    pub fn with_catalog_models(mut self, catalog_models: Arc<dyn CatalogModels>) -> Self {
+        self.catalog_models = Some(catalog_models);
         self
     }
 
@@ -255,6 +265,11 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut protected = Router::new()
         .route("/v1/hardware", get(hardware))
+        .route("/v1/models", get(models))
+        .route(
+            "/v1/models/catalog/reconcile",
+            post(reconcile_catalog_model),
+        )
         .route("/v1/models/installed", get(installed_models))
         .route(
             "/v1/models/installed/{package_id}",
@@ -281,12 +296,12 @@ pub fn app(state: AppState) -> Router {
             post(stop_model_instance),
         )
         .route(
-            "/v1/models/downloads/{attempt_id}",
-            get(model_download_attempt),
+            "/v1/models/downloads/{download_id}/cancel",
+            post(cancel_model_download),
         )
         .route(
-            "/v1/models/downloads/{attempt_id}/cancel",
-            post(cancel_model_download),
+            "/v1/models/downloads/{download_id}/acknowledge-failure",
+            post(acknowledge_model_download_failure),
         )
         .route(
             "/v1/hugging-face/models/search",
@@ -533,7 +548,9 @@ pub struct PropsResponse {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningProfileResponse {
-    pub default_reasoning_effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub default_reasoning_effort: Option<String>,
     pub reasoning_efforts: Vec<String>,
 }
 
@@ -1009,6 +1026,13 @@ pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1447,6 +1471,49 @@ async fn installed_models(
         .map_err(ApiError::from_inventory)
 }
 
+#[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models",
+    responses(
+        (status = 200, description = "Catalog models joined with current local artifact state", body = ModelsResponse),
+        (status = 500, description = "Model discovery failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.list", skip_all, err(Debug))]
+async fn models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, ApiError> {
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
+    models
+        .list()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/catalog/reconcile", operation_id = "reconcileCatalogModel", tag = "models",
+    request_body(content = ReconcileCatalogModelRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Catalog model reconciliation admission", body = ReconcileCatalogModelResponse),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 500, description = "Catalog model reconciliation failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.catalog.reconcile", skip_all, err(Debug))]
+async fn reconcile_catalog_model(
+    State(state): State<AppState>,
+    Json(request): Json<ReconcileCatalogModelRequest>,
+) -> Result<Json<ReconcileCatalogModelResponse>, ApiError> {
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
+    models
+        .reconcile(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
 #[utoipa::path(delete, path = "/v1/models/installed/{package_id}", operation_id = "removeInstalledModel", tag = "models",
     params(("package_id" = String, Path, description = "Canonical model package identity")),
     responses(
@@ -1496,6 +1563,7 @@ async fn recommendable_model_catalog(
     request_body(content = AssessModelsRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Exact target and profile assessments", body = AssessModelsResponse),
+        (status = 409, description = "Model assessment could not be completed", body = ErrorResponse),
         (status = 500, description = "Assessment operation failed", body = ErrorResponse)
     )
 )]
@@ -1518,7 +1586,7 @@ async fn assess_models(
 #[utoipa::path(post, path = "/v1/models/downloads", operation_id = "startModelDownload", tag = "models",
     request_body(content = StartModelDownloadRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Authoritative download attempt", body = StartModelDownloadResponse),
+        (status = 200, description = "Authoritative model-download admission", body = StartModelDownloadResponse),
         (status = 500, description = "Download could not start", body = ErrorResponse)
     )
 )]
@@ -1540,8 +1608,8 @@ async fn start_model_download(
 
 #[utoipa::path(get, path = "/v1/models/downloads", operation_id = "listModelDownloads", tag = "models",
     responses(
-        (status = 200, description = "Retained model download attempts", body = ModelDownloadsResponse),
-        (status = 500, description = "Download attempts unavailable", body = ErrorResponse)
+        (status = 200, description = "Retained model downloads and internal package attempts", body = ModelDownloadsResponse),
+        (status = 500, description = "Model downloads unavailable", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(name = "icn.models.downloads.list", skip_all, err(Debug))]
@@ -1553,53 +1621,58 @@ async fn model_downloads(
         .as_ref()
         .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
     downloads
-        .list_attempts()
+        .list()
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models/downloads/{attempt_id}", operation_id = "getModelDownload", tag = "models",
-    params(("attempt_id" = String, Path, description = "Download attempt ID")),
+#[utoipa::path(post, path = "/v1/models/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
+    params(("download_id" = String, Path, description = "Model download ID")),
     responses(
-        (status = 200, description = "Authoritative model download attempt", body = DownloadAttempt),
-        (status = 404, description = "Attempt not found", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.downloads.get", skip_all, err(Debug))]
-async fn model_download_attempt(
-    State(state): State<AppState>,
-    Path(attempt_id): Path<String>,
-) -> Result<Json<DownloadAttempt>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .get_attempt(&DownloadAttemptId(attempt_id))
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(post, path = "/v1/models/downloads/{attempt_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
-    params(("attempt_id" = String, Path, description = "Download attempt ID")),
-    responses(
-        (status = 200, description = "Cancelled or terminal model download attempt", body = DownloadAttempt),
-        (status = 404, description = "Attempt not found", body = ErrorResponse)
+        (status = 200, description = "Cancelled or terminal model download", body = ModelDownload),
+        (status = 404, description = "Model download not found", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(name = "icn.models.downloads.cancel", skip_all, err(Debug))]
 async fn cancel_model_download(
     State(state): State<AppState>,
-    Path(attempt_id): Path<String>,
-) -> Result<Json<DownloadAttempt>, ApiError> {
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
     let downloads = state
         .model_downloads
         .as_ref()
         .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
     downloads
-        .cancel(&DownloadAttemptId(attempt_id))
+        .cancel(&ModelDownloadId(download_id))
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/v1/models/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
+    params(("download_id" = String, Path, description = "Failed model download ID")),
+    responses(
+        (status = 200, description = "Acknowledged failed model download", body = ModelDownload),
+        (status = 400, description = "Model download has not failed", body = ErrorResponse),
+        (status = 404, description = "Model download not found", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(
+    name = "icn.models.downloads.acknowledge_failure",
+    skip_all,
+    err(Debug)
+)]
+async fn acknowledge_model_download_failure(
+    State(state): State<AppState>,
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .acknowledge_failure(&ModelDownloadId(download_id))
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -1866,6 +1939,9 @@ fn usage_chunk(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: generation.cached_prompt_tokens as u64,
+            },
         }),
         timings: Some(generation_timings(generation)),
         error: None,
@@ -2120,7 +2196,11 @@ fn validate_apply_template_request(
 
 fn props_response(properties: ModelProperties) -> PropsResponse {
     let reasoning = ReasoningProfileResponse {
-        default_reasoning_effort: properties.reasoning.default_effort.0.clone(),
+        default_reasoning_effort: properties
+            .reasoning
+            .default_effort
+            .as_ref()
+            .map(|effort| effort.0.clone()),
         reasoning_efforts: properties
             .reasoning
             .mappings
@@ -2625,17 +2705,32 @@ fn reasoning_control(
                     "thinking_budget_tokens cannot be used when raw template controls disable reasoning",
                 ));
             }
+            let effort = profile.default_effort.clone().ok_or_else(|| {
+                ApiError::invalid(
+                    "thinking_budget_tokens requires a classified reasoning default",
+                )
+            })?;
             return Ok(ReasoningControl::Resolved {
-                effort: profile.default_effort.clone(),
+                effort,
                 controls: icn_contracts::NativeReasoningControls::default(),
                 automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
                 explicit_budget_tokens: budget_tokens,
                 template_fingerprint: profile.template_fingerprint.clone(),
             });
         }
-        None => profile
-            .mapping(&profile.default_effort)
-            .expect("reasoning profile contains its default mapping"),
+        None => {
+            let Some(default_effort) = profile.default_effort.as_ref() else {
+                if budget_tokens.is_some() {
+                    return Err(ApiError::invalid(
+                        "thinking_budget_tokens requires a classified reasoning default",
+                    ));
+                }
+                return Ok(ReasoningControl::ModelDefault);
+            };
+            profile
+                .mapping(default_effort)
+                .expect("classified reasoning default has a mapping")
+        }
     };
 
     if budget_tokens.is_some() && selected.effort.as_str() == "none" {
@@ -2727,6 +2822,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
     paths(
         health,
         hardware,
+        models,
+        reconcile_catalog_model,
         search_hugging_face_models,
         resolve_hugging_face_repository,
         installed_models,
@@ -2735,8 +2832,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         assess_models,
         start_model_download,
         model_downloads,
-        model_download_attempt,
         cancel_model_download,
+        acknowledge_model_download_failure,
         preview_model_load,
         load_model_instance,
         model_instances,
@@ -2751,6 +2848,9 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         HealthResponse,
         SetModelResidencyPolicyRequest,
         HardwareSnapshot,
+        ModelsResponse,
+        ReconcileCatalogModelRequest,
+        ReconcileCatalogModelResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
         HuggingFaceRepositoryRequest,
@@ -2763,7 +2863,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         StartModelDownloadRequest,
         StartModelDownloadResponse,
         ModelDownloadsResponse,
-        DownloadAttempt,
+        ModelDownload,
         LoadModelRequest,
         PreviewModelLoadRequest,
         ModelLoadPlan,
@@ -3113,7 +3213,7 @@ impl CompletionBackend for FakeBackend {
                 enable_thinking: true,
             },
             reasoning: icn_contracts::ReasoningProfile {
-                default_effort: icn_contracts::NormalizedReasoningEffort("high".into()),
+                default_effort: Some(icn_contracts::NormalizedReasoningEffort("high".into())),
                 mappings: vec![
                     icn_contracts::ReasoningEffortMapping {
                         effort: icn_contracts::NormalizedReasoningEffort("none".into()),
@@ -3135,7 +3235,7 @@ impl CompletionBackend for FakeBackend {
                 template_fingerprint: "fake-fingerprint".into(),
             },
             modalities: ModelModalities::default(),
-            mtp: icn_contracts::MtpRuntimeProperties::Disabled {
+            speculative: icn_contracts::SpeculativeDecodingRuntimeProperties::Disabled {
                 reason: "fake_backend".into(),
             },
             execution: ExecutionConfigReport {
@@ -3286,9 +3386,10 @@ mod tests {
                     "cpu_model": "Test CPU",
                     "logical_cores": 8,
                     "system_memory": {
-                        "total_bytes": 1024,
-                        "current_available_bytes": 512,
-                        "warning_reserve_bytes": 256,
+                        "physical_capacity_bytes": 1024,
+                        "physical_available_bytes": 512,
+                        "allocation_capacity_bytes": 1024,
+                        "allocation_headroom_bytes": 512,
                         "assess_reserve_bytes": 128,
                         "abort_reserve_bytes": 64
                     },
@@ -3492,7 +3593,8 @@ mod tests {
                         message: "exact configuration loading is unavailable in the stub model controller"
                             .to_owned(),
                         retryable: false,
-                    },
+                    }
+                    .into(),
                 }
             }))
         }
@@ -3783,6 +3885,16 @@ mod tests {
         ] {
             assert!(schemas["Timings"]["properties"][field].is_object());
         }
+    }
+
+    #[test]
+    fn exported_assessment_operation_declares_conflict_response() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        assert_eq!(
+            value["paths"]["/v1/models/assess"]["post"]["responses"]["409"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ErrorResponse"
+        );
     }
 
     #[test]

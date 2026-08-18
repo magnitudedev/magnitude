@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use getrandom::fill;
 use hf_hub::HFError;
@@ -24,8 +23,11 @@ use tokio::sync::watch;
 
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, model_id};
-use crate::inventory::{ModelManager, build_model, hf_repo_dir, now};
-use crate::manifest::{MANIFEST_VERSION, ManagedManifest, OperationComponent, OperationManifest};
+use crate::inventory::{ManagedModelStore, build_model, hf_repo_dir, now, repository_lock_path};
+use crate::store_fs::{
+    acquire_exclusive_lock, ensure_owned_directory as ensure_store_directory,
+    quarantine_owned_path_sync,
+};
 use crate::validation::ValidatedDownloadPackage;
 
 const MAX_ATTEMPTS: usize = 5;
@@ -49,7 +51,7 @@ impl DownloadOperation {
     fn ensure_active(&self) -> Result<(), DownloadError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(DownloadError {
-                code: "cancelled",
+                kind: DownloadErrorKind::Cancelled,
                 message: "download was cancelled".to_owned(),
                 retryable: true,
                 resumable: true,
@@ -164,13 +166,13 @@ impl DownloadIntegrity {
 
     fn update(&mut self, bytes: &[u8]) -> Result<(), DownloadError> {
         let count = u64::try_from(bytes.len()).map_err(|_| DownloadError {
-            code: "size_overflow",
+            kind: DownloadErrorKind::Integrity,
             message: "download chunk size overflows u64".to_owned(),
             retryable: false,
             resumable: false,
         })?;
         self.bytes = self.bytes.checked_add(count).ok_or_else(|| DownloadError {
-            code: "size_overflow",
+            kind: DownloadErrorKind::Integrity,
             message: "download byte count overflows u64".to_owned(),
             retryable: false,
             resumable: false,
@@ -204,7 +206,7 @@ impl DownloadIntegrity {
     fn verify(&self, component: &ModelComponent) -> Result<(), DownloadError> {
         if self.bytes != component.size_bytes {
             return Err(DownloadError {
-                code: "size_mismatch",
+                kind: DownloadErrorKind::Integrity,
                 message: format!("unexpected size for {}", component.path.display()),
                 retryable: true,
                 resumable: true,
@@ -223,7 +225,7 @@ impl DownloadIntegrity {
             .collect::<String>();
         if &actual != expected {
             return Err(DownloadError {
-                code: "integrity_failed",
+                kind: DownloadErrorKind::Integrity,
                 message: format!("SHA-256 mismatch for {}", component.path.display()),
                 retryable: false,
                 resumable: false,
@@ -233,20 +235,75 @@ impl DownloadIntegrity {
     }
 }
 
+#[derive(Debug)]
+enum DownloadErrorKind {
+    Cancelled,
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    SourceUnavailable,
+    SourceAccessDenied,
+    MissingSource,
+    Network,
+    Integrity,
+    FileSystem,
+    InvalidRequest,
+    Internal,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 struct DownloadError {
-    code: &'static str,
+    kind: DownloadErrorKind,
     message: String,
     retryable: bool,
     resumable: bool,
 }
 
-impl ModelManager {
+impl DownloadError {
+    fn resumable(&self) -> bool {
+        self.resumable
+    }
+
+    fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    fn to_failure(&self) -> Option<DownloadFailure> {
+        Some(match &self.kind {
+            DownloadErrorKind::Cancelled => return None,
+            DownloadErrorKind::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes,
+            } => DownloadFailure::InsufficientDiskSpace {
+                required_bytes: *required_bytes,
+                available_bytes: *available_bytes,
+            },
+            DownloadErrorKind::SourceUnavailable
+            | DownloadErrorKind::SourceAccessDenied
+            | DownloadErrorKind::MissingSource => DownloadFailure::SourceUnavailable,
+            DownloadErrorKind::Network => DownloadFailure::NetworkUnavailable,
+            DownloadErrorKind::Integrity => DownloadFailure::CorruptDownload,
+            DownloadErrorKind::FileSystem => DownloadFailure::LocalStorageFailure,
+            DownloadErrorKind::InvalidRequest => DownloadFailure::Internal {
+                message: self.message.clone(),
+            },
+            DownloadErrorKind::Internal => DownloadFailure::Internal {
+                message: self.message.clone(),
+            },
+        })
+    }
+}
+
+impl ManagedModelStore {
     pub(crate) async fn start_target_downloads(
         &self,
         packages: Vec<ModelPackage>,
     ) -> Result<Vec<DownloadEventStream>, InventoryError> {
+        // Admission is a mutation boundary. Re-observe the store before deciding that any exact
+        // package is already present; the query snapshot is deliberately not mutation authority.
+        self.ensure_installed_model_inventory().await?;
         let packages = packages
             .into_iter()
             .map(|package| {
@@ -337,9 +394,25 @@ impl ModelManager {
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
-            if let Some(model_id) = model_id.as_ref() {
-                persist_operation_failure(&self.config.root, model_id, failure.code).await;
-            }
+            let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
+            let Some(download_failure) = failure.to_failure() else {
+                if let Some(model_id) = model_id.as_ref() {
+                    if let Ok(mut models) = self.models.write() {
+                        models.remove(model_id);
+                    }
+                }
+                operation
+                    .sender
+                    .send_replace(ModelDownloadEvent::Cancelled {
+                        operation_id,
+                        model_id,
+                        completed_bytes,
+                        total_bytes,
+                    });
+                self.operations.lock().await.remove(&operation_key);
+                return;
+            };
+            let resumable = failure.resumable();
             if let Some(model_id) = model_id.as_ref()
                 && let Ok(mut models) = self.models.write()
                 && let Some(model) = models.get_mut(model_id)
@@ -348,25 +421,19 @@ impl ModelManager {
                 model.availability = ModelAvailability::Interrupted {
                     completed_bytes,
                     total_bytes,
-                    resumable: failure.resumable,
-                    reason: (!failure.resumable).then(|| failure.code.to_owned()),
-                    last_error: failure.code.to_owned(),
+                    resumable,
+                    failure: download_failure.clone(),
                     updated_at: now(),
                 };
                 model.updated_at = now();
             }
-            let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
             operation.sender.send_replace(ModelDownloadEvent::Failed {
                 operation_id,
                 model_id,
-                error: DownloadFailure {
-                    code: failure.code.to_owned(),
-                    message: failure.message,
-                    retryable: failure.retryable,
-                },
+                error: download_failure,
                 completed_bytes,
                 total_bytes,
-                resumable: failure.resumable,
+                resumable,
             });
         }
         self.operations.lock().await.remove(&operation_key);
@@ -381,12 +448,14 @@ impl ModelManager {
         operation.ensure_active()?;
         let (repository, revision) = package.repository_revision();
         let (owner, name) = repository.split_once('/').ok_or_else(|| DownloadError {
-            code: "invalid_request",
+            kind: DownloadErrorKind::InvalidRequest,
             message: "repository must be owner/name".to_owned(),
             retryable: false,
             resumable: false,
         })?;
         let repo = self.client.model(owner.to_owned(), name.to_owned());
+        let repository_lock =
+            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
 
         let pinned = resolve_download_revision(
             &self.client,
@@ -447,7 +516,7 @@ impl ModelManager {
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
         let available_bytes =
             fs2::available_space(&self.config.root).map_err(|error| DownloadError {
-                code: "disk_inspection_failed",
+                kind: DownloadErrorKind::FileSystem,
                 message: error.to_string(),
                 retryable: true,
                 resumable: true,
@@ -462,14 +531,14 @@ impl ModelManager {
                 completed_bytes,
                 total_bytes,
             });
-        if missing_bytes.saturating_add(self.config.disk_reserve_bytes) > available_bytes {
+        let required_bytes = missing_bytes.saturating_add(self.config.disk_reserve_bytes);
+        if required_bytes > available_bytes {
             return Err(DownloadError {
-                code: "insufficient_disk",
-                message: format!(
-                    "download requires {} bytes including reserve, but {} bytes are available",
-                    missing_bytes.saturating_add(self.config.disk_reserve_bytes),
-                    available_bytes
-                ),
+                kind: DownloadErrorKind::InsufficientDiskSpace {
+                    required_bytes,
+                    available_bytes,
+                },
+                message: "insufficient disk space".to_owned(),
                 retryable: false,
                 resumable: true,
             });
@@ -511,7 +580,7 @@ impl ModelManager {
         self.models
             .write()
             .map_err(|_| DownloadError {
-                code: "internal",
+                kind: DownloadErrorKind::Internal,
                 message: "inventory lock poisoned".to_owned(),
                 retryable: false,
                 resumable: true,
@@ -540,52 +609,13 @@ impl ModelManager {
             .acquire()
             .await
             .map_err(|error| DownloadError {
-                code: "internal",
+                kind: DownloadErrorKind::Internal,
                 message: error.to_string(),
                 retryable: false,
                 resumable: true,
             })?;
-        tokio::fs::create_dir_all(repo_root.join("blobs"))
-            .await
-            .map_err(download_io)?;
-        tokio::fs::create_dir_all(&snapshot)
-            .await
-            .map_err(download_io)?;
-
-        let lock_path = self
-            .config
-            .root
-            .join("locks")
-            .join(format!("{}.lock", model_id.0));
-        let lock_file = acquire_lock(lock_path).await?;
-        let mut operation_manifest = OperationManifest {
-            version: MANIFEST_VERSION,
-            operation_id: operation_id.to_owned(),
-            model_id: model_id.clone(),
-            content_id: content_id.clone(),
-            repository: repository.clone(),
-            requested_revision: revision.clone(),
-            commit: commit.clone(),
-            components: components
-                .iter()
-                .map(|component| OperationComponent {
-                    path: component.path.clone(),
-                    role: component.role.clone(),
-                    content: component.content.clone(),
-                    shard_index: component.shard_index,
-                    relationship: component.relationship.clone(),
-                    expected_size: component.size_bytes,
-                    content_key: blob_key(&component.content),
-                    completed_bytes: 0,
-                })
-                .collect(),
-            stage: "downloading".to_owned(),
-            started_at,
-            updated_at: started_at,
-            last_error: None,
-        };
-        persist_operation_manifest(&self.config.root, &operation_manifest).await?;
-
+        ensure_owned_directory(&repo_root).await?;
+        ensure_owned_directory(&repo_root.join("blobs")).await?;
         let started = Instant::now();
         let mut resumed_by_component = Vec::with_capacity(components.len());
         for component in &components {
@@ -661,15 +691,8 @@ impl ModelManager {
                 &operation.cancelled,
             )
             .await?;
-            operation_manifest.components[index].completed_bytes = component.size_bytes;
-            operation_manifest.updated_at = now();
-            persist_operation_manifest(&self.config.root, &operation_manifest).await?;
-            publish_snapshot_link(&repo_root, &snapshot, component).await?;
         }
 
-        operation_manifest.stage = "verifying".to_owned();
-        operation_manifest.updated_at = now();
-        persist_operation_manifest(&self.config.root, &operation_manifest).await?;
         if let Some(last) = components.last() {
             operation.sender.send_replace(ModelDownloadEvent::Progress {
                 operation_id: operation_id.to_owned(),
@@ -687,22 +710,10 @@ impl ModelManager {
             });
         }
 
-        let manifest = ManagedManifest {
-            version: MANIFEST_VERSION,
-            model_id: model_id.clone(),
-            content_id,
-            repository: repository.to_owned(),
-            requested_revision: revision.to_owned(),
-            commit,
-            components,
-            created_at: started_at,
-            ready_at: now(),
-        };
-        persist_managed_manifest(&self.config.root, &manifest).await?;
-        let operation_path = operation_manifest_path(&self.config.root, &model_id);
-        let _ = tokio::fs::remove_file(operation_path).await;
-        let primary = manifest
-            .components
+        operation.ensure_active()?;
+        publish_package_snapshot(&repo_root, &snapshot, &commit, &components).await?;
+        let ready_at = now();
+        let primary = components
             .iter()
             .filter(|component| {
                 matches!(
@@ -713,27 +724,27 @@ impl ModelManager {
             .min_by_key(|component| component.shard_index.unwrap_or(0))
             .map(|component| snapshot.join(&component.path))
             .ok_or_else(|| DownloadError {
-                code: "publish_failed",
+                kind: DownloadErrorKind::Internal,
                 message: "published model has no runnable weight component".to_owned(),
                 retryable: false,
                 resumable: false,
             })?;
         let model = build_model(
-            manifest.model_id.clone(),
-            manifest.content_id.clone(),
-            manifest.created_at,
-            manifest.ready_at,
+            model_id.clone(),
+            content_id,
+            started_at,
+            ready_at,
             ModelSource::HuggingFace {
-                repository: manifest.repository.clone(),
-                requested_revision: manifest.requested_revision.clone(),
-                commit: manifest.commit.clone(),
+                repository: repository.clone(),
+                requested_revision: revision.clone(),
+                commit,
                 metadata: None,
             },
             ModelLocation::MagnitudeCache {
-                total_bytes: manifest.components.iter().map(|item| item.size_bytes).sum(),
-                components: manifest.components.clone(),
+                total_bytes,
+                components,
                 integrity: Integrity::Verified {
-                    method: "manifest".to_owned(),
+                    method: "content_identity".to_owned(),
                 },
             },
             &primary,
@@ -742,7 +753,7 @@ impl ModelManager {
             self.template_assessor.as_deref(),
         )
         .map_err(|error| DownloadError {
-            code: "inspection_failed",
+            kind: DownloadErrorKind::Internal,
             message: error.to_string(),
             retryable: true,
             resumable: true,
@@ -751,7 +762,7 @@ impl ModelManager {
             .complete_and_publish_model(model)
             .await
             .map_err(|error| DownloadError {
-                code: "publish_failed",
+                kind: DownloadErrorKind::Internal,
                 message: error.to_string(),
                 retryable: true,
                 resumable: true,
@@ -760,9 +771,50 @@ impl ModelManager {
             operation_id: operation_id.to_owned(),
             model: Box::new(ready),
         });
-        drop(lock_file);
+        drop(repository_lock);
         Ok(())
     }
+}
+
+async fn publish_package_snapshot(
+    repo_root: &Path,
+    snapshot: &Path,
+    commit: &str,
+    components: &[ModelComponent],
+) -> Result<(), DownloadError> {
+    let incomplete = repo_root.join(".incomplete");
+    let snapshots = repo_root.join("snapshots");
+    ensure_owned_directory(&incomplete).await?;
+    ensure_owned_directory(&snapshots).await?;
+
+    match tokio::fs::symlink_metadata(snapshot).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            for component in components {
+                publish_snapshot_link(repo_root, snapshot, component).await?;
+            }
+            return sync_directory(snapshot).await;
+        }
+        Ok(_) => quarantine(snapshot).await?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(download_io(error)),
+    }
+
+    let staged_snapshot = incomplete.join(format!("snapshot-{commit}"));
+    quarantine(&staged_snapshot).await?;
+    ensure_owned_directory(&staged_snapshot).await?;
+    for component in components {
+        publish_snapshot_link(repo_root, &staged_snapshot, component).await?;
+    }
+    tokio::fs::rename(staged_snapshot, snapshot)
+        .await
+        .map_err(download_io)?;
+    sync_parent(snapshot).await
+}
+
+async fn ensure_owned_directory(path: &Path) -> Result<(), DownloadError> {
+    ensure_store_directory(path)
+        .await
+        .map_err(inventory_download_error)
 }
 
 async fn download_component_with_retry(
@@ -802,7 +854,7 @@ async fn download_component_with_retry(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(error) if error.retryable && attempt + 1 < MAX_ATTEMPTS => {
+            Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_secs(1_u64 << attempt.min(4))).await;
             }
             Err(error) => return Err(error),
@@ -836,7 +888,7 @@ async fn download_component_once(
             .map_err(download_io)?;
     } else if partial_len < offset {
         return Err(DownloadError {
-            code: "size_mismatch",
+            kind: DownloadErrorKind::Integrity,
             message: format!(
                 "partial download is shorter than verified progress for {}",
                 component.path.display()
@@ -848,7 +900,7 @@ async fn download_component_once(
     if offset == component.size_bytes {
         progress(component.size_bytes, DownloadStage::Verifying);
         if let Err(error) = integrity.verify(component) {
-            quarantine_component_files(paths).await?;
+            discard_component_files(paths).await?;
             return Err(error);
         }
         publish_verified_blob(paths).await?;
@@ -881,7 +933,7 @@ async fn download_component_once(
             }
         };
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| DownloadError {
-            code: "size_overflow",
+            kind: DownloadErrorKind::Integrity,
             message: "download chunk size overflows u64".to_owned(),
             retryable: false,
             resumable: false,
@@ -891,7 +943,7 @@ async fn download_component_once(
             .is_none_or(|next| next > component.size_bytes)
         {
             return Err(DownloadError {
-                code: "size_mismatch",
+                kind: DownloadErrorKind::Integrity,
                 message: format!(
                     "download exceeded expected size for {}",
                     component.path.display()
@@ -911,7 +963,7 @@ async fn download_component_once(
     if offset != component.size_bytes {
         persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
         return Err(DownloadError {
-            code: "size_mismatch",
+            kind: DownloadErrorKind::Integrity,
             message: format!(
                 "download ended at {offset} bytes; expected {} for {}",
                 component.size_bytes,
@@ -925,7 +977,7 @@ async fn download_component_once(
     drop(file);
     progress(component.size_bytes, DownloadStage::Verifying);
     if let Err(error) = integrity.verify(component) {
-        quarantine_component_files(paths).await?;
+        discard_component_files(paths).await?;
         return Err(error);
     }
     publish_verified_blob(paths).await?;
@@ -940,14 +992,14 @@ async fn recover_partial(
     let record = read_integrity_record(&paths.checkpoint).await;
     let Some((partial_len, record)) = partial_len.zip(record) else {
         if partial_len.is_some() || paths.checkpoint.exists() {
-            quarantine_component_files(paths).await?;
+            discard_component_files(paths).await?;
         }
         return Ok(DownloadIntegrity::empty(component));
     };
     let integrity = match DownloadIntegrity::restore(component, record) {
         Ok(integrity) if partial_len >= integrity.bytes => integrity,
         _ => {
-            quarantine_component_files(paths).await?;
+            discard_component_files(paths).await?;
             return Ok(DownloadIntegrity::empty(component));
         }
     };
@@ -982,7 +1034,7 @@ async fn recover_completed_blob(
         return Ok(true);
     }
 
-    quarantine_component_files(paths).await?;
+    discard_component_files(paths).await?;
     Ok(false)
 }
 
@@ -1042,16 +1094,25 @@ async fn regular_file_len(path: &Path) -> Option<u64> {
     (metadata.is_file() && !metadata.file_type().is_symlink()).then_some(metadata.len())
 }
 
-async fn quarantine_component_files(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
+async fn discard_component_files(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
     for path in [&paths.partial, &paths.blob, &paths.checkpoint] {
-        quarantine(path).await?;
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                tokio::fs::remove_file(path).await.map_err(download_io)?;
+            }
+            // The store only ever writes regular files at these paths; anything
+            // else is foreign and is preserved by rename instead of deleted.
+            Ok(_) => quarantine(path).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(download_io(error)),
+        }
     }
     Ok(())
 }
 
 fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
     DownloadError {
-        code: "invalid_checkpoint",
+        kind: DownloadErrorKind::Integrity,
         message: format!(
             "download integrity checkpoint does not match {}",
             component.path.display()
@@ -1063,9 +1124,9 @@ fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
 
 fn cancelled_error() -> DownloadError {
     DownloadError {
-        code: "cancelled",
+        kind: DownloadErrorKind::Cancelled,
         message: "download was cancelled".to_owned(),
-        retryable: true,
+        retryable: false,
         resumable: true,
     }
 }
@@ -1077,27 +1138,41 @@ async fn publish_snapshot_link(
 ) -> Result<(), DownloadError> {
     let destination = snapshot.join(&component.path);
     if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(download_io)?;
+        let relative = parent.strip_prefix(snapshot).map_err(download_io)?;
+        let mut current = snapshot.to_path_buf();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            ensure_owned_directory(&current).await?;
+        }
     }
     let blob = repo_root.join("blobs").join(blob_key(&component.content));
+    let blob_metadata = tokio::fs::symlink_metadata(&blob)
+        .await
+        .map_err(download_io)?;
+    if !blob_metadata.is_file() || blob_metadata.file_type().is_symlink() {
+        return Err(DownloadError {
+            kind: DownloadErrorKind::FileSystem,
+            message: format!("verified blob is not a regular file: {}", blob.display()),
+            retryable: true,
+            resumable: true,
+        });
+    }
     let destination_clone = destination.clone();
     tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
-        if destination_clone.exists() {
-            let canonical = destination_clone.canonicalize().map_err(download_io)?;
-            if canonical == blob.canonicalize().map_err(download_io)? {
-                return Ok(());
+        match destination_clone.symlink_metadata() {
+            Ok(_) => {
+                let matching = destination_clone
+                    .canonicalize()
+                    .ok()
+                    .zip(blob.canonicalize().ok())
+                    .is_some_and(|(existing, expected)| existing == expected);
+                if matching {
+                    return Ok(());
+                }
+                quarantine_owned_path_sync(&destination_clone).map_err(inventory_download_error)?;
             }
-            return Err(DownloadError {
-                code: "publication_conflict",
-                message: format!(
-                    "snapshot path already exists: {}",
-                    destination_clone.display()
-                ),
-                retryable: false,
-                resumable: true,
-            });
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(download_io(error)),
         }
         #[cfg(unix)]
         {
@@ -1112,7 +1187,7 @@ async fn publish_snapshot_link(
     })
     .await
     .map_err(|error| DownloadError {
-        code: "publication_failed",
+        kind: DownloadErrorKind::FileSystem,
         message: error.to_string(),
         retryable: true,
         resumable: true,
@@ -1138,29 +1213,9 @@ fn pathdiff(path: &Path, base: &Path) -> PathBuf {
     result
 }
 
-async fn persist_operation_manifest(
-    root: &Path,
-    manifest: &OperationManifest,
-) -> Result<(), DownloadError> {
-    atomic_json(&operation_manifest_path(root, &manifest.model_id), manifest).await
-}
-
-async fn persist_managed_manifest(
-    root: &Path,
-    manifest: &ManagedManifest,
-) -> Result<(), DownloadError> {
-    atomic_json(
-        &root
-            .join("installations")
-            .join(format!("{}.json", manifest.model_id.0)),
-        manifest,
-    )
-    .await
-}
-
 async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), DownloadError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| DownloadError {
-        code: "serialization_failed",
+        kind: DownloadErrorKind::Internal,
         message: error.to_string(),
         retryable: false,
         resumable: true,
@@ -1193,33 +1248,9 @@ async fn sync_parent(path: &Path) -> Result<(), DownloadError> {
     directory.sync_all().await.map_err(download_io)
 }
 
-async fn read_operation_manifest(
-    root: &Path,
-    model_id: &icn_contracts::ModelId,
-) -> Option<OperationManifest> {
-    let bytes = tokio::fs::read(operation_manifest_path(root, model_id))
-        .await
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-async fn persist_operation_failure(root: &Path, model_id: &icn_contracts::ModelId, code: &str) {
-    let Some(mut manifest) = read_operation_manifest(root, model_id).await else {
-        return;
-    };
-    manifest.last_error = Some(code.to_owned());
-    manifest.updated_at = now();
-    for component in &mut manifest.components {
-        let repo_root = root.join("hub").join(hf_repo_dir(&manifest.repository));
-        let paths = DownloadComponentPaths::new(&repo_root.join("blobs"), &component.content_key);
-        component.completed_bytes =
-            recoverable_download_bytes(&paths, &component.content, component.expected_size).await;
-    }
-    let _ = persist_operation_manifest(root, &manifest).await;
-}
-
-fn operation_manifest_path(root: &Path, model_id: &icn_contracts::ModelId) -> PathBuf {
-    root.join("operations").join(format!("{}.json", model_id.0))
+async fn sync_directory(path: &Path) -> Result<(), DownloadError> {
+    let directory = tokio::fs::File::open(path).await.map_err(download_io)?;
+    directory.sync_all().await.map_err(download_io)
 }
 
 async fn resumable_bytes(repo_root: &Path, components: &[ModelComponent]) -> u64 {
@@ -1261,8 +1292,10 @@ async fn recoverable_download_bytes(
 }
 
 async fn quarantine(path: &Path) -> Result<(), DownloadError> {
-    if !path.exists() {
-        return Ok(());
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(download_io(error)),
     }
     let destination = path.with_extension(format!(
         "invalid-{}",
@@ -1275,19 +1308,11 @@ async fn quarantine(path: &Path) -> Result<(), DownloadError> {
 
 async fn acquire_lock(path: PathBuf) -> Result<File, DownloadError> {
     tokio::task::spawn_blocking(move || {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(download_io)?;
-        FileExt::lock_exclusive(&file).map_err(download_io)?;
-        Ok(file)
+        acquire_exclusive_lock(&path).map_err(inventory_download_error)
     })
     .await
     .map_err(|error| DownloadError {
-        code: "lock_failed",
+        kind: DownloadErrorKind::FileSystem,
         message: error.to_string(),
         retryable: true,
         resumable: true,
@@ -1300,7 +1325,7 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Err(DownloadError {
-            code: "unsafe_path",
+            kind: DownloadErrorKind::FileSystem,
             message: format!("partial path is a symlink: {}", path.display()),
             retryable: false,
             resumable: false,
@@ -1346,7 +1371,7 @@ fn random_id(prefix: &str) -> Result<String, InventoryError> {
 
 fn inventory_download_error(error: InventoryError) -> DownloadError {
     DownloadError {
-        code: "internal",
+        kind: DownloadErrorKind::Internal,
         message: error.to_string(),
         retryable: false,
         resumable: true,
@@ -1354,10 +1379,7 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
 }
 
 fn missing_upstream_content(error: &DownloadError) -> bool {
-    matches!(
-        error.code,
-        "repository_not_found" | "revision_not_found" | "file_not_found"
-    )
+    matches!(error.kind, DownloadErrorKind::MissingSource)
 }
 
 async fn resolve_download_revision(
@@ -1383,7 +1405,7 @@ async fn resolve_download_revision(
         Err(error) => return Err(error),
     };
     let commit = api.sha.clone().ok_or_else(|| DownloadError {
-        code: "missing_metadata",
+        kind: DownloadErrorKind::Network,
         message: "Hugging Face repository response did not include a commit".to_owned(),
         retryable: true,
         resumable: false,
@@ -1391,7 +1413,7 @@ async fn resolve_download_revision(
     if revision == "main" {
         if !is_immutable_commit(&commit) {
             return Err(DownloadError {
-                code: "missing_metadata",
+                kind: DownloadErrorKind::Network,
                 message: "Hugging Face main did not resolve to an immutable commit".to_owned(),
                 retryable: true,
                 resumable: false,
@@ -1399,7 +1421,7 @@ async fn resolve_download_revision(
         }
     } else {
         require_requested_revision(revision, Some(&commit)).map_err(|message| DownloadError {
-            code: "revision_changed",
+            kind: DownloadErrorKind::SourceUnavailable,
             message,
             retryable: false,
             resumable: false,
@@ -1423,7 +1445,7 @@ async fn resolve_download_revision(
         };
         if metadata.size == 0 {
             return Err(DownloadError {
-                code: "missing_metadata",
+                kind: DownloadErrorKind::SourceUnavailable,
                 message: format!(
                     "Hugging Face did not report a non-zero size for {}",
                     component.path.display()
@@ -1497,7 +1519,7 @@ fn package_unavailable(
         "pinned model package is unavailable and current main is not equivalent"
     );
     DownloadError {
-        code: "package_unavailable",
+        kind: DownloadErrorKind::SourceUnavailable,
         message: match path {
             Some(path) => format!(
                 "the publisher no longer provides the catalog package at {}: {reason}",
@@ -1518,7 +1540,7 @@ async fn hub_api_metadata(
     let url =
         revision_metadata_url(client.endpoint(), repository, revision).map_err(|message| {
             DownloadError {
-                code: "invalid_request",
+                kind: DownloadErrorKind::InvalidRequest,
                 message,
                 retryable: false,
                 resumable: false,
@@ -1532,16 +1554,16 @@ async fn hub_api_metadata(
     let response = request.send().await.map_err(reqwest_download_error)?;
     let status = response.status();
     if !status.is_success() {
+        let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(DownloadError {
-            code: match status.as_u16() {
-                401 => "authentication_required",
-                403 => "forbidden",
-                404 => "repository_not_found",
-                429 => "rate_limited",
-                _ => "upstream_http_error",
+            kind: match status.as_u16() {
+                401 | 403 => DownloadErrorKind::SourceAccessDenied,
+                404 => DownloadErrorKind::MissingSource,
+                _ if retryable => DownloadErrorKind::Network,
+                _ => DownloadErrorKind::InvalidRequest,
             },
             message: format!("Hugging Face repository metadata returned HTTP {status}"),
-            retryable: status.as_u16() == 429 || status.is_server_error(),
+            retryable,
             resumable: false,
         });
     }
@@ -1565,7 +1587,7 @@ async fn resolve_remote_metadata(
         Ok(metadata) => {
             if metadata.commit_hash != commit {
                 return Err(DownloadError {
-                    code: "revision_changed",
+                    kind: DownloadErrorKind::SourceUnavailable,
                     message: format!("{} resolved outside pinned commit", path.display()),
                     retryable: true,
                     resumable: false,
@@ -1594,7 +1616,7 @@ async fn resolve_remote_metadata(
                 .iter()
                 .find(|candidate| candidate.rfilename == filename)
                 .ok_or_else(|| DownloadError {
-                    code: "file_not_found",
+                    kind: DownloadErrorKind::MissingSource,
                     message: format!("Hugging Face repository has no {}", path.display()),
                     retryable: false,
                     resumable: false,
@@ -1611,7 +1633,7 @@ async fn resolve_remote_metadata(
 
 fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
     DownloadError {
-        code: "transport_failed",
+        kind: DownloadErrorKind::Network,
         message: error.to_string(),
         retryable: error.is_timeout() || error.is_connect() || error.is_request(),
         resumable: false,
@@ -1619,24 +1641,33 @@ fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
 }
 
 fn map_hf_error(error: HFError) -> DownloadError {
-    let (code, retryable) = match &error {
-        HFError::AuthRequired { .. } => ("authentication_required", false),
-        HFError::Forbidden { .. } => ("forbidden", false),
-        HFError::RepoNotFound { .. } => ("repository_not_found", false),
-        HFError::RevisionNotFound { .. } => ("revision_not_found", false),
-        HFError::EntryNotFound { .. } => ("file_not_found", false),
-        HFError::RateLimited { .. } => ("rate_limited", true),
-        HFError::Request { .. } | HFError::Xet { .. } => ("transport_failed", true),
+    let (kind, retryable) = match &error {
+        HFError::AuthRequired { .. } | HFError::Forbidden { .. } => {
+            (DownloadErrorKind::SourceAccessDenied, false)
+        }
+        HFError::RepoNotFound { .. }
+        | HFError::RevisionNotFound { .. }
+        | HFError::EntryNotFound { .. } => (DownloadErrorKind::MissingSource, false),
+        HFError::RateLimited { .. } | HFError::Request { .. } | HFError::Xet { .. } => {
+            (DownloadErrorKind::Network, true)
+        }
         HFError::Http { context } => {
             let retryable = context.status.as_u16() == 408 || context.status.is_server_error();
-            ("upstream_http_error", retryable)
+            (
+                if retryable {
+                    DownloadErrorKind::Network
+                } else {
+                    DownloadErrorKind::SourceUnavailable
+                },
+                retryable,
+            )
         }
-        HFError::Io(_) => ("io_failed", true),
-        HFError::MalformedResponse { .. } => ("malformed_upstream_response", true),
-        _ => ("upstream_failed", false),
+        HFError::Io(_) => (DownloadErrorKind::FileSystem, true),
+        HFError::MalformedResponse { .. } => (DownloadErrorKind::Network, true),
+        _ => (DownloadErrorKind::SourceUnavailable, false),
     };
     DownloadError {
-        code,
+        kind,
         message: error.to_string(),
         retryable,
         resumable: retryable,
@@ -1645,7 +1676,7 @@ fn map_hf_error(error: HFError) -> DownloadError {
 
 fn download_io(error: impl std::fmt::Display) -> DownloadError {
     DownloadError {
-        code: "io_failed",
+        kind: DownloadErrorKind::FileSystem,
         message: error.to_string(),
         retryable: true,
         resumable: true,
@@ -1665,7 +1696,9 @@ fn watch_stream(receiver: watch::Receiver<ModelDownloadEvent>) -> DownloadEventS
             let event = receiver.borrow_and_update().clone();
             let terminal = matches!(
                 event,
-                ModelDownloadEvent::Ready { .. } | ModelDownloadEvent::Failed { .. }
+                ModelDownloadEvent::Ready { .. }
+                    | ModelDownloadEvent::Cancelled { .. }
+                    | ModelDownloadEvent::Failed { .. }
             );
             Some((event, (receiver, true, terminal)))
         },
@@ -1678,6 +1711,7 @@ fn current_model_id(event: &ModelDownloadEvent) -> Option<icn_contracts::ModelId
         ModelDownloadEvent::CheckingSpace { model_id, .. }
         | ModelDownloadEvent::Progress { model_id, .. } => Some(model_id.clone()),
         ModelDownloadEvent::Ready { model, .. } => Some(model.id.clone()),
+        ModelDownloadEvent::Cancelled { model_id, .. } => model_id.clone(),
         ModelDownloadEvent::Failed { model_id, .. } => model_id.clone(),
         ModelDownloadEvent::Resolving { .. } => None,
     }
@@ -1696,6 +1730,11 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
             ..
         }
         | ModelDownloadEvent::Failed {
+            completed_bytes,
+            total_bytes,
+            ..
+        }
+        | ModelDownloadEvent::Cancelled {
             completed_bytes,
             total_bytes,
             ..
@@ -1722,14 +1761,52 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::inventory::InventoryConfig;
-    use crate::package_service::package_from_resolved;
+    use crate::package_service::inspected_package_from_resolved;
     use icn_contracts::models::{
         ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelPackageId,
         ModelPackageProperties, ModelPackageSource,
     };
     use icn_contracts::{
-        ComponentRelationship, ComponentRole, ModelId, ResolvedComponent, ResolvedModel,
+        CapabilityEvidence, ComponentRelationship, ComponentRole, EffectiveTemplateInputs,
+        ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
+        ResolvedModel, TemplateAssessment, TemplateAssessor, TemplateCapabilities,
     };
+
+    struct DownloadTestTemplateAssessor;
+
+    impl TemplateAssessor for DownloadTestTemplateAssessor {
+        fn cache_identity(&self) -> &str {
+            "download-test-template-assessor"
+        }
+
+        fn assess(&self, _: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
+            Ok(TemplateAssessment {
+                capabilities: TemplateCapabilities {
+                    string_content: true,
+                    typed_content: false,
+                    tools: false,
+                    tool_calls: false,
+                    parallel_tool_calls: false,
+                    system_role: true,
+                    preserve_reasoning: false,
+                    object_arguments: false,
+                    enable_thinking: false,
+                },
+                reasoning: ReasoningCapability::Supported {
+                    control: ReasoningControlDomain::Effort {
+                        levels: vec!["none".to_owned()],
+                        default: Some("none".to_owned()),
+                    },
+                    visibility: ReasoningVisibility::Hidden,
+                    delimiters: ReasoningDelimiters::Unavailable,
+                    evidence: CapabilityEvidence::BoundedTemplateProbe {
+                        fingerprint: "download-test".to_owned(),
+                    },
+                },
+                fingerprint: "download-test".to_owned(),
+            })
+        }
+    }
 
     fn model_component(contents: &[u8]) -> ModelComponent {
         let digest = format!("{:x}", Sha256::digest(contents));
@@ -1765,9 +1842,127 @@ mod tests {
                 quantization: "test".to_owned(),
                 quantization_name: "test".to_owned(),
                 architecture: "test".to_owned(),
-                maximum_context_length: 1,
+                maximum_context_length: Some(1),
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn publishing_a_revision_retains_other_snapshots_and_blobs() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("repository");
+        tokio::fs::create_dir_all(repository.join("snapshots/old"))
+            .await
+            .expect("old snapshot");
+        tokio::fs::create_dir_all(repository.join("snapshots/current"))
+            .await
+            .expect("current snapshot");
+        tokio::fs::create_dir_all(repository.join("blobs"))
+            .await
+            .expect("blobs");
+        tokio::fs::write(repository.join("blobs/model"), b"verified")
+            .await
+            .expect("blob");
+
+        let component = model_component(b"current");
+        let paths =
+            DownloadComponentPaths::new(&repository.join("blobs"), &blob_key(&component.content));
+        tokio::fs::write(&paths.blob, b"current")
+            .await
+            .expect("current blob");
+        publish_package_snapshot(
+            &repository,
+            &repository.join("snapshots/current"),
+            "current",
+            &[component],
+        )
+        .await
+        .expect("additive snapshot publication");
+
+        assert!(repository.join("snapshots/old").is_dir());
+        assert!(repository.join("snapshots/current").is_dir());
+        assert!(repository.join("blobs/model").is_file());
+    }
+
+    #[tokio::test]
+    async fn publishing_the_first_revision_creates_the_snapshot_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("repository");
+        let staged = repository.join(".incomplete/snapshot-current");
+        let published = repository.join("snapshots/current");
+        tokio::fs::create_dir_all(&staged)
+            .await
+            .expect("staged snapshot");
+        tokio::fs::write(staged.join("model.gguf"), b"verified")
+            .await
+            .expect("staged model");
+
+        let component = model_component(b"verified");
+        let paths =
+            DownloadComponentPaths::new(&repository.join("blobs"), &blob_key(&component.content));
+        tokio::fs::create_dir_all(repository.join("blobs"))
+            .await
+            .expect("blob directory");
+        tokio::fs::write(&paths.blob, b"verified")
+            .await
+            .expect("verified blob");
+
+        publish_package_snapshot(&repository, &published, "current", &[component])
+            .await
+            .expect("first snapshot publication");
+
+        assert!(!staged.exists());
+        assert_eq!(
+            tokio::fs::read(published.join("model.gguf"))
+                .await
+                .expect("published model"),
+            b"verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_another_package_into_the_same_revision_is_additive() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("repository");
+        let snapshot = repository.join("snapshots/current");
+
+        let mut target = model_component(b"target");
+        target.path = PathBuf::from("target.gguf");
+        let mut draft = model_component(b"draft");
+        draft.path = PathBuf::from("draft.gguf");
+        for (component, contents) in [
+            (&target, b"target".as_slice()),
+            (&draft, b"draft".as_slice()),
+        ] {
+            let paths = DownloadComponentPaths::new(
+                &repository.join("blobs"),
+                &blob_key(&component.content),
+            );
+            tokio::fs::create_dir_all(repository.join("blobs"))
+                .await
+                .expect("blob directory");
+            tokio::fs::write(paths.blob, contents)
+                .await
+                .expect("verified blob");
+        }
+
+        publish_package_snapshot(&repository, &snapshot, "current", &[target])
+            .await
+            .expect("target publication");
+        publish_package_snapshot(&repository, &snapshot, "current", &[draft])
+            .await
+            .expect("draft publication");
+
+        assert_eq!(
+            tokio::fs::read(snapshot.join("target.gguf")).await.unwrap(),
+            b"target"
+        );
+        assert_eq!(
+            tokio::fs::read(snapshot.join("draft.gguf")).await.unwrap(),
+            b"draft"
+        );
     }
 
     #[tokio::test]
@@ -1775,8 +1970,28 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().join("models");
         let cache_root = directory.path().join("cache");
-        let manager = ModelManager::open(
-            InventoryConfig::with_roots(root, cache_root).expect("inventory config"),
+        let hf_cache = directory.path().join("hugging-face");
+        let snapshot = hf_cache
+            .join("models--owner--repository")
+            .join("snapshots")
+            .join("a".repeat(40));
+        tokio::fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        let mut gguf = Vec::new();
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3_u32.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.resize(32, 0);
+        tokio::fs::write(snapshot.join("model.gguf"), gguf)
+            .await
+            .expect("installed model");
+        let mut config = InventoryConfig::with_roots(root, cache_root).expect("inventory config");
+        config.hf_cache_dirs.push(hf_cache);
+        let manager = ManagedModelStore::open_with_template_assessor(
+            config,
+            Some(Arc::new(DownloadTestTemplateAssessor)),
         )
         .await
         .expect("model manager");
@@ -1784,59 +1999,22 @@ mod tests {
             .ensure_installed_model_inventory()
             .await
             .expect("initial inventory");
-
-        let contents = b"installed model contents";
-        let path = directory.path().join("model.gguf");
-        tokio::fs::write(&path, contents)
-            .await
-            .expect("installed model");
-        let component = model_component(contents);
-        let model = InventoryModel {
-            id: ModelId("model_installed".to_owned()),
-            content_id: content_id(std::slice::from_ref(&component)),
-            created: 1,
-            name: "installed".to_owned(),
-            supported_parameters: Vec::new(),
-            availability: ModelAvailability::Available { ready_at: 1 },
-            source: ModelSource::HuggingFace {
-                repository: "owner/repository".to_owned(),
-                requested_revision: "a".repeat(40),
-                commit: "a".repeat(40),
-                metadata: None,
-            },
-            location: ModelLocation::File {
-                path: path.clone(),
-                component: component.clone(),
-                integrity: Integrity::Verified {
-                    method: "sha256".to_owned(),
-                },
-            },
-            properties: InventoryProperties::Pending,
-            operations: Vec::new(),
-            updated_at: 1,
-        };
-        let resolved = ResolvedModel {
-            model: model.clone(),
-            components: vec![ResolvedComponent {
-                path,
-                role: ComponentRole::Weights,
-                shard_index: None,
-                relationship: None,
-            }],
-        };
-        let package = package_from_resolved(&resolved).expect("installed package");
-        manager
+        let model = manager
             .models
-            .write()
+            .read()
             .expect("inventory lock")
-            .insert(model.id.clone(), model.clone());
-        let installed = manager
-            .build_installed_package_snapshot(&manager.models.read().expect("inventory lock"))
-            .expect("installed package snapshot");
-        *manager
-            .installed_packages
-            .write()
-            .expect("installed package snapshot lock") = installed;
+            .values()
+            .next()
+            .cloned()
+            .expect("installed inventory model");
+        let resolved = ResolvedModel {
+            components: crate::service::resolve_components(manager.root(), &model)
+                .expect("resolved components"),
+            model: model.clone(),
+        };
+        let package = inspected_package_from_resolved(&resolved)
+            .expect("installed package")
+            .package;
 
         let mut streams = manager
             .start_target_downloads(vec![package])
@@ -1984,9 +2162,32 @@ mod tests {
 
         let error = integrity.verify(&component).expect_err("digest mismatch");
 
-        assert_eq!(error.code, "integrity_failed");
-        assert!(!error.retryable);
-        assert!(!error.resumable);
+        assert!(matches!(error.kind, DownloadErrorKind::Integrity));
+        assert!(!error.retryable());
+        assert!(!error.resumable());
+    }
+
+    #[test]
+    fn insufficient_disk_failure_preserves_required_and_available_bytes() {
+        let failure = DownloadError {
+            kind: DownloadErrorKind::InsufficientDiskSpace {
+                required_bytes: 37_923_968_128,
+                available_bytes: 33_440_665_600,
+            },
+            message: "insufficient disk space".to_owned(),
+            retryable: false,
+            resumable: true,
+        };
+
+        assert_eq!(
+            failure
+                .to_failure()
+                .expect("test failure is not cancellation"),
+            DownloadFailure::InsufficientDiskSpace {
+                required_bytes: 37_923_968_128,
+                available_bytes: 33_440_665_600,
+            }
+        );
     }
 
     #[test]
@@ -2012,7 +2213,7 @@ mod tests {
             size: expected.size_bytes + 1,
             sha256: Some(sha256.clone()),
         };
-        assert_eq!(
+        assert!(matches!(
             validate_equivalent_file(
                 "owner/repository",
                 &"a".repeat(40),
@@ -2021,9 +2222,9 @@ mod tests {
                 &different_size,
             )
             .expect_err("changed size")
-            .code,
-            "package_unavailable"
-        );
+            .kind,
+            DownloadErrorKind::SourceUnavailable
+        ));
 
         let changed = ResolvedRemoteMetadata {
             size: expected.size_bytes,
@@ -2037,7 +2238,7 @@ mod tests {
             &changed,
         )
         .expect_err("changed file");
-        assert_eq!(failure.code, "package_unavailable");
+        assert!(matches!(failure.kind, DownloadErrorKind::SourceUnavailable));
     }
 
     #[test]
@@ -2077,15 +2278,20 @@ mod tests {
 
     #[test]
     fn fallback_is_limited_to_definitive_missing_content() {
-        let failure = |code| DownloadError {
-            code,
+        let failure = |kind| DownloadError {
+            kind,
             message: String::new(),
             retryable: false,
             resumable: false,
         };
-        assert!(missing_upstream_content(&failure("revision_not_found")));
-        assert!(missing_upstream_content(&failure("file_not_found")));
-        assert!(!missing_upstream_content(&failure("rate_limited")));
-        assert!(!missing_upstream_content(&failure("transport_failed")));
+        assert!(missing_upstream_content(&failure(
+            DownloadErrorKind::MissingSource
+        )));
+        assert!(!missing_upstream_content(&failure(
+            DownloadErrorKind::SourceUnavailable
+        )));
+        assert!(!missing_upstream_content(&failure(
+            DownloadErrorKind::Network
+        )));
     }
 }

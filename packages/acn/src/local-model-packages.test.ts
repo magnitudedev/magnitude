@@ -1,13 +1,16 @@
 import { LocalModelMutationFailed } from "@magnitudedev/acn-protocol"
 import { describe, expect, it } from "vitest"
 
-import { localModelPackageMutationFailure } from "./local-model-packages"
+import {
+  localModelPackageMutationFailure,
+  projectPackageAcquisition,
+} from "./local-model-packages"
 
 describe("localModelPackageMutationFailure", () => {
   it("preserves a typed mutation failure across an outer error boundary", () => {
     const failure = new LocalModelMutationFailed({
       code: "model_download_target_identity_mismatch",
-      message: "ICN admitted a different model target than requested.",
+      message: "ICN admitted a different model bundle than requested.",
       retryable: false,
     })
 
@@ -24,4 +27,18 @@ describe("localModelPackageMutationFailure", () => {
       retryable: true,
     })
   })
+})
+describe("projectPackageAcquisition", () => {
+  it("preserves generated installation provenance", () => {
+    expect(projectPackageAcquisition({
+      _tag: "Installed",
+      path: "/hf/model.gguf",
+      origin: "HuggingFaceCache",
+    })).toEqual({
+      _tag: "Installed",
+      path: "/hf/model.gguf",
+      origin: "HuggingFaceCache",
+    })
+  })
+
 })

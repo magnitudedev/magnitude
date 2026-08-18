@@ -9,8 +9,20 @@ export type ReasoningEffortControl =
   | { readonly _tag: "Available"; readonly options: readonly ReasoningEffortOption[] }
   | { readonly _tag: "Unavailable"; readonly label: string }
 
+export const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+  adaptive: "Adaptive",
+}
+
 export function formatReasoningEffort(effort: ReasoningEffort): string {
-  return String(effort)
+  const value = String(effort)
+  return REASONING_EFFORT_LABELS[value] ?? value
     .replace(/[_-]+/g, " ")
     .replace(/\b\w/g, (character) => character.toUpperCase())
 }

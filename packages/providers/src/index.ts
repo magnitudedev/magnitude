@@ -106,3 +106,9 @@ export type {
 } from "./magnitude/contract"
 export type { ToolChoice } from "@magnitudedev/ai"
 export type { CloudUsageResponse, UsagePeriod } from "./magnitude/usage"
+
+// Custom OpenAI-compatible endpoints
+export {
+  createCustomEndpointProvider,
+  customEndpointProviderId,
+} from "./custom-endpoint/provider"

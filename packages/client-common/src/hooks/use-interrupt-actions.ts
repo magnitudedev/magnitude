@@ -19,7 +19,7 @@ export interface UseInterruptActionsResult {
 export function useInterruptActions(): UseInterruptActionsResult {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptAtom = useMemo(() => client.mutation("Interrupt"), [client])
+  const interruptAtom = useMemo(() => client.rpc.mutation("Interrupt"), [client])
   const interruptMutation = useAtomSet(interruptAtom)
 
   function interrupt(forkId?: string | null): void {

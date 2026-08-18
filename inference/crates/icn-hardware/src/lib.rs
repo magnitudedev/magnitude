@@ -28,8 +28,8 @@ use icn_contracts::{
     HardwareMemory, HardwareMemoryDomain, HardwareMemoryDomainAssessment, HardwareMemoryDomainKind,
     HardwareProfile, HardwareRecommendation, HardwareSnapshot, HardwareSystemMemory,
     MemoryAccountant, MemoryAccounting, MemoryAccountingError, MemoryBreakdown, MemoryCharge,
-    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelExecutionAssessment, MtpConfig,
-    MtpSource, NativeDeviceIdentity, NativeDeviceLocator,
+    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelExecutionAssessment,
+    NativeDeviceIdentity, NativeDeviceLocator, SpeculativeDecodingConfig, SpeculativeDraftSource,
 };
 use llama_cpp_2::LlamaBackendDeviceType;
 use sha2::{Digest, Sha256};
@@ -45,7 +45,6 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// these values in the hardware layer gives every caller one authoritative policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SystemMemoryThresholds {
-    pub warning_reserve_bytes: u64,
     pub assess_reserve_bytes: u64,
     pub abort_reserve_bytes: u64,
 }
@@ -53,9 +52,90 @@ pub struct SystemMemoryThresholds {
 #[must_use]
 pub fn system_memory_thresholds(total_bytes: u64) -> SystemMemoryThresholds {
     SystemMemoryThresholds {
-        warning_reserve_bytes: (total_bytes / 5).max(4 * GIB),
         assess_reserve_bytes: (total_bytes / 10).max(2 * GIB),
         abort_reserve_bytes: (total_bytes / 20).max(GIB),
+    }
+}
+
+/// Cross-platform system-memory facts used by inference allocation.
+///
+/// Platform-specific constraints are collapsed into the binding allocation capacity and
+/// headroom. Callers never need to know which operating-system mechanism supplied the limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemMemoryObservation {
+    pub physical_capacity_bytes: u64,
+    pub physical_available_bytes: u64,
+    pub allocation_capacity_bytes: u64,
+    pub allocation_headroom_bytes: u64,
+}
+
+pub fn observe_system_memory() -> Result<SystemMemoryObservation, String> {
+    let mut system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    system.refresh_memory_specifics(MemoryRefreshKind::everything());
+    normalize_system_memory(system.total_memory(), system.available_memory())
+}
+
+/// Normalizes an already-sampled physical-memory observation into ICN's allocation contract.
+///
+/// Long-lived observers can reuse their platform sampler while this function keeps operating-
+/// system allocation constraints private to the hardware layer.
+pub fn normalize_system_memory(
+    physical_capacity_bytes: u64,
+    physical_available_bytes: u64,
+) -> Result<SystemMemoryObservation, String> {
+    if physical_capacity_bytes == 0 || physical_available_bytes > physical_capacity_bytes {
+        return Err(format!(
+            "invalid system memory observation: total={physical_capacity_bytes}, available={physical_available_bytes}"
+        ));
+    }
+    let platform_limit = platform_allocation_limit()?;
+    Ok(SystemMemoryObservation {
+        physical_capacity_bytes,
+        physical_available_bytes,
+        allocation_capacity_bytes: platform_limit.map_or(physical_capacity_bytes, |limit| {
+            physical_capacity_bytes.min(limit.capacity)
+        }),
+        allocation_headroom_bytes: platform_limit.map_or(physical_available_bytes, |limit| {
+            physical_available_bytes.min(limit.headroom)
+        }),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PlatformAllocationLimit {
+    capacity: u64,
+    headroom: u64,
+}
+
+#[cfg(not(windows))]
+fn platform_allocation_limit() -> Result<Option<PlatformAllocationLimit>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn platform_allocation_limit() -> Result<Option<PlatformAllocationLimit>, String> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
+
+    // SAFETY: the structure is initialized to its documented size and remains valid for the call.
+    unsafe {
+        let mut performance: PERFORMANCE_INFORMATION = zeroed();
+        performance.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+        if GetPerformanceInfo(&mut performance, performance.cb) == 0 {
+            return Err(format!(
+                "GetPerformanceInfo failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let page_size = performance.PageSize as u64;
+        let capacity = (performance.CommitLimit as u64).saturating_mul(page_size);
+        let allocated = (performance.CommitTotal as u64).saturating_mul(page_size);
+        Ok(Some(PlatformAllocationLimit {
+            capacity,
+            headroom: capacity.saturating_sub(allocated),
+        }))
     }
 }
 // ICN policy for work not represented by the synthetic matrix-operation calibration.
@@ -129,6 +209,8 @@ pub struct PlanningOptions {
     pub use_mmap: bool,
     /// Whether model pages should be locked in memory.
     pub use_mlock: bool,
+    /// Whether model loading includes multi-token-prediction layers.
+    pub load_mtp: bool,
     /// K-cache data type.
     pub cache_type_k: CacheType,
     /// V-cache data type.
@@ -164,6 +246,8 @@ pub enum PlanningContextType {
     Target,
     /// Multi-token-prediction draft context.
     Mtp,
+    /// DFlash or DSpark draft context using the ordinary decoder graph type.
+    SpeculativeDraft,
 }
 
 impl Default for PlanningOptions {
@@ -180,6 +264,7 @@ impl Default for PlanningOptions {
             tensor_split: None,
             use_mmap: true,
             use_mlock: false,
+            load_mtp: false,
             cache_type_k: CacheType::F16,
             cache_type_v: CacheType::F16,
             flash_attention: PlanningFlashAttention::Auto,
@@ -225,8 +310,8 @@ pub enum NativePlanningError {
     NativeBridge(#[from] FitReportError),
 }
 
-/// Stable Magnitude capacity policy. It intentionally uses total capacity,
-/// not volatile process-external free memory.
+/// Stable ICN assessment-capacity policy. It intentionally uses total capacity,
+/// not volatile process-external free memory or application warning policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct CapacityPolicy {
     pub reserve_bytes_per_domain: u64,
@@ -289,11 +374,13 @@ pub fn discover_hardware(
     );
     system.refresh_memory();
     let total_bytes = system.total_memory();
+    let available_bytes = system.available_memory();
     let thresholds = system_memory_thresholds(total_bytes);
     let mut system_memory = HardwareSystemMemory {
-        total_bytes,
-        current_available_bytes: system.available_memory(),
-        warning_reserve_bytes: thresholds.warning_reserve_bytes,
+        physical_capacity_bytes: total_bytes,
+        physical_available_bytes: available_bytes,
+        allocation_capacity_bytes: total_bytes,
+        allocation_headroom_bytes: available_bytes,
         assess_reserve_bytes: thresholds.assess_reserve_bytes,
         abort_reserve_bytes: thresholds.abort_reserve_bytes,
     };
@@ -316,15 +403,15 @@ pub fn discover_hardware(
             free_bytes: u64::try_from(device.memory_free).ok(),
         })
         .collect::<Vec<_>>();
-    if system_memory.total_bytes == 0 {
-        system_memory.total_bytes = devices
+    if system_memory.physical_capacity_bytes == 0 {
+        system_memory.physical_capacity_bytes = devices
             .iter()
             .filter(|device| device.kind == HardwareDeviceKind::Cpu)
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
-        let thresholds = system_memory_thresholds(system_memory.total_bytes);
-        system_memory.warning_reserve_bytes = thresholds.warning_reserve_bytes;
+        system_memory.allocation_capacity_bytes = system_memory.physical_capacity_bytes;
+        let thresholds = system_memory_thresholds(system_memory.physical_capacity_bytes);
         system_memory.assess_reserve_bytes = thresholds.assess_reserve_bytes;
         system_memory.abort_reserve_bytes = thresholds.abort_reserve_bytes;
     }
@@ -384,14 +471,14 @@ fn hardware_snapshot_from_devices(
     }
 
     let mut domains = Vec::new();
-    if !shared.is_empty() || environment.system_memory.total_bytes > 0 {
+    if !shared.is_empty() || environment.system_memory.physical_capacity_bytes > 0 {
         let backend_total = shared
             .iter()
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
-        let total = if environment.system_memory.total_bytes > 0 {
-            environment.system_memory.total_bytes
+        let total = if environment.system_memory.physical_capacity_bytes > 0 {
+            environment.system_memory.physical_capacity_bytes
         } else {
             backend_total
         };
@@ -409,7 +496,7 @@ fn hardware_snapshot_from_devices(
             total_capacity_bytes: total,
             stable_capacity_bytes: total
                 .saturating_sub(policy.reserve_for_domain(&MemoryDomainId::system())),
-            current_free_bytes: Some(environment.system_memory.current_available_bytes),
+            current_free_bytes: Some(environment.system_memory.physical_available_bytes),
             shares_system_memory: true,
             devices: shared
                 .into_iter()
@@ -531,6 +618,34 @@ pub fn with_capacity_policy(
                     .total_bytes
                     .saturating_sub(policy.reserve_for_domain(&domain.id));
             }
+        }
+    }
+    snapshot.topology_fingerprint = topology_fingerprint(&snapshot.memory_domains);
+    snapshot
+}
+
+/// Replaces volatile system-memory fields with one freshly normalized observation.
+#[must_use]
+pub fn with_system_memory_observation(
+    mut snapshot: HardwareSnapshot,
+    observation: SystemMemoryObservation,
+) -> HardwareSnapshot {
+    let thresholds = system_memory_thresholds(observation.physical_capacity_bytes);
+    snapshot.system_memory = HardwareSystemMemory {
+        physical_capacity_bytes: observation.physical_capacity_bytes,
+        physical_available_bytes: observation.physical_available_bytes,
+        allocation_capacity_bytes: observation.allocation_capacity_bytes,
+        allocation_headroom_bytes: observation.allocation_headroom_bytes,
+        assess_reserve_bytes: thresholds.assess_reserve_bytes,
+        abort_reserve_bytes: thresholds.abort_reserve_bytes,
+    };
+    for domain in &mut snapshot.memory_domains {
+        if domain.id.is_system() {
+            domain.total_capacity_bytes = observation.physical_capacity_bytes;
+            domain.stable_capacity_bytes = observation
+                .physical_capacity_bytes
+                .saturating_sub(thresholds.assess_reserve_bytes);
+            domain.current_free_bytes = Some(observation.physical_available_bytes);
         }
     }
     snapshot.topology_fingerprint = topology_fingerprint(&snapshot.memory_domains);
@@ -673,8 +788,8 @@ pub struct AssessedExecutionPlan {
     pub plan: ExecutionIntent,
     pub assessment: HardwareAssessment,
     pub text_report: FitReport,
-    /// No-allocation report for the MTP context and optional companion model.
-    pub mtp_report: Option<FitReport>,
+    /// No-allocation report for the speculative context and optional companion model.
+    pub speculative_report: Option<FitReport>,
     #[cfg(feature = "mtmd")]
     pub projector_memory: Vec<llama_cpp_2::mtmd::MtmdDeviceMemoryEstimate>,
 }
@@ -684,7 +799,13 @@ pub struct AssessedExecutionPlan {
 pub struct BackendLoadPlan {
     pub assessed: AssessedExecutionPlan,
     pub native: NativeParameterPlan,
-    pub native_mtp: Option<NativeParameterPlan>,
+    pub native_speculative: Option<NativeParameterPlan>,
+}
+
+/// Exact load planning either produces executable native parameters or a complete rejection.
+pub enum BackendLoadPlanningOutcome {
+    Planned(BackendLoadPlan),
+    Rejected(AssessedExecutionPlan),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -738,27 +859,17 @@ pub fn plan_load_with_backend(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     requested: &ExecutionIntent,
-) -> Result<BackendLoadPlan, AssessmentError> {
+) -> Result<BackendLoadPlanningOutcome, AssessmentError> {
     let (assessed, native) = plan_and_assess(backend, topology, requested, false)?;
-    let native = match (native, &assessed.assessment) {
-        (Some(native), _) => native,
-        (None, HardwareAssessment::IncompatibleArtifact { code, message }) => {
-            return Err(AssessmentError::IncompatibleArtifact {
-                code: code.clone(),
-                message: message.clone(),
-            });
-        }
-        (None, HardwareAssessment::InvalidArtifact { code, message }) => {
-            return Err(AssessmentError::InvalidArtifact {
-                code: code.clone(),
-                message: message.clone(),
-            });
-        }
-        (None, _) => return Err(AssessmentError::MissingMeasurements),
+    let Some(native) = native else {
+        return match assessed.assessment {
+            HardwareAssessment::Fits { .. } => Err(AssessmentError::MissingMeasurements),
+            _ => Ok(BackendLoadPlanningOutcome::Rejected(assessed)),
+        };
     };
-    let native_mtp = match requested.mtp {
-        MtpConfig::Disabled { .. } => None,
-        MtpConfig::Enabled { .. } => Some(
+    let native_speculative = match requested.speculative {
+        SpeculativeDecodingConfig::Disabled { .. } => None,
+        SpeculativeDecodingConfig::Enabled { .. } => Some(
             resolve_native_plan(
                 backend,
                 &planning_request(&assessed.plan, true)?,
@@ -768,11 +879,11 @@ pub fn plan_load_with_backend(
             .native,
         ),
     };
-    Ok(BackendLoadPlan {
+    Ok(BackendLoadPlanningOutcome::Planned(BackendLoadPlan {
         assessed,
         native,
-        native_mtp,
-    })
+        native_speculative,
+    }))
 }
 
 fn plan_and_assess(
@@ -794,22 +905,24 @@ fn plan_and_assess(
                         .to_owned(),
                 },
                 text_report,
-                mtp_report: None,
+                speculative_report: None,
                 #[cfg(feature = "mtmd")]
                 projector_memory: Vec::new(),
             },
             None,
         ));
     }
-    let mut mtp_report = estimate_mtp_report(backend, requested)?;
+    let mut speculative_report = estimate_speculative_report(backend, requested)?;
     let projector_memory = projector_memory(requested)?;
 
     let preferred = capacity_summary(
         topology,
         &text_report.devices,
         Measurement::Initial,
-        mtp_report.as_ref().map(|report| report.devices.as_slice()),
-        mtp_includes_model(requested),
+        speculative_report
+            .as_ref()
+            .map(|report| report.devices.as_slice()),
+        speculative_includes_model(requested),
         &projector_memory,
     )?;
     if preferred.fits {
@@ -820,7 +933,7 @@ fn plan_and_assess(
                 assessment: fits_assessment(&plan, &preferred, HardwareRecommendation::Recommended),
                 plan,
                 text_report,
-                mtp_report,
+                speculative_report,
                 #[cfg(feature = "mtmd")]
                 projector_memory,
             },
@@ -833,13 +946,15 @@ fn plan_and_assess(
     let fallback = fallback_plan
         .as_ref()
         .map(|plan| {
-            mtp_report = estimate_mtp_report(backend, plan)?;
+            speculative_report = estimate_speculative_report(backend, plan)?;
             capacity_summary(
                 topology,
                 &text_report.devices,
                 Measurement::Selected,
-                mtp_report.as_ref().map(|report| report.devices.as_slice()),
-                mtp_includes_model(plan),
+                speculative_report
+                    .as_ref()
+                    .map(|report| report.devices.as_slice()),
+                speculative_includes_model(plan),
                 &projector_memory,
             )
         })
@@ -852,7 +967,7 @@ fn plan_and_assess(
                 assessment: fits_assessment(&plan, &summary, HardwareRecommendation::Constrained),
                 plan,
                 text_report,
-                mtp_report,
+                speculative_report,
                 #[cfg(feature = "mtmd")]
                 projector_memory,
             },
@@ -878,7 +993,7 @@ fn plan_and_assess(
             plan: requested.clone(),
             assessment,
             text_report,
-            mtp_report,
+            speculative_report,
             #[cfg(feature = "mtmd")]
             projector_memory,
         },
@@ -888,34 +1003,41 @@ fn plan_and_assess(
 
 fn planning_request(
     plan: &ExecutionIntent,
-    mtp_context: bool,
+    speculative_context: bool,
 ) -> Result<PlanningRequest, AssessmentError> {
     let (model, cache_type_k, cache_type_v, context_type, recurrent_snapshots, maximum_outputs) =
-        if mtp_context {
-            let MtpConfig::Enabled {
+        if speculative_context {
+            let SpeculativeDecodingConfig::Enabled {
                 source,
+                method,
                 cache_type_k,
                 cache_type_v,
                 ..
-            } = &plan.mtp
+            } = &plan.speculative
             else {
                 return Err(AssessmentError::MissingMeasurements);
             };
             let model = match source {
-                MtpSource::Bundled => plan.model_path.clone(),
-                MtpSource::Separate { model_path } => model_path.clone(),
+                SpeculativeDraftSource::Embedded => plan.model_path.clone(),
+                SpeculativeDraftSource::Separate { model_path } => model_path.clone(),
             };
             (
                 model,
                 *cache_type_k,
                 *cache_type_v,
-                PlanningContextType::Mtp,
+                match method {
+                    icn_contracts::SpeculativeMethodConfig::Mtp { .. } => PlanningContextType::Mtp,
+                    icn_contracts::SpeculativeMethodConfig::DFlash { .. }
+                    | icn_contracts::SpeculativeMethodConfig::DSpark { .. } => {
+                        PlanningContextType::SpeculativeDraft
+                    }
+                },
                 0,
                 NonZeroU32::new(plan.max_sequences),
             )
         } else {
-            let (snapshots, outputs) = match plan.mtp {
-                MtpConfig::Enabled { n_max, .. } => (
+            let (snapshots, outputs) = match plan.speculative {
+                SpeculativeDecodingConfig::Enabled { n_max, .. } => (
                     n_max,
                     NonZeroU32::new(
                         plan.max_sequences
@@ -923,7 +1045,7 @@ fn planning_request(
                             .min(plan.batch_size),
                     ),
                 ),
-                MtpConfig::Disabled { .. } => (0, None),
+                SpeculativeDecodingConfig::Disabled { .. } => (0, None),
             };
             (
                 plan.model_path.clone(),
@@ -948,6 +1070,21 @@ fn planning_request(
             tensor_split: plan.execution.tensor_split.clone(),
             use_mmap: plan.execution.use_mmap,
             use_mlock: plan.execution.use_mlock,
+            load_mtp: matches!(
+                plan.speculative,
+                SpeculativeDecodingConfig::Enabled {
+                    source: SpeculativeDraftSource::Embedded,
+                    method: icn_contracts::SpeculativeMethodConfig::Mtp { .. },
+                    ..
+                }
+            ) || (speculative_context
+                && matches!(
+                    plan.speculative,
+                    SpeculativeDecodingConfig::Enabled {
+                        method: icn_contracts::SpeculativeMethodConfig::Mtp { .. },
+                        ..
+                    }
+                )),
             cache_type_k,
             cache_type_v,
             flash_attention: plan.execution.flash_attention,
@@ -964,13 +1101,13 @@ fn planning_request(
     })
 }
 
-fn estimate_mtp_report(
+fn estimate_speculative_report(
     backend: &LlamaBackend,
     plan: &ExecutionIntent,
 ) -> Result<Option<FitReport>, AssessmentError> {
-    match plan.mtp {
-        MtpConfig::Disabled { .. } => Ok(None),
-        MtpConfig::Enabled { .. } => Ok(Some(assess_linked_model_with_backend(
+    match plan.speculative {
+        SpeculativeDecodingConfig::Disabled { .. } => Ok(None),
+        SpeculativeDecodingConfig::Enabled { .. } => Ok(Some(assess_linked_model_with_backend(
             backend,
             &planning_request(plan, true)?,
             &planning_request(plan, false)?,
@@ -978,11 +1115,11 @@ fn estimate_mtp_report(
     }
 }
 
-fn mtp_includes_model(plan: &ExecutionIntent) -> bool {
+fn speculative_includes_model(plan: &ExecutionIntent) -> bool {
     matches!(
-        plan.mtp,
-        MtpConfig::Enabled {
-            source: MtpSource::Separate { .. },
+        plan.speculative,
+        SpeculativeDecodingConfig::Enabled {
+            source: SpeculativeDraftSource::Separate { .. },
             ..
         }
     )
@@ -2170,8 +2307,8 @@ fn capacity_summary(
     topology: &MemoryTopology,
     devices: &[FitDeviceEstimate],
     measurement: Measurement,
-    mtp_devices: Option<&[FitDeviceEstimate]>,
-    mtp_includes_model: bool,
+    speculative_devices: Option<&[FitDeviceEstimate]>,
+    speculative_includes_model: bool,
     projectors: &[ProjectorMemory],
 ) -> Result<CapacitySummary, AssessmentError> {
     #[cfg(not(feature = "mtmd"))]
@@ -2194,17 +2331,17 @@ fn capacity_summary(
             ))
             .map_err(accounting_error)?;
     }
-    if let Some(mtp_devices) = mtp_devices {
-        for device in mtp_devices {
+    if let Some(speculative_devices) = speculative_devices {
+        for device in speculative_devices {
             let Some(estimate) = device.initial else {
                 continue;
             };
             accountant
                 .record(native_memory_charge(
-                    MemoryChargeOwner::Mtp,
+                    MemoryChargeOwner::SpeculativeDraft,
                     device,
                     estimate,
-                    mtp_includes_model,
+                    speculative_includes_model,
                 ))
                 .map_err(accounting_error)?;
         }
@@ -2279,7 +2416,7 @@ pub fn assess_model_with_backend(
     Ok(resolve_native_plan(backend, request, None, false)?.report)
 }
 
-/// Estimate an MTP model/context linked to the exact target execution context.
+/// Estimate a speculative model/context linked to the exact target execution context.
 pub fn assess_linked_model_with_backend(
     backend: &LlamaBackend,
     request: &PlanningRequest,
@@ -2297,10 +2434,11 @@ pub struct NativeParameterPlan {
     threads_batch: NonZeroU32,
 }
 
-/// Exact native parameter objects used only for MTP capability preflight. Construction lives
+/// Exact native parameter objects used only for speculative capability preflight. Construction lives
 /// beside ordinary load planning so speculative discovery cannot drift from runtime defaults.
-pub struct MtpPreflightParameters {
-    pub model_params: std::pin::Pin<Box<LlamaModelParams>>,
+pub struct SpeculativePreflightParameters {
+    pub target_model_params: std::pin::Pin<Box<LlamaModelParams>>,
+    pub draft_model_params: std::pin::Pin<Box<LlamaModelParams>>,
     pub target_context: LlamaContextParams,
     pub draft_context: LlamaContextParams,
 }
@@ -2330,23 +2468,20 @@ impl NativeParameterPlan {
     }
 }
 
-pub fn mtp_preflight_parameters(
+pub fn speculative_preflight_parameters(
     intent: &ExecutionIntent,
-    recurrent_snapshots: u32,
-) -> Result<MtpPreflightParameters, AssessmentError> {
-    let mut preflight = intent.clone();
-    preflight.mtp = MtpConfig::Enabled {
-        source: MtpSource::Bundled,
-        n_max: recurrent_snapshots,
-        n_min: 0,
-        p_min: 0.0,
-        cache_type_k: CacheType::F16,
-        cache_type_v: CacheType::F16,
-    };
-    let target = native_parameter_plan(&planning_request(&preflight, false)?)?;
-    let draft = native_parameter_plan(&planning_request(&preflight, true)?)?;
-    Ok(MtpPreflightParameters {
-        model_params: target.model_params,
+) -> Result<SpeculativePreflightParameters, AssessmentError> {
+    if !matches!(
+        intent.speculative,
+        SpeculativeDecodingConfig::Enabled { .. }
+    ) {
+        return Err(AssessmentError::MissingMeasurements);
+    }
+    let target = native_parameter_plan(&planning_request(intent, false)?)?;
+    let draft = native_parameter_plan(&planning_request(intent, true)?)?;
+    Ok(SpeculativePreflightParameters {
+        target_model_params: target.model_params,
+        draft_model_params: draft.model_params,
         target_context: target.context_params,
         draft_context: draft.context_params,
     })
@@ -2439,6 +2574,7 @@ fn native_model_params(options: &PlanningOptions) -> Result<LlamaModelParams, Na
         })
         .with_use_mmap(options.use_mmap)
         .with_use_mlock(options.use_mlock)
+        .with_load_mtp(options.load_mtp)
         .with_split_mode(match options.split_mode {
             SplitMode::None => llama_cpp_2::model::params::LlamaSplitMode::None,
             SplitMode::Layer => llama_cpp_2::model::params::LlamaSplitMode::Layer,
@@ -2470,6 +2606,7 @@ fn native_context_params(options: &PlanningOptions) -> LlamaContextParams {
         .with_context_type(match options.context_type {
             PlanningContextType::Target => LlamaContextType::Default,
             PlanningContextType::Mtp => LlamaContextType::Mtp,
+            PlanningContextType::SpeculativeDraft => LlamaContextType::Default,
         })
         .with_n_rs_seq(options.recurrent_snapshots)
         .with_n_outputs_max(options.maximum_outputs)
@@ -2572,7 +2709,6 @@ mod tests {
         assert_eq!(
             system_memory_thresholds(16 * gib),
             SystemMemoryThresholds {
-                warning_reserve_bytes: 4 * gib,
                 assess_reserve_bytes: 2 * gib,
                 abort_reserve_bytes: gib,
             },
@@ -2580,7 +2716,6 @@ mod tests {
         assert_eq!(
             system_memory_thresholds(64 * gib),
             SystemMemoryThresholds {
-                warning_reserve_bytes: 64 * gib / 5,
                 assess_reserve_bytes: 64 * gib / 10,
                 abort_reserve_bytes: 64 * gib / 20,
             },
@@ -2595,6 +2730,14 @@ mod tests {
         };
         assert_eq!(policy.reserve_for_domain(&MemoryDomainId::system()), 10);
         assert_eq!(policy.reserve_for_domain(&MemoryDomainId::new("device")), 2);
+    }
+
+    #[test]
+    fn native_model_params_preserve_mtp_layer_loading_policy() {
+        let mut options = PlanningOptions::default();
+        assert!(!native_model_params(&options).unwrap().load_mtp());
+        options.load_mtp = true;
+        assert!(native_model_params(&options).unwrap().load_mtp());
     }
 
     fn discovered_device(
@@ -2635,9 +2778,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: system_memory_bytes,
-                    current_available_bytes: system_memory_bytes,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: system_memory_bytes,
+                    physical_available_bytes: system_memory_bytes,
+                    allocation_capacity_bytes: system_memory_bytes,
+                    allocation_headroom_bytes: system_memory_bytes,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2708,9 +2852,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 32_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 32_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 32_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2789,9 +2934,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 32_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 32_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 32_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2846,9 +2992,10 @@ mod tests {
                 system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 40_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 40_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 40_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2870,9 +3017,10 @@ mod tests {
                 system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 1,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 1,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 1,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2897,7 +3045,7 @@ mod tests {
                 current_free_bytes: Some(20_000),
             })
         );
-        assert_eq!(first.system_memory.total_bytes, 64_000);
+        assert_eq!(first.system_memory.physical_capacity_bytes, 64_000);
         assert_ne!(
             first.memory_domains[0].current_free_bytes,
             second.memory_domains[0].current_free_bytes
@@ -2937,9 +3085,10 @@ mod tests {
                 system_product_name: Some("MacBook Pro".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 40_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 40_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 40_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -2956,7 +3105,7 @@ mod tests {
 
         assert_eq!(selected.memory_domains[0].total_capacity_bytes, 64_000);
         assert_eq!(selected.memory_domains[0].stable_capacity_bytes, 54_000);
-        assert_eq!(selected.system_memory.current_available_bytes, 40_000);
+        assert_eq!(selected.system_memory.physical_available_bytes, 40_000);
         let metal = selected.memory_domains[0]
             .devices
             .iter()
@@ -3014,9 +3163,10 @@ mod tests {
                 system_product_name: None,
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 40_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 40_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 40_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -3495,9 +3645,10 @@ mod tests {
                 system_product_name: Some("Mac".to_owned()),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
-                    total_bytes: 64_000,
-                    current_available_bytes: 50_000,
-                    warning_reserve_bytes: 0,
+                    physical_capacity_bytes: 64_000,
+                    physical_available_bytes: 50_000,
+                    allocation_capacity_bytes: 64_000,
+                    allocation_headroom_bytes: 50_000,
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
@@ -3874,7 +4025,7 @@ mod tests {
         assert!(matches!(
             error,
             AssessmentError::TopologyMismatch {
-                owner: MemoryChargeOwner::Mtp,
+                owner: MemoryChargeOwner::SpeculativeDraft,
                 backend: Some(ref backend),
                 physical_id: Some(ref physical_id),
                 native_index: 1,

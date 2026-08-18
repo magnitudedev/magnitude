@@ -13,34 +13,43 @@ import { Cause, Option } from "effect"
 import {
   deriveHardwareMemoryView,
   deriveCurrentLocalModel,
-  modelMemoryStatusDetail,
-  modelMemoryStatusLabel,
-  modelSlotInstanceId,
+  formatLocalModelDisplayName,
+  formatMemorySize,
+  formatModelDisplayName,
   modelSlotResidentAllocation,
   getDisplayWidth,
-  requiredMemoryBytes,
-  providerModelMemoryConditions,
-  selectedSlotModel,
+  getAnimationTimeSnapshot,
+  localModelConfigurationId,
+  localModelProviderModelId,
+  localModelCapabilities,
+  localModelSpeculativeMethodLabel,
   truncateToDisplayWidth,
+  type NotificationState,
   usePlatform,
   useLocalInferenceHardware,
+  useCatalogModels,
   useLocalModelActions,
-  useLocalModels,
+  useLocalModelsSelector,
   useModelSlotActions,
   usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
+  type CatalogModelReconciliationState,
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
+  servableModelBundlePackages,
   type LocalModel,
-  type LocalModelCatalogCandidate,
-  type LocalModelRecommendation,
+  type ModelSlotsState,
+  type ProviderCatalogEntry,
+  type ProviderModelDisabledReason,
   type ProviderModelId,
+  type ModelServingConfigurationId,
   type ProviderModelCatalogEntry,
+  type ReasoningEffort,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { HardwareMemoryDomain } from "../../components/hardware-memory-domain"
@@ -56,7 +65,9 @@ import {
 import { SingleLineInput } from "../composer/single-line-input"
 import {
   describeLocalHardware,
-  formatBytes,
+  modelDownloadFailureMessage,
+  localModelMaximumContextLength,
+  localModelBundleKey,
   localInferenceProgressLines,
   performanceRangeSpeedLabel,
 } from "../local-inference/view-model"
@@ -64,10 +75,28 @@ import { deriveSettingsAuthInfo } from "../overlays/auth-display"
 import {
   catalogDetailHints,
   catalogListHints,
+  CATALOG_INSPECTOR_CONTENT_WIDTH,
+  CATALOG_SPLIT_INSPECTOR_HEIGHTS,
   deriveCatalogLayout,
   formatCatalogModelLabel,
   type CatalogLayout,
 } from "./catalog-layout"
+import {
+  pentagonRadarValues,
+  retargetPentagonRadar,
+  type PentagonRadarTransition,
+} from "../../components/pentagon-radar"
+import { localModelRadarAxes } from "../local-inference/model-radar"
+import {
+  formatModelClassification,
+  formatModelReleaseRecency,
+} from "../local-inference/model-classification"
+import { CatalogRadarView } from "./catalog-radar-view"
+import {
+  modelMenusLocalModelsStateEquivalent,
+  selectModelMenusLocalModelsState,
+} from "./state"
+import { NotificationArea } from "../notification-area/notification-area"
 
 // Cloud is disabled.
 const ROOTS = ["models", "catalog", "hardware"] as const
@@ -90,6 +119,12 @@ interface ModelsMenuProps {
   readonly openRoot: (root: ModelMenuRoot) => void
   readonly openCatalogDetail: (providerModelId: string) => void
   readonly setRootSwitchingEnabled: (enabled: boolean) => void
+}
+
+interface ModelsMenuOrdering {
+  readonly selectedModel: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>
+  readonly recentModelKeys: readonly string[]
+  readonly favoriteKeys: ReadonlySet<string>
 }
 
 interface CatalogMenuProps {
@@ -136,24 +171,301 @@ const formatContextWindow = (tokens: number): string =>
 const providerModelKey = (model: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">): string =>
   `${model.providerId}:${model.providerModelId}`
 
-const catalogModels = (
+interface CatalogContents {
+  readonly providers: readonly ProviderCatalogEntry[]
+  readonly models: readonly ProviderModelCatalogEntry[]
+}
+
+const catalogContents = (
   config: ReturnType<typeof useModelConfig>,
-): readonly ProviderModelCatalogEntry[] => Option.getOrElse(
-  Option.flatMap(Result.value(config.catalog), ({ state }) =>
+): CatalogContents => Option.getOrElse(
+  Option.map(Result.value(config.catalog), ({ state }) =>
     ProviderModelCatalogLifecycle.match(state, {
-      Loading: () => Option.none(),
-      Ready: ({ models }) => Option.some(models),
-      Refreshing: ({ models }) => Option.some(models),
-      Degraded: ({ models }) => Option.some(models),
-      Unavailable: () => Option.none(),
+      Loading: () => ({ providers: [], models: [] }),
+      Ready: ({ providers, models }) => ({ providers, models }),
+      Refreshing: ({ providers, models }) => ({ providers, models }),
+      Degraded: ({ providers, models }) => ({ providers, models }),
+      Unavailable: ({ providers }) => ({ providers, models: [] }),
     })),
-  () => [],
+  () => ({ providers: [], models: [] }),
 )
 
-export function ModelMenusContainer({
-  downloadSummary,
+const catalogModels = (config: ReturnType<typeof useModelConfig>) =>
+  catalogContents(config).models
+
+const providerKindLabel = (kind: ProviderCatalogEntry["kind"]): string => {
+  switch (kind) {
+    case "Custom": return "Custom"
+    case "Local": return "Local"
+    case "Hosted": return "Cloud"
+  }
+}
+
+export const providerDisabledStatus = (reason: ProviderModelDisabledReason): string => {
+  switch (reason) {
+    case "insufficient_resources": return "Insufficient resources"
+    case "provider_unavailable": return "Provider unavailable"
+    case "model_unavailable": return "Model unavailable"
+    case "installation_unavailable": return "Installation missing"
+    case "incompatible_runtime": return "Incompatible runtime"
+    case "invalid_configuration": return "Invalid configuration"
+    default: {
+      const unhandled: never = reason
+      return unhandled
+    }
+  }
+}
+
+const installedOriginStatus = (
+  origins: readonly ("Magnitude" | "HuggingFaceCache")[],
+): string => origins.every((origin) => origin === "HuggingFaceCache")
+  ? "Installed (HF)"
+  : "Installed"
+
+export const localModelInstalledStatus = (
+  model: LocalModel,
+): string => model.acquisitionState._tag === "Installed"
+  ? installedOriginStatus(model.acquisitionState.packages.map(({ origin }) => origin))
+  : "Installed"
+
+export const localModelReadinessStatus = (
+  model: LocalModel,
+): string => {
+  if (model.servingState._tag === "Resolving") return "Resolving"
+  if (model.servingState._tag === "Assessing") return "Assessing"
+  if (model.servingState._tag === "Failed") return "Error"
+
+  const assessment = model.servingState.assessment
+  if (assessment._tag === "Incompatible") return "Error"
+  if (assessment._tag === "DoesNotFit") return "Doesn’t fit"
+  if (model.upgradeState._tag === "Available") return "Update available"
+  if (model.upgradeState._tag === "Upgrading") return "Updating"
+  if (model.upgradeState._tag === "Failed") return "Update error"
+  return model.acquisitionState._tag === "Installed"
+    ? localModelInstalledStatus(model)
+    : "Available"
+}
+
+export type ModelsMenuEntry =
+  | {
+      readonly _tag: "Local"
+      readonly id: string
+      readonly model: LocalModel
+    }
+  | {
+      readonly _tag: "LocalStatus"
+      readonly id: string
+      readonly model: LocalModel
+    }
+  | {
+      readonly _tag: "Provider"
+      readonly id: string
+      readonly model: ProviderModelCatalogEntry
+      readonly provider: ProviderCatalogEntry
+    }
+
+export const modelsMenuStatusPresentation = (
+  status: string,
+): { readonly label: string; readonly tone: "muted" | "warning" } =>
+  status === "Low free memory"
+    ? { label: `! ${status}`, tone: "warning" }
+    : { label: status, tone: "muted" }
+
+const modelsMenuProviderModel = (
+  entry: ModelsMenuEntry,
+): ProviderModelCatalogEntry | undefined => entry._tag === "Provider"
+  ? entry.model
+  : undefined
+
+const modelsMenuLocalModel = (entry: ModelsMenuEntry): LocalModel | undefined =>
+  entry._tag === "Local" ? entry.model
+    : entry._tag === "LocalStatus" ? entry.model : undefined
+
+const modelsMenuDisplayName = (entry: ModelsMenuEntry): string => entry._tag === "Local"
+  ? formatLocalModelDisplayName(entry.model)
+  : entry._tag === "LocalStatus"
+    ? formatLocalModelDisplayName(entry.model)
+    : formatModelDisplayName(entry.model.displayName, entry.model.variantLabel)
+
+const modelsMenuContextLength = (entry: ModelsMenuEntry): Option.Option<number> => entry._tag === "Local"
+  ? entry.model.servingState._tag === "Assessed"
+    ? Option.some(entry.model.servingState.configuration.profile.contextLength)
+    : localModelMaximumContextLength(entry.model)
+  : entry._tag === "Provider"
+    ? Option.some(entry.model.contextWindow)
+    : localModelMaximumContextLength(entry.model)
+
+const modelsMenuContextLabel = (entry: ModelsMenuEntry): string => Option.match(
+  modelsMenuContextLength(entry),
+  {
+    onNone: () => "Unknown",
+    onSome: formatContextWindow,
+  },
+)
+
+const modelsMenuOfferingKey = (entry: ModelsMenuEntry): Option.Option<string> => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (providerModel !== undefined) return Option.some(providerModelKey(providerModel))
+  const localModel = modelsMenuLocalModel(entry)
+  return localModel === undefined
+    ? Option.none()
+    : Option.map(localModelProviderModelId(localModel), (providerModelId) =>
+        `${LOCAL_PROVIDER_ID}:${providerModelId}`)
+}
+
+const modelsMenuProviderIdentity = (
+  entry: ModelsMenuEntry,
+): Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">> => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (providerModel !== undefined) return Option.some(providerModel)
+  const localModel = modelsMenuLocalModel(entry)
+  return localModel === undefined
+    ? Option.none()
+    : Option.map(localModelProviderModelId(localModel), (providerModelId) => ({
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId,
+      }))
+}
+
+const sameProviderModel = (
+  left: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">,
+  right: Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">,
+): boolean => left.providerId === right.providerId
+  && left.providerModelId === right.providerModelId
+
+export const modelsMenuEntryIsSelected = (
+  entry: ModelsMenuEntry,
+  selectedModel: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): boolean => Option.exists(
+  selectedModel,
+  (selected) => entry._tag === "Provider"
+    ? sameProviderModel(entry.model, selected)
+    : Option.exists(
+        Option.fromNullable(modelsMenuLocalModel(entry)),
+        (model) => Option.contains(localModelProviderModelId(model), selected.providerModelId)
+          && selected.providerId === LOCAL_PROVIDER_ID,
+      ),
+)
+
+export const modelsMenuEntryIsEligible = (
+  entry: ModelsMenuEntry,
+  selectedAtOpen: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): boolean => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (entry._tag !== "Provider") return true
+  return providerModel !== undefined
+    && providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
+    && (providerModel.availability._tag === "Available"
+      || modelsMenuEntryIsSelected(entry, selectedAtOpen))
+}
+
+export const modelsMenuOrderingAtOpen = (
+  catalogReady: boolean,
+  slotsReady: boolean,
+  slots: Option.Option<ModelSlotsState>,
+  selected: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): Option.Option<ModelsMenuOrdering> => !catalogReady || !slotsReady
+  ? Option.none()
+  : Option.some({
+      selectedModel: selected,
+      recentModelKeys: Option.match(slots, {
+        onNone: () => [],
+        onSome: ({ recentModels }) => recentModels.primary.map(providerModelKey),
+      }),
+      favoriteKeys: new Set(Option.match(slots, {
+        onNone: () => [],
+        onSome: ({ favoriteModels }) => favoriteModels.map(providerModelKey),
+      })),
+    })
+
+export const buildModelsMenuEntries = (
+  localModels: readonly LocalModel[],
+  providerModels: readonly ProviderModelCatalogEntry[],
+  providers: readonly ProviderCatalogEntry[],
+): readonly ModelsMenuEntry[] => {
+  return [
+    ...localModels.flatMap((model): readonly ModelsMenuEntry[] => {
+      if (model.acquisitionState._tag !== "Installed") return []
+      const bundleKey = localModelBundleKey(model)
+      return [{
+        _tag: model.servingState._tag === "Assessed"
+          && model.servingState.assessment._tag === "Fits"
+          ? "Local" : "LocalStatus",
+        id: `local:${bundleKey}:status`,
+        model,
+      }]
+    }),
+    ...providerModels.flatMap((model): readonly ModelsMenuEntry[] => {
+      if (model.providerId === LOCAL_PROVIDER_ID) return []
+      const provider = providers.find(({ providerId }) => providerId === model.providerId)
+      return provider === undefined ? [] : [{
+        _tag: "Provider",
+        id: providerModelKey(model),
+        model,
+        provider,
+      }]
+    }),
+  ]
+}
+
+export const catalogLocalModels = (
+  models: readonly LocalModel[],
+): readonly LocalModel[] => models.filter((model) =>
+  model.catalogMembershipState._tag === "InCatalog"
+  && model.servingState._tag === "Assessed"
+  && model.servingState.assessment._tag === "Fits")
+
+export type ModelsMenuSelectionAction =
+  | {
+      readonly _tag: "AssignProvider"
+      readonly providerModel: ProviderModelCatalogEntry
+    }
+  | {
+      readonly _tag: "AssignLocal"
+      readonly providerModelId: ProviderModelId
+      readonly reasoningEffort: Option.Option<ReasoningEffort>
+    }
+  | {
+      readonly _tag: "InstallConfiguration"
+      readonly configurationId: ModelServingConfigurationId
+      readonly reasoningEffort: Option.Option<ReasoningEffort>
+    }
+
+export const modelsMenuSelectionAction = (
+  entry: ModelsMenuEntry,
+): Option.Option<ModelsMenuSelectionAction> => {
+  const providerModel = modelsMenuProviderModel(entry)
+  if (providerModel !== undefined) {
+    return providerModel.supportedSlots.includes(PRIMARY_SLOT_ID)
+      && providerModel.availability._tag === "Available"
+      ? Option.some({ _tag: "AssignProvider", providerModel })
+      : Option.none()
+  }
+  if (entry._tag === "Provider"
+    || entry._tag === "LocalStatus") return Option.none()
+  const { model } = entry
+  if (model.servingState._tag !== "Assessed"
+    || model.servingState.assessment._tag !== "Fits") return Option.none()
+  const reasoningEffort = model.servingState.capabilities.reasoning.defaultEffort
+  if (model.servingState.availabilityState._tag === "Selectable") {
+    return Option.some({
+      _tag: "AssignLocal",
+      providerModelId: model.servingState.availabilityState.providerModelId,
+      reasoningEffort,
+    })
+  }
+  if (model.servingState.availabilityState._tag !== "Installable") return Option.none()
+  return Option.some({
+    _tag: "InstallConfiguration",
+    configurationId: model.servingState.configuration.id,
+    reasoningEffort,
+  })
+}
+
+export const ModelMenusContainer = memo(function ModelMenusContainer({
+  notificationState,
 }: {
-  readonly downloadSummary: string | null
+  readonly notificationState: NotificationState | null
 }): ReactNode {
   const menu = useAtomValue(modelMenuStateAtom)
   const setMenu = useAtomSet(modelMenuStateAtom)
@@ -200,10 +512,10 @@ export function ModelMenusContainer({
         width: "100%",
         flexShrink: 0,
         flexDirection: "column",
-        backgroundColor: "transparent",
+        backgroundColor: theme.background.canvas,
       }}
     >
-      <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", backgroundColor: theme.menuBg }}>
+      <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", backgroundColor: theme.background.menu }}>
         {menu.root === "models" && <ModelsMenu openRoot={openRoot} openCatalogDetail={openCatalogDetail} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "catalog" && <CatalogMenu initialCatalogDetailId={catalogDetailId} setRootSwitchingEnabled={setAtRootLevel} />}
         {menu.root === "hardware" && <HardwareMenu />}
@@ -216,7 +528,7 @@ export function ModelMenusContainer({
           flexShrink: 0,
           borderStyle: "single",
           border: ["bottom"],
-          borderColor: theme.menuBg,
+          borderColor: theme.background.menu,
           customBorderChars: {
             topLeft: "",
             bottomLeft: "",
@@ -237,7 +549,7 @@ export function ModelMenusContainer({
           flexShrink: 0,
           flexDirection: "row",
           alignItems: "center",
-          backgroundColor: "transparent",
+          backgroundColor: theme.background.canvas,
           paddingLeft: 1,
           paddingRight: 1,
           height: 1,
@@ -255,8 +567,8 @@ export function ModelMenusContainer({
             >
               <text
                 style={{
-                  fg: active ? theme.menuBg : theme.foreground,
-                  ...(active ? { bg: theme.foreground } : {}),
+                  fg: active ? theme.background.menu : theme.text.body,
+                  ...(active ? { bg: theme.text.body } : {}),
                 }}
                 attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}
               >
@@ -269,19 +581,23 @@ export function ModelMenusContainer({
             </Button>
           )
         })}
-        {downloadSummary && (
-          <Button onClick={() => openRoot("catalog")}>
-            <text style={{ fg: theme.primary }}>{downloadSummary}</text>
-          </Button>
+        {notificationState !== null && (
+          <NotificationArea
+            notificationState={notificationState}
+            theme={theme}
+            onAction={(action) => {
+              if (action === "openCatalog") openRoot("catalog")
+            }}
+          />
         )}
         <box style={{ flexGrow: 1 }} />
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.metadata }}>
           {atRootLevel ? "←/→ switch menus" : "←/→ switch menus · Esc back"}
         </text>
       </box>
     </box>
   )
-}
+})
 
 const MenuHeader = memo(function MenuHeader({
   title,
@@ -306,7 +622,7 @@ const MenuHeader = memo(function MenuHeader({
   const [sectionHovered, setSectionHovered] = useState(false)
   const sectionTitle = (
     <text
-      style={{ fg: theme.foreground }}
+      style={{ fg: theme.text.body }}
       attributes={TextAttributes.BOLD | (sectionHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE)}
     >
       {title.toUpperCase()}
@@ -328,17 +644,17 @@ const MenuHeader = memo(function MenuHeader({
             {sectionTitle}
           </Button>
         ) : sectionTitle}
-        {!compact && subtitle && <text style={{ fg: theme.muted }}> · {subtitle}</text>}
-        {!compact && selection && <text style={{ fg: theme.foreground }}> → {selection}</text>}
+        {!compact && subtitle && <text style={{ fg: theme.text.metadata }}> · {subtitle}</text>}
+        {!compact && selection && <text style={{ fg: theme.text.body }}> → {selection}</text>}
         <box style={{ flexGrow: 1 }} />
-        {summary && <text style={{ fg: theme.muted }}>{summary}</text>}
+        {summary && <text style={{ fg: theme.text.metadata }}>{summary}</text>}
       </box>
       {compact && selection && (
-        <text style={{ fg: theme.foreground }} wrapMode="none">
+        <text style={{ fg: theme.text.body }} wrapMode="none">
           {truncateToDisplayWidth(selection, compactSelectionWidth)}
         </text>
       )}
-      {displayedHints && <text style={{ fg: theme.muted }} wrapMode="none">{displayedHints}</text>}
+      {displayedHints && <text style={{ fg: theme.text.metadata }} wrapMode="none">{displayedHints}</text>}
     </box>
   )
 })
@@ -351,145 +667,183 @@ const MenuAction = memo(function MenuAction({
   tone = "normal",
   onClick,
   onMouseOver,
+  onMouseOut,
 }: {
   readonly label: string
   readonly focused: boolean
   readonly tone?: MenuActionTone
   readonly onClick: () => void
   readonly onMouseOver: () => void
+  readonly onMouseOut?: () => void
 }) {
   const theme = useTheme()
   const color = focused
-    ? theme.primary
+    ? theme.accent
     : tone === "primary"
-      ? theme.primary
+      ? theme.accent
       : tone === "link"
         ? theme.link
         : tone === "warning"
-          ? theme.warning
+          ? theme.status.warning
           : tone === "error"
-            ? theme.error
-            : theme.foreground
+            ? theme.status.failure
+            : theme.text.body
   return (
-    <Button onClick={onClick} onMouseOver={onMouseOver}>
+    <Button onClick={onClick} onMouseOver={onMouseOver} onMouseOut={onMouseOut}>
       <text style={{ fg: color }}>{focused ? "› " : "  "}{label}</text>
     </Button>
   )
 })
 
-const ModelsMenu = memo(function ModelsMenu({
+const ModelsMenu = memo(function ModelsMenu(props: ModelsMenuProps) {
+  const theme = useTheme()
+  const config = useModelConfig()
+  const catalogReady = Result.match(config.catalog, {
+    onInitial: () => false,
+    onFailure: () => true,
+    onSuccess: ({ value: { state } }) => ProviderModelCatalogLifecycle.match(state, {
+      Loading: () => false,
+      Ready: () => true,
+      Refreshing: () => true,
+      Degraded: () => true,
+      Unavailable: () => true,
+    }),
+  })
+  const slotsReady = !Result.isInitial(config.slots)
+  const slots = Option.map(Result.value(config.slots), ({ state }) => state)
+  const selected = Option.flatMap(config.selections, ({ primary }) => primary)
+  const ordering = modelsMenuOrderingAtOpen(catalogReady, slotsReady, slots, selected)
+
+  return Option.match(ordering, {
+    onNone: () => <text style={{ fg: theme.status.progress }}>Loading models…</text>,
+    onSome: (initialOrdering) => (
+      <ReadyModelsMenu {...props} config={config} initialOrdering={initialOrdering} />
+    ),
+  })
+})
+
+const ReadyModelsMenu = memo(function ReadyModelsMenu({
   openRoot,
   openCatalogDetail,
   setRootSwitchingEnabled,
-}: ModelsMenuProps) {
+  config,
+  initialOrdering,
+}: ModelsMenuProps & {
+  readonly config: ReturnType<typeof useModelConfig>
+  readonly initialOrdering: ModelsMenuOrdering
+}) {
   const theme = useTheme()
-  const config = useModelConfig()
-  const localModels = useLocalModels()
-  const slotActions = useModelSlotActions()
-  const hardware = Option.getOrUndefined(Result.value(useLocalInferenceHardware()))
-  const models = catalogModels(config)
-  const catalogSnapshot = Result.value(config.catalog)
-  const slotsSnapshot = Result.value(config.slots)
-  const selected = Option.flatMap(
-    Option.all({ catalog: catalogSnapshot, slots: slotsSnapshot }),
-    ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
+  const localSnapshot = useLocalModelsSelector(
+    selectModelMenusLocalModelsState,
+    modelMenusLocalModelsStateEquivalent,
   )
-  const selectedKey = Option.match(selected, {
-    onNone: () => null,
-    onSome: ({ model }) => providerModelKey(model),
-  })
-  const currentRecentModelIds = Option.match(slotsSnapshot, {
-    onNone: () => [] as readonly string[],
-    onSome: ({ state }) => state.recentModelIds.primary,
-  })
+  const modelActions = useLocalModelActions()
+  const slotActions = useModelSlotActions()
+  const catalog = catalogContents(config)
+  const slotsSnapshot = Result.value(config.slots)
+  const selectedModel = Option.flatMap(config.selections, ({ primary }) => primary)
   const currentFavoriteKeys = new Set(config.favoriteModels.map(providerModelKey))
-  const [ordering] = useState(() => ({
-    selectedKey,
-    recentModelIds: currentRecentModelIds,
-    favoriteKeys: currentFavoriteKeys,
-  }))
-  const eligible = models
-    .filter((model) =>
-      model.supportedSlots.includes(PRIMARY_SLOT_ID)
-      && (model.availability._tag === "Available"
-        || providerModelKey(model) === selectedKey
-        || (model.providerId === LOCAL_PROVIDER_ID
-          && model.availability.reason === "insufficient_resources")))
+  const [ordering] = useState(initialOrdering)
+  const projectedLocalModels = Option.match(localSnapshot, {
+    onNone: () => [] as readonly LocalModel[],
+    onSome: ({ models }) => models,
+  })
+  const entries = buildModelsMenuEntries(
+    projectedLocalModels,
+    catalog.models,
+    catalog.providers,
+  )
+  const isSelected = (entry: ModelsMenuEntry): boolean =>
+    modelsMenuEntryIsSelected(entry, selectedModel)
+  const isFavorite = (entry: ModelsMenuEntry): boolean =>
+    Option.exists(modelsMenuOfferingKey(entry), (key) => currentFavoriteKeys.has(key))
+  const isEligible = (entry: ModelsMenuEntry): boolean => {
+    return modelsMenuEntryIsEligible(entry, ordering.selectedModel)
+  }
+  const eligible = entries
+    .filter(isEligible)
     .sort((left, right) => {
-      const leftFavorite = ordering.favoriteKeys.has(providerModelKey(left))
-      const rightFavorite = ordering.favoriteKeys.has(providerModelKey(right))
+      const leftKey = modelsMenuOfferingKey(left)
+      const rightKey = modelsMenuOfferingKey(right)
+      const leftFavorite = Option.exists(leftKey, (key) => ordering.favoriteKeys.has(key))
+      const rightFavorite = Option.exists(rightKey, (key) => ordering.favoriteKeys.has(key))
       if (leftFavorite !== rightFavorite) return leftFavorite ? -1 : 1
-      const leftSelected = providerModelKey(left) === ordering.selectedKey
-      const rightSelected = providerModelKey(right) === ordering.selectedKey
+      const leftSelected = modelsMenuEntryIsSelected(left, ordering.selectedModel)
+      const rightSelected = modelsMenuEntryIsSelected(right, ordering.selectedModel)
       if (leftSelected !== rightSelected) return leftSelected ? -1 : 1
-      const leftRecency = ordering.recentModelIds.indexOf(left.providerModelId)
-      const rightRecency = ordering.recentModelIds.indexOf(right.providerModelId)
+      const leftProviderModel = modelsMenuProviderModel(left)
+      const rightProviderModel = modelsMenuProviderModel(right)
+      const leftRecency = leftProviderModel === undefined
+        ? -1
+        : ordering.recentModelKeys.indexOf(providerModelKey(leftProviderModel))
+      const rightRecency = rightProviderModel === undefined
+        ? -1
+        : ordering.recentModelKeys.indexOf(providerModelKey(rightProviderModel))
       if (leftRecency !== rightRecency) {
         if (leftRecency < 0) return 1
         if (rightRecency < 0) return -1
         return leftRecency - rightRecency
       }
-      const leftLocal = left.providerId === LOCAL_PROVIDER_ID
-      const rightLocal = right.providerId === LOCAL_PROVIDER_ID
+      const leftLocal = left._tag !== "Provider"
+      const rightLocal = right._tag !== "Provider"
       if (leftLocal !== rightLocal) return leftLocal ? -1 : 1
-      return left.displayName.localeCompare(right.displayName)
+      return modelsMenuDisplayName(left).localeCompare(modelsMenuDisplayName(right))
+        || left.id.localeCompare(right.id)
     })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(null)
-  const cursorIndex = Math.max(0, eligible.findIndex((model) => providerModelKey(model) === cursorId))
+  const cursorIndex = Math.max(0, eligible.findIndex(({ id }) => id === cursorId))
   const cursor = eligible[cursorIndex]
-  const detail = eligible.find((model) => providerModelKey(model) === detailId) ?? null
-  const localSnapshot = Result.value(localModels)
-  const localCatalogCandidates = Option.match(localSnapshot, {
-    onNone: () => [] as readonly LocalModelCatalogCandidate[],
-    onSome: (models) =>
-      models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
-  })
-  const requirementFor = (model: ProviderModelCatalogEntry): string => {
-    if (model.providerId !== LOCAL_PROVIDER_ID) return "Cloud"
-    return Option.match(model.memory, {
+  const detail = eligible.find(({ id }) => id === detailId) ?? null
+  const memoryFor = (entry: ModelsMenuEntry) => {
+    const model = modelsMenuLocalModel(entry)
+    return model?.servingState._tag === "Assessed"
+      && model.servingState.assessment._tag === "Fits"
+      ? Option.some(model.servingState.assessment.memory)
+      : Option.none()
+  }
+  const requirementFor = (entry: ModelsMenuEntry): string => {
+    if (entry._tag === "Provider") {
+      return providerKindLabel(entry.provider.kind)
+    }
+    if (entry._tag === "LocalStatus") {
+      const assessment = entry.model.servingState._tag === "Assessed"
+        ? entry.model.servingState.assessment
+        : undefined
+      if (assessment?._tag === "DoesNotFit") {
+        return formatMemorySize(assessment.totalRequiredBytes)
+      }
+      return Option.match(memoryFor(entry), {
+        onNone: () => "—",
+        onSome: ({ totalRequiredBytes }) => formatMemorySize(totalRequiredBytes),
+      })
+    }
+    const assessment = entry.model.servingState._tag === "Assessed"
+      ? entry.model.servingState.assessment
+      : undefined
+    if (assessment?._tag === "DoesNotFit") {
+      return formatMemorySize(assessment.totalRequiredBytes)
+    }
+    return Option.match(memoryFor(entry), {
       onNone: () => "—",
-      onSome: (memory) => formatBytes(requiredMemoryBytes(memory)),
+      onSome: ({ totalRequiredBytes }) => formatMemorySize(totalRequiredBytes),
     })
   }
-  const assessingRequirementFor = (model: LocalModel): string => {
-    const candidate = localCatalogCandidates.find(({ targetId }) => targetId === model.targetId)
-    return candidate ? formatBytes(requiredMemoryBytes(candidate.memory)) : "—"
-  }
-  const assessing = Option.match(localSnapshot, {
-    onNone: () => [] as readonly LocalModel[],
-    onSome: (models) => models.models.filter((model) =>
-      model.download._tag === "Downloaded" && model.assessment._tag === "Assessing"),
-  })
   const primarySlot = Option.match(slotsSnapshot, {
     onNone: () => null,
     onSome: ({ state }) => state.slots.primary,
   })
-  const residentAllocation = primarySlot === null
-    ? Option.none()
-    : modelSlotResidentAllocation(primarySlot)
-  const detailIsLocal = detail?.providerId === LOCAL_PROVIDER_ID
-  const detailIsSelected = detail !== null && providerModelKey(detail) === selectedKey
-  const detailLocalModel = detailIsLocal && detail
-    ? Option.match(localSnapshot, {
-        onNone: () => undefined,
-        onSome: (models) => models.models.find(({ offerings }) =>
-          offerings.some(({ providerModelId }) => providerModelId === detail.providerModelId)),
-      })
-    : undefined
-  const detailCatalogCandidate = detailLocalModel && detail
-    ? localCatalogCandidates.find(({ configurationId }) =>
-        detailLocalModel.offerings.some((offering) =>
-          offering.providerModelId === detail.providerModelId
-          && offering.configurationId === configurationId))
+  const detailIsLocal = detail !== null && detail._tag !== "Provider"
+  const detailIsSelected = detail !== null && isSelected(detail)
+  const detailLocalModel = detail === null ? undefined : modelsMenuLocalModel(detail)
+  const detailCatalogConfigurationId = detailLocalModel?.servingState._tag === "Assessed"
+    && detailLocalModel.catalogMembershipState._tag === "InCatalog"
+    ? detailLocalModel.servingState.configuration.id
     : undefined
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
     const actions: ("select" | "load" | "stop" | "catalog")[] = []
-    const memoryConditions = providerModelMemoryConditions(detail, hardware, residentAllocation)
-    if (!detailIsSelected
-      && detail.availability._tag === "Available"
-      && detail.supportedSlots.includes(PRIMARY_SLOT_ID)) actions.push("select")
+    if (!detailIsSelected && Option.isSome(modelsMenuSelectionAction(detail))) actions.push("select")
     if (detailIsLocal
       && detailIsSelected
       && primarySlot?._tag === "ConfiguredLocal"
@@ -501,59 +855,100 @@ const ModelsMenu = memo(function ModelsMenu({
       && primarySlot
       && primarySlot._tag === "ConfiguredLocal"
       && primarySlot.actions.includes("Stop")) actions.push("stop")
-    if (detailCatalogCandidate) actions.push("catalog")
+    if (detailCatalogConfigurationId) actions.push("catalog")
     return actions
-  }, [detail, detailCatalogCandidate, detailIsLocal, detailIsSelected, hardware, primarySlot, residentAllocation])
+  }, [detail, detailCatalogConfigurationId, detailIsLocal, detailIsSelected, primarySlot])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
+  const installationFailed = modelActions.latestInstallationFailed
 
-  const statusFor = useCallback((model: ProviderModelCatalogEntry): string => {
-    const isSelected = providerModelKey(model) === selectedKey
-    if (model.providerId === LOCAL_PROVIDER_ID) {
-      const memoryConditions = providerModelMemoryConditions(model, hardware, residentAllocation)
-      if (isSelected
-        && primarySlot?._tag === "ConfiguredLocal"
-        && Option.isSome(primarySlot.instance)
-        && memoryConditions.lacksCurrentHeadroom) return "Selected"
-      const memoryLabel = modelMemoryStatusLabel(memoryConditions)
-      if (memoryLabel !== "") return memoryLabel
-      if (model.availability._tag === "Disabled") return "Unavailable"
+  const statusFor = (entry: ModelsMenuEntry): string => {
+    const selectedEntry = isSelected(entry)
+    if (entry._tag === "LocalStatus") {
+      return localModelReadinessStatus(entry.model)
     }
-    if (isSelected) return "Selected"
-    return model.providerId === LOCAL_PROVIDER_ID ? "Installed" : "Available"
-  }, [hardware, primarySlot, residentAllocation, selectedKey])
+    if (entry._tag === "Local") {
+      const memory = memoryFor(entry)
+      if (selectedEntry
+        && primarySlot?._tag === "ConfiguredLocal"
+        && (primarySlot.residency._tag === "Loading"
+          || primarySlot.residency._tag === "Ready"
+          || primarySlot.residency._tag === "Stopping")
+        && Option.exists(memory, ({ currentHeadroomState }) =>
+          currentHeadroomState._tag === "Insufficient")) return "Selected"
+      if (Option.exists(memory, ({ currentHeadroomState }) =>
+        currentHeadroomState._tag === "Insufficient")) return "Low free memory"
+      if (Option.exists(memory, ({ systemUseState }) => systemUseState._tag === "High")) return "Tight fit"
+      const servingState = entry.model.servingState
+      if (servingState._tag === "Assessed"
+        && servingState.availabilityState._tag === "Unavailable") {
+        return servingState.availabilityState.failure.message
+      }
+    }
+    if (selectedEntry) return "Selected"
+    return entry._tag === "Local"
+      ? localModelInstalledStatus(entry.model)
+      : "Available"
+  }
 
-  const choose = useCallback((model: ProviderModelCatalogEntry) => {
-    if (!model.supportedSlots.includes(PRIMARY_SLOT_ID)) return
-    if (model.availability._tag !== "Available") return
-    config.updateSlotModel(PRIMARY_SLOT_ID, model.providerId, model.providerModelId)
-  }, [config])
+  const choose = useCallback((entry: ModelsMenuEntry) => {
+    const action = modelsMenuSelectionAction(entry)
+    if (Option.isNone(action)) return
+    if (action.value._tag === "AssignProvider") {
+      const { providerModel } = action.value
+      config.updateSlotModel(PRIMARY_SLOT_ID, providerModel.providerId, providerModel.providerModelId)
+      return
+    }
+    if (action.value._tag === "AssignLocal") {
+      slotActions.assign(PRIMARY_SLOT_ID, {
+        providerId: LOCAL_PROVIDER_ID,
+        providerModelId: action.value.providerModelId,
+        reasoningEffort: Option.getOrElse(
+          action.value.reasoningEffort,
+          () => ReasoningEffortSchema.make("none"),
+        ),
+      })
+      return
+    }
+    const createAction = action.value
+    modelActions.installAndAssign(
+      createAction.configurationId,
+      PRIMARY_SLOT_ID,
+      Option.getOrElse(
+        createAction.reasoningEffort,
+        () => ReasoningEffortSchema.make("none"),
+      ),
+    )
+  }, [config, modelActions, slotActions])
 
-  const toggleFavorite = useCallback((model: ProviderModelCatalogEntry) => {
-    config.setModelFavorite({
-      providerId: model.providerId,
-      providerModelId: model.providerModelId,
-    }, !currentFavoriteKeys.has(providerModelKey(model)))
+  const toggleFavorite = useCallback((entry: ModelsMenuEntry) => {
+    Option.match(modelsMenuProviderIdentity(entry), {
+      onNone: () => {},
+      onSome: (model) => config.setModelFavorite(
+        model,
+        !currentFavoriteKeys.has(providerModelKey(model)),
+      ),
+    })
   }, [config, currentFavoriteKeys])
 
   const runDetailAction = useCallback((action: typeof detailActions[number]) => {
     if (!detail) return
     if (action === "select") choose(detail)
-    else if (action === "load") void slotActions.load(PRIMARY_SLOT_ID)
-    else if (action === "stop" && primarySlot) {
-      Option.match(modelSlotInstanceId(primarySlot), {
-        onNone: () => {},
-        onSome: slotActions.stop,
-      })
+    else if (action === "load" && primarySlot?._tag === "ConfiguredLocal") {
+      void slotActions.load(PRIMARY_SLOT_ID)
     }
-    else if (detailCatalogCandidate) openCatalogDetail(detailCatalogCandidate.configurationId)
-  }, [choose, detail, detailCatalogCandidate, openCatalogDetail, primarySlot, slotActions])
+    else if (action === "stop" && primarySlot?._tag === "ConfiguredLocal") {
+      void slotActions.stop(PRIMARY_SLOT_ID)
+    }
+    else if (detailCatalogConfigurationId) openCatalogDetail(detailCatalogConfigurationId)
+  }, [choose, detail, detailCatalogConfigurationId, openCatalogDetail, primarySlot, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
     if (detail) {
-      if (key.name === "f" && !key.ctrl && !key.meta && !key.option) {
+      if (key.name === "f" && !key.ctrl && !key.meta && !key.option
+        && Option.isSome(modelsMenuProviderIdentity(detail))) {
         key.preventDefault()
         toggleFavorite(detail)
         return
@@ -599,12 +994,12 @@ const ModelsMenu = memo(function ModelsMenu({
     }
     if ((key.name === "up" || key.name === "k") && eligible.length > 0) {
       key.preventDefault()
-      setCursorId(providerModelKey(eligible[Math.max(0, cursorIndex - 1)]!))
+      setCursorId(eligible[Math.max(0, cursorIndex - 1)]!.id)
       return
     }
     if ((key.name === "down" || key.name === "j") && eligible.length > 0) {
       key.preventDefault()
-      setCursorId(providerModelKey(eligible[Math.min(eligible.length - 1, cursorIndex + 1)]!))
+      setCursorId(eligible[Math.min(eligible.length - 1, cursorIndex + 1)]!.id)
       return
     }
     if ((key.name === "return" || key.name === "enter") && cursor) {
@@ -612,7 +1007,8 @@ const ModelsMenu = memo(function ModelsMenu({
       choose(cursor)
       return
     }
-    if (key.name === "f" && !key.ctrl && !key.meta && !key.option && cursor) {
+    if (key.name === "f" && !key.ctrl && !key.meta && !key.option && cursor
+      && Option.isSome(modelsMenuProviderIdentity(cursor))) {
       key.preventDefault()
       toggleFavorite(cursor)
       return
@@ -620,7 +1016,7 @@ const ModelsMenu = memo(function ModelsMenu({
     if (key.name === "d" && cursor) {
       key.preventDefault()
       detailActionCursor.reset()
-      setDetailId(providerModelKey(cursor))
+      setDetailId(cursor.id)
       setRootSwitchingEnabled(false)
       return
     }
@@ -632,6 +1028,16 @@ const ModelsMenu = memo(function ModelsMenu({
   }, [choose, config, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, eligible, emptyActionCursor, focusedDetailAction, openRoot, runDetailAction, setRootSwitchingEnabled, toggleFavorite]))
 
   if (detail) {
+    const detailProviderModel = modelsMenuProviderModel(detail)
+    const detailHasProviderIdentity = Option.isSome(modelsMenuProviderIdentity(detail))
+    const detailCapabilities = detailProviderModel?.capabilities
+      ?? (detail._tag === "LocalStatus"
+        ? Option.getOrUndefined(localModelCapabilities(detail.model))
+        : detail._tag === "Local"
+          ? Option.getOrUndefined(localModelCapabilities(detail.model))
+          : undefined)
+    const detailFavorite = isFavorite(detail)
+    const detailMemory = memoryFor(detail)
     const detailActionLabel = {
       select: "Use this model",
       load: "Load model",
@@ -642,30 +1048,47 @@ const ModelsMenu = memo(function ModelsMenu({
       <>
         <MenuHeader
           title="Models"
-          selection={detail.displayName}
+          selection={modelsMenuDisplayName(detail)}
           onSectionClick={() => {
             setDetailId(null)
             setRootSwitchingEnabled(true)
           }}
-          hints={detailActions.length > 0 ? "↑↓ navigate · Enter choose · F favorite · Esc back" : "F favorite · Esc back"}
+          hints={detailActions.length > 0
+            ? !detailHasProviderIdentity
+              ? "↑↓ navigate · Enter choose · Esc back"
+              : "↑↓ navigate · Enter choose · F favorite · Esc back"
+            : !detailHasProviderIdentity ? "Esc back" : "F favorite · Esc back"}
         />
         <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
-            {currentFavoriteKeys.has(providerModelKey(detail)) ? "★ " : ""}{detail.displayName}
+          <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>
+            {detailFavorite ? "★ " : ""}{modelsMenuDisplayName(detail)}
           </text>
-          <text style={{ fg: theme.muted }}>
-            {detailIsLocal ? "Local" : "Cloud"} · {formatContextWindow(detail.contextWindow)} context · {statusFor(detail)}
+          <text style={{ fg: theme.text.metadata }}>
+            {detail._tag === "Provider" ? providerKindLabel(detail.provider.kind) : "Local"} · {modelsMenuContextLabel(detail)} context · {statusFor(detail)}
           </text>
-          {detailIsLocal && modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware, residentAllocation)) !== "" && (
-            <text style={{ fg: theme.warning }}>
-              {modelMemoryStatusDetail(providerModelMemoryConditions(detail, hardware, residentAllocation))}
+          {detailLocalModel && (
+            <>
+              {detailLocalModel.catalogMembershipState._tag === "InCatalog" && detailLocalModel.catalogMembershipState.catalogData.quantizationAware && (
+                <text style={{ fg: theme.text.metadata }}>Training: Quantization-aware</text>
+              )}
+            </>
+          )}
+          {detailIsLocal && Option.exists(detailMemory, ({ currentHeadroomState, systemUseState }) =>
+            currentHeadroomState._tag === "Insufficient" || systemUseState._tag === "High") && (
+            <text style={{ fg: theme.status.warning }}>
+              {Option.exists(detailMemory, ({ currentHeadroomState }) =>
+                currentHeadroomState._tag === "Insufficient")
+                ? "Not enough free memory right now"
+                : "Uses more than the recommended share of system memory"}
             </text>
           )}
-          <text style={{ fg: theme.muted }}>
-            {detail.capabilities.vision ? "Vision" : "No vision"} · Tools · {detail.capabilities.reasoning.supported ? "Reasoning" : "No reasoning"}
-          </text>
+          {detailCapabilities && (
+            <text style={{ fg: theme.text.metadata }}>
+              {detailCapabilities.vision ? "Vision" : "No vision"} · Tools · {detailCapabilities.reasoning.supported ? "Reasoning" : "No reasoning"}
+            </text>
+          )}
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
-            {detailIsSelected && <text style={{ fg: theme.success }}>● Current model</text>}
+            {detailIsSelected && <text style={{ fg: theme.status.success }}>● Current model</text>}
             {detailActions.map((action, index) => (
               <MenuAction
                 key={action}
@@ -687,7 +1110,7 @@ const ModelsMenu = memo(function ModelsMenu({
       <MenuHeader
         title="Models"
         subtitle="Choose a model"
-        summary={`${eligible.filter((model) => model.providerId === LOCAL_PROVIDER_ID).length} local`}
+        summary={`${eligible.filter(({ _tag }) => _tag !== "Provider").length} local`}
         hints={eligible.length === 0
           ? "↑↓ choose · Enter open · R refresh · Esc close"
           : "↑↓ choose · Enter select · F favorite · D details · R refresh · Esc close"}
@@ -697,40 +1120,23 @@ const ModelsMenu = memo(function ModelsMenu({
         style={{
           flexGrow: 1,
           minHeight: 0,
-          rootOptions: { backgroundColor: theme.menuBg },
-          wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-          viewportOptions: { backgroundColor: theme.menuBg },
+          rootOptions: { backgroundColor: theme.background.menu },
+          wrapperOptions: { border: false, backgroundColor: theme.background.menu },
+          viewportOptions: { backgroundColor: theme.background.menu },
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}
       >
         <box style={{ flexDirection: "row", width: "100%" }}>
-          <text style={{ fg: theme.muted, width: 2 }}> </text>
-          <text style={{ fg: theme.muted, width: 2 }}> </text>
-          <text style={{ fg: theme.muted, flexGrow: 1 }}>MODEL</text>
-          <text style={{ fg: theme.muted, width: 14 }}>REQUIREMENTS</text>
-          <text style={{ fg: theme.muted, width: 9 }}>CONTEXT</text>
-          <text style={{ fg: theme.muted, width: 23 }}>STATUS</text>
+          <text style={{ fg: theme.text.metadata, width: 2 }}> </text>
+          <text style={{ fg: theme.text.metadata, width: 2 }}> </text>
+          <text style={{ fg: theme.text.metadata, flexGrow: 1 }}>MODEL</text>
+          <text style={{ fg: theme.text.metadata, width: 14 }}>REQUIREMENTS</text>
+          <text style={{ fg: theme.text.metadata, width: 9 }}>CONTEXT</text>
+          <text style={{ fg: theme.text.metadata, width: 23 }}>STATUS</text>
         </box>
-        {assessing.map((model, index) => (
-          <box
-            key={`assessing:${model.targetId}`}
-            style={{
-              flexDirection: "row",
-              width: "100%",
-              backgroundColor: index % 2 === 0 ? theme.menuBg : theme.menuAltBg,
-            }}
-          >
-            <text style={{ width: 2 }}> </text>
-            <text style={{ width: 2 }}> </text>
-            <text style={{ fg: theme.foreground, flexGrow: 1 }}>{model.displayName}</text>
-            <text style={{ fg: theme.muted, width: 14 }}>{assessingRequirementFor(model)}</text>
-            <text style={{ fg: theme.muted, width: 9 }}>{formatContextWindow(model.maximumContextLength)}</text>
-            <text style={{ fg: theme.primary, width: 23 }}>Assessing</text>
-          </box>
-        ))}
         {eligible.length === 0 ? (
           <box style={{ flexDirection: "column", paddingLeft: 2 }}>
-            <text style={{ fg: theme.warning, marginLeft: 2 }}>No model is currently available.</text>
+            <text style={{ fg: theme.status.warning, marginLeft: 2 }}>No model is currently available.</text>
             {EMPTY_MODEL_ACTIONS.map((action, index) => (
               <MenuAction
                 key={action.root}
@@ -741,116 +1147,123 @@ const ModelsMenu = memo(function ModelsMenu({
               />
             ))}
           </box>
-        ) : eligible.map((model, index) => {
+        ) : eligible.map((entry, index) => {
           const focused = index === cursorIndex
-          const active = providerModelKey(model) === selectedKey
-          const favorite = currentFavoriteKeys.has(providerModelKey(model))
-          const rowIndex = assessing.length + index
+          const active = isSelected(entry)
+          const favorite = isFavorite(entry)
+          const rowIndex = index
+          const status = modelsMenuStatusPresentation(statusFor(entry))
           return (
             <Button
-              key={providerModelKey(model)}
-              onClick={() => choose(model)}
-              onMouseOver={() => setCursorId(providerModelKey(model))}
+              key={entry.id}
+              onClick={() => choose(entry)}
+              onMouseOver={() => setCursorId(entry.id)}
               style={{
                 flexDirection: "row",
                 width: "100%",
                 backgroundColor: active
-                  ? focused ? theme.foreground : theme.primary
+                  ? focused ? theme.text.body : theme.accent
                   : focused
-                  ? theme.surfaceHover
-                  : rowIndex % 2 === 0 ? theme.menuBg : theme.menuAltBg,
+                  ? theme.background.focused
+                  : rowIndex % 2 === 0 ? theme.background.menu : theme.background.alternateRow,
               }}
             >
-              <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, width: 2 }}>{active ? "●" : focused ? "›" : " "}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.warning, width: 2 }}>{favorite ? "★" : " "}</text>
-              <text style={{ fg: active ? theme.menuBg : focused ? theme.primary : theme.foreground, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{model.displayName}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 14 }}>{requirementFor(model)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 9 }}>{formatContextWindow(model.contextWindow)}</text>
-              <text style={{ fg: active ? theme.menuBg : theme.muted, width: 23 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{statusFor(model)}</text>
+              <text style={{ fg: active ? theme.background.menu : focused ? theme.accent : theme.text.body, width: 2 }}>{active ? "●" : focused ? "›" : " "}</text>
+              <text style={{ fg: active ? theme.background.menu : theme.status.warning, width: 2 }}>{favorite ? "★" : " "}</text>
+              <text style={{ fg: active ? theme.background.menu : focused ? theme.accent : theme.text.body, flexGrow: 1 }} attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}>{modelsMenuDisplayName(entry)}</text>
+              <text style={{ fg: active ? theme.background.menu : theme.text.metadata, width: 14 }}>{requirementFor(entry)}</text>
+              <text style={{ fg: active ? theme.background.menu : theme.text.metadata, width: 9 }}>{modelsMenuContextLabel(entry)}</text>
+              <text
+                style={{
+                  fg: active
+                    ? theme.background.menu
+                    : status.tone === "warning" ? theme.status.warning : theme.text.metadata,
+                  width: 23,
+                }}
+                attributes={active ? TextAttributes.BOLD : TextAttributes.NONE}
+                wrapMode="none"
+              >
+                {truncateToDisplayWidth(status.label, 23)}
+              </text>
             </Button>
           )
         })}
         {Result.isFailure(config.catalog) && (
-          <text style={{ fg: theme.error }}>Unable to refresh the provider model catalog; showing the last usable state when available.</text>
+          <text style={{ fg: theme.status.failure }}>Unable to refresh the provider model catalog; showing the last usable state when available.</text>
         )}
-        {Result.isFailure(config.slotUpdate) && (
-          <text style={{ fg: theme.error }}>Failed to update model selection.</text>
+        {Result.isFailure(slotActions.assignResult) && (
+          <text style={{ fg: theme.status.failure }}>Failed to update model selection.</text>
+        )}
+        {installationFailed && (
+          <text style={{ fg: theme.status.failure }}>Failed to install the local model.</text>
         )}
         {Result.isFailure(config.favoriteUpdate) && (
-          <text style={{ fg: theme.error }}>Failed to update model favorite.</text>
+          <text style={{ fg: theme.status.failure }}>Failed to update model favorite.</text>
         )}
       </scrollbox>
     </>
   )
 })
 
-const recommendationLabel = (recommendation: Option.Option<LocalModelRecommendation>): string =>
-  Option.match(recommendation, {
-    onNone: () => "",
-    onSome: ({ intent }) => ({
-      balanced: "Balanced",
-      best_quality: "Best quality",
-      fastest: "Fastest",
-      lightweight: "Lightweight",
-    })[intent],
-  })
+export const huggingFaceRepositoryUrls = (
+  model: LocalModel,
+): readonly string[] => [...new Set(servableModelBundlePackages(model.bundle).flatMap(({ source }) =>
+  source._tag === "HuggingFace"
+    ? [`https://huggingface.co/${source.repository}`]
+    : [],
+))]
 
-const intelligenceLabel = ({ recommendationEvidence }: LocalModelCatalogCandidate): string =>
-  Option.match(recommendationEvidence, {
-    onNone: () => "—",
-    onSome: ({ intelligence }) => Option.match(intelligence, {
-      onNone: () => "—",
-      onSome: ({ score }) => `${Math.round(score)}/100`,
-    }),
-  })
-
-const qualityLabel = ({ recommendationEvidence }: LocalModelCatalogCandidate): string =>
-  Option.match(recommendationEvidence, {
-    onNone: () => "—",
-    onSome: ({ fidelityRank }) => fidelityRank >= 75
-      ? "Near original"
-      : fidelityRank >= 55
-        ? "Very high"
-        : fidelityRank >= 45 ? "High" : "Reduced",
-  })
-
-const recommendationEvidenceLabel = (candidate: LocalModelCatalogCandidate): string =>
-  Option.isNone(candidate.recommendationEvidence)
-    ? "recommendation evidence unavailable"
-    : `intelligence ${intelligenceLabel(candidate)} · ${qualityLabel(candidate)}`
-
-const qualityEvidence = ({ recommendationEvidence }: LocalModelCatalogCandidate): readonly string[] =>
-  Option.match(recommendationEvidence, {
-    onNone: () => [],
-    onSome: ({ qualityEvidence: evidence }) => evidence,
-  })
-
-const catalogStatus = (candidate: LocalModelCatalogCandidate): string => {
-  if (candidate.download._tag === "NotDownloaded"
-    || candidate.download._tag === "Cancelled") return "Available"
-  if (candidate.download._tag === "Downloading") {
-    return `Downloading ${Math.round(candidate.download.completedBytes / Math.max(1, candidate.download.totalBytes) * 100)}%`
+export const catalogStatus = (
+  model: LocalModel,
+  reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
+): string => {
+  if (reconciliationState._tag === "Removing") return "Removing…"
+  if (reconciliationState._tag === "RemoveFailed") return "Remove failed"
+  if (reconciliationState._tag === "Transferring") {
+    const verb = reconciliationState.operation === "Update" ? "Updating" : "Downloading"
+    return `${verb} ${Math.round(reconciliationState.completedBytes
+      / Math.max(1, reconciliationState.totalBytes) * 100)}%`
   }
-  if (candidate.download._tag === "Failed") return "Download failed"
-  if (candidate.availability._tag === "Unavailable") return "Unavailable"
-  return "Installed"
+  if (reconciliationState._tag === "Starting") {
+    return reconciliationState.operation === "Update" ? "Starting update…" : "Starting download…"
+  }
+  if (reconciliationState._tag === "Failed") {
+    return reconciliationState.operation === "Update" ? "Update failed" : "Download failed"
+  }
+  const acquisitionState = model.acquisitionState
+  if (model.upgradeState._tag === "Available") return "Update available"
+  if (model.upgradeState._tag === "Failed") return "Update failed"
+  if (acquisitionState._tag === "NotInstalled"
+    || acquisitionState._tag === "Cancelled") return "Available"
+  if (acquisitionState._tag === "Failed") return "Download failed"
+  if (model.servingState._tag === "Assessed"
+    && model.servingState.availabilityState._tag === "Unavailable") {
+    return model.servingState.availabilityState.failure.message
+  }
+  return localModelInstalledStatus(model)
 }
 
 const CatalogCandidateRow = memo(function CatalogCandidateRow({
-  candidate,
-  recommendation,
+  model,
+  memoryBytes,
+  highlighted,
   focused,
+  selected,
   pendingDelete,
+  reconciliationState,
   index,
   layout,
   rowId,
   onClick,
   onMouseOver,
 }: {
-  readonly candidate: LocalModelCatalogCandidate
-  readonly recommendation: Option.Option<LocalModelRecommendation>
+  readonly model: LocalModel
+  readonly memoryBytes: number | undefined
+  readonly highlighted: boolean
   readonly focused: boolean
+  readonly selected: boolean
   readonly pendingDelete: boolean
+  readonly reconciliationState: CatalogModelReconciliationState
   readonly index: number
   readonly layout: CatalogLayout
   readonly rowId: string
@@ -858,114 +1271,64 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   readonly onMouseOver: () => void
 }) {
   const theme = useTheme()
-  const status = pendingDelete ? "Delete [y/n]" : catalogStatus(candidate)
+  const status = pendingDelete
+    ? "Remove? ↵/Esc"
+    : catalogStatus(model, reconciliationState)
   const statusColor = pendingDelete
-    ? theme.warning
-    : candidate.download._tag === "Failed"
-      ? theme.error
-      : candidate.download._tag === "Downloading" || candidate.download._tag === "Downloaded"
-        ? theme.primary
-        : theme.muted
-  const recommendationText = recommendationLabel(recommendation)
-  const memoryText = formatBytes(requiredMemoryBytes(candidate.memory))
-  const speedText = performanceRangeSpeedLabel(candidate, "t/s")
-  const backgroundColor = focused
-    ? theme.surfaceHover
-    : index % 2 === 0 ? theme.menuBg : theme.menuAltBg
-
-  if (layout.stackedRows) {
-    const cursorWidth = 2
-    const primaryStatusWidth = layout.mode === "minimal"
-      ? 0
-      : Math.min(getDisplayWidth(status), Math.max(1, layout.contentWidth - cursorWidth - 1))
-    const secondaryStatusWidth = layout.mode === "minimal"
-      ? Math.min(getDisplayWidth(`${status} · `), Math.max(1, layout.contentWidth - cursorWidth - 1))
-      : 0
-    const modelWidth = Math.max(1, layout.contentWidth - cursorWidth - primaryStatusWidth)
-    const modelLabel = formatCatalogModelLabel(
-      candidate.displayName,
-      candidate.quantizationName,
-      modelWidth,
-    )
-    const metadata = [recommendationText, memoryText, ...(layout.showSpeed ? [speedText] : [])]
-      .filter((value) => value !== "")
-      .join(" · ")
-    const metadataWidth = Math.max(1, layout.contentWidth - cursorWidth - secondaryStatusWidth)
-
-    return (
-      <Button
-        id={rowId}
-        onClick={onClick}
-        onMouseOver={onMouseOver}
-        style={{
-          flexDirection: "column",
-          width: "100%",
-          height: 2,
-          minHeight: 2,
-          flexShrink: 0,
-          backgroundColor,
-        }}
-      >
-        <box style={{ flexDirection: "row", width: "100%", height: 1, flexShrink: 0 }}>
-          <text style={{ fg: focused ? theme.primary : theme.foreground, width: cursorWidth }} wrapMode="none">
-            {focused ? "›" : " "}
-          </text>
-          <text style={{ fg: focused ? theme.primary : theme.foreground, width: modelWidth }} wrapMode="none">
-            {modelLabel}
-          </text>
-          {layout.mode !== "minimal" && (
-            <text style={{ fg: statusColor, width: primaryStatusWidth }} wrapMode="none">
-              {truncateToDisplayWidth(status, primaryStatusWidth)}
-            </text>
-          )}
-        </box>
-        <box style={{ flexDirection: "row", width: "100%", height: 1, flexShrink: 0 }}>
-          <text style={{ width: cursorWidth }}> </text>
-          {layout.mode === "minimal" && (
-            <text style={{ fg: statusColor, width: secondaryStatusWidth }} wrapMode="none">
-              {truncateToDisplayWidth(`${status} · `, secondaryStatusWidth)}
-            </text>
-          )}
-          <text style={{ fg: theme.muted, width: metadataWidth }} wrapMode="none">
-            {truncateToDisplayWidth(metadata, metadataWidth)}
-          </text>
-        </box>
-      </Button>
-    )
-  }
+    ? theme.status.warning
+    : model.acquisitionState._tag === "Failed"
+      || reconciliationState._tag === "Failed"
+      || reconciliationState._tag === "RemoveFailed"
+      ? theme.status.failure
+      : reconciliationState._tag === "Starting"
+        || reconciliationState._tag === "Transferring"
+        || reconciliationState._tag === "Removing"
+        || model.acquisitionState._tag === "Downloading"
+        || model.acquisitionState._tag === "Installed"
+        ? theme.accent
+        : theme.text.metadata
+  const memoryText = memoryBytes === undefined ? "—" : formatMemorySize(memoryBytes)
+  const speedText = performanceRangeSpeedLabel(model, "t/s")
+  const speculativeMethod = localModelSpeculativeMethodLabel(model)
+  const speculativeText = Option.getOrElse(speculativeMethod, () => "—")
+  const backgroundColor = highlighted
+    ? theme.background.focused
+    : index % 2 === 0 ? theme.background.menu : theme.background.alternateRow
 
   return (
     <Button
       id={rowId}
       onClick={onClick}
       onMouseOver={onMouseOver}
-      style={{ flexDirection: "row", width: "100%", backgroundColor }}
+      style={{
+        flexDirection: "row",
+        columnGap: layout.columnGap,
+        width: "100%",
+        height: 1,
+        minHeight: 1,
+        flexShrink: 0,
+        backgroundColor,
+      }}
     >
-      <text style={{ fg: focused ? theme.primary : theme.foreground, width: 2 }} wrapMode="none">
-        {focused ? "›" : " "}
+      <text style={{ fg: focused ? theme.accent : theme.text.body, width: 1 }} wrapMode="none">
+        {selected ? "●" : focused ? "›" : " "}
       </text>
-      <text style={{ fg: focused ? theme.primary : theme.foreground, width: layout.modelWidth }} wrapMode="none">
-        {formatCatalogModelLabel(candidate.displayName, candidate.quantizationName, layout.modelWidth)}
+      <text style={{ fg: focused ? theme.accent : theme.text.body, width: layout.modelWidth }} wrapMode="none">
+        {formatCatalogModelLabel(model.presentation.displayName, model.presentation.variantLabel, layout.modelWidth)}
       </text>
-      <text style={{ fg: theme.primary, width: layout.columns.recommendation }} wrapMode="none">
-        {truncateToDisplayWidth(recommendationText, layout.columns.recommendation)}
-      </text>
-      <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">
-        {truncateToDisplayWidth(memoryText, layout.columns.memory)}
-      </text>
-      {layout.showIntelligence && (
-        <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">
-          {truncateToDisplayWidth(intelligenceLabel(candidate), layout.columns.intelligence)}
-        </text>
-      )}
-      {layout.showQuality && (
-        <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">
-          {truncateToDisplayWidth(qualityLabel(candidate), layout.columns.quality)}
+      {layout.showMemory && (
+        <text style={{ fg: theme.text.metadata, width: layout.columns.memory }} wrapMode="none">
+          {truncateToDisplayWidth(memoryText, layout.columns.memory)}
         </text>
       )}
       {layout.showSpeed && (
-        <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">
+        <text style={{ fg: theme.text.metadata, width: layout.columns.speed }} wrapMode="none">
           {truncateToDisplayWidth(speedText, layout.columns.speed)}
+        </text>
+      )}
+      {layout.showSpeculative && (
+        <text style={{ fg: theme.text.metadata, width: layout.columns.speculative }} wrapMode="none">
+          {truncateToDisplayWidth(speculativeText, layout.columns.speculative)}
         </text>
       )}
       <text style={{ fg: statusColor, width: layout.columns.status }} wrapMode="none">
@@ -975,157 +1338,502 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   )
 })
 
+export type CatalogInspectorActionId =
+  | "primary"
+  | "select"
+  | "cancel"
+  | "load"
+  | "stop"
+  | "uninstall"
+
+type CatalogPrimarySlot = ModelSlotsState["slots"]["primary"]
+
+interface CatalogActionHoverTarget {
+  readonly configurationId: string
+  readonly action: CatalogInspectorActionId
+}
+
+const catalogModelIsSelected = (
+  model: LocalModel,
+  selected: Option.Option<Pick<ProviderModelCatalogEntry, "providerId" | "providerModelId">>,
+): boolean => Option.exists(selected, (selection) =>
+  selection.providerId === LOCAL_PROVIDER_ID
+  && Option.contains(localModelProviderModelId(model), selection.providerModelId))
+
+const catalogSlotForModel = (
+  model: LocalModel,
+  slot: CatalogPrimarySlot | null,
+): CatalogPrimarySlot | null => slot?._tag === "ConfiguredLocal"
+  && slot.selection.providerId === LOCAL_PROVIDER_ID
+  && Option.contains(localModelProviderModelId(model), slot.selection.providerModelId)
+  ? slot
+  : null
+
+export const catalogInspectorActions = (
+  model: LocalModel,
+  reconciliationState: CatalogModelReconciliationState,
+  selected = false,
+  selectedSlot: CatalogPrimarySlot | null = null,
+): readonly CatalogInspectorActionId[] => {
+  if (reconciliationState._tag === "Removing") return []
+  if (reconciliationState._tag === "Transferring"
+    || model.acquisitionState._tag === "Downloading"
+    || model.upgradeState._tag === "Upgrading") return ["cancel"]
+  if (reconciliationState._tag === "Starting") return []
+  if (model.acquisitionState._tag !== "Installed") return ["primary"]
+
+  const actions: CatalogInspectorActionId[] = []
+  if (!selected) {
+    if (model.servingState._tag === "Assessed"
+      && model.servingState.availabilityState._tag === "Selectable") actions.push("select")
+  } else if (selectedSlot?._tag === "ConfiguredLocal") {
+    if (selectedSlot.actions.some((action) => action === "Load" || action === "RetryLoad")) actions.push("load")
+    else if (selectedSlot.actions.includes("Stop")) actions.push("stop")
+  }
+  if (model.upgradeState._tag === "Available"
+    || model.upgradeState._tag === "Failed") actions.push("primary")
+  actions.push("uninstall")
+  return actions
+}
+
+export const catalogInspectorActionLabel = (
+  action: CatalogInspectorActionId,
+  model: LocalModel,
+  selectedSlot: CatalogPrimarySlot | null = null,
+  reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
+): string => {
+  switch (action) {
+    case "select": return "Select model"
+    case "primary": {
+      if (reconciliationState._tag === "Failed" && reconciliationState.operation === "Update") {
+        return "Retry update"
+      }
+      if (model.upgradeState._tag === "Available") return "Update"
+      if (model.upgradeState._tag === "Failed") return "Retry update"
+      const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "Failed"
+        ? "Retry download"
+        : "Download"
+      return verb
+    }
+    case "cancel": return reconciliationState._tag === "Transferring"
+      ? reconciliationState.operation === "Update" ? "Cancel update" : "Cancel download"
+      : model.upgradeState._tag === "Upgrading" ? "Cancel update" : "Cancel download"
+    case "load": return selectedSlot?._tag === "ConfiguredLocal"
+      && selectedSlot.actions.includes("RetryLoad") ? "Retry loading" : "Load model"
+    case "stop": return selectedSlot?._tag === "ConfiguredLocal"
+      && (selectedSlot.residency._tag === "Requested"
+        || selectedSlot.residency._tag === "Loading")
+      ? "Cancel loading" : "Stop model"
+    case "uninstall": return reconciliationState._tag === "RemoveFailed"
+      ? "Retry uninstall"
+      : "Uninstall"
+  }
+}
+
+const catalogInspectorStatus = (
+  model: LocalModel,
+  reconciliationState: CatalogModelReconciliationState,
+  selected: boolean,
+  selectedSlot: CatalogPrimarySlot | null,
+): string => {
+  if (reconciliationState._tag === "Removing") return "REMOVING…"
+  if (reconciliationState._tag === "RemoveFailed") return "REMOVE FAILED"
+  if (reconciliationState._tag === "Transferring") {
+    const label = reconciliationState.operation === "Update" ? "UPDATING" : "DOWNLOADING"
+    return `${label} ${Math.round(reconciliationState.completedBytes / Math.max(1, reconciliationState.totalBytes) * 100)}%`
+  }
+  if (reconciliationState._tag === "Starting") return reconciliationState.operation === "Update"
+    ? "STARTING UPDATE…" : "STARTING DOWNLOAD…"
+  if (reconciliationState._tag === "Failed") return reconciliationState.operation === "Update"
+    ? "UPDATE FAILED" : "DOWNLOAD FAILED"
+  if (model.acquisitionState._tag === "Downloading") {
+    return `DOWNLOADING ${Math.round(model.acquisitionState.completedBytes / Math.max(1, model.acquisitionState.totalBytes) * 100)}%`
+  }
+  if (model.upgradeState._tag === "Upgrading") {
+    return `UPDATING ${Math.round(model.upgradeState.completedBytes / Math.max(1, model.upgradeState.totalBytes) * 100)}%`
+  }
+  if (model.acquisitionState._tag === "Failed") return "DOWNLOAD FAILED"
+  if (selected) {
+    const updateSuffix = model.upgradeState._tag === "Available"
+      ? " · UPDATE AVAILABLE"
+      : model.upgradeState._tag === "Failed" ? " · UPDATE FAILED" : ""
+    if (selectedSlot?._tag === "ConfiguredLocal") {
+      const residency = selectedSlot.residency
+      if (residency._tag === "Requested") return `LOADING 0%${updateSuffix}`
+      if (residency._tag === "Loading") return `LOADING ${Math.round(Option.getOrElse(residency.progress, () => 0) * 100)}%${updateSuffix}`
+      if (residency._tag === "Ready") return `SELECTED · READY${updateSuffix}`
+      if (residency._tag === "Stopping") return "STOPPING…"
+      if (residency._tag === "Failed") return "LOAD FAILED"
+    }
+    return `SELECTED${updateSuffix}`
+  }
+  return catalogStatus(model, reconciliationState).toUpperCase()
+}
+
+const CatalogInspector = memo(function CatalogInspector({
+  model,
+  reconciliationState,
+  selected,
+  selectedSlot,
+  transition,
+  actions,
+  actionCursor,
+  actionsFocused,
+  hoveredAction,
+  confirmingUninstall,
+  onAction,
+  onActionHover,
+}: {
+  readonly model: LocalModel
+  readonly reconciliationState: CatalogModelReconciliationState
+  readonly selected: boolean
+  readonly selectedSlot: CatalogPrimarySlot | null
+  readonly transition: PentagonRadarTransition | null
+  readonly actions: readonly CatalogInspectorActionId[]
+  readonly actionCursor: number
+  readonly actionsFocused: boolean
+  readonly hoveredAction: CatalogInspectorActionId | null
+  readonly confirmingUninstall: boolean
+  readonly onAction: (action: CatalogInspectorActionId) => void
+  readonly onActionHover: (action: CatalogInspectorActionId | null) => void
+}) {
+  const theme = useTheme()
+  const platform = usePlatform()
+  const [sourceHovered, setSourceHovered] = useState(false)
+  const radarAxes = localModelRadarAxes(model)
+  const status = catalogInspectorStatus(model, reconciliationState, selected, selectedSlot)
+  const contentWidth = CATALOG_INSPECTOR_CONTENT_WIDTH
+  const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
+  const repository = repositoryUrl?.replace("https://", "")
+  const license = Option.getOrElse(model.presentation.license, () => "Unknown license")
+  const classification = model.catalogMembershipState._tag === "InCatalog"
+    && model.servingState._tag === "Assessed"
+    ? formatModelClassification(
+        model.catalogMembershipState.catalogData.parameterization,
+        model.servingState.capabilities.vision,
+      )
+    : ""
+  const releaseRecency = model.catalogMembershipState._tag === "InCatalog"
+    && model.servingState._tag === "Assessed"
+    ? formatModelReleaseRecency(model.catalogMembershipState.catalogData.releaseDate)
+    : null
+
+  return (
+    <box style={{ flexGrow: 1, minHeight: 0, width: "100%", flexDirection: "column", paddingLeft: 2, paddingRight: 2 }}>
+      <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.identity, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.identity, flexShrink: 0, flexDirection: "column" }}>
+        <box style={{ flexDirection: "row", width: "100%" }}>
+          <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
+            {truncateToDisplayWidth(formatLocalModelDisplayName(model), Math.max(1, contentWidth - status.length - 1))}
+          </text>
+          <text style={{ fg: reconciliationState._tag === "Failed"
+            || reconciliationState._tag === "RemoveFailed"
+            || model.upgradeState._tag === "Failed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
+        </box>
+        <text style={{ fg: theme.text.supporting }} wrapMode="none">
+          {releaseRecency !== null && (
+            <span fg={theme.text.detail}>{`${releaseRecency} · `}</span>
+          )}
+          {truncateToDisplayWidth(
+            classification,
+            Math.max(0, contentWidth - (releaseRecency === null ? 0 : `${releaseRecency} · `.length)),
+          )}
+        </text>
+        <text> </text>
+      </box>
+      <box style={{ width: "100%", height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0 }}>
+        <CatalogRadarView axes={radarAxes} transition={transition} />
+      </box>
+      <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, flexShrink: 0, flexDirection: "column" }}>
+        <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
+        <text style={{ fg: theme.text.metadata }} wrapMode="none">{truncateToDisplayWidth(`License ${license}`, contentWidth)}</text>
+        {repositoryUrl === undefined ? (
+          <text style={{ fg: theme.text.metadata }} wrapMode="none">Repository unavailable</text>
+        ) : (
+          <Button
+            onClick={() => { void platform.openLink(repositoryUrl) }}
+            onMouseOver={() => setSourceHovered(true)}
+            onMouseOut={() => setSourceHovered(false)}
+          >
+            <text wrapMode="none">
+              <span
+                fg={sourceHovered ? theme.link : theme.text.metadata}
+                attributes={sourceHovered ? TextAttributes.UNDERLINE : TextAttributes.NONE}
+              >
+                {truncateToDisplayWidth(repository, contentWidth - (sourceHovered ? 1 : 0))}{sourceHovered ? "↗" : ""}
+              </span>
+            </text>
+          </Button>
+        )}
+      </box>
+      <box style={{ flexGrow: 1, minHeight: 1 }} />
+      <box style={{
+        height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.actions,
+        minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.actions,
+        flexShrink: 0,
+        flexDirection: "column",
+      }}>
+        <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD} wrapMode="none">ACTIONS</text>
+        <box style={{ flexDirection: "column" }}>
+          {actions.length === 0 ? (
+            <text style={{ fg: theme.text.disabled }}>
+              {reconciliationState._tag === "Removing" ? "Removing…" : "No actions available"}
+            </text>
+          ) : actions.map((action, index) => {
+            const focused = hoveredAction === action || (actionsFocused && index === actionCursor)
+            return action === "uninstall" && confirmingUninstall ? (
+              <text key={action} wrapMode="none">
+                <span fg={focused ? theme.accent : theme.text.body}>{focused ? "› " : "  "}Remove model? </span>
+                <span fg={theme.text.metadata}>[Enter] confirm · [Esc] cancel</span>
+              </text>
+            ) : (
+              <MenuAction
+                key={action}
+                label={catalogInspectorActionLabel(action, model, selectedSlot, reconciliationState)}
+                focused={focused}
+                tone="normal"
+                onClick={() => onAction(action)}
+                onMouseOver={() => {
+                  onActionHover(action)
+                }}
+                onMouseOut={() => onActionHover(null)}
+              />
+            )
+          })}
+        </box>
+      </box>
+    </box>
+  )
+})
+
 const CatalogMenu = memo(function CatalogMenu({
   initialCatalogDetailId,
   setRootSwitchingEnabled,
 }: CatalogMenuProps) {
   const theme = useTheme()
+  const config = useModelConfig()
   const menuSize = useLocalWidth()
   const catalogScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const menuWidth = menuSize.width ?? 80
   const layout = deriveCatalogLayout(menuWidth)
-  const localModels = useLocalModels()
+  const catalogView = Result.value(useCatalogModels())
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
-  const snapshot = Result.value(localModels)
-  const catalogCandidates = Option.match(snapshot, {
-    onNone: () => [] as readonly LocalModelCatalogCandidate[],
-    onSome: (models) =>
-      models.recommendations._tag === "Ready" ? models.recommendations.catalog : [],
-  })
-  const recommendations = Option.match(snapshot, {
-    onNone: () => [] as readonly LocalModelRecommendation[],
-    onSome: (models) =>
-      models.recommendations._tag === "Ready" ? models.recommendations.entries : [],
+  const catalogModels = Option.match(catalogView, {
+    onNone: () => [],
+    onSome: ({ models }) => models.filter(({ model }) =>
+      model.servingState._tag === "Assessed"
+        && model.servingState.assessment._tag === "Fits"),
   })
   const recommendationsReady = Option.exists(
-    snapshot,
-    (models) => models.recommendations._tag === "Ready",
+    catalogView,
+    (models) => models.discoveryState._tag === "Ready",
   )
-  const recommendationFor = useCallback((candidate: LocalModelCatalogCandidate) =>
-    Option.fromNullable(recommendations.find((recommendation) =>
-      recommendation.candidate.configurationId === candidate.configurationId)), [recommendations])
-  const candidates = [...catalogCandidates].sort((left, right) => {
-    const leftInstalled = left.download._tag === "Downloaded"
-    const rightInstalled = right.download._tag === "Downloaded"
-    return leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1
+  const memoryBytesFor = (model: LocalModel): number | undefined =>
+    model.servingState._tag === "Assessed"
+      && model.servingState.assessment._tag === "Fits"
+      ? model.servingState.assessment.memory.totalRequiredBytes
+      : undefined
+  const candidates = catalogModels.map(({ model }) => model).sort((left, right) => {
+    const leftInstalled = left.acquisitionState._tag === "Installed"
+    const rightInstalled = right.acquisitionState._tag === "Installed"
+    return (leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1)
+      || left.presentation.displayName.localeCompare(right.presentation.displayName)
+      || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
+      || Option.getOrElse(localModelConfigurationId(left), () => "")
+        .localeCompare(Option.getOrElse(localModelConfigurationId(right), () => ""))
   })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
-  const cursorIndex = Math.max(0, candidates.findIndex(({ configurationId }) =>
-    configurationId === cursorId))
+  const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
+  const [actionHoverTarget, setActionHoverTarget] = useState<CatalogActionHoverTarget | null>(null)
+  const configurationIdFor = (model: LocalModel) => Option.getOrUndefined(
+    localModelConfigurationId(model),
+  )
+  const reconciliationStateFor = (model: LocalModel): CatalogModelReconciliationState => {
+    const configurationId = configurationIdFor(model)
+    if (configurationId === undefined) return { _tag: "Idle" }
+    return catalogModels.find(({ model: candidate }) =>
+      configurationIdFor(candidate) === configurationId)?.reconciliationState ?? { _tag: "Idle" }
+  }
+  const cursorIndex = Math.max(0, candidates.findIndex((model) =>
+    configurationIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
-  const detail = candidates.find(({ configurationId }) => configurationId === detailId) ?? null
-  const progress = Option.match(snapshot, {
+  const detail = candidates.find((model) => configurationIdFor(model) === detailId) ?? null
+  const inspected = detail ?? cursor ?? null
+  const inspectedConfigurationId = inspected === null ? undefined : configurationIdFor(inspected)
+  const confirmingUninstall = inspectedConfigurationId !== undefined
+    && pendingDeleteId === inspectedConfigurationId
+  const hoveredInspectorAction = inspectedConfigurationId !== undefined
+    && actionHoverTarget?.configurationId === inspectedConfigurationId
+    ? actionHoverTarget.action
+    : null
+  const selectedModel = Option.flatMap(config.selections, ({ primary }) => primary)
+  const primarySlot = Option.match(Result.value(config.slots), {
+    onNone: () => null,
+    onSome: ({ state }) => state.slots.primary,
+  })
+  const inspectedSelected = inspected !== null && catalogModelIsSelected(inspected, selectedModel)
+  const inspectedSlot = inspected === null ? null : catalogSlotForModel(inspected, primarySlot)
+  const inspectedReconciliationState = inspected === null
+    ? { _tag: "Idle" } as const
+    : reconciliationStateFor(inspected)
+  const progress = Option.match(catalogView, {
     onNone: () => [],
-    onSome: (models) => localInferenceProgressLines(models.recommendations.progress),
+    onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
   })
   const runningProgress = progress.find((line) => line.state === "running")
   const spinner = useSpinnerFrame(runningProgress !== undefined)
-  const detailActions = useMemo(() => {
-    if (!detail) return [] as readonly ("primary" | "cancel" | "select")[]
-    const actions: ("primary" | "cancel" | "select")[] = []
-    if (detail.download._tag === "Downloading") actions.push("cancel")
-    else if (detail.download._tag === "Downloaded") {
-      if (detail.availability._tag === "Available") actions.push("select")
-    }
-    else actions.push("primary")
-    return actions
-  }, [detail])
-  const detailActionCursor = useBoundedCursor(detailActions.length)
-  const focusedDetailAction = detailActions[detailActionCursor.index]
-
+  const inspectorActions = inspected === null
+    ? []
+    : catalogInspectorActions(inspected, inspectedReconciliationState, inspectedSelected, inspectedSlot)
+  const inspectorActionCursor = useBoundedCursor(inspectorActions.length)
   const moveCursorTo = useCallback((index: number) => {
-    const candidate = candidates[index]
-    if (!candidate) return
-    setCursorId(candidate.configurationId)
-    scrollCatalogCandidateIntoView(catalogScrollRef.current, candidate.configurationId)
-  }, [candidates])
+    const model = candidates[index]
+    const configurationId = model && configurationIdFor(model)
+    if (!model || configurationId === undefined) return
+    setActionHoverTarget(null)
+    const fromAxes = cursor === undefined ? Option.none() : localModelRadarAxes(cursor)
+    const toAxes = localModelRadarAxes(model)
+    if (Option.isSome(fromAxes) && Option.isSome(toAxes)
+      && configurationIdFor(cursor!) !== configurationId) {
+      const now = getAnimationTimeSnapshot()
+      setRadarTransition(retargetPentagonRadar(
+        pentagonRadarValues(fromAxes.value),
+        pentagonRadarValues(toAxes.value),
+        radarTransition,
+        now,
+      ))
+    } else {
+      setRadarTransition(null)
+    }
+    setCursorId(configurationId)
+    scrollCatalogCandidateIntoView(catalogScrollRef.current, configurationId)
+  }, [candidates, cursor, radarTransition])
 
-  const primaryAction = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.download._tag === "Downloading"
-      || candidate.download._tag === "Downloaded") return
-    void modelActions.download(candidate.targetId)
-  }, [modelActions])
+  const primaryAction = useCallback((model: LocalModel) => {
+    const configurationId = configurationIdFor(model)
+    if (configurationId === undefined
+      || model.acquisitionState._tag === "Downloading"
+      || (model.acquisitionState._tag === "Installed"
+        && model.upgradeState._tag !== "Available"
+        && model.upgradeState._tag !== "Failed")
+      || reconciliationStateFor(model)._tag === "Starting") return
+    modelActions.install(configurationId)
+  }, [modelActions, catalogModels])
 
-  const selectCandidate = useCallback((candidate: LocalModelCatalogCandidate) => {
-    if (candidate.availability._tag !== "Available"
-      || Result.isWaiting(modelActions.createOfferingResult)) return
-    const providerModelId = Option.flatMap(snapshot, ({ models }) => Option.fromNullable(
-      models.find(({ targetId }) => targetId === candidate.targetId)
-        ?.offerings.find(({ configurationId }) => configurationId === candidate.configurationId)
-        ?.providerModelId,
-    ))
+  const selectCandidate = useCallback((model: LocalModel) => {
+    if (model.servingState._tag !== "Assessed"
+      || model.servingState.assessment._tag !== "Fits"
+      || model.servingState.availabilityState._tag !== "Selectable") return
+    const reasoningEffort = model.servingState.capabilities.reasoning.defaultEffort
+    const providerModelId = localModelProviderModelId(model)
     const assign = (id: ProviderModelId) => slotActions.assign(PRIMARY_SLOT_ID, {
       providerId: LOCAL_PROVIDER_ID,
       providerModelId: id,
       reasoningEffort: Option.getOrElse(
-        candidate.capabilities.reasoning.defaultEffort,
+        reasoningEffort,
         () => ReasoningEffortSchema.make("none"),
       ),
     })
     if (Option.isSome(providerModelId)) {
       void assign(providerModelId.value)
-      return
     }
-    void modelActions.createOffering(candidate.configurationId).then(
-      assign,
-      () => undefined,
-    )
-  }, [modelActions, slotActions, snapshot])
+  }, [slotActions])
 
-  const runDetailAction = useCallback((action: typeof detailActions[number]) => {
-    if (!detail) return
+  const runInspectorAction = useCallback((action: CatalogInspectorActionId) => {
+    if (inspected === null) return
+    if (action !== "uninstall") setPendingDeleteId(null)
     if (action === "primary") {
-      primaryAction(detail)
-      return
-    }
-    if (action === "cancel") {
-      if (detail.download._tag === "Downloading") {
-        modelActions.cancel(detail.download.attemptIds)
-      }
+      primaryAction(inspected)
       return
     }
     if (action === "select") {
-      selectCandidate(detail)
+      selectCandidate(inspected)
       return
     }
-  }, [detail, modelActions, primaryAction, selectCandidate])
+    if (action === "cancel") {
+      if (inspectedReconciliationState._tag === "Transferring") {
+        modelActions.cancel(inspectedReconciliationState.downloadId)
+      } else if (inspected.acquisitionState._tag === "Downloading") {
+        modelActions.cancel(inspected.acquisitionState.downloadId)
+      } else if (inspected.upgradeState._tag === "Upgrading") {
+        modelActions.cancel(inspected.upgradeState.downloadId)
+      }
+      return
+    }
+    if (action === "load" && inspectedSlot?._tag === "ConfiguredLocal") {
+      void slotActions.load(PRIMARY_SLOT_ID)
+      return
+    }
+    if (action === "stop" && inspectedSlot?._tag === "ConfiguredLocal") {
+      void slotActions.stop(PRIMARY_SLOT_ID)
+      return
+    }
+    if (action === "uninstall" && inspected.acquisitionState._tag === "Installed") {
+      const configurationId = configurationIdFor(inspected)
+      if (configurationId !== undefined) setPendingDeleteId(configurationId)
+    }
+  }, [inspected, inspectedReconciliationState, inspectedSlot, modelActions, primaryAction, selectCandidate, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
+    if (confirmingUninstall && pendingDeleteId !== null) {
+      if (key.name === "return" || key.name === "enter") {
+        const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
+        const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
+        if (model?.acquisitionState._tag === "Installed" && configurationId !== undefined) {
+          modelActions.delete(configurationId)
+        }
+        setPendingDeleteId(null)
+        key.preventDefault()
+        return
+      } else if (key.name === "escape") {
+        setPendingDeleteId(null)
+        key.preventDefault()
+        return
+      } else if (key.name === "up" || key.name === "down" || key.name === "k" || key.name === "j") {
+        setPendingDeleteId(null)
+      } else {
+        return
+      }
+    }
     if (detail) {
       if (key.name === "escape") {
         key.preventDefault()
         setDetailId(null)
+        setRadarTransition(null)
         setRootSwitchingEnabled(true)
-      } else if (key.name === "up" && detailActions.length > 0) {
+      } else if (key.name === "up" && inspectorActions.length > 0) {
         key.preventDefault()
-        detailActionCursor.previous()
-      } else if (key.name === "down" && detailActions.length > 0) {
+        inspectorActionCursor.previous()
+      } else if (key.name === "down" && inspectorActions.length > 0) {
         key.preventDefault()
-        detailActionCursor.next()
-      } else if ((key.name === "return" || key.name === "enter") && focusedDetailAction) {
-        key.preventDefault()
-        runDetailAction(focusedDetailAction)
+        inspectorActionCursor.next()
+      } else if (key.name === "return" || key.name === "enter") {
+        const action = inspectorActions[inspectorActionCursor.index]
+        if (action !== undefined) {
+          key.preventDefault()
+          runInspectorAction(action)
+        }
       }
       return
     }
+    setActionHoverTarget(null)
     if (pendingDeleteId !== null) {
-      const confirmsDelete = key.name === "y"
-        && !key.ctrl
-        && !key.meta
-        && !key.option
+      const confirmsDelete = key.name === "return" || key.name === "enter"
       if (confirmsDelete) {
-        const candidate = candidates.find(({ configurationId }) => configurationId === pendingDeleteId)
-        if (candidate?.download._tag === "Downloaded") modelActions.delete(candidate.targetId)
+        const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
+        const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
+        if (model?.acquisitionState._tag === "Installed" && configurationId !== undefined) {
+          modelActions.delete(configurationId)
+        }
         setPendingDeleteId(null)
         key.preventDefault()
         return
       }
       setPendingDeleteId(null)
-      if (key.name === "escape" || key.name === "backspace" || key.name === "y" || key.name === "n") {
+      if (key.name === "escape" || key.name === "backspace") {
         key.preventDefault()
         return
       }
@@ -1138,36 +1846,69 @@ const CatalogMenu = memo(function CatalogMenu({
       moveCursorTo(Math.min(candidates.length - 1, cursorIndex + 1))
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
-      detailActionCursor.reset()
-      setDetailId(cursor.configurationId)
+      setRadarTransition(null)
+      inspectorActionCursor.reset()
+      setDetailId(configurationIdFor(cursor) ?? null)
       setRootSwitchingEnabled(false)
     } else if (key.name === "d" && cursor) {
       key.preventDefault()
       primaryAction(cursor)
-    } else if (key.name === "s" && cursor && cursor.availability._tag === "Available") {
+    } else if (key.name === "s" && cursor && cursor.servingState._tag === "Assessed"
+      && cursor.servingState.availabilityState._tag === "Selectable") {
       key.preventDefault()
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
-      if (cursor.download._tag === "Downloading") {
-        modelActions.cancel(cursor.download.attemptIds)
+      if (cursor.acquisitionState._tag === "Downloading") {
+        modelActions.cancel(cursor.acquisitionState.downloadId)
         key.preventDefault()
-      } else if (cursor.download._tag === "Downloaded") {
-        setPendingDeleteId(cursor.configurationId)
+      } else if (cursor.upgradeState._tag === "Upgrading") {
+        modelActions.cancel(cursor.upgradeState.downloadId)
+        key.preventDefault()
+      } else if (cursor.acquisitionState._tag === "Installed") {
+        setPendingDeleteId(configurationIdFor(cursor) ?? null)
         key.preventDefault()
       }
     }
-  }, [candidates, cursor, cursorIndex, detail, detailActionCursor, detailActions.length, focusedDetailAction, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runDetailAction, selectCandidate, setRootSwitchingEnabled]))
+  }, [candidates, confirmingUninstall, cursor, cursorIndex, detail, inspectorActionCursor, inspectorActions, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runInspectorAction, selectCandidate, setRootSwitchingEnabled]))
 
-  if (detail) {
-    const recommendation = recommendationFor(detail)
-    const downloading = detail.download._tag === "Downloading"
-    const downloaded = detail.download._tag === "Downloaded"
-    const failed = detail.download._tag === "Failed"
-    const detailActionLabel = {
-      primary: failed ? "Retry download" : "Download",
-      cancel: "Cancel download",
-      select: "Select this model",
-    } as const
+  if (menuSize.width === null) {
+    return (
+      <box
+        ref={menuSize.ref}
+        onSizeChange={menuSize.onSizeChange}
+        style={{ flexGrow: 1, minHeight: 0, flexDirection: "column" }}
+      />
+    )
+  }
+
+  const inspectorView = inspected === null ? null : (
+    <>
+      <CatalogInspector
+        key={inspectedConfigurationId}
+        model={inspected}
+        reconciliationState={inspectedReconciliationState}
+        selected={inspectedSelected}
+        selectedSlot={inspectedSlot}
+        transition={detail === null ? radarTransition : null}
+        actions={inspectorActions}
+        actionCursor={inspectorActionCursor.index}
+        actionsFocused={detail !== null}
+        hoveredAction={hoveredInspectorAction}
+        confirmingUninstall={confirmingUninstall}
+        onAction={runInspectorAction}
+        onActionHover={(action) => {
+          setActionHoverTarget(action === null || inspectedConfigurationId === undefined
+            ? null
+            : { configurationId: inspectedConfigurationId, action })
+        }}
+      />
+      {Result.isFailure(slotActions.assignResult) && (
+        <text style={{ fg: theme.status.failure }}>Failed to update model selection.</text>
+      )}
+    </>
+  )
+
+  if (detail && layout.mode !== "split") {
     return (
       <box
         ref={menuSize.ref}
@@ -1176,74 +1917,97 @@ const CatalogMenu = memo(function CatalogMenu({
       >
         <MenuHeader
           title="Catalog"
-          selection={detail.displayName}
+          selection={formatLocalModelDisplayName(detail)}
           onSectionClick={() => {
             setDetailId(null)
+            setRadarTransition(null)
             setRootSwitchingEnabled(true)
           }}
           hints={catalogDetailHints(layout.compactHeader)}
           compact={layout.compactHeader}
           width={menuWidth}
         />
-        <scrollbox scrollX={false} style={{
-          flexGrow: 1,
-          minHeight: 0,
-          rootOptions: { backgroundColor: theme.menuBg },
-          wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-          viewportOptions: { backgroundColor: theme.menuBg },
-          contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
-        }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD} wrapMode="word">{detail.displayName}</text>
-          <text style={{ fg: theme.muted }} wrapMode="word">{detail.description}</text>
-          {Option.isSome(recommendation) && (
-            <>
-              <text style={{ fg: theme.primary }}>{recommendationLabel(recommendation)}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">{recommendation.value.explanation}</text>
-            </>
-          )}
-          <text style={{ fg: theme.foreground, marginTop: 1 }} attributes={TextAttributes.BOLD}>Calibrated for this machine</text>
-          {layout.compactHeader ? (
-            <>
-              <text style={{ fg: theme.muted }} wrapMode="word">Memory: {formatBytes(requiredMemoryBytes(detail.memory))}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Quantization: {detail.quantization}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Evidence: {recommendationEvidenceLabel(detail)}</text>
-              <text style={{ fg: theme.muted }} wrapMode="word">Speed: {performanceRangeSpeedLabel(detail, "tokens/sec")}</text>
-            </>
-          ) : (
-            <>
-              <text style={{ fg: theme.muted }} wrapMode="word">
-                {formatBytes(requiredMemoryBytes(detail.memory))} memory · {detail.quantization} · {recommendationEvidenceLabel(detail)}
-              </text>
-              <text style={{ fg: theme.muted }} wrapMode="word">
-                {performanceRangeSpeedLabel(detail, "tokens/sec")}
-              </text>
-            </>
-          )}
-          <text style={{ fg: failed ? theme.error : downloading || downloaded ? theme.primary : theme.muted }}>
-            {catalogStatus(detail)}
-          </text>
-          {failed && <text style={{ fg: theme.error }}>{detail.download.failure.message}</text>}
-          {Result.isFailure(modelActions.createOfferingResult) && (
-            <text style={{ fg: theme.error }}>Failed to create the local model offering.</text>
-          )}
-          <box style={{ paddingTop: 1, flexDirection: "column" }}>
-            {detailActions.map((action, index) => (
-              <MenuAction
-                key={action}
-                label={detailActionLabel[action]}
-                focused={index === detailActionCursor.index}
-                tone={action === "primary" || action === "select" ? "primary" : "warning"}
-                onClick={() => runDetailAction(action)}
-                onMouseOver={() => detailActionCursor.select(index)}
-              />
-            ))}
-          </box>
-          <text style={{ fg: theme.muted, marginTop: 1 }} wrapMode="word">License: {detail.license}</text>
-          {qualityEvidence(detail).map((evidence) => <text key={evidence} style={{ fg: theme.muted }} wrapMode="word">{evidence}</text>)}
-        </scrollbox>
+        <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "column", paddingTop: 1 }}>
+          {inspectorView}
+        </box>
       </box>
     )
   }
+
+  const list = (
+    <scrollbox ref={catalogScrollRef} scrollX={false} onMouseOver={() => setActionHoverTarget(null)} style={{
+      width: layout.mode === "split" ? layout.listWidth : "100%",
+      flexGrow: layout.mode === "split" ? 0 : 1,
+      minHeight: 0,
+      rootOptions: { backgroundColor: theme.background.menu },
+      wrapperOptions: { border: false, backgroundColor: theme.background.menu },
+      viewportOptions: { backgroundColor: theme.background.menu },
+      contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2 },
+    }}>
+      <box style={{
+        flexDirection: "row",
+        columnGap: layout.columnGap,
+        width: "100%",
+        height: 1,
+        minHeight: 1,
+        flexShrink: 0,
+      }}>
+        <text style={{ fg: theme.text.metadata, width: 1 }} wrapMode="none"> </text>
+        <text style={{ fg: theme.text.metadata, width: layout.modelWidth }} wrapMode="none">MODEL</text>
+        {layout.showMemory && <text style={{ fg: theme.text.metadata, width: layout.columns.memory }} wrapMode="none">MEMORY</text>}
+        {layout.showSpeed && <text style={{ fg: theme.text.metadata, width: layout.columns.speed }} wrapMode="none">SPEED</text>}
+        {layout.showSpeculative && <text style={{ fg: theme.text.metadata, width: layout.columns.speculative }} wrapMode="none">SPECULATIVE</text>}
+        <text style={{ fg: theme.text.metadata, width: layout.columns.status }} wrapMode="none">STATUS</text>
+      </box>
+      {runningProgress && (
+        <text style={{ fg: theme.accent, marginLeft: 2 }}>
+          {spinner} {runningProgress.label}{runningProgress.metadata}
+        </text>
+      )}
+      {candidates.length === 0 && recommendationsReady ? (
+        <text style={{ fg: theme.status.warning, marginLeft: 2 }}>
+          No compatible recommended models are currently available.
+        </text>
+      ) : candidates.map((candidate, index) => {
+        const configurationId = configurationIdFor(candidate)
+        if (configurationId === undefined) return null
+        const highlighted = index === cursorIndex
+        return (
+          <CatalogCandidateRow
+            key={configurationId}
+            model={candidate}
+            memoryBytes={memoryBytesFor(candidate)}
+            highlighted={highlighted}
+            focused={highlighted && detail === null}
+            selected={catalogModelIsSelected(candidate, selectedModel)}
+            pendingDelete={pendingDeleteId === configurationId}
+            reconciliationState={reconciliationStateFor(candidate)}
+            index={index}
+            layout={layout}
+            rowId={catalogCandidateRowId(configurationId)}
+            onClick={() => {
+              setPendingDeleteId(null)
+              moveCursorTo(index)
+              setRadarTransition(null)
+              inspectorActionCursor.reset()
+              setDetailId(configurationId)
+              setRootSwitchingEnabled(false)
+            }}
+            onMouseOver={() => {
+              if (detail !== null && detailId === configurationId) return
+              if (detail !== null) {
+                setDetailId(null)
+                setRootSwitchingEnabled(true)
+                inspectorActionCursor.reset()
+              }
+              moveCursorTo(index)
+              if (pendingDeleteId !== configurationId) setPendingDeleteId(null)
+            }}
+          />
+        )
+      })}
+    </scrollbox>
+  )
 
   return (
     <box
@@ -1253,78 +2017,32 @@ const CatalogMenu = memo(function CatalogMenu({
     >
       <MenuHeader
         title="Catalog"
-        subtitle={layout.stackedRows
-          ? undefined
-          : layout.mode === "full" ? "Find and download local models" : "Local models"}
-        summary={layout.mode === "minimal"
-          ? String(candidates.length)
-          : layout.compactHeader ? `${candidates.length} models` : `${candidates.length} compatible`}
-        hints={catalogListHints(layout.mode)}
+        selection={detail === null ? undefined : formatLocalModelDisplayName(detail)}
+        onSectionClick={detail === null ? undefined : () => {
+          setDetailId(null)
+          setRadarTransition(null)
+          setRootSwitchingEnabled(true)
+        }}
+        subtitle={detail !== null || layout.compactHeader ? undefined : "Find and download local models"}
+        summary={detail !== null ? undefined
+          : layout.compactHeader ? String(candidates.length) : `${candidates.length} compatible`}
+        hints={detail === null
+          ? catalogListHints(menuWidth)
+          : catalogDetailHints(layout.compactHeader)}
         compact={layout.compactHeader}
         width={menuWidth}
       />
-      <scrollbox ref={catalogScrollRef} scrollX={false} style={{
-        flexGrow: 1,
-        minHeight: 0,
-        rootOptions: { backgroundColor: theme.menuBg },
-        wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-        viewportOptions: { backgroundColor: theme.menuBg },
-        contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
-      }}>
-        {!layout.stackedRows && (
-          <box style={{ flexDirection: "row", width: "100%" }}>
-            <text style={{ fg: theme.muted, width: 2 }} wrapMode="none"> </text>
-            <text style={{ fg: theme.muted, width: layout.modelWidth }} wrapMode="none">MODEL</text>
-            <text style={{ fg: theme.muted, width: layout.columns.recommendation }} wrapMode="none">RECOMMENDATION</text>
-            <text style={{ fg: theme.muted, width: layout.columns.memory }} wrapMode="none">MEMORY</text>
-            {layout.showIntelligence && (
-              <text style={{ fg: theme.muted, width: layout.columns.intelligence }} wrapMode="none">INTELLIGENCE</text>
-            )}
-            {layout.showQuality && (
-              <text style={{ fg: theme.muted, width: layout.columns.quality }} wrapMode="none">QUALITY</text>
-            )}
-            {layout.showSpeed && (
-              <text style={{ fg: theme.muted, width: layout.columns.speed }} wrapMode="none">SPEED</text>
-            )}
-            <text style={{ fg: theme.muted, width: layout.columns.status }} wrapMode="none">STATUS</text>
-          </box>
+      <box style={{ flexGrow: 1, minHeight: 0, flexDirection: "row", paddingTop: 1 }}>
+        {list}
+        {layout.mode === "split" && inspected !== null && (
+          <>
+            <box style={{ width: layout.dividerWidth, backgroundColor: theme.border.standard }} />
+            <box style={{ width: layout.inspectorWidth, minWidth: layout.inspectorWidth, flexDirection: "column" }}>
+              {inspectorView}
+            </box>
+          </>
         )}
-        {runningProgress && (
-          <text style={{ fg: theme.primary, marginLeft: 2 }}>
-            {spinner} {runningProgress.label}{runningProgress.metadata}
-          </text>
-        )}
-        {candidates.length === 0 && recommendationsReady ? (
-          <text style={{ fg: theme.warning, marginLeft: 2 }}>
-            No compatible recommended models are currently available.
-          </text>
-        ) : candidates.map((candidate, index) => {
-          const focused = index === cursorIndex
-          const pendingDelete = pendingDeleteId === candidate.configurationId
-          return (
-            <CatalogCandidateRow
-              key={candidate.configurationId}
-              candidate={candidate}
-              recommendation={recommendationFor(candidate)}
-              focused={focused}
-              pendingDelete={pendingDelete}
-              index={index}
-              layout={layout}
-              rowId={catalogCandidateRowId(candidate.configurationId)}
-              onClick={() => {
-                setPendingDeleteId(null)
-                detailActionCursor.reset()
-                setDetailId(candidate.configurationId)
-                setRootSwitchingEnabled(false)
-              }}
-              onMouseOver={() => {
-                setCursorId(candidate.configurationId)
-                if (pendingDeleteId !== candidate.configurationId) setPendingDeleteId(null)
-              }}
-            />
-          )
-        })}
-      </scrollbox>
+      </box>
     </box>
   )
 })
@@ -1363,13 +2081,8 @@ const HardwareMenu = memo(function HardwareMenu() {
       void slotActions.load(PRIMARY_SLOT_ID)
       return
     }
-    Option.flatMap(currentSlot, modelSlotInstanceId).pipe(
-      Option.match({
-        onNone: () => {},
-        onSome: slotActions.stop,
-      }),
-    )
-  }, [action, currentSlot, slotActions])
+    void slotActions.stop(PRIMARY_SLOT_ID)
+  }, [action, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -1391,15 +2104,15 @@ const HardwareMenu = memo(function HardwareMenu() {
         style={{
           flexGrow: 1,
           minHeight: 0,
-          rootOptions: { backgroundColor: theme.menuBg },
-          wrapperOptions: { border: false, backgroundColor: theme.menuBg },
-          viewportOptions: { backgroundColor: theme.menuBg },
+          rootOptions: { backgroundColor: theme.background.menu },
+          wrapperOptions: { border: false, backgroundColor: theme.background.menu },
+          viewportOptions: { backgroundColor: theme.background.menu },
           contentOptions: { flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 },
         }}
       >
         {Option.match(hardwareSnapshot, {
           onNone: () => (
-            <text style={{ fg: Result.isFailure(hardwareState) ? theme.error : theme.muted }}>
+            <text style={{ fg: Result.isFailure(hardwareState) ? theme.status.failure : theme.text.metadata }}>
               {Result.isFailure(hardwareState) ? "Hardware detection is unavailable." : "Detecting local-inference hardware…"}
             </text>
           ),
@@ -1407,22 +2120,22 @@ const HardwareMenu = memo(function HardwareMenu() {
             const hardware = describeLocalHardware(detectedHardware)
             return (
               <>
-                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
-                {hardware.system.details.map((line) => <text key={line} style={{ fg: theme.muted }}>{line}</text>)}
+                <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{hardware.system.name}</text>
+                {hardware.system.details.map((line) => <text key={line} style={{ fg: theme.text.metadata }}>{line}</text>)}
                 {hardware.accelerators.map((accelerator) => (
-                  <text key={`${accelerator.name}:${accelerator.details}`} style={{ fg: theme.muted }}>{accelerator.name} · {accelerator.details}</text>
+                  <text key={`${accelerator.name}:${accelerator.details}`} style={{ fg: theme.text.metadata }}>{accelerator.name} · {accelerator.details}</text>
                 ))}
                 {hardware.accelerators.length === 0 && !detectedHardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory") && (
-                  <text style={{ fg: theme.muted }}>CPU inference · No GPU detected</text>
+                  <text style={{ fg: theme.text.metadata }}>CPU inference · No GPU detected</text>
                 )}
               </>
             )
           },
         })}
         <box style={{ flexDirection: "column", marginTop: 1 }}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>CURRENT MODEL</text>
+          <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD}>CURRENT MODEL</text>
           {currentModel._tag === "NoSelection"
-            ? <text style={{ fg: theme.muted }}>No local model selected</text>
+            ? <text style={{ fg: theme.text.metadata }}>No local model selected</text>
             : (() => {
               const actualAllocation = currentModel._tag === "Running"
                 ? Option.some(currentModel.allocation)
@@ -1441,22 +2154,22 @@ const HardwareMenu = memo(function HardwareMenu() {
               return (
                 <>
                   <box style={{ flexDirection: "row" }}>
-                    <text style={{ fg: theme.foreground, flexGrow: 1 }} attributes={TextAttributes.BOLD}>{currentModel.displayName}</text>
-                    <text style={{ fg: currentModel._tag === "Running" ? theme.primary : theme.muted }}>{status}</text>
+                    <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD}>{currentModel.displayName}</text>
+                    <text style={{ fg: currentModel._tag === "Running" ? theme.accent : theme.text.metadata }}>{status}</text>
                   </box>
                   {currentModel._tag === "NotLoaded" || currentModel._tag === "Failed"
                     ? <ModelLoadPlanDetails />
                     : (
                         <box style={{ flexDirection: "row" }}>
-                          <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
-                          <text style={{ fg: theme.foreground, width: 16 }}>
+                          <text style={{ fg: theme.text.metadata, width: 20 }}>Context window</text>
+                          <text style={{ fg: theme.text.body, width: 16 }}>
                             {Option.match(currentModel.contextWindow, {
                               onNone: () => "—",
                               onSome: (tokens) => `${formatContextWindow(tokens)} tokens`,
                             })}
                           </text>
-                          <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
-                          <text style={{ fg: theme.foreground }}>
+                          <text style={{ fg: theme.text.metadata, width: 16 }}>Parallelism</text>
+                          <text style={{ fg: theme.text.body }}>
                             {Option.match(actualAllocation, {
                               onNone: () => "—",
                               onSome: (allocation) => String(allocation.parallelSequences),
@@ -1479,15 +2192,16 @@ const HardwareMenu = memo(function HardwareMenu() {
         })}
         {Option.isSome(currentSlot) && (
           <box style={{ flexDirection: "column", marginTop: 1 }}>
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>ACTIONS</text>
+            <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD}>ACTIONS</text>
             {Option.match(action, {
               onNone: () =>
-                Option.exists(currentSlot.value.instance, (instance) =>
-                  instance.lifecycle._tag === "Stopping")
-                  ? <text style={{ fg: theme.muted }}>Stopping model…</text>
-                  : currentSlot.value.availability._tag === "Unavailable"
-                    ? <text style={{ fg: theme.muted }}>Unable to load model</text>
-                    : <text style={{ fg: theme.muted }}>{"  "}Load model</text>,
+                currentSlot.value.residency._tag === "Stopping"
+                  ? <text style={{ fg: theme.text.metadata }}>Stopping model…</text>
+                  : currentSlot.value.availability._tag === "Pending"
+                    ? <text style={{ fg: theme.text.metadata }}>Initializing model…</text>
+                    : currentSlot.value.availability._tag === "Unavailable"
+                      ? <text style={{ fg: theme.text.metadata }}>{currentSlot.value.availability.failure.message}</text>
+                      : <text style={{ fg: theme.text.metadata }}>{"  "}Load model</text>,
               onSome: (currentAction) => (
                 <MenuAction
                   label={currentAction === "load" ? "Load model" : "Stop model"}
@@ -1511,16 +2225,16 @@ const ModelLoadPlanDetails = memo(function ModelLoadPlanDetails() {
   const plan = Result.value(preview)
   return (
     <box style={{ flexDirection: "row" }}>
-      <text style={{ fg: theme.muted, width: 20 }}>Context window</text>
-      <text style={{ fg: theme.foreground, width: 16 }}>
+      <text style={{ fg: theme.text.metadata, width: 20 }}>Context window</text>
+      <text style={{ fg: theme.text.body, width: 16 }}>
         {Option.match(plan, {
           onNone: () => "—",
           onSome: ({ contextWindowTokens }) =>
             `${formatContextWindow(contextWindowTokens)} tokens`,
         })}
       </text>
-      <text style={{ fg: theme.muted, width: 16 }}>Parallelism</text>
-      <text style={{ fg: theme.foreground }}>
+      <text style={{ fg: theme.text.metadata, width: 16 }}>Parallelism</text>
+      <text style={{ fg: theme.text.body }}>
         {Option.match(plan, {
           onNone: () => Result.isFailure(preview) ? "Unable to load now" : "—",
           onSome: ({ parallelSequences }) => `${parallelSequences} if loaded now`,
@@ -1658,8 +2372,8 @@ const CloudMenu = memo(function CloudMenu({
           hints="Enter save · Esc cancel"
         />
         <box style={{ flexGrow: 1, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
-          <text style={{ fg: theme.foreground }}>API key</text>
-          <box style={{ borderStyle: "single", borderColor: error ? theme.error : theme.primary, paddingLeft: 1, paddingRight: 1, width: "100%" }}>
+          <text style={{ fg: theme.text.body }}>API key</text>
+          <box style={{ borderStyle: "single", borderColor: error ? theme.status.failure : theme.accent, paddingLeft: 1, paddingRight: 1, width: "100%" }}>
             <SingleLineInput
               value={keyValue}
               onChange={(value) => {
@@ -1670,8 +2384,8 @@ const CloudMenu = memo(function CloudMenu({
               focused
             />
           </box>
-          {error && <text style={{ fg: theme.error }}>{error}</text>}
-          <text style={{ fg: theme.muted }}>{auth.saving ? "Saving…" : "Enter to save"}</text>
+          {error && <text style={{ fg: theme.status.failure }}>{error}</text>}
+          <text style={{ fg: theme.text.metadata }}>{auth.saving ? "Saving…" : "Enter to save"}</text>
         </box>
       </>
     )
@@ -1690,8 +2404,8 @@ const CloudMenu = memo(function CloudMenu({
           hints="↑↓ navigate · Enter choose · Esc back"
         />
         <box style={{ flexGrow: 1, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
-          <text style={{ fg: theme.foreground }}>Disconnect Magnitude Cloud?</text>
-          <text style={{ fg: theme.muted }}>Cloud models will no longer be available in Models.</text>
+          <text style={{ fg: theme.text.body }}>Disconnect Magnitude Cloud?</text>
+          <text style={{ fg: theme.text.supporting }}>Cloud models will no longer be available in Models.</text>
           <box style={{ paddingTop: 1, flexDirection: "column" }}>
             <MenuAction
               label="Cancel"
@@ -1724,15 +2438,15 @@ const CloudMenu = memo(function CloudMenu({
       <MenuHeader title="Cloud" subtitle="Manage Magnitude Cloud connection" summary={connected ? "Connected" : "Not connected"} hints="↑↓ navigate" />
       <box style={{ flexGrow: 1, flexDirection: "column", paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
         {auth.source === "none" && (
-          <text style={{ fg: theme.muted }}>Magnitude Cloud provides hosted models and hosted research features.</text>
+          <text style={{ fg: theme.text.supporting }}>Magnitude Cloud provides hosted models and hosted research features.</text>
         )}
         {auth.source === "config" && (
-          <text style={{ fg: theme.success }}>● Connected via API key {auth.maskedKey ? `(${auth.maskedKey})` : ""}</text>
+          <text style={{ fg: theme.status.success }}>● Connected via API key {auth.maskedKey ? `(${auth.maskedKey})` : ""}</text>
         )}
         {auth.source === "env" && (
           <>
-            <text style={{ fg: theme.success }}>● Connected via {auth.envVarName}</text>
-            <text style={{ fg: theme.muted }}>This key is managed by the environment. Update it and relaunch to change it.</text>
+            <text style={{ fg: theme.status.success }}>● Connected via {auth.envVarName}</text>
+            <text style={{ fg: theme.text.supporting }}>This key is managed by the environment. Update it and relaunch to change it.</text>
           </>
         )}
         <box style={{ flexDirection: "column", paddingTop: 1 }}>
@@ -1741,7 +2455,7 @@ const CloudMenu = memo(function CloudMenu({
               onClick={() => runAction("add")}
               onMouseOver={() => actionCursor.select(actionIds.indexOf("add"))}
             >
-              <text style={{ fg: theme.primary }}>{selectedAction === "add" ? "› " : "  "}Add API key</text>
+              <text style={{ fg: theme.accent }}>{selectedAction === "add" ? "› " : "  "}Add API key</text>
             </Button>
           )}
           {auth.source === "config" && (
@@ -1750,7 +2464,7 @@ const CloudMenu = memo(function CloudMenu({
                 onClick={() => runAction("update")}
                 onMouseOver={() => actionCursor.select(actionIds.indexOf("update"))}
               >
-                <text style={{ fg: selectedAction === "update" ? theme.primary : theme.foreground }}>
+                <text style={{ fg: selectedAction === "update" ? theme.accent : theme.text.body }}>
                   {selectedAction === "update" ? "› " : "  "}Update API key
                 </text>
               </Button>
@@ -1758,22 +2472,22 @@ const CloudMenu = memo(function CloudMenu({
                 onClick={() => runAction("disconnect")}
                 onMouseOver={() => actionCursor.select(actionIds.indexOf("disconnect"))}
               >
-                <text style={{ fg: selectedAction === "disconnect" ? theme.primary : theme.foreground }}>
+                <text style={{ fg: selectedAction === "disconnect" ? theme.accent : theme.text.body }}>
                   {selectedAction === "disconnect" ? "› " : "  "}Disconnect
                 </text>
               </Button>
             </>
           )}
           <box style={{ flexDirection: "row" }}>
-            <text style={{ fg: theme.primary }}>{selectedAction === "link" ? "› " : "  "}</text>
+            <text style={{ fg: theme.accent }}>{selectedAction === "link" ? "› " : "  "}</text>
             <Button
               onClick={() => runAction("link")}
               onMouseOver={() => actionCursor.select(actionIds.indexOf("link"))}
             >
-              <text style={{ fg: theme.foreground }}>
+              <text style={{ fg: theme.text.body }}>
                 View dashboard{" "}
                 <span
-                  style={{ fg: selectedAction === "link" ? theme.link : theme.primary }}
+                  style={{ fg: selectedAction === "link" ? theme.link : theme.accent }}
                   attributes={TextAttributes.UNDERLINE}
                 >
                   {MAGNITUDE_CLOUD_URL}↗
@@ -1782,13 +2496,13 @@ const CloudMenu = memo(function CloudMenu({
             </Button>
           </box>
         </box>
-        {auth.error && <text style={{ fg: theme.error }}>{auth.error}</text>}
+        {auth.error && <text style={{ fg: theme.status.failure }}>{auth.error}</text>}
         {connected && cloudModels.length > 0 && (
           <box style={{ flexDirection: "column", paddingTop: 1 }}>
-            <text style={{ fg: theme.muted }}>AVAILABLE MODELS</text>
+            <text style={{ fg: theme.text.metadata }}>AVAILABLE MODELS</text>
             {cloudModels.map((model) => (
-              <text key={providerModelKey(model)} style={{ fg: theme.foreground }}>
-                {model.displayName}<span style={{ fg: theme.muted }}> · {formatContextWindow(model.contextWindow)} context</span>
+              <text key={providerModelKey(model)} style={{ fg: theme.text.body }}>
+                {formatModelDisplayName(model.displayName, model.variantLabel)}<span style={{ fg: theme.text.metadata }}> · {formatContextWindow(model.contextWindow)} context</span>
               </text>
             ))}
           </box>

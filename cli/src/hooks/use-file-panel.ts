@@ -56,9 +56,9 @@ export function useFilePanel({
   projectRoot,
 }: UseFilePanelParams): UseFilePanelResult {
   const atomClient = useAgentClient()
-  const observationRuntimeResult = useAtomValue(atomClient.runtime)
-  const resolvePathMutation = useAtomSet(atomClient.mutation('ResolvePath'), { mode: 'promise' })
-  const readFileMutation = useAtomSet(atomClient.mutation('ReadFile'), { mode: 'promise' })
+  const observationRuntimeResult = useAtomValue(atomClient.rpc.runtime)
+  const resolvePathMutation = useAtomSet(atomClient.rpc.mutation('ResolvePath'), { mode: 'promise' })
+  const readFileMutation = useAtomSet(atomClient.rpc.mutation('ReadFile'), { mode: 'promise' })
 
   // Selected file is atom state: the path is the shared selectedFilePathAtom
   // (any feature can open a file), the section anchor is CLI-only.
@@ -140,7 +140,7 @@ export function useFilePanel({
       // Set up file watch via streaming RPC
       if (Result.isSuccess(observationRuntimeResult)) {
         const watchEffect = Effect.gen(function* () {
-          const c = yield* atomClient
+          const c = yield* atomClient.rpc
           yield* c('WatchFile', { cwd: watchCwd, path }).pipe(
             Stream.runForEach((_event) =>
               Effect.sync(() => {

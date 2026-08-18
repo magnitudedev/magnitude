@@ -61,18 +61,18 @@ export const DiffView = memo(function DiffView({ diffs, dimmed = false }: DiffVi
         if (line === 'separator') {
           const pad = ' '.repeat(gutterWidth)
           return (
-            <text key={`sep-${i}`} style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+            <text key={`sep-${i}`} style={{ fg: theme.text.supporting }} attributes={TextAttributes.DIM}>
               {pad}  ⋮
             </text>
           )
         }
 
-        const color = line.type === 'added' ? theme.success : theme.error
+        const color = line.type === 'added' ? theme.status.success : theme.status.failure
         const numStr = line.lineNum.toString().padStart(gutterWidth)
 
         return (
           <text key={`${line.type[0]}-${i}`} attributes={dimmed ? TextAttributes.DIM : undefined}>
-            <span fg={theme.muted} attributes={TextAttributes.DIM}>{numStr}</span>
+            <span fg={theme.text.supporting} attributes={TextAttributes.DIM}>{numStr}</span>
             {'  '}
             <span fg={color}>{line.sign} {line.content}</span>
           </text>

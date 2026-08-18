@@ -119,10 +119,10 @@ function formatCpu(value: number | null): string {
 function formatMemory(bytes: number | null): string {
   if (bytes == null) return ''
   const mb = bytes / (1024 * 1024)
-  if (mb < 1024) return `${Math.round(mb)}MB`
+  if (mb < 1024) return `${Math.round(mb)} MB`
   const gb = mb / 1024
-  if (gb < 1024) return `${gb.toFixed(1)}GB`
-  return `${(gb / 1024).toFixed(1)}TB`
+  if (gb < 1024) return `${Number(gb.toFixed(1))} GB`
+  return `${Number((gb / 1024).toFixed(1))} TB`
 }
 
 function buildBackgroundProcessesLines(

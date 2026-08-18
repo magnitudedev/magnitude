@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { FetchHttpClient } from "@effect/platform"
 import { describe, expect, it } from "vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import type { ModelCatalog } from "../catalog"
 import { makeFileBackedModelCatalog } from "../file-catalog"
 import {
@@ -29,7 +29,7 @@ const model = (providerId: ProviderId, displayName: string): ProviderModel => ({
   },
   servingCapabilities: { tools: true, structuredOutput: false },
   availability: { _tag: "Available" },
-    pricing: { input: 0, output: 0, cached_input: null },
+    pricing: Option.some({ input: 0, output: 0, cached_input: null }),
 })
 
 describe("file-backed model catalog", () => {

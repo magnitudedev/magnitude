@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { TurnActive, TurnIdle } from '../src/projections/turn'
-import { buildObserverEscalationRunOptions } from '../src/workers/cortex'
+import { buildObserverEscalationRunOptions } from '../src/workers/turn-executor'
 
 const idleTurn = new TurnIdle({
   completedTurns: 0,

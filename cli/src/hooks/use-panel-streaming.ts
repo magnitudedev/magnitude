@@ -150,9 +150,9 @@ export function usePanelStreaming(
     () => activeHighlightRanges.map((range) => ({
       start: range.start,
       end: range.end,
-      backgroundColor: previewChangedRanges.length > 0 ? theme.success : theme.error,
+      backgroundColor: previewChangedRanges.length > 0 ? theme.status.success : theme.status.failure,
     })),
-    [activeHighlightRanges, previewChangedRanges.length, theme.success, theme.error],
+    [activeHighlightRanges, previewChangedRanges.length, theme.status.success, theme.status.failure],
   )
 
   const highlightAnchorId = highlightCharRanges.length > 0 ? 'file-highlight-anchor' : undefined

@@ -135,7 +135,7 @@ export const FileViewerPanel = memo(function FileViewerPanel({
         flexDirection: 'column',
         height: '100%',
         borderStyle: 'single',
-        borderColor: theme.border || theme.muted,
+        borderColor: theme.border.standard,
         customBorderChars: BOX_CHARS,
         paddingLeft: 1,
         paddingRight: 1,
@@ -143,7 +143,7 @@ export const FileViewerPanel = memo(function FileViewerPanel({
     >
       <box style={{ flexDirection: 'row', justifyContent: 'space-between', flexShrink: 0 }}>
         <box style={{ flexDirection: 'row', gap: 1 }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
+          <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>
             {headerLabel}
           </text>
         </box>
@@ -164,11 +164,11 @@ export const FileViewerPanel = memo(function FileViewerPanel({
           flexGrow: 1,
           rootOptions: {
             flexGrow: 1,
-            backgroundColor: 'transparent',
+            backgroundColor: theme.background.canvas,
           },
           wrapperOptions: {
             border: false,
-            backgroundColor: 'transparent',
+            backgroundColor: theme.background.canvas,
           },
           contentOptions: {
             paddingTop: 1,
@@ -187,8 +187,8 @@ export const FileViewerPanel = memo(function FileViewerPanel({
           />
         ) : (
           <box style={{ flexDirection: 'column' }}>
-            {highlightedCodeLines.map((line, idx) => renderCodeLines(line, idx, theme.foreground))}
-            {showCursor && <text style={{ fg: theme.foreground }}>▍</text>}
+            {highlightedCodeLines.map((line, idx) => renderCodeLines(line, idx, theme.text.body))}
+            {showCursor && <text style={{ fg: theme.text.body }}>▍</text>}
           </box>
         )}
       </scrollbox>

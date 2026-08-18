@@ -75,14 +75,14 @@ describe('queue race', () => {
         toolkit,
       })
 
-      // Run a turn and consume events — exactly as cortex does
+      // Run a turn and consume events — exactly as turn executor does
       const turn = yield* harness.runTurn(Prompt.from({
         messages: [{ _tag: 'UserMessage', parts: [{ _tag: 'TextPart', text: 'run' }] }],
       }))
 
       // Allow the forked dispatch fiber to complete and shut down the
       // queue before we start consuming. This reliably reproduces the
-      // race that occurs in production when the cortex does async work
+      // race that occurs in production when the turn executor does async work
       // between obtaining the LiveTurn and draining its event stream.
       yield* Effect.sleep("50 millis")
 

@@ -24,7 +24,7 @@
     }
   },
   "scripts": {
-    "typecheck": "bun run ../version/scripts/generate-version.ts && tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "effect": "^3.21.2",

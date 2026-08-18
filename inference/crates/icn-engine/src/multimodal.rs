@@ -8,10 +8,13 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::FlashAttentionPolicy;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunkType, MtmdInputChunks, MtmdInputText,
+    MtmdBitmap, MtmdChunkEvalParams, MtmdContext, MtmdContextParams, MtmdInputChunkType,
+    MtmdInputChunks, MtmdInputText, MtmdSpeculativeChunkEvalParams,
 };
-use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::speculative::SpeculativeOperations;
 use sha2::{Digest, Sha256};
+
+use crate::scheduler::{PromptBoundary, PromptLayout, PromptSegment};
 
 pub(crate) struct MultimodalRuntime<'model> {
     context: MtmdContext<'model>,
@@ -22,17 +25,28 @@ pub(crate) struct MultimodalRuntime<'model> {
 
 pub(crate) struct MultimodalPrompt {
     chunks: MtmdInputChunks,
-    text_tokens: Vec<LlamaToken>,
-    total_tokens: usize,
+    layout: PromptLayout,
 }
 
 impl MultimodalPrompt {
-    pub(crate) fn text_tokens(&self) -> &[LlamaToken] {
-        &self.text_tokens
+    pub(crate) fn layout(&self) -> &PromptLayout {
+        &self.layout
     }
 
-    pub(crate) const fn total_tokens(&self) -> usize {
-        self.total_tokens
+    fn media_chunk_at(&self, logical_token: usize) -> Option<(usize, usize)> {
+        let mut start = 0usize;
+        for (index, segment) in self.layout.segments().iter().enumerate() {
+            if start == logical_token
+                && let PromptSegment::Media { logical_tokens, .. } = segment
+            {
+                return Some((index, *logical_tokens));
+            }
+            start = start.checked_add(match segment {
+                PromptSegment::Text(tokens) => tokens.len(),
+                PromptSegment::Media { logical_tokens, .. } => *logical_tokens,
+            })?;
+        }
+        None
     }
 }
 
@@ -165,9 +179,14 @@ impl<'model> MultimodalRuntime<'model> {
                     data.len()
                 )));
             }
-            bitmap
-                .set_id(&format!("{:x}", Sha256::digest(data)))
-                .map_err(native_error)?;
+            let identity = format!(
+                "{}:{}x{}:{:x}",
+                image.media_type(),
+                bitmap.nx(),
+                bitmap.ny(),
+                Sha256::digest(data)
+            );
+            bitmap.set_id(&identity).map_err(native_error)?;
             bitmaps.push(bitmap);
         }
 
@@ -195,32 +214,140 @@ impl<'model> MultimodalRuntime<'model> {
                     .into(),
             ));
         }
-        let text_tokens = chunks.text_tokens().map_err(native_error)?;
-        Ok(MultimodalPrompt {
-            chunks,
-            text_tokens,
-            total_tokens,
-        })
+        let mut segments = Vec::with_capacity(chunks.len());
+        for index in 0..chunks.len() {
+            let chunk = chunks.get(index).ok_or_else(|| {
+                InferenceError::Backend(format!("multimodal prompt lost chunk {index}"))
+            })?;
+            match chunk.chunk_type() {
+                MtmdInputChunkType::Text => segments.push(PromptSegment::Text(
+                    chunk
+                        .text_tokens()
+                        .map_err(native_error)?
+                        .ok_or_else(|| {
+                            InferenceError::Backend(format!(
+                                "multimodal text chunk {index} contained no token view"
+                            ))
+                        })?
+                        .to_vec(),
+                )),
+                MtmdInputChunkType::Image => segments.push(PromptSegment::Media {
+                    identity: chunk
+                        .id()
+                        .map_err(native_error)?
+                        .ok_or_else(|| {
+                            InferenceError::Backend(format!(
+                                "multimodal image chunk {index} has no stable identity"
+                            ))
+                        })?
+                        .to_owned(),
+                    logical_tokens: chunk.n_tokens().map_err(native_error)?,
+                    native_positions: chunk.n_positions().map_err(native_error)?,
+                }),
+                MtmdInputChunkType::Audio => {
+                    return Err(InferenceError::InvalidConfig(
+                        "audio chunks are not supported by the image request contract".into(),
+                    ));
+                }
+                MtmdInputChunkType::Unknown(raw) => {
+                    return Err(InferenceError::Backend(format!(
+                        "multimodal prompt contains unsupported chunk type {raw}"
+                    )));
+                }
+                _ => {
+                    return Err(InferenceError::Backend(
+                        "multimodal prompt contains a chunk type unknown to this binding".into(),
+                    ));
+                }
+            }
+        }
+        let layout = PromptLayout::new(segments);
+        if layout.logical_tokens() != total_tokens {
+            return Err(InferenceError::Backend(format!(
+                "multimodal layout contains {} tokens but native chunks report {total_tokens}",
+                layout.logical_tokens()
+            )));
+        }
+        Ok(MultimodalPrompt { chunks, layout })
     }
 
-    pub(crate) fn evaluate_prompt(
+    pub(crate) fn evaluate_media(
         &mut self,
         prompt: &MultimodalPrompt,
         llama_context: &mut LlamaContext<'_>,
+        start: PromptBoundary,
         sequence_id: i32,
         batch_size: i32,
-    ) -> Result<i32, InferenceError> {
-        prompt
-            .chunks
-            .eval_chunks(
-                &mut self.context,
-                llama_context,
-                0,
-                sequence_id,
-                batch_size,
-                true,
-            )
-            .map_err(native_error)
+        speculative: Option<&mut SpeculativeOperations<'_>>,
+    ) -> Result<PromptBoundary, InferenceError> {
+        let (chunk_index, logical_tokens) =
+            prompt.media_chunk_at(start.logical_tokens).ok_or_else(|| {
+                InferenceError::Backend(format!(
+                    "multimodal evaluation expected media at logical token {}",
+                    start.logical_tokens
+                ))
+            })?;
+        let next = match speculative {
+            Some(speculative) => {
+                let position = start.speculative_position().ok_or_else(|| {
+                    InferenceError::Backend("draft position exceeded i32::MAX".into())
+                })?;
+                let next = prompt
+                    .chunks
+                    .eval_chunk_speculative(
+                        &mut self.context,
+                        speculative,
+                        MtmdSpeculativeChunkEvalParams {
+                            index: chunk_index,
+                            position,
+                            seq_id: sequence_id,
+                            n_batch: batch_size,
+                            logits_last: false,
+                        },
+                    )
+                    .map_err(native_error)?;
+                PromptBoundary {
+                    logical_tokens: usize::try_from(next.draft).map_err(native_error)?,
+                    native_position: next.target,
+                }
+            }
+            None => {
+                let native_position = prompt
+                    .chunks
+                    .eval_chunk(
+                        &mut self.context,
+                        llama_context,
+                        MtmdChunkEvalParams {
+                            index: chunk_index,
+                            n_past: start.native_position,
+                            seq_id: sequence_id,
+                            n_batch: batch_size,
+                            logits_last: false,
+                        },
+                    )
+                    .map_err(native_error)?;
+                PromptBoundary {
+                    logical_tokens: start
+                        .logical_tokens
+                        .checked_add(logical_tokens)
+                        .ok_or_else(|| {
+                            InferenceError::Backend("prompt token count overflowed".into())
+                        })?,
+                    native_position,
+                }
+            }
+        };
+        let expected_logical = start
+            .logical_tokens
+            .checked_add(logical_tokens)
+            .ok_or_else(|| InferenceError::Backend("prompt token count overflowed".into()))?;
+        if next.logical_tokens != expected_logical {
+            return Err(InferenceError::Backend(format!(
+                "linked draft advanced to logical position {} instead of {expected_logical}",
+                next.logical_tokens
+            )));
+        }
+        Ok(next)
     }
 }
 

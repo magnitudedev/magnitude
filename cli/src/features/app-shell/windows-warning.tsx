@@ -43,7 +43,7 @@ export const WindowsWarningScreen = memo(function WindowsWarningScreen({
           flexShrink: 0,
         }}
       >
-        <text style={{ fg: theme.error, flexGrow: 1 }}>
+        <text style={{ fg: theme.status.failure, flexGrow: 1 }}>
           <span attributes={TextAttributes.BOLD}>
             Native Windows is not supported
           </span>
@@ -52,7 +52,7 @@ export const WindowsWarningScreen = memo(function WindowsWarningScreen({
 
       {/* Divider */}
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.border }}>{'─'.repeat(80)}</text>
+        <text style={{ fg: theme.border.standard }}>{'─'.repeat(80)}</text>
       </box>
 
       {/* Body */}
@@ -66,7 +66,7 @@ export const WindowsWarningScreen = memo(function WindowsWarningScreen({
         }}
       >
         <box style={{ paddingBottom: 1 }}>
-          <text style={{ fg: theme.foreground }}>
+          <text style={{ fg: theme.text.body }}>
             Magnitude requires a Unix-like shell environment and does not run
             on native Windows. Please use WSL (Windows Subsystem for Linux) instead.
           </text>
@@ -74,34 +74,34 @@ export const WindowsWarningScreen = memo(function WindowsWarningScreen({
 
         <box style={{ paddingBottom: 1, flexDirection: 'column' }}>
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.muted }}>1. Open PowerShell as Administrator and run:</text>
+            <text style={{ fg: theme.text.supporting }}>1. Open PowerShell as Administrator and run:</text>
           </box>
           <box style={{ paddingLeft: 2, paddingBottom: 1 }}>
-            <text style={{ fg: theme.foreground }}>
+            <text style={{ fg: theme.text.body }}>
               <span attributes={TextAttributes.BOLD}>wsl --install</span>
             </text>
           </box>
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.muted }}>2. Restart your computer if prompted, then open a terminal and run:</text>
+            <text style={{ fg: theme.text.supporting }}>2. Restart your computer if prompted, then open a terminal and run:</text>
           </box>
           <box style={{ paddingLeft: 2, paddingBottom: 1 }}>
-            <text style={{ fg: theme.foreground }}>
+            <text style={{ fg: theme.text.body }}>
               <span attributes={TextAttributes.BOLD}>wsl</span>
             </text>
           </box>
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.muted }}>3. Inside the WSL shell, install Magnitude:</text>
+            <text style={{ fg: theme.text.supporting }}>3. Inside the WSL shell, install Magnitude:</text>
           </box>
           <box style={{ paddingLeft: 2, paddingBottom: 1 }}>
-            <text style={{ fg: theme.foreground }}>
+            <text style={{ fg: theme.text.body }}>
               <span attributes={TextAttributes.BOLD}>npm i -g @magnitudedev/cli</span>
             </text>
           </box>
           <box style={{ paddingBottom: 1 }}>
-            <text style={{ fg: theme.muted }}>4. Then run it from your project directory:</text>
+            <text style={{ fg: theme.text.supporting }}>4. Then run it from your project directory:</text>
           </box>
           <box style={{ paddingLeft: 2, paddingBottom: 1 }}>
-            <text style={{ fg: theme.foreground }}>
+            <text style={{ fg: theme.text.body }}>
               <span attributes={TextAttributes.BOLD}>magnitude</span>
             </text>
           </box>
@@ -118,7 +118,7 @@ export const WindowsWarningScreen = memo(function WindowsWarningScreen({
           flexShrink: 0,
         }}
       >
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.supporting }}>
           <span attributes={TextAttributes.DIM}>
             Press Esc or Ctrl+C to exit
           </span>

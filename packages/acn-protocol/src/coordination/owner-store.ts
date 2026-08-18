@@ -1,22 +1,22 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { Context, Effect, Layer, type Option } from "effect"
-import type { AcnRevision } from "../acn-revision"
 import {
   makeAcnCoordinationDatabase,
   type ReplaceOwnerResult,
 } from "./coordination-database"
-import type { AcnProcessStoreError } from "./errors"
+import type { AcnOwnerStoreError } from "./errors"
 import type { AcnOwnerRecord } from "./schemas"
 import { SqliteDriver } from "./sqlite-driver"
 
 export interface AcnOwnerStore {
-  readonly current: Effect.Effect<Option.Option<AcnOwnerRecord>, AcnProcessStoreError>
+  /** Returns one validated ownership snapshot or fails when no trustworthy snapshot is available. */
+  readonly current: Effect.Effect<Option.Option<AcnOwnerRecord>, AcnOwnerStoreError>
+  /** Atomically replaces exactly the expected snapshot; implementation contention never escapes. */
   readonly replaceOwner: (
     expectedOwner: Option.Option<AcnOwnerRecord>,
     candidateOwner: AcnOwnerRecord,
-    candidateRevision: AcnRevision,
-  ) => Effect.Effect<ReplaceOwnerResult, AcnProcessStoreError>
+  ) => Effect.Effect<ReplaceOwnerResult, AcnOwnerStoreError>
 }
 
 export const AcnOwnerStore = Context.GenericTag<AcnOwnerStore>(

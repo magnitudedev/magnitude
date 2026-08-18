@@ -5,11 +5,13 @@ import {
   backendArchive,
   backendPacks,
   hostById,
+  releaseBuildEnvironment,
 } from "../../src/targets"
 import {
   buildArchive,
   run,
   type ArchiveSource,
+  verifyAppleDeploymentTarget,
   verifyOwnedLoaderPaths,
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
@@ -59,12 +61,14 @@ export const buildBackendArtifact = async (
     target: host.bunTarget,
     profile: `backend-${pack.id}`,
     features: pack.cargoFeatures,
-    buildEnvironment:
-      pack.backend === "cuda"
+    buildEnvironment: {
+      ...releaseBuildEnvironment(host),
+      ...(pack.backend === "cuda"
         ? {
-            CMAKE_CUDA_ARCHITECTURES: pack.cuda.architectures.join(";"),
-          }
-        : {},
+          CMAKE_CUDA_ARCHITECTURES: pack.cuda.architectures.join(";"),
+        }
+        : {}),
+    },
   })
   if (!icn.identity.backends.includes(pack.backend)) {
     throw new Error(`${pack.id} build identity does not include ${pack.backend}`)
@@ -89,6 +93,7 @@ export const buildBackendArtifact = async (
     modules,
     runtime,
   })
+  await verifyAppleDeploymentTarget(host.id, [...modules, ...runtime])
   if (host.id.startsWith("darwin-")) {
     for (const file of [...modules, ...runtime]) {
       await run(["codesign", "--force", "--sign", "-", file])

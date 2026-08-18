@@ -1,39 +1,58 @@
-/**
- * AgentClient — AtomRpc tag for the MagnitudeRpcs group.
- * Spec §6.2.
- *
- * Uses the SDK's recovering protocol layer with a host-provided
- * daemon discovery and launch. The client runtime owns endpoint selection and recovery;
- * platform process access only queries or starts an ACN.
- */
-import { AtomRpc, Atom } from "@effect-atom/atom-react"
+/** Shared ACN transport with AtomRpc and Effect Query materializations. */
+import { Atom, AtomRpc } from "@effect-atom/atom-react"
+import * as Reactivity from "@effect/experimental/Reactivity"
 import { RpcClient } from "@effect/rpc"
-import type { Layer } from "effect"
-import { MagnitudeRpcs } from "@magnitudedev/sdk"
-
-/**
- * Placeholder class used as the type identifier for the AgentClient tag.
- */
-export class AgentClient {}
+import { Effect, Layer } from "effect"
+import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
+import {
+  AcnRpcClientTag,
+  LocalInferenceHardwareMirror,
+  MagnitudeRpcs,
+  ProviderModelCatalogMirror,
+} from "@magnitudedev/sdk"
+import {
+  clientServicesLayer,
+  type ClientServices,
+  type ClientServicesOptions,
+} from "./client-services"
+import { runMirroredStateInvalidationWatch } from "./mirrored-state-invalidation"
 
 export type AgentClientInstance = ReturnType<typeof createAgentClient>
+export type AgentClient = AgentClientInstance
+
+class AcnAtomRpcClient {}
 
 /**
- * Create an AgentClient AtomRpc tag backed by a shared protocol layer.
- *
- * The protocol layer must be created once at startup (by the Platform) and
- * passed here. This ensures all RPC consumers — AtomRpc mutations, the
- * display controller, file-watch, session-statuses — share one client
- * lifecycle and recovery authority. Each typed RPC client still builds its
- * own single-consumer protocol receiver.
+ * Create one flat RPC service. AtomRpc and Effect Query share that service;
+ * each domain chooses one state system and never mixes both for the same data.
  */
 export function createAgentClient(
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
+  options: ClientServicesOptions = {},
 ) {
-  const client = AtomRpc.Tag<AgentClient>()("AgentClient", {
+  const runtime = Atom.context({ memoMap: Effect.runSync(Layer.makeMemoMap) })
+  const rpc = AtomRpc.Tag<AcnAtomRpcClient>()("AcnRpc", {
     group: MagnitudeRpcs,
     protocol: protocolLayer,
+    runtime,
   })
-  Atom.runtime.addGlobalLayer(client.layer)
-  return client
+  const directMirrorIds = [
+    LocalInferenceHardwareMirror.id,
+    ProviderModelCatalogMirror.id,
+  ]
+  runtime.addGlobalLayer(Layer.scopedDiscard(Effect.gen(function* () {
+    const client = yield* rpc
+    const reactivity = yield* Reactivity.Reactivity
+    yield* runMirroredStateInvalidationWatch(
+      client,
+      () => reactivity.invalidate(directMirrorIds),
+      (event) => reactivity.invalidate([event.id]),
+    ).pipe(Effect.forkScoped)
+  })).pipe(Layer.provide(rpc.layer)))
+  const rpcLayer = Layer.effect(AcnRpcClientTag, rpc).pipe(Layer.provide(rpc.layer))
+  const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
+    rpcLayer,
+    (client) => clientServicesLayer(client, options),
+  )
+  return { rpc, effectQuery }
 }

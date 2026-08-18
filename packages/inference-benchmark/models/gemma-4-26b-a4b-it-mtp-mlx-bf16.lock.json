@@ -1,0 +1,45 @@
+{
+  "repository": "mlx-community/gemma-4-26B-A4B-it-assistant-bf16",
+  "revision": "cda74908f1dbe7d3dbd3030e66576a7d4094144f",
+  "quantization": {
+    "family": "mlx-unquantized",
+    "dtype": "bfloat16"
+  },
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sizeBytes": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    },
+    {
+      "path": "README.md",
+      "sizeBytes": 2333,
+      "sha256": "dbefa6eb400add77a99a7a2915cf3586c34a66da649ba13c70e6822c2638dbdc"
+    },
+    {
+      "path": "config.json",
+      "sizeBytes": 2315,
+      "sha256": "f393dd4bbdbb1de9bfade9de224493de4e728ba020f9078db8de93cc66a551b2"
+    },
+    {
+      "path": "generation_config.json",
+      "sizeBytes": 307,
+      "sha256": "8e58004dc0e2407b63410b190bb8470efbdcfeb71533f1770e09c20abe193a6f"
+    },
+    {
+      "path": "model.safetensors",
+      "sizeBytes": 839427840,
+      "sha256": "006c8713b29b046e296c0f0b7c524aa9264ae07ae8b0c3888b9bc062242297ff"
+    },
+    {
+      "path": "tokenizer.json",
+      "sizeBytes": 32169440,
+      "sha256": "75a6583c1a418e2bbd79c60d95d28e0f5bf549ad3f2990b5bdb5238c6c2bf70c"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "sizeBytes": 822,
+      "sha256": "089594a3924fcfd4cb1c596a7906fbf476193519e5198f780912eed02b177e42"
+    }
+  ]
+}

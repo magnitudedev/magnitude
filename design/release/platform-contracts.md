@@ -84,11 +84,19 @@ Apple artifacts may depend on operating-system libraries and frameworks included
 macOS deployment target. Metal is capability-owned by macOS. Homebrew, MacPorts, Xcode, standalone
 SDKs, and developer-tool libraries are not platform dependencies.
 
+The supported macOS floor is macOS 13.0 for both Apple arm64 and Apple x64. Release builds use the
+newest selected SDK while compiling and linking every Apple-native image for that floor. The floor
+does not select an older Metal implementation: guarded operating-system APIs and actual GPU
+capabilities remain runtime decisions, so the same artifact uses newer facilities on newer hosts.
+macOS 12 and older are outside the platform contract because the Bun runtime embedded in the CLI and
+ACN requires macOS 13 or newer.
+
 Artifact-owned libraries use `@loader_path` or declared installation rpaths and must not require
 `DYLD_LIBRARY_PATH`. Every Mach-O image must match its target architecture and must not declare a
-deployment target newer than the supported macOS floor. The release configuration must name that
-floor before minimum-version compatibility can be claimed; a runner label alone is not a support
-contract.
+deployment target newer than macOS 13.0. The release configuration is the authority for that floor;
+a runner label alone is not a support contract. Before packaging, the Apple build validates the
+expected architecture and deployment target of every executable and native library with Apple's
+`vtool`. Those validated files are the exact inputs to the deterministic archive builder.
 
 ## Required guarantees
 

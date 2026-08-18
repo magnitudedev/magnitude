@@ -16,6 +16,8 @@ export { makeRemoteAcnInstanceManager } from "./acn-jit/remote-acn-instance-mana
 export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
+export { AcnRpcClientTag } from "./protocol"
+export type { AcnRpcClient } from "./protocol"
 export type {
   AcnClientCloseReport,
   AcnClientCloseResult,
@@ -59,6 +61,7 @@ export {
   PercentageSchema,
   ModelCapabilitiesSchema,
   ModelFailureSchema,
+  ModelDownloadFailureSchema,
   ProviderModelCatalogStateSchema,
   ProviderCatalogEntrySchema,
   ProviderModelCatalogEntrySchema,
@@ -66,8 +69,7 @@ export {
   ModelSlotDescriptorSchema,
   ModelSlotAvailabilitySchema,
   ModelLoadPlanSchema,
-  ModelSlotInstanceLifecycleSchema,
-  ModelSlotInstanceSchema,
+  ModelResidencySchema,
   ModelSlotActionSchema,
   ModelSlotSchema,
   LocalInferenceAcceleratorSchema,
@@ -82,10 +84,12 @@ export {
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
   OnboardingMirror,
-  ModelOfferingTargetIdSchema,
-  DownloadAttemptIdSchema,
+  ModelDownloadIdSchema,
+  LocalModelInstalledPackageSchema,
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
+  ModelVariantLabelSchema,
+  formatModelDisplayName,
   RecommendationIdSchema,
   ModelAssessmentIdSchema,
   AssessmentEnvironmentIdSchema,
@@ -101,8 +105,8 @@ export {
 } from "@magnitudedev/ai/provider/model"
 
 export type {
-  DownloadAttemptId,
-  ModelOfferingTargetId,
+  ModelDownloadId,
+  LocalModelInstalledPackage,
   RecommendationId,
   LocalModel,
   LocalModelRecommendation,
