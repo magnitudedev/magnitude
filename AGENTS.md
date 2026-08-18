@@ -1,3 +1,4 @@
+TRESTING 
 # Magnitude Project Context
 
 You are working on Magnitude, an AI coding agent platform.

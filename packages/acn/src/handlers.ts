@@ -49,6 +49,7 @@ import { LocalModelConfigurationResolver } from "./local-model-configuration-res
 import { localCatalogProviderModelId } from "./local-provider-model-id";
 import { IcnModels } from "@magnitudedev/icn";
 import { Projects } from "./projects";
+import { ProjectFiles } from "./project-files";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -63,6 +64,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
     const projects = yield* Projects;
+    const projectFiles = yield* ProjectFiles;
     const providerCredentials = yield* ProviderCredentials;
     const providerModelCatalog = yield* ProviderModelCatalog;
     const modelSlots = yield* ModelSlotController;
@@ -345,6 +347,24 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
       StreamProjectChanges: () =>
         observeRpcStreamDefects("StreamProjectChanges", projects.changes),
+
+      ListProjectDirectory: ({ projectId, directory }) =>
+        observeRpcDefects("ListProjectDirectory", projectFiles.listDirectory(projectId, directory)),
+
+      WatchProjectFiles: ({ projectId }) =>
+        observeRpcStreamDefects("WatchProjectFiles", projectFiles.watchChanges(projectId)),
+
+      ReadProjectFile: ({ projectId, path }) =>
+        observeRpcDefects("ReadProjectFile", projectFiles.readFile(projectId, path)),
+
+      WriteProjectFile: (payload) =>
+        observeRpcDefects("WriteProjectFile", projectFiles.writeFile(payload)),
+
+      DeleteProjectFile: (payload) =>
+        observeRpcDefects("DeleteProjectFile", projectFiles.deleteFile(payload).pipe(Effect.as({}))),
+
+      MoveProjectEntry: (payload) =>
+        observeRpcDefects("MoveProjectEntry", projectFiles.moveEntry(payload)),
 
       // Agent control
       SendMessage: (payload) =>

@@ -119,12 +119,15 @@ export {
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelVariantLabelSchema,
+  ModelReleaseDateSchema,
   formatModelDisplayName,
   RecommendationIdSchema,
   ModelAssessmentIdSchema,
   AssessmentEnvironmentIdSchema,
   LocalModelsStateSchema,
   AcnInstanceIdSchema,
+  ProjectRelativePathSchema,
+  ProjectFileRevisionSchema,
 } from "@magnitudedev/acn-protocol"
 
 export type {

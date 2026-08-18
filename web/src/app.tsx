@@ -15,7 +15,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react"
-import { Menu } from "lucide-react"
+import { Menu, PanelRight } from "lucide-react"
 import { NotePencil, SidebarSimple } from "@phosphor-icons/react"
 import { Cause, Option, Effect } from "effect"
 import {
@@ -64,7 +64,7 @@ import {
   FooterBar,
   type FooterModelOptionsState,
 } from "./components/footer-bar"
-import { FileViewerPanel } from "./components/file-viewer-panel"
+import { ProjectFilesPanel } from "./components/project-files/panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
@@ -85,6 +85,7 @@ import {
   sidebarWidthAtom,
   sidebarVisibleAtom,
   settingsTabAtom,
+  projectFilesPanelOpenAtom,
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
@@ -113,7 +114,6 @@ import {
 import type {
   AcnLifecycleState,
   DisplayActor,
-  ReadFileResult,
   SessionMetadata,
 } from "@magnitudedev/sdk"
 import type { SlotId } from "@magnitudedev/sdk"
@@ -307,65 +307,6 @@ function SessionsSidebarContainer(props?: {
       overlay={props?.overlay}
       onCloseOverlay={props?.onCloseOverlay}
       titlebarIntegrated={props?.titlebarIntegrated}
-    />
-  )
-}
-
-/** FileViewerPanel container — ReadFile query */
-function FileViewerPanelContainer(): ReactNode {
-  const filePath = useAtomValue(selectedFilePathAtom)
-  const setFilePath = useAtomSet(selectedFilePathAtom)
-  const client = useAgentClient()
-  const selectedCwd = useAtomValue(selectedCwdAtom)
-
-  // Determine format based on file extension — images need base64
-  const isImageFile = filePath
-    ? ["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(
-        filePath.split(".").pop() ?? ""
-      )
-    : false
-
-  // Only query when we have a real path + cwd.
-  // When no file is selected, use a static idle atom so the hook count stays stable.
-  // P1: reactivityKeys: ["files"] so the query refreshes when files change.
-  const readFileAtom = useMemo(
-    () =>
-      filePath && selectedCwd
-        ? client.rpc.query(
-            "ReadFile",
-            {
-              cwd: selectedCwd,
-              path: filePath,
-              format: isImageFile ? "base64" : "text",
-            },
-            {
-              reactivityKeys: ["files"],
-            }
-          )
-        : Atom.make(() => null),
-    [client, selectedCwd, filePath, isImageFile]
-  )
-  const result = useAtomValue(readFileAtom)
-
-  // P2: Handle loading and error states explicitly
-  // result is null when no file is selected (idle atom), so guard for that.
-  const loading =
-    !!filePath && !!selectedCwd && result !== null && Result.isInitial(result)
-  const errorMsg =
-    filePath && selectedCwd && result !== null && Result.isFailure(result)
-      ? "Failed to read file. The file may not exist or is not accessible."
-      : null
-  const content =
-    filePath && result !== null && Result.isSuccess(result)
-      ? (result.value as ReadFileResult).content
-      : null
-  return (
-    <FileViewerPanel
-      filePath={filePath}
-      content={content}
-      loading={loading}
-      error={errorMsg}
-      onClose={() => setFilePath(null)}
     />
   )
 }
@@ -740,11 +681,15 @@ function BottomDockContainer({
 }
 function ChatTitleBar({
   onOpenSidebar,
+  onOpenProjectFiles,
+  projectFilesExpanded = false,
   desktop = false,
   onCompose,
   showTitle = true,
 }: {
   onOpenSidebar?: () => void
+  onOpenProjectFiles: () => void
+  projectFilesExpanded?: boolean
   desktop?: boolean
   onCompose?: () => void
   showTitle?: boolean
@@ -780,6 +725,16 @@ function ChatTitleBar({
   const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
   const sidebarWidth = useAtomValue(sidebarWidthAtom)
   const setSidebarCollapsed = useAtomSet(sidebarCollapsedAtom)
+  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
+  const projectFilesButton = (
+    <Button variant="unstyled" size="unstyled" type="button"
+      onClick={onOpenProjectFiles}
+      disabled={selectedProjectId === null}
+      className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
+      aria-label="Expand project files"
+      title={selectedProjectId === null ? "Select a project to browse files" : "Project files"}
+    ><PanelRight size={18} /></Button>
+  )
   if (desktop) {
     const titlebarActions = (
       <>
@@ -834,6 +789,9 @@ function ChatTitleBar({
             {title}
           </span>
         ) : null}
+        {!projectFilesExpanded ? (
+          <div className="absolute inset-y-0 right-2 flex items-center">{projectFilesButton}</div>
+        ) : null}
       </div>
     )
   }
@@ -856,6 +814,7 @@ function ChatTitleBar({
       <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
         {title}
       </span>
+      {!projectFilesExpanded ? <div className="ml-auto">{projectFilesButton}</div> : null}
     </div>
   )
 }
@@ -997,29 +956,40 @@ function AuthenticatedAppContent({
     : deriveLocalModelLoadActivity(modelSlots, rootSlotId)
   const showOverlaySidebar = isNarrow && sidebarVisible
   const settingsTab = useAtomValue(settingsTabAtom)
+  const projectFilesOpen = useAtomValue(projectFilesPanelOpenAtom)
+  const setProjectFilesOpen = useAtomSet(projectFilesPanelOpenAtom)
+  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const { startNewSession } = useSessionActions()
   const controller = useDisplayViewController()
   const forkStack = controller.expandedForkStack
   const panelOpen = settingsTab !== null
   const workerDetailOpen = !panelOpen && forkStack.length > 0
+  const projectFilesExpanded = !panelOpen && projectFilesOpen && selectedProjectId !== null
+  const openProjectFiles = () => {
+    setSettingsTab(null)
+    setProjectFilesOpen(true)
+  }
   return (
     <div
       className={`${
         isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-900"
-      } app flex h-screen flex-col overflow-hidden`}
+      } app relative flex h-screen overflow-hidden`}
     >
-      {isDesktop ? (
-        <ChatTitleBar
-          desktop
-          showTitle={!panelOpen}
-          onCompose={() => {
-            setSettingsTab(null)
-            startNewSession()
-          }}
-        />
-      ) : null}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        {isDesktop ? (
+          <ChatTitleBar
+            desktop
+            showTitle={!panelOpen}
+            projectFilesExpanded={projectFilesExpanded}
+            onOpenProjectFiles={openProjectFiles}
+            onCompose={() => {
+              setSettingsTab(null)
+              startNewSession()
+            }}
+          />
+        ) : null}
+        <div className="relative flex min-h-0 flex-1 overflow-hidden">
         {/* Docked sidebar — hidden by CSS when narrow */}
         {!isNarrow && <SessionsSidebarContainer titlebarIntegrated={isDesktop} />}
         {/* Overlay sidebar — shown when narrow + visible */}
@@ -1039,6 +1009,8 @@ function AuthenticatedAppContent({
           {!isDesktop ? (
             <ChatTitleBar
               onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
+              projectFilesExpanded={projectFilesExpanded}
+              onOpenProjectFiles={openProjectFiles}
             />
           ) : null}
           <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
@@ -1072,7 +1044,6 @@ function AuthenticatedAppContent({
         )}
         <Toaster />
         </div>
-        {!panelOpen && <FileViewerPanelContainer />}
         {connectionError && (
           <DaemonConnectionError
             message={connectionError.message}
@@ -1094,7 +1065,9 @@ function AuthenticatedAppContent({
             }}
           />
         )}
+        </div>
       </div>
+      {projectFilesExpanded && <ProjectFilesPanel projectId={selectedProjectId} />}
     </div>
   )
 }

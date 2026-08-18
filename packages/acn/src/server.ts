@@ -93,6 +93,7 @@ import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { SessionStoreLive } from "./session-store"
 import { ProjectRegistryLive } from "./project-registry"
 import { ProjectsLive } from "./projects"
+import { ProjectFilesLive } from "./project-files"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import {
@@ -452,9 +453,10 @@ const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
   const withCommands = Layer.provideMerge(SessionCommandsLive, withClientLeases)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
   const withProjects = Layer.provideMerge(ProjectsLive, withLifecycle)
+  const withProjectFiles = Layer.provideMerge(ProjectFilesLive, withProjects)
   const withActiveSessionStatuses = Layer.provideMerge(
     ActiveSessionStatusesLive,
-    withProjects
+    withProjectFiles
   )
   const withStreams = Layer.provideMerge(
     DisplayViewStreamsLive,

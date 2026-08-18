@@ -89,6 +89,7 @@ export interface MarkdownContentProps {
   readonly showCursor?: boolean
   readonly className?: string
   readonly style?: React.CSSProperties
+  readonly skipHtml?: boolean
 }
 function MarkdownContentImpl({
   content,
@@ -96,6 +97,7 @@ function MarkdownContentImpl({
   showCursor = false,
   className,
   style,
+  skipHtml = false,
 }: MarkdownContentProps): ReactNode {
   const components = useMemo<Components>(
     () => ({
@@ -234,7 +236,7 @@ function MarkdownContentImpl({
         ...style,
       }}
     >
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} skipHtml={skipHtml}>
         {displayContent}
       </ReactMarkdown>
     </div>

@@ -85,3 +85,10 @@ export const useAppearancePreference = (): AppearancePreference =>
     getAppearancePreference,
     () => "system"
   )
+
+export const useResolvedAppearance = (): ResolvedAppearance =>
+  useSyncExternalStore(
+    subscribeAppearance,
+    getResolvedAppearance,
+    () => "light",
+  )

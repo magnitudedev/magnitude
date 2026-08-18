@@ -11,6 +11,7 @@ import {
   ModelAssessmentIdSchema,
   ModelInstanceIdSchema,
   ModelPackageIdSchema,
+  ModelReleaseDateSchema,
   ModelServingConfigurationIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
@@ -85,6 +86,7 @@ const makeModel = (installed: boolean): LocalModel => {
       catalogData: {
         modelId: CatalogModelIdSchema.make("setup-model"),
         variantId: CatalogVariantIdSchema.make("gguf:q4"),
+        releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
         parameterization: { architecture: "dense", totalParameters: 1 },
         intelligenceScore: 1,
         intelligenceScoreSource: "test",
