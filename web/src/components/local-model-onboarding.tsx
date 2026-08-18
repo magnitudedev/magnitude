@@ -1,4 +1,6 @@
 import type { ReactNode } from "react"
+import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import { AlertTriangle, Cpu, HardDrive, Loader2, X } from "lucide-react"
@@ -244,19 +246,13 @@ export function LocalModelOnboarding({
                 </p>
                 {preparationStep !== null && preparationProgress !== null && (
                   <div className="mt-3 flex max-w-[480px] items-center gap-3">
-                    <div
-                      role="progressbar"
+                    <Progress
                       aria-label={preparationLabel(preparationStep, false)}
-                      aria-valuemin={0}
-                      aria-valuemax={100}
-                      aria-valuenow={Math.round(preparationProgress * 100)}
-                      className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"
-                    >
-                      <div
-                        className="h-full rounded-full bg-blue-700 transition-[width] duration-150 motion-reduce:transition-none dark:bg-blue-500"
-                        style={{ width: `${preparationProgress * 100}%` }}
-                      />
-                    </div>
+                      value={Math.round(preparationProgress * 100)}
+                      className="min-w-0 flex-1"
+                      trackClassName="h-1.5 rounded-full bg-slate-200 dark:bg-slate-800"
+                      indicatorClassName="rounded-full bg-blue-700 duration-150 motion-reduce:transition-none dark:bg-blue-500"
+                    />
                     <span className="w-9 text-right font-mono text-[11px] tabular-nums text-slate-500">
                       {Math.round(preparationProgress * 100)}%
                     </span>
@@ -327,19 +323,19 @@ export function LocalModelOnboarding({
             </div>
             <div className="model-actions">
               {operation._tag === "Loading" && operation.phase === "Failed" && (
-                <button
+                <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
                   onClick={() => setup.select(operation.configurationId)}
                 >
                   Retry
-                </button>
+                </Button>
               )}
               {operation._tag !== "Completing" &&
                 !(
                   operation._tag === "Loading" && operation.phase === "Ready"
                 ) && (
-                  <button
+                  <Button variant="unstyled" size="unstyled"
                     type="button"
                     className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 dark:hover:bg-slate-750"
                     onClick={setup.cancel}
@@ -349,7 +345,7 @@ export function LocalModelOnboarding({
                     {"cancelling" in operation && operation.cancelling
                       ? "Cancelling…"
                       : "Choose another"}
-                  </button>
+                  </Button>
                 )}
             </div>
           </section>
@@ -362,7 +358,7 @@ export function LocalModelOnboarding({
                 localModelConfigurationId(option.model)
               )
               return (
-                <button
+                <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none rounded-[10px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 p-[17px] text-left cursor-pointer font-[inherit] hover:border-blue-400 hover:bg-slate-100 dark:hover:border-blue-600 dark:hover:bg-slate-800 [&_h3]:mb-[5px] [&_h3]:text-[15px] [&_h3]:leading-[1.3] [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_p]:my-1.5 [&_p]:text-[12.5px] [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400"
                   key={option.id}
@@ -403,7 +399,7 @@ export function LocalModelOnboarding({
                     </p>
                   )}
                   <ModelSummary model={option.model} />
-                </button>
+                </Button>
               )
             })}
             {content.options.length === 0 && (
@@ -417,7 +413,7 @@ export function LocalModelOnboarding({
         <footer className="mt-6 flex items-center justify-between gap-4 text-[11px] text-slate-500 max-[760px]:flex-col max-[760px]:items-start">
           <span>Model files and inference stay on this machine.</span>
           {content._tag !== "Closing" && operation === null && (
-            <button
+            <Button variant="unstyled" size="unstyled"
               type="button"
               className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
               onClick={setup.exit}
@@ -425,7 +421,7 @@ export function LocalModelOnboarding({
               {state.exitKind === "Skip"
                 ? "Continue without loading a model"
                 : "Close"}
-            </button>
+            </Button>
           )}
         </footer>
       </div>

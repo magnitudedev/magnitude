@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * Thinking message — spec §9.3.4
  *
@@ -22,7 +24,7 @@ export function ThinkingMessage({
   if (mode === "default") return null
   return (
     <div className="[padding:4px_0]">
-      <button
+      <Button variant="unstyled" size="unstyled"
         onClick={() => setExpanded(!expanded)}
         className="text-slate-500 hover:text-slate-600 dark:hover:text-slate-400 [background:transparent] border-0 cursor-pointer flex items-center [gap:4px] font-sans text-[13px] [padding:0px]"
       >
@@ -34,7 +36,7 @@ export function ThinkingMessage({
             expanded ? "[transform:rotate(90deg)]" : "[transform:none]"
           }  [transition:transform_100ms_ease]`}
         />
-      </button>
+      </Button>
       {expanded && (
         <div className="mt-1 border-l border-dashed border-slate-300 pl-2 font-mono text-[13px] leading-[1.5] whitespace-pre-wrap text-slate-600 italic dark:border-slate-750 dark:text-slate-400">
           {message.content}

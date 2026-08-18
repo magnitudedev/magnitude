@@ -1,8 +1,17 @@
 import { useMemo, useState, type ReactNode } from "react"
+import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
+import { Progress } from "@/components/ui/progress"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Exit, Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import {
-  Activity,
   AlertTriangle,
   Check,
   Cpu,
@@ -56,7 +65,6 @@ import {
   intentLabel,
   modelContextLength,
   slotStatus,
-  transferLabel,
   transferProgress,
 } from "./local-inference-format"
 import { ModelRadarChart } from "./model-radar-chart"
@@ -245,6 +253,52 @@ const statusToneClass = (tone: string): string => {
       return "text-slate-600 dark:text-slate-400"
   }
 }
+type ModelTransferProgressValue = {
+  readonly completedBytes: number
+  readonly totalBytes: number
+  readonly stage?: string
+}
+function ModelTransferProgress({
+  transfer,
+  ariaLabel,
+  showStage = true,
+}: {
+  readonly transfer: ModelTransferProgressValue
+  readonly ariaLabel: string
+  readonly showStage?: boolean
+}): ReactNode {
+  const progress = transferProgress(transfer)
+  return (
+    <div className="grid w-full gap-2.5">
+      <div className="flex min-w-0 items-center justify-between gap-4 font-sans text-[12px] leading-4">
+        <div className="flex min-w-0 items-baseline gap-1.5 text-slate-500">
+          {showStage ? (
+            <>
+              <span className="shrink-0 font-medium capitalize text-slate-700 dark:text-slate-300">
+                {transfer.stage ?? "Downloading"}
+              </span>
+              <span aria-hidden="true">·</span>
+            </>
+          ) : null}
+          <span className="truncate">
+            {formatBytes(transfer.completedBytes)} of {formatBytes(transfer.totalBytes)}
+          </span>
+        </div>
+        <strong className="shrink-0 font-semibold tabular-nums text-blue-700 dark:text-blue-400">
+          {progress}%
+        </strong>
+      </div>
+      <Progress
+        value={progress}
+        max={100}
+        aria-label={ariaLabel}
+        className="block w-full"
+        trackClassName="h-2 rounded-full bg-slate-250 dark:bg-slate-700"
+        indicatorClassName="rounded-full bg-blue-600 dark:bg-blue-500"
+      />
+    </div>
+  )
+}
 function RuntimeSlot({
   slot,
   label,
@@ -360,20 +414,19 @@ function RuntimeSlot({
           <p className="!text-red-600 dark:!text-red-500">{status.detail}</p>
         )}
       </div>
-      <div className="min-w-0 [&_select]:w-full [&_select]:min-h-9 [&_select]:rounded-md [&_select]:border [&_select]:border-slate-300 dark:[&_select]:border-slate-750 [&_select]:bg-slate-50 dark:[&_select]:bg-slate-925 [&_select]:text-slate-900 dark:[&_select]:text-slate-200 [&_select]:px-2.5 [&_select]:font-sans [&_select]:text-xs">
-        <label
+      <div className="min-w-0">
+        <Label
           className="mt-0 mb-1.5 block text-[11px] font-semibold text-slate-600 dark:text-slate-400"
           htmlFor={`slot-${slotId}`}
         >
           Model
-        </label>
-        <select
-          id={`slot-${slotId}`}
+        </Label>
+        <Select
           value={selectedKey}
           disabled={busy}
-          onChange={(event) => {
+          onValueChange={(nextValue) => {
             const selected = options.find(
-              ({ providerModelId }) => providerModelId === event.target.value
+              ({ providerModelId }) => providerModelId === nextValue
             )
             if (!selected) return actions.clear(slotId)
             const capabilities =
@@ -391,23 +444,27 @@ function RuntimeSlot({
             })
           }}
         >
-          <option value="">Choose from installed models</option>
-          {options.map(({ model, providerModelId }) => (
-            <option key={providerModelId} value={providerModelId}>
-              {formatLocalModelDisplayName(model)}
-              {modelContextLength(model)
-                ? ` · ${formatContext(modelContextLength(model)!)} context`
-                : ""}
-            </option>
-          ))}
-        </select>
+          <SelectTrigger id={`slot-${slotId}`} className="h-9 w-full border-slate-300 bg-slate-50 px-2.5 text-xs dark:border-slate-750 dark:bg-slate-925 dark:text-slate-200">
+            <SelectValue placeholder="Choose from installed models" />
+          </SelectTrigger>
+          <SelectContent align="start" className="min-w-[var(--anchor-width)]">
+            {options.map(({ model, providerModelId }) => (
+              <SelectItem key={providerModelId} value={providerModelId}>
+                {formatLocalModelDisplayName(model)}
+                {modelContextLength(model)
+                  ? ` · ${formatContext(modelContextLength(model)!)} context`
+                  : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-[7px] max-[1050px]:col-span-full max-[1050px]:justify-start max-[620px]:col-auto">
         {slot._tag === "ConfiguredLocal" &&
           slot.actions.some(
             (action) => action === "Load" || action === "RetryLoad"
           ) && (
-            <button
+            <Button variant="unstyled" size="unstyled"
               type="button"
               className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
               disabled={busy}
@@ -415,10 +472,10 @@ function RuntimeSlot({
             >
               <Play size={14} />
               {slot.actions.includes("RetryLoad") ? "Retry load" : "Load"}
-            </button>
+            </Button>
           )}
         {slot._tag === "ConfiguredLocal" && slot.actions.includes("Stop") && (
-          <button
+          <Button variant="unstyled" size="unstyled"
             type="button"
             className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 dark:hover:bg-slate-750"
             disabled={busy}
@@ -429,10 +486,10 @@ function RuntimeSlot({
             slot.residency._tag === "Requested"
               ? "Cancel load"
               : "Stop"}
-          </button>
+          </Button>
         )}
         {slot._tag === "ConfiguredLocal" && (
-          <button
+          <Button variant="unstyled" size="unstyled"
             type="button"
             className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200"
             title={isFavorite ? "Remove favorite" : "Favorite model"}
@@ -441,17 +498,17 @@ function RuntimeSlot({
             onClick={() => actions.setFavorite(slot.selection, !isFavorite)}
           >
             <Heart size={15} fill={isFavorite ? "currentColor" : "none"} />
-          </button>
+          </Button>
         )}
         {slot._tag !== "Unassigned" && (
-          <button
+          <Button variant="unstyled" size="unstyled"
             type="button"
             className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
             disabled={busy}
             onClick={() => actions.clear(slotId)}
           >
             Clear
-          </button>
+          </Button>
         )}
       </div>
       {failed && (
@@ -495,61 +552,56 @@ function TransferQueue({
           const downloadId = modelDownloadId(model)
           return (
             <article
-              className="grid min-h-[66px] grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-3 border-b border-slate-200 px-2.5 py-3 text-slate-500 dark:border-slate-800 max-[620px]:grid-cols-[auto_minmax(0,1fr)_auto] max-[620px]:[&>span]:hidden"
+              className="min-h-[88px] border-b border-slate-200 px-2.5 py-4 dark:border-slate-800"
               key={modelKey(model)}
             >
-              <Activity size={16} aria-hidden="true" />
-              <div className="min-w-0 [&>div]:mb-2 [&>div]:flex [&>div]:justify-between [&>div]:gap-3 [&_strong]:text-slate-900 dark:[&_strong]:text-slate-200 [&_strong]:text-xs [&_span]:text-slate-500 [&_span]:text-[11px]">
-                <div>
-                  <strong>{formatLocalModelDisplayName(model)}</strong>
-                  <span>
-                    {transfer ? transferLabel(transfer) : modelFailure(model)}
-                  </span>
+              <div className="mb-3 flex min-w-0 items-center justify-between gap-4">
+                <strong className="min-w-0 truncate font-sans text-[13px] font-semibold leading-4 text-slate-900 dark:text-slate-200">
+                  {formatLocalModelDisplayName(model)}
+                </strong>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {transfer && downloadId && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
+                      onClick={() => actions.cancel(downloadId)}
+                    >
+                      <X size={14} /> Cancel
+                    </Button>
+                  )}
+                  {!transfer && configurationId && (
+                    <Button variant="unstyled" size="unstyled"
+                      type="button"
+                      className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
+                      onClick={() => actions.install(configurationId)}
+                    >
+                      Retry
+                    </Button>
+                  )}
+                  {!transfer && downloadId && (
+                    <Button variant="unstyled" size="unstyled"
+                      type="button"
+                      className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
+                      onClick={() => actions.dismissFailure(downloadId)}
+                    >
+                      Dismiss
+                    </Button>
+                  )}
                 </div>
-                {transfer && (
-                  <progress
-                    max={100}
-                    value={transferProgress(transfer)}
-                    aria-label={`${formatLocalModelDisplayName(
-                      model
-                    )} transfer progress`}
-                  />
-                )}
               </div>
-              <span
-                className={`${statusToneClass(
-                  transfer ? "progress" : "danger"
-                )} inline-flex items-center gap-1 text-[10px] font-bold whitespace-nowrap`}
-              >
-                {transfer ? `${transferProgress(transfer)}%` : "Failed"}
-              </span>
-              <div className="flex items-center gap-1.5 max-[620px]:col-[2/-1]">
-                {transfer && downloadId && (
-                  <button
-                    type="button"
-                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
-                    onClick={() => actions.cancel(downloadId)}
-                  >
-                    Cancel
-                  </button>
-                )}
-                {!transfer && configurationId && (
-                  <button
-                    type="button"
-                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
-                    onClick={() => actions.install(configurationId)}
-                  >
-                    Retry
-                  </button>
-                )}
-                {!transfer && downloadId && (
-                  <button
-                    type="button"
-                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
-                    onClick={() => actions.dismissFailure(downloadId)}
-                  >
-                    Dismiss
-                  </button>
+              <div className="min-w-0">
+                {transfer ? (
+                  <ModelTransferProgress
+                    transfer={transfer}
+                    ariaLabel={`${formatLocalModelDisplayName(model)} transfer progress`}
+                  />
+                ) : (
+                  <div className="flex items-center gap-1.5 text-[12px] text-red-600 dark:text-red-400">
+                    <AlertTriangle size={14} aria-hidden="true" />
+                    <span>{modelFailure(model)}</span>
+                  </div>
                 )}
               </div>
             </article>
@@ -633,7 +685,7 @@ function InstalledLibrary({
                     </dd>
                   </div>
                 </dl>
-                <button
+                <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 !border-transparent !text-slate-500 enabled:hover:!border-red-400 enabled:hover:!text-red-600 dark:enabled:hover:!border-red-700 dark:enabled:hover:!text-red-400"
                   title="Delete model files"
@@ -652,7 +704,7 @@ function InstalledLibrary({
                   }
                 >
                   <Trash2 size={14} />
-                </button>
+                </Button>
               </article>
             )
           })}
@@ -762,7 +814,7 @@ function CatalogCandidate({
       ? model.servingState.recommendations[0] ?? null
       : null
   return (
-    <button
+    <Button variant="unstyled" size="unstyled"
       type="button"
       className="appearance-none block min-h-[66px] w-full border-b border-slate-200 bg-transparent px-3.5 py-3 text-left text-slate-600 cursor-pointer hover:bg-white data-[selected=true]:bg-slate-100 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-850 dark:data-[selected=true]:bg-slate-800"
       data-selected={selected}
@@ -783,7 +835,7 @@ function CatalogCandidate({
           </span>
         </span>
       </span>
-    </button>
+    </Button>
   )
 }
 function CatalogInspector({
@@ -822,7 +874,7 @@ function CatalogInspector({
   const actions = (
     <div className="flex flex-wrap items-center justify-end gap-[7px] max-[620px]:justify-start">
       {!installed && !transfer && configurationId && (
-        <button
+        <Button variant="unstyled" size="unstyled"
           className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
           type="button"
           disabled={starting}
@@ -836,13 +888,13 @@ function CatalogInspector({
           {model.acquisitionState._tag === "Failed"
             ? "Retry download"
             : "Download"}
-        </button>
+        </Button>
       )}
       {installed &&
         (model.upgradeState._tag === "Available" ||
           model.upgradeState._tag === "Failed") &&
         configurationId && (
-          <button
+          <Button variant="unstyled" size="unstyled"
             className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
             type="button"
             disabled={starting}
@@ -850,19 +902,21 @@ function CatalogInspector({
           >
             <RefreshCw size={14} />
             {model.upgradeState._tag === "Failed" ? "Retry update" : "Update"}
-          </button>
+          </Button>
         )}
       {transfer && downloadId && (
-        <button
-          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 dark:hover:bg-slate-750"
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
           type="button"
           onClick={() => modelActions.cancel(downloadId)}
         >
           <X size={14} /> Cancel
-        </button>
+        </Button>
       )}
       {selectable && serving && (
-        <button
+        <Button variant="unstyled" size="unstyled"
           className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
           type="button"
           onClick={() =>
@@ -877,10 +931,10 @@ function CatalogInspector({
           }
         >
           <Check size={14} /> Select as primary
-        </button>
+        </Button>
       )}
       {installed && configurationId && (
-        <button
+        <Button variant="unstyled" size="unstyled"
           className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200 text-red-600 dark:text-red-400"
           type="button"
           disabled={starting}
@@ -891,7 +945,7 @@ function CatalogInspector({
           }
         >
           <Trash2 size={14} /> Uninstall
-        </button>
+        </Button>
       )}
     </div>
   )
@@ -902,13 +956,16 @@ function CatalogInspector({
           <h2>{formatLocalModelDisplayName(model)}</h2>
           <p>{model.presentation.description}</p>
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-[9px] max-[620px]:w-full max-[620px]:items-start">
+        <div className="flex shrink-0 items-center gap-2.5 max-[620px]:w-full max-[620px]:justify-between">
           <span
             className={`${statusToneClass(
               status.tone
-            )} inline-flex items-center gap-1 text-[10px] font-bold whitespace-nowrap`}
+            )} inline-flex items-center gap-1.5 text-[11px] font-semibold whitespace-nowrap ${
+              transfer ? "capitalize" : ""
+            }`}
           >
-            {status.label}
+            {transfer ? <span className="size-1.5 rounded-full bg-blue-500" /> : null}
+            {transfer ? transfer.stage ?? "Downloading" : status.label}
           </span>
           {actions}
         </div>
@@ -916,17 +973,11 @@ function CatalogInspector({
 
       <div className="min-h-0 overflow-y-auto p-[22px] max-[840px]:overflow-visible">
         {transfer && (
-          <div className="mb-[18px] [&>div]:mb-1.5 [&>div]:flex [&>div]:justify-between [&>div]:text-[10px] [&>div]:text-slate-600 dark:[&>div]:text-slate-400">
-            <div>
-              <span>{transferLabel(transfer)}</span>
-              <strong>{transferProgress(transfer)}%</strong>
-            </div>
-            <progress
-              max={100}
-              value={transferProgress(transfer)}
-              aria-label={`${formatLocalModelDisplayName(
-                model
-              )} transfer progress`}
+          <div className="mb-6 border-b border-slate-200 pb-5 dark:border-slate-800">
+            <ModelTransferProgress
+              transfer={transfer}
+              showStage={false}
+              ariaLabel={`${formatLocalModelDisplayName(model)} transfer progress`}
             />
           </div>
         )}

@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react"
 import { formatTokensCompact } from "@magnitudedev/client-common"
 import type { ContextUsageDisplay } from "@magnitudedev/sdk"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 export interface ContextUsageIndicatorProps {
   context: ContextUsageDisplay | null
@@ -26,9 +27,9 @@ export function contextUsageTooltipLines(
   const tokenEstimate = context?.tokenEstimate ?? null
   const heading = context?.isCompacting ? "Compacting..." : "Context"
   const hasCap = tokenCap !== null && tokenCap !== undefined && tokenCap > 0
-  const tokens = `${
-    tokenEstimate === null ? "-" : formatTokensCompact(tokenEstimate)
-  } / ${hasCap ? formatTokensCompact(tokenCap) : "-"} tokens`
+  const tokens = `${tokenEstimate === null ? "-" : formatTokensCompact(tokenEstimate)} / ${
+    hasCap ? formatTokensCompact(tokenCap) : "-"
+  } tokens`
   const remaining =
     tokenEstimate === null
       ? "100% remaining"
@@ -41,15 +42,10 @@ export function contextUsageTooltipLines(
   return [heading, tokens, remaining]
 }
 
-export function contextUsageStrokeClass(
-  percent: number | null,
-  isCompacting: boolean
-): string {
+export function contextUsageStrokeClass(percent: number | null, isCompacting: boolean): string {
   if (isCompacting) return "stroke-violet-700 dark:stroke-violet-400"
-  if (percent !== null && percent >= 90)
-    return "stroke-red-600 dark:stroke-red-400"
-  if (percent !== null && percent >= 70)
-    return "stroke-orange-700 dark:stroke-orange-400"
+  if (percent !== null && percent >= 90) return "stroke-red-600 dark:stroke-red-400"
+  if (percent !== null && percent >= 70) return "stroke-orange-700 dark:stroke-orange-400"
   return "stroke-blue-700 dark:stroke-blue-500"
 }
 export function ContextUsageIndicator({
@@ -70,8 +66,7 @@ export function ContextUsageIndicator({
   const radius = Math.max(1, (size - strokeWidth * 2 - 2) / 2)
   const center = size / 2
   const circumference = 2 * Math.PI * radius
-  const popoverVisible = tooltip === "popover" && active
-  return (
+  const indicator = (
     <span
       className="context-usage-indicator relative inline-flex min-w-0 items-center gap-1 text-slate-600 outline-none dark:text-slate-400"
       data-compacting={isCompacting}
@@ -132,31 +127,28 @@ export function ContextUsageIndicator({
           {formatTokensCompact(tokenEstimate)}
         </span>
       )}
-
-      {popoverVisible && (
-        <span
-          role="tooltip"
-          style={{
-            right: tooltipPlacement === "above-right" ? 0 : undefined,
-            left: tooltipPlacement === "above-center" ? "50%" : undefined,
-            transform:
-              tooltipPlacement === "above-center"
-                ? "translateX(-50%)"
-                : undefined,
-          }}
-          className="absolute bottom-[calc(100%+9px)] z-30 min-w-[190px] rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-left text-slate-900 shadow-[0_8px_24px_rgba(0,0,0,.16)] dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100 dark:shadow-[0_8px_24px_rgba(0,0,0,.36)]"
-        >
-          <span className="block whitespace-nowrap font-sans text-[12px] font-semibold leading-4">
-            {tooltipLines[0]}
-          </span>
-          <span className="mt-1 block whitespace-nowrap font-sans text-[11px] leading-4 text-slate-600 dark:text-slate-200">
-            {tooltipLines[1]}
-          </span>
-          <span className="block whitespace-nowrap font-sans text-[11px] leading-4 text-slate-500 dark:text-slate-300">
-            {tooltipLines[2]}
-          </span>
-        </span>
-      )}
     </span>
+  )
+  if (tooltip !== "popover") return indicator
+  return (
+    <Tooltip>
+      <TooltipTrigger render={indicator} />
+      <TooltipContent
+        side="top"
+        sideOffset={9}
+        align={tooltipPlacement === "above-right" ? "end" : "center"}
+        className="min-w-[190px] flex-col items-start gap-0 border border-slate-300 bg-white px-3 py-2.5 text-left text-slate-900 shadow-md dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100"
+      >
+        <span className="block whitespace-nowrap text-[12px] font-semibold leading-4">
+          {tooltipLines[0]}
+        </span>
+        <span className="mt-1 block whitespace-nowrap text-[11px] leading-4 text-slate-600 dark:text-slate-200">
+          {tooltipLines[1]}
+        </span>
+        <span className="block whitespace-nowrap text-[11px] leading-4 text-slate-500 dark:text-slate-300">
+          {tooltipLines[2]}
+        </span>
+      </TooltipContent>
+    </Tooltip>
   )
 }

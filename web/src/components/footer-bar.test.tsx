@@ -58,6 +58,9 @@ describe("FooterBar", () => {
 
     expect(html).toContain("enabled:hover:bg-slate-100")
     expect(html).toContain("dark:enabled:hover:bg-slate-750")
+    expect(html).not.toContain("border-slate-300")
+    expect(html).not.toContain("dark:bg-slate-900")
+    expect(html).not.toContain("shadow-")
     expect(html).not.toContain("hover:text-")
     expect(html).not.toContain("hover:underline")
   })

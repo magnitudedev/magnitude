@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * TaskList — spec §9.5
  *
@@ -69,14 +71,14 @@ export function TaskList({
           <span className="font-semibold text-slate-900 dark:text-slate-200">
             Assigned To
           </span>
-          <button
+          <Button variant="unstyled" size="unstyled"
             onClick={() => setExpanded((v) => !v)}
             title={expanded ? "Collapse" : "Expand"}
             className="[background:transparent] border-0 text-slate-600 dark:text-slate-400 cursor-pointer flex items-center [gap:2px] font-mono text-[12px] [padding:2px_4px] rounded-[3px]"
           >
             {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
             <span>{expanded ? "Collapse" : "Expand"}</span>
-          </button>
+          </Button>
         </div>
       </div>
 

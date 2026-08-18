@@ -1,3 +1,6 @@
+import { Button } from "@/components/ui/button"
+import { Textarea } from "@/components/ui/textarea"
+
 /**
  * Composer — spec §9.6
  *
@@ -533,9 +536,9 @@ export function Composer({
           </div>
         )}
 
-        <textarea
+        <Textarea
           ref={textareaRef}
-          className="composer-textarea w-full box-border [padding-right:42px] font-sans text-[14px] leading-[1.5] text-slate-900 dark:text-slate-200 [background:transparent] border-0 [outline:none] [resize:none] [min-height:64px] [max-height:240px]"
+          className="composer-textarea field-sizing-fixed box-border min-h-16 max-h-60 w-full resize-none border-0 bg-transparent p-0 pr-[42px] font-sans text-[14px] leading-[1.5] text-slate-900 shadow-none focus-visible:ring-0 dark:bg-transparent dark:text-slate-200"
           value={text}
           placeholder={placeholder}
           onChange={handleTextareaChange}
@@ -548,7 +551,7 @@ export function Composer({
         {footer}
 
         {/* Submit / Stop button */}
-        <button
+        <Button variant="unstyled" size="unstyled"
           onClick={() => {
             if (canSend) handleSubmit()
             else if (isStreaming && onInterrupt) onInterrupt()
@@ -592,7 +595,7 @@ export function Composer({
               } transition-colors duration-100`}
             />
           )}
-        </button>
+        </Button>
       </div>
     </div>
   )
@@ -773,13 +776,13 @@ function AttachmentPill({
         {attachment.path}
       </span>
       {rangeSuffix && <span className="text-slate-500">{rangeSuffix}</span>}
-      <button
+      <Button variant="unstyled" size="unstyled"
         onClick={onRemove}
         aria-label="Remove attachment"
         className="[background:transparent] border-0 text-slate-500 cursor-pointer [padding:0px] flex"
       >
         <X size={14} />
-      </button>
+      </Button>
     </span>
   )
 }

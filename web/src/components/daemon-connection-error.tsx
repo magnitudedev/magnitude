@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * DaemonConnectionError — spec §10
  *
@@ -64,7 +66,7 @@ function CopyDiagnosticsButton({ text }: { text: string }): ReactNode {
   }, [text])
   const label = failed ? "Copy failed" : copied ? "Copied" : "Copy"
   return (
-    <button
+    <Button variant="unstyled" size="unstyled"
       onClick={handleCopy}
       className="border-slate-300 dark:border-slate-750 text-slate-600 dark:text-slate-400 hover:border-slate-400 hover:text-slate-900 dark:hover:border-slate-600 dark:hover:text-slate-200 [height:30px] inline-flex items-center [gap:6px] [padding:0_10px] [background:transparent] border border-slate-300 dark:border-slate-750 rounded-[4px] font-sans text-[13px] cursor-pointer shrink-0"
       aria-label="Copy error details"
@@ -72,7 +74,7 @@ function CopyDiagnosticsButton({ text }: { text: string }): ReactNode {
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
       <span>{label}</span>
-    </button>
+    </Button>
   )
 }
 export function DaemonConnectionError({
@@ -147,22 +149,22 @@ export function DaemonConnectionError({
 
           {!reconnecting && (
             <div className="flex justify-end [gap:10px] flex-wrap">
-              <button
+              <Button variant="unstyled" size="unstyled"
                 onClick={onRetry}
                 className="data-[disabled=false]:hover:opacity-90 flex items-center [gap:6px] [padding:8px_14px] bg-blue-700 dark:bg-blue-500 border-0 rounded-[4px] text-slate-900 dark:text-slate-200 font-sans text-[14px] font-medium cursor-pointer [transition:opacity_100ms]"
                 data-disabled="false"
               >
                 <RefreshCw size={14} />
                 <span>Retry</span>
-              </button>
+              </Button>
 
-              <button
+              <Button variant="unstyled" size="unstyled"
                 onClick={onQuit}
                 className="border-slate-300 dark:border-slate-750 text-slate-600 dark:text-slate-400 hover:border-slate-400 hover:text-slate-900 dark:hover:border-slate-600 dark:hover:text-slate-200 flex items-center [gap:6px] [padding:8px_14px] [background:transparent] border border-slate-300 dark:border-slate-750 rounded-[4px] font-sans text-[14px] cursor-pointer [transition:all_100ms]"
               >
                 <LogOut size={14} />
                 <span>Quit</span>
-              </button>
+              </Button>
             </div>
           )}
         </div>

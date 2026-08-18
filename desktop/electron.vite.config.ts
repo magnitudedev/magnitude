@@ -1,7 +1,7 @@
-import { defineConfig } from "electron-vite"
-import react from "@vitejs/plugin-react"
-import tailwindcss from "@tailwindcss/vite"
-import { resolve } from "node:path"
+import { defineConfig } from "electron-vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import { resolve } from "node:path";
 
 export default defineConfig({
   main: {
@@ -36,6 +36,10 @@ export default defineConfig({
     },
     resolve: {
       alias: [
+        {
+          find: "@",
+          replacement: resolve(__dirname, "../web/src"),
+        },
         {
           find: "@magnitudedev/web",
           replacement: resolve(__dirname, "../web/src/index.tsx"),
@@ -72,4 +76,4 @@ export default defineConfig({
       ],
     },
   },
-})
+});
