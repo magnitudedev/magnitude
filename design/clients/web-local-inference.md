@@ -59,10 +59,20 @@ placing it inside a card, badge, or manufactured background.
 
 The ordinary shell contains a dedicated Settings surface for local inference:
 
-- Models presents selected slots, installed models, active transfers, failures, and residency.
+- Models is the searchable installed-model library. It lists downloaded model artifacts and exposes
+  only artifact-level actions: reveal the daemon-published installed target path or remove the
+  download. Slot selection, residency, favorites, transfer activity, and load controls do not belong
+  on this surface.
 - Catalog presents the unified assessed local catalog and recommendation evidence.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside
   resident allocations. Internal admission thresholds are not exposed as end-user concepts.
+
+Models and Catalog distinguish an unobserved query, server-side inventory initialization,
+catalog discovery, a successfully loaded empty collection, and failure. Before the first snapshot,
+and while the corresponding server lifecycle is still loading, each surface renders an explicit
+loading state rather than empty model chrome. An empty-state message is shown only after the daemon
+has made that collection authoritative. Partial usable choices may remain available while a refresh
+or discovery operation continues, accompanied by its nonterminal state.
 
 Opening Settings changes the application sidebar from session navigation to Settings navigation.
 Models, Catalog, and Hardware are vertical sidebar destinations; the main pane renders only the
@@ -105,7 +115,14 @@ upward chooser containing selectable installed model names, reasoning effort ope
 upward chooser containing the selected model's supported levels, and resident memory routes to
 Hardware. The two choosers are mutually exclusive and keyboard operable. Their triggers have no
 caret, underline, or hover text-color shift; hover is communicated with a restrained background
-change. Reasoning retains its violet semantic color.
+change. A selected model retains the ordinary foreground color regardless of residency. Its
+authoritative slot identity remains a selectable chooser entry while the installed-model catalog
+loads, so a selected model never produces a disabled trigger. Loading is communicated by the
+work-status activity instead of muting model identity. The model chooser also reflects authoritative
+inventory and discovery availability: without a selection its trigger identifies loading, and with
+a selection it preserves the selected identity while its menu reports that additional choices are
+still loading. Query failure is distinct from both loading and a successfully loaded empty list.
+Reasoning retains its violet semantic color.
 
 Context usage is normally a compact circular meter rather than persistent text. Its arc is blue
 below 70 percent usage, orange from 70 through 89 percent, and red at 90 percent or above. Hover or

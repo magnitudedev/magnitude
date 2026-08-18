@@ -60,7 +60,10 @@ import { SessionsSidebar } from "./components/sessions-sidebar"
 import { ChatTimeline } from "./components/chat-timeline"
 import { WorkStatusBar } from "./components/work-status-bar"
 import { Composer } from "./components/composer"
-import { FooterBar } from "./components/footer-bar"
+import {
+  FooterBar,
+  type FooterModelOptionsState,
+} from "./components/footer-bar"
 import { FileViewerPanel } from "./components/file-viewer-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
@@ -642,6 +645,7 @@ function FooterBarContainer({
   const openHardware = useCallback(() => {
     setSettingsTab("hardware")
   }, [setSettingsTab])
+  const localModels = Option.getOrNull(Result.value(localModelsResult))
   const modelOptions = Option.match(Result.value(localModelsResult), {
     onNone: () => [],
     onSome: (state) =>
@@ -662,6 +666,17 @@ function FooterBarContainer({
         })
         .sort((left, right) => left.label.localeCompare(right.label)),
   })
+  const modelOptionsState: FooterModelOptionsState =
+    Result.isFailure(localModelsResult) ||
+    localModels?.discoveryState._tag === "Failed"
+      ? { _tag: "Failed", options: modelOptions }
+      : localModels?.inventoryState._tag === "Degraded"
+      ? { _tag: "Degraded", options: modelOptions }
+      : localModels === null ||
+        localModels.inventoryState._tag === "Initializing" ||
+        localModels.discoveryState._tag === "Loading"
+      ? { _tag: "Loading", options: modelOptions }
+      : { _tag: "Ready", options: modelOptions }
   const primarySlot = slots?.slots.primary
   const selectedModelId =
     primarySlot && primarySlot._tag !== "Unassigned"
@@ -684,7 +699,7 @@ function FooterBarContainer({
       memoryLabel={memoryLabel}
       thinkingEffort={profile?.reasoningEffort ?? null}
       thinkingOptions={thinkingOptions}
-      modelOptions={modelOptions}
+      modelOptionsState={modelOptionsState}
       selectedModelId={selectedModelId}
       onModelSelect={(providerModelId) => {
         modelConfig.updateSlotModel(

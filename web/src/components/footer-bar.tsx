@@ -15,11 +15,18 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Button } from "@/components/ui/button"
+import { Loader2 } from "lucide-react"
 
 export interface FooterModelOption {
   readonly value: ProviderModelId
   readonly label: string
 }
+
+export type FooterModelOptionsState =
+  | { readonly _tag: "Loading"; readonly options: readonly FooterModelOption[] }
+  | { readonly _tag: "Ready"; readonly options: readonly FooterModelOption[] }
+  | { readonly _tag: "Degraded"; readonly options: readonly FooterModelOption[] }
+  | { readonly _tag: "Failed"; readonly options: readonly FooterModelOption[] }
 
 export interface FooterBarProps {
   /** Context usage info from timeline */
@@ -38,8 +45,8 @@ export interface FooterBarProps {
   nextEscWillKillAll?: boolean
   /** Transcript mode active */
   transcriptMode?: boolean
-  /** Installed models available for primary-slot selection. */
-  modelOptions?: readonly FooterModelOption[]
+  /** Authoritative availability of installed models for primary-slot selection. */
+  modelOptionsState?: FooterModelOptionsState
   /** Currently selected provider-model identity. */
   selectedModelId?: ProviderModelId | null
   /** Applies an installed model to the primary model slot. */
@@ -65,6 +72,7 @@ function FooterDropdown<Value extends string>({
   options,
   open,
   tone,
+  availability = "Ready",
   onOpenChange,
   onSelect,
 }: {
@@ -73,28 +81,55 @@ function FooterDropdown<Value extends string>({
   readonly options: readonly FooterDropdownOption<Value>[]
   readonly open: boolean
   readonly tone: "model" | "reasoning"
+  readonly availability?: "Loading" | "Ready" | "Degraded" | "Failed"
   readonly onOpenChange: (open: boolean) => void
   readonly onSelect: (value: Value) => void
 }): React.ReactNode {
-  const enabled = options.length > 0
+  const selected = value !== null
+  const menuOptions =
+    tone === "model" &&
+    value !== null &&
+    !options.some((option) => option.value === value)
+      ? [{ value, label }, ...options]
+      : options
+  const hasAvailabilityNotice = availability !== "Ready"
+  const enabled = menuOptions.length > 0 || hasAvailabilityNotice
+  const availabilityLabel =
+    availability === "Loading"
+      ? "Loading models…"
+      : availability === "Degraded"
+      ? "Some installed models are unavailable."
+      : availability === "Failed"
+      ? menuOptions.length > 0
+        ? "Some models could not be loaded."
+        : "Unable to load models."
+      : null
   return (
     <Select
-      value={value ?? undefined}
+      value={value}
       open={open}
       onOpenChange={onOpenChange}
       onValueChange={(nextValue) => onSelect(nextValue as Value)}
       disabled={!enabled}
     >
       <SelectTrigger
-        aria-label={`${tone === "model" ? "Model" : "Thinking level"}: ${label}`}
+        aria-label={`${
+          tone === "model" ? "Model" : "Thinking level"
+        }: ${label}`}
+        aria-busy={availability === "Loading" || undefined}
         variant="inline"
         showIcon={false}
         className={`h-auto min-w-0 px-1.5 py-1 text-[14px] leading-5 ${
           tone === "reasoning"
             ? "text-violet-700 enabled:hover:bg-slate-100 dark:text-violet-400 dark:enabled:hover:bg-slate-750"
+            : selected
+            ? "text-slate-900 data-placeholder:text-slate-900 enabled:hover:bg-slate-100 dark:text-slate-50 dark:data-placeholder:text-slate-50 dark:enabled:hover:bg-slate-750"
             : "text-slate-700 enabled:hover:bg-slate-100 dark:text-slate-300 dark:enabled:hover:bg-slate-750"
         }`}
       >
+        {availability === "Loading" && !selected ? (
+          <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+        ) : null}
         <SelectValue>{label}</SelectValue>
       </SelectTrigger>
       <SelectContent
@@ -105,7 +140,7 @@ function FooterDropdown<Value extends string>({
           tone === "model" ? "w-max min-w-[260px]" : "w-[168px]"
         }`}
       >
-        {options.map((option) => (
+        {menuOptions.map((option) => (
           <SelectItem
             key={option.value}
             value={option.value}
@@ -118,6 +153,17 @@ function FooterDropdown<Value extends string>({
             {option.label}
           </SelectItem>
         ))}
+        {availabilityLabel ? (
+          <div
+            role="status"
+            className="flex items-center gap-2 px-2 py-2 text-[12px] leading-[1.35] text-slate-500 dark:text-slate-300"
+          >
+            {availability === "Loading" ? (
+              <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+            ) : null}
+            <span>{availabilityLabel}</span>
+          </div>
+        ) : null}
       </SelectContent>
     </Select>
   )
@@ -132,7 +178,7 @@ export function FooterBar({
   memoryLabel,
   nextEscWillKillAll,
   transcriptMode,
-  modelOptions = [],
+  modelOptionsState = { _tag: "Ready", options: [] },
   selectedModelId,
   onModelSelect,
   onMemoryClick,
@@ -162,11 +208,20 @@ export function FooterBar({
 
         {!bashMode && model && (
           <FooterDropdown
-            label={model}
+            label={
+              selectedModelId === null || selectedModelId === undefined
+                ? modelOptionsState._tag === "Loading"
+                  ? "Loading models…"
+                  : modelOptionsState._tag === "Failed"
+                  ? "Models unavailable"
+                  : model
+                : model
+            }
             value={selectedModelId ?? null}
-            options={onModelSelect ? modelOptions : []}
+            options={onModelSelect ? modelOptionsState.options : []}
             open={openDropdown === "model"}
             tone="model"
+            availability={modelOptionsState._tag}
             onOpenChange={(open) => setOpenDropdown(open ? "model" : null)}
             onSelect={(providerModelId) => onModelSelect?.(providerModelId)}
           />
