@@ -3,6 +3,13 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -23,7 +30,6 @@ import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import {
   AlertTriangle,
-  Check,
   Cpu,
   Download,
   EllipsisVertical,
@@ -41,7 +47,6 @@ import {
   deriveHardwareMemoryView,
   formatLocalModelDisplayName,
   localModelConfigurationId,
-  localModelProviderModelId,
   localModelRadarAxes,
   modelDownloadFailureMessage,
   modelSlotResidentAllocation,
@@ -49,7 +54,6 @@ import {
   useLocalInferenceHardware,
   useLocalModelActions,
   useLocalModels,
-  useModelSlotActions,
   useModelSlots,
   usePlatform,
   usePreviewModelLoad,
@@ -58,8 +62,6 @@ import {
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
-  ProviderIdSchema,
-  ReasoningEffortSchema,
   servableModelBundlePackages,
   servableModelBundleTargetPackageId,
   type LocalModel,
@@ -74,7 +76,6 @@ import {
   transferProgress,
 } from "./local-inference-format"
 import { ModelRadarChart } from "./model-radar-chart"
-const localProviderId = ProviderIdSchema.make("local")
 const recommendationOrder = {
   balanced: 0,
   smartest: 1,
@@ -87,11 +88,6 @@ const modelKey = (model: LocalModel): string =>
   Option.getOrElse(localModelConfigurationId(model), () =>
     formatLocalModelDisplayName(model)
   )
-const fitsAssessment = (model: LocalModel) =>
-  model.servingState._tag === "Assessed" &&
-  model.servingState.assessment._tag === "Fits"
-    ? model.servingState.assessment
-    : null
 function QueryNotice({
   result,
   label,
@@ -574,6 +570,76 @@ const recommendationRank = (view: CatalogModelView): number => {
     serving._tag === "Assessed" ? serving.recommendations[0]?.intent : undefined
   return intent === undefined ? 4 : recommendationOrder[intent]
 }
+
+type CatalogFilter = "all" | "installed"
+type CatalogSort =
+  | "recommended"
+  | "recent"
+  | "intelligence"
+  | "largest"
+  | "smallest"
+  | "name"
+
+const catalogSortLabels: Readonly<Record<CatalogSort, string>> = {
+  recommended: "Recommended",
+  recent: "Newest",
+  intelligence: "Most intelligent",
+  largest: "Largest download",
+  smallest: "Smallest download",
+  name: "Name",
+}
+
+const catalogData = (model: LocalModel) =>
+  model.catalogMembershipState._tag === "InCatalog"
+    ? model.catalogMembershipState.catalogData
+    : null
+
+const isCatalogVisible = ({ model }: CatalogModelView): boolean =>
+  model.servingState._tag !== "Assessed" ||
+  model.servingState.assessment._tag === "Fits"
+
+const matchesCatalogFilter = (
+  view: CatalogModelView,
+  filter: CatalogFilter
+): boolean => {
+  const { model } = view
+  if (filter === "all") return true
+  return model.acquisitionState._tag === "Installed"
+}
+
+const compareCatalogModels = (
+  left: CatalogModelView,
+  right: CatalogModelView,
+  sort: CatalogSort
+): number => {
+  const leftName = formatLocalModelDisplayName(left.model)
+  const rightName = formatLocalModelDisplayName(right.model)
+  const byName = leftName.localeCompare(rightName)
+  const leftCatalog = catalogData(left.model)
+  const rightCatalog = catalogData(right.model)
+  if (sort === "name") return byName
+  if (sort === "recent") {
+    return (
+      String(rightCatalog?.releaseDate ?? "").localeCompare(
+        String(leftCatalog?.releaseDate ?? "")
+      ) || byName
+    )
+  }
+  if (sort === "intelligence") {
+    return (
+      (rightCatalog?.intelligenceScore ?? -1) -
+        (leftCatalog?.intelligenceScore ?? -1) || byName
+    )
+  }
+  if (sort === "largest") {
+    return right.model.downloadBytes - left.model.downloadBytes || byName
+  }
+  if (sort === "smallest") {
+    return left.model.downloadBytes - right.model.downloadBytes || byName
+  }
+  return recommendationRank(left) - recommendationRank(right) || byName
+}
+
 function CatalogCandidate({
   view,
   selected,
@@ -590,26 +656,39 @@ function CatalogCandidate({
       ? model.servingState.recommendations[0] ?? null
       : null
   return (
-    <Button variant="unstyled" size="unstyled"
+    <Button
+      variant="unstyled"
+      size="unstyled"
       type="button"
-      className="appearance-none block min-h-[66px] w-full border-b border-slate-200 bg-transparent px-3.5 py-3 text-left text-slate-600 cursor-pointer hover:bg-white data-[selected=true]:bg-slate-100 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-850 dark:data-[selected=true]:bg-slate-800"
+      className="flex min-h-[76px] w-full items-center border-b border-slate-200 bg-transparent px-5 py-3.5 text-left font-sans text-slate-600 outline-none transition-colors last:border-b-0 hover:bg-slate-100 focus-visible:bg-slate-100 data-[selected=true]:bg-slate-150 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:focus-visible:bg-slate-800 dark:data-[selected=true]:bg-slate-750"
       data-selected={selected}
       aria-pressed={selected}
       onClick={onSelect}
     >
-      <span className="flex min-w-0 flex-col gap-1.5 [&>strong]:text-[12.5px] [&>strong]:leading-[1.35] [&>strong]:text-slate-900 dark:[&>strong]:text-slate-200 [&>strong]:[overflow-wrap:anywhere]">
-        <strong>{formatLocalModelDisplayName(model)}</strong>
-        <span className="flex flex-wrap items-center gap-[5px] text-[10px] text-slate-500">
-          {recommendation && <span>{intentLabel(recommendation.intent)}</span>}
-          {recommendation && <span aria-hidden="true">·</span>}
-          <span
-            className={`${statusToneClass(
-              status.tone
-            )} inline-flex items-center gap-1 text-[10px] font-bold whitespace-nowrap`}
-          >
-            {status.label}
+      <span className="flex min-w-0 flex-1 flex-col gap-1.5">
+        {recommendation || status.tone !== "neutral" ? (
+          <span className="flex items-center justify-between gap-3 text-[10px] font-semibold uppercase leading-none tracking-[.07em]">
+            {recommendation ? (
+              <span className="text-violet-700 dark:text-violet-400">
+                {intentLabel(recommendation.intent)} pick
+              </span>
+            ) : (
+              <span />
+            )}
+            {status.tone !== "neutral" ? (
+              <span
+                className={`${statusToneClass(
+                  status.tone
+                )} shrink-0 tracking-normal normal-case`}
+              >
+                {status.label}
+              </span>
+            ) : null}
           </span>
-        </span>
+        ) : null}
+        <strong className="text-[13px] font-semibold leading-[1.4] text-slate-900 [overflow-wrap:anywhere] dark:text-slate-100">
+          {formatLocalModelDisplayName(model)}
+        </strong>
       </span>
     </Button>
   )
@@ -621,11 +700,8 @@ function CatalogInspector({
 }): ReactNode {
   const { model, reconciliationState } = view
   const modelActions = useLocalModelActions()
-  const slotActions = useModelSlotActions()
   const configurationId = Option.getOrNull(localModelConfigurationId(model))
-  const providerModelId = Option.getOrNull(localModelProviderModelId(model))
   const status = modelStatus(model, reconciliationState)
-  const assessment = fitsAssessment(model)
   const serving =
     model.servingState._tag === "Assessed" ? model.servingState : null
   const recommendation = serving?.recommendations[0] ?? null
@@ -639,19 +715,27 @@ function CatalogInspector({
       ? reconciliationState.downloadId
       : modelDownloadId(model)
   const installed = model.acquisitionState._tag === "Installed"
-  const selectable =
-    serving?.availabilityState._tag === "Selectable" &&
-    assessment !== null &&
-    providerModelId !== null
   const starting =
     reconciliationState._tag === "Starting" ||
     reconciliationState._tag === "Removing"
   const source = repositoryUrl(model)
   const actions = (
-    <div className="flex flex-wrap items-center justify-end gap-[7px] max-[620px]:justify-start">
+    <div className="flex shrink-0 items-center gap-2">
+      {status.tone !== "neutral" ? (
+        <span
+          className={`${statusToneClass(
+            status.tone
+          )} text-[11px] font-medium whitespace-nowrap ${
+            transfer ? "capitalize" : ""
+          }`}
+        >
+          {transfer ? transfer.stage ?? "Downloading" : status.label}
+        </span>
+      ) : null}
       {!installed && !transfer && configurationId && (
-        <Button variant="unstyled" size="unstyled"
-          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
+        <Button
+          variant="default"
+          size="default"
           type="button"
           disabled={starting}
           onClick={() => modelActions.install(configurationId)}
@@ -670,8 +754,9 @@ function CatalogInspector({
         (model.upgradeState._tag === "Available" ||
           model.upgradeState._tag === "Failed") &&
         configurationId && (
-          <Button variant="unstyled" size="unstyled"
-            className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
+          <Button
+            variant="default"
+            size="default"
             type="button"
             disabled={starting}
             onClick={() => modelActions.install(configurationId)}
@@ -682,72 +767,33 @@ function CatalogInspector({
         )}
       {transfer && downloadId && (
         <Button
-          variant="ghost"
-          size="sm"
-          className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
+          variant="outline"
+          size="default"
           type="button"
           onClick={() => modelActions.cancel(downloadId)}
         >
           <X size={14} /> Cancel
         </Button>
       )}
-      {selectable && serving && (
-        <Button variant="unstyled" size="unstyled"
-          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
-          type="button"
-          onClick={() =>
-            slotActions.assign(PRIMARY_SLOT_ID, {
-              providerId: localProviderId,
-              providerModelId,
-              reasoningEffort: Option.getOrElse(
-                serving.capabilities.reasoning.defaultEffort,
-                () => ReasoningEffortSchema.make("none")
-              ),
-            })
-          }
-        >
-          <Check size={14} /> Select as primary
-        </Button>
-      )}
-      {installed && configurationId && (
-        <Button variant="unstyled" size="unstyled"
-          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200 text-red-600 dark:text-red-400"
-          type="button"
-          disabled={starting}
-          onClick={() =>
-            window.confirm(
-              `Delete ${formatLocalModelDisplayName(model)} from this computer?`
-            ) && modelActions.delete(configurationId)
-          }
-        >
-          <Trash2 size={14} /> Uninstall
-        </Button>
-      )}
     </div>
   )
   return (
-    <article className="grid min-w-0 max-h-full grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-[10px] border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 max-[840px]:max-h-none max-[840px]:overflow-visible">
-      <header className="flex items-start justify-between gap-6 border-b border-slate-300 dark:border-slate-750 px-[22px] py-5 max-[620px]:flex-col [&_h2]:mb-[5px] [&_h2]:text-xl [&_h2]:leading-tight [&_h2]:tracking-[-.02em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_h2]:[overflow-wrap:anywhere] [&_p]:text-[11.5px] [&_p]:leading-[1.45] [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-        <div className="min-w-0">
-          <h2>{formatLocalModelDisplayName(model)}</h2>
-          <p>{model.presentation.description}</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2.5 max-[620px]:w-full max-[620px]:justify-between">
-          <span
-            className={`${statusToneClass(
-              status.tone
-            )} inline-flex items-center gap-1.5 text-[11px] font-semibold whitespace-nowrap ${
-              transfer ? "capitalize" : ""
-            }`}
-          >
-            {transfer ? <span className="size-1.5 rounded-full bg-blue-500" /> : null}
-            {transfer ? transfer.stage ?? "Downloading" : status.label}
-          </span>
+    <article className="grid h-full min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-white dark:bg-slate-850 max-[840px]:h-auto max-[840px]:overflow-visible">
+      <header className="border-b border-slate-300 px-7 py-6 dark:border-slate-750 max-[620px]:px-4">
+        <div className="flex items-start justify-between gap-6 max-[620px]:flex-col">
+          <div className="min-w-0 max-w-[720px]">
+            <h2 className="font-heading text-[24px] leading-[1.2] tracking-[-.025em] text-slate-900 [overflow-wrap:anywhere] dark:text-slate-100">
+              {formatLocalModelDisplayName(model)}
+            </h2>
+            <p className="mt-2 text-[13px] leading-5 text-slate-600 dark:text-slate-400">
+              {model.presentation.description}
+            </p>
+          </div>
           {actions}
         </div>
       </header>
 
-      <div className="min-h-0 overflow-y-auto p-[22px] max-[840px]:overflow-visible">
+      <div className="min-h-0 overflow-x-hidden overflow-y-auto px-7 py-6 max-[840px]:overflow-visible max-[620px]:p-4">
         {transfer && (
           <div className="mb-6 border-b border-slate-200 pb-5 dark:border-slate-800">
             <ModelTransferProgress
@@ -763,34 +809,49 @@ function CatalogInspector({
           </p>
         )}
 
-        {recommendation && (
+        {recommendation ? (
           <section
-            className="border-b border-slate-200 dark:border-slate-800 pb-5 [&_h3]:mb-[5px] [&_h3]:text-[14px] [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_p]:text-[11.5px] [&_p]:leading-[1.55] [&_p]:text-slate-600 dark:[&_p]:text-slate-400"
+            className="max-w-[760px]"
             aria-labelledby="why-model-title"
           >
-            <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
-              Why this model
-            </span>
-            <h3 id="why-model-title">{intentLabel(recommendation.intent)}</h3>
-            <p>{recommendation.explanation}</p>
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <h3
+                id="why-model-title"
+                className="font-heading text-[18px] text-slate-900 dark:text-slate-100"
+              >
+                Why this model
+              </h3>
+              <span className="text-[11px] font-semibold uppercase tracking-[.07em] text-violet-700 dark:text-violet-400">
+                {intentLabel(recommendation.intent)}
+              </span>
+            </div>
+            <p className="mt-2 text-[13px] leading-5 text-slate-600 dark:text-slate-400">
+              {recommendation.explanation}
+            </p>
           </section>
-        )}
+        ) : null}
 
         {axes ? (
-          <section className="py-[22px]" aria-labelledby="model-profile-title">
-            <div className="flex items-end justify-between gap-3 [&_h3]:text-[15px] [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&>span]:text-[9px] [&>span]:text-slate-500">
-              <h3 id="model-profile-title">Model profile</h3>
-            </div>
+          <section
+            className={`${recommendation ? "mt-7" : ""} min-w-0`}
+            aria-labelledby="model-profile-title"
+          >
+            <h3
+              id="model-profile-title"
+              className="font-heading text-[18px] text-slate-900 dark:text-slate-100"
+            >
+              Model profile
+            </h3>
             <ModelRadarChart axes={axes} />
           </section>
         ) : (
-          <div className="my-[18px] flex items-center gap-2 text-[11px] text-slate-500">
+          <div className="mt-7 flex items-center gap-2 text-[11px] text-slate-500">
             <AlertTriangle size={15} />A complete comparison profile is not
             available for this configuration.
           </div>
         )}
 
-        <dl className="flex flex-wrap gap-x-10 gap-y-[18px] border-t border-slate-300 dark:border-slate-750 pt-[18px] [&_div]:min-w-[140px] [&_dt]:text-[9px] [&_dt]:tracking-[.06em] [&_dt]:uppercase [&_dt]:text-slate-500 [&_dd]:mt-1 [&_dd]:text-[11px] [&_dd]:text-slate-600 dark:[&_dd]:text-slate-400 [&_a]:text-blue-700 dark:[&_a]:text-blue-400 [&_a]:no-underline hover:[&_a]:underline">
+        <dl className="flex flex-wrap gap-x-10 gap-y-4 border-t border-slate-300 pt-5 dark:border-slate-750 [&_div]:min-w-[120px] [&_dt]:text-[10px] [&_dt]:font-medium [&_dt]:uppercase [&_dt]:tracking-[.06em] [&_dt]:text-slate-500 [&_dd]:mt-1.5 [&_dd]:text-[12px] [&_dd]:text-slate-600 dark:[&_dd]:text-slate-400 [&_a]:text-blue-700 [&_a]:no-underline hover:[&_a]:underline dark:[&_a]:text-blue-400">
           <div>
             <dt>License</dt>
             <dd>
@@ -802,7 +863,7 @@ function CatalogInspector({
               <dt>Source</dt>
               <dd>
                 <a href={source} target="_blank" rel="noreferrer">
-                  View on Hugging Face ↗
+                  Hugging Face ↗
                 </a>
               </dd>
             </div>
@@ -817,24 +878,45 @@ function CatalogView(): ReactNode {
   const modelActions = useLocalModelActions()
   const catalog = valueOf(catalogResult)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
+  const [query, setQuery] = useState("")
+  const [filter, setFilter] = useState<CatalogFilter>("all")
+  const [sort, setSort] = useState<CatalogSort>("recommended")
+  const normalizedQuery = query.trim().toLowerCase()
+  const allCandidates = catalog?.models ?? []
+  const visibleCandidates = useMemo(
+    () => allCandidates.filter(isCatalogVisible),
+    [allCandidates]
+  )
   const candidates = useMemo(
     () =>
-      [...(catalog?.models ?? [])].sort(
-        (left, right) =>
-          recommendationRank(left) - recommendationRank(right) ||
-          formatLocalModelDisplayName(left.model).localeCompare(
-            formatLocalModelDisplayName(right.model)
-          )
-      ),
-    [catalog]
+      visibleCandidates
+        .filter(
+          (candidate) =>
+            matchesCatalogFilter(candidate, filter) &&
+            (normalizedQuery.length === 0 ||
+              formatLocalModelDisplayName(candidate.model)
+                .toLowerCase()
+                .includes(normalizedQuery))
+        )
+        .toSorted((left, right) => compareCatalogModels(left, right, sort)),
+    [filter, normalizedQuery, sort, visibleCandidates]
   )
   const selected =
     candidates.find(({ model }) => modelKey(model) === selectedKey) ??
     candidates[0] ??
     null
   const discovery = catalog?.discoveryState ?? null
+  const filterCounts = useMemo(
+    () => ({
+      all: visibleCandidates.length,
+      installed: visibleCandidates.filter((candidate) =>
+        matchesCatalogFilter(candidate, "installed")
+      ).length,
+    }),
+    [visibleCandidates]
+  )
   return (
-    <div className="box-border mx-auto flex w-full max-w-[1240px] flex-col gap-[34px] px-[clamp(18px,4vw,48px)] pt-[34px] pb-[72px] max-[640px]:pt-16 max-[620px]:px-3.5 !max-w-[1360px]">
+    <div className="box-border mx-auto flex h-full min-h-0 w-full max-w-[1500px] flex-col gap-5 overflow-hidden px-[clamp(18px,3vw,42px)] py-7 max-[840px]:h-auto max-[840px]:overflow-visible max-[640px]:pt-16 max-[620px]:px-3.5">
       {catalog === null && !Result.isFailure(catalogResult) ? (
         <LoadingNotice
           title="Loading catalog"
@@ -862,40 +944,123 @@ function CatalogView(): ReactNode {
       )}
       {catalog && discovery?._tag !== "Loading" ? (
         <>
-          <div className="flex items-end justify-between gap-5 -mb-3.5 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+          <header className="shrink-0">
             <div>
-              <h2>Catalog</h2>
-              <p>Models assessed for this computer.</p>
+              <h2 className="font-heading text-[24px] leading-tight tracking-[-.02em] text-slate-900 dark:text-slate-100">
+                Catalog
+              </h2>
+              <p className="mt-1 text-[13px] text-slate-600 dark:text-slate-400">
+                Models assessed for this computer.
+              </p>
             </div>
-            <span className="min-w-6 text-right font-mono text-xs leading-[normal] font-semibold text-slate-500">
-              {candidates.length}
-            </span>
-          </div>
-          {candidates.length === 0 && discovery?._tag === "Ready" ? (
+            <div className="mt-5 flex min-w-0 flex-wrap items-center gap-3">
+              <div className="relative w-[280px] max-[620px]:w-full">
+                <Search
+                  size={15}
+                  aria-hidden="true"
+                  className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500"
+                />
+                <Input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.currentTarget.value)}
+                  placeholder="Search catalog"
+                  aria-label="Search catalog"
+                  className="pl-8"
+                />
+              </div>
+              <div
+                className="flex h-8 items-center rounded-md bg-slate-100 p-0.5 dark:bg-slate-800"
+                role="group"
+                aria-label="Filter catalog"
+              >
+                {(
+                  [
+                    ["all", "All"],
+                    ["installed", "Installed"],
+                  ] as const
+                ).map(([value, label]) => (
+                  <Button
+                    key={value}
+                    variant="unstyled"
+                    size="unstyled"
+                    type="button"
+                    aria-pressed={filter === value}
+                    onClick={() => setFilter(value)}
+                    className="h-7 rounded-[5px] px-2.5 text-[11px] font-medium text-slate-600 transition-colors hover:text-slate-900 aria-pressed:bg-white aria-pressed:text-slate-900 aria-pressed:shadow-sm dark:text-slate-400 dark:hover:text-slate-100 dark:aria-pressed:bg-slate-750 dark:aria-pressed:text-slate-100"
+                  >
+                    {label}
+                    <span className="ml-1.5 tabular-nums text-slate-500">
+                      {filterCounts[value]}
+                    </span>
+                  </Button>
+                ))}
+              </div>
+              <div className="ml-auto flex items-center gap-2 max-[760px]:ml-0">
+                <span className="text-[11px] text-slate-500">Sort by</span>
+                <Select
+                  value={sort}
+                  onValueChange={(value) => setSort(value as CatalogSort)}
+                >
+                  <SelectTrigger aria-label="Sort catalog" className="w-[168px]">
+                    <SelectValue>{catalogSortLabels[sort]}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent align="end" className="w-[196px]">
+                    <SelectItem value="recommended">Recommended</SelectItem>
+                    <SelectItem value="recent">Newest</SelectItem>
+                    <SelectItem value="intelligence">Most intelligent</SelectItem>
+                    <SelectItem value="largest">Largest download</SelectItem>
+                    <SelectItem value="smallest">Smallest download</SelectItem>
+                    <SelectItem value="name">Name</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </header>
+          {visibleCandidates.length === 0 && discovery?._tag === "Ready" ? (
             <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
               No local catalog models are currently available.
             </div>
-          ) : candidates.length > 0 ? (
-            <div className="grid h-[calc(100vh-250px)] min-h-[500px] grid-cols-[minmax(330px,.72fr)_minmax(480px,1.28fr)] items-stretch gap-[22px] max-[1050px]:grid-cols-[minmax(280px,.8fr)_minmax(400px,1.2fr)] max-[1050px]:gap-3.5 max-[840px]:h-auto max-[840px]:min-h-0 max-[840px]:grid-cols-1">
-              <div
-                className="min-w-0 max-h-full overflow-y-auto border-t border-slate-300 dark:border-slate-750 max-[840px]:max-h-[360px] max-[840px]:overflow-auto"
-                role="group"
-                aria-label="Catalog models"
+          ) : candidates.length === 0 ? (
+            <div className="flex min-h-[240px] flex-1 flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 px-6 text-center dark:border-slate-750">
+              <p className="text-[13px] text-slate-600 dark:text-slate-400">
+                No catalog models match these controls.
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-2"
+                onClick={() => {
+                  setQuery("")
+                  setFilter("all")
+                }}
               >
-                {candidates.map((candidate) => {
-                  const key = modelKey(candidate.model)
-                  return (
-                    <CatalogCandidate
-                      key={key}
-                      view={candidate}
-                      selected={
-                        selected !== null && modelKey(selected.model) === key
-                      }
-                      onSelect={() => setSelectedKey(key)}
-                    />
-                  )
-                })}
-              </div>
+                Clear search and filter
+              </Button>
+            </div>
+          ) : candidates.length > 0 ? (
+            <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,.66fr)_minmax(0,1.34fr)] items-stretch overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850 max-[1050px]:grid-cols-[minmax(280px,.76fr)_minmax(0,1.24fr)] max-[840px]:grid-cols-1 max-[840px]:overflow-visible">
+              <section className="min-h-0 min-w-0 border-r border-slate-300 dark:border-slate-750 max-[840px]:border-r-0 max-[840px]:border-b">
+                <div
+                  className="h-full min-h-0 overflow-y-auto max-[840px]:max-h-[420px]"
+                  role="group"
+                  aria-label="Catalog models"
+                >
+                  {candidates.map((candidate) => {
+                    const key = modelKey(candidate.model)
+                    return (
+                      <CatalogCandidate
+                        key={key}
+                        view={candidate}
+                        selected={
+                          selected !== null && modelKey(selected.model) === key
+                        }
+                        onSelect={() => setSelectedKey(key)}
+                      />
+                    )
+                  })}
+                </div>
+              </section>
               {selected && <CatalogInspector view={selected} />}
             </div>
           ) : null}
@@ -1162,7 +1327,13 @@ export function SettingsCenter({
   readonly tab: SettingsTab
 }): ReactNode {
   return (
-    <div className="min-w-0 min-h-0 flex-1 overflow-auto">
+    <div
+      className={`min-w-0 min-h-0 flex-1 ${
+        tab === "catalog"
+          ? "overflow-hidden max-[840px]:overflow-auto"
+          : "overflow-auto"
+      }`}
+    >
       {tab === "models" ? (
         <ModelsView />
       ) : tab === "catalog" ? (

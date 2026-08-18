@@ -103,6 +103,10 @@ describe("Settings model loading states", () => {
     const html = renderToStaticMarkup(<SettingsCenter tab="catalog" />)
 
     expect(html).toContain("No local catalog models are currently available.")
+    expect(html).toContain('aria-label="Search catalog"')
+    expect(html).toContain('aria-label="Filter catalog"')
+    expect(html).toContain('aria-label="Sort catalog"')
+    expect(html).toContain("Installed")
     expect(html).not.toContain("Loading catalog")
   })
 
