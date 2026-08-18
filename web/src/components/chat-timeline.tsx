@@ -29,7 +29,8 @@ import {
   getFork,
   messageForEntry,
   toolSummaryLabel,
-  selectedFilePathAtom,
+  selectedCwdAtom,
+  selectedProjectIdAtom,
   useDisplayState,
   useTimelineStatus,
   useSelectedSessionId,
@@ -41,6 +42,8 @@ import {
   type ActivityKind,
   TRANSCRIPT_LINE_CAP,
 } from "@magnitudedev/client-common"
+import { ProjectRelativePathSchema, normalizeReferencedPath } from "@magnitudedev/sdk"
+import { projectFilesPanelOpenAtom, selectedProjectFileAtom } from "@/state/web-atoms"
 import { useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import type {
   DisplayTimeline,
@@ -107,11 +110,19 @@ function PathText({
   path: string
   displayPath?: string | null
 }): ReactNode {
-  const setFilePath = useAtomSet(selectedFilePathAtom)
+  const cwd = useAtomValue(selectedCwdAtom)
+  const projectId = useAtomValue(selectedProjectIdAtom)
+  const setFilePath = useAtomSet(selectedProjectFileAtom)
+  const setPanelOpen = useAtomSet(projectFilesPanelOpenAtom)
+  const relativePath = normalizeReferencedPath(cwd && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path)
   return (
     <Button variant="unstyled" size="unstyled"
       type="button"
-      onClick={() => setFilePath(path)}
+      onClick={() => {
+        if (relativePath === null || projectId === null) return
+        setFilePath({ projectId, path: ProjectRelativePathSchema.make(relativePath) })
+        setPanelOpen(true)
+      }}
       className="hover-text-accent border-0 [background:transparent] [padding:0px] [margin:0px] text-blue-700 dark:text-blue-500 [font:inherit] cursor-pointer text-left"
     >
       {displayPath ?? path}

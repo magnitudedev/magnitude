@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type ReactNode } from "react"
+import { useMemo, useState, type ReactNode } from "react"
 import {
   ArrowLeft,
   HardDrive,
@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Input } from "@/components/ui/input"
+import { ResizableEdge } from "@/components/ui/resizable-edge"
 
 interface SessionItemData {
   readonly sessionId: string
@@ -291,7 +292,6 @@ export function SessionsSidebar({
   const setCollapsed = useAtomSet(sidebarCollapsedAtom)
   const collapsedProjects = useAtomValue(collapsedProjectIdsAtom)
   const setCollapsedProjects = useAtomSet(collapsedProjectIdsAtom)
-  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null)
   const [formProject, setFormProject] = useState<ProjectRecord | "new" | null>(null)
   const [removeProject, setRemoveProject] = useState<ProjectRecord | null>(null)
   const compact = collapsed && !overlay
@@ -333,29 +333,6 @@ export function SessionsSidebar({
       return next
     })
   }
-
-  const handleResizeStart = useCallback(
-    (event: React.MouseEvent) => {
-      event.preventDefault()
-      const startX = event.clientX
-      const startWidth = sidebarWidth
-      dragRef.current = { startX, startWidth }
-      const onMove = (move: MouseEvent) =>
-        setSidebarWidth(Math.min(400, Math.max(220, startWidth + move.clientX - startX)))
-      const onUp = () => {
-        dragRef.current = null
-        document.removeEventListener("mousemove", onMove)
-        document.removeEventListener("mouseup", onUp)
-        document.body.style.cursor = ""
-        document.body.style.userSelect = ""
-      }
-      document.addEventListener("mousemove", onMove)
-      document.addEventListener("mouseup", onUp)
-      document.body.style.cursor = "col-resize"
-      document.body.style.userSelect = "none"
-    },
-    [setSidebarWidth, sidebarWidth]
-  )
 
   const effectiveWidth = floatingFooter ? 0 : compact ? 48 : overlay ? 280 : sidebarWidth
   return (
@@ -607,6 +584,17 @@ export function SessionsSidebar({
             }}
           />
         ) : null}
+        {!overlay && !compact ? (
+          <ResizableEdge
+            side="right"
+            value={sidebarWidth}
+            minimum={220}
+            maximum={400}
+            onValueChange={setSidebarWidth}
+            label="Resize sessions sidebar"
+            className="max-[640px]:hidden"
+          />
+        ) : null}
       </aside>
       {floatingFooter ? (
         <SidebarFooter
@@ -621,12 +609,6 @@ export function SessionsSidebar({
             setCollapsed(false)
             onOpenSettings?.()
           }}
-        />
-      ) : null}
-      {!overlay && !compact ? (
-        <div
-          className="absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize max-[640px]:hidden"
-          onMouseDown={handleResizeStart}
         />
       ) : null}
       {formProject ? (

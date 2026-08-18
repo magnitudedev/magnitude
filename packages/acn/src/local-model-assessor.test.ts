@@ -4,6 +4,7 @@ import {
   AssessmentEnvironmentIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
+  ModelReleaseDateSchema,
   ModelServingConfigurationIdSchema,
   type ModelPackageEntry,
 } from "@magnitudedev/acn-protocol"
@@ -83,6 +84,7 @@ describe("LocalModelAssessor", () => {
         displayName: "Test",
         variantLabel: "Q4",
         description: "Test",
+        releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
         license: "test",
         capabilities: packageEntry.inspection._tag === "Inspected"
           ? packageEntry.inspection.capabilities

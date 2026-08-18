@@ -91,11 +91,14 @@ export {
   ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelVariantLabelSchema,
+  ModelReleaseDateSchema,
   formatModelDisplayName,
   RecommendationIdSchema,
   ModelAssessmentIdSchema,
   AssessmentEnvironmentIdSchema,
   LocalModelsStateSchema,
+  ProjectRelativePathSchema,
+  ProjectFileRevisionSchema,
 } from "@magnitudedev/acn-protocol"
 
 export {
@@ -157,6 +160,8 @@ export type {
   ToolMessage,
 } from "@magnitudedev/acn-protocol"
 export type * from "@magnitudedev/acn-protocol"
+
+export { normalizeReferencedPath } from "./path-utils"
 
 export {
   isRoleId,

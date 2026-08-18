@@ -7,6 +7,11 @@
  */
 import { Atom } from "@effect-atom/atom-react"
 import type { ProjectId } from "@magnitudedev/sdk"
+import type { ProjectFileRevision, ProjectRelativePath } from "@magnitudedev/sdk"
+import {
+  PROJECT_FILES_BROWSER_WIDTH,
+  PROJECT_FILES_DOCUMENT_WIDTH,
+} from "../lib/project-files-layout"
 import {
   selectedCwdAtom,
   selectedFilePathAtom,
@@ -59,3 +64,36 @@ export const sidebarVisibleAtom = Atom.make(false)
  * Sidebar search query.
  */
 export const sidebarSearchAtom = Atom.keepAlive(Atom.make(""))
+
+export const projectFilesPanelOpenAtom = Atom.keepAlive(Atom.make(false))
+export interface ProjectFilesPanelWidths {
+  readonly browser: number
+  readonly document: number
+}
+export const projectFilesPanelWidthsAtom = Atom.keepAlive(
+  Atom.make<ProjectFilesPanelWidths>({
+    browser: PROJECT_FILES_BROWSER_WIDTH,
+    document: PROJECT_FILES_DOCUMENT_WIDTH,
+  }),
+)
+export const projectFileDirtyAtom = Atom.keepAlive(Atom.make(false))
+export const projectFileDiscardIntentAtom = Atom.keepAlive(
+  Atom.make<"back" | "close" | null>(null),
+)
+export interface ProjectFileDraft {
+  readonly content: string
+  readonly baseRevision: ProjectFileRevision
+}
+export const projectFileDraftsAtom = Atom.keepAlive(
+  Atom.make<Readonly<Record<string, ProjectFileDraft>>>({}),
+)
+export interface SelectedProjectFile {
+  readonly projectId: ProjectId
+  readonly path: ProjectRelativePath
+}
+export const selectedProjectFileAtom = Atom.keepAlive(
+  Atom.make<SelectedProjectFile | null>(null),
+)
+export const expandedProjectDirectoriesAtom = Atom.keepAlive(
+  Atom.make<Readonly<Record<string, ReadonlySet<ProjectRelativePath>>>>({}),
+)

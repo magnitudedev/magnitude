@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { ProjectIdSchema } from "./schemas/project"
+import { ProjectFileTextSnapshotSchema, ProjectRelativePathSchema } from "./schemas/project-files"
 import { SlotIdSchema } from "./schemas/model-state"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
@@ -81,6 +82,47 @@ export const ProjectError = Schema.Union(
   ProjectOperationFailed,
 )
 export type ProjectError = Schema.Schema.Type<typeof ProjectError>
+
+export class InvalidProjectFilePath extends Schema.TaggedError<InvalidProjectFilePath>()(
+  "InvalidProjectFilePath",
+  { path: Schema.String, reason: Schema.String },
+) {}
+
+export class ProjectFileNotFound extends Schema.TaggedError<ProjectFileNotFound>()(
+  "ProjectFileNotFound",
+  { path: ProjectRelativePathSchema },
+) {}
+
+export class ProjectFileAlreadyExists extends Schema.TaggedError<ProjectFileAlreadyExists>()(
+  "ProjectFileAlreadyExists",
+  { path: ProjectRelativePathSchema },
+) {}
+
+export class ProjectFileAccessDenied extends Schema.TaggedError<ProjectFileAccessDenied>()(
+  "ProjectFileAccessDenied",
+  { path: ProjectRelativePathSchema, reason: Schema.String },
+) {}
+
+export class ProjectFileConflict extends Schema.TaggedError<ProjectFileConflict>()(
+  "ProjectFileConflict",
+  { path: ProjectRelativePathSchema, current: ProjectFileTextSnapshotSchema },
+) {}
+
+export class ProjectFileOperationFailed extends Schema.TaggedError<ProjectFileOperationFailed>()(
+  "ProjectFileOperationFailed",
+  { operation: Schema.String, path: ProjectRelativePathSchema, reason: Schema.String },
+) {}
+
+export const ProjectFileError = Schema.Union(
+  ProjectNotFound,
+  InvalidProjectFilePath,
+  ProjectFileNotFound,
+  ProjectFileAlreadyExists,
+  ProjectFileAccessDenied,
+  ProjectFileConflict,
+  ProjectFileOperationFailed,
+)
+export type ProjectFileError = Schema.Schema.Type<typeof ProjectFileError>
 
 export class LocalModelMutationFailed extends Schema.TaggedError<LocalModelMutationFailed>()(
   "LocalModelMutationFailed",
