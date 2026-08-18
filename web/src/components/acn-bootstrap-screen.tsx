@@ -1,6 +1,9 @@
 import type { ReactNode } from "react"
-import { AlertTriangle, LoaderCircle } from "lucide-react"
+import { AlertTriangle } from "lucide-react"
 import { Option } from "effect"
+import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
+import { Spinner } from "@/components/ui/spinner"
 import type {
   AcnInstallationPhase,
   AcnLifecycleState,
@@ -89,22 +92,22 @@ export function AcnBootstrapScreen({
           </div>
           <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
             {state.retryable && (
-              <button
+              <Button variant="unstyled" size="unstyled"
                 type="button"
                 className="min-h-8 rounded-[7px] bg-blue-700 px-3 text-xs font-semibold text-slate-50 hover:bg-blue-800 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400 dark:focus-visible:outline-blue-500"
                 onClick={onRetry}
               >
                 Retry
-              </button>
+              </Button>
             )}
             {onQuit !== undefined && (
-              <button
+              <Button variant="unstyled" size="unstyled"
                 type="button"
                 className="min-h-8 rounded-[7px] border border-slate-300 bg-transparent px-3 text-xs font-semibold text-slate-600 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:border-slate-750 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200 dark:focus-visible:outline-blue-500"
                 onClick={onQuit}
               >
                 Quit
-              </button>
+              </Button>
             )}
           </div>
         </section>
@@ -148,11 +151,10 @@ export function AcnBootstrapScreen({
         </h1>
         {percentage === null ? (
           <div className="mt-5 flex items-center justify-center gap-2.5 text-[16px] leading-7 text-slate-600 dark:text-slate-300">
-            <LoaderCircle
+            <Spinner
               aria-hidden="true"
-              className="animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
-              size={17}
-              strokeWidth={1.8}
+              aria-label={undefined}
+              className="size-[17px] text-blue-700 motion-reduce:animate-none dark:text-blue-500"
             />
             <p id="acn-bootstrap-phase">{phase}</p>
           </div>
@@ -170,19 +172,13 @@ export function AcnBootstrapScreen({
               </span>
             </div>
             <div>
-              <div
-                role="progressbar"
+              <Progress
                 aria-label="Magnitude installation progress"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={percentage}
-                className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"
-              >
-                <div
-                  className="h-full rounded-full bg-blue-700 transition-[width] duration-150 motion-reduce:transition-none dark:bg-blue-500"
-                  style={{ width: `${percentage}%` }}
-                />
-              </div>
+                value={percentage}
+                className="block w-full"
+                trackClassName="h-1.5 rounded-full bg-slate-200 dark:bg-slate-800"
+                indicatorClassName="rounded-full bg-blue-700 duration-150 motion-reduce:transition-none dark:bg-blue-500"
+              />
             </div>
             {detail !== null && (
               <p className="mt-2.5 font-mono text-[12px] tabular-nums text-slate-500 dark:text-slate-500">

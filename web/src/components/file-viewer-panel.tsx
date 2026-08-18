@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * FileViewerPanel — spec §8.5
  *
@@ -162,30 +164,30 @@ export function FileViewerPanel({
           </span>
         </div>
         <div className="flex items-center [gap:4px] shrink-0">
-          <button
+          <Button variant="unstyled" size="unstyled"
             onClick={handleCopy}
             title="Copy"
             aria-label="Copy file content"
             className="[width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] text-slate-500 cursor-pointer"
           >
             {copied ? <Check size={14} /> : <Copy size={14} />}
-          </button>
-          <button
+          </Button>
+          <Button variant="unstyled" size="unstyled"
             onClick={handleOpenExternal}
             title="Open in editor"
             aria-label="Open in editor"
             className="[width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] text-slate-500 cursor-pointer"
           >
             <ExternalLink size={14} />
-          </button>
-          <button
+          </Button>
+          <Button variant="unstyled" size="unstyled"
             onClick={onClose}
             title="Close (Esc)"
             aria-label="Close file viewer"
             className="[width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] text-slate-500 cursor-pointer"
           >
             <X size={14} />
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -217,13 +219,13 @@ export function FileViewerPanel({
               File is too large to display (
               {(content || "").length.toLocaleString()} characters).
             </div>
-            <button
+            <Button variant="unstyled" size="unstyled"
               onClick={handleOpenExternal}
               className="flex items-center [gap:6px] bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:6px_12px] font-sans text-[13px] text-slate-600 dark:text-slate-400 cursor-pointer"
             >
               <ExternalLink size={14} />
               Open in editor
-            </button>
+            </Button>
           </div>
         ) : isMarkdown ? (
           <MarkdownContent

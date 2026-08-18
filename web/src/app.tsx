@@ -86,8 +86,11 @@ import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
 import { AcnBootstrapScreen } from "./components/acn-bootstrap-screen"
 import { MagnitudeMark } from "./components/magnitude-mark"
-import { ToastContainer } from "./components/toast"
-import { showToast } from "./stores/toast-store"
+import { Button } from "@/components/ui/button"
+import { Spinner } from "@/components/ui/spinner"
+import { Toaster } from "@/components/ui/toast"
+import { TooltipProvider } from "@/components/ui/tooltip"
+import { notify } from "@/lib/notifications"
 import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
 import {
   useSlotProfiles,
@@ -248,7 +251,7 @@ function SessionsSidebarContainer(props?: {
         void reopenSession({
           payload: { sessionId: session.sessionId },
           reactivityKeys: ["sessions", "projects"],
-        }).then(select).catch(() => showToast("error", "Could not reopen this session."))
+        }).then(select).catch(() => notify("error", "Could not reopen this session."))
       }}
       onCloseSession={(sessionId) => {
         void closeSession({
@@ -260,14 +263,14 @@ function SessionsSidebarContainer(props?: {
           startNewSession(closed
             ? { cwd: closed.workingDirectory, projectId: closed.projectId }
             : { cwd: null, projectId: null })
-        }).catch(() => showToast("error", "Could not close this session."))
+        }).catch(() => notify("error", "Could not close this session."))
       }}
       onCompose={handleCompose}
       onRevealProject={(projectId) => {
         void revealProject({
           payload: { projectId },
           reactivityKeys: [],
-        }).catch(() => showToast("error", "Could not reveal this project folder."))
+        }).catch(() => notify("error", "Could not reveal this project folder."))
       }}
       onCreateProject={(project) => {
         setSettingsTab(null)
@@ -498,7 +501,7 @@ function ComposerContainer({
   const commandContext: CommandContext = useMemo(
     () => ({
       resetConversation: () => startNewSession(),
-      showSystemMessage: (message: string) => showToast("info", message),
+      showSystemMessage: (message: string) => notify("info", message),
       exitApp: () => {
         if (platform.quit) platform.quit()
       },
@@ -520,7 +523,7 @@ function ComposerContainer({
         sendRef.current(content)
       },
       initProject: () => {
-        showToast(
+        notify(
           "info",
           "Project initialization is not available in the web app yet."
         )
@@ -533,7 +536,7 @@ function ComposerContainer({
         }
       },
       toggleAutopilot: () => {
-        showToast("info", "Autopilot mode is not yet available in the web app.")
+        notify("info", "Autopilot mode is not yet available in the web app.")
       },
     }),
     [
@@ -759,7 +762,7 @@ function ChatTitleBar({
   if (desktop) {
     const titlebarActions = (
       <>
-        <button
+        <Button variant="unstyled" size="unstyled"
           type="button"
           onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
           className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
@@ -767,8 +770,8 @@ function ChatTitleBar({
           title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
           <SidebarSimple size={18} />
-        </button>
-        <button
+        </Button>
+        <Button variant="unstyled" size="unstyled"
           type="button"
           onClick={onCompose}
           className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
@@ -776,7 +779,7 @@ function ChatTitleBar({
           title="New chat"
         >
           <NotePencil size={18} />
-        </button>
+        </Button>
       </>
     )
 
@@ -819,7 +822,7 @@ function ChatTitleBar({
       title={title}
     >
       {onOpenSidebar && (
-        <button
+        <Button variant="unstyled" size="unstyled"
           type="button"
           className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 shrink-0 mr-2.5"
           aria-label="Open sessions"
@@ -827,7 +830,7 @@ function ChatTitleBar({
           onClick={onOpenSidebar}
         >
           <Menu size={17} />
-        </button>
+        </Button>
       )}
       <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
         {title}
@@ -914,13 +917,13 @@ function AppInner({
         <AlertTriangleIcon />
         <h1>Couldn’t load local setup</h1>
         <p>{failureDescription}</p>
-        <button
+        <Button variant="unstyled" size="unstyled"
           className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
           type="button"
           onClick={onboarding.retry}
         >
           Retry
-        </button>
+        </Button>
       </div>
     )
   }
@@ -932,7 +935,7 @@ function AppInner({
           Opening Magnitude
         </h1>
         <div className="mt-5 flex items-center gap-2.5 text-[16px] leading-7 text-slate-600 dark:text-slate-300">
-          <div className="size-[17px] rounded-full border-2 border-slate-300 border-t-blue-700 animate-spin motion-reduce:animate-none dark:border-slate-750 dark:border-t-blue-500" />
+          <Spinner className="size-[17px] text-blue-700 motion-reduce:animate-none dark:text-blue-500" />
           <p>Loading local model settings…</p>
         </div>
       </div>
@@ -1017,7 +1020,7 @@ function AuthenticatedAppContent({
             {panelOpen && (
               <>
                 {isNarrow && (
-                  <button
+                  <Button variant="unstyled" size="unstyled"
                     type="button"
                     className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-900"
                     aria-label="Open settings navigation"
@@ -1025,7 +1028,7 @@ function AuthenticatedAppContent({
                     onClick={() => setSidebarVisible(true)}
                   >
                     <Menu size={17} />
-                  </button>
+                  </Button>
                 )}
                 <SettingsCenter tab={settingsTab} />
               </>
@@ -1035,7 +1038,7 @@ function AuthenticatedAppContent({
             )}
           </div>
         )}
-        <ToastContainer />
+        <Toaster />
         </div>
         {!panelOpen && <FileViewerPanelContainer />}
         {connectionError && (
@@ -1070,7 +1073,9 @@ export function App({
 }): ReactNode {
   return (
     <DisplayViewControllerProvider>
-      <AppInner initialAcnLifecycle={initialAcnLifecycle} />
+      <TooltipProvider>
+        <AppInner initialAcnLifecycle={initialAcnLifecycle} />
+      </TooltipProvider>
     </DisplayViewControllerProvider>
   )
 }

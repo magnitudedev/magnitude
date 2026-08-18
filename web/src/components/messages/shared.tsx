@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * Shared utilities for message components — copy button, timestamp, attachment pill.
  */
@@ -23,7 +25,7 @@ export function CopyButton({
 }): ReactNode {
   const [copied, setCopied] = useState(false)
   return (
-    <button
+    <Button variant="unstyled" size="unstyled"
       onClick={() => {
         navigator.clipboard?.writeText(text)
         setCopied(true)
@@ -35,7 +37,7 @@ export function CopyButton({
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
       {label}
-    </button>
+    </Button>
   )
 }
 

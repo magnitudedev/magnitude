@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * MarkdownContent — spec §14.1
  *
@@ -35,7 +37,7 @@ function useCodeHighlight(code: string, lang: string): string | null {
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
   return (
-    <button
+    <Button variant="unstyled" size="unstyled"
       className={`${
         copied ? "text-green-700 dark:text-green-500" : "text-slate-500"
       }  code-block-copy [background:transparent] border-0 cursor-pointer flex items-center [padding:2px]`}
@@ -48,7 +50,7 @@ function CopyButton({ text }: { text: string }) {
       }}
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
-    </button>
+    </Button>
   )
 }
 

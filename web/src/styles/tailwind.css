@@ -2,6 +2,8 @@
 @import "@fontsource-variable/inter/wght-italic.css";
 @import "@fontsource-variable/martian-mono/wght.css";
 @import "tailwindcss" source(none);
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
 
 @source "../";
 @source "../../../desktop/src/renderer.tsx";

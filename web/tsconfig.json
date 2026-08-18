@@ -5,6 +5,7 @@
     "jsxImportSource": "react",
     "noEmit": true,
     "paths": {
+      "@/*": ["./src/*"],
       "@magnitudedev/web": ["./src/index.tsx"],
       "@magnitudedev/sdk": ["../packages/sdk/src"],
       "@magnitudedev/sdk/*": ["../packages/sdk/src/*"],

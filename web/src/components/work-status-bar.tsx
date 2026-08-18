@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button"
 import { useState, useSyncExternalStore, type ReactNode } from "react"
 import { ChevronDown, ChevronUp, Circle } from "lucide-react"
 import {
@@ -189,7 +190,7 @@ function TaskStatusRow({
       ? "text-green-700 dark:text-green-500"
       : "text-slate-500"
   return (
-    <button
+    <Button variant="unstyled" size="unstyled"
       type="button"
       disabled={!isInteractive}
       onClick={() => {
@@ -238,7 +239,7 @@ function TaskStatusRow({
       <span className="text-slate-500 text-right">
         {timerMs !== null && timerMs > 0 ? formatElapsedMs(timerMs) : ""}
       </span>
-    </button>
+    </Button>
   )
 }
 export function WorkStatusBar({
@@ -273,7 +274,7 @@ export function WorkStatusBar({
   return (
     <div className="[margin:0px] border border-slate-300 dark:border-slate-750 rounded-[6px] bg-white dark:bg-slate-850 overflow-hidden font-sans shrink-0">
       {hasTasks ? (
-        <button
+        <Button variant="unstyled" size="unstyled"
           type="button"
           onClick={() => setExpanded((value) => !value)}
           aria-expanded={expanded}
@@ -286,7 +287,7 @@ export function WorkStatusBar({
             <span>{taskCountLabel}</span>
             {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
           </span>
-        </button>
+        </Button>
       ) : (
         <div className="[min-height:34px] [padding:0_10px] flex items-center [gap:8px] text-slate-600 dark:text-slate-400 text-[13px]">
           <StatusSummary status={rootStatus} />

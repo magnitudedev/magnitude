@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * ChatTimeline
  *
@@ -107,13 +109,13 @@ function PathText({
 }): ReactNode {
   const setFilePath = useAtomSet(selectedFilePathAtom)
   return (
-    <button
+    <Button variant="unstyled" size="unstyled"
       type="button"
       onClick={() => setFilePath(path)}
       className="hover-text-accent border-0 [background:transparent] [padding:0px] [margin:0px] text-blue-700 dark:text-blue-500 [font:inherit] cursor-pointer text-left"
     >
       {displayPath ?? path}
-    </button>
+    </Button>
   )
 }
 function ToolSummaryRow({

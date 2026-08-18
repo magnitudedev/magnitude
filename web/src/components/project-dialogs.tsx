@@ -2,20 +2,35 @@ import { useMemo, useState, type ReactNode } from "react"
 import { useAtomSet, useAtomValue, Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import { FolderOpen } from "@phosphor-icons/react"
-import {
-  useAgentClient,
-  usePlatform,
-} from "@magnitudedev/client-common"
+import { useAgentClient, usePlatform } from "@magnitudedev/client-common"
 import type { ProjectRecord } from "@magnitudedev/sdk"
 import {
   Dialog,
-  DialogActions,
-  dialogPrimaryButton,
-  dialogSecondaryButton,
-} from "./dialog"
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 
 const basename = (path: string): string =>
-  path.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) ?? path
+  path
+    .replace(/[\\/]+$/, "")
+    .split(/[\\/]/)
+    .at(-1) ?? path
 
 export function ProjectFormDialog({
   project,
@@ -41,22 +56,23 @@ export function ProjectFormDialog({
   const mutationState = project ? editState : createState
   const pending = Result.isWaiting(mutationState)
   const failed = Result.isFailure(mutationState)
-  const failure = failed
-    ? Option.getOrNull(Cause.failureOption(mutationState.cause))
-    : null
-  const failureMessage = failure === null
-    ? (project ? "Could not update this project." : "Could not create this project.")
-    : failure._tag === "InvalidProjectSource"
+  const failure = failed ? Option.getOrNull(Cause.failureOption(mutationState.cause)) : null
+  const failureMessage =
+    failure === null
+      ? project
+        ? "Could not update this project."
+        : "Could not create this project."
+      : failure._tag === "InvalidProjectSource"
       ? `That source cannot be used: ${failure.reason}`
       : failure._tag === "ProjectSourceAlreadyRegistered"
-        ? "That source already belongs to another project."
-        : failure._tag === "ProjectBusy"
-          ? "Wait for this project's active work to finish before changing its source."
-          : failure._tag === "InvalidProjectName"
-            ? "Enter a project name."
-            : project
-              ? "Could not update this project."
-              : "Could not create this project."
+      ? "That source already belongs to another project."
+      : failure._tag === "ProjectBusy"
+      ? "Wait for this project's active work to finish before changing its source."
+      : failure._tag === "InvalidProjectName"
+      ? "Enter a project name."
+      : project
+      ? "Could not update this project."
+      : "Could not create this project."
 
   const updateSource = (path: string) => {
     setSourceDirectory(path)
@@ -99,87 +115,108 @@ export function ProjectFormDialog({
 
   return (
     <Dialog
-      title={project ? "Edit project" : "New project"}
-      description={project
-        ? "Change the name or source. Every existing chat in this project will use the new source directory."
-        : "Choose a folder for Magnitude to work in."
-      }
-      onDismiss={onDismiss}
+      open
+      onOpenChange={(open) => {
+        if (!open) onDismiss()
+      }}
     >
-      <div className="space-y-4 px-5 pb-5 pt-2">
-        <label className="block">
-          <span className="mb-1.5 block font-sans text-[12px] font-semibold text-slate-700 dark:text-slate-300">
-            Source
-          </span>
-          <div className="flex gap-2">
-            <input
-              value={sourceDirectory}
-              onChange={(event) => updateSource(event.target.value)}
-              placeholder="/path/to/project"
-              readOnly={platform.id === "desktop"}
-              className="h-9 min-w-0 flex-1 rounded-md border border-slate-300 bg-white px-3 font-sans text-[13px] text-slate-900 outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-500/15 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:focus:border-blue-500"
-            />
-            {platform.id === "desktop" ? (
-              <button
-                autoFocus
-                type="button"
-                onClick={selectSource}
-                className={dialogSecondaryButton}
+      <DialogContent className="max-w-[520px] gap-0 overflow-hidden p-0 dark:bg-slate-800">
+        <DialogHeader className="px-5 pb-3 pt-5">
+          <DialogTitle className="text-[15px] font-semibold">
+            {project ? "Edit project" : "New project"}
+          </DialogTitle>
+          <DialogDescription className="mt-1.5 text-[13px] leading-5 text-slate-600 dark:text-slate-400">
+            {project
+              ? "Change the name or source. Every existing chat in this project will use the new source directory."
+              : "Choose a folder for Magnitude to work in."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 px-5 pb-5 pt-2">
+          <div>
+            <Label className="mb-1.5 block text-[12px] font-semibold text-slate-700 dark:text-slate-300">
+              Source
+            </Label>
+            <div className="flex gap-2">
+              <Input
+                value={sourceDirectory}
+                onChange={(event) => updateSource(event.target.value)}
+                placeholder="/path/to/project"
+                readOnly={platform.id === "desktop"}
+                className="h-9 min-w-0 flex-1 border-slate-300 bg-white px-3 text-[13px] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              />
+              {platform.id === "desktop" ? (
+                <Button
+                  autoFocus
+                  type="button"
+                  onClick={selectSource}
+                  variant="outline"
+                  className="h-9"
+                >
+                  <span className="flex items-center gap-2">
+                    <FolderOpen size={16} /> {project ? "Change source" : "Select source"}
+                  </span>
+                </Button>
+              ) : null}
+            </div>
+            <span className="mt-1.5 block text-[11px] text-slate-500">
+              {platform.id === "desktop"
+                ? "Select a source folder on this computer."
+                : "Enter an absolute directory on the agent host."}
+            </span>
+            {sourcePickerFailed ? (
+              <span
+                role="alert"
+                className="mt-1.5 block text-[11px] text-red-600 dark:text-red-400"
               >
-                <span className="flex items-center gap-2"><FolderOpen size={16} /> {project ? "Change source" : "Select source"}</span>
-              </button>
+                Could not open the folder picker.
+              </span>
             ) : null}
           </div>
-          <span className="mt-1.5 block font-sans text-[11px] text-slate-500">
-            {platform.id === "desktop"
-              ? "Select a source folder on this computer."
-              : "Enter an absolute directory on the agent host."
-            }
-          </span>
-          {sourcePickerFailed ? (
-            <span role="alert" className="mt-1.5 block font-sans text-[11px] text-red-600 dark:text-red-400">
-              Could not open the folder picker.
-            </span>
-          ) : null}
-        </label>
 
-        <label className="block">
-          <span className="mb-1.5 block font-sans text-[12px] font-semibold text-slate-700 dark:text-slate-300">
-            Project name
-          </span>
-          <input
-            autoFocus={platform.id !== "desktop"}
-            value={name}
-            onChange={(event) => {
-              setNameWasEdited(true)
-              setName(event.target.value)
-            }}
-            placeholder="Project name"
-            className="h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-sans text-[13px] text-slate-900 outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-500/15 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:focus:border-blue-500"
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void save()
-            }}
-          />
-        </label>
-        {failed ? (
-          <p role="alert" className="font-sans text-[12px] text-red-600 dark:text-red-400">
-            {failureMessage}
-          </p>
-        ) : null}
-      </div>
-      <DialogActions>
-        <button type="button" onClick={onDismiss} disabled={pending} className={dialogSecondaryButton}>
-          Cancel
-        </button>
-        <button
-          type="button"
-          onClick={() => void save()}
-          disabled={pending || !sourceDirectory.trim() || !name.trim()}
-          className={dialogPrimaryButton}
-        >
-          {pending ? "Saving…" : project ? "Save changes" : "Create new"}
-        </button>
-      </DialogActions>
+          <div>
+            <Label className="mb-1.5 block text-[12px] font-semibold text-slate-700 dark:text-slate-300">
+              Project name
+            </Label>
+            <Input
+              autoFocus={platform.id !== "desktop"}
+              value={name}
+              onChange={(event) => {
+                setNameWasEdited(true)
+                setName(event.target.value)
+              }}
+              placeholder="Project name"
+              className="h-9 w-full border-slate-300 bg-white px-3 text-[13px] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void save()
+              }}
+            />
+          </div>
+          {failed ? (
+            <p role="alert" className="text-[12px] text-red-600 dark:text-red-400">
+              {failureMessage}
+            </p>
+          ) : null}
+        </div>
+        <DialogFooter className="border-t border-slate-200 px-5 py-4 dark:border-slate-750">
+          <Button
+            type="button"
+            onClick={onDismiss}
+            disabled={pending}
+            variant="outline"
+            className="h-9"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={() => void save()}
+            disabled={pending || !sourceDirectory.trim() || !name.trim()}
+            className="h-9 bg-blue-700 text-white hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
+          >
+            {pending ? "Saving…" : project ? "Save changes" : "Create new"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   )
 }
@@ -211,30 +248,39 @@ export function RemoveProjectDialog({
     }
   }
   return (
-    <Dialog
-      title="Remove project?"
-      description={`Remove “${project.name}” from the sidebar? Its sessions and files will not be deleted.`}
-      onDismiss={onDismiss}
-      size="small"
+    <AlertDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onDismiss()
+      }}
     >
-      {failed ? (
-        <p role="alert" className="px-5 pb-4 font-sans text-[12px] text-red-600 dark:text-red-400">
-          Could not remove this project.
-        </p>
-      ) : null}
-      <DialogActions>
-        <button type="button" onClick={onDismiss} disabled={pending} className={dialogSecondaryButton}>
-          Cancel
-        </button>
-        <button
-          type="button"
-          onClick={() => void confirm()}
-          disabled={pending}
-          className="h-9 rounded-md border border-red-600 bg-red-600 px-3.5 font-sans text-[13px] font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-500 dark:bg-red-500 dark:text-slate-925 dark:hover:bg-red-400"
-        >
-          {pending ? "Removing…" : "Remove"}
-        </button>
-      </DialogActions>
-    </Dialog>
+      <AlertDialogContent className="max-w-[400px] dark:bg-slate-800">
+        <AlertDialogHeader>
+          <AlertDialogTitle className="text-[15px] font-semibold">Remove project?</AlertDialogTitle>
+          <AlertDialogDescription className="text-[13px] leading-5">
+            Remove “{project.name}” from the sidebar? Its sessions and files will not be deleted.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {failed ? (
+          <p role="alert" className="text-[12px] text-red-600 dark:text-red-400">
+            Could not remove this project.
+          </p>
+        ) : null}
+        <AlertDialogFooter>
+          <AlertDialogCancel onClick={onDismiss} disabled={pending} className="h-9">
+            Cancel
+          </AlertDialogCancel>
+          <AlertDialogAction
+            type="button"
+            onClick={() => void confirm()}
+            disabled={pending}
+            variant="destructive"
+            className="h-9 bg-red-600 text-white hover:bg-red-700 dark:bg-red-500 dark:text-slate-925 dark:hover:bg-red-400"
+          >
+            {pending ? "Removing…" : "Remove"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }

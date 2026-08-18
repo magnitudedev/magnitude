@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * Agent communication message — spec §9.3.13
  *
@@ -66,7 +68,7 @@ export function AgentCommunication({
         />
       </div>
       {canExpand && (
-        <button
+        <Button variant="unstyled" size="unstyled"
           onClick={() => setExpanded(!expanded)}
           className="[background:transparent] border-0 cursor-pointer flex items-center [gap:4px] text-slate-500 font-sans text-[11px] [padding:0px] [margin-top:2px]"
         >
@@ -77,7 +79,7 @@ export function AgentCommunication({
             }  [transition:transform_100ms_ease]`}
           />
           {expanded ? "Show less" : "Show more"}
-        </button>
+        </Button>
       )}
     </div>
   )

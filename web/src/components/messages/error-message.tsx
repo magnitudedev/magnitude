@@ -1,3 +1,5 @@
+import { Button } from "@/components/ui/button"
+
 /**
  * Error message — spec §9.3.10
  *
@@ -31,9 +33,9 @@ function ErrorCta({ cta }: { cta: ErrorCtaValue }): ReactNode {
   // action
   return (
     <div className="[margin-top:6px]">
-      <button className="bg-transparent hover:bg-red-300 hover:text-slate-900 dark:hover:bg-red-700 dark:hover:text-slate-200 border border-red-600 dark:border-red-500 rounded-[4px] [background:transparent] text-red-600 dark:text-red-500 font-mono text-[13px] [padding:4px_10px] cursor-pointer">
+      <Button variant="unstyled" size="unstyled" className="bg-transparent hover:bg-red-300 hover:text-slate-900 dark:hover:bg-red-700 dark:hover:text-slate-200 border border-red-600 dark:border-red-500 rounded-[4px] [background:transparent] text-red-600 dark:text-red-500 font-mono text-[13px] [padding:4px_10px] cursor-pointer">
         {cta.label} ({cta.chord})
-      </button>
+      </Button>
     </div>
   )
 }
