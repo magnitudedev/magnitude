@@ -35,10 +35,10 @@ export function ModelRadarChart({
   const description = axes
     .map(({ label, detail }) => `${label.toLowerCase()}: ${detail}`)
     .join(", ")
-  const centerX = 180
+  const centerX = 210
   const centerY = 158
   const radius = 88
-  const labelRadius = 126
+  const labelRadius = 136
   const chartPoints = (chartValues: readonly number[], scale = 1) =>
     chartValues
       .map((value, index) =>
@@ -49,8 +49,8 @@ export function ModelRadarChart({
   return (
     <div className="mt-2">
       <svg
-        className="h-auto max-h-[340px] w-full overflow-visible max-[1050px]:max-h-[220px]"
-        viewBox="0 0 360 320"
+        className="h-auto max-h-[340px] w-full overflow-hidden max-[1050px]:max-h-[220px]"
+        viewBox="0 0 420 320"
         role="img"
         aria-label={`Model comparison profile. ${description}`}
       >

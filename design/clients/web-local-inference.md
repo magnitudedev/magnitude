@@ -63,7 +63,15 @@ The ordinary shell contains a dedicated Settings surface for local inference:
   only artifact-level actions: reveal the daemon-published installed target path or remove the
   download. Slot selection, residency, favorites, transfer activity, and load controls do not belong
   on this surface.
-- Catalog presents the unified assessed local catalog and recommendation evidence.
+- Catalog presents the unified assessed local catalog and recommendation evidence. Its index may be
+  searched by model identity, filtered to installed models, and sorted
+  by recommendation, release date, intelligence, download size, or name. Recommendation is an
+  ordering and visible model annotation rather than a second overlapping filter. Ordinary
+  downloadable rows do not repeat an `Available` label; non-default lifecycle and compatibility
+  states remain visible while completed `DoesNotFit` and `Incompatible` assessments are excluded
+  from the browsable catalog. Catalog owns
+  install, update, and transfer cancellation; active-model selection remains in the composer and
+  installed-artifact removal remains in Models.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside
   resident allocations. Internal admission thresholds are not exposed as end-user concepts.
 
@@ -167,7 +175,13 @@ semantics.
 - Wide and narrow layouts preserve access to every model-management view and action.
 - Footer model and reasoning choices remain available without navigating away from the chat.
 - Catalog keeps the selected model's primary action visible while its evidence scrolls, labels
-  radar axes directly, and does not repeat radar evidence in candidate rows or metric tiles.
+  radar axes directly, presents recommendation evidence before the radar and license/source metadata
+  below it, and does not repeat radar evidence in candidate rows or metric tiles. The chart remains
+  fully contained without horizontal scrolling. Search,
+  the installed-model filter, and the labeled sort control remain visually distinct. Its
+  two-pane layout is one unified browser surface, consumes the available Settings height without
+  viewport-height arithmetic, and gives each pane its own overflow so the detail surface neither
+  clips nor leaves a false bottom gap.
 - Slash commands and host menu actions route to the corresponding web-native surface.
 - System appearance is the default, explicit overrides persist locally, and code highlighting tracks
   the resolved theme.
