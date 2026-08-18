@@ -1,37 +1,45 @@
 import { useMemo, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
-import { Label } from "@/components/ui/label"
+import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { Exit, Option } from "effect"
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import {
   AlertTriangle,
   Check,
   Cpu,
   Download,
-  Gauge,
-  Heart,
+  EllipsisVertical,
+  FolderOpen,
   Layers3,
   Loader2,
   MemoryStick,
   PackageOpen,
-  Play,
   RefreshCw,
-  Square,
+  Search,
   Trash2,
   X,
 } from "lucide-react"
 import {
   deriveHardwareMemoryView,
   formatLocalModelDisplayName,
-  installedLocalModels,
   localModelConfigurationId,
   localModelProviderModelId,
   localModelRadarAxes,
@@ -43,6 +51,7 @@ import {
   useLocalModels,
   useModelSlotActions,
   useModelSlots,
+  usePlatform,
   usePreviewModelLoad,
   type CatalogModelReconciliationState,
   type CatalogModelView,
@@ -51,12 +60,9 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ReasoningEffortSchema,
-  SECONDARY_SLOT_ID,
   servableModelBundlePackages,
+  servableModelBundleTargetPackageId,
   type LocalModel,
-  type ModelSlot,
-  type ModelSlotsState,
-  type SlotId,
 } from "@magnitudedev/sdk"
 import type { SettingsTab } from "../state/web-atoms"
 import {
@@ -101,7 +107,7 @@ function QueryNotice({
       </div>
     )
   }
-  if (Result.isWaiting(result) && Option.isNone(Result.value(result))) {
+  if (Option.isNone(Result.value(result))) {
     return (
       <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400">
         <Loader2 className="animate-spin" size={15} />
@@ -110,6 +116,28 @@ function QueryNotice({
     )
   }
   return null
+}
+
+function LoadingNotice({
+  title,
+  description,
+}: {
+  readonly title: string
+  readonly description: string
+}): ReactNode {
+  return (
+    <section
+      className="flex items-center gap-3.5 rounded-lg border border-slate-300 bg-white px-[18px] py-4 dark:border-slate-750 dark:bg-slate-850 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400"
+      role="status"
+      aria-live="polite"
+    >
+      <Loader2 className="shrink-0 animate-spin" size={20} aria-hidden="true" />
+      <div>
+        <h2>{title}</h2>
+        <p>{description}</p>
+      </div>
+    </section>
+  )
 }
 const modelFailure = (model: LocalModel): string | null => {
   if (model.acquisitionState._tag === "Failed")
@@ -299,355 +327,156 @@ function ModelTransferProgress({
     </div>
   )
 }
-function RuntimeSlot({
-  slot,
-  label,
-  slotId,
-  models,
-  slots,
-}: {
-  readonly slot: ModelSlot
-  readonly label: string
-  readonly slotId: SlotId
-  readonly models: readonly LocalModel[]
-  readonly slots: ModelSlotsState
-}): ReactNode {
-  const actions = useModelSlotActions()
-  const [controlling, setControlling] = useState(false)
-  const [controlFailed, setControlFailed] = useState(false)
-  const status = slotStatus(slot)
-  const busy =
-    controlling ||
-    Result.isWaiting(actions.assignResult) ||
-    Result.isWaiting(actions.clearResult) ||
-    Result.isWaiting(actions.favoriteResult)
-  const failed =
-    controlFailed ||
-    Result.isFailure(actions.assignResult) ||
-    Result.isFailure(actions.clearResult) ||
-    Result.isFailure(actions.favoriteResult)
-  const isFavorite =
-    slot._tag !== "Unassigned" &&
-    slots.favoriteModels.some(
-      (favorite) =>
-        favorite.providerId === slot.selection.providerId &&
-        favorite.providerModelId === slot.selection.providerModelId
-    )
-  const options = models.flatMap((model) => {
-    if (
-      model.servingState._tag !== "Assessed" ||
-      model.servingState.assessment._tag !== "Fits" ||
-      model.servingState.availabilityState._tag !== "Selectable"
-    )
-      return []
-    return [
-      {
-        model,
-        providerModelId: model.servingState.availabilityState.providerModelId,
-      },
-    ]
-  })
-  const selectedKey =
-    slot._tag === "Unassigned" || slot.selection.providerId !== localProviderId
-      ? ""
-      : slot.selection.providerModelId
-  const selectedModel = options.find(
-    ({ providerModelId }) => providerModelId === selectedKey
-  )?.model
-  const allocation = Option.getOrNull(modelSlotResidentAllocation(slot))
-  const residentBytes = allocation?.memoryDomains.reduce(
-    (total, domain) =>
-      total +
-      domain.modelBytes +
-      domain.contextBytes +
-      domain.computeBytes +
-      domain.auxiliaryBytes,
-    0
-  )
-  const control = async (kind: "load" | "stop") => {
-    setControlling(true)
-    setControlFailed(false)
-    const exit = await actions[kind](slotId)
-    setControlFailed(Exit.isFailure(exit))
-    setControlling(false)
-  }
+const installedModelTargetPath = (model: LocalModel): string | null => {
+  if (model.acquisitionState._tag !== "Installed") return null
+  const targetPackageId = servableModelBundleTargetPackageId(model.bundle)
   return (
-    <article
-      className="relative grid min-h-[116px] grid-cols-[minmax(220px,1.1fr)_minmax(240px,.9fr)_auto] items-center gap-[22px] px-[18px] py-5 bg-white dark:bg-slate-850 border-b border-slate-300 dark:border-slate-750 first:rounded-t-[9px] last:rounded-b-[9px] max-[1050px]:grid-cols-[minmax(200px,1fr)_minmax(230px,1fr)] max-[620px]:grid-cols-1 max-[620px]:gap-3.5"
-      data-slot={slotId}
-    >
-      <div className="min-w-0 [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_h3]:text-base [&_h3]:leading-[1.3]">
-        <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
-          {label}
-        </span>
-        <h3>
-          {slot._tag === "Unassigned"
-            ? "No model configured"
-            : selectedModel
-            ? formatLocalModelDisplayName(selectedModel)
-            : `${slot.descriptor.displayName}${Option.match(
-                slot.descriptor.variantLabel,
-                {
-                  onNone: () => "",
-                  onSome: (variant) => ` (${variant})`,
-                }
-              )}`}
-        </h3>
-        <div className="mt-[7px] flex flex-wrap gap-x-3 gap-y-[5px] font-sans text-[11px] leading-[normal] text-slate-500">
-          <span
-            className={`${statusToneClass(
-              status.tone
-            )} inline-flex items-center gap-1 text-[10px] font-bold whitespace-nowrap`}
-          >
-            {status.label}
-          </span>
-          {selectedModel && modelContextLength(selectedModel) !== null && (
-            <span>
-              {formatContext(modelContextLength(selectedModel)!)} context
-            </span>
-          )}
-          {residentBytes !== undefined && (
-            <span>{formatBytes(residentBytes)} resident</span>
-          )}
-        </div>
-        {status.detail && (
-          <p className="!text-red-600 dark:!text-red-500">{status.detail}</p>
-        )}
-      </div>
-      <div className="min-w-0">
-        <Label
-          className="mt-0 mb-1.5 block text-[11px] font-semibold text-slate-600 dark:text-slate-400"
-          htmlFor={`slot-${slotId}`}
-        >
-          Model
-        </Label>
-        <Select
-          value={selectedKey}
-          disabled={busy}
-          onValueChange={(nextValue) => {
-            const selected = options.find(
-              ({ providerModelId }) => providerModelId === nextValue
-            )
-            if (!selected) return actions.clear(slotId)
-            const capabilities =
-              selected.model.servingState._tag === "Assessed"
-                ? selected.model.servingState.capabilities
-                : null
-            actions.assign(slotId, {
-              providerId: localProviderId,
-              providerModelId: selected.providerModelId,
-              reasoningEffort: capabilities
-                ? Option.getOrElse(capabilities.reasoning.defaultEffort, () =>
-                    ReasoningEffortSchema.make("none")
-                  )
-                : ReasoningEffortSchema.make("none"),
-            })
-          }}
-        >
-          <SelectTrigger id={`slot-${slotId}`} className="h-9 w-full border-slate-300 bg-slate-50 px-2.5 text-xs dark:border-slate-750 dark:bg-slate-925 dark:text-slate-200">
-            <SelectValue placeholder="Choose from installed models" />
-          </SelectTrigger>
-          <SelectContent align="start" className="min-w-[var(--anchor-width)]">
-            {options.map(({ model, providerModelId }) => (
-              <SelectItem key={providerModelId} value={providerModelId}>
-                {formatLocalModelDisplayName(model)}
-                {modelContextLength(model)
-                  ? ` · ${formatContext(modelContextLength(model)!)} context`
-                  : ""}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="flex flex-wrap items-center justify-end gap-[7px] max-[1050px]:col-span-full max-[1050px]:justify-start max-[620px]:col-auto">
-        {slot._tag === "ConfiguredLocal" &&
-          slot.actions.some(
-            (action) => action === "Load" || action === "RetryLoad"
-          ) && (
-            <Button variant="unstyled" size="unstyled"
-              type="button"
-              className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
-              disabled={busy}
-              onClick={() => void control("load")}
-            >
-              <Play size={14} />
-              {slot.actions.includes("RetryLoad") ? "Retry load" : "Load"}
-            </Button>
-          )}
-        {slot._tag === "ConfiguredLocal" && slot.actions.includes("Stop") && (
-          <Button variant="unstyled" size="unstyled"
-            type="button"
-            className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-200 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 dark:hover:bg-slate-750"
-            disabled={busy}
-            onClick={() => void control("stop")}
-          >
-            <Square size={13} />
-            {slot.residency._tag === "Loading" ||
-            slot.residency._tag === "Requested"
-              ? "Cancel load"
-              : "Stop"}
-          </Button>
-        )}
-        {slot._tag === "ConfiguredLocal" && (
-          <Button variant="unstyled" size="unstyled"
-            type="button"
-            className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200"
-            title={isFavorite ? "Remove favorite" : "Favorite model"}
-            aria-label={isFavorite ? "Remove favorite" : "Favorite model"}
-            disabled={busy}
-            onClick={() => actions.setFavorite(slot.selection, !isFavorite)}
-          >
-            <Heart size={15} fill={isFavorite ? "currentColor" : "none"} />
-          </Button>
-        )}
-        {slot._tag !== "Unassigned" && (
-          <Button variant="unstyled" size="unstyled"
-            type="button"
-            className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
-            disabled={busy}
-            onClick={() => actions.clear(slotId)}
-          >
-            Clear
-          </Button>
-        )}
-      </div>
-      {failed && (
-        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger col-span-full">
-          <AlertTriangle size={14} />
-          The model action failed. The configured slot was not changed.
-        </div>
-      )}
-    </article>
+    model.acquisitionState.packages.find(
+      ({ packageId }) => packageId === targetPackageId
+    )?.path ?? null
   )
 }
-function TransferQueue({
-  models,
+
+function InstalledModelMenu({
+  model,
 }: {
-  readonly models: readonly LocalModel[]
+  readonly model: LocalModel
 }): ReactNode {
+  const platform = usePlatform()
   const actions = useLocalModelActions()
-  if (models.length === 0) return null
+  const [confirmingRemoval, setConfirmingRemoval] = useState(false)
+  const configurationId = Option.getOrNull(localModelConfigurationId(model))
+  const displayName = formatLocalModelDisplayName(model)
+  const installedPath = installedModelTargetPath(model)
+
   return (
-    <section
-      className="flex flex-col gap-3.5"
-      aria-labelledby="model-activity-title"
-    >
-      <div className="flex items-end justify-between gap-5 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-        <div>
-          <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
-            Activity
-          </span>
-          <h2 id="model-activity-title">Transfers and failures</h2>
-        </div>
-        <span className="min-w-6 text-right font-mono text-xs leading-[normal] font-semibold text-slate-500">
-          {models.length}
-        </span>
-      </div>
-      <div className="border-t border-slate-300 dark:border-slate-750">
-        {models.map((model) => {
-          const configurationId = Option.getOrNull(
-            localModelConfigurationId(model)
-          )
-          const transfer = modelTransfer(model)
-          const downloadId = modelDownloadId(model)
-          return (
-            <article
-              className="min-h-[88px] border-b border-slate-200 px-2.5 py-4 dark:border-slate-800"
-              key={modelKey(model)}
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={`Actions for ${displayName}`}
+            />
+          }
+        >
+          <EllipsisVertical aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuItem
+            disabled={installedPath === null || platform.id === "web"}
+            onClick={() => {
+              if (installedPath !== null) platform.showItemInFolder(installedPath)
+            }}
+          >
+            <FolderOpen aria-hidden="true" />
+            Reveal in Finder
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            variant="destructive"
+            disabled={configurationId === null}
+            onClick={() => setConfirmingRemoval(true)}
+          >
+            <Trash2 aria-hidden="true" />
+            Remove Model
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <AlertDialog open={confirmingRemoval} onOpenChange={setConfirmingRemoval}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove {displayName}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This deletes the downloaded model files from this computer.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              type="button"
+              variant="destructive"
+              onClick={() => {
+                if (configurationId === null) return
+                actions.delete(configurationId)
+                setConfirmingRemoval(false)
+              }}
             >
-              <div className="mb-3 flex min-w-0 items-center justify-between gap-4">
-                <strong className="min-w-0 truncate font-sans text-[13px] font-semibold leading-4 text-slate-900 dark:text-slate-200">
-                  {formatLocalModelDisplayName(model)}
-                </strong>
-                <div className="flex shrink-0 items-center gap-1.5">
-                  {transfer && downloadId && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-                      onClick={() => actions.cancel(downloadId)}
-                    >
-                      <X size={14} /> Cancel
-                    </Button>
-                  )}
-                  {!transfer && configurationId && (
-                    <Button variant="unstyled" size="unstyled"
-                      type="button"
-                      className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
-                      onClick={() => actions.install(configurationId)}
-                    >
-                      Retry
-                    </Button>
-                  )}
-                  {!transfer && downloadId && (
-                    <Button variant="unstyled" size="unstyled"
-                      type="button"
-                      className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-transparent text-slate-600 dark:text-slate-400 !px-1 hover:text-slate-900 dark:hover:text-slate-200"
-                      onClick={() => actions.dismissFailure(downloadId)}
-                    >
-                      Dismiss
-                    </Button>
-                  )}
-                </div>
-              </div>
-              <div className="min-w-0">
-                {transfer ? (
-                  <ModelTransferProgress
-                    transfer={transfer}
-                    ariaLabel={`${formatLocalModelDisplayName(model)} transfer progress`}
-                  />
-                ) : (
-                  <div className="flex items-center gap-1.5 text-[12px] text-red-600 dark:text-red-400">
-                    <AlertTriangle size={14} aria-hidden="true" />
-                    <span>{modelFailure(model)}</span>
-                  </div>
-                )}
-              </div>
-            </article>
-          )
-        })}
-      </div>
-    </section>
+              Remove Model
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }
+
 function InstalledLibrary({
   models,
 }: {
   readonly models: readonly LocalModel[]
 }): ReactNode {
-  const actions = useLocalModelActions()
+  const [query, setQuery] = useState("")
+  const normalizedQuery = query.trim().toLowerCase()
+  const filteredModels = normalizedQuery
+    ? models.filter((model) =>
+        formatLocalModelDisplayName(model)
+          .toLowerCase()
+          .includes(normalizedQuery)
+      )
+    : models
+
   return (
     <section
-      className="flex flex-col gap-3.5"
+      className="flex flex-col gap-5"
       aria-labelledby="installed-models-title"
     >
-      <div className="flex items-end justify-between gap-5 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-        <div>
-          <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
-            Local library
+      <div className="flex items-center justify-between gap-5 max-[640px]:items-start max-[640px]:flex-col">
+        <h2
+          id="installed-models-title"
+          className="font-heading text-[22px] leading-tight tracking-[-.02em] text-slate-900 dark:text-slate-100"
+        >
+          Installed models
+        </h2>
+        <div className="flex w-full max-w-[390px] items-center justify-end gap-3">
+          <span className="shrink-0 font-sans text-xs tabular-nums text-slate-500">
+            {filteredModels.length} {filteredModels.length === 1 ? "model" : "models"}
           </span>
-          <h2 id="installed-models-title">Installed models</h2>
-          <p>Model files available on this machine.</p>
+          <div className="relative w-full max-w-[300px]">
+            <Search
+              size={15}
+              aria-hidden="true"
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500"
+            />
+            <Input
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+              placeholder="Search installed models"
+              aria-label="Search installed models"
+              className="pl-8"
+            />
+          </div>
         </div>
-        <span className="min-w-6 text-right font-mono text-xs leading-[normal] font-semibold text-slate-500">
-          {models.length}
-        </span>
       </div>
       {models.length === 0 ? (
         <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
           No models are installed yet. Open Catalog to choose one for this
           machine.
         </div>
+      ) : filteredModels.length === 0 ? (
+        <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 p-[26px] text-center text-[13px] text-slate-500">
+          No installed models match “{query.trim()}”.
+        </div>
       ) : (
         <div
-          className="border-t border-slate-300 dark:border-slate-750"
+          className="overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850"
           role="list"
         >
-          {models.map((model) => {
-            const configurationId = Option.getOrNull(
-              localModelConfigurationId(model)
-            )
+          {filteredModels.map((model) => {
+            const displayName = formatLocalModelDisplayName(model)
             const context = modelContextLength(model)
             const installedBytes =
               model.acquisitionState._tag === "Installed"
@@ -655,56 +484,38 @@ function InstalledLibrary({
                 : model.downloadBytes
             return (
               <article
-                className="grid min-h-[78px] grid-cols-[auto_minmax(210px,1fr)_minmax(300px,.8fr)_auto] items-center gap-3.5 border-b border-slate-200 dark:border-slate-800 px-2.5 py-[13px] text-slate-500 max-[1050px]:grid-cols-[auto_minmax(180px,1fr)_minmax(250px,.9fr)_auto] max-[840px]:grid-cols-[auto_minmax(0,1fr)_auto]"
+                className="grid min-h-[82px] grid-cols-[auto_minmax(240px,1fr)_minmax(190px,.45fr)_auto] items-center gap-4 border-b border-slate-200 px-4 py-3.5 text-slate-500 last:border-b-0 dark:border-slate-800 max-[820px]:grid-cols-[auto_minmax(0,1fr)_auto]"
                 role="listitem"
                 key={modelKey(model)}
               >
                 <PackageOpen size={17} aria-hidden="true" />
-                <div className="flex min-w-0 flex-col gap-[3px] [&_strong]:text-slate-900 dark:[&_strong]:text-slate-200 [&_strong]:text-[13px] [&_span]:overflow-hidden [&_span]:text-ellipsis [&_span]:whitespace-nowrap [&_span]:text-slate-500 [&_span]:text-[11px]">
-                  <strong>{formatLocalModelDisplayName(model)}</strong>
-                  <span>{model.presentation.description}</span>
+                <div className="flex min-w-0 flex-col gap-[3px]">
+                  <strong className="break-words text-[13px] font-semibold text-slate-900 dark:text-slate-200">
+                    {displayName}
+                  </strong>
+                  <span className="overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-slate-500">
+                    {model.presentation.description}
+                  </span>
                 </div>
-                <dl className="grid grid-cols-3 gap-4 [&_div]:min-w-0 [&_dt]:text-[9px] [&_dt]:tracking-[.06em] [&_dt]:uppercase [&_dt]:text-slate-500 [&_dd]:overflow-hidden [&_dd]:text-ellipsis [&_dd]:whitespace-nowrap [&_dd]:text-[11px] [&_dd]:text-slate-600 dark:[&_dd]:text-slate-400 max-[840px]:col-start-2 max-[620px]:grid-cols-2 max-[620px]:[&>div:last-child]:hidden">
-                  <div>
-                    <dt>Context</dt>
-                    <dd>
+                <dl className="grid grid-cols-2 gap-5 max-[820px]:col-start-2">
+                  <div className="min-w-0">
+                    <dt className="text-[9px] uppercase tracking-[.06em] text-slate-500">
+                      Context
+                    </dt>
+                    <dd className="whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400">
                       {context === null ? "Pending" : formatContext(context)}
                     </dd>
                   </div>
-                  <div>
-                    <dt>Storage</dt>
-                    <dd>{formatBytes(installedBytes)}</dd>
-                  </div>
-                  <div>
-                    <dt>License</dt>
-                    <dd>
-                      {Option.getOrElse(
-                        model.presentation.license,
-                        () => "Unknown"
-                      )}
+                  <div className="min-w-0">
+                    <dt className="text-[9px] uppercase tracking-[.06em] text-slate-500">
+                      Storage
+                    </dt>
+                    <dd className="whitespace-nowrap text-[11px] tabular-nums text-slate-600 dark:text-slate-400">
+                      {formatBytes(installedBytes)}
                     </dd>
                   </div>
                 </dl>
-                <Button variant="unstyled" size="unstyled"
-                  type="button"
-                  className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 !border-transparent !text-slate-500 enabled:hover:!border-red-400 enabled:hover:!text-red-600 dark:enabled:hover:!border-red-700 dark:enabled:hover:!text-red-400"
-                  title="Delete model files"
-                  aria-label={`Delete ${formatLocalModelDisplayName(
-                    model
-                  )} files`}
-                  disabled={configurationId === null}
-                  onClick={() =>
-                    configurationId &&
-                    window.confirm(
-                      `Delete ${formatLocalModelDisplayName(
-                        model
-                      )} from this computer?`
-                    ) &&
-                    actions.delete(configurationId)
-                  }
-                >
-                  <Trash2 size={14} />
-                </Button>
+                <InstalledModelMenu model={model} />
               </article>
             )
           })}
@@ -715,72 +526,37 @@ function InstalledLibrary({
 }
 function ModelsView(): ReactNode {
   const modelsResult = useLocalModels()
-  const slotsResult = useModelSlots()
   const models = valueOf(modelsResult)
-  const slots = valueOf(slotsResult)
+  const inventoryLoading = models?.inventoryState._tag === "Initializing"
   const installed =
     models?.models.filter(
       (model) => model.acquisitionState._tag === "Installed"
     ) ?? []
-  const selectableModels = models ? installedLocalModels(models) : []
-  const active =
-    models?.models.filter(
-      (model) =>
-        modelTransfer(model) !== null ||
-        model.acquisitionState._tag === "Failed" ||
-        model.upgradeState._tag === "Failed"
-    ) ?? []
   return (
     <div className="box-border mx-auto flex w-full max-w-[1240px] flex-col gap-[34px] px-[clamp(18px,4vw,48px)] pt-[34px] pb-[72px] max-[640px]:pt-16 max-[620px]:px-3.5">
-      <QueryNotice result={slotsResult} label="model slots" />
-      <QueryNotice result={modelsResult} label="local models" />
-      {slots && models && (
-        <section
-          className="flex flex-col gap-3.5"
-          aria-labelledby="runtime-title"
-        >
-          <div className="flex items-end justify-between gap-5 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-            <div>
-              <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
-                Runtime
-              </span>
-              <h2 id="runtime-title">Configured models</h2>
-              <p>
-                Select what each agent role uses and control local residency.
-              </p>
-            </div>
-            <div className="inline-flex items-center gap-1.5 text-slate-600 dark:text-slate-400 text-[11px]">
-              <Gauge size={15} />
-              {
-                [slots.slots.primary, slots.slots.secondary].filter(
-                  (slot) =>
-                    slot._tag === "ConfiguredLocal" &&
-                    slot.residency._tag === "Ready"
-                ).length
-              }{" "}
-              ready
-            </div>
-          </div>
-          <div className="border-t border-slate-300 dark:border-slate-750">
-            <RuntimeSlot
-              slot={slots.slots.primary}
-              label="Primary"
-              slotId={PRIMARY_SLOT_ID}
-              models={selectableModels}
-              slots={slots}
-            />
-            <RuntimeSlot
-              slot={slots.slots.secondary}
-              label="Secondary"
-              slotId={SECONDARY_SLOT_ID}
-              models={selectableModels}
-              slots={slots}
-            />
-          </div>
-        </section>
+      {models === null && !Result.isFailure(modelsResult) ? (
+        <LoadingNotice
+          title="Loading models"
+          description="Checking the models available on this computer."
+        />
+      ) : (
+        <QueryNotice result={modelsResult} label="models" />
       )}
-      <TransferQueue models={active} />
-      <InstalledLibrary models={installed} />
+      {models && inventoryLoading ? (
+        <LoadingNotice
+          title="Loading models"
+          description="Reading the models installed on this computer."
+        />
+      ) : null}
+      {models?.inventoryState._tag === "Degraded" ? (
+        <div className="danger flex items-center gap-2 rounded-[7px] border border-red-300 bg-white px-3 py-2.5 text-xs text-red-600 dark:border-red-700 dark:bg-slate-850 dark:text-red-400">
+          <AlertTriangle size={15} />
+          {models.inventoryState.failure.message}
+        </div>
+      ) : null}
+      {models && !inventoryLoading ? (
+        <InstalledLibrary models={installed} />
+      ) : null}
     </div>
   )
 }
@@ -1059,67 +835,72 @@ function CatalogView(): ReactNode {
   const discovery = catalog?.discoveryState ?? null
   return (
     <div className="box-border mx-auto flex w-full max-w-[1240px] flex-col gap-[34px] px-[clamp(18px,4vw,48px)] pt-[34px] pb-[72px] max-[640px]:pt-16 max-[620px]:px-3.5 !max-w-[1360px]">
-      <QueryNotice result={catalogResult} label="local catalog" />
+      {catalog === null && !Result.isFailure(catalogResult) ? (
+        <LoadingNotice
+          title="Loading catalog"
+          description="Checking the model catalog for this computer."
+        />
+      ) : (
+        <QueryNotice result={catalogResult} label="catalog" />
+      )}
       {modelActions.latestInstallationFailed && (
         <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
           <AlertTriangle size={14} />
           The latest model installation or update request failed.
         </div>
       )}
-      {discovery?._tag === "Loading" && (
-        <section className="flex items-center gap-3.5 rounded-lg border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 px-[18px] py-4 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-          <Loader2 className="animate-spin" size={20} />
-          <div>
-            <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
-              Local assessment
-            </span>
-            <h2>Preparing models for this machine</h2>
-            <p>Hardware detection and native assessment are running locally.</p>
-          </div>
-        </section>
-      )}
+      {discovery?._tag === "Loading" ? (
+        <LoadingNotice
+          title="Loading catalog"
+          description="Assessing local models for this computer."
+        />
+      ) : null}
       {discovery?._tag === "Failed" && (
         <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
           <AlertTriangle size={15} /> {discovery.failure.message}
         </div>
       )}
-      <div className="flex items-end justify-between gap-5 -mb-3.5 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-        <div>
-          <h2>Catalog</h2>
-          <p>Models assessed for this computer.</p>
-        </div>
-        <span className="min-w-6 text-right font-mono text-xs leading-[normal] font-semibold text-slate-500">
-          {candidates.length}
-        </span>
-      </div>
-      {candidates.length === 0 && discovery?._tag === "Ready" ? (
-        <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
-          No local catalog models are currently available.
-        </div>
-      ) : (
-        <div className="grid h-[calc(100vh-250px)] min-h-[500px] grid-cols-[minmax(330px,.72fr)_minmax(480px,1.28fr)] items-stretch gap-[22px] max-[1050px]:grid-cols-[minmax(280px,.8fr)_minmax(400px,1.2fr)] max-[1050px]:gap-3.5 max-[840px]:h-auto max-[840px]:min-h-0 max-[840px]:grid-cols-1">
-          <div
-            className="min-w-0 max-h-full overflow-y-auto border-t border-slate-300 dark:border-slate-750 max-[840px]:max-h-[360px] max-[840px]:overflow-auto"
-            role="group"
-            aria-label="Catalog models"
-          >
-            {candidates.map((candidate) => {
-              const key = modelKey(candidate.model)
-              return (
-                <CatalogCandidate
-                  key={key}
-                  view={candidate}
-                  selected={
-                    selected !== null && modelKey(selected.model) === key
-                  }
-                  onSelect={() => setSelectedKey(key)}
-                />
-              )
-            })}
+      {catalog && discovery?._tag !== "Loading" ? (
+        <>
+          <div className="flex items-end justify-between gap-5 -mb-3.5 [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
+            <div>
+              <h2>Catalog</h2>
+              <p>Models assessed for this computer.</p>
+            </div>
+            <span className="min-w-6 text-right font-mono text-xs leading-[normal] font-semibold text-slate-500">
+              {candidates.length}
+            </span>
           </div>
-          {selected && <CatalogInspector view={selected} />}
-        </div>
-      )}
+          {candidates.length === 0 && discovery?._tag === "Ready" ? (
+            <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
+              No local catalog models are currently available.
+            </div>
+          ) : candidates.length > 0 ? (
+            <div className="grid h-[calc(100vh-250px)] min-h-[500px] grid-cols-[minmax(330px,.72fr)_minmax(480px,1.28fr)] items-stretch gap-[22px] max-[1050px]:grid-cols-[minmax(280px,.8fr)_minmax(400px,1.2fr)] max-[1050px]:gap-3.5 max-[840px]:h-auto max-[840px]:min-h-0 max-[840px]:grid-cols-1">
+              <div
+                className="min-w-0 max-h-full overflow-y-auto border-t border-slate-300 dark:border-slate-750 max-[840px]:max-h-[360px] max-[840px]:overflow-auto"
+                role="group"
+                aria-label="Catalog models"
+              >
+                {candidates.map((candidate) => {
+                  const key = modelKey(candidate.model)
+                  return (
+                    <CatalogCandidate
+                      key={key}
+                      view={candidate}
+                      selected={
+                        selected !== null && modelKey(selected.model) === key
+                      }
+                      onSelect={() => setSelectedKey(key)}
+                    />
+                  )
+                })}
+              </div>
+              {selected && <CatalogInspector view={selected} />}
+            </div>
+          ) : null}
+        </>
+      ) : null}
     </div>
   )
 }

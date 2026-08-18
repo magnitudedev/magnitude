@@ -108,6 +108,7 @@ export {
   LocalInferenceHardwareMirror,
   LocalModelsMirror,
   servableModelBundlePackages,
+  servableModelBundleTargetPackageId,
   OnboardingMirror,
   ModelPackageIdSchema,
   CatalogModelIdSchema,

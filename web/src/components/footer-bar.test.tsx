@@ -15,7 +15,10 @@ describe("FooterBar", () => {
         model="Qwen Test (Q4)"
         thinkingLevel="High"
         memoryLabel="16 GB mem"
-        modelOptions={[{ value: selectedModelId, label: "Qwen Test (Q4)" }]}
+        modelOptionsState={{
+          _tag: "Ready",
+          options: [{ value: selectedModelId, label: "Qwen Test (Q4)" }],
+        }}
         selectedModelId={selectedModelId}
         onModelSelect={() => {}}
         thinkingOptions={[{ value: high, label: "High" }]}
@@ -50,7 +53,10 @@ describe("FooterBar", () => {
       <FooterBar
         context={null}
         model="Qwen Test"
-        modelOptions={[{ value: selectedModelId, label: "Qwen Test" }]}
+        modelOptionsState={{
+          _tag: "Ready",
+          options: [{ value: selectedModelId, label: "Qwen Test" }],
+        }}
         selectedModelId={selectedModelId}
         onModelSelect={() => {}}
       />
@@ -63,5 +69,69 @@ describe("FooterBar", () => {
     expect(html).not.toContain("shadow-")
     expect(html).not.toContain("hover:text-")
     expect(html).not.toContain("hover:underline")
+  })
+
+  it("keeps a selected model at full foreground while choices refresh", () => {
+    const html = renderToStaticMarkup(
+      <FooterBar
+        context={null}
+        model="Qwen Test"
+        modelOptionsState={{ _tag: "Loading", options: [] }}
+        selectedModelId={selectedModelId}
+        onModelSelect={() => {}}
+      />
+    )
+
+    expect(html).toContain("text-slate-900")
+    expect(html).toContain("dark:text-slate-50")
+    expect(html).toContain("data-placeholder:text-slate-900")
+    expect(html).toContain("dark:data-placeholder:text-slate-50")
+    expect(html).not.toContain(' disabled=""')
+    expect(html).not.toContain(' data-disabled=""')
+    expect(html).not.toContain(' data-placeholder=""')
+    expect(html).toContain('aria-busy="true"')
+  })
+
+  it("shows authoritative model loading before an initial selection is available", () => {
+    const html = renderToStaticMarkup(
+      <FooterBar
+        context={null}
+        model="Choose model"
+        modelOptionsState={{ _tag: "Loading", options: [] }}
+        selectedModelId={null}
+        onModelSelect={() => {}}
+      />
+    )
+
+    expect(html).toContain('aria-label="Model: Loading models…"')
+    expect(html).toContain('aria-busy="true"')
+    expect(html).toContain("animate-spin")
+    expect(html).not.toContain(' disabled=""')
+  })
+
+  it("distinguishes model loading failure from a loaded empty model list", () => {
+    const failed = renderToStaticMarkup(
+      <FooterBar
+        context={null}
+        model="Choose model"
+        modelOptionsState={{ _tag: "Failed", options: [] }}
+        selectedModelId={null}
+        onModelSelect={() => {}}
+      />
+    )
+    const empty = renderToStaticMarkup(
+      <FooterBar
+        context={null}
+        model="Choose model"
+        modelOptionsState={{ _tag: "Ready", options: [] }}
+        selectedModelId={null}
+        onModelSelect={() => {}}
+      />
+    )
+
+    expect(failed).toContain('aria-label="Model: Models unavailable"')
+    expect(failed).not.toContain('aria-busy="true"')
+    expect(empty).toContain('aria-label="Model: Choose model"')
+    expect(empty).toContain(' disabled=""')
   })
 })
