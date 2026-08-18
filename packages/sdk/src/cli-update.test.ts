@@ -3,7 +3,7 @@ import { BunContext } from "@effect/platform-bun"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect, Option } from "effect"
+import { Effect, Exit, Option, Scope } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   installMethodFromEnvironment,
@@ -16,6 +16,13 @@ import {
 import { currentHost } from "@magnitudedev/release"
 
 const roots: string[] = []
+
+const runScoped = <A, E>(
+  scope: Scope.CloseableScope,
+  effect: Effect.Effect<A, E, Scope.Scope>,
+) => Effect.runPromise(
+  effect.pipe(Effect.provideService(Scope.Scope, scope)),
+)
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) =>
@@ -110,6 +117,7 @@ describe("CLI updater", () => {
       },
     })
 
+    const scope = await Effect.runPromise(Scope.make())
     try {
       const updater = await Effect.runPromise(
         makeCliUpdater({
@@ -121,7 +129,7 @@ describe("CLI updater", () => {
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
 
-      expect(Option.isNone(await Effect.runPromise(updater.getUpgradeVersion)))
+      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
         .toBe(true)
 
       const cachePath = join(root, "version.json")
@@ -134,11 +142,11 @@ describe("CLI updater", () => {
       }).toBe(latestVersion)
 
       expect(Option.getOrNull(
-        await Effect.runPromise(updater.getUpgradeVersion),
+        await runScoped(scope, updater.getUpgradeVersion),
       )).toBe(latestVersion)
 
       await Effect.runPromise(updater.dismissVersion(latestVersion))
-      expect(Option.isNone(await Effect.runPromise(updater.getUpgradeVersion)))
+      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
         .toBe(true)
 
       await writeFile(cachePath, JSON.stringify({
@@ -146,7 +154,7 @@ describe("CLI updater", () => {
         lastCheckedAt: new Date(0).toISOString(),
       }))
       latestVersion = "0.0.1-alpha.36"
-      expect(Option.isNone(await Effect.runPromise(updater.getUpgradeVersion)))
+      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
         .toBe(true)
       await expect.poll(async () => {
         try {
@@ -156,9 +164,10 @@ describe("CLI updater", () => {
         }
       }).toBe(latestVersion)
       expect(Option.getOrNull(
-        await Effect.runPromise(updater.getUpgradeVersion),
+        await runScoped(scope, updater.getUpgradeVersion),
       )).toBe(latestVersion)
     } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
     }
   })
@@ -178,6 +187,7 @@ describe("CLI updater", () => {
       },
     })
 
+    const scope = await Effect.runPromise(Scope.make())
     try {
       const newerUpdater = await Effect.runPromise(
         makeCliUpdater({
@@ -189,7 +199,7 @@ describe("CLI updater", () => {
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
       expect(Option.isNone(
-        await Effect.runPromise(newerUpdater.getUpgradeVersion),
+        await runScoped(scope, newerUpdater.getUpgradeVersion),
       )).toBe(true)
       await expect.poll(() => releaseRequests).toBe(1)
 
@@ -203,9 +213,10 @@ describe("CLI updater", () => {
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
       expect(Option.isNone(
-        await Effect.runPromise(olderUpdater.getUpgradeVersion),
+        await runScoped(scope, olderUpdater.getUpgradeVersion),
       )).toBe(true)
     } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
     }
   })
@@ -226,6 +237,7 @@ describe("CLI updater", () => {
       },
     })
 
+    const scope = await Effect.runPromise(Scope.make())
     try {
       const updater = await Effect.runPromise(
         makeCliUpdater({
@@ -236,10 +248,11 @@ describe("CLI updater", () => {
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
       )
-      expect(Option.isNone(await Effect.runPromise(updater.getUpgradeVersion)))
+      expect(Option.isNone(await runScoped(scope, updater.getUpgradeVersion)))
         .toBe(true)
       expect(requests).toBe(0)
     } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
     }
   })

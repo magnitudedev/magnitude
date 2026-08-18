@@ -117,14 +117,14 @@ export const UpdatePrompt = memo(function UpdatePrompt({
           paddingRight: 2,
         }}
       >
-        <text style={{ fg: theme.foreground }}>
-          <span fg={theme.primary} attributes={TextAttributes.BOLD}>Update available! </span>
+        <text style={{ fg: theme.text.body }}>
+          <span fg={theme.accent} attributes={TextAttributes.BOLD}>Update available! </span>
           <span>{currentVersion}</span>
-          <span fg={theme.muted}> -&gt; </span>
+          <span fg={theme.text.supporting}> -&gt; </span>
           <span>{latestVersion}</span>
         </text>
         <box style={{ height: 1 }} />
-        <text style={{ fg: theme.muted }}>
+        <text style={{ fg: theme.text.supporting }}>
           Release notes:{" "}
           <span attributes={TextAttributes.UNDERLINE}>
             {updateReleaseNotesUrl(latestVersion)}
@@ -135,7 +135,7 @@ export const UpdatePrompt = memo(function UpdatePrompt({
           <text
             key={selection}
             style={{
-              fg: highlighted === selection ? theme.primary : theme.foreground,
+              fg: highlighted === selection ? theme.accent : theme.text.body,
             }}
             attributes={highlighted === selection
               ? TextAttributes.BOLD
@@ -146,7 +146,7 @@ export const UpdatePrompt = memo(function UpdatePrompt({
           </text>
         ))}
         <box style={{ height: 1 }} />
-        <text style={{ fg: theme.muted }}>Press Enter to continue</text>
+        <text style={{ fg: theme.text.supporting }}>Press Enter to continue</text>
       </box>
     </box>
   )
