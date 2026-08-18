@@ -1,13 +1,20 @@
 import {
+  LAUNCH_PROTOCOL_VERSION,
+  LAUNCH_PROTOCOL_VERSION_VARIABLE,
+  RELAUNCH_EXIT_CODE,
   updateCommandString,
   type UpdateAction,
 } from "@magnitudedev/release"
 import { Effect } from "effect"
 import type { CliUpdaterShape } from "./updater"
 
+const launcherSpeaksRelaunch = (): boolean =>
+  process.env[LAUNCH_PROTOCOL_VERSION_VARIABLE] === String(LAUNCH_PROTOCOL_VERSION)
+
 export const executeUpdate = (
   updater: CliUpdaterShape,
   action: UpdateAction,
+  options: { readonly relaunch: boolean } = { relaunch: false },
 ): Effect.Effect<void> => {
   const command = updateCommandString(action)
   return Effect.gen(function* () {
@@ -16,6 +23,11 @@ export const executeUpdate = (
     })
     yield* updater.runUpdate(action)
     yield* Effect.sync(() => {
+      if (options.relaunch && launcherSpeaksRelaunch()) {
+        // The launcher re-runs its pipeline and starts the new version.
+        process.exitCode = RELAUNCH_EXIT_CODE
+        return
+      }
       process.stdout.write("\nUpdate ran successfully. Please restart Magnitude.\n")
     })
   }).pipe(

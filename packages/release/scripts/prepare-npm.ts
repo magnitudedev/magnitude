@@ -3,7 +3,7 @@ import { appendFile, mkdir, readFile, rm } from "node:fs/promises"
 import { basename, resolve } from "node:path"
 import { run } from "./build/common"
 
-const PACKAGE_ROOT = resolve(import.meta.dir, "../../cli")
+const PACKAGE_ROOT = resolve(import.meta.dir, "../../launcher")
 const EXPECTED_FILES = [
   "package/README.md",
   "package/bin/magnitude.js",

@@ -10,25 +10,24 @@ import {
   PlatformProvider,
 } from "@magnitudedev/client-common"
 import type { UpdateAction } from "@magnitudedev/release"
+import type { AcnLifecycleState } from "@magnitudedev/sdk"
 import { CliApp, type CliAppProps } from "../app"
+import { AcnBootstrapScreen } from "../features/app-shell/acn-bootstrap"
 import {
   UpdatePrompt,
   type UpdatePromptOutcome,
 } from "../features/update/prompt"
-import { useTheme } from "../hooks/use-theme"
-
-export type CliStartupStage = "UpdateCheck" | "Platform" | "ClientPreflight"
 
 export type CliRootState =
   | {
-      readonly _tag: "Starting"
-      readonly stage: CliStartupStage
-    }
-  | {
-      readonly _tag: "UpdateAvailable"
+      readonly _tag: "UpdatePrompt"
       readonly currentVersion: string
       readonly latestVersion: string
       readonly action: UpdateAction
+    }
+  | {
+      readonly _tag: "DaemonStartup"
+      readonly lifecycle: AcnLifecycleState
     }
   | {
       readonly _tag: "Application"
@@ -37,30 +36,9 @@ export type CliRootState =
       readonly app: CliAppProps
     }
 
-export const makeCliRootStateAtom = (): Atom.Writable<CliRootState> =>
-  Atom.make<CliRootState>({ _tag: "Starting", stage: "UpdateCheck" })
-
-function StartingScreen({ stage }: { readonly stage: CliStartupStage }): ReactNode {
-  const theme = useTheme()
-  const detail = stage === "Platform"
-    ? "Starting local services…"
-    : stage === "ClientPreflight"
-      ? "Preparing your workspace…"
-      : "Starting Magnitude…"
-
-  return (
-    <box
-      style={{
-        width: "100%",
-        height: "100%",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-    >
-      <text style={{ fg: theme.text.supporting }}>{detail}</text>
-    </box>
-  )
-}
+export const makeCliRootStateAtom = (
+  initial: CliRootState,
+): Atom.Writable<CliRootState> => Atom.make<CliRootState>(initial)
 
 function ApplicationRoot({
   state,
@@ -81,22 +59,30 @@ function ApplicationRoot({
 export function CliStartupRoot({
   stateAtom,
   onUpdateSelect,
+  onDaemonRetry,
+  onDaemonQuit,
 }: {
   readonly stateAtom: Atom.Atom<CliRootState>
   readonly onUpdateSelect: (outcome: UpdatePromptOutcome) => void
+  readonly onDaemonRetry: () => void
+  readonly onDaemonQuit: () => void
 }): ReactNode {
   const state = useAtomValue(stateAtom)
 
   return (
     <box style={{ width: "100%", height: "100%" }}>
-      {state._tag === "Starting" ? (
-        <StartingScreen stage={state.stage} />
-      ) : state._tag === "UpdateAvailable" ? (
+      {state._tag === "UpdatePrompt" ? (
         <UpdatePrompt
           currentVersion={state.currentVersion}
           latestVersion={state.latestVersion}
           action={state.action}
           onSelect={onUpdateSelect}
+        />
+      ) : state._tag === "DaemonStartup" ? (
+        <AcnBootstrapScreen
+          state={state.lifecycle}
+          onRetry={onDaemonRetry}
+          onQuit={onDaemonQuit}
         />
       ) : (
         <ApplicationRoot state={state} />

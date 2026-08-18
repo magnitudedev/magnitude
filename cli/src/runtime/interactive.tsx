@@ -9,6 +9,8 @@ import {
   RegistryContext,
   scheduleTask,
 } from "@effect-atom/atom-react"
+import type * as FileSystem from "@effect/platform/FileSystem"
+import type * as Path from "@effect/platform/Path"
 import {
   createAgentClient,
   deriveCliExitNotice,
@@ -18,13 +20,16 @@ import {
 } from "@magnitudedev/client-common"
 import type { UpdateAction } from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
+import { acnInstallationPresent, SDK_ACN_TARGET } from "@magnitudedev/sdk"
 import {
   Array as Arr,
   Deferred,
   Effect,
   Option,
+  Runtime,
   Schema,
   Scope,
+  Stream,
 } from "effect"
 import type { SessionOptions } from "@magnitudedev/sdk"
 import type { CliAppProps, SessionStart } from "../app"
@@ -35,6 +40,8 @@ import { makeCliEffectLoggingLayer } from "../platform/effect-logger"
 import {
   detectTerminalAppearance,
   installTerminalAppearanceRuntime,
+  persistTerminalAppearance,
+  readPersistedTerminalAppearance,
 } from "../platform/terminal-appearance"
 import {
   makeTerminalPlatform,
@@ -46,6 +53,7 @@ import {
   type ProcessExitRequest,
 } from "../platform/process-exit"
 import { terminalAppearanceAtom } from "../hooks/use-theme"
+import { collectCliEnv } from "../utils/env"
 import type { UpdatePromptOutcome } from "../features/update/prompt"
 import { executeUpdate } from "../features/update/execute"
 import { CliUpdater, makeCliUpdater } from "../features/update/updater"
@@ -91,6 +99,12 @@ type ExitRace<A> =
   | { readonly _tag: "Value"; readonly value: A }
   | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
 
+interface RootCallbacks {
+  readonly onUpdateSelect: (outcome: UpdatePromptOutcome) => void
+  readonly onDaemonRetry: () => void
+  readonly onDaemonQuit: () => void
+}
+
 const acquireRegistry = Effect.acquireRelease(
   Effect.sync(() => Registry.make({
     scheduleTask,
@@ -129,22 +143,24 @@ const renderRoot = (
   root: Root,
   registry: ReturnType<typeof Registry.make>,
   stateAtom: Atom.Atom<CliRootState>,
-  onUpdateSelect: (outcome: UpdatePromptOutcome) => void,
+  callbacks: RootCallbacks,
 ): Effect.Effect<void> => Effect.sync(() => {
   root.render(
     <RegistryContext.Provider value={registry}>
       <CliStartupRoot
         stateAtom={stateAtom}
-        onUpdateSelect={onUpdateSelect}
+        onUpdateSelect={callbacks.onUpdateSelect}
+        onDaemonRetry={callbacks.onDaemonRetry}
+        onDaemonQuit={callbacks.onDaemonQuit}
       />
     </RegistryContext.Provider>,
   )
 })
 
-const raceExit = <A, R,>(
-  effect: Effect.Effect<A, never, R>,
+const raceExit = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
   exit: Effect.Effect<ProcessExitRequest>,
-): Effect.Effect<ExitRace<A>, never, R> => Effect.race(
+): Effect.Effect<ExitRace<A>, E, R> => Effect.race(
   effect.pipe(Effect.map((value): ExitRace<A> => ({ _tag: "Value", value }))),
   exit.pipe(Effect.map((request): ExitRace<A> => ({ _tag: "Exit", request }))),
 )
@@ -200,7 +216,7 @@ const runInteractiveSession = (
 ): Effect.Effect<
   InteractiveSessionResult,
   CliRendererAcquisitionFailed,
-  CliUpdater | Scope.Scope
+  CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
 > => Effect.gen(function* () {
   const updater = yield* CliUpdater
   const registry = yield* acquireRegistry
@@ -210,47 +226,128 @@ const runInteractiveSession = (
       registry.set(pushNotificationAtom, notification)
     },
   })
-  const renderer = yield* acquireRenderer
-  const appearance = yield* detectTerminalAppearance(renderer)
-  registry.set(terminalAppearanceAtom, appearance)
-  yield* installTerminalAppearanceRuntime(renderer, registry)
   const processExit = yield* makeProcessExitSource
-  const updateSelection = yield* Deferred.make<UpdatePromptOutcome>()
-  const stateAtom = makeCliRootStateAtom()
-  const root = yield* acquireRoot(renderer)
-  yield* renderRoot(
-    root,
-    registry,
-    stateAtom,
-    (outcome) => Deferred.unsafeDone(updateSelection, Effect.succeed(outcome)),
-  )
+  const runtime = yield* Effect.runtime<never>()
 
-  const shouldPromptForUpdate =
+  // The first frame never waits on appearance detection: paint with the last
+  // detected appearance, correct live once detection answers.
+  const persistedAppearance = yield* readPersistedTerminalAppearance
+  if (Option.isSome(persistedAppearance)) {
+    registry.set(terminalAppearanceAtom, persistedAppearance.value)
+  }
+
+  let updateSelectionHandler: (outcome: UpdatePromptOutcome) => void = () => {}
+  let daemonRetryHandler: () => void = () => {}
+  const callbacks: RootCallbacks = {
+    onUpdateSelect: (outcome) => { updateSelectionHandler(outcome) },
+    onDaemonRetry: () => { daemonRetryHandler() },
+    onDaemonQuit: () => { process.kill(process.pid, "SIGINT") },
+  }
+
+  // The renderer (and with it the alternate screen) is acquired at the first
+  // moment a state must render, never earlier; the root is created once.
+  const mountedAtom: { current: Atom.Writable<CliRootState> | null } = {
+    current: null,
+  }
+  const mountPresentation = (initial: CliRootState) => Effect.gen(function* () {
+    const renderer = yield* acquireRenderer
+    yield* installTerminalAppearanceRuntime(renderer, registry)
+    yield* Effect.forkScoped(detectTerminalAppearance(
+      renderer,
+      collectCliEnv(),
+      Option.getOrUndefined(persistedAppearance),
+    ).pipe(
+      Effect.tap((appearance) => Effect.sync(() => {
+        registry.set(terminalAppearanceAtom, appearance)
+      })),
+      Effect.flatMap(persistTerminalAppearance),
+    ))
+    const stateAtom = makeCliRootStateAtom(initial)
+    const root = yield* acquireRoot(renderer)
+    yield* renderRoot(root, registry, stateAtom, callbacks)
+    mountedAtom.current = stateAtom
+  })
+  const present = (
+    state: CliRootState,
+  ): Effect.Effect<
+    void,
+    CliRendererAcquisitionFailed,
+    FileSystem.FileSystem | Path.Path | Scope.Scope
+  > => Effect.suspend(() => {
+    const stateAtom = mountedAtom.current
+    return stateAtom !== null
+      ? Effect.sync(() => registry.set(stateAtom, state))
+      : mountPresentation(state)
+  })
+
+  // Update interaction happens only on plain interactive launches with a
+  // known package-manager action; discovery itself still runs and caches.
+  const promptAction: Option.Option<UpdateAction> =
     (options.initialPrompt?.length ?? 0) === 0
     && process.stdin.isTTY === true
     && process.stdout.isTTY === true
-  const upgradeVersion = shouldPromptForUpdate
-    ? yield* updater.getUpgradeVersion.pipe(Effect.provide(effectLoggingLayer))
-    : Option.none()
+      ? updater.updateAction
+      : Option.none()
+  const discovery = yield* updater.discover.pipe(Effect.provide(effectLoggingLayer))
+  let freshPending = true
+  const declinedVersions = new Set<string>()
+  const offerable = (latest: Option.Option<string>): Option.Option<string> =>
+    Option.filter(latest, (version) => !declinedVersions.has(version))
 
-  if (Option.isSome(upgradeVersion) && Option.isSome(updater.updateAction)) {
-    registry.set(stateAtom, {
-      _tag: "UpdateAvailable",
-      currentVersion: CLI_VERSION,
-      latestVersion: upgradeVersion.value,
-      action: updater.updateAction.value,
+  const presentUpdatePrompt = (latestVersion: string, action: UpdateAction) =>
+    Effect.gen(function* () {
+      const selection = yield* Deferred.make<UpdatePromptOutcome>()
+      updateSelectionHandler = (outcome) => {
+        Deferred.unsafeDone(selection, Effect.succeed(outcome))
+      }
+      yield* present({
+        _tag: "UpdatePrompt",
+        currentVersion: CLI_VERSION,
+        latestVersion,
+        action,
+      })
+      const selected = yield* raceExit(Deferred.await(selection), processExit.await)
+      if (selected._tag === "Exit") {
+        return { _tag: "Exit", request: selected.request } as const
+      }
+      if (selected.value._tag === "Dismiss") {
+        yield* updater.dismissVersion(latestVersion)
+      }
+      if (selected.value._tag === "Update") return { _tag: "Update" } as const
+      declinedVersions.add(latestVersion)
+      return { _tag: "Declined" } as const
     })
-    const selected = yield* raceExit(Deferred.await(updateSelection), processExit.await)
-    if (selected._tag === "Exit") return preApplicationExit(selected.request)
-    if (selected.value._tag === "Dismiss") {
-      yield* updater.dismissVersion(upgradeVersion.value)
-    }
-    if (selected.value._tag === "Update") {
-      return { _tag: "UpdateRequested", action: updater.updateAction.value }
+
+  if (Option.isSome(promptAction) && Option.isSome(discovery.known)) {
+    const resolution = yield* presentUpdatePrompt(
+      discovery.known.value,
+      promptAction.value,
+    )
+    if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
+    if (resolution._tag === "Update") {
+      return { _tag: "UpdateRequested", action: promptAction.value }
     }
   }
 
-  registry.set(stateAtom, { _tag: "Starting", stage: "Platform" })
+  // The installation gate: with no installed daemon build this launch is about
+  // to download one, so it awaits the version check first — an offer must
+  // prompt before any download of the version it would replace. Installation
+  // needs the network regardless, so the wait costs nothing real.
+  if (Option.isSome(promptAction)
+    && !(yield* acnInstallationPresent(SDK_ACN_TARGET.identity))) {
+    const answer = yield* raceExit(discovery.fresh, processExit.await)
+    if (answer._tag === "Exit") return preApplicationExit(answer.request)
+    freshPending = false
+    const offer = offerable(answer.value)
+    if (Option.isSome(offer)) {
+      const resolution = yield* presentUpdatePrompt(offer.value, promptAction.value)
+      if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
+      if (resolution._tag === "Update") {
+        return { _tag: "UpdateRequested", action: promptAction.value }
+      }
+    }
+  }
+
   const platformResult = yield* raceExit(
     makeTerminalPlatform({
       launchCommand: developmentLaunchCommand(options),
@@ -261,10 +358,76 @@ const runInteractiveSession = (
   )
   if (platformResult._tag === "Exit") return preApplicationExit(platformResult.request)
   const terminal = platformResult.value
+  daemonRetryHandler = () => {
+    Runtime.runFork(runtime)(terminal.platform.acnStartup.retry.pipe(Effect.ignore))
+  }
 
-  registry.set(stateAtom, { _tag: "Starting", stage: "ClientPreflight" })
-  const prepared = yield* raceExit(Effect.gen(function* () {
-    const initialAcnLifecycle = yield* terminal.platform.acnStartup.prepare
+  const prepared = yield* raceExit(
+    terminal.platform.acnStartup.prepare,
+    processExit.await,
+  )
+  if (prepared._tag === "Exit") return preApplicationExit(prepared.request)
+
+  if (prepared.value._tag !== "Ready") {
+    yield* present({ _tag: "DaemonStartup", lifecycle: prepared.value })
+
+    const driveToReady = terminal.platform.acnStartup.state.changes.pipe(
+      Stream.tap((state) => state._tag === "Ready"
+        ? Effect.void
+        : present({ _tag: "DaemonStartup", lifecycle: state })),
+      Stream.filter((state) => state._tag === "Ready"),
+      Stream.runHead,
+      Effect.asVoid,
+    )
+
+    type DaemonWaitOutcome =
+      | { readonly _tag: "Ready" }
+      | { readonly _tag: "FreshAnswer"; readonly latest: Option.Option<string> }
+      | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
+
+    // The daemon work races the discovery answer: an offer arriving before the
+    // app commits presents the prompt, and daemon work continues behind it —
+    // declining loses nothing, accepting interrupts old-version work by
+    // closing the scope.
+    let starting = true
+    while (starting) {
+      const waiters: Array<Effect.Effect<
+        DaemonWaitOutcome,
+        CliRendererAcquisitionFailed,
+        FileSystem.FileSystem | Path.Path | Scope.Scope
+      >> = [
+        driveToReady.pipe(Effect.map((): DaemonWaitOutcome => ({ _tag: "Ready" }))),
+        processExit.await.pipe(Effect.map(
+          (request): DaemonWaitOutcome => ({ _tag: "Exit", request }),
+        )),
+      ]
+      if (Option.isSome(promptAction) && freshPending) {
+        waiters.push(discovery.fresh.pipe(Effect.map(
+          (latest): DaemonWaitOutcome => ({ _tag: "FreshAnswer", latest }),
+        )))
+      }
+      const outcome = yield* Effect.raceAll(waiters)
+      if (outcome._tag === "Exit") return preApplicationExit(outcome.request)
+      if (outcome._tag === "Ready") {
+        starting = false
+        continue
+      }
+      freshPending = false
+      const offer = offerable(outcome.latest)
+      if (Option.isNone(offer) || Option.isNone(promptAction)) continue
+      const resolution = yield* presentUpdatePrompt(offer.value, promptAction.value)
+      if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
+      if (resolution._tag === "Update") {
+        return { _tag: "UpdateRequested", action: promptAction.value }
+      }
+      yield* present({
+        _tag: "DaemonStartup",
+        lifecycle: yield* terminal.platform.acnStartup.state.get,
+      })
+    }
+  }
+
+  const connected = yield* raceExit(Effect.gen(function* () {
     const agentClient = createAgentClient(terminal.platform.protocolLayer, {
       onboardingSetupInitiallyOpen: options.setup,
     })
@@ -272,24 +435,42 @@ const runInteractiveSession = (
       registry,
       onboardingModelSetupViewAtom(agentClient),
     ))
-    return { initialAcnLifecycle, agentClient }
+    return agentClient
   }), processExit.await)
-  if (prepared._tag === "Exit") return preApplicationExit(prepared.request)
+  if (connected._tag === "Exit") return preApplicationExit(connected.request)
 
   const app: CliAppProps = {
     sessionStart: options.sessionStart,
     initialPrompt: options.initialPrompt,
     goal: options.goal,
     envAuth: options.envAuth,
-    initialAcnLifecycle: prepared.value.initialAcnLifecycle,
+    initialAcnLifecycle: yield* terminal.platform.acnStartup.state.get,
     sessionOptions: options.sessionOptions,
   }
-  registry.set(stateAtom, {
+  yield* present({
     _tag: "Application",
     platform: terminal.platform,
-    agentClient: prepared.value.agentClient,
+    agentClient: connected.value,
     app,
   })
+
+  // A discovery answer arriving after the app committed surfaces as one
+  // notification line; the prompt would interrupt real work now.
+  if (Option.isSome(promptAction) && freshPending) {
+    yield* Effect.forkScoped(discovery.fresh.pipe(
+      Effect.flatMap((latest) => Option.match(offerable(latest), {
+        onNone: () => Effect.void,
+        onSome: (version) => Effect.sync(() => {
+          registry.set(pushNotificationAtom, {
+            message: `Update available: ${version} — restart or run \`magnitude update\``,
+            priority: "notice",
+            action: Option.none(),
+            dismissAfterMilliseconds: 30_000,
+          })
+        }),
+      })),
+    ))
+  }
 
   const request = yield* processExit.await
   return yield* closeApplication(terminal, request)
@@ -324,7 +505,7 @@ export const runInteractiveCommand = (
     Effect.provideService(CliUpdater, updater),
   ))
   if (result._tag === "UpdateRequested") {
-    yield* executeUpdate(updater, result.action)
+    yield* executeUpdate(updater, result.action, { relaunch: true })
   } else {
     yield* writeSessionResult(result)
   }

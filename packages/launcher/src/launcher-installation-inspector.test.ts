@@ -20,7 +20,7 @@ afterEach(async () => {
   ))
 })
 
-const makeLayout = async (pnpmLayout: boolean) => {
+const makeLayout = async (owner: "none" | "pnpm" | "bun") => {
   const root = await mkdtemp(join(tmpdir(), "magnitude-inspector-"))
   roots.push(root)
   const nodeModules = join(root, "node_modules")
@@ -32,7 +32,8 @@ const makeLayout = async (pnpmLayout: boolean) => {
     JSON.stringify({ name: "@magnitudedev/cli", version: "1.2.3" }),
   )
   await writeFile(join(binDirectory, "magnitude.js"), "")
-  if (pnpmLayout) await writeFile(join(nodeModules, ".modules.yaml"), "")
+  if (owner === "pnpm") await writeFile(join(nodeModules, ".modules.yaml"), "")
+  if (owner === "bun") await writeFile(join(root, "bun.lock"), "")
   return { packageRoot, entrypoint: join(binDirectory, "magnitude.js") }
 }
 
@@ -48,48 +49,31 @@ const inspect = (config: LauncherInstallationInspectorConfig) =>
 
 describe("LauncherInstallationInspector", () => {
   it("reads the package root and version", async () => {
-    const { packageRoot, entrypoint } = await makeLayout(false)
-    const installation = await inspect({ entrypoint, environment: {} })
+    const { packageRoot, entrypoint } = await makeLayout("none")
+    const installation = await inspect({ entrypoint })
     expect(installation.root).toBe(realpathSync(packageRoot))
     expect(installation.version).toBe("1.2.3")
   })
 
-  it("detects npm, bun, and pnpm ownership", async () => {
-    const npm = await makeLayout(false)
-    expect((await inspect({
-      entrypoint: npm.entrypoint,
-      environment: { npm_config_user_agent: "npm/11.0.0 node/v24" },
-    })).packageManager).toEqual(Option.some("npm"))
+  it("detects ownership from filesystem markers only", async () => {
+    const pnpm = await makeLayout("pnpm")
+    expect((await inspect({ entrypoint: pnpm.entrypoint })).packageManager)
+      .toEqual(Option.some("pnpm"))
 
-    const bunAgent = await makeLayout(false)
-    expect((await inspect({
-      entrypoint: bunAgent.entrypoint,
-      environment: { npm_config_user_agent: "bun/1.3.0 npm/?" },
-    })).packageManager).toEqual(Option.some("bun"))
+    const bun = await makeLayout("bun")
+    expect((await inspect({ entrypoint: bun.entrypoint })).packageManager)
+      .toEqual(Option.some("bun"))
 
-    const bunExec = await makeLayout(false)
-    expect((await inspect({
-      entrypoint: bunExec.entrypoint,
-      environment: { npm_execpath: "/home/user/.bun/bin/bun" },
-    })).packageManager).toEqual(Option.some("bun"))
-
-    const pnpm = await makeLayout(true)
-    expect((await inspect({
-      entrypoint: pnpm.entrypoint,
-      environment: { npm_config_user_agent: "npm/11.0.0 node/v24" },
-    })).packageManager).toEqual(Option.some("pnpm"))
-
-    const unknown = await makeLayout(false)
-    expect((await inspect({
-      entrypoint: unknown.entrypoint,
-      environment: {},
-    })).packageManager).toEqual(Option.none())
+    // npm leaves no marker in a global tree; no positive evidence means no
+    // claim here, and the spawner's default carries npm.
+    const unmarked = await makeLayout("none")
+    expect((await inspect({ entrypoint: unmarked.entrypoint })).packageManager)
+      .toEqual(Option.none())
   })
 
   it("fails with LauncherPackageNotFound for a missing entrypoint", async () => {
     await expect(inspect({
       entrypoint: "/nonexistent/bin/magnitude.js",
-      environment: {},
     })).rejects.toThrow("unreadable")
   })
 })

@@ -24,17 +24,15 @@ import {
   type InstallMethod,
   type UpdateAction,
 } from "@magnitudedev/release"
-import { Clock, Context, Effect, Option, Schema, Scope, Stream } from "effect"
+import { Context, Deferred, Effect, Option, Schema, Scope, Stream } from "effect"
 import semver from "semver"
 
 const NPM_PACKAGE_URL =
   "https://registry.npmjs.org/-/package/@magnitudedev%2Fcli/dist-tags"
 const NPM_RESPONSE_LIMIT = 64 * 1_024
-const UPDATE_CACHE_TTL_MS = 20 * 60 * 60 * 1_000
 
 export const UpdateVersionInfoSchema = Schema.Struct({
   latestVersion: Schema.String,
-  lastCheckedAt: Schema.String,
 })
 export type UpdateVersionInfo = typeof UpdateVersionInfoSchema.Type
 
@@ -72,10 +70,21 @@ export interface CliUpdaterOptions {
   readonly releaseBaseUrl?: string
 }
 
+export interface UpdateDiscovery {
+  /** The last known answer, available without the network. */
+  readonly known: Option.Option<string>
+  /**
+   * Resolves when this launch's check completes, with the freshest available
+   * answer (the known answer when the check fails). Never fails; hangs only
+   * if the discovery scope closes first, so consumers race or fork it.
+   */
+  readonly fresh: Effect.Effect<Option.Option<string>>
+}
+
 export interface CliUpdaterShape {
   readonly installMethod: InstallMethod
   readonly updateAction: Option.Option<UpdateAction>
-  readonly getUpgradeVersion: Effect.Effect<Option.Option<string>, never, Scope.Scope>
+  readonly discover: Effect.Effect<UpdateDiscovery, never, Scope.Scope>
   readonly dismissVersion: (version: string) => Effect.Effect<void>
   readonly runUpdate: (action: UpdateAction) => Effect.Effect<void, UpdateCommandFailed>
 }
@@ -96,7 +105,7 @@ export const isNewerVersion = (
   && semver.gt(candidate, current)
 
 export const updateReleaseNotesUrl = (version: string): string =>
-  `https://github.com/magnitudedev/magnitude/releases/tag/${encodeURIComponent(releaseTag(version))}`
+  `https://github.com/magnitudedev/magnitude/releases/tag/${releaseTag(version)}`
 
 export const makeCliUpdater = (
   options: CliUpdaterOptions,
@@ -258,23 +267,32 @@ export const makeCliUpdater = (
   const refresh = Effect.gen(function* () {
     const latestVersion = yield* fetchLatestVersion
     yield* verifyNativeRelease(latestVersion)
-    const now = yield* Clock.currentTimeMillis
-    yield* writeVersionInfo({
-      latestVersion,
-      lastCheckedAt: new Date(now).toISOString(),
-    })
+    yield* writeVersionInfo({ latestVersion })
+    return Option.some(latestVersion)
   }).pipe(
     Effect.catchAll((error) => Effect.logDebug(
       `Failed to refresh Magnitude update information: ${String(error)}`,
-    )),
+    ).pipe(Effect.as(Option.none<string>()))),
   )
 
-  const getUpgradeVersion = Effect.gen(function* () {
+  const offerable = (
+    latest: Option.Option<string>,
+    dismissal: Option.Option<UpdateDismissal>,
+  ): Option.Option<string> => Option.filter(latest, (version) =>
+    isNewerVersion(version, options.currentVersion)
+    && !Option.exists(dismissal, (dismissed) => dismissed.version === version))
+
+  const discover = Effect.gen(function* () {
     if (
       options.developmentBuild === true
       || isDevelopmentVersion(options.currentVersion)
       || Option.isNone(updateAction)
-    ) return Option.none()
+    ) {
+      return {
+        known: Option.none<string>(),
+        fresh: Effect.succeed(Option.none<string>()),
+      }
+    }
 
     const config = yield* configStorage.load().pipe(
       Effect.catchAll(() => Effect.succeed({
@@ -282,26 +300,26 @@ export const makeCliUpdater = (
       })),
     )
     if (Option.contains(config.checkForUpdateOnStartup, false)) {
-      return Option.none()
+      return {
+        known: Option.none<string>(),
+        fresh: Effect.succeed(Option.none<string>()),
+      }
     }
 
-    const info = yield* readVersionInfo
-    const now = yield* Clock.currentTimeMillis
-    const stale = Option.match(info, {
-      onNone: () => true,
-      onSome: ({ lastCheckedAt }) => {
-        const checkedAt = Date.parse(lastCheckedAt)
-        return !Number.isFinite(checkedAt)
-          || checkedAt < now - UPDATE_CACHE_TTL_MS
-      },
-    })
-    if (stale) yield* Effect.forkScoped(refresh)
-
     const dismissal = yield* readDismissal
-    return Option.filter(info, ({ latestVersion }) =>
-      isNewerVersion(latestVersion, options.currentVersion)
-      && !Option.exists(dismissal, ({ version }) => version === latestVersion),
-    ).pipe(Option.map(({ latestVersion }) => latestVersion))
+    const known = offerable(
+      Option.map(yield* readVersionInfo, (info) => info.latestVersion),
+      dismissal,
+    )
+    const outcome = yield* Deferred.make<Option.Option<string>>()
+    yield* Effect.forkScoped(refresh.pipe(
+      Effect.map((latest) => Option.orElse(
+        offerable(latest, dismissal),
+        () => known,
+      )),
+      Effect.flatMap((answer) => Deferred.succeed(outcome, answer)),
+    ))
+    return { known, fresh: Deferred.await(outcome) }
   })
 
   const dismissVersion = (version: string) => writeDismissal({ version })
@@ -330,7 +348,7 @@ export const makeCliUpdater = (
   return CliUpdater.of({
     installMethod,
     updateAction,
-    getUpgradeVersion,
+    discover,
     dismissVersion,
     runUpdate,
   })

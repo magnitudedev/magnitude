@@ -214,7 +214,7 @@ export type * from "@magnitudedev/acn-protocol"
 export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS } from "@magnitudedev/roles"
 export type { RoleId } from "@magnitudedev/roles"
 
-export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
+export { acnInstallationPresent, resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
 export { SDK_VERSION, SDK_REVISION, SDK_ACN_TARGET } from "./version"
 export {
   AcnAdministrationFailed,

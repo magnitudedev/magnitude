@@ -1,11 +1,18 @@
 import { Registry } from "@effect-atom/atom-react"
+import * as FileSystem from "@effect/platform/FileSystem"
+import * as Path from "@effect/platform/Path"
 import {
   CliRenderEvents,
   type CliRenderer,
   type TerminalColors,
   type ThemeMode as OpenTuiThemeMode,
 } from "@opentui/core"
-import { Chunk, Effect, Queue, Runtime, Scope } from "effect"
+import {
+  defaultGlobalStorageRoot,
+  readStructuredFile,
+  writeStructuredFileAtomic,
+} from "@magnitudedev/storage"
+import { Chunk, Effect, Option, Queue, Runtime, Schema, Scope } from "effect"
 import { terminalAppearanceAtom } from "../hooks/use-theme"
 import type { CliEnv } from "../types/env"
 import type { TerminalAppearance, ThemeMode } from "../types/theme-system"
@@ -68,6 +75,46 @@ export const detectTerminalAppearance = (
 const sameAppearance = (left: TerminalAppearance, right: TerminalAppearance): boolean =>
   left.mode === right.mode
   && left.defaultBackground === right.defaultBackground
+
+/**
+ * The last detected appearance, persisted across runs so the first frame never
+ * waits on detection: paint with the last answer, correct live if detection
+ * disagrees.
+ */
+const TerminalAppearanceSchema = Schema.Struct({
+  mode: Schema.Literal("dark", "light"),
+  defaultBackground: Schema.NullOr(Schema.String),
+})
+
+const persistedAppearancePath = (path: Path.Path): string =>
+  path.join(defaultGlobalStorageRoot(), "appearance.json")
+
+export const readPersistedTerminalAppearance: Effect.Effect<
+  Option.Option<TerminalAppearance>,
+  never,
+  FileSystem.FileSystem | Path.Path
+> = Path.Path.pipe(
+  Effect.flatMap((path) => readStructuredFile(
+    persistedAppearancePath(path),
+    TerminalAppearanceSchema,
+  )),
+  Effect.map((result) => result._tag === "Present"
+    ? Option.some<TerminalAppearance>(result.value)
+    : Option.none<TerminalAppearance>()),
+  Effect.catchAll(() => Effect.succeed(Option.none<TerminalAppearance>())),
+)
+
+export const persistTerminalAppearance = (
+  appearance: TerminalAppearance,
+): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> => Path.Path.pipe(
+  Effect.flatMap((path) => writeStructuredFileAtomic(
+    persistedAppearancePath(path),
+    TerminalAppearanceSchema,
+    appearance,
+    { mode: 0o600 },
+  )),
+  Effect.catchAll(() => Effect.void),
+)
 
 export const installTerminalAppearanceRuntime = (
   renderer: CliRenderer,

@@ -11,6 +11,18 @@ import { Option, Schema } from "effect"
 export const MANAGED_BY_VARIABLE = "MAGNITUDE_MANAGED_BY"
 export const MANAGED_PACKAGE_ROOT_VARIABLE = "MAGNITUDE_MANAGED_PACKAGE_ROOT"
 
+/**
+ * The launcher↔CLI relaunch handshake. The launcher declares the protocol
+ * version it speaks; after a successful update the CLI exits with the relaunch
+ * code only on an exact version match, and the launcher then re-runs its
+ * pipeline once. Mismatch or absence degrades to the manual-restart message by
+ * definition.
+ */
+export const LAUNCH_PROTOCOL_VERSION_VARIABLE = "MAGNITUDE_LAUNCH_PROTOCOL_VERSION"
+export const LAUNCH_PROTOCOL_VERSION = 1
+/** BSD EX_TEMPFAIL: the installation changed under this launcher; run again. */
+export const RELAUNCH_EXIT_CODE = 75
+
 export const PackageManagerSchema = Schema.Literal("npm", "bun", "pnpm")
 export type PackageManager = typeof PackageManagerSchema.Type
 

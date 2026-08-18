@@ -30,7 +30,6 @@ export class LauncherInstallationInspector extends Context.Tag(
 export interface LauncherInstallationInspectorConfig {
   /** The launcher entrypoint path as invoked (process.argv[1]), un-realpathed. */
   readonly entrypoint: string
-  readonly environment: Readonly<Record<string, string | undefined>>
 }
 
 const PackageManifestSchema = Schema.parseJson(Schema.Struct({
@@ -61,6 +60,26 @@ export const launcherInstallationInspectorLayer = (
       )
     })
 
+  // Detection reads only the filesystem — environment hints (user agent,
+  // npm_execpath) describe whichever tool spawned this process, not whichever
+  // one owns the installation, and any process launched from a package
+  // manager's script context inherits them. pnpm and bun both leave positive
+  // markers; npm leaves none in a global tree (verified: `npm install -g`
+  // writes only the package directory), so with pnpm and bun ruled out no
+  // evidence remains and the spawner's npm default carries the claim.
+  const isBunOwnedInstall = (root: string) =>
+    Effect.gen(function* () {
+      const nodeModules = path.dirname(path.dirname(root))
+      if (path.basename(nodeModules) !== "node_modules") return false
+      const owner = path.dirname(nodeModules)
+      for (const lockfile of ["bun.lock", "bun.lockb"]) {
+        if (yield* fs.exists(path.join(owner, lockfile)).pipe(
+          Effect.orElseSucceed(() => false),
+        )) return true
+      }
+      return false
+    })
+
   const detectPackageManager = (root: string) =>
     Effect.gen(function* () {
       const entrypointDirectory = path.dirname(path.resolve(config.entrypoint))
@@ -78,20 +97,9 @@ export const launcherInstallationInspectorLayer = (
         }
       }
 
-      const userAgent = config.environment.npm_config_user_agent || ""
-      if (/\bbun\//.test(userAgent)) return Option.some<PackageManager>("bun")
+      if (yield* isBunOwnedInstall(root)) return Option.some<PackageManager>("bun")
 
-      const execPath = config.environment.npm_execpath || ""
-      if (execPath.includes("bun")) return Option.some<PackageManager>("bun")
-
-      if (
-        root.includes(".bun/install/global") ||
-        root.includes(".bun\\install\\global")
-      ) return Option.some<PackageManager>("bun")
-
-      return userAgent
-        ? Option.some<PackageManager>("npm")
-        : Option.none<PackageManager>()
+      return Option.none<PackageManager>()
     })
 
   const inspect = Effect.gen(function* () {

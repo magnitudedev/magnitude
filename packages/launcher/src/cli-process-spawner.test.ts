@@ -23,6 +23,7 @@ require("node:fs").writeFileSync(process.env.TEST_SPAWN_OUTPUT, JSON.stringify({
   args: process.argv.slice(2),
   managedBy: process.env.MAGNITUDE_MANAGED_BY,
   packageRoot: process.env.MAGNITUDE_MANAGED_PACKAGE_ROOT,
+  launchProtocolVersion: process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION,
   path: process.env.PATH,
 }))
 process.exit(Number(process.env.TEST_SPAWN_EXIT ?? "0"))
@@ -78,6 +79,11 @@ describe("CliProcessSpawner", () => {
     expect(report.managedBy).toBe("pnpm")
     expect(report.packageRoot).toBe("/installed/launcher")
     expect(report.path).toBe(process.env.PATH)
+  })
+
+  it("declares the launch protocol version it speaks", async () => {
+    const { report } = await spawnWith({ packageManager: Option.some("npm") })
+    expect(report.launchProtocolVersion).toBe("1")
   })
 
   it("claims npm when no package manager was detected", async () => {
