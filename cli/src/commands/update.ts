@@ -1,7 +1,7 @@
 import type { Command } from "@commander-js/extra-typings"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { makeCliUpdater } from "@magnitudedev/sdk"
+import { makeCliUpdater } from "../features/update/updater"
 import { Effect, Option } from "effect"
 import { executeUpdate } from "../features/update/execute"
 import { isDevelopmentBuild } from "../runtime/environment"

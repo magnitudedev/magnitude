@@ -1,9 +1,9 @@
 import {
   updateCommandString,
-  type CliUpdaterShape,
   type UpdateAction,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/release"
 import { Effect } from "effect"
+import type { CliUpdaterShape } from "./updater"
 
 export const executeUpdate = (
   updater: CliUpdaterShape,

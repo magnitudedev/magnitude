@@ -20,6 +20,7 @@
     "build": "bun run packages/version/scripts/generate-version.ts && turbo build",
     "build:release": "bun run icn:catalog:build-bundle && bun run packages/release/scripts/build/host.ts",
     "test:release-bootstrap": "bun run packages/release/scripts/test-bootstrap.ts",
+    "simulate:distribution": "bun run packages/release/scripts/simulate-distribution.ts",
     "typecheck": "turbo typecheck",
     "test": "bun run packages/version/scripts/generate-version.ts && bun test",
     "cache:clear": "bun run scripts/clear-derived-cache.ts assessments",

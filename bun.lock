@@ -39,7 +39,9 @@
         "@effect/platform-bun": "^0.90.0",
         "@magnitudedev/client-common": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
+        "@magnitudedev/release": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
+        "@magnitudedev/storage": "workspace:*",
         "@magnitudedev/version": "workspace:*",
         "@opentui/core": "0.5.1",
         "@opentui/react": "0.5.1",
@@ -52,12 +54,14 @@
         "lowlight": "^3.3.0",
         "pino": "^10.3.0",
         "react": "^19.2.0",
+        "semver": "^7.7.3",
         "string-width": "^8.1.1",
       },
       "devDependencies": {
         "@magnitudedev/logger": "workspace:*",
         "@types/react": "^19.2.0",
         "@types/react-dom": "^19.2.3",
+        "@types/semver": "^7.7.1",
         "react-dom": "^19.2.4",
         "typescript": "^5.8.3",
       },
@@ -196,13 +200,6 @@
       },
       "devDependencies": {
         "@types/bun": "latest",
-      },
-    },
-    "packages/cli": {
-      "name": "@magnitudedev/cli",
-      "version": "0.0.6",
-      "bin": {
-        "magnitude": "bin/magnitude.js",
       },
     },
     "packages/client-common": {
@@ -359,6 +356,22 @@
         "vite": "^6.3.2",
       },
     },
+    "packages/launcher": {
+      "name": "@magnitudedev/cli",
+      "version": "0.0.6",
+      "bin": {
+        "magnitude": "bin/magnitude.js",
+      },
+      "devDependencies": {
+        "@effect/platform": "^0.96.0",
+        "@effect/platform-node": "0.107.0",
+        "@magnitudedev/release": "workspace:*",
+        "@types/bun": "latest",
+        "@types/tar-stream": "^3.1.4",
+        "effect": "^3.21.2",
+        "tar-stream": "3.2.0",
+      },
+    },
     "packages/logger": {
       "name": "@magnitudedev/logger",
       "version": "0.0.1",
@@ -469,11 +482,9 @@
         "@magnitudedev/utils": "workspace:*",
         "@magnitudedev/version": "workspace:*",
         "effect": "^3.21.2",
-        "semver": "^7.7.3",
       },
       "devDependencies": {
         "@effect/platform-bun": "^0.90.0",
-        "@types/semver": "^7.7.1",
         "vitest": "^3.2.4",
       },
     },
@@ -844,7 +855,7 @@
 
     "@magnitudedev/ai": ["@magnitudedev/ai@workspace:packages/ai"],
 
-    "@magnitudedev/cli": ["@magnitudedev/cli@workspace:packages/cli"],
+    "@magnitudedev/cli": ["@magnitudedev/cli@workspace:packages/launcher"],
 
     "@magnitudedev/cli-source": ["@magnitudedev/cli-source@workspace:cli"],
 

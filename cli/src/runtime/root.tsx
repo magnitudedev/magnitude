@@ -9,7 +9,7 @@ import {
   DisplayViewControllerProvider,
   PlatformProvider,
 } from "@magnitudedev/client-common"
-import type { UpdateAction } from "@magnitudedev/sdk"
+import type { UpdateAction } from "@magnitudedev/release"
 import { CliApp, type CliAppProps } from "../app"
 import {
   UpdatePrompt,

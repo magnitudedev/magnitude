@@ -176,7 +176,7 @@ export const smokeHostArchives = async (
     await run(["tar", "-xzf", icnArchivePath, "-C", icnRoot])
 
     const packageJson = JSON.parse(
-      await readFile(resolve(PROJECT_ROOT, "packages/cli/package.json"), "utf8"),
+      await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
     ) as { readonly version?: string }
     const version = packageJson.version
     if (!version) throw new Error("CLI package has no version")

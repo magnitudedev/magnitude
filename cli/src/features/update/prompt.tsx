@@ -1,11 +1,11 @@
 import { memo, useCallback, useState } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
-import type { UpdateAction } from "@magnitudedev/sdk"
 import {
   updateCommandString,
-  updateReleaseNotesUrl,
-} from "@magnitudedev/sdk"
+  type UpdateAction,
+} from "@magnitudedev/release"
+import { updateReleaseNotesUrl } from "./updater"
 import { useTheme } from "../../hooks/use-theme"
 
 export type UpdatePromptOutcome =
