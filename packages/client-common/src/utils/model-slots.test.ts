@@ -82,6 +82,27 @@ describe("canonical model-slot helpers", () => {
     expect(deriveLocalModelLoadActivity(state, PRIMARY_SLOT_ID)).toBe(primary)
   })
 
+  it("treats an admitted load request as model-loading activity", () => {
+    const primary = new ModelSlotConfiguredLocal({
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+      descriptor,
+      availability: { _tag: "Available" },
+      residency: { _tag: "Requested" },
+      actions: ["Stop"],
+    })
+    const state = {
+      slots: {
+        primary,
+        secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
+      },
+      recentModels: { primary: [], secondary: [] },
+      favoriteModels: [],
+    }
+
+    expect(deriveLocalModelLoadActivity(state, PRIMARY_SLOT_ID)).toBe(primary)
+  })
+
   it("reports resident memory only from a ready or resident-stopping instance", () => {
     const ready = configured({ _tag: "Ready", allocation })
     expect(Option.getOrThrow(modelSlotResidentAllocation(ready))).toStrictEqual(allocation)

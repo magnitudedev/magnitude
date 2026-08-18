@@ -45,6 +45,7 @@ import {
   useModelConfig,
   useProviderModelCatalog,
   deriveCurrentLocalModel,
+  deriveLocalModelLoadActivity,
   installedLocalModels,
   formatLocalModelDisplayName,
   modelSlotResidentAllocation,
@@ -97,6 +98,7 @@ import {
   findSlotProfile,
   type SlotProfile,
   type SlotProfiles,
+  type LocalModelLoadActivity,
 } from "@magnitudedev/client-common"
 import {
   isRoleId,
@@ -445,8 +447,10 @@ function deriveWorkerInfo(
 /** Work status container — timer + active task table above composer */
 function WorkStatusBarContainer({
   slotProfiles,
+  modelLoadActivity,
 }: {
   slotProfiles: SlotProfiles | null
+  modelLoadActivity: LocalModelLoadActivity | null
 }): ReactNode {
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
   const actors = useDisplayState((state) => state.actors)
@@ -466,6 +470,7 @@ function WorkStatusBarContainer({
       actors={actors}
       tasks={tasks}
       slotProfiles={slotProfiles}
+      modelLoadActivity={modelLoadActivity}
       onWorkerClick={pushFork}
     />
   )
@@ -488,16 +493,12 @@ function ComposerContainer({
   const slotsResult = useModelSlots()
   const onboarding = useOnboardingModelSetup()
   const slots = Option.getOrNull(Result.value(slotsResult))
-  const primary = slots?.slots.primary ?? null
-  const modelReady =
-    primary?._tag === "ConfiguredLocal" &&
-    primary.availability._tag === "Available" &&
-    primary.residency._tag === "Ready"
-  const disabledReason = modelReady
+  const currentModel = slots === null
     ? null
-    : Result.isFailure(slotsResult)
-    ? "Model runtime state is unavailable"
-    : "Load a local model before sending"
+    : deriveCurrentLocalModel(Option.some(slots.slots.primary))
+  const disabledReason = currentModel?._tag === "NoSelection"
+    ? "Choose a model before sending"
+    : null
   const commandContext: CommandContext = useMemo(
     () => ({
       resetConversation: () => startNewSession(),
@@ -704,12 +705,17 @@ function FooterBarContainer({
 }
 function BottomDockContainer({
   slotProfiles,
+  modelLoadActivity,
 }: {
   slotProfiles: SlotProfiles | null
+  modelLoadActivity: LocalModelLoadActivity | null
 }): ReactNode {
   return (
     <div className="mx-auto my-[14px] flex w-[calc(100%-24px)] max-w-[800px] shrink-0 flex-col gap-2">
-      <WorkStatusBarContainer slotProfiles={slotProfiles} />
+      <WorkStatusBarContainer
+        slotProfiles={slotProfiles}
+        modelLoadActivity={modelLoadActivity}
+      />
       <ComposerContainer
         docked
         footer={<FooterBarContainer slotProfiles={slotProfiles} />}
@@ -965,7 +971,15 @@ function AuthenticatedAppContent({
   const isDesktop = platform.id === "desktop"
   const sidebarVisible = useAtomValue(sidebarVisibleAtom)
   const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
-  const { profiles: slotProfiles } = useSlotProfiles()
+  const {
+    profiles: slotProfiles,
+    slots: slotsResult,
+    rootSlotId,
+  } = useSlotProfiles()
+  const modelSlots = Option.getOrNull(Result.value(slotsResult))?.state ?? null
+  const modelLoadActivity = modelSlots === null
+    ? null
+    : deriveLocalModelLoadActivity(modelSlots, rootSlotId)
   const showOverlaySidebar = isNarrow && sidebarVisible
   const settingsTab = useAtomValue(settingsTabAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
@@ -1013,7 +1027,10 @@ function AuthenticatedAppContent({
             />
           ) : null}
           <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
-          <BottomDockContainer slotProfiles={slotProfiles} />
+          <BottomDockContainer
+            slotProfiles={slotProfiles}
+            modelLoadActivity={modelLoadActivity}
+          />
         </div>
         {(panelOpen || workerDetailOpen) && (
           <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-900 z-[1]">

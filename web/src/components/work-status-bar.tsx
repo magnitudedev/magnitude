@@ -1,5 +1,7 @@
 import { Button } from "@/components/ui/button"
+import { Spinner } from "@/components/ui/spinner"
 import { useState, useSyncExternalStore, type ReactNode } from "react"
+import { Option } from "effect"
 import { ChevronDown, ChevronUp, Circle } from "lucide-react"
 import {
   formatElapsedMs,
@@ -13,6 +15,7 @@ import {
   useStabilizedRootDetail,
   type SlotProfile,
   type SlotProfiles,
+  type LocalModelLoadActivity,
 } from "@magnitudedev/client-common"
 import type {
   DisplayActor,
@@ -28,6 +31,7 @@ export interface WorkStatusBarProps {
   actors: Record<string, DisplayActor>
   tasks: DisplayTasks | null
   slotProfiles?: SlotProfiles | null
+  modelLoadActivity?: LocalModelLoadActivity | null
   onWorkerClick?: (forkId: string) => void
 }
 export function isWorkStatusBarVisible(
@@ -106,9 +110,35 @@ function assigneeStatus(
   }
   return assignee.variant
 }
-function StatusSummary({ status }: { status: DisplayRootStatus }): ReactNode {
-  const active = status._tag === "Working"
+function StatusSummary({
+  status,
+  modelLoadActivity,
+}: {
+  status: DisplayRootStatus
+  modelLoadActivity: LocalModelLoadActivity | null
+}): ReactNode {
+  const residency = modelLoadActivity?.residency
   const stabilizedDetail = useStabilizedRootDetail(status)
+  if (residency?._tag === "Requested" || residency?._tag === "Loading") {
+    const percentage = residency._tag === "Requested"
+      ? 0
+      : Math.min(
+          100,
+          Math.max(0, Math.round(Option.getOrElse(residency.progress, () => 0) * 100))
+        )
+    return (
+      <>
+        <Spinner className="size-[14px] shrink-0 text-blue-700 motion-reduce:animate-none dark:text-blue-500" />
+        <span className="shrink-0 text-slate-900 dark:text-slate-200">
+          Loading model
+        </span>
+        <span className="shrink-0 text-slate-600 dark:text-slate-400">
+          {` · ${percentage}%`}
+        </span>
+      </>
+    )
+  }
+  const active = status._tag === "Working"
   const detail =
     stabilizedDetail === null ? null : rootDetailSegments(stabilizedDetail)
   const terminalLabel =
@@ -247,6 +277,7 @@ export function WorkStatusBar({
   actors,
   tasks,
   slotProfiles,
+  modelLoadActivity = null,
   onWorkerClick,
 }: WorkStatusBarProps): ReactNode {
   const [expanded, setExpanded] = useState(false)
@@ -259,6 +290,7 @@ export function WorkStatusBar({
   )
   const tick = useSyncExternalStore(
     chainActive || anyActorClockRunning ? subscribeTick : subscribeNoop,
+    getTickSnapshot,
     getTickSnapshot
   )
   void tick
@@ -282,7 +314,10 @@ export function WorkStatusBar({
           title={expanded ? "Collapse tasks" : "Expand tasks"}
           className="bg-transparent hover:bg-slate-100 dark:hover:bg-slate-800 [min-height:34px] w-full [padding:0_10px] flex items-center [gap:8px] text-slate-600 dark:text-slate-400 text-[13px] font-sans text-left [background:transparent] border-0 rounded-[0px] cursor-pointer"
         >
-          <StatusSummary status={rootStatus} />
+          <StatusSummary
+            status={rootStatus}
+            modelLoadActivity={modelLoadActivity}
+          />
           <span className="[margin-left:auto] flex items-center [gap:4px] text-slate-600 dark:text-slate-400 text-[12px] shrink-0">
             <span>{taskCountLabel}</span>
             {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
@@ -290,7 +325,10 @@ export function WorkStatusBar({
         </Button>
       ) : (
         <div className="[min-height:34px] [padding:0_10px] flex items-center [gap:8px] text-slate-600 dark:text-slate-400 text-[13px]">
-          <StatusSummary status={rootStatus} />
+          <StatusSummary
+            status={rootStatus}
+            modelLoadActivity={modelLoadActivity}
+          />
         </div>
       )}
 
