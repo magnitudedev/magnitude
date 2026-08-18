@@ -4,7 +4,7 @@ applies_to:
   - packages/release/src/targets.ts
   - packages/release/scripts/assemble.ts
   - packages/release/scripts/build/**
-  - packages/cli/package.json
+  - packages/launcher/package.json
 ---
 
 # Release distribution

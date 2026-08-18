@@ -1,8 +1,8 @@
 ---
 applies_to:
-  - packages/cli/bin/magnitude.js
-  - packages/sdk/src/cli-update.ts
-  - packages/sdk/src/cli-update.test.ts
+  - packages/release/src/client-update/**
+  - packages/launcher/src/**
+  - packages/launcher/scripts/build-launcher.ts
   - packages/storage/src/types/config.ts
   - cli/src/index.tsx
   - cli/src/commands/update.ts
@@ -10,7 +10,6 @@ applies_to:
   - cli/src/runtime/**
   - cli/src/platform/process-exit.ts
   - cli/src/platform/terminal.ts
-  - packages/release/src/launcher-install-context.test.ts
 ---
 
 # CLI updates

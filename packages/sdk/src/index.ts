@@ -215,27 +215,6 @@ export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT
 export type { RoleId } from "@magnitudedev/roles"
 
 export { resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
-export {
-  CliUpdater,
-  InstallMethodSchema,
-  UpdateActionSchema,
-  UpdateDismissalSchema,
-  UpdateVersionInfoSchema,
-  UpdateCommandFailed,
-  installMethodFromEnvironment,
-  updateActionFor,
-  updateCommandString,
-  updateReleaseNotesUrl,
-  isDevelopmentVersion,
-  isNewerVersion,
-  makeCliUpdater,
-  type CliUpdaterOptions,
-  type CliUpdaterShape,
-  type InstallMethod,
-  type UpdateAction,
-  type UpdateDismissal,
-  type UpdateVersionInfo,
-} from "./cli-update"
 export { SDK_VERSION, SDK_REVISION, SDK_ACN_TARGET } from "./version"
 export {
   AcnAdministrationFailed,

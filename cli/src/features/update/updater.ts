@@ -15,27 +15,22 @@ import {
 import {
   acquireRelease,
   currentHost,
+  installMethodFromEnvironment,
+  releaseBaseUrl,
+  releaseTag,
   selectArtifact,
+  updateActionFor,
+  updateCommandString,
+  type InstallMethod,
+  type UpdateAction,
 } from "@magnitudedev/release"
 import { Clock, Context, Effect, Option, Schema, Scope, Stream } from "effect"
 import semver from "semver"
-import { releaseBaseUrl } from "./binary"
 
-const PACKAGE_NAME = "@magnitudedev/cli"
 const NPM_PACKAGE_URL =
   "https://registry.npmjs.org/-/package/@magnitudedev%2Fcli/dist-tags"
 const NPM_RESPONSE_LIMIT = 64 * 1_024
 const UPDATE_CACHE_TTL_MS = 20 * 60 * 60 * 1_000
-
-export const InstallMethodSchema = Schema.Literal("npm", "bun", "pnpm", "other")
-export type InstallMethod = typeof InstallMethodSchema.Type
-
-export const UpdateActionSchema = Schema.Struct({
-  method: Schema.Literal("npm", "bun", "pnpm"),
-  command: Schema.String,
-  args: Schema.NonEmptyArray(Schema.String),
-})
-export type UpdateAction = typeof UpdateActionSchema.Type
 
 export const UpdateVersionInfoSchema = Schema.Struct({
   latestVersion: Schema.String,
@@ -90,45 +85,6 @@ export class CliUpdater extends Context.Tag("CliUpdater")<
   CliUpdaterShape
 >() {}
 
-export const installMethodFromEnvironment = (
-  environment: Readonly<Record<string, string | undefined>>,
-): InstallMethod => {
-  if (environment.MAGNITUDE_MANAGED_BY_PNPM !== undefined) return "pnpm"
-  if (environment.MAGNITUDE_MANAGED_BY_NPM !== undefined) return "npm"
-  if (environment.MAGNITUDE_MANAGED_BY_BUN !== undefined) return "bun"
-  return "other"
-}
-
-export const updateActionFor = (
-  method: InstallMethod,
-): Option.Option<UpdateAction> => {
-  switch (method) {
-    case "npm":
-      return Option.some({
-        method,
-        command: "npm",
-        args: ["install", "-g", PACKAGE_NAME],
-      })
-    case "bun":
-      return Option.some({
-        method,
-        command: "bun",
-        args: ["install", "-g", PACKAGE_NAME],
-      })
-    case "pnpm":
-      return Option.some({
-        method,
-        command: "pnpm",
-        args: ["add", "-g", PACKAGE_NAME],
-      })
-    case "other":
-      return Option.none()
-  }
-}
-
-export const updateCommandString = (action: UpdateAction): string =>
-  [action.command, ...action.args].join(" ")
-
 export const isDevelopmentVersion = (version: string): boolean =>
   version.includes("+dev.") || version === "0.0.0"
 
@@ -139,10 +95,8 @@ export const isNewerVersion = (
   && semver.valid(current) !== null
   && semver.gt(candidate, current)
 
-const releaseNotesUrl = (version: string): string =>
-  `https://github.com/magnitudedev/magnitude/releases/tag/${encodeURIComponent(`${PACKAGE_NAME}@${version}`)}`
-
-export const updateReleaseNotesUrl = releaseNotesUrl
+export const updateReleaseNotesUrl = (version: string): string =>
+  `https://github.com/magnitudedev/magnitude/releases/tag/${encodeURIComponent(releaseTag(version))}`
 
 export const makeCliUpdater = (
   options: CliUpdaterOptions,
@@ -164,6 +118,11 @@ export const makeCliUpdater = (
   const environment = options.environment ?? process.env
   const installMethod = installMethodFromEnvironment(environment)
   const updateAction = updateActionFor(installMethod)
+  // Environment override mirrors MAGNITUDE_RELEASE_BASE_URL: it lets the
+  // distribution simulator point discovery at a local registry.
+  const npmPackageUrl = options.npmPackageUrl
+    ?? environment.MAGNITUDE_NPM_PACKAGE_URL
+    ?? NPM_PACKAGE_URL
   const configStorage = yield* makeConfigStorage().pipe(
     Effect.provideService(GlobalStorage, makeGlobalStorage({ root: dataDir })),
   )
@@ -214,7 +173,7 @@ export const makeCliUpdater = (
 
   const fetchLatestVersion = Effect.gen(function* () {
     const response = yield* http.execute(HttpClientRequest.get(
-      options.npmPackageUrl ?? NPM_PACKAGE_URL,
+      npmPackageUrl,
     )).pipe(Effect.mapError((error) => new UpdateDiscoveryFailed({
       stage: "registry",
       reason: String(error),

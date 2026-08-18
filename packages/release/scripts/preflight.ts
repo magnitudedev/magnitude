@@ -1,5 +1,6 @@
 import { appendFile, readFile } from "node:fs/promises"
 import { resolve } from "node:path"
+import { releaseTag } from "../src/contracts"
 import { run } from "./build/common"
 import { findGithubRelease } from "./github-release"
 
@@ -40,12 +41,12 @@ const npm = async (version: string): Promise<unknown | undefined> => {
 }
 
 const packageJson = JSON.parse(
-  await readFile(resolve(PROJECT_ROOT, "packages/cli/package.json"), "utf8"),
+  await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
 ) as { readonly version?: string }
 const version = required("MAGNITUDE_RELEASE_VERSION", packageJson.version)
 const sourceCommit = required("MAGNITUDE_SOURCE_COMMIT", process.env.GITHUB_SHA)
 if (packageJson.version !== version) {
-  throw new Error("requested version differs from packages/cli/package.json")
+  throw new Error("requested version differs from packages/launcher/package.json")
 }
 if (!/^[a-f0-9]{40}$/.test(sourceCommit)) {
   throw new Error("source commit must be a full lowercase SHA")
@@ -57,7 +58,7 @@ if (!/^[a-f0-9]{40}$/.test(releaseCommit)) {
 const releasePackageJson = JSON.parse(await run([
   "git",
   "show",
-  `${releaseCommit}:packages/cli/package.json`,
+  `${releaseCommit}:packages/launcher/package.json`,
 ], { cwd: PROJECT_ROOT })) as { readonly version?: string }
 if (releasePackageJson.version !== version) {
   throw new Error("Changesets release commit differs from the requested version")
@@ -65,7 +66,7 @@ if (releasePackageJson.version !== version) {
 const previousPackageJson = JSON.parse(await run([
   "git",
   "show",
-  `${releaseCommit}^:packages/cli/package.json`,
+  `${releaseCommit}^:packages/launcher/package.json`,
 ], { cwd: PROJECT_ROOT })) as { readonly version?: string }
 if (!previousPackageJson.version || previousPackageJson.version === version) {
   throw new Error("release commit did not change the Changesets-owned CLI version")
@@ -79,7 +80,7 @@ await run([
 ], { cwd: PROJECT_ROOT })
 
 const repository = required("GITHUB_REPOSITORY")
-const tag = `@magnitudedev/cli@${version}`
+const tag = releaseTag(version)
 const [tagRef, release, npmVersion] = await Promise.all([
   github(`/repos/${repository}/git/ref/tags/${encodeURIComponent(tag)}`),
   findGithubRelease(

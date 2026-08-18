@@ -16,11 +16,7 @@ import {
   pushNotificationAtom,
   stopDisplayViewController,
 } from "@magnitudedev/client-common"
-import {
-  CliUpdater,
-  makeCliUpdater,
-  type UpdateAction,
-} from "@magnitudedev/sdk"
+import type { UpdateAction } from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
 import {
   Array as Arr,
@@ -52,6 +48,7 @@ import {
 import { terminalAppearanceAtom } from "../hooks/use-theme"
 import type { UpdatePromptOutcome } from "../features/update/prompt"
 import { executeUpdate } from "../features/update/execute"
+import { CliUpdater, makeCliUpdater } from "../features/update/updater"
 import {
   CliStartupRoot,
   makeCliRootStateAtom,

@@ -6,13 +6,10 @@ import { join } from "node:path"
 import { Effect, Exit, Option, Scope } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import {
-  installMethodFromEnvironment,
   isDevelopmentVersion,
   isNewerVersion,
   makeCliUpdater,
-  updateActionFor,
-  updateCommandString,
-} from "./cli-update"
+} from "./updater"
 import { currentHost } from "@magnitudedev/release"
 
 const roots: string[] = []
@@ -31,24 +28,6 @@ afterEach(async () => {
 })
 
 describe("CLI updater", () => {
-  it("maps launcher provenance to Codex-style global update commands", () => {
-    expect(installMethodFromEnvironment({ MAGNITUDE_MANAGED_BY_NPM: "1" }))
-      .toBe("npm")
-    expect(installMethodFromEnvironment({ MAGNITUDE_MANAGED_BY_BUN: "1" }))
-      .toBe("bun")
-    expect(installMethodFromEnvironment({ MAGNITUDE_MANAGED_BY_PNPM: "1" }))
-      .toBe("pnpm")
-    expect(installMethodFromEnvironment({})).toBe("other")
-
-    expect(updateCommandString(Option.getOrThrow(updateActionFor("npm"))))
-      .toBe("npm install -g @magnitudedev/cli")
-    expect(updateCommandString(Option.getOrThrow(updateActionFor("bun"))))
-      .toBe("bun install -g @magnitudedev/cli")
-    expect(updateCommandString(Option.getOrThrow(updateActionFor("pnpm"))))
-      .toBe("pnpm add -g @magnitudedev/cli")
-    expect(Option.isNone(updateActionFor("other"))).toBe(true)
-  })
-
   it("uses semantic version ordering and disables development versions", () => {
     expect(isNewerVersion("0.0.1-alpha.35", "0.0.1-alpha.34")).toBe(true)
     expect(isNewerVersion("0.0.1-alpha.34", "0.0.1-alpha.35")).toBe(false)
@@ -64,7 +43,7 @@ describe("CLI updater", () => {
       makeCliUpdater({
         currentVersion: "1.0.0",
         dataDir: root,
-        environment: { MAGNITUDE_MANAGED_BY_NPM: "1" },
+        environment: { MAGNITUDE_MANAGED_BY: "npm" },
       }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
     )
 
@@ -123,7 +102,7 @@ describe("CLI updater", () => {
         makeCliUpdater({
           currentVersion: "0.0.1-alpha.34",
           dataDir: root,
-          environment: { MAGNITUDE_MANAGED_BY_NPM: "1" },
+          environment: { MAGNITUDE_MANAGED_BY: "npm" },
           npmPackageUrl: `${server.url}registry`,
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
@@ -193,7 +172,7 @@ describe("CLI updater", () => {
         makeCliUpdater({
           currentVersion: "2.0.0",
           dataDir: root,
-          environment: { MAGNITUDE_MANAGED_BY_NPM: "1" },
+          environment: { MAGNITUDE_MANAGED_BY: "npm" },
           npmPackageUrl: `${server.url}registry`,
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
@@ -207,7 +186,7 @@ describe("CLI updater", () => {
         makeCliUpdater({
           currentVersion: "1.0.0",
           dataDir: root,
-          environment: { MAGNITUDE_MANAGED_BY_NPM: "1" },
+          environment: { MAGNITUDE_MANAGED_BY: "npm" },
           npmPackageUrl: `${server.url}registry`,
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
@@ -243,7 +222,7 @@ describe("CLI updater", () => {
         makeCliUpdater({
           currentVersion: "1.0.0",
           dataDir: root,
-          environment: { MAGNITUDE_MANAGED_BY_NPM: "1" },
+          environment: { MAGNITUDE_MANAGED_BY: "npm" },
           npmPackageUrl: server.url.toString(),
           releaseBaseUrl: server.url.toString(),
         }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),

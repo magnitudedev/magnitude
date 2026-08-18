@@ -11,7 +11,9 @@ import {
   currentHost,
   installArtifact,
   NodeArchiveExtractor,
+  releaseBaseUrl,
   releaseBundleSizes,
+  releaseTag,
   selectArtifact,
   type ArtifactInstallationEvent,
   type ReleaseBundleSizes,
@@ -60,17 +62,6 @@ const pointerPath = (dataDir: string, version: string) =>
   join(acnRoot(dataDir, version), "current.txt");
 const executableName = () =>
   process.platform === "win32" ? "magnitude-acn.exe" : "magnitude-acn";
-
-export function releaseTag(version: string): string {
-  return `@magnitudedev/cli@${version}`;
-}
-
-export function releaseBaseUrl(): string {
-  return (
-    process.env.MAGNITUDE_RELEASE_BASE_URL ??
-    "https://github.com/magnitudedev/magnitude/releases/download"
-  ).replace(/\/+$/, "");
-}
 
 const validateBinaryVersion = (
   binaryPath: string,
