@@ -17,7 +17,7 @@ import {
   currentHost,
   selectArtifact,
 } from "@magnitudedev/release"
-import { Clock, Context, Effect, Option, Schema, Stream } from "effect"
+import { Clock, Context, Effect, Option, Schema, Scope, Stream } from "effect"
 import semver from "semver"
 import { releaseBaseUrl } from "./binary"
 
@@ -80,7 +80,7 @@ export interface CliUpdaterOptions {
 export interface CliUpdaterShape {
   readonly installMethod: InstallMethod
   readonly updateAction: Option.Option<UpdateAction>
-  readonly getUpgradeVersion: Effect.Effect<Option.Option<string>>
+  readonly getUpgradeVersion: Effect.Effect<Option.Option<string>, never, Scope.Scope>
   readonly dismissVersion: (version: string) => Effect.Effect<void>
   readonly runUpdate: (action: UpdateAction) => Effect.Effect<void, UpdateCommandFailed>
 }
@@ -336,7 +336,7 @@ export const makeCliUpdater = (
           || checkedAt < now - UPDATE_CACHE_TTL_MS
       },
     })
-    if (stale) yield* Effect.forkDaemon(refresh)
+    if (stale) yield* Effect.forkScoped(refresh)
 
     const dismissal = yield* readDismissal
     return Option.filter(info, ({ latestVersion }) =>
