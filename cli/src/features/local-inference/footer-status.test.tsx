@@ -76,7 +76,7 @@ test("ready status exposes the model, residency, and complete resident allocatio
   )).toEqual({
     modelName: "Qwen Test",
     residency: "loaded",
-    memoryLabel: "17.2 GB mem",
+    memoryLabel: "16 GB mem",
   })
 })
 
@@ -104,7 +104,7 @@ test("slot residency remains visible when local-model inventory is unavailable",
   )).toEqual({
     modelName: "Qwen Test",
     residency: "loaded",
-    memoryLabel: "17.2 GB mem",
+    memoryLabel: "16 GB mem",
   })
 })
 

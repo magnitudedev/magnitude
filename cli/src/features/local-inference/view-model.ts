@@ -7,8 +7,8 @@ import {
   localModelBundleKey,
   localModelOptions,
   localModelSpeculativeMethodLabel,
-  formatDecimalByteSize,
-  formatDecimalGigabytes,
+  formatStorageSize,
+  formatMemorySize,
   type LocalModelOption,
 } from "@magnitudedev/client-common"
 export {
@@ -267,8 +267,8 @@ export const describeLocalHardwareSummary = (
     `${platform} ${architecture}`,
     `${hardware.logicalCores} ${hardware.logicalCores === 1 ? "core" : "cores"}`,
     unified.length > 0
-      ? `${formatDecimalGigabytes(hardware.totalSystemMemoryBytes)} unified`
-      : `${formatDecimalGigabytes(hardware.totalSystemMemoryBytes)} RAM`,
+      ? `${formatMemorySize(hardware.totalSystemMemoryBytes)} unified`
+      : `${formatMemorySize(hardware.totalSystemMemoryBytes)} RAM`,
     ...unifiedBackends,
     ...(unified.length === 0 && discrete.length === 0 ? ["CPU inference"] : []),
   ]
@@ -279,7 +279,7 @@ export const describeLocalHardwareSummary = (
       const backends = backendsFor(domain.memoryDomainId)
       return {
         name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: [`${formatDecimalGigabytes(domain.totalBytes)} VRAM`, ...backends],
+        details: [`${formatMemorySize(domain.totalBytes)} VRAM`, ...backends],
       }
     }),
   ]
@@ -301,7 +301,7 @@ export const describeLocalHardware = (
       name: systemName,
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
-        `${formatDecimalGigabytes(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
+        `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
       ],
     },
     accelerators: discrete.map((domain) => {
@@ -309,7 +309,7 @@ export const describeLocalHardware = (
       const backends = backendsFor(domain.memoryDomainId)
       return {
         name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: `${formatDecimalGigabytes(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
+        details: `${formatMemorySize(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
       }
     }),
   }
@@ -334,7 +334,7 @@ export const selectionMetadata = (selection: LocalInferenceSelection): string =>
   const { model } = selection
   const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
   return [
-    formatDecimalByteSize(model.downloadBytes),
+    formatStorageSize(model.downloadBytes),
     Option.map(selectionContextLabel(selection), (context) => `${context} ctx`).pipe(Option.getOrNull),
     speculativeMethod,
   ].filter((value): value is string => value !== null).join(" · ")

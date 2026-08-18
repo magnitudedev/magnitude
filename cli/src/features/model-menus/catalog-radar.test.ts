@@ -33,7 +33,7 @@ describe("catalog radar", () => {
     ])
   })
 
-  test("displays memory as the actual decimal gigabyte value", () => {
+  test("displays memory using the hardware convention", () => {
     const model = makeCatalogOnlyModel()
     if (model.servingState._tag !== "Assessed"
       || model.servingState.assessment._tag !== "Fits") {
@@ -51,7 +51,7 @@ describe("catalog radar", () => {
       },
     }))
 
-    expect(axes[3].detail).toBe("Tiny (3.7 GB)")
+    expect(axes[3].detail).toBe("Tiny (3.4 GB)")
   })
 
   test("uses cubic ease-out and clamps interpolation", () => {

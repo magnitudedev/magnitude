@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import {
-  formatDecimalGigabytes,
+  formatMemorySize,
   formatLocalModelDisplayName,
   modelSlotResidentAllocation,
 } from "@magnitudedev/client-common"
@@ -28,7 +28,7 @@ const residentMemoryLabel = (
           + domain.auxiliaryBytes,
         0,
       )
-      return `${formatDecimalGigabytes(bytes)} mem`
+      return `${formatMemorySize(bytes)} mem`
     },
   })
 

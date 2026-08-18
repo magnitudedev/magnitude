@@ -3,8 +3,8 @@ import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
 import {
-  formatDecimalByteSize,
-  formatDecimalMegabytesPerSecond,
+  formatStorageSize,
+  formatTransferRate,
 } from "@magnitudedev/client-common"
 import type { LocalModel, ModelDownloadId } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -66,16 +66,16 @@ export function OnboardingModelDownloadProgress({
     if (activeDownload.stage === "verifying" || activeDownload.stage === "publishing") {
       return "Verifying download…"
     }
-    const transferred = `${formatDecimalByteSize(activeDownload.completedBytes)} / ${formatDecimalByteSize(activeDownload.totalBytes)}`
+    const transferred = `${formatStorageSize(activeDownload.completedBytes)} / ${formatStorageSize(activeDownload.totalBytes)}`
     if (rate === null || rate <= 0) return `${transferred} · Estimating time remaining…`
-    return `${transferred} · ${formatDecimalMegabytesPerSecond(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
+    return `${transferred} · ${formatTransferRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
   }, [activeDownload, cancelling, rate, starting])
   const status = starting
-    ? `Starting download (${formatDecimalByteSize(totalBytes)})…`
+    ? `Starting download (${formatStorageSize(totalBytes)})…`
     : cancelling
       ? "Cancelling download…"
       : downloading
-        ? `Downloading (${formatDecimalByteSize(totalBytes)})`
+        ? `Downloading (${formatStorageSize(totalBytes)})`
         : null
   const declineCancellation = useCallback(() => {
     setConfirmationDownloadId(null)
