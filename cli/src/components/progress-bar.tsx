@@ -13,8 +13,8 @@ export const ProgressBar = ({ value, width }: ProgressBarProps) => {
   const empty = Math.max(0, width - filled)
   return (
     <text>
-      <span fg={theme.primary}>{'█'.repeat(filled)}</span>
-      <span fg={theme.muted}>{'░'.repeat(empty)}</span>
+      <span fg={theme.accent}>{'█'.repeat(filled)}</span>
+      <span fg={theme.text.supporting}>{'░'.repeat(empty)}</span>
     </text>
   )
 }

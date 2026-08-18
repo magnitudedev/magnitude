@@ -10,7 +10,7 @@ import {
   makeLocalAcnInstanceManager,
 } from "@magnitudedev/sdk"
 import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
-import { Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
+import { Duration, Effect, Exit, Layer, Schema, Scope } from "effect"
 import {
   mkdir,
   mkdtemp,
@@ -22,7 +22,6 @@ import { tmpdir } from "node:os"
 import { resolve } from "node:path"
 import { releaseUrl } from "@magnitudedev/release/acquisition"
 import { ReleaseManifestSchema } from "@magnitudedev/release/contracts"
-import { currentHost } from "@magnitudedev/release/targets"
 
 const BOOTSTRAP_TIMEOUT_MS = 2 * 60_000
 const SHUTDOWN_TIMEOUT_MS = 20_000
@@ -64,13 +63,6 @@ const run = async (
 const manifest = Schema.decodeUnknownSync(
   Schema.parseJson(ReleaseManifestSchema),
 )(await readFile(resolve(candidate, "magnitude-release.json"), "utf8"))
-const cliArtifact = manifest.artifacts.find((artifact) =>
-  artifact.kind === "cli" &&
-  Option.getOrUndefined(artifact.host) === currentHost()
-)
-if (!cliArtifact) {
-  throw new Error(`candidate has no CLI artifact for ${currentHost()}`)
-}
 
 const routes = new Map(
   [
@@ -96,7 +88,6 @@ const server = Bun.serve({
 const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
-let serverRunning = true
 const ensurerScope = await Effect.runPromise(Scope.make())
 
 const manager = await Effect.runPromise(
@@ -221,18 +212,7 @@ const probeBootstrap = Effect.gen(function* () {
   )
   return yield* Effect.gen(function* () {
     const client = yield* RpcClient.make(MagnitudeRpcs)
-    const health = yield* client.Health({})
-    while (true) {
-      const localModels = yield* client.GetLocalModels({})
-      switch (localModels.state.recommendations._tag) {
-        case "Ready":
-          return health
-        case "Failed":
-          return yield* Effect.fail(localModels.state.recommendations)
-        case "Loading":
-          yield* Effect.sleep(Duration.millis(250))
-      }
-    }
+    return yield* client.Health({})
   }).pipe(
     Effect.provide(protocolLayer),
     Effect.scoped,
@@ -296,21 +276,11 @@ try {
   await writeFile(resolve(bunRoot, "package.json"), "{}\n")
   await run(["npm", "install", "--ignore-scripts", tarball], { cwd: npmRoot })
   await invoke(
-    ["node", resolve(npmRoot, "node_modules/@magnitudedev/cli/bin/magnitude.js"), "--version"],
-    npmRoot,
-    resolve(root, "home-node"),
-  )
-  await invoke(
     ["npx", "--no-install", "magnitude", "--version"],
     npmRoot,
     resolve(root, "home-npx"),
   )
   await run(["bun", "add", "--ignore-scripts", tarball], { cwd: bunRoot })
-  await invoke(
-    ["bun", resolve(bunRoot, "node_modules/@magnitudedev/cli/bin/magnitude.js"), "--version"],
-    bunRoot,
-    resolve(root, "home-bun"),
-  )
   await invoke(
     ["bunx", "--bun", "magnitude", "--version"],
     bunRoot,
@@ -318,11 +288,8 @@ try {
   )
 
   await acceptBootstrap()
-  server.stop(true)
-  serverRunning = false
-  await acceptBootstrap()
 } finally {
   await Effect.runPromise(Scope.close(ensurerScope, Exit.void))
-  if (serverRunning) server.stop(true)
+  server.stop(true)
   await rm(root, { recursive: true, force: true })
 }

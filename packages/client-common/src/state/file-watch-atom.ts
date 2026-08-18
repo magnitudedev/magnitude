@@ -29,11 +29,11 @@ export function useFileWatchBridge(): void {
 
   const watchAtom = useMemo(
     () =>
-      client.runtime.atom(
+      client.rpc.runtime.atom(
         Effect.gen(function* () {
           if (!selectedCwd || !filePath) return
 
-          const rpc = yield* client
+          const rpc = yield* client.rpc
 
           yield* rpc("WatchFile", { cwd: selectedCwd, path: filePath }).pipe(
             Stream.tap(() => Reactivity.invalidate(["files"])),

@@ -1,19 +1,333 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use llama_cpp_2::LlamaSequenceState;
+use llama_cpp_2::speculative::{SpeculativePosition, SpeculativePromptState};
 use llama_cpp_2::token::LlamaToken;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PromptBoundary {
+    pub(crate) logical_tokens: usize,
+    pub(crate) native_position: i32,
+}
+
+impl PromptBoundary {
+    pub(crate) fn speculative_position(self) -> Option<SpeculativePosition> {
+        Some(SpeculativePosition {
+            target: self.native_position,
+            draft: i32::try_from(self.logical_tokens).ok()?,
+        })
+    }
+
+    pub(crate) fn advance(self, tokens: usize) -> Option<Self> {
+        Some(Self {
+            logical_tokens: self.logical_tokens.checked_add(tokens)?,
+            native_position: self
+                .native_position
+                .checked_add(i32::try_from(tokens).ok()?)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PromptSegment {
+    Text(Vec<LlamaToken>),
+    Media {
+        identity: String,
+        logical_tokens: usize,
+        native_positions: i32,
+    },
+}
+
+impl PromptSegment {
+    fn logical_tokens(&self) -> usize {
+        match self {
+            Self::Text(tokens) => tokens.len(),
+            Self::Media { logical_tokens, .. } => *logical_tokens,
+        }
+    }
+
+    fn native_positions(&self) -> i32 {
+        match self {
+            Self::Text(tokens) => i32::try_from(tokens.len()).unwrap_or(i32::MAX),
+            Self::Media {
+                native_positions, ..
+            } => *native_positions,
+        }
+    }
+}
+
+/// Semantic prompt input used to correlate native KV with future requests.
+///
+/// Text may be matched token-by-token. Media is an indivisible span identified by content and
+/// preprocessing semantics, with logical token and native position counts kept separate for
+/// M-RoPE models.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptLayout {
+    segments: Vec<PromptSegment>,
+}
+
+impl PromptLayout {
+    pub(crate) fn text(tokens: Vec<LlamaToken>) -> Self {
+        Self {
+            segments: vec![PromptSegment::Text(tokens)],
+        }
+    }
+
+    pub(crate) fn new(segments: Vec<PromptSegment>) -> Self {
+        Self { segments }
+    }
+
+    pub(crate) fn segments(&self) -> &[PromptSegment] {
+        &self.segments
+    }
+
+    pub(crate) fn logical_tokens(&self) -> usize {
+        self.segments
+            .iter()
+            .map(PromptSegment::logical_tokens)
+            .sum()
+    }
+
+    pub(crate) fn text_tokens(&self) -> Vec<LlamaToken> {
+        self.segments
+            .iter()
+            .filter_map(|segment| match segment {
+                PromptSegment::Text(tokens) => Some(tokens.as_slice()),
+                PromptSegment::Media { .. } => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn text_tokens_at(&self, logical_token: usize) -> Option<&[LlamaToken]> {
+        let mut start = 0usize;
+        for segment in &self.segments {
+            let end = start.checked_add(segment.logical_tokens())?;
+            if logical_token < end {
+                return match segment {
+                    PromptSegment::Text(tokens) => Some(&tokens[logical_token - start..]),
+                    PromptSegment::Media { .. } => None,
+                };
+            }
+            start = end;
+        }
+        None
+    }
+
+    pub(crate) fn media_at(&self, logical_token: usize) -> Option<(usize, i32)> {
+        let mut start = 0usize;
+        for segment in &self.segments {
+            if start == logical_token {
+                return match segment {
+                    PromptSegment::Media {
+                        logical_tokens,
+                        native_positions,
+                        ..
+                    } => Some((*logical_tokens, *native_positions)),
+                    PromptSegment::Text(_) => None,
+                };
+            }
+            start = start.checked_add(segment.logical_tokens())?;
+        }
+        None
+    }
+
+    pub(crate) fn common_prefix(&self, incoming: &Self) -> PromptBoundary {
+        let mut boundary = PromptBoundary::default();
+        let mut left = self.segments.iter();
+        let mut right = incoming.segments.iter();
+        loop {
+            match (left.next(), right.next()) {
+                (Some(PromptSegment::Text(left)), Some(PromptSegment::Text(right))) => {
+                    let matched = left
+                        .iter()
+                        .zip(right)
+                        .take_while(|(left, right)| left == right)
+                        .count();
+                    boundary.logical_tokens += matched;
+                    boundary.native_position = boundary
+                        .native_position
+                        .saturating_add(i32::try_from(matched).unwrap_or(i32::MAX));
+                    if matched != left.len() || matched != right.len() {
+                        return boundary;
+                    }
+                }
+                (
+                    Some(PromptSegment::Media {
+                        identity: left_identity,
+                        logical_tokens: left_tokens,
+                        native_positions: left_positions,
+                    }),
+                    Some(PromptSegment::Media {
+                        identity: right_identity,
+                        logical_tokens: right_tokens,
+                        native_positions: right_positions,
+                    }),
+                ) if left_identity == right_identity
+                    && left_tokens == right_tokens
+                    && left_positions == right_positions =>
+                {
+                    boundary.logical_tokens += left_tokens;
+                    boundary.native_position =
+                        boundary.native_position.saturating_add(*left_positions);
+                }
+                _ => return boundary,
+            }
+        }
+    }
+
+    pub(crate) fn boundary_before_final_text_token(&self) -> Option<PromptBoundary> {
+        let logical_tokens = self.logical_tokens().checked_sub(1)?;
+        self.boundary_at(logical_tokens)
+    }
+
+    pub(crate) fn boundary_at(&self, logical_tokens: usize) -> Option<PromptBoundary> {
+        let mut boundary = PromptBoundary::default();
+        for segment in &self.segments {
+            let segment_tokens = segment.logical_tokens();
+            if boundary.logical_tokens + segment_tokens <= logical_tokens {
+                boundary.logical_tokens += segment_tokens;
+                boundary.native_position = boundary
+                    .native_position
+                    .checked_add(segment.native_positions())?;
+                continue;
+            }
+            let within = logical_tokens.checked_sub(boundary.logical_tokens)?;
+            match segment {
+                PromptSegment::Text(_) => {
+                    boundary.logical_tokens += within;
+                    boundary.native_position = boundary
+                        .native_position
+                        .checked_add(i32::try_from(within).ok()?)?;
+                    return Some(boundary);
+                }
+                PromptSegment::Media { .. } => return None,
+            }
+        }
+        (boundary.logical_tokens == logical_tokens).then_some(boundary)
+    }
+
+    /// Return the first legal semantic boundary at or after a requested logical position.
+    ///
+    /// Text can be split token-by-token. Media cannot, so a position inside a media span advances
+    /// to the end of that span instead of inventing a partially reusable media boundary.
+    pub(crate) fn boundary_at_or_after(&self, logical_tokens: usize) -> Option<PromptBoundary> {
+        let mut boundary = PromptBoundary::default();
+        for segment in &self.segments {
+            let segment_tokens = segment.logical_tokens();
+            let segment_end = boundary.logical_tokens.checked_add(segment_tokens)?;
+            if segment_end < logical_tokens {
+                boundary.logical_tokens = segment_end;
+                boundary.native_position = boundary
+                    .native_position
+                    .checked_add(segment.native_positions())?;
+                continue;
+            }
+            if logical_tokens <= boundary.logical_tokens {
+                return Some(boundary);
+            }
+            match segment {
+                PromptSegment::Text(_) => {
+                    let within = logical_tokens.checked_sub(boundary.logical_tokens)?;
+                    boundary.logical_tokens = boundary.logical_tokens.checked_add(within)?;
+                    boundary.native_position = boundary
+                        .native_position
+                        .checked_add(i32::try_from(within).ok()?)?;
+                }
+                PromptSegment::Media { .. } => {
+                    boundary.logical_tokens = segment_end;
+                    boundary.native_position = boundary
+                        .native_position
+                        .checked_add(segment.native_positions())?;
+                }
+            }
+            return Some(boundary);
+        }
+        (boundary.logical_tokens == logical_tokens).then_some(boundary)
+    }
+
+    pub(crate) fn prefix(&self, boundary: PromptBoundary) -> Option<Self> {
+        if self.boundary_at(boundary.logical_tokens)? != boundary {
+            return None;
+        }
+        let mut remaining = boundary.logical_tokens;
+        let mut segments = Vec::new();
+        for segment in &self.segments {
+            if remaining == 0 {
+                break;
+            }
+            let segment_tokens = segment.logical_tokens();
+            if segment_tokens <= remaining {
+                segments.push(segment.clone());
+                remaining -= segment_tokens;
+            } else if let PromptSegment::Text(tokens) = segment {
+                segments.push(PromptSegment::Text(tokens[..remaining].to_vec()));
+                remaining = 0;
+            } else {
+                return None;
+            }
+        }
+        (remaining == 0).then_some(Self { segments })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PromptCheckpointState {
+    Target(LlamaSequenceState),
+    Speculative(SpeculativePromptState),
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PromptCheckpoint {
-    pub(crate) target: LlamaSequenceState,
-    pub(crate) draft: Option<LlamaSequenceState>,
-    pub(crate) prefix: usize,
+    pub(crate) state: PromptCheckpointState,
+    pub(crate) boundary: PromptBoundary,
 }
 
 #[derive(Debug)]
-pub(crate) struct SequenceCache {
-    pub(crate) prompt: Vec<LlamaToken>,
+pub(crate) struct ReusablePrefix {
+    pub(crate) layout: PromptLayout,
     pub(crate) checkpoints: Vec<PromptCheckpoint>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AvailableSequence {
+    id: i32,
+    pub(crate) reusable_prefix: Option<ReusablePrefix>,
+}
+
+impl AvailableSequence {
+    pub(crate) fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub(crate) fn activate(self) -> ActiveSequence {
+        ActiveSequence { id: self.id }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveSequence {
+    id: i32,
+}
+
+impl ActiveSequence {
+    pub(crate) fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub(crate) fn into_available(
+        self,
+        reusable_prefix: Option<ReusablePrefix>,
+    ) -> AvailableSequence {
+        AvailableSequence {
+            id: self.id,
+            reusable_prefix,
+        }
+    }
+
+    /// Consume capacity whose native state could not be made safe for another request.
+    pub(crate) fn quarantine(self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,90 +442,80 @@ impl BatchPlanner {
 
 #[derive(Debug)]
 pub(crate) struct SequencePool {
-    free: VecDeque<i32>,
-    owned: BTreeSet<i32>,
-    cached: BTreeMap<i32, SequenceCache>,
+    available: VecDeque<AvailableSequence>,
 }
 
 impl SequencePool {
     pub(crate) fn new(count: u32) -> Self {
         Self {
-            free: (0..count)
-                .map(|value| i32::try_from(value).expect("validated sequence count fits i32"))
+            available: (0..count)
+                .map(|value| AvailableSequence {
+                    id: i32::try_from(value).expect("validated sequence count fits i32"),
+                    reusable_prefix: None,
+                })
                 .collect(),
-            owned: BTreeSet::new(),
-            cached: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> Option<i32> {
-        let sequence_id = self.free.pop_front()?;
-        assert!(self.owned.insert(sequence_id), "sequence was already owned");
-        Some(sequence_id)
+    pub(crate) fn acquire(&mut self) -> Option<AvailableSequence> {
+        self.available.pop_front()
     }
 
-    pub(crate) fn acquire_matching(&mut self, prompt: &[LlamaToken]) -> Option<i32> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.available.is_empty()
+    }
+
+    pub(crate) fn acquire_matching(&mut self, prompt: &PromptLayout) -> Option<AvailableSequence> {
         let best = self
-            .free
+            .available
             .iter()
             .enumerate()
-            .max_by_key(|(_, sequence_id)| {
-                self.cached.get(sequence_id).map_or(0, |cache| {
-                    cache
-                        .prompt
-                        .iter()
-                        .zip(prompt)
-                        .take_while(|(left, right)| left == right)
-                        .count()
+            .max_by_key(|(_, sequence)| {
+                sequence.reusable_prefix.as_ref().map_or(0, |prefix| {
+                    prefix.layout.common_prefix(prompt).logical_tokens
                 })
             })
             .map(|(index, _)| index)?;
-        let sequence_id = self.free.remove(best)?;
-        assert!(self.owned.insert(sequence_id), "sequence was already owned");
-        Some(sequence_id)
+        self.available.remove(best)
     }
 
-    pub(crate) fn release(&mut self, sequence_id: i32) {
-        assert!(
-            self.owned.remove(&sequence_id),
-            "attempted to release an unowned sequence"
-        );
-        self.cached.remove(&sequence_id);
-        self.free.push_front(sequence_id);
+    pub(crate) fn release(&mut self, sequence: AvailableSequence) {
+        self.available.push_front(sequence);
     }
 
-    pub(crate) fn release_cached(&mut self, sequence_id: i32, cache: SequenceCache) {
-        assert!(
-            self.owned.remove(&sequence_id),
-            "attempted to release an unowned sequence"
-        );
-        self.cached.insert(sequence_id, cache);
-        self.free.push_front(sequence_id);
-    }
-
-    pub(crate) fn take_cache(&mut self, sequence_id: i32) -> Option<SequenceCache> {
-        self.cached.remove(&sequence_id)
-    }
-
-    /// Remove a sequence from service after native cleanup failed. Reusing it could expose one
-    /// request to another request's resident state, so capacity is deliberately reduced instead.
-    pub(crate) fn quarantine(&mut self, sequence_id: i32) {
-        assert!(
-            self.owned.remove(&sequence_id),
-            "attempted to quarantine an unowned sequence"
-        );
-        self.cached.remove(&sequence_id);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owned(&self) -> &BTreeSet<i32> {
-        &self.owned
+    /// Native context reset erases KV for available sequences as well as active ones.
+    pub(crate) fn invalidate_reuse(&mut self) {
+        for sequence in &mut self.available {
+            sequence.reusable_prefix = None;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_position_preserves_target_and_draft_coordinate_systems() {
+        let boundary = PromptBoundary {
+            logical_tokens: 4_096,
+            native_position: 137,
+        };
+        assert_eq!(
+            boundary.speculative_position(),
+            Some(SpeculativePosition {
+                target: 137,
+                draft: 4_096,
+            })
+        );
+        assert_eq!(
+            boundary.advance(3),
+            Some(PromptBoundary {
+                logical_tokens: 4_099,
+                native_position: 140,
+            })
+        );
+    }
 
     #[test]
     fn decode_work_always_precedes_prefill() {
@@ -316,70 +620,187 @@ mod tests {
         let mut pool = SequencePool::new(2);
         let first = pool.acquire().unwrap();
         let second = pool.acquire().unwrap();
-        assert_ne!(first, second);
-        assert_eq!(pool.acquire(), None);
-        assert_eq!(pool.owned(), &BTreeSet::from([first, second]));
+        assert_ne!(first.id(), second.id());
+        assert!(pool.acquire().is_none());
 
+        let first_id = first.id();
         pool.release(first);
-        assert_eq!(pool.acquire(), Some(first));
-        assert_eq!(pool.owned(), &BTreeSet::from([first, second]));
+        assert_eq!(pool.acquire().unwrap().id(), first_id);
+        assert!(pool.acquire().is_none());
+        drop(second);
     }
 
     #[test]
     fn failed_cleanup_quarantines_only_the_affected_sequence() {
         let mut pool = SequencePool::new(2);
-        let cancelled = pool.acquire().unwrap();
+        let quarantined = pool.acquire().unwrap().activate();
         let survivor = pool.acquire().unwrap();
-        pool.quarantine(cancelled);
+        quarantined.quarantine();
 
-        assert_eq!(pool.acquire(), None);
-        assert_eq!(pool.owned(), &BTreeSet::from([survivor]));
+        assert!(pool.acquire().is_none());
+        let survivor_id = survivor.id();
         pool.release(survivor);
-        assert_eq!(pool.acquire(), Some(survivor));
-        assert_eq!(pool.acquire(), None);
+        assert_eq!(pool.acquire().unwrap().id(), survivor_id);
+        assert!(pool.acquire().is_none());
     }
 
     #[test]
-    fn retained_cache_returns_with_the_same_sequence() {
+    fn returning_an_unmodified_available_sequence_preserves_its_reusable_prefix() {
         let mut pool = SequencePool::new(2);
-        let sequence = pool.acquire().unwrap();
-        pool.release_cached(
-            sequence,
-            SequenceCache {
-                prompt: vec![LlamaToken::new(7)],
-                checkpoints: Vec::new(),
-            },
-        );
-        assert_eq!(pool.acquire(), Some(sequence));
-        let cache = pool.take_cache(sequence).unwrap();
-        assert_eq!(cache.prompt, vec![LlamaToken::new(7)]);
-        assert!(cache.checkpoints.is_empty());
+        let available = pool.acquire().unwrap();
+        let sequence_id = available.id();
+        let active = available.activate();
+        pool.release(active.into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(7)]),
+            checkpoints: Vec::new(),
+        })));
+        let available = pool.acquire().unwrap();
+        assert_eq!(available.id(), sequence_id);
+        pool.release(available);
+        let returned = pool.acquire().unwrap();
+        let prefix = returned.reusable_prefix.unwrap();
+        assert_eq!(prefix.layout.text_tokens(), vec![LlamaToken::new(7)]);
+        assert!(prefix.checkpoints.is_empty());
     }
 
     #[test]
     fn matching_cache_is_selected_independently_of_free_order() {
         let mut pool = SequencePool::new(2);
         let first = pool.acquire().unwrap();
+        let first_id = first.id();
         let second = pool.acquire().unwrap();
-        pool.release_cached(
-            first,
-            SequenceCache {
-                prompt: vec![LlamaToken::new(1), LlamaToken::new(2)],
-                checkpoints: Vec::new(),
-            },
+        pool.release(first.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(1), LlamaToken::new(2)]),
+            checkpoints: Vec::new(),
+        })));
+        pool.release(second.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(7), LlamaToken::new(8)]),
+            checkpoints: Vec::new(),
+        })));
+
+        let acquired = pool
+            .acquire_matching(&PromptLayout::text(vec![
+                LlamaToken::new(1),
+                LlamaToken::new(9),
+            ]))
+            .unwrap();
+        assert_eq!(acquired.id(), first_id);
+    }
+
+    #[test]
+    fn context_reset_invalidates_available_reusable_prefixes() {
+        let mut pool = SequencePool::new(1);
+        let sequence = pool.acquire().unwrap().activate();
+        pool.release(sequence.into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(7)]),
+            checkpoints: Vec::new(),
+        })));
+
+        pool.invalidate_reuse();
+
+        assert!(pool.acquire().unwrap().reusable_prefix.is_none());
+    }
+
+    #[test]
+    fn multimodal_prefix_matches_identical_media_and_tracks_mrope_positions() {
+        let cached = multimodal_layout("image-a", &[1, 2], 576, 1, &[3, 4]);
+        let incoming = multimodal_layout("image-a", &[1, 2], 576, 1, &[3, 9]);
+
+        let boundary = cached.common_prefix(&incoming);
+        assert_eq!(
+            boundary,
+            PromptBoundary {
+                logical_tokens: 2 + 576 + 1,
+                native_position: 2 + 1 + 1,
+            }
         );
-        pool.release_cached(
-            second,
-            SequenceCache {
-                prompt: vec![LlamaToken::new(7), LlamaToken::new(8)],
-                checkpoints: Vec::new(),
-            },
+        assert_eq!(
+            boundary.speculative_position(),
+            Some(SpeculativePosition {
+                target: 4,
+                draft: 579,
+            })
         );
+    }
+
+    #[test]
+    fn multimodal_prefix_stops_before_changed_media() {
+        let cached = multimodal_layout("image-a", &[1, 2], 64, 64, &[3]);
+        let incoming = multimodal_layout("image-b", &[1, 2], 64, 64, &[3]);
 
         assert_eq!(
-            pool.acquire_matching(&[LlamaToken::new(1), LlamaToken::new(9)]),
-            Some(first)
+            cached.common_prefix(&incoming),
+            PromptBoundary {
+                logical_tokens: 2,
+                native_position: 2,
+            }
         );
+    }
+
+    #[test]
+    fn media_cannot_be_split_by_a_cache_boundary() {
+        let layout = multimodal_layout("image-a", &[1], 64, 1, &[2]);
+
+        assert!(layout.boundary_at(32).is_none());
+        assert!(
+            layout
+                .prefix(PromptBoundary {
+                    logical_tokens: 32,
+                    native_position: 32,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn checkpoint_inside_media_advances_to_the_next_semantic_boundary() {
+        let layout = multimodal_layout("image-a", &[1, 2], 512, 32, &[3, 4]);
+
+        assert_eq!(
+            layout.boundary_at_or_after(128),
+            Some(PromptBoundary {
+                logical_tokens: 514,
+                native_position: 34,
+            })
+        );
+        assert_eq!(
+            layout.boundary_at_or_after(515),
+            Some(PromptBoundary {
+                logical_tokens: 515,
+                native_position: 35,
+            })
+        );
+    }
+
+    #[test]
+    fn retained_partial_text_prefix_matches_longer_text_segment() {
+        let complete = PromptLayout::text(vec![
+            LlamaToken::new(1),
+            LlamaToken::new(2),
+            LlamaToken::new(3),
+        ]);
+        let boundary = complete.boundary_at(2).unwrap();
+        let retained = complete.prefix(boundary).unwrap();
+
+        assert_eq!(retained.common_prefix(&complete), boundary);
+    }
+
+    fn multimodal_layout(
+        identity: &str,
+        before: &[i32],
+        media_tokens: usize,
+        media_positions: i32,
+        after: &[i32],
+    ) -> PromptLayout {
+        PromptLayout::new(vec![
+            PromptSegment::Text(before.iter().copied().map(LlamaToken::new).collect()),
+            PromptSegment::Media {
+                identity: identity.to_owned(),
+                logical_tokens: media_tokens,
+                native_positions: media_positions,
+            },
+            PromptSegment::Text(after.iter().copied().map(LlamaToken::new).collect()),
+        ])
     }
 
     fn batch_size(work: &BatchWork) -> usize {

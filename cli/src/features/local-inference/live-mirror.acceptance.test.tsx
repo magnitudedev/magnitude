@@ -11,14 +11,12 @@ import {
 } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema, protocolLayer } from "@magnitudedev/sdk"
 import { deriveLocalInferenceFooterView } from "./footer-status"
+import { defaultCliThemes } from "../../utils/theme"
 
 const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 
 vi.mock("../../hooks/use-theme", () => ({
-  useTheme: () => ({
-    primary: "blue", secondary: "gray", info: "cyan", link: "blue",
-    foreground: "white", muted: "gray", border: "gray", warning: "magenta",
-  }),
+  useTheme: () => defaultCliThemes.dark,
 }))
 
 const acnUrl = Option.fromNullable(process.env.LIVE_ACN_URL)

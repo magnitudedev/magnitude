@@ -90,7 +90,7 @@ const rpcClient = (
                   primary: new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
                   secondary: new ModelSlotUnassigned({ slotId: SECONDARY_SLOT_ID }),
                 },
-                recentModelIds: { primary: [], secondary: [] },
+                recentModels: { primary: [], secondary: [] },
                 favoriteModels: [],
               },
             }

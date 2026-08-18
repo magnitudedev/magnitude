@@ -101,7 +101,7 @@ function DirectoryPicker(): ReactNode {
   const visibleLimit = limitState.query === trimmedQuery ? limitState.limit : DIRECTORY_PAGE_SIZE
 
   const directoriesAtom = useMemo(
-    () => client.query("SearchDirectories", {
+    () => client.rpc.query("SearchDirectories", {
       query: trimmedQuery,
       limit: visibleLimit,
       includeRecent: true,

@@ -1,7 +1,7 @@
 ---
 applies_to:
   - inference/crates/icn-engine/**
-  - inference/crates/icn-mtp/**
+  - inference/crates/icn-speculative/**
   - inference/crates/icn-contracts/src/lib.rs
   - inference/crates/icn-contracts/src/output.rs
   - inference/crates/icn-api/src/lib.rs
@@ -11,183 +11,182 @@ applies_to:
   - inference/native/llama-cpp-rs/llama-cpp-2/**
 ---
 
-# Inference engine design
+# Inference engine
 
-The Magnitude inference engine is a persistent, per-model serving runtime built around pinned upstream llama.cpp. It converts typed chat requests into token work, continuously batches multiple sequences, streams semantic output, and retains reusable prompt state. The engine is deliberately opinionated: one thread owns native model state, while bounded channels isolate callers and transport backpressure from that state.
+The inference engine is a persistent, per-model llama.cpp runtime. Magnitude owns request
+admission, batching, streaming, and sequence assignment; llama.cpp owns model execution and native
+KV state.
 
-Two subsystem documents carry the detailed policies:
+Detailed policy lives in:
 
-- [KV state reuse](./kv.md) describes standard llama.cpp sequence-state reuse and its safety boundary.
-- [Scheduler design](./scheduler.md) describes admission, batching, request state transitions, fairness, and failure handling.
-- [System memory management](./system-memory-management.md) relates model assessment, load admission, and
-  pressure eviction through one safety policy.
+- [KV state reuse](./kv.md)
+- [Scheduler](./scheduler.md)
+- [System memory management](./system-memory-management.md)
 
-## Influences
-
-The engine keeps **llama.cpp** as its native model runtime while Magnitude owns request admission,
-batching, streaming, and sequence assignment. Prompt reuse stays within llama.cpp's standard sequence
-state primitives; Magnitude does not duplicate the native KV representation.
-
-The engine receives per-request context separately from native physical context. A load resolved
-at sequence capacity `P` provisions `configured context × P` physical context while every request
-remains capped at the configured context. Version-one dynamic allocation uses partitioned native
-KV so llama.cpp's model-visible per-sequence context remains exact.
-
-## System shape
+## Runtime shape
 
 ```text
-API / caller threads in persistent ICN
-        │ bounded private IPC
-        ▼
-disposable inference worker process
-        │ bounded commands
-        ▼
-per-model executor thread
-  ├── chat preparation and tokenization
-  ├── waiting queue and active request state
-  ├── scheduler and sequence pool
-  │      └── retained llama.cpp sequence state
-  ├── llama.cpp target context
-  ├── optional multimodal runtime
-  └── optional MTP target/draft operations
-        │ bounded result streams
-        ▼
-IPC proxy / API caller
+persistent ICN
+  |
+  | bounded IPC
+  v
+disposable inference worker (one resident model)
+  |
+  | bounded commands
+  v
+single executor thread
+  +-- request preparation
+  +-- scheduler + sequence pool
+  +-- llama.cpp target context
+  +-- optional projector
+  `-- optional speculative target/draft state
+  |
+  | bounded result streams
+  v
+caller
 ```
 
-`NativeBackend` is the process-lifetime capability proving that llama.cpp's global backend is
-initialized. A persistent planning worker owns the capability used for calibration and assessment;
-resident loading initializes a distinct capability inside a disposable inference worker.
-`LlamaCompletionBackend` is the worker-local resident-model handle; persistent ICN publishes a
-bounded IPC proxy for it. Preparing a load starts the named executor thread, creates a fresh
-worker-process-local backend plan on that thread, and returns a `PreparedModelLoad` only after the
-exact plan is fixed. The non-`Send` native plan remains on its owner thread; executing the prepared
-handle releases that thread to consume the exact owned plan and initialize the model, context, chat templates, worker
-pools, and optional projector or MTP runtime. It then returns a typed readiness result which
-distinguishes invalid or incompatible artifacts, `DoesNotFit`, operational planning failure,
-allocation failure, and success with normalized resolved evidence. The
-handle exposes completion, template application, model properties, and idle-only native planning
-operations.
+The executor thread is the only owner and mutator of resident native state. Callers are concurrent;
+native model, context, sequence, sampler, and shutdown operations are serialized.
 
-Execution intent is policy, not an executable plan. Native defaults, tensor splits, arbitrary
-tensor-buffer placements, model/context parameters, and auxiliary context parameters are built in
-one ICN planner implementation. They are retained in pointer-safe owned native objects and passed
-directly to loading. The engine never reconstructs them from a serialized summary. Preview uses the
-same planner but destroys the process-local plan and caches only normalized assessment evidence;
-loading always replans under current conditions.
+Persistent ICN owns no resident executor. Worker exit reclaims the complete resident topology.
 
-Prepared execution reports synchronous semantic boundaries for target model, target context,
-optional draft model and context, optional projector, runtime setup, warm-up, and finalization.
-These boundaries describe completed engine work; they are not native tensor percentages and do not
-claim that any individual phase exposes byte-level completion.
+## Planning and loading
 
-## Ownership and concurrency
+Execution intent is policy, not a native plan. One planner resolves native defaults, device and
+tensor placement, model/context parameters, and optional components.
 
-One executor thread exclusively owns each model's mutable native resources. This gives the engine a clear serialization boundary for llama.cpp memory operations, sequence mutations, sampling state, and shutdown. Callers may be concurrent, but they communicate with the owner rather than locking the native context directly.
+```text
+execution intent
+      |
+      v
+native planner -----> normalized assessment evidence
+      |
+      `-------------> process-local owned plan -----> resident load
+```
 
-Persistent ICN owns no resident native executor. One disposable worker owns exactly one
-resident-backend capability and its executor; worker exit reclaims the complete resident topology.
-The resident executor exclusively owns model, context, and scheduler mutation. Load-time MTP
-selection, allocation planning, and model construction occur inside that worker from the serialized
-execution intent. The selected MTP configuration remains part of the execution intent passed to allocation planning, so
-target and draft memory are assessed together. A serving-process preflight must never initialize a
-temporary backend. Model assessment uses the persistent planning worker; each inference worker
-creates one backend capability for its complete process lifetime. Worker capability
-construction is installation-bound: the persistent service transfers its verified installation
-authority to every installed worker, which registers and validates that exact runtime before
-initialization. Knowing the executable path is not native-runtime authority.
-The same MTP selector implementation and policy fingerprint are used in isolated assessment and
-resident loading. Target identity includes the selected component set and serving-configuration
-revision, and parity tests compare normalized fit evidence with loaded execution evidence.
+Rules:
 
-There are four bounded flows:
+- Native plans are pointer-safe, process-local values and are never reconstructed from summaries.
+- Assessment discards its plan; resident loading replans under current conditions.
+- Assessment and loading use the same speculative-decoding selector and policy fingerprint.
+- Execution identity includes the selected components and serving-configuration revision.
+- A serving worker initializes one installation-authorized native backend for its lifetime.
+- Load success requires exhaustive resident-allocation evidence with every location resolved to one
+  physical memory domain.
+- Load readiness distinguishes incompatible artifacts, insufficient memory, planning failure,
+  allocation failure, and success with normalized evidence.
 
-- the host/worker framed IPC queues bound cross-process demand and retained payload bytes;
-- the model command queue bounds queued demand;
-- each request's native-to-caller event channel bounds transport buffering;
-- each active request's small outbound queue decouples native scheduling from a briefly slow consumer.
+A resolved sequence capacity of `P` provisions `configured context x P` physical context while each
+request remains capped at the configured context. The current allocator uses partitioned native KV
+to preserve that per-request limit.
 
-Read-only hardware observations share the bounded model command channel. They run between scheduler
-batches and may inspect backend device memory plus
-immutable generation allocation evidence. They cannot mutate model/context state, plan a load, or
-delay until all inference becomes idle. General native planning callbacks remain idle-only.
+Prepared execution reports completed semantic phases—target model, context, optional components,
+setup, warm-up, and finalization. These phases are not byte-level native progress.
 
-Resident allocation capture is part of model-load success. The binding returns an exhaustive typed
-capture error; the engine fails the load rather than retaining an unavailable-evidence sentinel.
-Every captured native location must resolve to one physical memory domain before a loaded runtime's
-hardware snapshot is published.
+## Request flow
 
-This design avoids unbounded queues and makes overload explicit. It also means synchronous native work and current KV tier I/O can pause progress for all sequences owned by that executor.
+```text
+submit
+  -> prepare + tokenize
+  -> wait for sequence capacity
+  -> restore exact reusable prefix or cold-prefill
+  -> prefill / decode / sample
+  -> stop, cancel, disconnect, or fail
+  -> retain committed semantic prefix when safe
+  -> terminal result
+```
 
-## Request lifecycle
+Prompt progress becomes committed only after target decode and linked speculative processing
+succeed, including every token or embedding sub-batch in a multimodal prompt.
+Batch effects are staged separately from requests until that boundary. A sampled token becomes
+committed only when a later decode or speculative-verification step accepts it.
+Multimodal projector execution supports only speculative methods that can advance from embedding
+sub-batches; MTP is rejected during configuration validation.
 
-At a high level, a completion follows this path:
+Linked speculative execution carries two explicit coordinates at every boundary: the target's
+native position and the draft context's consecutive logical-token position. Text-only execution
+advances them together. M-RoPE media may advance the target coordinate differently, so the binding
+mirrors target batch rows through a lightweight position view rather than passing target positions
+to the draft model. Draft preparation, verification, rollback, and trimming consume the same
+linked boundary; there is no independently inferred draft cursor.
 
-1. The caller submits a typed chat request and cancellation flag.
-2. The executor validates/prepares the chat template and queues the request.
-3. The scheduler tokenizes and admits it when a sequence and KV capacity are available.
-4. A reusable prompt prefix is retained or restored from standard sequence state when eligible.
-5. Prefill and decode tokens join continuous native batches.
-6. Ready logits are sampled and decoded into UTF-8 and semantic stream events.
-7. Stop conditions, generation limits, cancellation, or errors make the request terminal.
-8. Committed KV history is retained when eligible, the sequence is cleared/released, and a final generation or failure is delivered.
+Prepared prompts use one semantic representation for text-only and multimodal requests. Text spans
+contain exact model tokens; media spans contain a stable content identity, their logical
+token cost, and their native position cost. Exact media spans can therefore reuse resident KV just
+like text while remaining indivisible. The binding exposes upstream single-chunk MTMD evaluation;
+Magnitude does not modify or recreate llama.cpp projector behavior.
 
-Prompt K/V is considered committed only after native decode succeeds. The currently sampled token remains outside committed history until a subsequent decode or verification step commits it. That boundary protects both cache correctness and recovery after speculative or native failure.
+Lifecycle observations report queueing, preparation, prefill, and generation start. They are
+coalesced, rate-limited latest-state signals and may be replaced rather than delay inference.
+Semantic output and terminal results retain bounded backpressure.
 
-The request stream also carries typed, non-semantic lifecycle observations for queueing,
-preparation, prefill, and generation start. Prefill counts advance only after the corresponding
-native decode batch succeeds and distinguish the reusable cached prefix from the total prompt.
-These observations are latest-state signals: the executor coalesces them, emits them at a bounded
-rate, and drops or replaces an update rather than allowing progress reporting to delay inference.
-Semantic output and terminal results retain their existing bounded backpressure guarantees.
+## Bounded concurrency
+
+| Flow | Bound |
+| --- | --- |
+| Host to worker | Framed IPC queues |
+| Worker to executor | Model command queue |
+| Executor to request | Per-request event channel |
+| Native scheduling to transport | Small per-request outbound queue |
+
+A slow consumer pauses native work only for its request. Synchronous native operations may still
+pause all sequences on the executor.
+
+Read-only hardware observations share the command queue and run between batches. They may inspect
+device memory and immutable allocation evidence but cannot mutate state or plan a load. Other native
+planning work is idle-only.
 
 ## Prompt state
 
-The engine retains committed prompt state per free native sequence and assigns the longest exact
-prefix match at admission. This avoids a second physical-cache abstraction and works for every
-architecture supported by the selected upstream llama.cpp primitives. Unified KV remains an
-ordinary native execution option, not a prerequisite for a Magnitude-specific page cache.
+An available native sequence carries its optional reusable prefix as one owned value. Admission
+chooses the longest exact semantic match and transfers the sequence into active ownership. Native
+KV never leaves llama.cpp. Logical token counts drive capacity and progress; native positions drive
+KV trimming and continuation, including M-RoPE prompts where those values differ.
+When speculation is active, a reusable checkpoint is one value containing the linked boundary and
+a binding-owned prompt state with target state, draft state, and any method-owned state. A
+target-only or partially restored speculative checkpoint is not representable.
 
-## Scheduler loop
+Cancellation and stream disconnection do not make committed semantic state ambiguous. They
+preserve it when cache policy permits. See [KV state reuse](./kv.md) for invalidation rules.
 
-Each executor iteration performs a bounded amount of orchestration:
+## Failure and shutdown
 
-1. Drain new commands.
-2. Service one read-only hardware observation when pending.
-3. Run exclusive native tasks only if inference is idle.
-4. Clean up terminal or disconnected requests.
-5. Admit queued completions while sequences and KV capacity permit.
-6. Sample requests whose logits are ready and update committed sequence histories.
-7. Build and execute one decode/prefill batch.
-8. Flush outputs and clean up again.
-9. Poll for commands briefly when no native work ran.
+| Event | Effect |
+| --- | --- |
+| Validation, cancellation, disconnection, request-local failure | Affect one request; retain its committed semantic prefix when eligible |
+| Shared native batch failure | Reset target/draft context state and invalidate all prefixes in that context |
+| Sequence cleanup failure | Quarantine that sequence ID |
+| Shutdown | Reject queued work, fail active work, release state, join the executor |
 
-The detailed admission and batching policy is in [scheduler.md](./scheduler.md). The important architectural property is that scheduling decisions and the KV mutations they depend on occur under the same single-owner loop.
+Prompt reuse is optional: missing state always falls back to cold prefill.
 
 ## Output and observability
 
-Native token results pass through UTF-8 buffering, stop detection, and a semantic stream parser before reaching the API. Transport-specific tool-call policy remains outside the native parser. Timing snapshots can be emitted with stream events, and final generation metrics include:
+Token output passes through UTF-8 buffering, stop detection, and semantic parsing. Transport-specific
+tool-call policy remains outside the native parser.
 
-- queue, prompt, decode, and time-to-first-token durations;
-- prompt and decode throughput;
-- sampler and parser time;
-- reused prompt-token counts;
-- speculative draft, acceptance, and verification metrics when MTP is active.
+Final metrics cover queue, prompt, decode, first-token latency, throughput, sampler/parser time,
+reused prompt tokens, and speculative draft/acceptance/verification when enabled. The server also
+reports the selected method, effective draft bounds, and resolved execution configuration.
+Lifecycle control chunks contain no semantic choices.
 
-The server reports the effective resolved execution configuration so observed behavior can be tied to the loaded plan.
-The API represents lifecycle observations as typed control chunks with no choices. Provider
-adapters must consume those chunks outside the semantic model-output codec.
+## Boundaries
 
-## Failure model
+The engine provides no cross-process or restart-persistent KV sharing, request migration,
+paged-attention block table, prefix-aware queue ordering, or benefit-aware preemption. A new native
+fork must first establish that upstream primitives cannot provide the required behavior and receive
+explicit approval under the inference fork-maintenance policy.
 
-Prompt reuse is an optimization; unavailable state falls back to cold prefill. Request-local validation and cancellation fail only the affected request where possible. Native batch failure is treated more conservatively because several sequences may share one context and a single decode call: the executor synchronizes and clears affected native memory before admitting more work.
+## Acceptance criteria
 
-Sequence IDs whose cleanup fails are quarantined rather than returned to the free pool. Shutdown rejects new work, fails queued work, releases active state, and joins the owner thread.
-
-## Design boundaries
-
-The current engine is not a distributed cache or a general GPU serving fabric. It has no
-cross-process KV sharing, restart-persistent KV state, request migration, paged-attention block
-table, prefix-aware queue ordering, or benefit-aware preemption. Any future low-level native change
-must establish that upstream primitives cannot provide the required behavior and requires explicit
-approval under the inference fork-maintenance policy.
+- One executor exclusively owns all mutable native state for a loaded model.
+- All command and result paths are bounded.
+- Request-visible prompt progress reflects committed native work only.
+- Prompt reuse is optional and cannot change inference semantics.
+- Assessment and resident loading produce comparable normalized execution evidence.
+- MTP, DFlash, and DSpark use one shared speculative lifecycle; method-specific behavior remains
+  explicit and is delegated to the pinned native implementation.
+- Target and draft state advance atomically. Failure after either side advances resets both before
+  the sequence can be reused.
+- Every speculative operation uses an explicit target-native/draft-sequential position pair.

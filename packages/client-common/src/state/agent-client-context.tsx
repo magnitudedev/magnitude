@@ -1,12 +1,11 @@
 /**
- * AgentClient runtime — stores the created AtomRpc tag instance and
- * provides it to components via React context.
+ * ACN client context. Domains use either AtomRpc or Effect Query according to
+ * their state ownership; a single domain never uses both.
  *
  * At renderer startup:
- * 1. Call createAgentClient(protocolLayer) — this creates the AtomRpc.Tag and
- *    calls Atom.runtime.addGlobalLayer(tag.layer)
+ * 1. Call createAgentClient(protocolLayer)
  * 2. Wrap the app in <AgentClientProvider tag={tag}>
- * 3. Components use useAgentClient() to call .query() and .mutation()
+ * 3. Effect Query domains materialize static definitions through .effectQuery
  */
 import { createContext, useContext, type ReactNode } from "react"
 import type { AgentClientInstance } from "./agent-client"
@@ -27,13 +26,12 @@ export function AgentClientProvider({ tag, children }: AgentClientProviderProps)
 }
 
 /**
- * Get the AgentClient AtomRpc tag from context.
- * Use this to call .query() and .mutation() in components.
+ * Get the connection client from context.
  */
 export function useAgentClient(): AgentClientInstance {
-  const tag = useContext(AgentClientContext)
-  if (!tag) {
+  const client = useContext(AgentClientContext)
+  if (!client) {
     throw new Error("useAgentClient must be used within an AgentClientProvider")
   }
-  return tag
+  return client
 }

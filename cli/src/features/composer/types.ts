@@ -1,6 +1,7 @@
 import type { DisplayMessage, DisplayTimeline, LocalModelsState, ModelSlotsState, ProviderId, RawImageAttachment, RawMentionOccurrence, ReasoningEffort, SlotId } from '@magnitudedev/sdk'
 import type { KeyEvent } from '@opentui/core'
-import type { ChatTheme } from '../../types/theme-system'
+import type { CliTheme } from '../../types/theme-system'
+import type { NotificationState, SlashCommandOutcome } from '@magnitudedev/client-common'
 
 /**
  * Composer presentational props — individual and typed (spec §5.6: no prop
@@ -30,13 +31,14 @@ export type ComposerProps = {
   displayMode: 'default' | 'transcript'
 
   // Presentation
-  theme: ChatTheme
+  theme: CliTheme
   modeColor: string
   chatColumnWidth: number
   attachmentsMaxWidth: number
   composerCanFocus: boolean
   widgetNavActive: boolean
   isWorkerView: boolean
+  notificationState: NotificationState | null
 
   // Autopilot (disabled)
   enableAutopilot: boolean
@@ -50,13 +52,14 @@ export type ComposerProps = {
     imageAttachments: RawImageAttachment[]
     mentions: RawMentionOccurrence[]
   }) => void
-  runSlashCommand: (commandText: string) => boolean | void
+  runSlashCommand: (commandText: string) => SlashCommandOutcome
   executeBash: (command: string) => boolean | Promise<boolean>
   clearSystemBanners: () => void
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
   openSettings: () => void
   openHardware: () => void
+  openCatalog: () => void
   thinkingOptions: readonly { value: ReasoningEffort; label: string }[]
   applyThinking: (effort: ReasoningEffort) => void
   handleWidgetKeyEvent: (key: KeyEvent) => boolean

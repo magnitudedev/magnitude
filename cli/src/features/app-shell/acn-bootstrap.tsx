@@ -6,6 +6,7 @@ import type {
   AcnLifecycleState,
   AcnStartingPhase,
 } from "@magnitudedev/sdk";
+import { formatStorageSize } from "@magnitudedev/client-common";
 import { ProgressBar } from "../../components/progress-bar";
 import { useTheme } from "../../hooks/use-theme";
 
@@ -16,9 +17,8 @@ const PHASE_LABELS: Readonly<Record<AcnInstallationPhase, string>> = {
 };
 
 const STARTING_PHASE_LABELS: Readonly<Record<Extract<AcnStartingPhase, string>, string>> = {
-  Discovering: "Looking for Magnitude",
+  PreparingAcn: "Preparing background server",
   WaitingForOwner: "Waiting for previous Magnitude process",
-  LaunchingAcn: "Starting Magnitude",
   ResolvingLocalInference: "Preparing local inference",
   LaunchingLocalInference: "Starting local inference",
 };
@@ -31,11 +31,6 @@ const startingPhaseLabel = (phase: AcnStartingPhase): string =>
 const INSTALLATION_PANEL_WIDTH = 64;
 const PROGRESS_BAR_WIDTH = 36;
 const PERCENTAGE_WIDTH = 5;
-
-const formatBytes = (bytes: number): string => {
-  const mebibytes = bytes / (1024 * 1024);
-  return `${mebibytes.toFixed(1)} MiB`;
-};
 
 export function AcnBootstrapScreen({
   state,
@@ -80,14 +75,14 @@ export function AcnBootstrapScreen({
     return (
       <box
         style={{
-          backgroundColor: theme.background,
+          backgroundColor: theme.background.canvas,
           flexGrow: 1,
           flexDirection: "column",
           justifyContent: "center",
           alignItems: "center",
         }}
       >
-        <text style={{ fg: theme.error }} attributes={TextAttributes.BOLD}>
+        <text style={{ fg: theme.status.failure }} attributes={TextAttributes.BOLD}>
           {title}
         </text>
         <box
@@ -98,10 +93,10 @@ export function AcnBootstrapScreen({
             paddingRight: 2,
           }}
         >
-          <text style={{ fg: theme.foreground }}>{state.message}</text>
+          <text style={{ fg: theme.text.body }}>{state.message}</text>
         </box>
         <box style={{ marginTop: 2 }}>
-          <text style={{ fg: theme.muted }}>R Retry Q Quit</text>
+          <text style={{ fg: theme.text.supporting }}>R Retry Q Quit</text>
         </box>
       </box>
     );
@@ -115,7 +110,7 @@ export function AcnBootstrapScreen({
     state.detailIsExact &&
     Option.isSome(state.detail) &&
     state.detail.value.unit === "Bytes"
-      ? ` · ${formatBytes(state.detail.value.completed)} of ${formatBytes(
+      ? ` · ${formatStorageSize(state.detail.value.completed)} of ${formatStorageSize(
           state.detail.value.totalBytes
         )}`
       : "";
@@ -123,7 +118,7 @@ export function AcnBootstrapScreen({
   return (
     <box
       style={{
-        backgroundColor: theme.background,
+        backgroundColor: theme.background.canvas,
         flexGrow: 1,
         flexDirection: "column",
         justifyContent: "center",
@@ -139,7 +134,7 @@ export function AcnBootstrapScreen({
           }}
         >
           <text
-            style={{ fg: theme.foreground }}
+            style={{ fg: theme.text.body }}
             attributes={TextAttributes.BOLD}
           >
             Installing Magnitude
@@ -161,7 +156,7 @@ export function AcnBootstrapScreen({
                 alignItems: "flex-end",
               }}
             >
-              <text style={{ fg: theme.muted }}>{`${percentage}%`}</text>
+              <text style={{ fg: theme.text.supporting }}>{`${percentage}%`}</text>
             </box>
           </box>
           <box
@@ -171,7 +166,7 @@ export function AcnBootstrapScreen({
               alignItems: "center",
             }}
           >
-            <text style={{ fg: theme.muted }}>
+            <text style={{ fg: theme.text.supporting }}>
               {`${PHASE_LABELS[state.phase]}${downloadDetail}`}
             </text>
           </box>
@@ -185,12 +180,12 @@ export function AcnBootstrapScreen({
           }}
         >
           <text
-            style={{ fg: theme.foreground }}
+            style={{ fg: theme.text.body }}
             attributes={TextAttributes.BOLD}
           >
             Starting Magnitude
           </text>
-          <text style={{ fg: theme.muted }}>
+          <text style={{ fg: theme.text.supporting }}>
             {startingPhaseLabel(state.phase)}
           </text>
         </box>

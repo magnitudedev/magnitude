@@ -1,8 +1,9 @@
-import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option, Schema } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
 import {
   ModelDownloadsResponse as ModelDownloadsResponseSchema,
-  type DownloadAttempt,
+  type ModelDownload,
+  type StartModelDownloadResponse,
 } from "@magnitudedev/icn-protocol/schemas"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
 
@@ -12,7 +13,8 @@ type DownloadsReadError = Effect.Effect.Error<
 
 export interface IcnDownloadsService
   extends IcnObservedState<ModelDownloadsResponseSchema, DownloadsReadError> {
-  readonly observeAttempt: (attempt: DownloadAttempt) => Effect.Effect<void>
+  readonly observeDownload: (download: ModelDownload) => Effect.Effect<void>
+  readonly observeAdmission: (admission: StartModelDownloadResponse) => Effect.Effect<void>
 }
 
 export class IcnDownloads extends Context.Tag("@magnitudedev/icn/IcnDownloads")<
@@ -39,16 +41,16 @@ export const makeIcnDownloads = (
         read,
         Schema.equivalence(ModelDownloadsResponseSchema),
       )
-      const hasActiveAttempt = observed.get.pipe(Effect.map(({ state }) =>
-        state.attempts.some((attempt) =>
-          attempt._tag === "Pending" || attempt._tag === "Downloading")))
+      const hasActiveDownload = observed.get.pipe(Effect.map(({ state }) =>
+        state.downloads.some(({ state }) =>
+          state._tag === "Pending" || state._tag === "Downloading")))
       const poll = Effect.gen(function* () {
-        const active = yield* hasActiveAttempt
+        const active = yield* hasActiveDownload
         yield* Effect.sleep(active
           ? options.refreshInterval ?? "1 second"
           : options.idleRefreshInterval ?? "5 seconds")
         yield* observed.refresh.pipe(
-          Effect.tapError((error) => Effect.logWarning("Unable to refresh model download attempts").pipe(
+          Effect.tapError((error) => Effect.logWarning("Unable to refresh model downloads").pipe(
             Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
           )),
           Effect.option,
@@ -58,22 +60,31 @@ export const makeIcnDownloads = (
         Effect.forever,
         Effect.forkScoped,
       )
-      const observeAttempt = (attempt: DownloadAttempt) => observed.update((state) => {
-        const existing = state.attempts.findIndex(({ id }) => id === attempt.id)
+      const observeDownload = (download: ModelDownload) => observed.update((state) => {
+        const existing = state.downloads.findIndex(({ id }) => id === download.id)
         if (existing === -1) {
-          return { attempts: [...state.attempts, attempt] }
+          return { ...state, downloads: [...state.downloads, download] }
         }
         return {
-          attempts: state.attempts.map((current, index) =>
-            index === existing ? attempt : current),
+          ...state,
+          downloads: state.downloads.map((current, index) =>
+            index === existing ? download : current),
         }
       })
+      const observeAdmission = (admission: StartModelDownloadResponse) => Option.match(
+        admission.download,
+        {
+          onNone: () => Effect.void,
+          onSome: observeDownload,
+        },
+      )
       return IcnDownloads.of({
         get: observed.get,
         changes: observed.changes,
         initialized: observed.initialized,
         refresh: observed.refresh,
-        observeAttempt,
+        observeDownload,
+        observeAdmission,
       })
     }),
   )

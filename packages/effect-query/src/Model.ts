@@ -50,14 +50,14 @@ export interface QueryFilter {
   readonly predicate?: (entry: QueryMetadata) => boolean
 }
 
-export type MutationExecutionId = string & Brand.Brand<"MutationExecutionId">
-export const MutationExecutionId = Brand.nominal<MutationExecutionId>()
+export type MutationStateId = string & Brand.Brand<"MutationStateId">
+export const MutationStateId = Brand.nominal<MutationStateId>()
 
 export type MutationScope = string & Brand.Brand<"MutationScope">
 export const MutationScope = Brand.nominal<MutationScope>()
 
-export interface MutationExecution<Input, Output, Error> {
-  readonly id: MutationExecutionId
+export interface MutationState<Input, Output, Error> {
+  readonly id: MutationStateId
   readonly mutation: MutationDefinition
   readonly input: Input
   readonly result: AtomResult.Result<Output, Error>
@@ -66,14 +66,14 @@ export interface MutationExecution<Input, Output, Error> {
   readonly settledAt: Option.Option<number>
 }
 
-/** A mutation execution after crossing the heterogeneous client-history boundary. */
-export type AnyMutationExecution = MutationExecution<unknown, unknown, unknown>
+/** Mutation state after crossing the heterogeneous client-history boundary. */
+export type AnyMutationState = MutationState<unknown, unknown, unknown>
 
 export interface MutationFilter {
   readonly mutation?: MutationDefinition
   readonly scope?: MutationScope
-  readonly status?: "pending" | "success" | "failure"
-  readonly predicate?: (execution: AnyMutationExecution) => boolean
+  readonly status?: "pending" | "success" | "error"
+  readonly predicate?: (state: AnyMutationState) => boolean
 }
 
 export type QueryClientEvent =
@@ -82,10 +82,10 @@ export type QueryClientEvent =
   | { readonly _tag: "FetchStarted"; readonly name: string; readonly keyHash: number }
   | { readonly _tag: "FetchSettled"; readonly name: string; readonly keyHash: number; readonly success: boolean }
   | { readonly _tag: "QueryInvalidated"; readonly name: string; readonly keyHash: number }
-  | { readonly _tag: "MutationStarted"; readonly name: string; readonly id: MutationExecutionId }
+  | { readonly _tag: "MutationStarted"; readonly name: string; readonly id: MutationStateId }
   | {
     readonly _tag: "MutationSettled"
     readonly name: string
-    readonly id: MutationExecutionId
+    readonly id: MutationStateId
     readonly success: boolean
   }

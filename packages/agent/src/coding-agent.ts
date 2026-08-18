@@ -44,8 +44,8 @@ import { GoalProjection } from './projections/goal'
 
 
 // Workers
-import { TurnController } from './workers/turn-controller'
-import { Cortex } from './workers/cortex'
+import { TurnInitiator } from './workers/turn-initiator'
+import { TurnExecutor } from './workers/turn-executor'
 import { AgentLifecycle } from './workers/agent-lifecycle'
 import { RetryController } from './workers/retry-controller'
 import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
@@ -169,8 +169,8 @@ export const CodingAgent = EventEngine.make<AppEvent>()({
   ],
 
   workers: [
-    TurnController,
-    Cortex,
+    TurnInitiator,
+    TurnExecutor,
     AgentLifecycle,
     RetryController,
     LifecycleCoordinator,
@@ -679,7 +679,10 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           if (!slotConfig || !slotConfig.isUserOverride) return
           if (slotConfig.providerId === 'local') return
 
-          yield* options.storage.config.updateModelSlot(SlotIdSchema.make(slotId), Option.none()).pipe(
+          yield* options.storage.models.update((current) => ({
+            ...current,
+            slots: { ...current.slots, [SlotIdSchema.make(slotId)]: Option.none() },
+          })).pipe(
             Effect.catchAll(() =>
               Effect.logWarning(`Self-heal: failed to clear override for slot ${slotId}`)
             ),

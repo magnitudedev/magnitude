@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import {
   ModelFamilyIdSchema,
   ProviderIdSchema,
@@ -31,7 +31,7 @@ describe("provider identity brands", () => {
       },
       servingCapabilities: { tools: true, structuredOutput: false },
       availability: { _tag: "Available" },
-      pricing: { input: 0, output: 0, cached_input: null },
+      pricing: Option.some({ input: 0, output: 0, cached_input: null }),
     })
 
     expect(model.providerId).toBe("local")

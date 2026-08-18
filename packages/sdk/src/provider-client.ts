@@ -98,6 +98,7 @@ export type {
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export type { WebSearchError } from "@magnitudedev/providers"
 export { formatWebSearchError } from "@magnitudedev/providers"
+export { createCustomEndpointProvider, customEndpointProviderId } from "@magnitudedev/providers"
 export type { UsagePeriod } from "@magnitudedev/acn-protocol"
 
 // =============================================================================

@@ -2,7 +2,12 @@ import { resolve } from "path";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot, type Root } from "@opentui/react";
 import { Command } from "@commander-js/extra-typings";
-import { Atom, RegistryProvider } from "@effect-atom/atom-react";
+import {
+  Atom,
+  Registry,
+  RegistryContext,
+  scheduleTask,
+} from "@effect-atom/atom-react";
 import { FetchHttpClient } from "@effect/platform";
 import { BunContext } from "@effect/platform-bun";
 import {
@@ -12,6 +17,8 @@ import {
   DisplayViewControllerProvider,
   deriveCliExitNotice,
   stopDisplayViewController,
+  pushNotificationAtom,
+  onboardingModelSetupViewAtom,
 } from "@magnitudedev/client-common";
 import {
   isDevelopmentVersion,
@@ -34,7 +41,13 @@ import {
 } from "./utils/graceful-shutdown";
 import { createTerminalPlatform, stopTerminalAcn } from "./platform/terminal";
 import { makeCliEffectLoggingLayer } from "./platform/effect-logger";
-import { Array as Arr, Effect, Option } from "effect";
+import { Array as Arr, Effect, Exit, Option, Scope } from "effect";
+import { registerDocsCommand } from "./commands/docs";
+import {
+  detectTerminalAppearance,
+  installTerminalAppearanceRuntime,
+} from "./platform/terminal-appearance";
+import { terminalAppearanceAtom } from "./hooks/use-theme";
 
 const isDevelopmentBuild = (): boolean =>
   import.meta.url.endsWith(".tsx") ||
@@ -51,12 +64,13 @@ const createUpdater = (developmentBuild: boolean): Promise<CliUpdaterShape> =>
 
 const waitForUpdatePrompt = (
   root: Root,
+  atomRegistry: ReturnType<typeof Registry.make>,
   latestVersion: string,
   action: UpdateAction,
 ): Effect.Effect<UpdatePromptOutcome> => Effect.async((resume) => {
   let resolved = false;
   root.render(
-    <RegistryProvider defaultIdleTTL={5000}>
+    <RegistryContext.Provider value={atomRegistry}>
       <UpdatePrompt
         currentVersion={CLI_VERSION}
         latestVersion={latestVersion}
@@ -67,7 +81,7 @@ const waitForUpdatePrompt = (
           resume(Effect.succeed(outcome));
         }}
       />
-    </RegistryProvider>,
+    </RegistryContext.Provider>,
   );
 });
 
@@ -168,6 +182,8 @@ async function main() {
       await Effect.runPromise(executeUpdate(updater, updater.updateAction.value));
     });
 
+  registerDocsCommand(program);
+
   program.action(async (opts) => {
     const sessionStart: SessionStart =
       opts.resume === undefined
@@ -205,8 +221,15 @@ async function main() {
         ])
       : Option.none();
 
+    const atomRegistry = Registry.make({
+      scheduleTask,
+      defaultIdleTTL: 5_000,
+    });
     const effectLoggingLayer = makeCliEffectLoggingLayer({
       debug: opts.debug === true,
+      publishNotification: (notification) => {
+        atomRegistry.set(pushNotificationAtom, notification);
+      },
     });
     Atom.runtime.addGlobalLayer(effectLoggingLayer);
     const updater = await createUpdater(isDev);
@@ -222,6 +245,19 @@ async function main() {
     const renderer = await createCliRenderer({
       exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
     });
+    const terminalAppearance = await Effect.runPromise(
+      detectTerminalAppearance(renderer)
+    );
+    atomRegistry.set(terminalAppearanceAtom, terminalAppearance);
+    const terminalAppearanceScope = await Effect.runPromise(Scope.make());
+    await Effect.runPromise(
+      installTerminalAppearanceRuntime(renderer, atomRegistry).pipe(
+        Effect.provideService(Scope.Scope, terminalAppearanceScope)
+      )
+    );
+    renderer.once("destroy", () => {
+      Effect.runFork(Scope.close(terminalAppearanceScope, Exit.void));
+    });
     const removePromptShutdownHandlers = installGracefulShutdownHandlers(
       renderer,
     );
@@ -230,6 +266,7 @@ async function main() {
       const promptRoot = createRoot(renderer);
       const outcome = await Effect.runPromise(waitForUpdatePrompt(
         promptRoot,
+        atomRegistry,
         upgradeVersion.value,
         updater.updateAction.value,
       ));
@@ -259,11 +296,20 @@ async function main() {
       renderer.destroy();
       throw error;
     }
+    const initialAcnLifecycleState = await Effect.runPromise(
+      platform.acnStartup.prepare
+    );
+    const agentClientTag = createAgentClient(platform.protocolLayer, {
+      onboardingSetupInitiallyOpen: opts.setup ?? false,
+    });
+    await Effect.runPromise(Effect.exit(
+      Registry.getResult(
+        atomRegistry,
+        onboardingModelSetupViewAtom(agentClientTag),
+      ),
+    ));
     let modelExitNotice: string | undefined;
     removePromptShutdownHandlers();
-
-    // Terminal background detection is handled by useTerminalBgDetection
-    // inside the React tree (needs atom registry to write to themeAtom)
 
     installGracefulShutdownHandlers(
       renderer,
@@ -289,15 +335,10 @@ async function main() {
       }
     );
 
-    const initialAcnLifecycleState = await Effect.runPromise(
-      platform.acnStartup.prepare
-    );
-    const agentClientTag = createAgentClient(platform.protocolLayer);
-
     const root = createRoot(renderer);
     root.render(
       <PlatformProvider platform={platform}>
-        <RegistryProvider defaultIdleTTL={5000}>
+        <RegistryContext.Provider value={atomRegistry}>
           <AgentClientProvider tag={agentClientTag}>
             <DisplayViewControllerProvider>
               <CliApp
@@ -305,7 +346,6 @@ async function main() {
                 initialPrompt={opts.prompt}
                 goal={opts.goal}
                 envAuth={resolveEnvAuth()}
-                forceLocalInferenceSetup={opts.setup ?? false}
                 initialAcnLifecycle={initialAcnLifecycleState}
                 sessionOptions={{
                   disableShellSafeguards:
@@ -319,7 +359,7 @@ async function main() {
               />
             </DisplayViewControllerProvider>
           </AgentClientProvider>
-        </RegistryProvider>
+        </RegistryContext.Provider>
       </PlatformProvider>
     );
   });

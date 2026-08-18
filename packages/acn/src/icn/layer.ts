@@ -11,6 +11,7 @@ import {
   IcnLifecycleConfig,
   IcnProcess,
   makeIcnCatalog,
+  makeIcnModels,
   makeIcnClient,
   makeIcnDownloads,
   makeIcnProcess,
@@ -95,7 +96,6 @@ const makeProcess = (dataDir: string) =>
       storage: new IcnStorageConfig({
         modelStore: Option.some(join(dataDir, "models")),
         cacheRoot: Option.some(join(dataDir, "cache")),
-        modelSources: [],
         huggingFaceCaches: resolveHuggingFaceCacheRoots(),
       }),
       host: "127.0.0.1",
@@ -213,7 +213,8 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withClient);
-  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
+  const withModels = Layer.provideMerge(makeIcnModels(), withHardware);
+  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withModels);
   const withInstalled = Layer.provideMerge(
     makeIcnInstalledModels(),
     withCatalog

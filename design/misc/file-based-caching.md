@@ -1,9 +1,6 @@
 ---
 applies_to:
-  - packages/storage/src/config/**
-  - packages/storage/src/io/structured-file.ts
-  - packages/storage/src/sessions/storage.ts
-  - packages/acn/src/model-configuration.ts
+  - packages/storage/src/**
   - packages/icn/src/catalog/**
   - packages/ai/src/provider/file-catalog.ts
   - inference/crates/icn-models/**
@@ -15,17 +12,17 @@ applies_to:
   - packages/acn/src/icn/layer.ts
 ---
 
-# File-based cache, index, and configuration recovery
+# File-based cache, index, and durable-state recovery
 
 File-backed derived state is an optimization, never an availability dependency. A cache path is an
 optimistic opportunity to reuse work: missing, unreadable, malformed, stale, partially valid, or
 unwritable cache data behaves as a cache miss for only the affected recovery unit. It must not crash
 the process, fail the user operation, or discard valid siblings.
 
-Durable configuration uses the same granular decoding discipline. Configuration is not disposable,
-so recovery preserves valid user choices and, when a damaged source must be replaced wholesale,
-preserves the original bytes before installing defaults. Only catastrophic conditions escape the
-configuration boundary as errors.
+Durable user state uses the same granular decoding discipline. User intent is not disposable, so
+recovery preserves valid choices and, when a damaged source must be replaced wholesale, preserves
+the original bytes before installing defaults. Only catastrophic conditions escape the durable-state
+boundary as errors.
 
 These guarantees apply equally to Bun/Effect and Rust implementations.
 
@@ -37,7 +34,7 @@ Every file-backed format must be classified before its persistence behavior is d
 | --- | --- | --- | --- |
 | Recomputable cache | model assessment, load timing evidence, remote header, parsed provider catalog | Recompute from authoritative inputs | Never |
 | Recomputable index | local-model inventory, session lookup index | Re-enumerate authoritative files or records | Never |
-| Durable configuration | user preferences with defined defaults | Preserve valid values; default damaged values | Only if recovery is catastrophic |
+| Durable user state | user preferences with defined defaults | Preserve valid values; default damaged values | Only if recovery is catastrophic |
 | Irreplaceable record | session events, user content, credentials | Format-specific durability and repair protocol | Yes; this document's defaulting rules do not apply |
 
 Release artifacts are a separate class from files in a user data directory. Reviewed catalog
@@ -61,30 +58,27 @@ that metadata may independently be unavailable.
 
 ## No cache schema versions
 
-Recomputable caches and indexes must not contain, track, migrate, or gate reads on a file-format
-schema version. This prohibits version fields used to select a decoder, versioned cache filenames,
-whole-file invalidation because an application release changed, and cache migration code.
+Recomputable caches and indexes derive validity from domain evidence rather than a file-format
+schema version. Their filenames and decoders are stable across application releases, and evidence
+invalidates only the affected recovery unit.
 
 Current decoders instead accept the values they understand, preserve independently valid data, and
 default or discard invalid data at the smallest safe boundary. Unknown fields are ignored. A format
-change therefore costs, at worst, recomputation of affected entries rather than a migration or a
-whole-cache reset.
+change therefore costs, at worst, recomputation of affected entries rather than a whole-cache reset.
 
 Content identities, algorithm fingerprints, native-build fingerprints, and concrete configuration
 inputs are not schema versions. They are domain inputs to cache validity and belong in entry keys or
 evidence. An evidence mismatch invalidates only the entries whose computed result may have changed.
 
-Durable configuration should likewise evolve through tolerant decoding, optional fields, and
-defaults rather than a global format-version gate. If a historical configuration value has changed
-meaning in a way that cannot be inferred from its shape, any required semantic migration must be
-local to that value and must not prevent recovery of unrelated configuration.
+Durable user state should likewise evolve through tolerant decoding, optional fields, and
+defaults rather than a global format-version gate. A missing owned document uses its current
+defaults and domain recovery authorities.
 
-The canonical model configuration contains a partial map of branded slot IDs to complete explicit
-slot selections (`providerId`, `providerModelId`, and `reasoningEffort`) and user preferences such
-as provider-qualified model favorites. A legacy selected local profile, raw native model identity,
-repository/configuration association, or local-slot-intent flag has no current meaning and is
-discarded rather than dual-read. An incomplete selection or favorite identity is removed as one
-invalid leaf; ACN never guesses its missing identity or reasoning value.
+The canonical internal model-state document contains a partial map of branded slot IDs to complete
+explicit slot selections (`providerId`, `providerModelId`, and `reasoningEffort`) plus
+provider-qualified recency and favorites. It contains no serving configuration, bundle, offering
+registry, package inventory, assessment, acquisition, recovery marker, or runtime state. An invalid
+selection or favorite is removed at that leaf; ACN never guesses missing identity or reasoning.
 
 ## Granular recovery
 
@@ -101,19 +95,21 @@ The recovery unit is the smallest independently meaningful value:
 A field with a defined safe default is restored to that default. A malformed optional field is
 removed. If defaulting a field would create a misleading or internally inconsistent entity, the
 smallest enclosing entity with an independent identity is removed instead. References to missing or
-discarded entities are themselves removed or recomputed; they must not be left dangling.
+discarded entities are removed or recomputed unless the owning domain defines the complete reference
+itself as durable unresolved user intent. In that case it remains present and explicitly unavailable
+rather than being silently substituted.
 
 Recovery follows this conceptual flow:
 
 ```text
 read bounded bytes
        |
-       +-- missing / inaccessible / wrong file type ----------> miss or config fallback
+       +-- missing / inaccessible / wrong file type ----------> miss or durable-state fallback
        |
        v
 parse outer representation
        |
-       +-- malformed root ------------------------------------> miss or preserved config reset
+       +-- malformed root ------------------------------------> miss or preserved durable-state reset
        |
        v
 decode independent sections, entries, and fields
@@ -170,18 +166,28 @@ constraints must exactly match current stable topology limits. Live available/fr
 cached assessment evidence. Failure of any such check is an entry-level miss; readers do not
 recognize historical aliases or add a cache-format revision to force invalidation.
 
-## Durable configuration behavior
+Model inventory indexes, content hashes, GGUF inspection, source resolution, package construction,
+tensor storage, hardware calibration, model assessment, execution planning, and timing evidence are
+all recomputable caches. Completed artifact files and immutable release catalog data are their
+authorities. Removing or corrupting any such cache cannot change which artifacts are present,
+create or remove a serving configuration, or change durable user intent.
 
-Configuration recovery is intentionally more conservative because the valid portions express user
+An inventory entry may reuse an enriched model only when both its filesystem observation and the
+exact artifact-inspection evidence still match. That inspection evidence includes the template
+assessor's semantic-policy identity. Changing template-inspection behavior therefore invalidates
+the affected durable inventory entries even when the underlying GGUF files are unchanged.
+
+## Durable user-state behavior
+
+Durable-state recovery is intentionally more conservative because the valid portions express user
 intent:
 
-- missing configuration uses the complete default;
+- a missing user-state document uses the complete default;
 - invalid fields, map entries, and array elements recover independently wherever the schema defines
   a safe default or removal behavior;
 - unknown fields are preserved when rewriting so a temporarily older binary does not erase settings
-  it does not understand; fields explicitly tombstoned by a completed cutover are removed instead
-  of being preserved as unknown data, and closed owned namespaces such as model selection discard
-  fields outside their canonical shape;
+  it does not understand; closed owned namespaces such as model selection discard fields outside
+  their canonical shape;
 - recovery rewrites a normalized file only after the recovered value passes the current complete
   schema and semantic invariants;
 - if malformed syntax or an invalid root forces a whole-file reset, the original bytes are preserved
@@ -189,26 +195,31 @@ intent:
 - recovery diagnostics identify affected paths without logging sensitive values.
 
 Model selection persistence exposes one addressed update per branded slot, and model preference
-persistence exposes one addressed update per provider-qualified model. Neither exposes a partial
-model-configuration patch or a second model-only read API. ACN loads the complete configuration
-into one resident source; each update durably writes the addressed value and then publishes that
-same configuration as one interruption-safe critical section.
+persistence exposes one addressed update per provider-qualified model. Neither exposes a serving
+configuration write or a second model-only read API. ACN loads the complete model state into one
+resident source; each update durably writes the addressed value and then publishes that same state
+as one interruption-safe critical section.
 
-Catastrophic configuration conditions are limited to cases where safe recovery cannot be completed:
+The model-state document is a closed owned schema containing only slot selections, recency, and
+favorites. Missing optional fields receive their defined defaults. An invalid document is preserved
+before the complete default is published. Serving configuration, package, and offering meaning are
+resolved continuously from their current authorities and are never repaired into this document.
+
+Catastrophic durable-state conditions are limited to cases where safe recovery cannot be completed:
 the current default itself violates the schema, the original authoritative bytes cannot be preserved
 before a required whole-file reset, storage access cannot be made safe, or the surviving values
 cannot satisfy a security or cross-field invariant without guessing user intent. These failures may
-be returned explicitly. A merely missing, malformed, outdated, or partially invalid configuration
-is not catastrophic.
+be returned explicitly. A merely missing, malformed, outdated, or partially invalid user-state
+document is not catastrophic.
 
 ## Shared implementation requirements
 
-Recovery mechanics must be centralized rather than reimplemented by each cache or configuration
+Recovery mechanics must be centralized rather than reimplemented by each cache or durable-state
 owner.
 
 On the Bun side, the Effect Schema structured-file recovery utility is the common decoding
 foundation. Cache adapters wrap it with no-fail semantics: filesystem failures, malformed and
-unrecoverable decode results become scoped misses or defaults. Configuration adapters retain the
+unrecoverable decode results become scoped misses or defaults. Durable-state adapters retain the
 richer recovery report, preservation, and catastrophic-error behavior. A cache must not use a
 single all-or-nothing decode when its schema contains independent entries.
 
@@ -233,7 +244,7 @@ New recovery helpers are added to `icn-utils` only after the same mechanically c
 needed by more than one consumer or is required to keep file I/O no-fail.
 
 Disposable-cache reads may silently return misses. A bounded recovery report is optional and is
-introduced only where it materially improves operational diagnosis. Durable configuration retains
+introduced only where it materially improves operational diagnosis. Durable user state retains
 the richer behavior: when recovery changes user-authored data it records affected paths, preserves
 unknown fields, and preserves the original before a root reset.
 
@@ -260,18 +271,18 @@ enter the caller's error channel, and failed writes do not change the operation 
 property-based coverage is appropriate for shared parsers that do more than bounded
 `serde_json::Value` decoding; it is not required for every thin cache consumer.
 
-Durable-configuration tests use the same corruption matrix and additionally assert minimal
+Durable-state tests use the same corruption matrix and additionally assert minimal
 defaulting, preservation of unknown fields, preservation of original bytes before a root reset, and
 explicit failure only for the catastrophic cases defined above.
 
 ## Acceptance criteria
 
 - Removing any recomputable cache or index produces, at most, additional work.
-- No recomputable cache or index has a file-format schema version or migration path.
+- No recomputable cache or index has a file-format schema version.
 - Corrupting one independent value does not discard valid siblings.
 - Arbitrary cache-file contents and filesystem failures cannot crash the process or fail the user
   operation solely because caching was unavailable.
 - Cache validity is established by complete domain evidence, not by file presence or application
   version.
-- Durable configuration retains valid user intent and defaults only the smallest unsafe subset.
+- Durable user state retains valid user intent and defaults only the smallest unsafe subset.
 - Bun and Rust use shared recovery facilities with equivalent externally observable guarantees.

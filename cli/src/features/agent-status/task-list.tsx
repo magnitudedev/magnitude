@@ -1,9 +1,6 @@
 import { TextAttributes } from '@opentui/core'
 import {
-  blue,
   findSlotProfile,
-  red,
-  slate,
   type SlotProfiles,
 } from '@magnitudedev/client-common'
 import { Atom, useAtomMount } from '@effect-atom/atom-react'
@@ -34,11 +31,6 @@ const EXPANDED_ROWS = 25
 export function getVisibleTasks(tasks: readonly TaskDisplayRow[], expanded: boolean): readonly TaskDisplayRow[] {
   return expanded ? tasks : tasks.slice(-COLLAPSED_ROWS)
 }
-
-const PULSE_BLUE_SHADES = [
-  blue[50], blue[100], blue[200], blue[300], blue[400], blue[500], blue[600], blue[700], blue[800], blue[900],
-  blue[800], blue[700], blue[600], blue[500], blue[400], blue[300], blue[200], blue[100], blue[50],
-] as const
 
 type Props = {
   tasks: readonly TaskDisplayRow[]
@@ -132,7 +124,7 @@ function getStatusGlyph(status: VisualStatus): '✓' | '○' {
 }
 
 function getStatusColor(status: VisualStatus, theme: ReturnType<typeof useTheme>): string {
-  return status === 'completed' ? theme.success : theme.muted
+  return status === 'completed' ? theme.status.success : theme.text.metadata
 }
 
 function buildTaskTitleText(task: TaskDisplayRow) {
@@ -173,21 +165,21 @@ function getWorkerPresentation(
     case 'user':
       return {
         icon: '',
-        iconColor: theme.warning ?? theme.foreground,
-        labelColor: theme.warning ?? theme.foreground,
-        timerColor: theme.warning ?? theme.foreground,
+        iconColor: theme.status.warning,
+        labelColor: theme.status.warning,
+        timerColor: theme.status.warning,
         showTimer: false,
         showResumed: false,
         interactiveForkId: null,
       }
     case 'worker': {
-      const labelBaseColor = theme.foreground
-      const labelColor = hovered ? theme.primary : labelBaseColor
+      const labelBaseColor = theme.text.body
+      const labelColor = hovered ? theme.accent : labelBaseColor
       return {
         icon: assignee.icon,
-        iconColor: PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length],
+        iconColor: theme.activityPulse[Math.floor(now / 200) % theme.activityPulse.length]!,
         labelColor,
-        timerColor: theme.muted,
+        timerColor: theme.text.metadata,
         showTimer: false,
         showResumed: false,
         interactiveForkId: assignee.interactiveForkId._tag === 'Some' ? assignee.interactiveForkId.value : null,
@@ -197,18 +189,18 @@ function getWorkerPresentation(
       const actor = actors[assignee.actorKey]
       const isKilling = assignee.taskState === 'killing'
       const isWorking = actor?.kind === 'worker' && actor.status.phase === 'working'
-      const labelBaseColor = isKilling ? red[500] : theme.foreground
-      const labelColor = hovered && actor?.kind === 'worker' ? theme.primary : labelBaseColor
+      const labelBaseColor = isKilling ? theme.status.terminated : theme.text.body
+      const labelColor = hovered && actor?.kind === 'worker' ? theme.accent : labelBaseColor
 
       return {
         icon: isKilling ? '✕' : '●',
         iconColor: isKilling
-          ? red[500]
+          ? theme.status.terminated
           : isWorking
-            ? PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length]
-            : slate[600],
+            ? theme.activityPulse[Math.floor(now / 200) % theme.activityPulse.length]!
+            : theme.status.inactive,
         labelColor,
-        timerColor: isKilling ? labelColor : theme.muted,
+        timerColor: isKilling ? labelColor : theme.text.metadata,
         showTimer: !isKilling,
         showResumed: !isKilling,
         interactiveForkId: actor?.kind === 'worker' ? assignee.actorKey : null,
@@ -237,11 +229,11 @@ function TaskNameContent({
 
   return (
     <>
-      {indent.length > 0 && <text style={{ fg: theme.muted }}>{indent}</text>}
+      {indent.length > 0 && <text style={{ fg: theme.text.metadata }}>{indent}</text>}
       <text style={{ fg: getStatusColor(effectiveStatus, theme) }}>{glyphText}</text>
       {isCompleted
-        ? <text attributes={TextAttributes.STRIKETHROUGH} style={{ fg: theme.muted }}>{taskNameStr}</text>
-        : <text style={{ fg: theme.foreground }}>{taskNameStr}</text>}
+        ? <text attributes={TextAttributes.STRIKETHROUGH} style={{ fg: theme.text.disabled }}>{taskNameStr}</text>
+        : <text style={{ fg: theme.text.body }}>{taskNameStr}</text>}
     </>
   )
 }
@@ -335,7 +327,7 @@ function TaskRow({
             </text>
           )}
           {layout.showModel && modelDisplayName ? (
-            <text style={{ fg: theme.muted }}>{` · ${modelDisplayName}`}</text>
+            <text style={{ fg: theme.text.metadata }}>{` · ${modelDisplayName}`}</text>
           ) : null}
           {workerTimer ? (
             <text style={{ fg: workerPresentation.timerColor }}>
@@ -345,7 +337,7 @@ function TaskRow({
             </text>
           ) : null}
           {layout.showTokens && tokensLabel ? (
-            <text style={{ fg: theme.muted }}>{` · ${tokensLabel}`}</text>
+            <text style={{ fg: theme.text.metadata }}>{` · ${tokensLabel}`}</text>
           ) : null}
         </box>
       ) : null}
@@ -449,7 +441,7 @@ export function TaskList({
     <box
       ref={box.ref}
       onSizeChange={box.onSizeChange}
-      style={{ flexDirection: 'column', flexShrink: 0, marginBottom: 1, borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: slate[500], customBorderChars: BOX_CHARS, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 }}
+      style={{ flexDirection: 'column', flexShrink: 0, marginBottom: 1, borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: theme.border.strong, customBorderChars: BOX_CHARS, backgroundColor: theme.background.canvas, paddingLeft: 1, paddingRight: 1 }}
     >
       {stickyRootSummary && stickyRootSummary.task.kind === 'task' ? (
         <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
@@ -459,7 +451,7 @@ export function TaskList({
               const countsStr = ` (${stickyRootSummary.completed} completed, ${stickyRootSummary.active} active)`
               return <>
                 <TaskNameContent task={stickyTask} effectiveStatus={effectiveVisualStates.get(stickyTask.taskId) ?? 'pending'} taskNameWidth={taskNameWidth - countsStr.length} theme={theme} />
-                <text style={{ fg: theme.muted }}>{countsStr}</text>
+                <text style={{ fg: theme.text.metadata }}>{countsStr}</text>
               </>
             })()}
           </box>
@@ -483,28 +475,28 @@ export function TaskList({
               const showModel = stickyModel != null && labelText.length + modelSuffix.length <= availableWidth
               const labelDisplay = truncate(labelText, Math.max(1, showModel ? availableWidth - modelSuffix.length : availableWidth))
               return (
-                <text style={{ fg: theme.muted }}>
-                  <span fg={theme.muted}>{labelDisplay}</span>
-                  {showModel ? <span fg={theme.muted}>{modelSuffix}</span> : null}
+                <text style={{ fg: theme.text.metadata }}>
+                  <span fg={theme.text.metadata}>{labelDisplay}</span>
+                  {showModel ? <span fg={theme.text.metadata}>{modelSuffix}</span> : null}
                 </text>
               )
             })()}
             <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
-              <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
+              <text style={{ fg: expandHovered ? theme.text.body : theme.text.metadata }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
             </Button>
           </box>
         </box>
       ) : (
         <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
           <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Task</text>
-            <text style={{ fg: theme.muted }}>{` (${completedCount} completed, ${activeCount} active)`}</text>
+            <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>Task</text>
+            <text style={{ fg: theme.text.metadata }}>{` (${completedCount} completed, ${activeCount} active)`}</text>
           </box>
           <box style={{ width: columnGap, minWidth: columnGap, maxWidth: columnGap, flexShrink: 0 }} />
           <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
+            <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>Assigned To</text>
             <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
-              <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
+              <text style={{ fg: expandHovered ? theme.text.body : theme.text.metadata }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
             </Button>
           </box>
         </box>
@@ -523,11 +515,11 @@ export function TaskList({
             rootOptions: {
               height: EXPANDED_ROWS,
               flexShrink: 0,
-              backgroundColor: 'transparent',
+              backgroundColor: theme.background.canvas,
             },
             wrapperOptions: {
               border: false,
-              backgroundColor: 'transparent',
+              backgroundColor: theme.background.canvas,
             },
             contentOptions: {
               flexDirection: 'column',

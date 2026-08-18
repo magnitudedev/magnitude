@@ -16,9 +16,12 @@ export class AcnProcessStoreBusy extends Data.TaggedError("AcnProcessStoreBusy")
   readonly path: string
 }> {}
 
-export type AcnProcessStoreError =
+export type AcnOwnerStoreError =
   | AcnProcessStoreUnavailable
   | AcnProcessStoreInvalid
+
+export type AcnProcessStoreError =
+  | AcnOwnerStoreError
   | AcnProcessStoreBusy
 
 export class ExactProcessInspectionFailed extends Data.TaggedError("ExactProcessInspectionFailed")<{

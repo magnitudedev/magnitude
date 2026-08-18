@@ -41,7 +41,7 @@ export const MarkdownContent = memo(function MarkdownContent({
     <box ref={box.ref} onSizeChange={box.onSizeChange} style={{ flexDirection: 'column' }}>
       <BlockRenderer
         blocks={blocks}
-        foreground={theme.foreground}
+        foreground={theme.text.body}
         contentWidth={contentWidth}
         showCursor={showCursor}
         onOpenArtifact={onOpenArtifact}
@@ -50,7 +50,7 @@ export const MarkdownContent = memo(function MarkdownContent({
         highlightAnchorId={highlightAnchorId}
       />
       {showCursor && blocks.length === 0 && (
-        <text style={{ fg: theme.foreground }}>▍</text>
+        <text style={{ fg: theme.text.body }}>▍</text>
       )}
     </box>
   )
@@ -93,7 +93,7 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
     <box ref={box.ref} onSizeChange={box.onSizeChange} style={{ flexDirection: 'column' }}>
       <BlockRenderer
         blocks={blocks}
-        foreground={theme.foreground}
+        foreground={theme.text.body}
         contentWidth={contentWidth}
         showCursor={showCursor && !pendingText}
         onOpenArtifact={onOpenArtifact}
@@ -102,13 +102,13 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
         highlightAnchorId={highlightAnchorId}
       />
       {pendingText && (
-        <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
+        <text style={{ fg: theme.text.body, wrapMode: 'word' }}>
           {pendingText}
-          {showCursor && <span style={{ fg: theme.muted }}>▍</span>}
+          {showCursor && <span style={{ fg: theme.text.supporting }}>▍</span>}
         </text>
       )}
       {showCursor && blocks.length === 0 && !pendingText && (
-        <text style={{ fg: theme.foreground }}>▍</text>
+        <text style={{ fg: theme.text.body }}>▍</text>
       )}
     </box>
   )

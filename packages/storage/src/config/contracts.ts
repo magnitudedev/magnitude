@@ -1,16 +1,11 @@
 import type { PlatformError } from '@effect/platform/Error'
-import { Context, Effect, Option } from 'effect'
+import { Context, Effect } from 'effect'
 
 import type { JsonError } from '../io/storage'
 import type { ResolvedContextLimitPolicy } from '../types/config'
 import type {
   ContextLimitPolicy,
   MagnitudeConfig,
-  ModelPackageId,
-  OnboardingConfig,
-  PersistedLocalProviderOffering,
-  SlotId,
-  SlotModelConfig,
 } from '../types'
 
 export interface ConfigStorageShape {
@@ -23,26 +18,6 @@ export interface ConfigStorageShape {
   readonly getContextLimitPolicy: () => Effect.Effect<ResolvedContextLimitPolicy, PlatformError | JsonError>
   readonly setContextLimitPolicy: (
     policy: ContextLimitPolicy
-  ) => Effect.Effect<void, PlatformError | JsonError>
-
-  readonly updateModelSlot: (
-    slotId: SlotId,
-    selection: Option.Option<SlotModelConfig>,
-  ) => Effect.Effect<void, PlatformError | JsonError>
-
-  readonly upsertLocalProviderOffering: (
-    offering: PersistedLocalProviderOffering,
-  ) => Effect.Effect<void, PlatformError | JsonError>
-  readonly dismissDownloadFailure: (
-    packageId: ModelPackageId,
-  ) => Effect.Effect<void, PlatformError | JsonError>
-  readonly clearDismissedDownloadFailure: (
-    packageId: ModelPackageId,
-  ) => Effect.Effect<void, PlatformError | JsonError>
-
-  readonly getOnboardingConfig: () => Effect.Effect<Option.Option<OnboardingConfig>, PlatformError | JsonError>
-  readonly updateOnboardingState: (
-    completed: boolean,
   ) => Effect.Effect<void, PlatformError | JsonError>
 }
 

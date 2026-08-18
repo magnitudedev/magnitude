@@ -34,7 +34,8 @@ pub struct PlannerStubContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlannerStubComponent {
     Primary,
-    Auxiliary,
+    Shard,
+    Companion,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -106,26 +107,28 @@ pub fn compact_planner_stub(
     component: PlannerStubComponent,
 ) -> Result<Vec<u8>, PlannerStubError> {
     let parsed = parse_header(source)?;
-    if let Some(architecture) = &parsed.architecture
-        && architecture != &context.architecture
-    {
-        return Err(PlannerStubError::Invalid(
-            "split GGUF architecture differs from its primary",
-        ));
-    }
-    if let Some(tokens) = parsed.token_count
-        && tokens != context.vocabulary_size
-    {
-        return Err(PlannerStubError::Invalid(
-            "split GGUF token count differs from its primary",
-        ));
-    }
-    if let Some(declared) = parsed.declared_vocabulary_size
-        && declared != context.vocabulary_size
-    {
-        return Err(PlannerStubError::Invalid(
-            "split GGUF vocabulary size differs from its primary",
-        ));
+    if component != PlannerStubComponent::Companion {
+        if let Some(architecture) = &parsed.architecture
+            && architecture != &context.architecture
+        {
+            return Err(PlannerStubError::Invalid(
+                "split GGUF architecture differs from its primary",
+            ));
+        }
+        if let Some(tokens) = parsed.token_count
+            && tokens != context.vocabulary_size
+        {
+            return Err(PlannerStubError::Invalid(
+                "split GGUF token count differs from its primary",
+            ));
+        }
+        if let Some(declared) = parsed.declared_vocabulary_size
+            && declared != context.vocabulary_size
+        {
+            return Err(PlannerStubError::Invalid(
+                "split GGUF vocabulary size differs from its primary",
+            ));
+        }
     }
 
     if component == PlannerStubComponent::Primary && parsed.architecture.is_none() {
@@ -138,7 +141,7 @@ pub fn compact_planner_stub(
         .entries
         .iter()
         .filter(|entry| {
-            component == PlannerStubComponent::Auxiliary
+            component != PlannerStubComponent::Primary
                 || (!removed_metadata(&entry.key) && entry.key != vocabulary_key)
         })
         .collect::<Vec<_>>();
@@ -606,8 +609,7 @@ mod tests {
         tensor(&mut tensors, "blk.0.weight", &[2, 2], 0, 64);
         let source = header(metadata, 2, tensors, 1);
 
-        let stub =
-            compact_planner_stub(&source, &context, PlannerStubComponent::Auxiliary).unwrap();
+        let stub = compact_planner_stub(&source, &context, PlannerStubComponent::Shard).unwrap();
         let parsed = parse_header(&stub).unwrap();
         assert_eq!(parsed.architecture, None);
         assert_eq!(parsed.entries.len(), 2);
@@ -618,6 +620,26 @@ mod tests {
                 .any(|entry| entry.key == TOKENIZER_MODEL)
         );
         assert_eq!(parsed.declared_vocabulary_size, None);
+    }
+
+    #[test]
+    fn companion_keeps_independent_architecture_and_vocabulary_metadata() {
+        let context = planner_stub_context(&primary_header()).unwrap();
+        let mut metadata = Vec::new();
+        entry_string(&mut metadata, "general.architecture", "draft");
+        entry_string(&mut metadata, TOKENIZER_MODEL, "gpt2");
+        entry_string_array(&mut metadata, TOKENIZER_TOKENS, &["one", "two"]);
+        entry_u32(&mut metadata, "draft.vocab_size", 2);
+        let mut tensors = Vec::new();
+        tensor(&mut tensors, "draft.weight", &[2, 2], 0, 0);
+        let source = header(metadata, 4, tensors, 1);
+
+        let stub =
+            compact_planner_stub(&source, &context, PlannerStubComponent::Companion).unwrap();
+        let parsed = parse_header(&stub).unwrap();
+        assert_eq!(parsed.architecture.as_deref(), Some("draft"));
+        assert_eq!(parsed.token_count, Some(2));
+        assert_eq!(parsed.declared_vocabulary_size, Some(2));
     }
 
     #[test]

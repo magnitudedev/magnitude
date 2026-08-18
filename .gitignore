@@ -9,6 +9,8 @@ inference/.parity-models/
 inference/results/parity/
 # Composite benchmark evidence is likewise generated and immutable.
 inference/results/benchmark/
+# TypeScript benchmark evidence is generated, immutable, and workspace-local.
+benchmark-results/
 .turbo
 dist
 /bin

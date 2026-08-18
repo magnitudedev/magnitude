@@ -43,6 +43,10 @@ Magnitude is a TUI-based local agent where the user chats with it to give it ins
 
 Magnitude's tools have no built-in approval system. Magnitude is responsible for asking for approval.
 
+## Magnitude documentation
+
+For Magnitude-specific product setup or configuration, run `magnitude docs` to list available topics, then `magnitude docs <topic-id>` to read the relevant Markdown.
+
 ## Context window
 
 Magitude has a finite context window but is prompted to compact when it reaches its limit.

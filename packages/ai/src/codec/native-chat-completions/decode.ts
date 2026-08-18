@@ -1,4 +1,4 @@
-import { Cause, Stream } from "effect"
+import { Cause, Option, Stream } from "effect"
 import type { Schema } from "effect"
 import { createStreamingFieldParser, type StreamingFieldParser } from "../../streaming/field-parser"
 import { createToolCallId, type ProviderToolCallId, type ToolCallId } from "../../prompt/ids"
@@ -21,7 +21,7 @@ import {
   type UsageMissingReason,
 } from "../../errors/failure"
 import type { ToolDefinition } from "../../tools/tool-definition"
-import type { ChatCompletionsStreamChunk } from "../../wire/chat-completions"
+import type { NormalizedChatCompletionsStreamChunk } from "./chunk"
 import type { FieldEvent } from "../../streaming/types"
 import type { TokenLogprob } from "../../trace"
 import type { RawInputToken, RawOutputToken } from "../../response/events"
@@ -41,10 +41,14 @@ interface ToolCallState {
 // Terminal construction helpers
 // ---------------------------------------------------------------------------
 
-function usageAtTermination(usage: ResponseUsage | null, reasonIfMissing: UsageMissingReason): UsageAtTermination {
-  return usage === null
-    ? { _tag: "UsageNotReported" as const, reason: reasonIfMissing }
-    : { _tag: "UsageReported" as const, usage }
+function usageAtTermination(
+  usage: Option.Option<ResponseUsage>,
+  reasonIfMissing: UsageMissingReason,
+): UsageAtTermination {
+  return Option.match(usage, {
+    onNone: () => ({ _tag: "UsageNotReported" as const, reason: reasonIfMissing }),
+    onSome: (value) => ({ _tag: "UsageReported" as const, usage: value }),
+  })
 }
 
 function buildTerminal(
@@ -52,7 +56,7 @@ function buildTerminal(
   call: ProviderCall,
   response: AcceptedHttpResponse,
   progress: StreamProgress,
-  usage: ResponseUsage | null,
+  usage: Option.Option<ResponseUsage>,
 ): ModelStreamTerminal {
   const usageAt = usageAtTermination(usage, "usage_chunk_never_arrived")
 
@@ -89,7 +93,7 @@ function buildTerminal(
 
 function makeTerminatedStreamTerminal(
   failure: StreamFailure,
-  usage: ResponseUsage | null,
+  usage: Option.Option<ResponseUsage>,
 ): ModelStreamTerminal {
   const usageAt = usageAtTermination(usage, "stream_failed_before_usage")
   return ModelStreamTerminal.StreamFailed({
@@ -122,8 +126,8 @@ interface DecoderState {
   readonly openToolCalls: ReadonlyMap<number, ToolCallState>
   readonly toolSchemas: ReadonlyMap<string, Schema.Schema.AnyNoContext>
   readonly phase: DecoderPhase
-  readonly rawInput: ReadonlyArray<RawInputToken> | null
-  readonly rawOutput: ReadonlyArray<RawOutputToken> | null
+  readonly rawInput: Option.Option<ReadonlyArray<RawInputToken>>
+  readonly rawOutput: Option.Option<ReadonlyArray<RawOutputToken>>
 }
 
 // ---------------------------------------------------------------------------
@@ -145,33 +149,8 @@ function makeInitialState(
     openToolCalls: new Map(),
     toolSchemas,
     phase: { _tag: 'streaming' },
-    rawInput: null,
-    rawOutput: null,
-  }
-}
-
-function toUsage(
-  usage: NonNullable<ChatCompletionsStreamChunk["usage"]>,
-): ResponseUsage {
-  return {
-    inputTokens: usage.prompt_tokens,
-    outputTokens: usage.completion_tokens,
-    cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
-    cacheWriteTokens: 0,
-    cost: usage.cost ?? null,
-  }
-}
-
-function mapReason(reason: string | null | undefined): FinishReason {
-  switch (reason) {
-    case "stop":
-    case "tool_calls":
-    case "length":
-    case "content_filter":
-    case "end_turn":
-      return reason
-    default:
-      return "unknown"
+    rawInput: Option.none(),
+    rawOutput: Option.none(),
   }
 }
 
@@ -202,7 +181,7 @@ function decoderProgress(chunksObserved: number, modelEventsEmitted: number): St
 // ---------------------------------------------------------------------------
 
 function processChunk(
-  chunk: ChatCompletionsStreamChunk,
+  chunk: NormalizedChatCompletionsStreamChunk,
   state: DecoderState,
   parsers: Map<ToolCallId, StreamingFieldParser>,
   logprobs: TokenLogprob[],
@@ -221,36 +200,36 @@ function processChunk(
   // ── Accumulate raw data from every chunk ────────────────────────────────────
   nextState = {
     ...nextState,
-    rawInput: chunk.raw_input ?? nextState.rawInput,
-    rawOutput: chunk.raw_output ?? nextState.rawOutput,
+    rawInput: Option.orElse(chunk.rawInput, () => nextState.rawInput),
+    rawOutput: Option.orElse(chunk.rawOutput, () => nextState.rawOutput),
   }
 
   // ── Server-side error envelope: terminate the stream with a typed error ────
-  if (chunk.error) {
-    const error = chunk.error
+  if (Option.isSome(chunk.error)) {
+    const error = chunk.error.value
     const failure = new StreamProviderError({
       call: streamContext.call,
       response: streamContext.response,
       providerError: {
         message: error.message,
-        type: error.type ?? null,
-        code: error.code ?? null,
-        param: error.param ?? null,
+        type: Option.getOrNull(error.type),
+        code: Option.getOrNull(error.code),
+        param: Option.getOrNull(error.param),
       },
       payload: payloadSample(JSON.stringify({ error })),
       progress,
     })
     events.push({
       _tag: "stream_end",
-      terminal: makeTerminatedStreamTerminal(failure, null),
-      rawInput: nextState.rawInput ?? undefined,
-      rawOutput: nextState.rawOutput ?? undefined,
+      terminal: makeTerminatedStreamTerminal(failure, Option.none()),
+      rawInput: Option.getOrUndefined(nextState.rawInput),
+      rawOutput: Option.getOrUndefined(nextState.rawOutput),
     })
     return [{ ...nextState, phase: { _tag: 'done' } }, events]
   }
 
   // ── Usage chunk: emit stream_end with the pending terminal + raw data ────────
-  if (chunk.usage) {
+  if (Option.isSome(chunk.usage)) {
     if (nextState.phase._tag === 'finishing') {
       const { pending } = nextState.phase
       events.push({
@@ -260,10 +239,10 @@ function processChunk(
           streamContext.call,
           streamContext.response,
           progress,
-          toUsage(chunk.usage),
+          chunk.usage,
         ),
-        rawInput: nextState.rawInput ?? undefined,
-        rawOutput: nextState.rawOutput ?? undefined,
+        rawInput: Option.getOrUndefined(nextState.rawInput),
+        rawOutput: Option.getOrUndefined(nextState.rawOutput),
       })
       return [{ ...nextState, phase: { _tag: 'done' } }, events]
     }
@@ -275,35 +254,25 @@ function processChunk(
   }
 
   // ── STREAMING: normal processing ───────────────────────────────────────────
-  const choice = chunk.choices[0]
-  if (!choice) {
+  if (Option.isNone(chunk.delta)) {
     return [nextState, events]
   }
+  const delta = chunk.delta.value
 
   // Accumulate logprobs from chunk
-  if (choice.logprobs?.content) {
-    for (const lp of choice.logprobs.content) {
-      logprobs.push({
-        token: lp.token,
-        logprob: lp.logprob,
-        topLogprobs: lp.top_logprobs.map((tp) => ({ token: tp.token, logprob: tp.logprob })),
-      })
-    }
-  }
-
-  const delta = choice.delta
+  logprobs.push(...delta.logprobs)
 
   // Thought content
-  if (delta.reasoning_content) {
+  if (Option.isSome(delta.thought)) {
     if (!nextState.thoughtOpen) {
       nextState = { ...nextState, thoughtOpen: true }
       events.push({ _tag: "thought_start", level: "medium" })
     }
-    events.push({ _tag: "thought_delta", text: delta.reasoning_content })
+    events.push({ _tag: "thought_delta", text: delta.thought.value })
   }
 
   // Message content
-  if (delta.content) {
+  if (Option.isSome(delta.text)) {
     if (nextState.thoughtOpen) {
       events.push({ _tag: "thought_end" })
       nextState = { ...nextState, thoughtOpen: false }
@@ -312,11 +281,11 @@ function processChunk(
       nextState = { ...nextState, messageOpen: true }
       events.push({ _tag: "message_start" })
     }
-    events.push({ _tag: "message_delta", text: delta.content })
+    events.push({ _tag: "message_delta", text: delta.text.value })
   }
 
   // Tool calls
-  if (delta.tool_calls && delta.tool_calls.length > 0) {
+  if (delta.toolCalls.length > 0) {
     if (nextState.thoughtOpen) {
       events.push({ _tag: "thought_end" })
       nextState = { ...nextState, thoughtOpen: false }
@@ -328,7 +297,7 @@ function processChunk(
 
     const calls = new Map(nextState.openToolCalls)
 
-    for (const toolCallDelta of delta.tool_calls) {
+    for (const toolCallDelta of delta.toolCalls) {
       let toolCall = calls.get(toolCallDelta.index)
 
       if (!toolCall) {
@@ -358,13 +327,16 @@ function processChunk(
           }
         }
 
-        const name = toolCallDelta.function?.name ?? ""
+        const name = Option.getOrElse(toolCallDelta.name, () => "")
         const schema = nextState.toolSchemas.get(name)
         const parser = schema
           ? createStreamingFieldParser(schema)
           : createStreamingFieldParser()
         const toolCallId = generateToolCallId()
-        const providerToolCallId = (toolCallDelta.id ?? toolCallId) as ProviderToolCallId
+        const providerToolCallId = Option.getOrElse(
+          toolCallDelta.providerToolCallId,
+          () => toolCallId,
+        ) as ProviderToolCallId
         toolCall = { toolCallId, providerToolCallId, toolName: name, parser }
         calls.set(toolCallDelta.index, toolCall)
         parsers.set(toolCallId, parser)
@@ -374,8 +346,8 @@ function processChunk(
           providerToolCallId: toolCall.providerToolCallId,
           toolName: toolCall.toolName,
         })
-      } else if (toolCallDelta.function?.name && toolCall.toolName.length === 0) {
-        const name = toolCallDelta.function.name
+      } else if (Option.isSome(toolCallDelta.name) && toolCall.toolName.length === 0) {
+        const name = toolCallDelta.name.value
         const schema = nextState.toolSchemas.get(name)
         const parser = schema
           ? createStreamingFieldParser(schema)
@@ -385,8 +357,8 @@ function processChunk(
         parsers.set(toolCall.toolCallId, parser)
       }
 
-      if (toolCallDelta.function?.arguments) {
-        const fieldEvents = toolCall.parser.push(toolCallDelta.function.arguments)
+      if (Option.isSome(toolCallDelta.input)) {
+        const fieldEvents = toolCall.parser.push(toolCallDelta.input.value)
         events.push(...wrapFieldEvents(fieldEvents, toolCall.toolCallId, toolCall.providerToolCallId))
       }
     }
@@ -398,7 +370,7 @@ function processChunk(
   }
 
   // ── Finish reason ──────────────────────────────────────────────────────────
-  if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
+  if (Option.isSome(chunk.finishReason)) {
     // Close open blocks
     if (nextState.thoughtOpen) {
       events.push({ _tag: "thought_end" })
@@ -422,7 +394,7 @@ function processChunk(
           toolName: toolCall.toolName,
           issue: toolCall.parser.validationIssue!,
         }
-        if (chunk.usage) {
+        if (Option.isSome(chunk.usage)) {
           events.push({
             _tag: "stream_end",
             terminal: buildTerminal(
@@ -430,10 +402,10 @@ function processChunk(
               streamContext.call,
               streamContext.response,
               progress,
-              toUsage(chunk.usage),
+              chunk.usage,
             ),
-            rawInput: nextState.rawInput ?? undefined,
-            rawOutput: nextState.rawOutput ?? undefined,
+            rawInput: Option.getOrUndefined(nextState.rawInput),
+            rawOutput: Option.getOrUndefined(nextState.rawOutput),
           })
           return [{ ...nextState, phase: { _tag: 'done' }, openToolCalls: new Map() }, events]
         }
@@ -447,14 +419,9 @@ function processChunk(
       })
     }
 
-    const finishReason = mapReason(choice.finish_reason)
+    const finishReason = chunk.finishReason.value
 
-    if (chunk.usage) {
-      nextState = {
-        ...nextState,
-        rawInput: chunk.raw_input ?? nextState.rawInput,
-        rawOutput: chunk.raw_output ?? nextState.rawOutput,
-      }
+    if (Option.isSome(chunk.usage)) {
       events.push({
         _tag: "stream_end",
         terminal: buildTerminal(
@@ -462,10 +429,10 @@ function processChunk(
           streamContext.call,
           streamContext.response,
           progress,
-          toUsage(chunk.usage),
+          chunk.usage,
         ),
-        rawInput: nextState.rawInput ?? undefined,
-        rawOutput: nextState.rawOutput ?? undefined,
+        rawInput: Option.getOrUndefined(nextState.rawInput),
+        rawOutput: Option.getOrUndefined(nextState.rawOutput),
       })
       nextState = { ...nextState, openToolCalls: new Map(), phase: { _tag: 'done' } }
     } else {
@@ -481,7 +448,7 @@ function processChunk(
 // ---------------------------------------------------------------------------
 
 export function decode<E>(
-  chunks: Stream.Stream<ChatCompletionsStreamChunk, E>,
+  chunks: Stream.Stream<NormalizedChatCompletionsStreamChunk, E>,
   options: {
     tools?: readonly ToolDefinition[]
     streamContext: StreamFailureContext
@@ -536,10 +503,10 @@ export function decode<E>(
             options.streamContext.call,
             options.streamContext.response,
             decoderProgress(chunksObserved, modelEventsEmitted),
-            null,
+            Option.none(),
           ),
-          rawInput: lastState.rawInput ?? undefined,
-          rawOutput: lastState.rawOutput ?? undefined,
+          rawInput: Option.getOrUndefined(lastState.rawInput),
+          rawOutput: Option.getOrUndefined(lastState.rawOutput),
         }
         return Stream.make(endEvent)
       }
@@ -557,9 +524,9 @@ export function decode<E>(
         })
         const endEvent: ResponseStreamEvent = {
           _tag: "stream_end",
-          terminal: makeTerminatedStreamTerminal(failure, null),
-          rawInput: lastState.rawInput ?? undefined,
-          rawOutput: lastState.rawOutput ?? undefined,
+          terminal: makeTerminatedStreamTerminal(failure, Option.none()),
+          rawInput: Option.getOrUndefined(lastState.rawInput),
+          rawOutput: Option.getOrUndefined(lastState.rawOutput),
         }
         return Stream.make(endEvent)
       }
@@ -575,9 +542,9 @@ export function decode<E>(
     const streamFailure = options.toStreamFailure(error)
     const endEvent: ResponseStreamEvent = {
       _tag: "stream_end",
-      terminal: makeTerminatedStreamTerminal(streamFailure, null),
-      rawInput: lastState.rawInput ?? undefined,
-      rawOutput: lastState.rawOutput ?? undefined,
+      terminal: makeTerminatedStreamTerminal(streamFailure, Option.none()),
+      rawInput: Option.getOrUndefined(lastState.rawInput),
+      rawOutput: Option.getOrUndefined(lastState.rawOutput),
     }
     return Stream.make(endEvent)
   })
@@ -597,9 +564,9 @@ export function decode<E>(
     })
     const endEvent: ResponseStreamEvent = {
       _tag: "stream_end",
-      terminal: makeTerminatedStreamTerminal(streamFailure, null),
-      rawInput: lastState.rawInput ?? undefined,
-      rawOutput: lastState.rawOutput ?? undefined,
+      terminal: makeTerminatedStreamTerminal(streamFailure, Option.none()),
+      rawInput: Option.getOrUndefined(lastState.rawInput),
+      rawOutput: Option.getOrUndefined(lastState.rawOutput),
     }
     return Stream.make(endEvent)
   })

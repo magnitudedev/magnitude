@@ -305,7 +305,7 @@ export const TurnProjection = Projection.defineForked<AppEvent>()({
       const advisorRequirementPending = hasPendingAdvisorRequirement(fork)
 
       // Increment retry count on ConnectionFailure, reset on anything else.
-      // Cortex enforces the cap by transforming the outcome before publishing,
+      // TurnExecutor enforces the cap by transforming the outcome before publishing,
       // so the projection trusts what it sees here.
       const nextRetryCount = isConnectionFailure ? fork.connectionRetryCount + 1 : 0
 

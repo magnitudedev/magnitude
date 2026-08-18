@@ -19,7 +19,6 @@ import {
   ExactProcessController,
   ExactProcessControllerLive,
   makeAcnOwnerStore,
-  makeAcnRevisionStore,
 } from "@magnitudedev/acn-protocol/coordination"
 import { Duration, Effect, Exit, Fiber, Layer, Option, Schema, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
@@ -64,6 +63,7 @@ const makeOwnerHttp = (
   id: AcnInstanceId,
   health: () => Option.Option<{ readonly status: number; readonly state: AcnHealthState }>,
   stopOwner: () => void,
+  revision = SDK_ACN_TARGET.revision,
 ) => {
   const requests = { health: 0, shutdown: 0 }
   const client = HttpClient.make((request) => Effect.sync(() => {
@@ -80,7 +80,7 @@ const makeOwnerHttp = (
     const response = Schema.encodeSync(AcnHealthResponseSchema)({
       service: "magnitude-acn",
       version: SDK_VERSION,
-      revision: SDK_ACN_TARGET.revision,
+      revision,
       id,
       pid: owner.pid,
       state: observed.value.state,
@@ -94,7 +94,7 @@ const makeOwnerHttp = (
 }
 
 describe("LocalAcnInstanceManager", () => {
-  it("adopts a newer selected owner without resolving or spawning the caller's older artifact", async () => {
+  it("adopts a newer live owner without resolving or spawning the caller's older artifact", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-adopt-" })
@@ -105,8 +105,6 @@ describe("LocalAcnInstanceManager", () => {
       const selected = AcnRevisionSchema.make(2_000_000)
       const identity = AcnIdentitySchema.make("2.0.0")
       const exact = yield* ExactProcessControllerLive.current
-      const store = yield* makeAcnRevisionStore(dataDir)
-      yield* store.register(selected)
       const owners = yield* makeAcnOwnerStore(dataDir)
       const id = AcnInstanceIdSchema.make("selected-owner")
       const server = Bun.serve({
@@ -123,13 +121,13 @@ describe("LocalAcnInstanceManager", () => {
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
       if (server.port === undefined) return yield* Effect.dieMessage("test server has no TCP port")
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: server.port }, selected)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: server.port })
 
       const manager = yield* makeLocalAcnInstanceManager({
         dataDir,
         binaryPath: `${dataDir}/must-not-be-resolved`,
       }).pipe(Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
-        spawn: () => Effect.dieMessage("a valid selected owner must not spawn"),
+        spawn: () => Effect.dieMessage("a valid newer live owner must not spawn"),
       })))
       const ready = yield* runAcnEnsure(manager.ensure({ target: requested }))
       expect(ready.id).toBe(id)
@@ -157,15 +155,13 @@ describe("LocalAcnInstanceManager", () => {
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
       if (server.port === undefined) return yield* Effect.dieMessage("test server has no TCP port")
-      const revisions = yield* makeAcnRevisionStore(dataDir)
       const owners = yield* makeAcnOwnerStore(dataDir)
-      yield* revisions.register(selected)
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: server.port }, selected)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: server.port })
       const manager = yield* makeLocalAcnInstanceManager({
         dataDir,
         binaryPath: `${dataDir}/missing-acn`,
       }).pipe(Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
-        spawn: () => Effect.dieMessage("selection preparation must fail before spawning"),
+        spawn: () => Effect.dieMessage("replacement preparation must fail before spawning"),
       })))
 
       expect(Exit.isFailure(yield* Effect.exit(
@@ -174,7 +170,43 @@ describe("LocalAcnInstanceManager", () => {
     }).pipe(Effect.provide(platform))))
   })
 
-  it("prepares and hands off one candidate only when the selected target has no owner", async () => {
+  it("prepares replacement before retiring a lower live owner", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-replace-lower-" })
+      const processFixture = yield* makeExactProcessFixture
+      const lowerRevision = AcnRevisionSchema.make(SDK_ACN_TARGET.revision - 1)
+      const http = makeOwnerHttp(
+        processFixture.exact,
+        AcnInstanceIdSchema.make("lower-owner"),
+        () => Option.some({ status: 200, state: new AcnReady({}) }),
+        processFixture.stop,
+        lowerRevision,
+      )
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      yield* owners.replaceOwner(Option.none(), { ...processFixture.exact, port: 49152 })
+      let spawns = 0
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http.client),
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.sync(() => { spawns += 1 }).pipe(Effect.zipRight(Effect.never)),
+        })),
+      )
+
+      const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.fork)
+      while (http.requests.shutdown === 0) yield* Effect.yieldNow()
+      while (spawns === 0) yield* Effect.yieldNow()
+      expect(http.requests.shutdown).toBe(1)
+      expect(spawns).toBe(1)
+      yield* Fiber.interrupt(ensuring)
+    }).pipe(Effect.provide(platform))))
+  })
+
+  it("replaces a stale owner because its dead revision has no authority", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-launch-" })
@@ -195,6 +227,11 @@ describe("LocalAcnInstanceManager", () => {
       yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
       if (server.port === undefined) return yield* Effect.dieMessage("test server has no TCP port")
       const owners = yield* makeAcnOwnerStore(dataDir)
+      yield* owners.replaceOwner(Option.none(), {
+        pid: 9_000_001,
+        processStartIdentity: exact.processStartIdentity,
+        port: 49_151,
+      })
       let spawns = 0
       const spawner = ChildProcessSpawner.of({
         spawn: () => Effect.gen(function* () {
@@ -203,7 +240,6 @@ describe("LocalAcnInstanceManager", () => {
           const replaced = yield* owners.replaceOwner(
             expected,
             { ...exact, port: server.port! },
-            SDK_ACN_TARGET.revision,
           )
           if (replaced._tag !== "Replaced") return yield* Effect.dieMessage("candidate was not admitted")
           return {
@@ -224,6 +260,127 @@ describe("LocalAcnInstanceManager", () => {
       const ready = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET }))
       expect(ready.id).toBe(id)
       expect(spawns).toBe(1)
+    }).pipe(Effect.provide(platform))))
+  })
+
+  it("reports retained stderr when its admitted daemon exits before readiness", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-admitted-exit-" })
+      const processFixture = yield* makeExactProcessFixture
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      let admissions = 0
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
+      }).pipe(
+        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.gen(function* () {
+            const expected = yield* owners.current
+            const replaced = yield* owners.replaceOwner(
+              expected,
+              { ...processFixture.exact, port: 49_152 },
+            )
+            if (replaced._tag !== "Replaced") {
+              return yield* Effect.dieMessage("candidate was not admitted")
+            }
+            return {
+              pid: processFixture.exact.pid,
+              exited: Effect.succeed({ code: 17, stderr: "fatal startup detail" }),
+              admit: Effect.sync(() => {
+                admissions += 1
+                processFixture.stop()
+              }),
+            }
+          }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+        })),
+      )
+
+      const result = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.either)
+      expect(result).toMatchObject({
+        _tag: "Left",
+        left: {
+          reason: `Magnitude daemon ${processFixture.exact.pid} exited with code 17 after admission before it became ready:\nfatal startup detail`,
+        },
+      })
+      expect(admissions).toBe(1)
+    }).pipe(Effect.provide(platform))))
+  })
+
+  it("reports an admitted daemon exit after another owner replaces its row", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-replaced-owner-exit-" })
+      const current = yield* ExactProcessControllerLive.current
+      const candidate = current
+      const successor = { ...current, pid: current.pid + 1 }
+      const owners = yield* makeAcnOwnerStore(dataDir)
+      const successorId = AcnInstanceIdSchema.make("successor-owner")
+      const controller = ExactProcessController.of({
+        inspect: (pid) => Effect.succeed(
+          pid === candidate.pid || pid === successor.pid
+            ? Option.some(current.processStartIdentity)
+            : Option.none(),
+        ),
+        current: Effect.succeed(current),
+        signal: () => Effect.succeed(false),
+        signalTree: () => Effect.succeed(false),
+        treeAbsent: () => Effect.succeed(false),
+      })
+      const http = HttpClient.make((request) => Effect.succeed(
+        request.url.includes(":49153/")
+          ? HttpClientResponse.fromWeb(request, Response.json(
+              Schema.encodeSync(AcnHealthResponseSchema)({
+                service: "magnitude-acn",
+                version: SDK_VERSION,
+                revision: SDK_ACN_TARGET.revision,
+                id: successorId,
+                pid: successor.pid,
+                state: new AcnReady({}),
+              }),
+            ))
+          : HttpClientResponse.fromWeb(request, new Response("starting", { status: 503 })),
+      ))
+      const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
+        dataDir,
+        launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http),
+        Effect.provideService(ExactProcessController, controller),
+        Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
+          spawn: () => Effect.gen(function* () {
+            const replaced = yield* owners.replaceOwner(
+              yield* owners.current,
+              { ...candidate, port: 49_152 },
+            )
+            if (replaced._tag !== "Replaced") {
+              return yield* Effect.dieMessage("candidate was not admitted")
+            }
+            return {
+              pid: candidate.pid,
+              exited: Effect.succeed({ code: 23, stderr: "original daemon failed" }),
+              admit: owners.replaceOwner(
+                Option.some({ ...candidate, port: 49_152 }),
+                { ...successor, port: 49_153 },
+              ).pipe(
+                Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) })),
+                Effect.flatMap((result) => result._tag === "Replaced"
+                  ? Effect.void
+                  : Effect.dieMessage("successor did not replace admitted candidate")),
+              ),
+            }
+          }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+        })),
+      )
+
+      const result = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(Effect.either)
+      expect(result).toMatchObject({
+        _tag: "Left",
+        left: {
+          reason: `Magnitude daemon ${candidate.pid} exited with code 23 after admission before it became ready:\noriginal daemon failed`,
+        },
+      })
     }).pipe(Effect.provide(platform))))
   })
 
@@ -294,10 +451,8 @@ describe("LocalAcnInstanceManager", () => {
               progress: Option.none(),
             }),
           }), processFixture.stop)
-      const revisions = yield* makeAcnRevisionStore(dataDir)
       const owners = yield* makeAcnOwnerStore(dataDir)
-      yield* revisions.register(SDK_ACN_TARGET.revision)
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 })
 
       const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
         dataDir,
@@ -336,10 +491,8 @@ describe("LocalAcnInstanceManager", () => {
         status: 503,
         state: new AcnStarting({ activity: "Resolving", progress: Option.none() }),
       }), processFixture.stop)
-      const revisions = yield* makeAcnRevisionStore(dataDir)
       const owners = yield* makeAcnOwnerStore(dataDir)
-      yield* revisions.register(SDK_ACN_TARGET.revision)
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 })
       const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
         dataDir,
         binaryPath: `${dataDir}/must-not-be-resolved`,
@@ -377,10 +530,8 @@ describe("LocalAcnInstanceManager", () => {
       const exact = processFixture.exact
       const id = AcnInstanceIdSchema.make("unobservable-owner")
       const http = makeOwnerHttp(exact, id, Option.none, processFixture.stop)
-      const revisions = yield* makeAcnRevisionStore(dataDir)
       const owners = yield* makeAcnOwnerStore(dataDir)
-      yield* revisions.register(SDK_ACN_TARGET.revision)
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 })
       const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
         dataDir,
         binaryPath: `${dataDir}/must-not-be-resolved`,
@@ -417,10 +568,8 @@ describe("LocalAcnInstanceManager", () => {
           safeDetail: Option.none(),
         }),
       }), processFixture.stop)
-      const revisions = yield* makeAcnRevisionStore(dataDir)
       const owners = yield* makeAcnOwnerStore(dataDir)
-      yield* revisions.register(SDK_ACN_TARGET.revision)
-      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 }, SDK_ACN_TARGET.revision)
+      yield* owners.replaceOwner(Option.none(), { ...exact, port: 49152 })
       const manager = yield* makeLocalAcnInstanceManagerWithProcessController({
         dataDir,
         binaryPath: `${dataDir}/must-not-be-resolved`,

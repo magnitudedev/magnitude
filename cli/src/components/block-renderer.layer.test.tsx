@@ -6,17 +6,10 @@ mock.module('beautiful-mermaid', () => ({
 }))
 
 mock.module('../hooks/use-theme', async () => {
-  const { chatThemes } = await import('../utils/theme')
-  const theme = chatThemes.dark
+  const { defaultCliThemes } = await import('../utils/theme')
+  const theme = defaultCliThemes.dark
   return {
-    useTheme: () => ({
-      ...theme,
-      border: theme.border ?? theme.muted,
-      success: theme.success ?? 'green',
-      primary: theme.primary ?? theme.foreground,
-      foreground: theme.foreground ?? 'white',
-      muted: theme.muted ?? 'gray',
-    }),
+    useTheme: () => theme,
   }
 })
 
@@ -34,7 +27,7 @@ mock.module('@opentui/react', () => ({
 }))
 
 const { parseMarkdownToMdast } = await import('@magnitudedev/client-common')
-const { buildMarkdownColorPalette, chatThemes } = await import('../utils/theme')
+const { buildMarkdownColorPalette, defaultCliThemes } = await import('../utils/theme')
 const { renderDocumentToBlocks } = await import('../markdown/blocks')
 type Block = import('../markdown/blocks').Block
 const {
@@ -46,7 +39,7 @@ const {
   renderBlocksToTree,
 } = await import('./test-render-helpers')
 
-const theme = chatThemes.dark
+const theme = defaultCliThemes.dark
 const palette = buildMarkdownColorPalette(theme)
 
 function renderMarkdownBlocks(markdown: string, codeBlockWidth = 80): Block[] {

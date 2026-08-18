@@ -103,7 +103,6 @@ describe("model request preparation", () => {
     const prepare = makeModelRequestPreparation({
       acquireLocalModel: () => Effect.succeed({
         _tag: "Cancelled",
-        instanceId: ModelInstanceIdSchema.make("stopped-instance"),
         reason: "user_stop",
       }),
     })

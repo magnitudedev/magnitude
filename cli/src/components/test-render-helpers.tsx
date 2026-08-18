@@ -2,7 +2,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { BlockRenderer } from '../markdown/block-renderer'
 import type { Block, HighlightRange } from '../markdown/blocks'
-import { buildMarkdownColorPalette, chatThemes } from '../utils/theme'
+import { buildMarkdownColorPalette, defaultCliThemes } from '../utils/theme'
 
 export interface RenderTreeNode {
   kind: 'element'
@@ -91,7 +91,7 @@ type BlockRendererProps = {
   contentWidth?: number
 }
 
-const palette = buildMarkdownColorPalette(chatThemes.dark)
+const palette = buildMarkdownColorPalette(defaultCliThemes.dark)
 
 export function renderBlocksToTree(blocks: Block[], props?: BlockRendererProps): RenderTree {
   const element = (

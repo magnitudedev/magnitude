@@ -15,7 +15,7 @@ import { useAgentClient } from "../state/agent-client-context"
 import { useDisplayState } from "../state/display-state-store"
 import { useSlotProfiles } from "./use-slot-profiles"
 import { getDraftSessionOwnerId } from "./draft-session-owner"
-import { routeSlashCommand, type CommandContext } from "../commands/command-router"
+import { routeSlashCommand, type CommandContext, type SlashCommandOutcome } from "../commands/command-router"
 import type { MentionSearchClient } from "./use-file-mentions"
 import {
   selectedCwdAtom,
@@ -43,6 +43,7 @@ import type {
   RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { createId } from "@magnitudedev/generate-id"
+import { formatReasoningEffort } from "../utils/model-properties"
 import { isDisplayRootStatusActive } from "../utils/actor-status"
 
 export interface UseComposerStateResult {
@@ -72,7 +73,7 @@ export interface UseComposerStateResult {
   /** Run a bash command. The persisted event is the display source of truth. */
   handleRunBash: (command: string) => Promise<boolean>
   /** Handle a slash command string */
-  handleSlashCommand: (cmdText: string) => void
+  handleSlashCommand: (cmdText: string) => SlashCommandOutcome
   /** Mention search client (null if runtime not ready) */
   mentionClient: MentionSearchClient | null
   /** Currently selected session ID */
@@ -109,7 +110,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const { rootRoleLabel, rootProfile } = useSlotProfiles()
   const model = rootProfile?.modelDisplayName ?? ""
   const thinkingLevel = rootProfile?.reasoningEffort
-    ? rootProfile.reasoningEffort.charAt(0).toUpperCase() + rootProfile.reasoningEffort.slice(1)
+    ? formatReasoningEffort(rootProfile.reasoningEffort)
     : ""
 
   const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
@@ -126,11 +127,11 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   })), [selectedSessionId])
   useAtomMount(selectedSessionSyncAtom)
 
-  const sendAtom = useMemo(() => client.mutation("SendMessage"), [client])
-  const createSessionAtom = useMemo(() => client.mutation("CreateSession"), [client])
-  const interruptAtom = useMemo(() => client.mutation("Interrupt"), [client])
-  const runBashAtom = useMemo(() => client.mutation("RunBash"), [client])
-  const searchMentionsAtom = useMemo(() => client.mutation("SearchMentions"), [client])
+  const sendAtom = useMemo(() => client.rpc.mutation("SendMessage"), [client])
+  const createSessionAtom = useMemo(() => client.rpc.mutation("CreateSession"), [client])
+  const interruptAtom = useMemo(() => client.rpc.mutation("Interrupt"), [client])
+  const runBashAtom = useMemo(() => client.rpc.mutation("RunBash"), [client])
+  const searchMentionsAtom = useMemo(() => client.rpc.mutation("SearchMentions"), [client])
   const sendMutation = useAtomSet(sendAtom, { mode: "promise" })
   const createSession = useAtomSet(createSessionAtom, { mode: "promise" })
   const interruptMutation = useAtomSet(interruptAtom)
@@ -330,9 +331,10 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     }
   }, [selectedSessionId, runBashMutation, commandContext])
 
-  const handleSlashCommand = useCallback((cmdText: string) => {
-    routeSlashCommand(cmdText, commandContext)
-  }, [commandContext])
+  const handleSlashCommand = useCallback(
+    (cmdText: string): SlashCommandOutcome => routeSlashCommand(cmdText, commandContext),
+    [commandContext],
+  )
 
   return {
     roleLabel: rootRoleLabel,

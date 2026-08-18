@@ -4,13 +4,24 @@ import { create, type ReactTestInstance } from 'react-test-renderer'
 import { act, type ReactNode } from 'react'
 import { Option } from 'effect'
 import { TextAttributes } from '@opentui/core'
-import type { ChatTheme } from '../../types/theme-system'
-import { violet } from '../../utils/theme'
+import { defaultCliThemes } from '../../utils/theme'
 import type { ComposerProps } from './types'
-import { PRIMARY_SLOT_ID, ReasoningEffortSchema, type TaskDisplayRow } from '@magnitudedev/sdk'
+import {
+  ModelDownloadIdSchema,
+  PRIMARY_SLOT_ID,
+  ReasoningEffortSchema,
+  type TaskDisplayRow,
+} from '@magnitudedev/sdk'
+import {
+  deriveModelDownloadNotificationState,
+  NotificationIdSchema,
+  NotificationStateSchema,
+} from '@magnitudedev/client-common'
 import {
   GIB,
   LOCAL_PROVIDER_ID,
+  makeAcquiringModel,
+  makeModel,
   makeView,
   TEST_MEMORY_DOMAIN_ID,
 } from '../local-inference/test-fixtures'
@@ -88,10 +99,12 @@ vi.mock('@magnitudedev/client-common', async () => {
       handleKeyIntercept: () => false,
     }),
     useAgentClient: () => ({
-      query: () => ({ pipe: () => {} }),
-      mutation: () => ({ pipe: () => {} }),
-      runtime: { pipe: () => {} },
-      pipe: () => {},
+      rpc: {
+        query: () => ({ pipe: () => {} }),
+        mutation: () => ({ pipe: () => {} }),
+        runtime: { pipe: () => {} },
+        pipe: () => {},
+      },
     }),
   }
 })
@@ -131,62 +144,14 @@ vi.mock('./multiline-input', () => ({
 }))
 
 vi.mock('../../hooks/use-theme', () => ({
-  useTheme: () => theme,
+  useTheme: () => defaultCliThemes.dark,
 }))
-
-const { Composer, COMPOSER_BORDER_CHARS } = await import('./composer')
 
 const noop = () => {}
 
-const theme: ChatTheme = {
-  name: 'dark',
-  primary: '#55aaff',
-  secondary: '#ffaa00',
-  success: '#00ff00',
-  error: '#ff3333',
-  warning: '#ffaa00',
-  info: '#00aaff',
-  link: '#55aaff',
-  directory: '#55aaff',
-  foreground: '#ffffff',
-  background: '#000000',
-  muted: '#888888',
-  border: '#444444',
-  surface: '#222222',
-  surfaceHover: '#2a2a2a',
-  aiLine: '#55aaff',
-  userLine: '#ffaa00',
-  userMessageBg: '#111111',
-  userMessageHoverBg: '#1a1a1a',
-  inputBg: '#111111',
-  menuBg: '#111111',
-  menuAltBg: '#181818',
-  agentToggleExpandedBg: '#1a1a1a',
-  agentFocusedBg: '#1a1a1a',
-  agentContentBg: '#111111',
-  terminalBg: '#000000',
-  diffGreenBg: '#122b22',
-  diffRedBg: '#2c1919',
-  inputFg: '#cccccc',
-  inputFocusedFg: '#ffffff',
-  modeDefault: '#00aaff',
-  modePlan: '#ffaa00',
-  imageCardBorder: '#444444',
-  syntax: {
-    keyword: '#c084fc',
-    string: '#86efac',
-    number: '#93c5fd',
-    comment: '#64748b',
-    function: '#60a5fa',
-    variable: '#e2e8f0',
-    type: '#86efac',
-    operator: '#94a3b8',
-    property: '#e2e8f0',
-    punctuation: '#64748b',
-    literal: '#93c5fd',
-    default: '#f1f5f9',
-  },
-}
+const theme = defaultCliThemes.dark
+
+const { Composer, COMPOSER_BORDER_CHARS } = await import('./composer')
 
 function render(node: ReactNode) {
   return renderToStaticMarkup(<>{node}</>)
@@ -223,6 +188,7 @@ function makeProps(): ComposerProps {
     modelsConfigured: true,
     modelSetupInProgress: false,
     modelSetupPlaceholder: null,
+    notificationState: null,
     modelSummary: { role: 'role', model: 'model', thinkingLevel: 'high' },
     localModels: null,
     modelSlots: null,
@@ -243,13 +209,14 @@ function makeProps(): ComposerProps {
     autopilotEnabled: false,
     autopilotGenerating: false,
     submitUserMessage: () => {},
-    runSlashCommand: () => false,
+    runSlashCommand: () => ({ _tag: 'Unhandled' }),
     executeBash: () => true,
     clearSystemBanners: noop,
     interruptFork: noop,
     interruptAll: noop,
     openSettings: noop,
     openHardware: noop,
+    openCatalog: noop,
     thinkingOptions: [],
     applyThinking: noop,
     handleWidgetKeyEvent: () => false,
@@ -268,7 +235,7 @@ function makeProps(): ComposerProps {
 test('composer shell renders without an embedded task list (task list is the AgentStatus feature)', () => {
   const html = render(<Composer {...makeProps()} clientWorkingDirectory="/tmp/magnitude" />)
 
-  expect(html).toContain('background-color:#111111;padding-top:1px;padding-bottom:1px;padding-left:1px;padding-right:2px')
+  expect(html).toContain(`background-color:${theme.background.input};padding-top:1px;padding-bottom:1px;padding-left:1px;padding-right:2px`)
   expect(html).toContain('border-style:single;border:left')
   expect(COMPOSER_BORDER_CHARS.vertical).toBe('┃')
   expect(html).toContain('>model<')
@@ -284,10 +251,12 @@ test('composer shell renders without an embedded task list (task list is the Age
   expect(html).toContain('5k / 100k (5%)')
 })
 
-test('shows a single no-provider label instead of model and reasoning effort', () => {
+test('shows the unassigned-slot prompt instead of model and reasoning effort', () => {
   const html = render(<Composer {...makeProps()} modelsConfigured={false} />)
 
   expect(html).toContain('No model configured')
+  expect(html).toContain('/models')
+  expect(html).toContain('to see available models')
   expect(html).not.toContain('>model<')
   expect(html).not.toContain('>high<')
 })
@@ -319,7 +288,7 @@ test('shows resident memory three spaces after context and links it to hardware'
   )
 
   expect(html).toContain(
-    '5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:#888888"><span attributes="0">16 GB mem',
+    `5k / 100k (5%)</text><box style="width:3px;flex-shrink:0"></box><box><text style="fg:${theme.text.supporting}"><span attributes="0">16 GB mem`,
   )
 
   let view!: ReturnType<typeof create>
@@ -345,7 +314,7 @@ test('shows resident memory three spaces after context and links it to hardware'
   const hoveredMemory = view.root.findAll(
     (node) => node.type === 'text' && textOf(node) === '16 GB mem',
   )[0]!
-  expect(hoveredMemory.props.style).toEqual({ fg: theme.primary })
+  expect(hoveredMemory.props.style).toEqual({ fg: theme.accent })
   expect(hoveredMemory.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
   act(() => { (memoryButton!.props.onMouseOut as () => void)() })
   act(() => {
@@ -353,6 +322,115 @@ test('shows resident memory three spaces after context and links it to hardware'
   })
   expect(openHardware).toHaveBeenCalledOnce()
   act(() => { view.unmount() })
+})
+
+test('shows active model downloads in the persistent footer and links to the catalog', () => {
+  const openCatalog = vi.fn()
+  const localInferenceState = makeView({
+    models: [makeAcquiringModel({
+        _tag: 'Downloading',
+        downloadId: ModelDownloadIdSchema.make('download-1'),
+        stage: 'downloading',
+        completedBytes: GIB,
+        totalBytes: 16 * GIB,
+        bytesPerSecond: Option.none(),
+    })],
+  })
+  const notificationState = deriveModelDownloadNotificationState(
+    localInferenceState.models,
+  )
+  const mediumHtml = render(
+    <Composer
+      {...makeProps()}
+      chatColumnWidth={60}
+      localModels={localInferenceState.models}
+      notificationState={notificationState}
+      openCatalog={openCatalog}
+    />,
+  )
+  expect(mediumHtml).toContain(
+    'height:1px;flex-direction:row;justify-content:flex-end',
+  )
+  expect(mediumHtml.match(/justify-content:space-between/g)).toHaveLength(1)
+
+  const narrowHtml = render(
+    <Composer
+      {...makeProps()}
+      chatColumnWidth={45}
+      localModels={localInferenceState.models}
+      notificationState={notificationState}
+      openCatalog={openCatalog}
+    />,
+  )
+  expect(narrowHtml).not.toContain(
+    'height:1px;flex-direction:row;justify-content:flex-end',
+  )
+  expect(narrowHtml.match(/justify-content:space-between/g)).toHaveLength(2)
+  let view!: ReturnType<typeof create>
+  act(() => {
+    view = create(
+      <Composer
+        {...makeProps()}
+        localModels={localInferenceState.models}
+        notificationState={notificationState}
+        openCatalog={openCatalog}
+      />,
+    )
+  })
+
+  const textOf = (node: ReactTestInstance): string => node.children
+    .map((child) => typeof child === 'string' ? child : textOf(child))
+    .join('')
+  const downloadButton = view.root.findAll(
+    (node) => typeof node.props.onClick === 'function',
+  ).find((node) => textOf(node) === '1 model downloading')
+  expect(downloadButton).toBeDefined()
+  const downloadText = view.root.findAll(
+    (node) => node.type === 'text' && textOf(node) === '1 model downloading',
+  )[0]!
+  expect(downloadText.props.style).toEqual({ fg: theme.accent })
+
+  act(() => { (downloadButton!.props.onMouseOver as () => void)() })
+  expect(downloadText.findByType('span').props.attributes).toBe(TextAttributes.UNDERLINE)
+  act(() => { (downloadButton!.props.onMouseOut as () => void)() })
+  act(() => { (downloadButton!.props.onClick as () => void)() })
+  expect(openCatalog).toHaveBeenCalledOnce()
+
+  act(() => {
+    view.update(
+      <Composer
+        {...makeProps()}
+        localModels={makeView().models}
+        openCatalog={openCatalog}
+      />,
+    )
+  })
+  expect(view.root.findAll(
+    (node) => node.type === 'text' && textOf(node) === '1 model downloading',
+  )).toHaveLength(0)
+  act(() => { view.unmount() })
+})
+
+test('uses compact notification copy when the footer stacks into two rows', () => {
+  const notificationState = NotificationStateSchema.make({
+    id: NotificationIdSchema.make('selected-local-model-low-memory'),
+    message: 'Low memory: close memory-intensive apps (need 2.4 GB) to load model',
+    compactMessage: Option.some('Low memory: Free 2.4 GB to load'),
+    priority: 'warning',
+    action: Option.none(),
+    createdAt: 0,
+  })
+
+  const html = render(
+    <Composer
+      {...makeProps()}
+      chatColumnWidth={45}
+      notificationState={notificationState}
+    />,
+  )
+
+  expect(html).toContain('! Low memory: Free 2.4 GB to load')
+  expect(html).not.toContain('close memory-intensive apps')
 })
 
 test('clicking effort opens the footer selector and clicking an option commits it', () => {
@@ -466,9 +544,9 @@ test('disables footer settings controls while onboarding downloads a model', () 
     .map((child) => typeof child === 'string' ? child : textOf(child))
     .join('')
   const expectedColors = new Map([
-    ['model', theme.foreground],
-    ['high', violet[300]],
-    ['16 GB mem', theme.muted],
+    ['model', theme.text.body],
+    ['high', defaultCliThemes.dark.planAccent],
+    ['16 GB mem', theme.text.supporting],
   ])
   for (const label of expectedColors.keys()) {
     const control = view.root.findAll((node) => textOf(node) === label)

@@ -260,8 +260,7 @@ pub enum ModelAvailability {
         completed_bytes: u64,
         total_bytes: u64,
         resumable: bool,
-        reason: Option<String>,
-        last_error: String,
+        failure: DownloadFailure,
         updated_at: u64,
     },
     Available {
@@ -394,7 +393,7 @@ pub struct ReasoningEffortMapping {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningProfile {
-    pub default_effort: NormalizedReasoningEffort,
+    pub default_effort: Option<NormalizedReasoningEffort>,
     pub mappings: Vec<ReasoningEffortMapping>,
     pub template_fingerprint: String,
 }
@@ -451,6 +450,7 @@ pub enum InventoryProperties {
         parameter_count: Option<u64>,
         active_parameter_count: Option<u64>,
         training_context_length: Option<u32>,
+        nextn_predict_layers: Option<u32>,
         tokenizer: Option<String>,
         modalities: Vec<String>,
         base_models: Vec<String>,
@@ -654,9 +654,10 @@ pub struct HardwareDevice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareSystemMemory {
-    pub total_bytes: u64,
-    pub current_available_bytes: u64,
-    pub warning_reserve_bytes: u64,
+    pub physical_capacity_bytes: u64,
+    pub physical_available_bytes: u64,
+    pub allocation_capacity_bytes: u64,
+    pub allocation_headroom_bytes: u64,
     pub assess_reserve_bytes: u64,
     pub abort_reserve_bytes: u64,
 }
@@ -854,7 +855,7 @@ pub enum MemoryLocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryChargeOwner {
     Target,
-    Mtp,
+    SpeculativeDraft,
     Projector,
     ResidentRuntime,
 }
@@ -1499,6 +1500,12 @@ pub enum ModelDownloadEvent {
         operation_id: String,
         model: Box<InventoryModel>,
     },
+    Cancelled {
+        operation_id: String,
+        model_id: Option<ModelId>,
+        completed_bytes: u64,
+        total_bytes: u64,
+    },
     Failed {
         operation_id: String,
         model_id: Option<ModelId>,
@@ -1517,12 +1524,25 @@ pub struct DownloadFileProgress {
     pub total_bytes: u64,
 }
 
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadFailure {
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum DownloadFailure {
+    Interrupted,
+    #[serde(rename_all = "camelCase")]
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    SourceUnavailable,
+    NetworkUnavailable,
+    LocalStorageFailure,
+    CorruptDownload,
+    #[serde(rename_all = "camelCase")]
+    Internal {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1791,7 +1811,7 @@ mod tests {
             .unwrap();
         accountant
             .record(MemoryCharge::new(
-                MemoryChargeOwner::Mtp,
+                MemoryChargeOwner::SpeculativeDraft,
                 MemoryLocation::NativeDevice(NativeDeviceLocator::exact(
                     "Metal",
                     Some("metal-0"),

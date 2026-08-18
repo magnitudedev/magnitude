@@ -7,8 +7,8 @@
  * terminal layout. No feature logic, no rendering primitives beyond layout
  * boxes and the startup header slot.
  */
-import { useCallback, useSyncExternalStore, type ReactNode } from "react";
-import { Cause, Option } from "effect";
+import { useCallback, type ReactNode } from "react";
+import { Option } from "effect";
 import {
   useAtomValue,
   useAtomSet,
@@ -16,7 +16,6 @@ import {
   Result,
 } from "@effect-atom/atom-react";
 import {
-  useOnboardingState,
   useSlotProfiles,
   useDisplayViewController,
   useDisplayConnectionError,
@@ -26,20 +25,26 @@ import {
   selectedCwdAtom,
   sessionCreateOptionsAtom,
   useSessionPreload,
-  subscribeEphemeralMessage,
-  getEphemeralMessageSnapshot,
   useFileWatchBridge,
   useOnboardingModelSetup,
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
+  notificationAreaStateAtom,
+  deriveLocalModelPersistentNotificationStates,
+  deriveSelectedModelResidencyNotificationState,
+  notificationStatesEquivalent,
+  resolveActiveNotificationState,
+  useLocalModelsSelector,
+  useModelSlots,
+  useModelSlotActions,
   useAcnLifecycle,
-  type OnboardingModelCommandFailed,
+  localModelConfigurationId,
+  formatLocalModelDisplayName,
+  onboardingModelSetupFailureMessage,
+  type OnboardingModelSetupState,
 } from "@magnitudedev/client-common";
 import {
-  ReasoningEffortSchema,
   type LocalModelsState,
-  type ModelSlotsState,
-  type ProviderModelCatalogState,
   type SessionOptions,
   type AcnLifecycleState,
 } from "@magnitudedev/sdk";
@@ -53,7 +58,6 @@ import {
   useSessionStartup,
   type SessionStart,
 } from "./hooks/use-session-startup";
-import { useTerminalBgDetection } from "./hooks/use-terminal-bg-detection";
 import { useTerminalKeyboard } from "./hooks/use-terminal-keyboard";
 import { useTheme } from "./hooks/use-theme";
 import { useLocalWidth } from "./hooks/use-local-width";
@@ -84,10 +88,8 @@ import {
 } from "./features/sessions/container";
 import {
   OnboardingModelChooser,
+  OnboardingModelExiting,
   OnboardingModelPreparation,
-  deriveModelSetupActive,
-  deriveOnboardingModelSetupView,
-  onboardingModelSetupPlaceholder,
 } from "./features/model-setup";
 import { registerCliCommands } from "./commands/register";
 import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
@@ -102,7 +104,6 @@ export interface CliAppProps {
   goal: string | undefined;
   envAuth: AuthSource;
   sessionOptions: SessionOptions;
-  forceLocalInferenceSetup?: boolean;
   initialAcnLifecycle: AcnLifecycleState;
 }
 
@@ -131,7 +132,6 @@ function CliAppGates(props: CliAppProps): ReactNode {
         <OnboardingGate
           {...props}
           onExitApp={exitApp}
-          forceSetup={props.forceLocalInferenceSetup ?? false}
         />
       )}
     </CliEnvironmentGate>
@@ -145,8 +145,6 @@ function CliEnvironmentGate({
 }): ReactNode {
   const connectionError = useDisplayConnectionError();
   const controller = useDisplayViewController();
-  useTerminalBgDetection();
-
   const exitApp = useCallback(() => {
     process.kill(process.pid, "SIGINT");
   }, []);
@@ -177,18 +175,18 @@ function CliEnvironmentGate({
 function OnboardingGate(
   props: CliAppProps & {
     readonly onExitApp: () => void;
-    readonly forceSetup: boolean;
   }
 ): ReactNode {
-  const onboarding = useOnboardingState();
+  const onboardingSetup = useOnboardingModelSetup();
   const { slots, retry: retryProfiles } = useSlotProfiles();
-  const controller = useDisplayViewController();
 
-  if (Result.isFailure(onboarding.state)) {
+  if (Result.isInitial(onboardingSetup.view)) return null;
+
+  if (Result.isFailure(onboardingSetup.view)) {
     return (
       <FatalErrorScreen
-        error="Failed to read onboarding state."
-        onRetry={() => controller.retry()}
+        error="Failed to determine whether onboarding setup is required."
+        onRetry={onboardingSetup.retry}
         onQuit={props.onExitApp}
       />
     );
@@ -207,24 +205,14 @@ function OnboardingGate(
     }
   }
 
-  const onboardingRequired = Result.isSuccess(onboarding.state)
-    ? !onboarding.state.value.completed
-    : false;
   const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary);
-  const modelSetupActive = deriveModelSetupActive({
-    forceSetup: props.forceSetup,
-    onboardingRequired,
-    completionSucceeded: Result.isSuccess(onboarding.updateResult),
-  });
+  const onboardingSetupOpen = onboardingSetup.view.value._tag === "Open";
   const modelsConfigured = Option.exists(primary, isModelSlotConfigured);
   const modelsReadyForInitialWork = Option.exists(primary, (slot) => {
     if (slot._tag === "Unassigned" || slot.availability._tag !== "Available")
       return false;
     if (slot._tag === "ConfiguredRemote") return true;
-    return Option.exists(
-      slot.instance,
-      (instance) => instance.lifecycle._tag === "Ready"
-    );
+    return slot.residency._tag === "Ready";
   });
 
   return (
@@ -232,9 +220,8 @@ function OnboardingGate(
       {...props}
       modelsConfigured={modelsConfigured}
       modelsReadyForInitialWork={modelsReadyForInitialWork}
-      modelSetupActive={modelSetupActive}
-      updateOnboarding={onboarding.update}
-      updateOnboardingResult={onboarding.updateResult}
+      onboardingSetupOpen={onboardingSetupOpen}
+      onboardingSetup={onboardingSetup}
     />
   );
 }
@@ -243,21 +230,18 @@ function CliAppContent(
   props: CliAppProps & {
     readonly modelsConfigured: boolean;
     readonly modelsReadyForInitialWork: boolean;
-    readonly modelSetupActive: boolean;
-    readonly updateOnboarding: ReturnType<typeof useOnboardingState>["update"];
-    readonly updateOnboardingResult: ReturnType<
-      typeof useOnboardingState
-    >["updateResult"];
+    readonly onboardingSetupOpen: boolean;
+    readonly onboardingSetup: ReturnType<typeof useOnboardingModelSetup>;
   }
 ): ReactNode {
-  useSessionPreload(!props.modelSetupActive);
+  useSessionPreload(!props.onboardingSetupOpen);
   useFileWatchBridge();
   useSessionStartup({
     sessionStart: props.sessionStart,
     initialPrompt: props.initialPrompt,
     goal: props.goal,
     modelsConfigured:
-      props.modelsReadyForInitialWork && !props.modelSetupActive,
+      props.modelsReadyForInitialWork && !props.onboardingSetupOpen,
   });
 
   const theme = useTheme();
@@ -277,60 +261,41 @@ function CliAppContent(
 
   const widget = useRecentChatsWidgetState();
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
-  const ephemeralMessage = useSyncExternalStore(
-    subscribeEphemeralMessage,
-    getEphemeralMessageSnapshot
-  );
-  const onboardingSetup = useOnboardingModelSetup();
-  const downloadingModelCount = Result.match(onboardingSetup.models, {
-    onInitial: () => 0,
-    onFailure: () => 0,
-    onSuccess: ({ value }) =>
-      value.models.filter((model) => model.download._tag === "Downloading")
-        .length,
-  });
-  const downloadSummary =
-    downloadingModelCount === 0
-      ? null
-      : `${downloadingModelCount} ${
-          downloadingModelCount === 1 ? "model" : "models"
-        } downloading`;
+  const notificationAreaState = useAtomValue(notificationAreaStateAtom);
+  const onboardingSetup = props.onboardingSetup;
+  const setupState = Option.getOrNull(Result.value(onboardingSetup.view));
+  const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const { rootSlotId } = useSlotProfiles();
-  const localModelLoadActivity = Result.match(onboardingSetup.slots, {
-    onInitial: () => null,
-    onFailure: () => null,
-    onSuccess: ({ value }) => deriveLocalModelLoadActivity(value, rootSlotId),
-  });
-  const workflowError = <A,>(
-    result: Result.Result<A, OnboardingModelCommandFailed>,
-    command: OnboardingModelCommandFailed["command"]
-  ): string | null =>
-    Result.matchWithError(result, {
-      onInitial: () => null,
-      onError: (failure) =>
-        failure.command === command ? failure.message : null,
-      onDefect: (_, failure) =>
-        Cause.isInterruptedOnly(failure.cause)
-          ? null
-          : "The local model setup command failed unexpectedly.",
-      onSuccess: () => null,
-    });
-  const configurationMutationError = workflowError(
-    onboardingSetup.workflowResult,
-    "createOffering",
-  )
-    ?? workflowError(onboardingSetup.workflowResult, "download");
-  const loadMutationError = workflowError(onboardingSetup.workflowResult, "load");
-  const assignmentMutationError = workflowError(onboardingSetup.workflowResult, "assign");
-  const completionMutationError = workflowError(onboardingSetup.workflowResult, "complete");
-  const cancelDownloadError = workflowError(onboardingSetup.cancelResult, "cancel")
-    ?? workflowError(onboardingSetup.cancelResult, "clear");
-  const completeModelSetup = useCallback(() => {
-    void props.updateOnboarding(true);
-  }, [props.updateOnboarding]);
-  const loadOnboardingModel = onboardingSetup.load;
-  const configureOnboardingModel = onboardingSetup.configureThenLoad;
+  const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
+    === "ConfiguredLocal"
+    ? modelSlotsState.slots.primary.selection.providerModelId
+    : null;
+  const selectPersistentNotificationStates = useCallback(
+    (modelsState: LocalModelsState) =>
+      deriveLocalModelPersistentNotificationStates(
+        modelsState,
+        selectedLocalProviderModelId,
+      ),
+    [selectedLocalProviderModelId],
+  );
+  const persistentNotificationStates = useLocalModelsSelector(
+    selectPersistentNotificationStates,
+    notificationStatesEquivalent,
+  );
+  const notificationState = resolveActiveNotificationState(
+    notificationAreaState,
+    [
+      ...Option.getOrElse(persistentNotificationStates, () => []),
+      deriveSelectedModelResidencyNotificationState(modelSlotsState, rootSlotId),
+    ],
+  );
+  const localModelLoadActivity = modelSlotsState === null
+    ? null
+    : deriveLocalModelLoadActivity(modelSlotsState, rootSlotId);
+  const setupOnboardingModel = onboardingSetup.select;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
+  const exitOnboardingModelSetup = onboardingSetup.exit;
+  const slotActions = useModelSlotActions();
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
   const clientWorkingDirectory = process.cwd();
@@ -350,12 +315,13 @@ function CliAppContent(
 
   useTerminalKeyboard({
     dispatchErrorAction,
-    recentChatsEnabled: !props.modelSetupActive,
+    recentChatsEnabled: !props.onboardingSetupOpen,
   });
 
   const setupPreparation = (
-    progress: LocalModelsState["recommendations"]["progress"],
-    error: string | null
+    progress: LocalModelsState["discoveryState"]["progress"],
+    error: string | null,
+    exitKind: "Skip" | "Close" | null,
   ) => ({
     surface: (
       <OnboardingModelPreparation
@@ -363,223 +329,140 @@ function CliAppContent(
         progress={progress}
         error={error}
         width={chatColumnWidth}
-        onSkip={completeModelSetup}
+        onExit={exitKind === null ? undefined : exitOnboardingModelSetup}
+        exitKind={exitKind}
       />
     ),
     placeholder: "Preparing local models…",
   });
-  const setupWithDomains = (
-    models: LocalModelsState,
-    catalog: ProviderModelCatalogState,
-    slots: ModelSlotsState
-  ) => {
-    if (models.recommendations._tag === "Loading") {
-      return setupPreparation(models.recommendations.progress, null);
+  const setupWithState = (state: OnboardingModelSetupState) => {
+    if (state._tag === "Closed") {
+      return { surface: undefined, placeholder: null };
     }
-    if (models.recommendations._tag === "Failed") {
+    if (state.content._tag === "Closing") {
+      return {
+        surface: (
+          <OnboardingModelExiting
+            hardware={onboardingSetup.hardware}
+            width={chatColumnWidth}
+          />
+        ),
+        placeholder: "Finishing onboarding…",
+      };
+    }
+    if (state.content._tag === "Preparation") {
+      const content = state.content;
+      const notice = Option.map(
+        state.notice,
+        onboardingModelSetupFailureMessage,
+      );
       return setupPreparation(
-        models.recommendations.progress,
-        models.recommendations.failure.message
+        content.progress,
+        Option.getOrElse(
+          notice,
+          () => content.discoveryFailure?.message ?? null,
+        ),
+        state.exitKind,
       );
     }
-    if (catalog._tag === "Loading") {
-      return setupPreparation(models.recommendations.progress, null);
-    }
-    if (catalog._tag === "Unavailable") {
-      return setupPreparation(
-        models.recommendations.progress,
-        "The model catalog is unavailable."
-      );
-    }
-    const setupView = deriveOnboardingModelSetupView({
-      active: true,
-      submission: onboardingSetup.submission,
-      providerModelId: onboardingSetup.providerModelId,
-      submitting: Result.isWaiting(onboardingSetup.workflowResult),
-      models,
-      slots,
+    const content = state.content;
+    const setupError = Option.match(state.notice, {
+      onNone: () => null,
+      onSome: onboardingModelSetupFailureMessage,
     });
-    const surface = (() => {
-      switch (setupView._tag) {
-        case "Inactive":
-          return undefined;
-        case "Downloading":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              catalog={catalog}
-              slots={slots}
-              width={chatColumnWidth}
-              error={configurationMutationError}
-              operation={{
+    const chooser = (
+      operation: Parameters<typeof OnboardingModelChooser>[0]["operation"],
+      placeholder: string,
+    ) => ({
+      surface: (
+        <OnboardingModelChooser
+          hardware={onboardingSetup.hardware}
+          options={content.options}
+          width={chatColumnWidth}
+          error={setupError}
+          operation={operation}
+          onSelect={setupOnboardingModel}
+          onExit={exitOnboardingModelSetup}
+          exitKind={state.exitKind}
+        />
+      ),
+      placeholder,
+    });
+    return Option.match(content.operation, {
+      onNone: () => chooser(null, "Select a model to start coding…"),
+      onSome: (operation) => {
+        switch (operation._tag) {
+          case "Preparing": {
+            const acquisition = operation.model.acquisitionState;
+            if (acquisition._tag !== "Installed") {
+              const starting = acquisition._tag !== "Downloading";
+              return chooser({
                 _tag: "Downloading",
-                candidate: setupView.candidate,
-                cancelling: onboardingSetup.cancelling,
-                cancelError: cancelDownloadError,
+                model: operation.model,
+                starting,
+                cancelling: operation.cancelling,
                 onCancel: cancelOnboardingModelSetup,
-                onRetry: () =>
-                  configureOnboardingModel({
-                    targetId: setupView.candidate.targetId,
-                    configurationId: setupView.candidate.configurationId,
-                    displayName: setupView.candidate.displayName,
-                    reasoningEffort: Option.getOrElse(
-                      setupView.candidate.capabilities.reasoning.defaultEffort,
-                      () => ReasoningEffortSchema.make("none")
-                    ),
-                  }),
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "DownloadFailed":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              catalog={catalog}
-              slots={slots}
-              width={chatColumnWidth}
-              error={null}
-              operation={{
-                _tag: "DownloadFailed",
-                candidate: setupView.candidate,
-                onChooseAnother: cancelOnboardingModelSetup,
-                onRetry: () =>
-                  configureOnboardingModel({
-                    targetId: setupView.candidate.targetId,
-                    configurationId: setupView.candidate.configurationId,
-                    displayName: setupView.candidate.displayName,
-                    reasoningEffort: Option.getOrElse(
-                      setupView.candidate.capabilities.reasoning.defaultEffort,
-                      () => ReasoningEffortSchema.make("none")
-                    ),
-                  }),
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "Configuring":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              catalog={catalog}
-              slots={slots}
-              width={chatColumnWidth}
-              error={configurationMutationError}
-              operation={{
-                _tag: "Configuring",
-                candidate: setupView.candidate,
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "Activating":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              catalog={catalog}
-              slots={slots}
-              width={chatColumnWidth}
-              error={
-                setupView.phase === "Ready"
-                  ? completionMutationError
-                  : cancelDownloadError ?? assignmentMutationError ?? loadMutationError
-              }
-              operation={{
-                _tag: "Activating",
-                providerModelId: setupView.providerModelId,
-                displayName: setupView.displayName,
-                phase: setupView.phase,
-                failure: setupView.failure,
-                onRetry: () => loadOnboardingModel({
-                  providerModelId: setupView.providerModelId,
-                  displayName: setupView.displayName,
-                  reasoningEffort: setupView.reasoningEffort,
-                }),
-                onChooseAnother: cancelOnboardingModelSetup,
-              }}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-        case "Choosing":
-          return (
-            <OnboardingModelChooser
-              hardware={onboardingSetup.hardware}
-              models={models}
-              catalog={catalog}
-              slots={slots}
-              width={chatColumnWidth}
-              error={
-                configurationMutationError ??
-                assignmentMutationError ??
-                loadMutationError
-              }
-              operation={null}
-              onLoad={loadOnboardingModel}
-              onSelectConfiguration={configureOnboardingModel}
-              onContinue={completeModelSetup}
-              onSkip={completeModelSetup}
-            />
-          );
-      }
-    })();
-    return {
-      surface,
-      placeholder: onboardingModelSetupPlaceholder(setupView),
-    };
+              }, `${starting ? "Starting download for" : "Downloading"} ${formatLocalModelDisplayName(operation.model)}…`);
+            }
+            return chooser({
+              _tag: "Configuring",
+              model: operation.model,
+            }, `Configuring ${formatLocalModelDisplayName(operation.model)}…`);
+          }
+          case "Configuring": return chooser({
+            _tag: "Configuring",
+            model: operation.model,
+          }, `Configuring ${formatLocalModelDisplayName(operation.model)}…`);
+          case "Installing": return chooser({
+            _tag: "Downloading",
+            model: operation.model,
+            starting: operation.model.acquisitionState._tag === "NotInstalled",
+            cancelling: operation.cancelling,
+            onCancel: cancelOnboardingModelSetup,
+          }, `Downloading ${formatLocalModelDisplayName(operation.model)}…`);
+          case "Loading": return chooser({
+            _tag: "Activating",
+            providerModelId: operation.providerModelId,
+            model: operation.model,
+            phase: operation.phase,
+            failure: operation.failure,
+            onRetry: () => setupOnboardingModel(operation.configurationId),
+            onChooseAnother: cancelOnboardingModelSetup,
+          }, operation.phase === "Loading"
+            ? `Loading ${formatLocalModelDisplayName(operation.model)}…`
+            : operation.phase === "Stopping"
+              ? `Stopping ${formatLocalModelDisplayName(operation.model)}…`
+              : operation.phase === "Ready"
+                ? `Finishing setup for ${formatLocalModelDisplayName(operation.model)}…`
+                : `Couldn’t load ${formatLocalModelDisplayName(operation.model)}`);
+          case "Completing": return chooser({
+            _tag: "Activating",
+            providerModelId: operation.providerModelId,
+            model: operation.model,
+            phase: "Ready",
+            failure: null,
+            onRetry: () => setupOnboardingModel(operation.configurationId),
+            onChooseAnother: cancelOnboardingModelSetup,
+          }, `Finishing setup for ${formatLocalModelDisplayName(operation.model)}…`);
+        }
+      },
+    });
   };
-  const setupPresentation = !props.modelSetupActive
+  const setupPresentation = !props.onboardingSetupOpen
     ? { surface: undefined, placeholder: null }
-    : Result.match(onboardingSetup.models, {
-        onInitial: () => setupPreparation([], null),
-        onFailure: () =>
-          setupPreparation([], "Local model discovery is unavailable."),
-        onSuccess: ({ value: models }) =>
-          Result.match(onboardingSetup.catalog, {
-            onInitial: () =>
-              setupPreparation(models.recommendations.progress, null),
-            onFailure: () =>
-              setupPreparation(
-                models.recommendations.progress,
-                "The model catalog is unavailable."
-              ),
-            onSuccess: ({ value: catalog }) =>
-              Result.match(onboardingSetup.slots, {
-                onInitial: () =>
-                  setupPreparation(models.recommendations.progress, null),
-                onFailure: () =>
-                  setupPreparation(
-                    models.recommendations.progress,
-                    "Model selection is unavailable."
-                  ),
-                onSuccess: ({ value: slots }) =>
-                  setupWithDomains(models, catalog, slots),
-              }),
-          }),
+    : Result.match(onboardingSetup.view, {
+        onInitial: () => setupPreparation([], null, null),
+        onFailure: () => setupPreparation([], "Local model setup is unavailable.", null),
+        onSuccess: ({ value }) => setupWithState(value),
       });
   const setupSurface = setupPresentation.surface;
   const modelSetupPlaceholder = setupPresentation.placeholder;
   const activityRail = (
     <ActivityRailContainer
       modelLoadActivity={localModelLoadActivity}
-      onStopModel={onboardingSetup.slotActions.stop}
+      onStopModel={slotActions.stop}
       width={chatColumnWidth}
-      agentActivityEnabled={!props.modelSetupActive}
+      agentActivityEnabled={!props.onboardingSetupOpen}
     />
   );
 
@@ -592,7 +475,7 @@ function CliAppContent(
         "~"
       )}
       recentChats={
-        !props.modelSetupActive &&
+        !props.onboardingSetupOpen &&
         !widget.hasActivity &&
         !(menu.open && sessionId === null) ? (
           <RecentChatsWidgetView state={widget} />
@@ -641,16 +524,16 @@ function CliAppContent(
                   dispatchErrorAction={dispatchErrorAction}
                   isOverlayActive={isOverlayActive}
                   emptyState={setupSurface}
-                  exclusiveEmptyState={props.modelSetupActive}
+                  exclusiveEmptyState={props.onboardingSetupOpen}
                 />
-                {!props.modelSetupActive && (
+                {!props.onboardingSetupOpen && (
                   <box
                     style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}
                   >
                     <TaskListContainer />
                   </box>
                 )}
-                {props.modelSetupActive ? (
+                {props.onboardingSetupOpen ? (
                   <box
                     style={{
                       height: 1,
@@ -665,21 +548,23 @@ function CliAppContent(
                   activityRail
                 )}
               </box>
-              {menu.open && !props.modelSetupActive ? (
-                <ModelMenusContainer downloadSummary={downloadSummary} />
+              {menu.open && !props.onboardingSetupOpen ? (
+                <ModelMenusContainer notificationState={notificationState} />
               ) : (
                 <ComposerContainer
                   chatColumnWidth={chatColumnWidth}
                   clientWorkingDirectory={clientWorkingDirectory}
                   widgetNavActive={
-                    widget.widgetNavActive && !props.modelSetupActive
+                    widget.widgetNavActive && !props.onboardingSetupOpen
                   }
                   handleWidgetKeyEvent={widget.navigation.handleKeyEvent}
                   modelsConfigured={props.modelsConfigured}
-                  modelSetupInProgress={props.modelSetupActive}
+                  modelSetupInProgress={props.onboardingSetupOpen}
                   modelSetupPlaceholder={
-                    props.modelSetupActive ? modelSetupPlaceholder : null
+                    props.onboardingSetupOpen ? modelSetupPlaceholder : null
                   }
+                  notificationState={notificationState}
+                  openSetup={onboardingSetup.open}
                 />
               )}
             </box>
@@ -687,21 +572,9 @@ function CliAppContent(
 
           {clipboardToast && (
             <Toast
-              color={theme.success}
-              background={theme.surface}
+              color={theme.status.success}
+              background={theme.background.surface}
               text="Copied to clipboard"
-            />
-          )}
-          {ephemeralMessage && (
-            <Toast
-              color={
-                ephemeralMessage.color ??
-                (ephemeralMessage.tone === "warning"
-                  ? theme.warning
-                  : theme.error)
-              }
-              background={theme.surface}
-              text={ephemeralMessage.text}
             />
           )}
         </box>

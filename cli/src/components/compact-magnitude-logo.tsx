@@ -22,7 +22,7 @@ export function CompactMagnitudeLogo() {
       flexDirection: 'column',
     }}>
       {COMPACT_MAGNITUDE_LOGO_LINES.map((line, index) => (
-        <text key={index} style={{ fg: theme.primary }}>{line}</text>
+        <text key={index} style={{ fg: theme.accent }}>{line}</text>
       ))}
     </box>
   )

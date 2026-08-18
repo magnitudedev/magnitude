@@ -1,9 +1,11 @@
 use icn_contracts::models::{ModelCapabilities, ModelReasoningCapabilities};
 use icn_contracts::{CapabilitySupport, InventoryProperties, ReasoningCapability};
 
-pub(crate) fn model_capabilities(properties: &InventoryProperties) -> ModelCapabilities {
+pub(crate) fn model_capabilities(
+    properties: &InventoryProperties,
+    vision: bool,
+) -> ModelCapabilities {
     let InventoryProperties::Inspected {
-        modalities,
         tools,
         structured_output,
         reasoning,
@@ -51,18 +53,22 @@ pub(crate) fn model_capabilities(properties: &InventoryProperties) -> ModelCapab
                 }
                 unique
             });
-            let default_effort = requested_default
-                .filter(|effort| efforts.contains(effort))
-                .or_else(|| efforts.first().cloned());
-            ModelReasoningCapabilities {
-                supported: !efforts.is_empty(),
-                efforts,
-                default_effort,
+            match requested_default.filter(|effort| efforts.contains(effort)) {
+                Some(default_effort) if !efforts.is_empty() => ModelReasoningCapabilities {
+                    supported: true,
+                    efforts,
+                    default_effort: Some(default_effort),
+                },
+                _ => ModelReasoningCapabilities {
+                    supported: false,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                },
             }
         }
     };
     ModelCapabilities {
-        vision: modalities.iter().any(|modality| modality == "vision"),
+        vision,
         tools: matches!(tools, CapabilitySupport::Supported { .. }),
         structured_output: matches!(structured_output, CapabilitySupport::Supported { .. }),
         reasoning,

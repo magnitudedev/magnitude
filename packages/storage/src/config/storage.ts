@@ -2,7 +2,7 @@ import * as FileSystem from "@effect/platform/FileSystem";
 import * as Path from "@effect/platform/Path";
 import { type PlatformError } from "@effect/platform/Error";
 import { randomUUID } from "node:crypto";
-import { Effect, Option, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
 import {
   makeStorageIo,
@@ -25,30 +25,6 @@ import {
 import type { ConfigStorageShape } from "./contracts";
 
 const DEFAULT_CONFIG = Schema.decodeUnknownSync(MagnitudeConfigSchema)({});
-
-const discardRemovedModelConfiguration = (config: MagnitudeConfig): {
-  readonly value: MagnitudeConfig;
-  readonly changed: boolean;
-} => {
-  const models = config.models === undefined ? undefined : {
-    slots: config.models.slots,
-    localModelRecency: config.models.localModelRecency,
-    favoriteModels: config.models.favoriteModels,
-    localProviderOfferings: config.models.localProviderOfferings,
-    dismissedDownloadFailures: config.models.dismissedDownloadFailures,
-  };
-  const removedModelFields = config.models !== undefined
-    && Reflect.ownKeys(config.models).some((key) =>
-      key !== "slots"
-      && key !== "localModelRecency"
-      && key !== "favoriteModels"
-      && key !== "localProviderOfferings"
-      && key !== "dismissedDownloadFailures");
-  const value = models === undefined ? { ...config } : { ...config, models };
-  const removedLocalInference = Reflect.has(value, "localInference");
-  if (removedLocalInference) Reflect.deleteProperty(value, "localInference");
-  return { value, changed: removedModelFields || removedLocalInference };
-};
 
 const safeRecoveryMessage = (message: string): string =>
   message.replace(/, actual[\s\S]*$/, "").slice(0, 500);
@@ -119,13 +95,10 @@ export function makeConfigStorage(): Effect.Effect<
           );
           return DEFAULT_CONFIG;
         }
-        const cleaned = discardRemovedModelConfiguration(result.value);
         const backupPath = result.recovery.recovered && result.recovery.resetRoot
           ? yield* preserveCorruptOriginal(result.originalText)
           : undefined;
-        if (result.recovery.recovered || cleaned.changed) {
-          yield* writeConfigUnlocked(cleaned.value);
-        }
+        if (result.recovery.recovered) yield* writeConfigUnlocked(result.value);
         if (result.recovery.recovered) {
           yield* Effect.logWarning("Recovered invalid Magnitude config values").pipe(
             Effect.annotateLogs({
@@ -145,25 +118,16 @@ export function makeConfigStorage(): Effect.Effect<
             })
           );
         }
-        return cleaned.value;
+        return result.value;
       });
 
     const readConfig = (): Effect.Effect<MagnitudeConfig, PlatformError | JsonError> =>
       io.withPathLock(g.configFile, readConfigUnlocked());
 
-    const emptyModelConfig = () => ({
-      slots: { primary: Option.none(), secondary: Option.none() },
-      localModelRecency: { primary: [], secondary: [] },
-      favoriteModels: [],
-      localProviderOfferings: [],
-      dismissedDownloadFailures: [],
-    } as const);
-
     return {
       load: () => readConfig(),
 
-      save: (config) =>
-        io.withPathLock(g.configFile, writeConfigUnlocked(config)),
+      save: (config) => io.withPathLock(g.configFile, writeConfigUnlocked(config)),
 
       update: (f) =>
         io.withPathLock(
@@ -190,93 +154,6 @@ export function makeConfigStorage(): Effect.Effect<
                 ...(current.contextLimits ?? {}),
                 ...policy,
               },
-            });
-          })
-        ),
-
-      updateModelSlot: (slotId, selection) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfigUnlocked();
-            const existingModels = current.models ?? emptyModelConfig();
-            yield* writeConfigUnlocked({
-              ...current,
-              models: {
-                ...existingModels,
-                slots: { ...existingModels.slots, [slotId]: selection },
-              },
-            });
-          })
-        ),
-
-      upsertLocalProviderOffering: (offering) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfigUnlocked();
-            const existingModels = current.models ?? emptyModelConfig();
-            const withoutExisting = existingModels.localProviderOfferings.filter(
-              ({ providerModelId }) => providerModelId !== offering.providerModelId,
-            );
-            yield* writeConfigUnlocked({
-              ...current,
-              models: {
-                ...existingModels,
-                localProviderOfferings: [...withoutExisting, offering],
-              },
-            });
-          }),
-        ),
-
-      dismissDownloadFailure: (packageId) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfigUnlocked();
-            const existingModels = current.models ?? emptyModelConfig();
-            yield* writeConfigUnlocked({
-              ...current,
-              models: {
-                ...existingModels,
-                dismissedDownloadFailures: [
-                  ...new Set([...existingModels.dismissedDownloadFailures, packageId]),
-                ],
-              },
-            });
-          }),
-        ),
-
-      clearDismissedDownloadFailure: (packageId) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfigUnlocked();
-            const existingModels = current.models ?? emptyModelConfig();
-            yield* writeConfigUnlocked({
-              ...current,
-              models: {
-                ...existingModels,
-                dismissedDownloadFailures: existingModels.dismissedDownloadFailures.filter(
-                  (candidate) => candidate !== packageId,
-                ),
-              },
-            });
-          }),
-        ),
-
-      getOnboardingConfig: () =>
-        readConfig().pipe(Effect.map((config) => config.onboarding)),
-
-
-      updateOnboardingState: (completed) =>
-        io.withPathLock(
-          g.configFile,
-          Effect.gen(function* () {
-            const current = yield* readConfigUnlocked();
-            yield* writeConfigUnlocked({
-              ...current,
-              onboarding: Option.some({ completed }),
             });
           })
         ),

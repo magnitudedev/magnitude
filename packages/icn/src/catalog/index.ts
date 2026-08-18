@@ -1,26 +1,13 @@
-import {
-  Cause,
-  Context,
-  Duration,
-  Effect,
-  Layer,
-  Schedule,
-  Schema,
-  Stream,
-} from "effect"
-import { IcnClient, type IcnClientService } from "../client.js"
-import { RecommendableModelCatalog as RecommendableModelCatalogSchema } from "@magnitudedev/icn-protocol/schemas"
-import { makeIcnObservedState, type IcnObservedSnapshot } from "../observed-state.js"
-
-type CatalogReadError = Effect.Effect.Error<
-  ReturnType<IcnClientService["models"]["getRecommendableModelCatalog"]>
->
+import { Context, Duration, Effect, Layer, Schema, Stream } from "effect"
+import { RecommendableModelCatalog } from "@magnitudedev/icn-protocol/schemas"
+import { IcnModels, type IcnModelsService } from "../models/index.js"
+import type { IcnObservedSnapshot } from "../observed-state.js"
 
 export interface IcnCatalogService {
-  readonly get: Effect.Effect<IcnObservedSnapshot<RecommendableModelCatalogSchema>>
-  readonly changes: Stream.Stream<IcnObservedSnapshot<RecommendableModelCatalogSchema>>
+  readonly get: Effect.Effect<IcnObservedSnapshot<RecommendableModelCatalog>>
+  readonly changes: Stream.Stream<IcnObservedSnapshot<RecommendableModelCatalog>>
   readonly ready: Effect.Effect<boolean>
-  readonly refresh: Effect.Effect<void, CatalogReadError>
+  readonly refresh: Effect.Effect<void, unknown>
 }
 
 export class IcnCatalog extends Context.Tag("@magnitudedev/icn/IcnCatalog")<
@@ -32,35 +19,30 @@ export interface IcnCatalogOptions {
   readonly refreshInterval?: Duration.DurationInput
 }
 
+const catalogSnapshot = (
+  snapshot: Effect.Effect.Success<IcnModelsService["get"]>,
+) =>
+  Schema.validate(RecommendableModelCatalog)({
+    models: snapshot.state.catalogModels.map((model) => ({
+      ...model,
+      configuration: model.desiredConfiguration,
+    })),
+    diagnostics: snapshot.state.diagnostics,
+  }).pipe(Effect.map((state) => ({ revision: snapshot.revision, state })))
+
 export const makeIcnCatalog = (
-  options: IcnCatalogOptions = {},
-): Layer.Layer<IcnCatalog, CatalogReadError, IcnClient> =>
-  Layer.scoped(
+  _options: IcnCatalogOptions = {},
+): Layer.Layer<IcnCatalog, never, IcnModels> =>
+  Layer.effect(
     IcnCatalog,
     Effect.gen(function* () {
-      const client = yield* IcnClient
-      const read = client.models.getRecommendableModelCatalog({})
-      const observed = yield* makeIcnObservedState(
-        {
-          models: [],
-          diagnostics: [],
-        },
-        read,
-        Schema.equivalence(RecommendableModelCatalogSchema),
-      )
-      yield* observed.refresh.pipe(
-        Effect.tapError((error) => Effect.logWarning("Unable to refresh ICN model catalog").pipe(
-          Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
-        )),
-        Effect.option,
-        Effect.repeat(Schedule.spaced(options.refreshInterval ?? "1 hour")),
-        Effect.forkScoped,
-      )
+      const models = yield* IcnModels
       return IcnCatalog.of({
-        get: observed.get,
-        changes: observed.changes,
-        ready: observed.initialized,
-        refresh: observed.refresh,
+        get: models.get.pipe(Effect.flatMap(catalogSnapshot), Effect.orDie),
+        changes: models.changes.pipe(Stream.mapEffect((snapshot) =>
+          catalogSnapshot(snapshot).pipe(Effect.orDie))),
+        ready: models.initialized,
+        refresh: models.refresh,
       })
     }),
   )

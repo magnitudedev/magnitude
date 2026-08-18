@@ -1,6 +1,7 @@
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
+import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Data from "effect/Data"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
@@ -8,28 +9,29 @@ import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 import {
-  addExecution,
+  addMutationState,
   getClientCore,
   MutationInternalTypeId,
+  mutationMatches,
   mutationController,
-  settleExecution,
+  settleMutationState,
   type MutationController,
   type MutationControllerCarrier
 } from "./internal.js"
 import {
   MutationDefinitionTypeId,
-  MutationExecutionId,
+  MutationStateId,
   MutationScope,
-  type AnyMutationExecution,
+  type AnyMutationState,
   type MutationDefinition,
-  type MutationExecution,
+  type MutationState,
   type MutationFilter
 } from "./Model.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Mutation")
+const OptionsTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Mutation/options")
 
-export { MutationExecutionId, MutationScope }
-export type { AnyMutationExecution, MutationExecution, MutationFilter }
+export { MutationScope }
 
 export class MutationSynchronizationError<Output, SynchronizationError> extends Data.TaggedError(
   "MutationSynchronizationError"
@@ -39,16 +41,7 @@ export class MutationSynchronizationError<Output, SynchronizationError> extends 
 }> {}
 
 export interface Mutation<Input, Output, CommandError, Requirements, SynchronizationError = never>
-  extends Atom.Writable<
-    AtomResult.Result<Output, CommandError | MutationSynchronizationError<Output, SynchronizationError>>,
-    Input | Atom.Reset | Atom.Interrupt
-  >,
-    MutationDefinition,
-    MutationControllerCarrier<
-      Input,
-      Output,
-      CommandError | MutationSynchronizationError<Output, SynchronizationError>
-    > {
+  extends MutationDefinition {
   readonly [TypeId]?: {
     readonly input: Input
     readonly output: Output
@@ -56,8 +49,22 @@ export interface Mutation<Input, Output, CommandError, Requirements, Synchroniza
     readonly requirements: Requirements
     readonly synchronizationError: SynchronizationError
   }
+  readonly [OptionsTypeId]: unknown
   readonly name: string
   readonly match: () => MutationFilter
+}
+
+export interface MutationAtom<Input, Output, CommandError, Requirements, SynchronizationError = never>
+  extends Atom.Writable<
+    AtomResult.Result<Output, CommandError | MutationSynchronizationError<Output, SynchronizationError>>,
+    Input | Atom.Reset | Atom.Interrupt
+  >,
+    MutationControllerCarrier<
+      Input,
+      Output,
+      CommandError | MutationSynchronizationError<Output, SynchronizationError>
+    > {
+  readonly definition: MutationDefinition
 }
 
 export type Any = MutationDefinition
@@ -66,6 +73,56 @@ export type Output<M> = M extends Mutation<infer _I, infer O, infer _CE, infer _
 export type CommandError<M> = M extends Mutation<infer _I, infer _O, infer E, infer _R, infer _SE> ? E : never
 export type Requirements<M> = M extends Mutation<infer _I, infer _O, infer _CE, infer R, infer _SE> ? R : never
 export type SynchronizationError<M> = M extends Mutation<infer _I, infer _O, infer _CE, infer _R, infer E> ? E : never
+export type Error<M> = M extends Mutation<infer _I, infer O, infer CE, infer _R, infer SE>
+  ? CE | MutationSynchronizationError<O, SE>
+  : never
+export type State<M> = M extends Mutation<infer I, infer O, infer CE, infer _R, infer SE>
+  ? MutationState<I, O, CE | MutationSynchronizationError<O, SE>>
+  : AnyMutationState
+
+export interface Filters<M extends AnyMutation = AnyMutation> {
+  readonly mutation?: M
+  readonly scope?: MutationScope
+  readonly status?: "pending" | "success" | "error"
+  readonly predicate?: (state: State<M>) => boolean
+}
+
+type AnyMutation = MutationDefinition
+
+const mutationFilter = <M extends AnyMutation>(
+  filters: Filters<M> | undefined,
+): MutationFilter | undefined => filters === undefined ? undefined : ({
+    mutation: filters.mutation,
+    scope: filters.scope,
+    status: filters.status,
+    predicate: filters.predicate as MutationFilter["predicate"],
+  })
+
+export interface StateOptions<M extends AnyMutation = AnyMutation, Selected = State<M>> {
+  readonly filters?: Filters<M>
+  readonly select?: (state: State<M>) => Selected
+}
+
+/** Reactive mutation-cache selection, equivalent to TanStack Query's useMutationState. */
+export const state = <M extends AnyMutation = AnyMutation, Selected = State<M>>(
+  options: StateOptions<M, Selected> = {},
+): Atom.Atom<ReadonlyArray<Selected>> => Atom.readable((get) => {
+  const core = getClientCore(get.registry)
+  get(core.revision)
+  const states = core.mutationStates.filter((state) =>
+    mutationMatches(state, mutationFilter(options.filters))) as unknown as ReadonlyArray<State<M>>
+  return options.select === undefined
+    ? states as unknown as ReadonlyArray<Selected>
+    : states.map(options.select)
+})
+
+/** Number of matching pending mutation states, equivalent to TanStack Query's useIsMutating. */
+export const isMutating = <M extends AnyMutation = AnyMutation>(
+  filters?: Filters<M>,
+): Atom.Atom<number> => state({
+  filters: { ...filters, status: "pending" },
+  select: () => 1,
+}).pipe(Atom.map((matches) => matches.length))
 
 export interface Options<Input, Output, CommandError, CommandRequirements, SynchronizationError, SynchronizationRequirements> {
   readonly effect: (input: Input) => Effect.Effect<Output, CommandError, CommandRequirements>
@@ -78,35 +135,8 @@ export interface Options<Input, Output, CommandError, CommandRequirements, Synch
   readonly gcTime?: Duration.DurationInput
 }
 
-export interface Factory<Provided, RuntimeError> {
-  readonly make: <
-    Input,
-    Output,
-    CommandError,
-    CommandRequirements extends Provided,
-    SynchronizationError = never,
-    SynchronizationRequirements extends Provided = never
-  >(
-    name: string,
-    options: Options<
-      Input,
-      Output,
-      CommandError,
-      CommandRequirements,
-      SynchronizationError,
-      SynchronizationRequirements
-    >
-  ) => Mutation<
-    Input,
-    Output,
-    CommandError | RuntimeError,
-    CommandRequirements | SynchronizationRequirements,
-    SynchronizationError
-  >
-}
-
 interface Invocation<Input, Output, Error> {
-  readonly id: MutationExecutionId
+  readonly id: MutationStateId
   readonly input: Input
   readonly registry: AtomRegistry.Registry
   readonly deferred: Deferred.Deferred<Output, Error>
@@ -115,19 +145,16 @@ interface Invocation<Input, Output, Error> {
   started: boolean
 }
 
-let nextExecutionId = 0
+let nextMutationStateId = 0
 
-const makeDefinition = <
-  Provided,
-  RuntimeError,
+export const make = <
   Input,
   Output,
   CommandError,
-  CommandRequirements extends Provided,
-  SynchronizationError,
-  SynchronizationRequirements extends Provided
+  CommandRequirements,
+  SynchronizationError = never,
+  SynchronizationRequirements = never
 >(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
   name: string,
   options: Options<
     Input,
@@ -140,46 +167,87 @@ const makeDefinition = <
 ): Mutation<
   Input,
   Output,
-  CommandError | RuntimeError,
+  CommandError,
   CommandRequirements | SynchronizationRequirements,
   SynchronizationError
 > => {
+  let definition!: Mutation<
+    Input,
+    Output,
+    CommandError,
+    CommandRequirements | SynchronizationRequirements,
+    SynchronizationError
+  >
+  definition = {
+    [MutationDefinitionTypeId]: true,
+    [OptionsTypeId]: options,
+    name,
+    match: (): MutationFilter => ({ mutation: definition })
+  }
+  return definition
+}
+
+export const makeAtom = <
+  Provided,
+  RuntimeError,
+  Input,
+  Output,
+  CommandError,
+  Required extends Provided | Reactivity.Reactivity,
+  SynchronizationError,
+>(
+  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  definition: Mutation<
+    Input,
+    Output,
+    CommandError,
+    Required,
+    SynchronizationError
+  >
+): MutationAtom<
+  Input,
+  Output,
+  CommandError | RuntimeError,
+  Required,
+  SynchronizationError
+> => {
+  const { name } = definition
+  const options = definition[OptionsTypeId] as Options<
+    Input,
+    Output,
+    CommandError,
+    Required,
+    SynchronizationError,
+    Required
+  >
   type PublicError = CommandError | RuntimeError | MutationSynchronizationError<Output, SynchronizationError>
   type CurrentInvocation = Invocation<Input, Output, PublicError>
   const registryAtom = Atom.readable((get) => get.registry)
-  const semaphoresByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationScope, Effect.Semaphore>>()
-  const semaphoresFor = (registry: AtomRegistry.Registry): Map<MutationScope, Effect.Semaphore> => {
-    const existing = semaphoresByRegistry.get(registry)
-    if (existing !== undefined) return existing
-    const semaphores = new Map<MutationScope, Effect.Semaphore>()
-    semaphoresByRegistry.set(registry, semaphores)
-    return semaphores
-  }
-  const activeByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationExecutionId, CurrentInvocation>>()
-  const activeFor = (registry: AtomRegistry.Registry): Map<MutationExecutionId, CurrentInvocation> => {
+  const activeByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationStateId, CurrentInvocation>>()
+  const activeFor = (registry: AtomRegistry.Registry): Map<MutationStateId, CurrentInvocation> => {
     const existing = activeByRegistry.get(registry)
     if (existing !== undefined) return existing
-    const active = new Map<MutationExecutionId, CurrentInvocation>()
+    const active = new Map<MutationStateId, CurrentInvocation>()
     activeByRegistry.set(registry, active)
     return active
   }
   const gcTime = Duration.toMillis(Duration.decode(options.gcTime ?? Duration.minutes(5)))
-  const completeExecution = (
+  const completeInvocation = (
     core: ReturnType<typeof getClientCore>,
     invocation: CurrentInvocation,
     result: AtomResult.Result<Output, PublicError>
   ) => {
     invocation.result = result
-    settleExecution(core, invocation.id, result)
+    settleMutationState(core, invocation.id, result)
     if (gcTime === Number.POSITIVE_INFINITY) return
     const timer = setTimeout(() => {
-      const index = core.executions.findIndex((execution) => execution.id === invocation.id)
-      if (index >= 0) core.executions.splice(index, 1)
+      const index = core.mutationStates.findIndex((state) => state.id === invocation.id)
+      if (index >= 0) core.mutationStates.splice(index, 1)
       if (core.registry.getNodes().has(core.revision)) core.touch()
     }, gcTime)
     timer.unref()
   }
-  let mutation!: Mutation<Input, Output, CommandError | RuntimeError, CommandRequirements | SynchronizationRequirements, SynchronizationError>
+  let mutation!: MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
 
   const run = runtime.fn<CurrentInvocation>()((invocation) => {
     if (invocation.started) {
@@ -201,11 +269,10 @@ const makeDefinition = <
 
     const scope = options.scope?.(invocation.input)
     if (scope !== undefined) {
-      const semaphores = semaphoresFor(invocation.registry)
-      let semaphore = semaphores.get(scope)
+      let semaphore = core.mutationScopes.get(scope)
       if (semaphore === undefined) {
         semaphore = Effect.unsafeMakeSemaphore(1)
-        semaphores.set(scope, semaphore)
+        core.mutationScopes.set(scope, semaphore)
       }
       operation = semaphore.withPermits(1)(operation)
     }
@@ -217,7 +284,7 @@ const makeDefinition = <
       Effect.onExit((exit) => Deferred.done(invocation.deferred, exit).pipe(
         Effect.zipRight(Effect.sync(() => {
           activeFor(invocation.registry).delete(invocation.id)
-          completeExecution(
+          completeInvocation(
             core,
             invocation,
             AtomResult.fromExit(exit)
@@ -238,7 +305,7 @@ const makeDefinition = <
         && result._tag === "Failure" && !result.waiting) {
         activeFor(get.registry).delete(invocation.id)
         Effect.runSync(Deferred.failCause(invocation.deferred, result.cause))
-        completeExecution(getClientCore(get.registry), invocation, result)
+        completeInvocation(getClientCore(get.registry), invocation, result)
       }
       return invocation === undefined
         ? result
@@ -259,17 +326,17 @@ const makeDefinition = <
       }
       const registry = ctx.get(registryAtom)
       const core = getClientCore(registry)
-      const id = MutationExecutionId(`${name}:${Date.now()}:${nextExecutionId++}`)
-      const execution: MutationExecution<Input, Output, PublicError> = {
+      const id = MutationStateId(`${name}:${Date.now()}:${nextMutationStateId++}`)
+      const state: MutationState<Input, Output, PublicError> = {
         id,
-        mutation,
+        mutation: definition,
         input: value,
         result: AtomResult.initial(true),
         scope: Option.fromNullable(options.scope?.(value)),
         submittedAt: Date.now(),
         settledAt: Option.none()
       }
-      addExecution(core, execution)
+      addMutationState(core, state)
       core.emit({ _tag: "MutationStarted", name, id })
       const invocation: CurrentInvocation = {
         id,
@@ -291,28 +358,19 @@ const makeDefinition = <
       registry.get(mutation)
       registry.set(mutation, input)
       const invocation = latest.get(registry)
-      if (invocation === undefined) throw new Error(`Mutation ${name} did not create an execution`)
+      if (invocation === undefined) throw new Error(`Mutation ${name} did not create invocation state`)
       return { id: invocation.id, await: Deferred.await(invocation.deferred) }
     }
   }
   mutation = Object.assign(writable, {
-    [MutationDefinitionTypeId]: true as const,
     [MutationInternalTypeId]: internal,
-    name,
-    match: (): MutationFilter => ({ mutation })
+    definition
   })
   return mutation
 }
 
-export const bind = <Provided, RuntimeError>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>
-): Factory<Provided, RuntimeError> => ({
-  make: ((name: string, options: Options<unknown, unknown, unknown, Provided, unknown, Provided>) =>
-    makeDefinition(runtime, name, options)) as Factory<Provided, RuntimeError>["make"]
-})
-
 export const execute = <Input, Output, CommandError, Requirements, SynchronizationError>(
-  mutation: Mutation<Input, Output, CommandError, Requirements, SynchronizationError>,
+  mutation: MutationAtom<Input, Output, CommandError, Requirements, SynchronizationError>,
   input: Input
 ): Effect.Effect<
   Output,
@@ -331,4 +389,7 @@ export const execute = <Input, Output, CommandError, Requirements, Synchronizati
 })
 
 export const isMutation = (value: unknown): value is Any =>
+  typeof value === "object" && value !== null && MutationDefinitionTypeId in value
+
+export const isMutationAtom = (value: unknown): value is MutationAtom<any, any, any, any, any> =>
   typeof value === "object" && value !== null && MutationInternalTypeId in value

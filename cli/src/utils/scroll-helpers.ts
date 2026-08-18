@@ -1,3 +1,5 @@
+import type { ScrollBoxRenderable } from '@opentui/core'
+
 /**
  * Scroll activity subscription for the OpenTUI scrollbox.
  *
@@ -10,7 +12,7 @@
  * instant it happens.
  */
 export function subscribeScrollboxActivity(
-  scrollbox: any,
+  scrollbox: ScrollBoxRenderable | null,
   handler: (kind: "scroll" | "resize") => void,
 ): () => void {
   if (!scrollbox) return () => {}
@@ -18,32 +20,14 @@ export function subscribeScrollboxActivity(
   const content = scrollbox.content
 
   const onContentResize = (): void => {
-    // Anti-flicker workaround for an OpenTUI culling bug: the render walk
-    // culls the content's children (Renderable.ts:1343) using positions
-    // cached from the PREVIOUS frame for existing children — only
-    // newly-added children are refreshed pre-culling (_shouldUpdateBefore,
-    // Renderable.ts:1306-1315). On a prepend frame, existing entries
-    // evaluate at old-position + new-scroll-translate, land "outside" the
-    // viewport, and all get culled — a blank frame paints, then the next
-    // frame corrects: a full-screen flicker.
-    //
-    // This listener runs inside content.updateFromLayout's resize emit,
-    // strictly before that culling. updateFromLayout() is a cached-value
-    // readback (yoga layout already ran this frame), so this is ~100-200
-    // cheap reads, fires only when content SIZE changes (never on scroll),
-    // and at most once per frame.
-    const children = content?.getChildren?.() ?? []
-    for (const child of children) {
-      child.updateFromLayout?.()
-    }
     handler("resize")
   }
 
   const onScroll = (): void => handler("scroll")
-  bar?.on?.('change', onScroll)
-  content?.on?.('resize', onContentResize)
+  bar.on('change', onScroll)
+  content.on('resize', onContentResize)
   return () => {
-    bar?.off?.('change', onScroll)
-    content?.off?.('resize', onContentResize)
+    bar.off('change', onScroll)
+    content.off('resize', onContentResize)
   }
 }

@@ -174,7 +174,7 @@ fn configuration_inspect(input: &Map<String, Value>) -> Result<Value, ProbeError
         prefill_quantum: input.context.batch_tokens,
         execution,
         projector: None,
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     };
     let (_, _, params, _, _) = icn_hardware::native_parameters_for_intent(&config)
         .map_err(|error| ProbeError::invalid("invalid-engine-configuration", error))?
@@ -920,7 +920,7 @@ fn llama_batched_bench(input: &Map<String, Value>) -> Result<Value, ProbeError> 
         prefill_quantum: input.batch_tokens,
         execution,
         projector: None,
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     };
     if !config.model_path.is_file() {
         return Err(ProbeError::invalid(
@@ -1248,7 +1248,7 @@ fn llama_bench(operation: &str, input: &Map<String, Value>) -> Result<Value, Pro
         prefill_quantum: input.batch_tokens,
         execution,
         projector: None,
-        mtp: icn_contracts::MtpConfig::default(),
+        speculative: icn_contracts::SpeculativeDecodingConfig::default(),
     };
 
     if !config.model_path.is_file() {
@@ -1790,10 +1790,24 @@ fn sampler_apply(input: &Map<String, Value>) -> Result<Value, ProbeError> {
         ));
     }
     let selection = input.selection.normalized_raw();
+    let n_vocab = input
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id)
+        .chain(input.accepted_tokens.iter().copied())
+        .max()
+        .and_then(|token| token.checked_add(1))
+        .filter(|n_vocab| *n_vocab > 0)
+        .ok_or_else(|| {
+            ProbeError::invalid(
+                "invalid-candidates",
+                "candidate and accepted token IDs must define a positive vocabulary size",
+            )
+        })?;
     let mut components = input
         .samplers
         .iter()
-        .map(make_sampler)
+        .map(|definition| make_sampler(definition, n_vocab))
         .collect::<Result<Vec<_>, _>>()?;
     match input.selection.kind.as_str() {
         "distribution" => components.push(LlamaSampler::dist(input.selection.seed)),
@@ -2611,7 +2625,7 @@ fn include_semantic_checksum_value(result: &mut u64, value: &str) {
     *result = (*result ^ 255).wrapping_mul(SEMANTIC_CHECKSUM_PRIME);
 }
 
-fn make_sampler(input: &SamplerDefinition) -> Result<LlamaSampler, ProbeError> {
+fn make_sampler(input: &SamplerDefinition, n_vocab: i32) -> Result<LlamaSampler, ProbeError> {
     Ok(match input.kind.as_str() {
         "top-k" => LlamaSampler::top_k(required_i32(input.k, "k")?),
         "top-p" => LlamaSampler::top_p(required_f32(input.p, "p")?, input.min_keep),
@@ -2631,6 +2645,7 @@ fn make_sampler(input: &SamplerDefinition) -> Result<LlamaSampler, ProbeError> {
         ),
         "top-n-sigma" => LlamaSampler::top_n_sigma(required_f32(input.n, "n")?),
         "penalties" => LlamaSampler::penalties(
+            n_vocab,
             required_i32(input.last_n, "lastN")?,
             required_f32(input.repeat, "repeat")?,
             required_f32(input.frequency, "frequency")?,
