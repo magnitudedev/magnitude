@@ -21,7 +21,6 @@ describe("FooterBar", () => {
         tokenCap={100_000}
         model="Qwen Test (Q4)"
         thinkingLevel="High"
-        memoryLabel="16 GB mem"
         modelOptionsState={{
           _tag: "Ready",
           options: [modelOption],
@@ -31,7 +30,6 @@ describe("FooterBar", () => {
         thinkingOptions={[{ value: high, label: "High" }]}
         thinkingEffort={high}
         onThinkingSelect={() => {}}
-        onMemoryClick={() => {}}
       />
     )
 
@@ -40,14 +38,10 @@ describe("FooterBar", () => {
     expect(html.match(/aria-haspopup="menu"/g)).toHaveLength(1)
     expect(html).toContain("<svg")
     expect(html).not.toContain("hover:underline")
-    expect(html).toContain(">16 GB mem</button>")
-
-    const memory = html.indexOf("16 GB mem")
     const context = html.indexOf("95% remaining")
     const model = html.indexOf("Qwen Test (Q4)")
     const thinking = html.indexOf("High")
-    expect(memory).toBeGreaterThan(-1)
-    expect(memory).toBeLessThan(context)
+    expect(html).not.toContain("GB mem")
     expect(context).toBeLessThan(model)
     expect(model).toBeGreaterThan(-1)
     expect(model).toBeLessThan(thinking)

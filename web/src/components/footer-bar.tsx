@@ -47,8 +47,6 @@ export interface FooterBarProps {
   model?: string | null
   /** Thinking level label (e.g. "High", "Medium") */
   thinkingLevel?: string | null
-  /** Resident model allocation label. */
-  memoryLabel?: string | null
   /** Next Esc will kill all workers */
   nextEscWillKillAll?: boolean
   /** Transcript mode active */
@@ -62,8 +60,6 @@ export interface FooterBarProps {
     providerModelId: ProviderModelId,
     effort: ReasoningEffort,
   ) => void
-  /** Click handler for resident memory (opens Hardware) */
-  onMemoryClick?: () => void
   /** Reasoning efforts supported by the selected model. */
   thinkingOptions?: readonly ReasoningEffortOption[]
   /** Currently selected reasoning effort. */
@@ -280,13 +276,11 @@ export function FooterBar({
   bashMode,
   model,
   thinkingLevel,
-  memoryLabel,
   nextEscWillKillAll,
   transcriptMode,
   modelOptionsState = { _tag: "Ready", options: [] },
   selectedModelId,
   onSelectionCommit,
-  onMemoryClick,
   thinkingOptions = [],
   thinkingEffort,
   onThinkingSelect,
@@ -312,17 +306,6 @@ export function FooterBar({
       </div>
       {!bashMode && (
         <div className="ml-auto flex min-w-0 items-center gap-1">
-          {memoryLabel && (
-            <Button
-              type="button"
-              onClick={onMemoryClick}
-              disabled={!onMemoryClick}
-              variant="ghost"
-              className="h-auto whitespace-nowrap px-1.5 py-1 text-[12px] leading-none text-slate-500"
-            >
-              {memoryLabel}
-            </Button>
-          )}
           {showContext ? (
             <span className="inline-flex px-1.5 py-1">
               <ContextUsageIndicator
