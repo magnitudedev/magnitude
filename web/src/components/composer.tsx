@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
+import { ActionTooltip } from "@/components/ui/tooltip"
 
 /**
  * Composer — spec §9.6
@@ -489,6 +490,8 @@ export function Composer({
     : isStreaming
     ? "Type to queue a message..."
     : "Describe a task or ask a question"
+  const submitTooltip = !canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"
+  const submitDisabled = !isStreaming && !canSend && !disabledReason
 
   return (
     <div
@@ -551,51 +554,60 @@ export function Composer({
         {footer}
 
         {/* Submit / Stop button */}
-        <Button variant="unstyled" size="unstyled"
-          onClick={() => {
-            if (canSend) handleSubmit()
-            else if (isStreaming && onInterrupt) onInterrupt()
-            else if (disabledReason) onDisabledAction?.()
-          }}
-          disabled={!isStreaming && !canSend && !disabledReason}
-          aria-disabled={!isStreaming && !!disabledReason}
-          className={`${
-            isStreaming || canSend || disabledReason
-              ? "cursor-pointer"
-              : "cursor-default"
-          } ${
-            isStreaming || canSend ? "opacity-[1]" : "opacity-[0.45]"
-          } group bg-white hover:bg-white dark:bg-slate-850 dark:hover:bg-slate-850 absolute [right:10px] [bottom:10px] [width:28px] [height:28px] rounded-[4px] border-0 flex items-center justify-center [transition:opacity_100ms]`}
-          data-can-send={canSend ? "true" : "false"}
-          title={
-            !canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"
+        <ActionTooltip
+          label={submitTooltip}
+          side="top"
+          trigger={
+            <span
+              className="absolute bottom-[10px] right-[10px] inline-flex"
+              tabIndex={submitDisabled ? 0 : undefined}
+              aria-label={submitDisabled ? submitTooltip : undefined}
+            >
+              <Button variant="unstyled" size="unstyled"
+                onClick={() => {
+                  if (canSend) handleSubmit()
+                  else if (isStreaming && onInterrupt) onInterrupt()
+                  else if (disabledReason) onDisabledAction?.()
+                }}
+                disabled={submitDisabled}
+                aria-disabled={!isStreaming && !!disabledReason}
+                className={`${
+                  isStreaming || canSend || disabledReason
+                    ? "cursor-pointer"
+                    : "cursor-default"
+                } ${
+                  isStreaming || canSend ? "opacity-[1]" : "opacity-[0.45]"
+                } group flex size-7 items-center justify-center rounded-[4px] border-0 bg-white transition-opacity hover:bg-white dark:bg-slate-850 dark:hover:bg-slate-850`}
+                data-can-send={canSend ? "true" : "false"}
+                aria-label={
+                  !canSend && isStreaming
+                    ? "Interrupt"
+                    : disabledReason
+                    ? `${disabledReason}. Open Settings`
+                    : "Send message"
+                }
+              >
+                {!canSend && isStreaming ? (
+                  <Square
+                    size={16}
+                    fill="currentColor"
+                    className="text-red-600 dark:text-red-500"
+                  />
+                ) : (
+                  <ArrowUp
+                    size={17}
+                    strokeWidth={2.4}
+                    className={`${
+                      canSend && !disabledReason
+                        ? "text-blue-700 dark:text-blue-500 group-hover:text-slate-900 dark:group-hover:text-slate-200"
+                        : "text-slate-500"
+                    } transition-colors duration-100`}
+                  />
+                )}
+              </Button>
+            </span>
           }
-          aria-label={
-            !canSend && isStreaming
-              ? "Interrupt"
-              : disabledReason
-              ? `${disabledReason}. Open Settings`
-              : "Send message"
-          }
-        >
-          {!canSend && isStreaming ? (
-            <Square
-              size={16}
-              fill="currentColor"
-              className="text-red-600 dark:text-red-500"
-            />
-          ) : (
-            <ArrowUp
-              size={17}
-              strokeWidth={2.4}
-              className={`${
-                canSend && !disabledReason
-                  ? "text-blue-700 dark:text-blue-500 group-hover:text-slate-900 dark:group-hover:text-slate-200"
-                  : "text-slate-500"
-              } transition-colors duration-100`}
-            />
-          )}
-        </Button>
+        />
       </div>
     </div>
   )

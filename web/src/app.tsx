@@ -94,7 +94,7 @@ import { MagnitudeMark } from "./components/magnitude-mark"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { Toaster } from "@/components/ui/toast"
-import { TooltipProvider } from "@/components/ui/tooltip"
+import { ActionTooltip, TooltipProvider } from "@/components/ui/tooltip"
 import { notify } from "@/lib/notifications"
 import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
 import {
@@ -729,52 +729,78 @@ function ChatTitleBar({
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const projectFilesButton = (
-    <Button variant="unstyled" size="unstyled" type="button"
-      onClick={onOpenProjectFiles}
-      disabled={selectedProjectId === null}
-      className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
-      aria-label="Expand project files"
-      title={selectedProjectId === null ? "Select a project to browse files" : "Project files"}
-    ><PanelRight size={18} /></Button>
+    <ActionTooltip
+      label="Expand sidebar"
+      side="bottom"
+      trigger={
+        <span
+          className="inline-flex [-webkit-app-region:no-drag]"
+          tabIndex={selectedProjectId === null ? 0 : undefined}
+          aria-label={selectedProjectId === null ? "Expand sidebar" : undefined}
+        >
+          <Button variant="unstyled" size="unstyled" type="button"
+            onClick={onOpenProjectFiles}
+            disabled={selectedProjectId === null}
+            className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
+            aria-label="Expand sidebar"
+          ><PanelRight size={18} /></Button>
+        </span>
+      }
+    />
   )
   if (desktop) {
     const titlebarActions = (
       <>
-        <Button variant="unstyled" size="unstyled"
-          type="button"
-          onClick={() => {
-            if (settingsTab !== null) {
-              setSettingsTab(null)
-              return
-            }
-            setSidebarCollapsed(false)
-            setSettingsTab("models")
-          }}
-          className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400 [-webkit-app-region:no-drag]"
-          aria-label="Settings"
-          aria-current={settingsTab !== null ? "page" : undefined}
-          title="Settings"
-        >
-          <Gear size={17} />
-        </Button>
-        <Button variant="unstyled" size="unstyled"
-          type="button"
-          onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-          className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
-          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-          title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-        >
-          <SidebarSimple size={18} />
-        </Button>
-        <Button variant="unstyled" size="unstyled"
-          type="button"
-          onClick={onCompose}
-          className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
-          aria-label="New chat"
-          title="New chat"
-        >
-          <NotePencil size={18} />
-        </Button>
+        <ActionTooltip
+          label="Settings"
+          side="bottom"
+          trigger={
+            <Button variant="unstyled" size="unstyled"
+              type="button"
+              onClick={() => {
+                if (settingsTab !== null) {
+                  setSettingsTab(null)
+                  return
+                }
+                setSidebarCollapsed(false)
+                setSettingsTab("models")
+              }}
+              className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400 [-webkit-app-region:no-drag]"
+              aria-label="Settings"
+              aria-current={settingsTab !== null ? "page" : undefined}
+            >
+              <Gear size={17} />
+            </Button>
+          }
+        />
+        <ActionTooltip
+          label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          side="bottom"
+          trigger={
+            <Button variant="unstyled" size="unstyled"
+              type="button"
+              onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+              className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <SidebarSimple size={18} />
+            </Button>
+          }
+        />
+        <ActionTooltip
+          label="New chat"
+          side="bottom"
+          trigger={
+            <Button variant="unstyled" size="unstyled"
+              type="button"
+              onClick={onCompose}
+              className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
+              aria-label="New chat"
+            >
+              <NotePencil size={18} />
+            </Button>
+          }
+        />
       </>
     )
 
@@ -820,15 +846,20 @@ function ChatTitleBar({
       title={title}
     >
       {onOpenSidebar && (
-        <Button variant="unstyled" size="unstyled"
-          type="button"
-          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 shrink-0 mr-2.5"
-          aria-label="Open sessions"
-          title="Open sessions"
-          onClick={onOpenSidebar}
-        >
-          <Menu size={17} />
-        </Button>
+        <ActionTooltip
+          label="Open sessions"
+          side="bottom"
+          trigger={
+            <Button variant="unstyled" size="unstyled"
+              type="button"
+              className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 shrink-0 mr-2.5"
+              aria-label="Open sessions"
+              onClick={onOpenSidebar}
+            >
+              <Menu size={17} />
+            </Button>
+          }
+        />
       )}
       <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
         {title}
@@ -1043,15 +1074,20 @@ function AuthenticatedAppContent({
             {panelOpen && (
               <>
                 {isNarrow && (
-                  <Button variant="unstyled" size="unstyled"
-                    type="button"
-                    className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-900"
-                    aria-label="Open settings navigation"
-                    title="Open settings navigation"
-                    onClick={() => setSidebarVisible(true)}
-                  >
-                    <Menu size={17} />
-                  </Button>
+                  <ActionTooltip
+                    label="Open settings navigation"
+                    side="right"
+                    trigger={
+                      <Button variant="unstyled" size="unstyled"
+                        type="button"
+                        className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-900"
+                        aria-label="Open settings navigation"
+                        onClick={() => setSidebarVisible(true)}
+                      >
+                        <Menu size={17} />
+                      </Button>
+                    }
+                  />
                 )}
                 <SettingsCenter tab={settingsTab} />
               </>
