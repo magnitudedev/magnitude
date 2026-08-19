@@ -183,7 +183,7 @@ export function AcnBootstrapScreen({
             style={{ fg: theme.text.body }}
             attributes={TextAttributes.BOLD}
           >
-            Starting Magnitude...
+            Starting Magnitude
           </text>
           <text style={{ fg: theme.text.supporting }}>
             {startingPhaseLabel(state.phase)}
