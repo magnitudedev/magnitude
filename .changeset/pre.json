@@ -36,5 +36,7 @@
     "@magnitudedev/vcs": "0.0.1",
     "@magnitudedev/version": "0.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "cool-clouds-unite"
+  ]
 }
