@@ -70,6 +70,7 @@ import { MessageDispatch } from "./messages"
 import { TimelineLoadingState } from "./timeline-loading-state"
 import { ChatEmptyState } from "./chat-empty-state"
 import { DiffHunk } from "./diff-hunk"
+import { chatTimelinePlaceholderState } from "./chat-timeline-state"
 const DEFAULT_SHELL_LINE_CAP = 8
 const TOOL_ICONS: Record<ToolIcon, LucideIcon> = {
   file: FileText,
@@ -842,9 +843,11 @@ export function ChatTimeline({
   const selectedSessionId = useSelectedSessionId()
   const displaySession = useDisplayState((state) => state.session)
   const entries = timeline?.presentation.entries ?? []
-  const isSessionLoading =
-    selectedSessionId !== null && timelineStatus._tag === "pending"
-  const isEmpty = selectedSessionId === null || timelineStatus._tag === "empty"
+  const { isSessionLoading, isEmpty } = chatTimelinePlaceholderState(
+    selectedSessionId,
+    timelineStatus,
+    entries.length,
+  )
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
 

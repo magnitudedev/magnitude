@@ -33,10 +33,7 @@ import {
 } from "../state/session-atoms"
 import { useDisplayViewControllerCore, useSelectedSessionId } from "../display-view-controller/hooks"
 import {
-  appendMessageToTimeline,
-  emptyTimeline,
-  INITIAL_ROOT_PAGE_SIZE,
-  timelineTail,
+  presentPendingUserMessage,
   useDisplaySpeculator,
 } from "../sync/index"
 import type {
@@ -170,10 +167,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     const displayText = opts?.visibleMessage ?? text
     const activeSessionId = selectedSessionId ?? activatedSessionIdRef.current
     const draftOwnerId = getDraftSessionOwnerId()
-    const optimisticOwner = activeSessionId
-      ? `send:${messageId}`
-      : `activation:${draftOwnerId}:${selectedCwd ?? ""}`
-
     if (!activeSessionId && !selectedCwd) {
       commandContext.showSystemMessage("Choose a working directory before starting a session.")
       return
@@ -183,31 +176,14 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     setMessageHistory((prev: string[]) => [text, ...prev].slice(0, 50))
     setPendingUserSubmit(true)
 
-    // Optimistic speculator disabled — the real message arrives via stream.
-    // const optimistic = displaySpeculator.mutate(
-    //   { owner: optimisticOwner, label: "send-message" },
-    //   (draft) => {
-    //     const cwd = selectedCwd ?? draft.state.session.cwd ?? ""
-    //     if (!activeSessionId && !draft.state.session.sessionId) {
-    //       draft.state.session = {
-    //         sessionId: `draft:${draftOwnerId}`,
-    //         title: null,
-    //         cwd,
-    //       }
-    //     }
-    //     draft.shape.timelines.root ??= timelineTail(INITIAL_ROOT_PAGE_SIZE)
-    //     draft.state.timelines.root ??= emptyTimeline()
-    //     draft.state.timelines.root = appendMessageToTimeline(draft.state.timelines.root, {
-    //       id: messageId,
-    //       type: activeSessionId && isStreaming ? "queued_user_message" : "user_message",
-    //       content: displayText,
-    //       timestamp: Date.now(),
-    //       taskMode,
-    //       attachments: displayAttachments,
-    //     })
-    //   },
-    // )
-    const optimistic = { remove: () => {} }
+    const optimistic = presentPendingUserMessage(displaySpeculator, {
+      messageId,
+      content: displayText,
+      taskMode,
+      activeSessionId,
+      draftSessionId: `draft:${draftOwnerId}`,
+      cwd: selectedCwd ?? "",
+    })
 
     const rollback = (err: unknown): void => {
       const errMsg = err instanceof Error ? err.message : String(err)
@@ -302,7 +278,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     }
 
     void deliver().catch(rollback)
-  }, [selectedSessionId, selectedCwd, selectedProjectId, isStreaming, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, setComposerAttachments, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
+  }, [selectedSessionId, selectedCwd, selectedProjectId, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, setComposerAttachments, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
 
   const handleInterrupt = useCallback(() => {
     if (!selectedSessionId) return

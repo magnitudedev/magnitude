@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import type { DisplayMessage, DisplayState as SdkDisplayState, DisplayViewShape } from '@magnitudedev/sdk'
 import { createDisplayViewStore } from '../display-view-store'
+import { EMPTY_DISPLAY_STATE } from '../../state/empty-display-state'
 
 describe('createDisplayViewStore', () => {
   const userMessage = (id: string, content: string, timestamp: number): DisplayMessage => ({
@@ -152,5 +153,89 @@ describe('createDisplayViewStore', () => {
     store.clear()
 
     expect(store.getSnapshot().state.timelines.root.messages.byId['m2']).toBeUndefined()
+  })
+
+  it('keeps an exactly reconciled transaction until its acknowledgement is present', () => {
+    const initial = makeDisplayState([])
+    const store = createDisplayViewStore(initial, makeShape())
+
+    store.mutate(
+      {
+        owner: 'send:m2',
+        acknowledgedBy: (accepted) =>
+          accepted.state.timelines.root?.messages.byId.m2 !== undefined,
+      },
+      (draft) => {
+        draft.state.timelines.root.messages.byId.m2 = userMessage('m2', 'pending', 2)
+        draft.state.timelines.root.messages.order = ['m2']
+      },
+    )
+
+    store.accept({
+      shape: makeShape(),
+      state: { ...initial, session: { ...initial.session, title: 'Unrelated' } },
+    })
+    expect(store.getSnapshot().state.timelines.root.messages.order).toEqual(['m2'])
+
+    store.accept({
+      shape: makeShape(),
+      state: makeDisplayState([userMessage('m2', 'authoritative', 3)]),
+    })
+    expect(store.getSnapshot().state.timelines.root.messages.order).toEqual(['m2'])
+    expect(store.getSnapshot().state.timelines.root.messages.byId.m2).toMatchObject({
+      content: 'authoritative',
+      timestamp: 3,
+    })
+  })
+
+  it('preserves a later pending message across a coarse initial snapshot', () => {
+    const store = createDisplayViewStore(EMPTY_DISPLAY_STATE, { timelines: {} })
+
+    for (const [id, timestamp] of [['m1', 1], ['m2', 2]] as const) {
+      store.mutate(
+        {
+          owner: `send:${id}`,
+          acknowledgedBy: (accepted) =>
+            accepted.state.timelines.root?.messages.byId[id] !== undefined,
+        },
+        (draft) => {
+          draft.shape = makeShape()
+          draft.state.timelines.root ??= makeDisplayState([]).timelines.root
+          draft.state.timelines.root.messages.byId[id] = userMessage(id, id, timestamp)
+          draft.state.timelines.root.messages.order = [
+            ...draft.state.timelines.root.messages.order,
+            id,
+          ]
+        },
+      )
+    }
+
+    expect(store.getSnapshot().state.timelines.root.messages.order).toEqual(['m1', 'm2'])
+
+    store.accept({
+      shape: makeShape(),
+      state: makeDisplayState([userMessage('m1', 'authoritative', 10)]),
+    })
+
+    expect(store.getSnapshot().state.timelines.root.messages.order).toEqual(['m1', 'm2'])
+    expect(store.getSnapshot().state.timelines.root.messages.byId.m1).toMatchObject({
+      content: 'authoritative',
+      timestamp: 10,
+    })
+  })
+
+  it('retains legacy write-conflict reconciliation without an acknowledgement contract', () => {
+    const initial = makeDisplayState([])
+    const store = createDisplayViewStore(initial, makeShape())
+
+    store.mutate({ owner: 'legacy' }, (draft) => {
+      draft.state.session.title = 'Speculative'
+    })
+    store.accept({
+      shape: makeShape(),
+      state: { ...initial, session: { ...initial.session, title: 'Authoritative' } },
+    })
+
+    expect(store.getSnapshot().state.session.title).toBe('Authoritative')
   })
 })
