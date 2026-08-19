@@ -1973,7 +1973,7 @@ mod tests {
                 .iter()
                 .filter(|model| model.speculative_decoding.is_none())
                 .count(),
-            9
+            8
         );
         assert!(projected.iter().all(|model| {
             model

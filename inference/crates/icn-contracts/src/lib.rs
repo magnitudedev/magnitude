@@ -340,6 +340,7 @@ pub struct GenerationMetrics {
     pub sampler_ms: f64,
     pub parser_ms: f64,
     pub draft_tokens: usize,
+    pub proposal_distribution_draft_tokens: usize,
     pub accepted_draft_tokens: usize,
     pub draft_ms: f64,
     pub verification_ms: f64,

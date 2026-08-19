@@ -57,6 +57,8 @@ token counts, finish reason, queue duration, prompt duration, decode duration, c
 backend selection, worker generation, system-memory reserve, available physical/commit memory,
 worker footprint, selected parallel sequences, physical context allocation, eviction latency,
 status, and stable error diagnostics.
+Speculative metrics distinguish total draft tokens from drafts carrying proposal distributions so
+distribution-aware verification can be established without recording token identities or values.
 
 Isolated native planning reports semaphore queue duration separately from worker duration, together
 with operation kind, profile count, and a bounded terminal outcome. This distinction makes scheduler

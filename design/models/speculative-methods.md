@@ -16,9 +16,9 @@ configured artifact; `Best known method` intentionally contains no links.
 | Qwen3.5 4B | MTP | None | — | — |
 | Qwen3.5 9B | MTP | None | — | — |
 | Qwen3.6 27B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-27B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-27B-DFlash-GGUF/blob/main/Qwen3.6-27B-DFlash-Q8_0.gguf) |
-| Qwen3.8 27B | MTP | None | — | — |
+| Qwen3.8 27B | DFlash2 | DFlash | Separate file, draft repo | [Qwen3.8-27B-DFlash2-Q8_0.gguf](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q8_0.gguf) |
 | Qwen3.6 35B-A3B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-35B-A3B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF/blob/main/Qwen3.6-35B-A3B-DFlash-Q8_0.gguf) |
-| Muse Glimmer 30B | DFlash | DFlash | Separate file, target repo | [dflash-kquant.gguf](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/blob/main/dflash-kquant.gguf) |
+| Muse Glimmer 30B | DFlash2 | DFlash | Separate file, draft repo | [Muse-Glimmer-30B-DFlash2-Q8_0.gguf](https://huggingface.co/incoai/Muse-Glimmer-30B-DFlash2-GGUF/blob/main/Muse-Glimmer-30B-DFlash2-Q8_0.gguf) |
 | Gemma 4 E2B | MTP | None | — | — |
 | Gemma 4 E4B | MTP | None | — | — |
 | Liquid LFM2.5 2.6B | None known | None | — | — |
@@ -36,6 +36,9 @@ configured artifact; `Best known method` intentionally contains no links.
 | GLM 5.2 753B-A40B | MTP | MTP | Embedded | [Target model](https://huggingface.co/unsloth/GLM-5.2-GGUF) |
 
 Update this table whenever a catalog model or its configured speculative method changes.
+
+DFlash2 checkpoints use the `DFlash` catalog method. DFlash2 is an evolution of that native
+method's drafting and verification behavior, not a separate artifact-packaging or lifecycle kind.
 
 MTP is currently disabled for every vision-capable model. When a vision-capable model has a
 compatible DFlash or DSpark method available, Magnitude may activate that method instead; otherwise
