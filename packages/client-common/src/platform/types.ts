@@ -11,6 +11,7 @@ import type { Layer } from "effect"
 import { RpcClient } from "@effect/rpc"
 import type { AcnClientCloseResult, AcnStartup } from "@magnitudedev/sdk"
 import type { MenuAction } from "../types/menu-action"
+import type { EmbeddedBrowserCapability } from "./embedded-browser"
 
 export type { MenuAction }
 
@@ -65,6 +66,8 @@ export interface Platform {
   readonly setDefaultServer: (url: string) => Promise<void>
   readonly onMenuAction?: (cb: (action: MenuAction) => void) => () => void
   readonly quit?: () => void
+  /** Electron-only embedded Chromium browser. */
+  readonly embeddedBrowser?: EmbeddedBrowserCapability
   /** Terminal capabilities — present only on the CLI platform */
   readonly terminal?: TerminalCapabilities
 }

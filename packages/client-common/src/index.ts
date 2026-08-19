@@ -15,6 +15,7 @@ export * from './hooks/use-stabilized-root-detail'
 
 // Platform
 export * from './platform/types'
+export * from './platform/embedded-browser'
 export * from './platform/platform-context'
 
 // Stores

@@ -9,6 +9,7 @@ import { CircleAlert, ChevronDown, ChevronRight, File, Folder, FolderOpen, Arrow
 import { Cause, Effect, Option } from "effect"
 import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
+  usePlatform,
   useProjectDirectoryTree,
   useProjectDirectoryRefresh,
   useProjectEntryMove,
@@ -22,6 +23,7 @@ import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { ResizableEdge } from "@/components/ui/resizable-edge"
 import { ActionTooltip } from "@/components/ui/tooltip"
+import { WorkspacePanelHeader } from "@/components/workspace-panel-header"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -41,20 +43,25 @@ import {
 import {
   expandedProjectDirectoriesAtom,
   projectFileDiscardIntentAtom,
-  projectFilesPanelOpenAtom,
-  projectFilesPanelWidthsAtom,
+  workspacePanelEnteringAtom,
+  workspacePanelOpenAtom,
+  workspacePanelSurfaceAtom,
+  workspacePanelWidthsAtom,
   projectFileDirtyAtom,
   projectFileDraftsAtom,
   selectedProjectFileAtom,
+  sidebarCollapsedAtom,
+  sidebarWidthAtom,
 } from "@/state/web-atoms"
 import {
-  PROJECT_FILES_FULL_WIDTH_BREAKPOINT,
-  PROJECT_FILES_MINIMUM_WIDTH,
-  projectFilesDocumentWidthForViewport,
-  projectFilesMaximumWidthForViewport,
-  projectFilesWidthForViewport,
-  type ProjectFilesPanelMode,
-} from "@/lib/project-files-layout"
+  WORKSPACE_CHAT_MINIMUM_WIDTH,
+  WORKSPACE_FILES_MINIMUM_WIDTH,
+  WORKSPACE_PANEL_FULL_WIDTH_BREAKPOINT,
+  workspaceDocumentWidthForViewport,
+  workspacePanelMaximumWidthForViewport,
+  workspacePanelWidthForViewport,
+  type WorkspacePanelWidthMode,
+} from "@/lib/workspace-panel-layout"
 import {
   canMoveProjectEntryToDirectory,
   parentProjectPath,
@@ -200,6 +207,7 @@ export function ProjectFilesPanel({ projectId }: { readonly projectId: ProjectId
 }
 
 function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId }): ReactNode {
+  const platform = usePlatform()
   useProjectFilesWatch(projectId)
   const panelRef = useRef<HTMLElement>(null)
   const closingRef = useRef(false)
@@ -209,9 +217,12 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   const refreshDirectory = useProjectDirectoryRefresh()
   const scheduledPrefetchRef = useRef<{ readonly path: ProjectRelativePath; readonly timer: number } | null>(null)
   const prefetchExpiryTimersRef = useRef(new Map<ProjectRelativePath, number>())
-  const close = useAtomSet(projectFilesPanelOpenAtom)
-  const panelWidths = useAtomValue(projectFilesPanelWidthsAtom)
-  const setPanelWidths = useAtomSet(projectFilesPanelWidthsAtom)
+  const close = useAtomSet(workspacePanelOpenAtom)
+  const entering = useAtomValue(workspacePanelEnteringAtom)
+  const setEntering = useAtomSet(workspacePanelEnteringAtom)
+  const setSurface = useAtomSet(workspacePanelSurfaceAtom)
+  const panelWidths = useAtomValue(workspacePanelWidthsAtom)
+  const setPanelWidths = useAtomSet(workspacePanelWidthsAtom)
   const discardIntent = useAtomValue(projectFileDiscardIntentAtom)
   const setDiscardIntent = useAtomSet(projectFileDiscardIntentAtom)
   const dirty = useAtomValue(projectFileDirtyAtom)
@@ -272,6 +283,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   useAtomMount(prefetchLifecycleAtom)
   const collapsePanel = useCallback(() => {
     if (closingRef.current) return
+    setEntering(false)
     const panel = panelRef.current
     if (panel === null || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       close(false)
@@ -287,7 +299,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
       () => close(false),
       () => close(false),
     )
-  }, [close])
+  }, [close, setEntering])
   const handleCollapse = useCallback(() => {
     if (dirty) {
       setDiscardIntent("close")
@@ -366,18 +378,27 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   const { result: moveResult, move } = useProjectEntryMove({ onSuccess: handleMoveSuccess })
   const height = useSyncExternalStore(subscribeWindow, windowHeight, windowHeight) - 60
   const viewportWidth = useSyncExternalStore(subscribeWindow, windowWidth, windowWidth)
-  const panelMode: ProjectFilesPanelMode = selectedPath === null ? "browser" : "document"
-  const maximumWidth = projectFilesMaximumWidthForViewport(viewportWidth)
-  const browserWidth = projectFilesWidthForViewport(panelWidths.browser, viewportWidth)
-  const panelWidth = panelMode === "browser"
-    ? browserWidth
-    : projectFilesDocumentWidthForViewport(
-        panelWidths.browser,
+  const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
+  const sidebarWidth = useAtomValue(sidebarWidthAtom)
+  const occupiedWidth = WORKSPACE_CHAT_MINIMUM_WIDTH + (sidebarCollapsed ? 0 : sidebarWidth)
+  const panelMode: WorkspacePanelWidthMode = selectedPath === null ? "filesTree" : "document"
+  const maximumWidth = workspacePanelMaximumWidthForViewport(viewportWidth, occupiedWidth)
+  const filesWidth = workspacePanelWidthForViewport(
+    panelWidths.filesTree,
+    WORKSPACE_FILES_MINIMUM_WIDTH,
+    viewportWidth,
+    occupiedWidth,
+  )
+  const panelWidth = panelMode === "filesTree"
+    ? filesWidth
+    : workspaceDocumentWidthForViewport(
+        panelWidths.filesTree,
         panelWidths.document,
         viewportWidth,
+        occupiedWidth,
       )
-  const minimumWidth = panelMode === "browser" ? PROJECT_FILES_MINIMUM_WIDTH : browserWidth
-  const fullWidth = viewportWidth <= PROJECT_FILES_FULL_WIDTH_BREAKPOINT
+  const minimumWidth = panelMode === "filesTree" ? WORKSPACE_FILES_MINIMUM_WIDTH : filesWidth
+  const fullWidth = viewportWidth <= WORKSPACE_PANEL_FULL_WIDTH_BREAKPOINT
 
   const root = directoryTree.root
   const rootListing = Result.value(root)
@@ -438,7 +459,10 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
       ref={panelRef}
       aria-label="Project files"
       style={{ width: fullWidth ? "100%" : panelWidth }}
-      className={`relative flex shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-850 ${resizing ? "" : "animate-[project-files-open_150ms_ease-out]"} ${resizing || fullWidth ? "" : "transition-[width] duration-150 ease-out"}`}
+      onAnimationEnd={(event) => {
+        if (event.currentTarget === event.target) setEntering(false)
+      }}
+      className={`relative flex shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-850 ${entering && !resizing ? "animate-[workspace-panel-open_150ms_ease-out]" : ""} ${resizing || fullWidth ? "" : "transition-[width] duration-150 ease-out"}`}
     >
       {!fullWidth ? (
         <ResizableEdge
@@ -451,13 +475,23 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
           label="Resize project files"
         />
       ) : null}
-      <header className="flex h-11 shrink-0 select-none items-center gap-2 border-b border-slate-200 px-2 dark:border-slate-800 [-webkit-app-region:drag]">
-        <ActionTooltip
-          label="Collapse sidebar"
-          side="bottom"
-          trigger={<Button variant="ghost" size="icon-sm" onClick={handleCollapse} className="[-webkit-app-region:no-drag]" aria-label="Collapse sidebar"><PanelRight size={18} /></Button>}
-        />
-        {selectedPath !== null && (
+      <WorkspacePanelHeader
+        surface="files"
+        filesEnabled
+        browserEnabled={platform.embeddedBrowser !== undefined}
+        onSurfaceChange={(next) => {
+          if (next !== "browser") return
+          setEntering(false)
+          if (dirty) {
+            setDiscardIntent("browser")
+            return
+          }
+          setSurface("browser")
+        }}
+        onCollapse={handleCollapse}
+      />
+      {selectedPath !== null && (
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-slate-200 px-2 dark:border-slate-800">
           <ActionTooltip
             label="Back to project files"
             side="bottom"
@@ -472,8 +506,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
               }} className="[-webkit-app-region:no-drag]" aria-label="Back to project files"><ArrowLeft size={16} /></Button>
             }
           />
-        )}
-        <div className="min-w-0 flex-1 truncate font-sans text-[15px] font-medium text-slate-900 dark:text-slate-200">{selectedPath ?? "Project Files"}</div>
+          <div className="min-w-0 flex-1 truncate font-sans text-xs font-medium text-slate-700 dark:text-slate-300">{selectedPath}</div>
         {snapshot !== null && snapshot._tag !== "unsupported" && (
           <DropdownMenu>
             <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="[-webkit-app-region:no-drag]" aria-label="File actions" />}><Ellipsis size={16} /></DropdownMenuTrigger>
@@ -482,8 +515,8 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <Button variant="ghost" size="icon-sm" onClick={handleCollapse} className="[-webkit-app-region:no-drag]" aria-label="Close project files"><X size={16} /></Button>
-      </header>
+        </div>
+      )}
       {selectedPath === null ? (
         <div className="relative min-h-0 flex-1 px-1 py-2">
           {Option.isNone(rootListing)
@@ -658,6 +691,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
               setDirty(false)
               if (intent === "back") setSelectedPath(null)
               if (intent === "close") collapsePanel()
+              if (intent === "browser") setSurface("browser")
             }}>Discard changes</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

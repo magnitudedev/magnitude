@@ -3,7 +3,18 @@ import { Schema } from "effect"
 import {
   MenuActionSchema,
   type MenuAction,
-} from "@magnitudedev/client-common/src/types/menu-action"
+} from "@magnitudedev/client-common/types/menu-action"
+import {
+  BrowserDownloadIdSchema,
+  BrowserPermissionRequestIdSchema,
+  BrowserTabIdSchema,
+  BrowserViewportRectSchema,
+  BrowserWorkspaceStateSchema,
+  type BrowserDownloadId,
+  type BrowserPermissionRequestId,
+  type BrowserTabId,
+  type BrowserViewportRect,
+} from "@magnitudedev/client-common/platform/embedded-browser"
 import {
   AcnEnsureEventSchema,
   AcnEnsureRequestSchema,
@@ -86,6 +97,70 @@ export const DesktopRpcs = RpcGroup.make(
     error: DesktopRpcError,
     stream: true,
   }),
+  Rpc.make("BrowserObserve", {
+    payload: Unit,
+    success: BrowserWorkspaceStateSchema,
+    error: DesktopRpcError,
+    stream: true,
+  }),
+  Rpc.make("BrowserCreateTab", {
+    payload: Schema.Struct({ url: Schema.NullOr(Schema.String) }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserActivateTab", {
+    payload: Schema.Struct({ tabId: BrowserTabIdSchema }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserCloseTab", {
+    payload: Schema.Struct({ tabId: BrowserTabIdSchema }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserNavigate", {
+    payload: Schema.Struct({ input: Schema.String }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserGoBack", { payload: Unit, success: Unit, error: DesktopRpcError }),
+  Rpc.make("BrowserGoForward", { payload: Unit, success: Unit, error: DesktopRpcError }),
+  Rpc.make("BrowserReload", { payload: Unit, success: Unit, error: DesktopRpcError }),
+  Rpc.make("BrowserStop", { payload: Unit, success: Unit, error: DesktopRpcError }),
+  Rpc.make("BrowserContinueInsecureNavigation", {
+    payload: Unit,
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserCancelInsecureNavigation", {
+    payload: Unit,
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserSetViewport", {
+    payload: Schema.Struct({ bounds: Schema.NullOr(BrowserViewportRectSchema) }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserOpenExternal", { payload: Unit, success: Unit, error: DesktopRpcError }),
+  Rpc.make("BrowserRespondToPermission", {
+    payload: Schema.Struct({
+      requestId: BrowserPermissionRequestIdSchema,
+      allow: Schema.Boolean,
+    }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserCancelDownload", {
+    payload: Schema.Struct({ downloadId: BrowserDownloadIdSchema }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
+  Rpc.make("BrowserRevealDownload", {
+    payload: Schema.Struct({ downloadId: BrowserDownloadIdSchema }),
+    success: Unit,
+    error: DesktopRpcError,
+  }),
 )
 
 export type DesktopRpcClient = RpcClient.FromGroup<
@@ -104,6 +179,14 @@ export const encodeDesktopAcnEnsureEvent =
   Schema.encodeSync(AcnEnsureEventSchema)
 export const decodeDesktopAcnEnsureEvent =
   Schema.decodeUnknownSync(AcnEnsureEventSchema)
+
+export type DesktopBrowserWorkspaceState = Schema.Schema.Encoded<
+  typeof BrowserWorkspaceStateSchema
+>
+export const encodeDesktopBrowserWorkspaceState =
+  Schema.encodeSync(BrowserWorkspaceStateSchema)
+export const decodeDesktopBrowserWorkspaceState =
+  Schema.decodeUnknownSync(BrowserWorkspaceStateSchema)
 
 export type DesktopPlatform = "darwin" | "win32" | "linux"
 
@@ -138,5 +221,30 @@ export interface DesktopApi {
   }
   readonly notifications: {
     show(title: string, body: string): void
+  }
+  readonly browser: {
+    observe(
+      onState: (state: DesktopBrowserWorkspaceState) => void,
+      onError: (error: unknown) => void,
+      onEnd: () => void,
+    ): () => void
+    createTab(url?: string): Promise<void>
+    activateTab(tabId: BrowserTabId): Promise<void>
+    closeTab(tabId: BrowserTabId): Promise<void>
+    navigate(input: string): Promise<void>
+    goBack(): Promise<void>
+    goForward(): Promise<void>
+    reload(): Promise<void>
+    stop(): Promise<void>
+    continueInsecureNavigation(): Promise<void>
+    cancelInsecureNavigation(): Promise<void>
+    setViewport(bounds: BrowserViewportRect | null): Promise<void>
+    openExternal(): Promise<void>
+    respondToPermission(
+      requestId: BrowserPermissionRequestId,
+      allow: boolean,
+    ): Promise<void>
+    cancelDownload(downloadId: BrowserDownloadId): Promise<void>
+    revealDownload(downloadId: BrowserDownloadId): Promise<void>
   }
 }
