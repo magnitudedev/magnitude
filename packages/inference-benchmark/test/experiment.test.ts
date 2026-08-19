@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest"
+import qwen38DflashComparison from "../experiments/qwen38-q4-icn-dflash.experiment"
 import { defineExperiment, defineModel, existingEndpoint, icn, llamaCpp, mlxLm, mlxVlm, resolveExecutionOrder } from "../src/experiment"
 
 describe("TypeScript experiments", () => {
+  it("allows the long-context DFlash sweep to exceed the default request timeout", () => {
+    expect(qwen38DflashComparison.requestPolicy.requestTimeoutMs).toBe(3_600_000)
+  })
+
   it("builds a serializable model/artifact/engine experiment", () => {
     const model = defineModel({
       id: "model",

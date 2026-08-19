@@ -72,7 +72,7 @@ function engineFor(prepared: PreparedExperiment, variantId: string) {
   return engine
 }
 
-function targetFor(prepared: PreparedExperiment, variantId: string, port: number, logPath: string): TargetConfiguration {
+export function targetFor(prepared: PreparedExperiment, variantId: string, port: number, logPath: string): TargetConfiguration {
   const variant = prepared.experiment.variants.find((candidate) => candidate.id === variantId)
   if (!variant) throw new RunError({ operation: "resolve-target", message: `unknown variant ${variantId}` })
   const artifact = artifactFor(prepared, variantId, "target")
@@ -138,7 +138,7 @@ function targetFor(prepared: PreparedExperiment, variantId: string, port: number
           }
         : {}),
     })
-    return { ...target, id: variant.id, logPath, artifact: artifactIdentity }
+    return { ...target, ...common }
   }
   if (variant.engine.kind === "llama.cpp") {
     const sharedContextTokens = prepared.experiment.requestPolicy.contextTokensPerSequence
