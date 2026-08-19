@@ -48,7 +48,6 @@ import {
   deriveLocalModelLoadActivity,
   installedLocalModels,
   formatLocalModelDisplayName,
-  modelSlotResidentAllocation,
   selectedSlotModel,
   reasoningEffortControl,
   formatReasoningEffort,
@@ -71,7 +70,6 @@ import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
 import { SettingsCenter } from "./components/settings-center"
 import { LocalModelOnboarding } from "./components/local-model-onboarding"
-import { formatBytes } from "./components/local-inference-format"
 import { ChatColumnPage } from "./components/chat-column-page"
 import {
   selectedCwdAtom,
@@ -552,7 +550,6 @@ function FooterBarContainer({
   const bashMode = useAtomValue(bashModeAtom)
   const nextEscWillKillAll = useAtomValue(nextEscWillKillAllAtom)
   const { displayMode } = useDisplayViewController()
-  const setSettingsTab = useAtomSet(settingsTabAtom)
   const localModelsResult = useLocalModels()
   const slotsResult = useModelSlots()
   const catalogResult = useProviderModelCatalog()
@@ -561,22 +558,6 @@ function FooterBarContainer({
   const currentModel = deriveCurrentLocalModel(
     Option.fromNullable(slots?.slots.primary)
   )
-  const allocation = slots
-    ? modelSlotResidentAllocation(slots.slots.primary)
-    : Option.none()
-  const residentBytes = Option.match(allocation, {
-    onNone: () => null,
-    onSome: ({ memoryDomains }) =>
-      memoryDomains.reduce(
-        (total, domain) =>
-          total +
-          domain.modelBytes +
-          domain.contextBytes +
-          domain.computeBytes +
-          domain.auxiliaryBytes,
-        0
-      ),
-  })
   const selectedModel = Option.flatMap(
     Option.all({
       catalog: Result.value(catalogResult),
@@ -594,9 +575,6 @@ function FooterBarContainer({
   const thinkingLevel = thinkingOptions.length > 0 && profile?.reasoningEffort
     ? formatReasoningEffort(profile.reasoningEffort)
     : null
-  const openHardware = useCallback(() => {
-    setSettingsTab("hardware")
-  }, [setSettingsTab])
   const localModels = Option.getOrNull(Result.value(localModelsResult))
   const providerCatalog = Option.match(Result.value(catalogResult), {
     onNone: () => ({ _tag: "Loading" as const, models: [] }),
@@ -666,10 +644,6 @@ function FooterBarContainer({
     currentModel._tag === "NoSelection"
       ? "Choose model"
       : currentModel.displayName
-  const memoryLabel =
-    currentModel._tag === "Running" && residentBytes !== null
-      ? `${formatBytes(residentBytes)} mem`
-      : null
   return (
     <FooterBar
       context={context}
@@ -677,7 +651,6 @@ function FooterBarContainer({
       tokenCap={tokenCap}
       model={modelLabel}
       thinkingLevel={thinkingLevel}
-      memoryLabel={memoryLabel}
       thinkingEffort={profile?.reasoningEffort ?? null}
       thinkingOptions={thinkingOptions}
       modelOptionsState={modelOptionsState}
@@ -692,7 +665,6 @@ function FooterBarContainer({
       onThinkingSelect={(effort) => {
         modelConfig.updateSlotReasoning(PRIMARY_SLOT_ID, effort)
       }}
-      onMemoryClick={openHardware}
       bashMode={bashMode}
       nextEscWillKillAll={nextEscWillKillAll}
       transcriptMode={displayMode === "transcript"}
