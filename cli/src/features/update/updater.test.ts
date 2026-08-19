@@ -115,7 +115,7 @@ describe("CLI updater", () => {
         .toBe(latestVersion)
 
       // The cache keeps only the last known answer.
-      const cachePath = join(root, "version.json")
+      const cachePath = join(root, "state", "version.json")
       expect(JSON.parse(await readFile(cachePath, "utf8")))
         .toEqual({ latestVersion })
 
