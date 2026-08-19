@@ -479,6 +479,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
         surface="files"
         filesEnabled
         browserEnabled={platform.embeddedBrowser !== undefined}
+        collapseTooltipDisabled={entering}
         onSurfaceChange={(next) => {
           if (next !== "browser") return
           setEntering(false)

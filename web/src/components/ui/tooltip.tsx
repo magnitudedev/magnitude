@@ -55,6 +55,7 @@ function TooltipContent({
 function ActionTooltip({
   label,
   trigger,
+  disabled = false,
   side = "top",
   sideOffset,
   align,
@@ -62,12 +63,13 @@ function ActionTooltip({
 }: {
   readonly label: ReactNode
   readonly trigger: ReactElement
+  readonly disabled?: boolean
 } & Pick<
   TooltipPrimitive.Positioner.Props,
   "align" | "alignOffset" | "side" | "sideOffset"
 >) {
   return (
-    <Tooltip>
+    <Tooltip disabled={disabled}>
       <TooltipTrigger render={trigger} />
       <TooltipContent
         side={side}

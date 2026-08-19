@@ -9,18 +9,21 @@ export function WorkspacePanelHeader({
   browserEnabled,
   onSurfaceChange,
   onCollapse,
+  collapseTooltipDisabled = false,
 }: {
   readonly surface: "files" | "browser"
   readonly filesEnabled: boolean
   readonly browserEnabled: boolean
   readonly onSurfaceChange: (surface: "files" | "browser") => void
   readonly onCollapse: () => void
+  readonly collapseTooltipDisabled?: boolean
 }): ReactNode {
   return (
     <header className="flex h-11 shrink-0 select-none items-center gap-2 border-b border-slate-200 px-2 dark:border-slate-800 [-webkit-app-region:drag]">
       <ActionTooltip
         label="Collapse sidebar"
         side="bottom"
+        disabled={collapseTooltipDisabled}
         trigger={(
           <Button
             variant="ghost"
