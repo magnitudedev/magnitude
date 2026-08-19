@@ -47,8 +47,7 @@ export const registerInteractiveCommand = (program: Command): void => {
         process.stderr.write(
           "Error: --headless is temporarily disabled. Use the TUI mode.\n",
         )
-        process.exitCode = 1
-        return
+        process.exit(1)
       }
 
       const options: InteractiveLaunchOptions = {
@@ -77,8 +76,8 @@ export const registerInteractiveCommand = (program: Command): void => {
         Effect.provide([BunContext.layer, FetchHttpClient.layer]),
         Effect.catchAll((error) => Effect.sync(() => {
           process.stderr.write(`Failed to start Magnitude: ${error.reason}\n`)
-          process.exitCode = 1
+          return 1
         })),
-      ))
+      )).then((exitCode) => process.exit(exitCode))
     })
 }

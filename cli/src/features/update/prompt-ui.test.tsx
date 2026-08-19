@@ -112,7 +112,7 @@ describe("UpdatePrompt", () => {
       expect(view.captureCharFrame()).toContain("Update available!")
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
-      expect(frame).toContain("Starting Magnitude...")
+      expect(frame).toContain("Starting Magnitude")
       expect(frame).toContain("Preparing background server")
 
       await act(async () => view.mockInput.pressCtrlC())

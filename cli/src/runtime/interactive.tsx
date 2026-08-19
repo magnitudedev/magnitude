@@ -10,6 +10,8 @@ import {
   scheduleTask,
 } from "@effect-atom/atom-react"
 import type * as FileSystem from "@effect/platform/FileSystem"
+import type * as CommandExecutor from "@effect/platform/CommandExecutor"
+import type * as HttpClient from "@effect/platform/HttpClient"
 import type * as Path from "@effect/platform/Path"
 import {
   createAgentClient,
@@ -472,7 +474,6 @@ const runInteractiveSession = (
 const writeSessionResult = (
   result: Extract<InteractiveSessionResult, { readonly _tag: "Exit" }>,
 ): Effect.Effect<void> => Effect.sync(() => {
-  process.exitCode = result.code
   if (Option.isSome(result.fatal)) {
     const fatal = result.fatal.value
     logger.error({
@@ -489,7 +490,14 @@ const writeSessionResult = (
 
 export const runInteractiveCommand = (
   options: InteractiveLaunchOptions,
-) => Effect.gen(function* () {
+): Effect.Effect<
+  number,
+  CliRendererAcquisitionFailed,
+  | CommandExecutor.CommandExecutor
+  | FileSystem.FileSystem
+  | HttpClient.HttpClient
+  | Path.Path
+> => Effect.gen(function* () {
   const updater = yield* makeCliUpdater({
     currentVersion: CLI_VERSION,
     developmentBuild: options.developmentBuild,
@@ -498,10 +506,10 @@ export const runInteractiveCommand = (
     Effect.provideService(CliUpdater, updater),
   ))
   if (result._tag === "UpdateRequested") {
-    yield* executeUpdate(updater, result.action, { relaunch: true })
-  } else {
-    yield* writeSessionResult(result)
+    return yield* executeUpdate(updater, result.action, { relaunch: true })
   }
+  yield* writeSessionResult(result)
+  return result.code
 })
 
 const developmentLaunchCommand = (
