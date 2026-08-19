@@ -39,26 +39,29 @@ destructive operation.
 
 The ordinary browser sidebar order is:
 
-1. sidebar expand/collapse and New Chat compose icon toolbar;
+1. Settings, sidebar expand/collapse, and New Chat controls in that order;
 2. Search Sessions;
 3. full-row New Project; and
 4. the expandable Project/session hierarchy.
 
-Electron places sidebar expand/collapse and New Chat in the persistent native title-bar row rather
-than adding a second toolbar inside the sidebar. While expanded, the sidebar background and right
-border continue through the full title-bar height and the two actions sit at the right edge of that
-region; the current session title starts in the main pane. When collapsed, the sidebar region and
-border disappear and those actions move beside the native window controls, followed by the session
-title. In dark mode the main pane uses slate-900 and the sidebar uses opaque slate-850 on every
+Electron places Settings, sidebar expand/collapse, and New Chat in that order in the
+persistent native title-bar row rather than adding a second toolbar inside the sidebar. While
+expanded, the sidebar background and right border continue through the full title-bar height and
+the three actions sit at the right edge of that region; the current session title starts in the main
+pane. When collapsed, the sidebar region and border disappear and the same ordered actions move
+beside the native window controls, followed by the session title. In dark mode the main pane uses
+slate-900 and the sidebar uses opaque slate-850 on every
 desktop platform; native vibrancy does not alter the sidebar's rendered color. macOS reserves the
 configured traffic-light region. Linux and Windows use Electron's Window
 Controls Overlay safe-area variables because native controls may appear on either side according to
 the desktop environment. A collapsed Electron sidebar has no residual rail: the main pane takes the
-available width and Settings and appearance controls float at bottom-left. The composer keeps the
+available width. The composer keeps the
 same wide, centered maximum measure whether the sidebar is expanded or collapsed, so collapsing
 changes its position within the main pane rather than its width. The narrower new-chat chooser
 retains its own independent reading measure. Settings keeps the same application chrome but does
-not display the session title as a Settings page heading.
+not display the session title as a Settings page heading. Appearance is not a persistent title-bar
+action; its control sits at the bottom-left of the Settings sidebar and is available only while
+Settings is open.
 
 New Chat opens a Project-owned draft in the main pane. It retains the current available Project or,
 when no valid selection exists, defaults to the most recently active available Project. The empty

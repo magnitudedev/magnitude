@@ -5,7 +5,6 @@ import {
   Layers3,
   Monitor,
   Moon,
-  Settings,
   SlidersHorizontal,
   Sun,
 } from "lucide-react"
@@ -18,6 +17,7 @@ import {
   Gear,
   MagnifyingGlass,
   NotePencil,
+  Plus,
   SidebarSimple,
   X,
 } from "@phosphor-icons/react"
@@ -105,6 +105,10 @@ function SettingsNavigation({
   readonly onTabChange?: (tab: SettingsTab) => void
   readonly onBack?: () => void
 }): ReactNode {
+  const appearance = useAppearancePreference()
+  const nextAppearance =
+    appearance === "system" ? "light" : appearance === "light" ? "dark" : "system"
+  const AppearanceIcon = appearance === "light" ? Sun : appearance === "dark" ? Moon : Monitor
   return (
     <>
       <Button
@@ -143,35 +147,40 @@ function SettingsNavigation({
           </Button>
         ))}
       </nav>
+      <div className="shrink-0 px-2 pb-2 [-webkit-app-region:no-drag]">
+        <Button
+          variant="unstyled"
+          size="unstyled"
+          type="button"
+          onClick={() => setAppearancePreference(nextAppearance)}
+          className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
+          aria-label={`Theme: ${appearance}`}
+          title={`Theme: ${appearance}`}
+        >
+          <AppearanceIcon size={16} />
+        </Button>
+      </div>
     </>
   )
 }
 
-function SidebarFooter({
-  compact,
-  floating = false,
+function SidebarHeaderActions({
+  vertical = false,
+  collapsed,
   settingsActive,
   onToggleSettings,
+  onToggleSidebar,
+  onCompose,
 }: {
-  readonly compact: boolean
-  readonly floating?: boolean
+  readonly vertical?: boolean
+  readonly collapsed: boolean
   readonly settingsActive: boolean
   readonly onToggleSettings?: () => void
+  readonly onToggleSidebar: () => void
+  readonly onCompose?: () => void
 }): ReactNode {
-  const appearance = useAppearancePreference()
-  const nextAppearance =
-    appearance === "system" ? "light" : appearance === "light" ? "dark" : "system"
-  const AppearanceIcon = appearance === "light" ? Sun : appearance === "dark" ? Moon : Monitor
   return (
-    <div
-      className={
-        floating
-          ? "fixed bottom-3 left-3 z-20 flex items-center gap-1 [-webkit-app-region:no-drag]"
-          : `flex min-h-[49px] shrink-0 items-center border-t border-slate-200 p-2 dark:border-slate-800 mac:[-webkit-app-region:no-drag] ${
-              compact ? "flex-col gap-1" : "gap-2"
-            }`
-      }
-    >
+    <div className={`flex gap-1 [-webkit-app-region:no-drag] ${vertical ? "flex-col" : "items-center"}`}>
       <Button
         variant="unstyled"
         size="unstyled"
@@ -182,18 +191,29 @@ function SidebarFooter({
         aria-current={settingsActive ? "page" : undefined}
         title="Settings"
       >
-        {compact ? <Gear size={17} /> : <Settings size={16} />}
+        <Gear size={17} />
       </Button>
       <Button
         variant="unstyled"
         size="unstyled"
         type="button"
-        onClick={() => setAppearancePreference(nextAppearance)}
+        onClick={onToggleSidebar}
         className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-        aria-label={`Theme: ${appearance}`}
-        title={`Theme: ${appearance}`}
+        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
       >
-        <AppearanceIcon size={16} />
+        <SidebarSimple size={18} />
+      </Button>
+      <Button
+        variant="unstyled"
+        size="unstyled"
+        type="button"
+        onClick={onCompose}
+        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
+        aria-label="New chat"
+        title="New chat"
+      >
+        <NotePencil size={18} />
       </Button>
     </div>
   )
@@ -295,7 +315,6 @@ export function SessionsSidebar({
   const [formProject, setFormProject] = useState<ProjectRecord | "new" | null>(null)
   const [removeProject, setRemoveProject] = useState<ProjectRecord | null>(null)
   const compact = collapsed && !overlay
-  const floatingFooter = compact && titlebarIntegrated
 
   const sessionsByProject = useMemo(() => {
     const grouped = new Map<ProjectId, SessionItemData[]>()
@@ -334,7 +353,16 @@ export function SessionsSidebar({
     })
   }
 
-  const effectiveWidth = floatingFooter ? 0 : compact ? 48 : overlay ? 280 : sidebarWidth
+  const toggleSettings = () => {
+    if (settingsTab !== null) {
+      onCloseSettings?.()
+      return
+    }
+    setCollapsed(false)
+    onOpenSettings?.()
+  }
+
+  const effectiveWidth = compact && titlebarIntegrated ? 0 : compact ? 48 : overlay ? 280 : sidebarWidth
   return (
     <>
       {overlay ? (
@@ -349,33 +377,28 @@ export function SessionsSidebar({
             : "relative shrink-0"
         } max-[640px]:[&:not([data-overlay])]:hidden flex flex-col overflow-hidden border-r border-slate-200 bg-slate-100 transition-[width] duration-150 dark:border-slate-800 dark:bg-slate-850`}
       >
+        {!compact && !titlebarIntegrated ? (
+          <div className="flex h-11 shrink-0 items-center justify-end px-2.5">
+            <SidebarHeaderActions
+              collapsed={false}
+              settingsActive={settingsTab !== null}
+              onToggleSettings={toggleSettings}
+              onToggleSidebar={() => setCollapsed(true)}
+              onCompose={onCompose}
+            />
+          </div>
+        ) : null}
         {compact ? (
           <div className="flex flex-1 flex-col items-center gap-1 pt-2">
             {!titlebarIntegrated ? (
-              <>
-                <Button
-                  variant="unstyled"
-                  size="unstyled"
-                  type="button"
-                  onClick={() => setCollapsed(false)}
-                  className="flex size-8 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-                  aria-label="Expand sidebar"
-                  title="Expand sidebar"
-                >
-                  <SidebarSimple size={18} />
-                </Button>
-                <Button
-                  variant="unstyled"
-                  size="unstyled"
-                  type="button"
-                  onClick={onCompose}
-                  className="flex size-8 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-                  aria-label="New chat"
-                  title="New chat"
-                >
-                  <NotePencil size={18} />
-                </Button>
-              </>
+              <SidebarHeaderActions
+                vertical
+                collapsed
+                settingsActive={settingsTab !== null}
+                onToggleSettings={toggleSettings}
+                onToggleSidebar={() => setCollapsed(false)}
+                onCompose={onCompose}
+              />
             ) : null}
           </div>
         ) : settingsTab !== null ? (
@@ -387,32 +410,6 @@ export function SessionsSidebar({
         ) : (
           <>
             <div className="mac:[-webkit-app-region:no-drag] shrink-0 px-2.5 pb-2 pt-2">
-              {!titlebarIntegrated ? (
-                <div className="mb-2 flex h-8 items-center justify-end gap-1">
-                  <Button
-                    variant="unstyled"
-                    size="unstyled"
-                    type="button"
-                    onClick={() => setCollapsed(true)}
-                    className="flex size-8 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-                    aria-label="Collapse sidebar"
-                    title="Collapse sidebar"
-                  >
-                    <SidebarSimple size={18} />
-                  </Button>
-                  <Button
-                    variant="unstyled"
-                    size="unstyled"
-                    type="button"
-                    onClick={onCompose}
-                    className="flex size-8 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-                    aria-label="New chat"
-                    title="New chat"
-                  >
-                    <NotePencil size={18} />
-                  </Button>
-                </div>
-              ) : null}
               <div className="mb-2 flex h-8 items-center gap-2 rounded-md border border-slate-300 bg-white px-2 dark:border-slate-750 dark:bg-slate-900">
                 <MagnifyingGlass size={15} className="shrink-0 text-slate-500" />
                 <Input
@@ -443,7 +440,8 @@ export function SessionsSidebar({
                 className="flex h-8 w-full items-center gap-2 rounded-md border-0 bg-transparent px-2 text-left font-sans text-[13px] font-semibold text-slate-700 hover:bg-white dark:text-slate-300 dark:hover:bg-slate-800"
               >
                 <FolderPlus size={17} className="text-slate-500" />
-                New project
+                <span className="min-w-0 flex-1">New project</span>
+                <Plus size={15} aria-hidden="true" className="shrink-0 text-slate-500" />
               </Button>
             </div>
             <div
@@ -570,20 +568,6 @@ export function SessionsSidebar({
             </div>
           </>
         )}
-        {!floatingFooter ? (
-          <SidebarFooter
-            compact={compact}
-            settingsActive={settingsTab !== null}
-            onToggleSettings={() => {
-              if (settingsTab !== null) {
-                onCloseSettings?.()
-                return
-              }
-              setCollapsed(false)
-              onOpenSettings?.()
-            }}
-          />
-        ) : null}
         {!overlay && !compact ? (
           <ResizableEdge
             side="right"
@@ -596,21 +580,6 @@ export function SessionsSidebar({
           />
         ) : null}
       </aside>
-      {floatingFooter ? (
-        <SidebarFooter
-          compact
-          floating
-          settingsActive={settingsTab !== null}
-          onToggleSettings={() => {
-            if (settingsTab !== null) {
-              onCloseSettings?.()
-              return
-            }
-            setCollapsed(false)
-            onOpenSettings?.()
-          }}
-        />
-      ) : null}
       {formProject ? (
         <ProjectFormDialog
           project={formProject === "new" ? undefined : formProject}

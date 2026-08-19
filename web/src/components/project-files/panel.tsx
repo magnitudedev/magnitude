@@ -200,6 +200,8 @@ export function ProjectFilesPanel({ projectId }: { readonly projectId: ProjectId
 
 function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId }): ReactNode {
   useProjectFilesWatch(projectId)
+  const panelRef = useRef<HTMLElement>(null)
+  const closingRef = useRef(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [resizing, setResizing] = useState(false)
   const [prefetchedDirectories, setPrefetchedDirectories] = useState<ReadonlySet<ProjectRelativePath>>(() => new Set())
@@ -267,14 +269,32 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
     [cancelScheduledPrefetch],
   )
   useAtomMount(prefetchLifecycleAtom)
+  const collapsePanel = useCallback(() => {
+    if (closingRef.current) return
+    const panel = panelRef.current
+    if (panel === null || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      close(false)
+      return
+    }
+    closingRef.current = true
+    const width = panel.getBoundingClientRect().width
+    const animation = panel.animate(
+      [{ width: `${width}px` }, { width: "0px" }],
+      { duration: 150, easing: "ease-out", fill: "forwards" },
+    )
+    void animation.finished.then(
+      () => close(false),
+      () => close(false),
+    )
+  }, [close])
   const handleCollapse = useCallback(() => {
     if (dirty) {
       setDiscardIntent("close")
       return
     }
     setDirty(false)
-    close(false)
-  }, [close, dirty, setDirty, setDiscardIntent])
+    collapsePanel()
+  }, [collapsePanel, dirty, setDirty, setDiscardIntent])
   const setSelectedPath = useCallback((path: ProjectRelativePath | null) => {
     setSelectedFile(path === null ? null : { projectId, path })
   }, [projectId, setSelectedFile])
@@ -414,9 +434,10 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
 
   return (
     <aside
+      ref={panelRef}
       aria-label="Project files"
       style={{ width: fullWidth ? "100%" : panelWidth }}
-      className={`relative flex shrink-0 flex-col border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-850 max-[1400px]:absolute max-[1400px]:inset-y-0 max-[1400px]:right-0 max-[1400px]:z-20 ${resizing || fullWidth ? "" : "transition-[width] duration-150 ease-out"}`}
+      className={`relative flex shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-850 ${resizing ? "" : "animate-[project-files-open_150ms_ease-out]"} ${resizing || fullWidth ? "" : "transition-[width] duration-150 ease-out"}`}
     >
       {!fullWidth ? (
         <ResizableEdge
@@ -527,7 +548,14 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
           )}
         </div>
       ) : snapshot === null ? (
-        <div className="px-4 py-6 text-sm text-slate-500">{Result.isFailure(file) ? "Could not open this file." : "Opening file…"}</div>
+        Result.isFailure(file) ? (
+          <div className="px-4 py-6 text-sm text-red-600 dark:text-red-400">Could not open this file.</div>
+        ) : (
+          <div className="flex min-h-48 flex-1 flex-col items-center justify-center gap-3 text-[13px] font-medium text-slate-600 dark:text-slate-400">
+            <Spinner className="size-5 text-blue-600 motion-reduce:animate-none dark:text-blue-400" />
+            <span>Opening file…</span>
+          </div>
+        )
       ) : snapshot._tag === "image" ? (
         <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4"><img src={`data:${snapshot.mediaType};base64,${snapshot.data}`} alt={snapshot.path} className="max-h-full max-w-full object-contain" /></div>
       ) : snapshot._tag === "unsupported" ? (
@@ -616,7 +644,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
               setDiscardIntent(null)
               setDirty(false)
               if (intent === "back") setSelectedPath(null)
-              if (intent === "close") close(false)
+              if (intent === "close") collapsePanel()
             }}>Discard changes</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

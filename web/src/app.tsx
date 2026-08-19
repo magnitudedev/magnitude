@@ -16,7 +16,7 @@ import {
   type ReactNode,
 } from "react"
 import { Menu, PanelRight } from "lucide-react"
-import { NotePencil, SidebarSimple } from "@phosphor-icons/react"
+import { Gear, NotePencil, SidebarSimple } from "@phosphor-icons/react"
 import { Cause, Option, Effect } from "effect"
 import {
   useAtomValue,
@@ -725,6 +725,8 @@ function ChatTitleBar({
   const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
   const sidebarWidth = useAtomValue(sidebarWidthAtom)
   const setSidebarCollapsed = useAtomSet(sidebarCollapsedAtom)
+  const settingsTab = useAtomValue(settingsTabAtom)
+  const setSettingsTab = useAtomSet(settingsTabAtom)
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const projectFilesButton = (
     <Button variant="unstyled" size="unstyled" type="button"
@@ -738,6 +740,23 @@ function ChatTitleBar({
   if (desktop) {
     const titlebarActions = (
       <>
+        <Button variant="unstyled" size="unstyled"
+          type="button"
+          onClick={() => {
+            if (settingsTab !== null) {
+              setSettingsTab(null)
+              return
+            }
+            setSidebarCollapsed(false)
+            setSettingsTab("models")
+          }}
+          className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400 [-webkit-app-region:no-drag]"
+          aria-label="Settings"
+          aria-current={settingsTab !== null ? "page" : undefined}
+          title="Settings"
+        >
+          <Gear size={17} />
+        </Button>
         <Button variant="unstyled" size="unstyled"
           type="button"
           onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
