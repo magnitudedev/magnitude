@@ -64,8 +64,9 @@ magnitude (shell)
     Application ──────────────────────────────── TUI state   the product
 ```
 
-Discovery race: a result arriving before the app commits presents `UpdatePrompt`; a result
-arriving after `Application` presents one notification line (`design/release/client-updates.md`).
+Discovery race: a result arriving while daemon startup work is still running presents
+`UpdatePrompt`; from daemon readiness on, a result presents one notification line, and the cached
+answer prompts first thing next launch (`design/release/client-updates.md`).
 An install-needed launch does not race at all: the probe holds the install sequence until the
 discovery result answers, so an update is always offered before a multi-minute download of the
 version it would replace, and an install path never paints `DaemonStartup` only to replace it

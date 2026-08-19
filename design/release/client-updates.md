@@ -47,10 +47,11 @@ The check result is consumed by a race:
   result before the install sequence begins: an offer always prompts before any download, and a
   multi-minute install of a version about to be replaced never starts. The wait is bounded by the
   check's own ceiling and costs nothing real — installation needs the network regardless.
-- Fresh result arrives before the app commits (cold daemon spawn — the check usually outruns it)
-  → the prompt is shown this launch, before expensive work proceeds.
-- Fresh result arrives after the app is up (typical warm start) → one in-session notification
-  line. Startup latency is never added to wait for the network.
+- Fresh result arrives while daemon startup work is still running (cold spawn — the check
+  usually outruns it) → the prompt is shown this launch, before expensive work proceeds.
+- Fresh result arrives from daemon readiness on (typical warm start) → one in-session
+  notification line, and the now-cached answer prompts first thing next launch. Startup latency
+  is never added to wait for the network.
 
 Dismissal state is user-owned and stored separately from the discovery answer. A dismissal
 suppresses both the prompt and the notification for exactly that version; a newer version is

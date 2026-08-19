@@ -312,11 +312,14 @@ export const makeCliUpdater = (
       dismissal,
     )
     const outcome = yield* Deferred.make<Option.Option<string>>()
+    // A completed check is authoritative: its filtered result is the answer,
+    // even when that retracts a cached offer (registry rollback). The known
+    // answer stands in only when the check itself failed.
     yield* Effect.forkScoped(refresh.pipe(
-      Effect.map((latest) => Option.orElse(
-        offerable(latest, dismissal),
-        () => known,
-      )),
+      Effect.map(Option.match({
+        onSome: (latestVersion) => offerable(Option.some(latestVersion), dismissal),
+        onNone: () => known,
+      })),
       Effect.flatMap((answer) => Deferred.succeed(outcome, answer)),
     ))
     return { known, fresh: Deferred.await(outcome) }

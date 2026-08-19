@@ -135,6 +135,14 @@ describe("CLI updater", () => {
       expect(Option.isNone(fourth.known)).toBe(true)
       expect(Option.getOrNull(await Effect.runPromise(fourth.fresh)))
         .toBe(latestVersion)
+
+      // A successful check is authoritative: a rolled-back registry retracts
+      // the cached offer instead of falling back to it.
+      await writeFile(cachePath, JSON.stringify({ latestVersion: "0.0.1-alpha.40" }))
+      latestVersion = "0.0.1-alpha.34"
+      const fifth = await runScoped(scope, updater.discover)
+      expect(Option.getOrNull(fifth.known)).toBe("0.0.1-alpha.40")
+      expect(Option.isNone(await Effect.runPromise(fifth.fresh))).toBe(true)
     } finally {
       await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
