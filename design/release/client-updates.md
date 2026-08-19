@@ -25,20 +25,45 @@ or modify a package-manager installation directly.
 
 ## Discovery
 
-The npm registry's `latest` dist-tag is the sole version target. A prerelease identifier in a
-package version does not select an npm dist-tag, and the updater does not derive a channel from the
-installed version. Changesets remains responsible for advancing `latest` during publication.
+### Channels
+
+A release channel is derived from a version's prerelease identifier: none → stable, `alpha` →
+alpha, `beta` → beta. The client's channel comes from its own running version, and it admits
+update candidates by the candidate's channel:
+
+- stable clients follow only stable releases;
+- beta clients follow stable and beta releases;
+- alpha clients follow stable, beta, and alpha releases.
+
+A prerelease identifier outside these channels is admitted nowhere and classifies a client
+conservatively as stable. Publishing maintains the channels with npm dist-tags: changesets pre
+mode publishes under the pre id's tag (`alpha`, `beta`) and moves `latest` only outside pre mode.
+
+The single dist-tags request the check already makes carries every channel's candidate; the
+client decodes `latest`, `beta`, and `alpha` and discards nothing it needs. Selection is a pure
+function: among admissible candidates newer than the running version, the highest version wins.
+Semver's prerelease ordering (`alpha < beta < stable` within a base) makes cross-channel
+supersession fall out naturally.
+
+### Checks and the cache
 
 Every interactive launch fires one discovery check, concurrently with startup, supervised by the
-startup scope. There is no check interval or cache expiry: the check is two small requests from
-human-frequency launches. The cache holds only the last known answer, so a known update can be
-offered instantly without the network. Check failures are silent, leave the prior answer intact,
-and never delay or prevent startup.
+startup scope. There is no check interval or cache expiry. A candidate is an available update
+only when it is newer than the running version, admissible for this client's channel, and its
+public release manifest contains exactly one CLI artifact for the current host — the readiness
+check. The check walks the admissible upgrades newest-first and stops at the first that passes
+readiness, so the normal case verifies exactly one manifest; a candidate published before its
+release assets is skipped, not fatal. Readiness exists because the launcher acquires the native
+CLI from the corresponding GitHub release; an update must never be offered before its binary is
+downloadable.
 
-A registry version is an available update only when it is newer than the running version and the
-matching public release manifest contains exactly one CLI artifact for the current host. This
-readiness check exists because the launcher acquires the native CLI from the corresponding GitHub
-release; an update must never be offered before its binary is downloadable.
+The cache (`state/version.json`) stores the selected, readiness-verified candidate of the last
+completed check — including the empty result, which erases the cache. A completed check is
+authoritative: its selection stands even when it retracts a cached offer (registry rollback);
+the cached answer stands in only when the check itself failed. Check failures are silent, leave
+the prior answer intact, and never delay or prevent startup. Admissibility, newness, and the
+dismissal floor are re-applied when the cache is read: the running binary — and so its channel —
+may have changed since the write.
 
 The check result is consumed by a race:
 
@@ -53,9 +78,14 @@ The check result is consumed by a race:
   notification line, and the now-cached answer prompts first thing next launch. Startup latency
   is never added to wait for the network.
 
-Dismissal state is user-owned and stored separately from the discovery answer. A dismissal
-suppresses both the prompt and the notification for exactly that version; a newer version is
-eligible again. Source and development builds do not check.
+Dismissal state is user-owned and stored separately from the discovery answer
+(`state/version-dismissal.json`). A dismissal is a floor: it suppresses the prompt and the
+notification for every candidate at or below the dismissed version — the user declined the best
+available option, so a strictly older one is never surfaced in its place — and anything strictly
+newer re-engages. The floor is monotonic (only ever-higher versions can be dismissed, since only
+offers above the floor are shown) and self-healing: a completed check whose best candidate falls
+below the floor clears it, because the registry retreated past what was dismissed. The explicit
+update command ignores dismissals entirely. Source and development builds do not check.
 
 ## Startup interaction
 
@@ -90,17 +120,20 @@ version — is exactly the manual-restart behavior, plus one fast failed resolut
 
 ## Package-manager actions
 
-Update actions follow the manager's ordinary global installation command and therefore resolve npm
-`latest` at execution time:
+Update actions follow the manager's ordinary global installation command, pinned to the exact
+selected version — pinning keeps the offer and the installation identical and keeps prerelease
+clients on their own channel, where an unpinned install would resolve `latest`:
 
-- npm runs `npm install -g @magnitudedev/cli`.
-- Bun runs `bun install -g @magnitudedev/cli`.
-- pnpm runs `pnpm add -g @magnitudedev/cli`.
+- npm runs `npm install -g @magnitudedev/cli@<version>`.
+- Bun runs `bun install -g @magnitudedev/cli@<version>`.
+- pnpm runs `pnpm add -g @magnitudedev/cli@<version>`.
 
 The visible command and executed command come from the same structured action. Arguments are passed
-directly to the executable rather than through a shell. `magnitude update` runs this action directly
-without first performing discovery; it is unavailable to development builds or unknown installation
-methods.
+directly to the executable rather than through a shell. `magnitude update` resolves its target the
+same way the prompt does — one fresh check, channel-selected, readiness-verified — but ignores
+dismissals: asking to update overrides having dismissed. No target means "already up to date"; a
+failed check reports itself and exits nonzero. The command is unavailable to development builds or
+unknown installation methods.
 
 ## Required guarantees
 

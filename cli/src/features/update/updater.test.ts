@@ -7,7 +7,6 @@ import { Effect, Exit, Option, Scope } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   isDevelopmentVersion,
-  isNewerVersion,
   makeCliUpdater,
 } from "./updater"
 import { currentHost } from "@magnitudedev/release"
@@ -28,10 +27,7 @@ afterEach(async () => {
 })
 
 describe("CLI updater", () => {
-  it("uses semantic version ordering and disables development versions", () => {
-    expect(isNewerVersion("0.0.1-alpha.35", "0.0.1-alpha.34")).toBe(true)
-    expect(isNewerVersion("0.0.1-alpha.34", "0.0.1-alpha.35")).toBe(false)
-    expect(isNewerVersion("not-a-version", "0.0.1-alpha.35")).toBe(false)
+  it("recognizes development versions", () => {
     expect(isDevelopmentVersion("0.0.1-alpha.35+dev.abc.1")).toBe(true)
     expect(isDevelopmentVersion("0.0.1-alpha.35")).toBe(false)
   })
@@ -114,10 +110,10 @@ describe("CLI updater", () => {
       expect(Option.getOrNull(await Effect.runPromise(first.fresh)))
         .toBe(latestVersion)
 
-      // The cache keeps only the last known answer.
+      // The cache keeps the selected candidate of the last completed check.
       const cachePath = join(root, "state", "version.json")
       expect(JSON.parse(await readFile(cachePath, "utf8")))
-        .toEqual({ latestVersion })
+        .toEqual({ version: latestVersion })
 
       // Next launch knows the answer without the network.
       const second = await runScoped(scope, updater.discover)
@@ -138,11 +134,92 @@ describe("CLI updater", () => {
 
       // A successful check is authoritative: a rolled-back registry retracts
       // the cached offer instead of falling back to it.
-      await writeFile(cachePath, JSON.stringify({ latestVersion: "0.0.1-alpha.40" }))
+      await writeFile(cachePath, JSON.stringify({ version: "0.0.1-alpha.40" }))
       latestVersion = "0.0.1-alpha.34"
       const fifth = await runScoped(scope, updater.discover)
       expect(Option.getOrNull(fifth.known)).toBe("0.0.1-alpha.40")
       expect(Option.isNone(await Effect.runPromise(fifth.fresh))).toBe(true)
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void))
+      server.stop(true)
+    }
+  })
+
+  it("selects by release channel and admits only the client's channels", async () => {
+    const tags = {
+      latest: "1.0.0",
+      beta: "1.1.0-beta.2",
+      alpha: "1.2.0-alpha.1",
+    }
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const pathname = decodeURIComponent(new URL(request.url).pathname)
+        if (pathname === "/registry") return Response.json(tags)
+        const version = /cli@([^/]+)/.exec(pathname)?.[1]
+        if (!version) return new Response("not found", { status: 404 })
+        return Response.json({
+          schemaVersion: 2,
+          version,
+          acnRevision: 1,
+          tag: `@magnitudedev/cli@${version}`,
+          sourceCommit: "a".repeat(40),
+          artifacts: [{
+            id: `cli-${currentHost()}`,
+            kind: "cli",
+            host: currentHost(),
+            filename: "magnitude-cli.tar.gz",
+            bytes: 1,
+            sha256: "b".repeat(64),
+          }],
+        })
+      },
+    })
+
+    const updaterOn = async (currentVersion: string) => {
+      const dataDir = await mkdtemp(join(tmpdir(), "magnitude-updater-channel-"))
+      roots.push(dataDir)
+      return Effect.runPromise(
+        makeCliUpdater({
+          currentVersion,
+          dataDir,
+          environment: { MAGNITUDE_MANAGED_BY: "npm" },
+          npmPackageUrl: `${server.url}registry`,
+          releaseBaseUrl: server.url.toString(),
+        }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])),
+      )
+    }
+
+    const scope = await Effect.runPromise(Scope.make())
+    try {
+      // Stable clients follow only stable releases.
+      const stable = await updaterOn("0.9.0")
+      const stableDiscovery = await runScoped(scope, stable.discover)
+      expect(Option.getOrNull(await Effect.runPromise(stableDiscovery.fresh)))
+        .toBe("1.0.0")
+
+      // Beta clients follow stable and beta, never alpha.
+      const beta = await updaterOn("1.0.0-beta.1")
+      const betaDiscovery = await runScoped(scope, beta.discover)
+      expect(Option.getOrNull(await Effect.runPromise(betaDiscovery.fresh)))
+        .toBe("1.1.0-beta.2")
+
+      // Alpha clients follow everything; the highest admissible version wins.
+      const alpha = await updaterOn("1.0.0-alpha.5")
+      const alphaDiscovery = await runScoped(scope, alpha.discover)
+      expect(Option.getOrNull(await Effect.runPromise(alphaDiscovery.fresh)))
+        .toBe("1.2.0-alpha.1")
+
+      // Dismissal is a floor: declining the best offer suppresses everything
+      // at or below it — never an older fallback offer.
+      await Effect.runPromise(alpha.dismissVersion("1.2.0-alpha.1"))
+      const afterDismissal = await runScoped(scope, alpha.discover)
+      expect(Option.isNone(afterDismissal.known)).toBe(true)
+      expect(Option.isNone(await Effect.runPromise(afterDismissal.fresh))).toBe(true)
+
+      // The explicit update target ignores dismissals.
+      expect(Option.getOrNull(await Effect.runPromise(alpha.updateTarget)))
+        .toBe("1.2.0-alpha.1")
     } finally {
       await Effect.runPromise(Scope.close(scope, Exit.void))
       server.stop(true)
@@ -179,7 +256,7 @@ describe("CLI updater", () => {
       expect(Option.isNone(await Effect.runPromise(discovery.fresh))).toBe(true)
       expect(releaseRequests).toBe(1)
 
-      // The failed readiness check never wrote a cache entry.
+      // The failed readiness check left no candidate in the cache.
       const next = await runScoped(scope, updater.discover)
       expect(Option.isNone(next.known)).toBe(true)
     } finally {

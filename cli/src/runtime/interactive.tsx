@@ -18,7 +18,11 @@ import {
   pushNotificationAtom,
   stopDisplayViewController,
 } from "@magnitudedev/client-common"
-import type { UpdateAction } from "@magnitudedev/release"
+import {
+  updateActionFor,
+  type PackageManager,
+  type UpdateAction,
+} from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
 import { acnInstallationPresent, SDK_ACN_TARGET } from "@magnitudedev/sdk"
 import {
@@ -270,12 +274,12 @@ const runInteractiveSession = (
   })
 
   // Update interaction happens only on plain interactive launches with a
-  // known package-manager action; discovery itself still runs and caches.
-  const promptAction: Option.Option<UpdateAction> =
+  // known owning package manager; discovery itself still runs and caches.
+  const updateMethod: Option.Option<PackageManager> =
     (options.initialPrompt?.length ?? 0) === 0
     && process.stdin.isTTY === true
     && process.stdout.isTTY === true
-      ? updater.updateAction
+      ? updater.packageManager
       : Option.none()
   const discovery = yield* updater.discover.pipe(Effect.provide(effectLoggingLayer))
   let freshPending = true
@@ -307,14 +311,12 @@ const runInteractiveSession = (
       return { _tag: "Declined" } as const
     })
 
-  if (Option.isSome(promptAction) && Option.isSome(discovery.known)) {
-    const resolution = yield* presentUpdatePrompt(
-      discovery.known.value,
-      promptAction.value,
-    )
+  if (Option.isSome(updateMethod) && Option.isSome(discovery.known)) {
+    const action = updateActionFor(updateMethod.value, discovery.known.value)
+    const resolution = yield* presentUpdatePrompt(discovery.known.value, action)
     if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
     if (resolution._tag === "Update") {
-      return { _tag: "UpdateRequested", action: promptAction.value }
+      return { _tag: "UpdateRequested", action }
     }
   }
 
@@ -322,17 +324,18 @@ const runInteractiveSession = (
   // to download one, so it awaits the version check first — an offer must
   // prompt before any download of the version it would replace. Installation
   // needs the network regardless, so the wait costs nothing real.
-  if (Option.isSome(promptAction)
+  if (Option.isSome(updateMethod)
     && !(yield* acnInstallationPresent(SDK_ACN_TARGET.identity))) {
     const answer = yield* raceExit(discovery.fresh, processExit.await)
     if (answer._tag === "Exit") return preApplicationExit(answer.request)
     freshPending = false
     const offer = offerable(answer.value)
     if (Option.isSome(offer)) {
-      const resolution = yield* presentUpdatePrompt(offer.value, promptAction.value)
+      const action = updateActionFor(updateMethod.value, offer.value)
+      const resolution = yield* presentUpdatePrompt(offer.value, action)
       if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
       if (resolution._tag === "Update") {
-        return { _tag: "UpdateRequested", action: promptAction.value }
+        return { _tag: "UpdateRequested", action }
       }
     }
   }
@@ -390,7 +393,7 @@ const runInteractiveSession = (
           (request): DaemonWaitOutcome => ({ _tag: "Exit", request }),
         )),
       ]
-      if (Option.isSome(promptAction) && freshPending) {
+      if (Option.isSome(updateMethod) && freshPending) {
         waiters.push(discovery.fresh.pipe(Effect.map(
           (latest): DaemonWaitOutcome => ({ _tag: "FreshAnswer", latest }),
         )))
@@ -403,11 +406,12 @@ const runInteractiveSession = (
       }
       freshPending = false
       const offer = offerable(outcome.latest)
-      if (Option.isNone(offer) || Option.isNone(promptAction)) continue
-      const resolution = yield* presentUpdatePrompt(offer.value, promptAction.value)
+      if (Option.isNone(offer) || Option.isNone(updateMethod)) continue
+      const action = updateActionFor(updateMethod.value, offer.value)
+      const resolution = yield* presentUpdatePrompt(offer.value, action)
       if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
       if (resolution._tag === "Update") {
-        return { _tag: "UpdateRequested", action: promptAction.value }
+        return { _tag: "UpdateRequested", action }
       }
       yield* present({
         _tag: "DaemonStartup",
@@ -445,7 +449,7 @@ const runInteractiveSession = (
 
   // A discovery answer arriving after the app committed surfaces as one
   // notification line; the prompt would interrupt real work now.
-  if (Option.isSome(promptAction) && freshPending) {
+  if (Option.isSome(updateMethod) && freshPending) {
     yield* Effect.forkScoped(discovery.fresh.pipe(
       Effect.flatMap((latest) => Option.match(offerable(latest), {
         onNone: () => Effect.void,
