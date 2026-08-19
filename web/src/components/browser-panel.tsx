@@ -285,6 +285,7 @@ export function BrowserPanel({
         surface="browser"
         filesEnabled={filesEnabled}
         browserEnabled
+        collapseTooltipDisabled={entering}
         onSurfaceChange={(next) => {
           if (next === "browser") return
           setEntering(false)

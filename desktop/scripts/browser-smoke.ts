@@ -162,6 +162,12 @@ async function waitForPage(
 async function openBrowser(page: Page): Promise<void> {
   const expandButtons = page.getByRole("button", { name: "Expand sidebar" })
   await expandButtons.last().click()
+  await page.waitForTimeout(200)
+  assert.equal(
+    await page.getByRole("tooltip").filter({ hasText: "Collapse sidebar" }).count(),
+    0,
+    "the moving panel-header action must not flash a tooltip during expansion",
+  )
   await page.getByRole("button", { name: "Browser", exact: true }).click()
   await page.getByRole("textbox", { name: "Address and search" }).waitFor()
 }
