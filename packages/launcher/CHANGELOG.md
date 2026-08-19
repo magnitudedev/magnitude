@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.7-alpha.0
+
+### Patch Changes
+
+- [`413fbdf`](https://github.com/magnitudedev/magnitude/commit/413fbdfd1f73dfec53fe87e89626a3e6034faef3) Thanks [@anerli](https://github.com/anerli)! - auto-update system
+
 ## 0.0.6
 
 ### Patch Changes
