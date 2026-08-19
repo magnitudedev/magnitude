@@ -8,9 +8,12 @@ export const ImageMediaType = Schema.Literal(
 )
 export type ImageMediaType = Schema.Schema.Type<typeof ImageMediaType>
 
+export const MAX_IMAGE_FILE_UPLOAD_BYTES = 10 * 1024 * 1024
+const MAX_IMAGE_FILE_UPLOAD_BASE64_LENGTH = Math.ceil(MAX_IMAGE_FILE_UPLOAD_BYTES / 3) * 4
+
 export const RawClipboardImageAttachment = Schema.Struct({
   type: Schema.Literal("raw_image_clipboard"),
-  data: Schema.String,
+  data: Schema.String.pipe(Schema.maxLength(MAX_IMAGE_FILE_UPLOAD_BASE64_LENGTH)),
   mediaType: ImageMediaType,
   width: Schema.Number,
   height: Schema.Number,
@@ -19,7 +22,7 @@ export type RawClipboardImageAttachment = Schema.Schema.Type<typeof RawClipboard
 
 export const RawFileImageAttachment = Schema.Struct({
   type: Schema.Literal("raw_image_file"),
-  data: Schema.String,
+  data: Schema.String.pipe(Schema.maxLength(MAX_IMAGE_FILE_UPLOAD_BASE64_LENGTH)),
   filename: Schema.String,
   mediaType: ImageMediaType,
   width: Schema.Number,
@@ -32,6 +35,30 @@ export const RawImageAttachment = Schema.Union(
   RawFileImageAttachment,
 )
 export type RawImageAttachment = Schema.Schema.Type<typeof RawImageAttachment>
+
+export const MAX_TEXT_FILE_UPLOAD_BYTES = 500 * 1024
+export const MAX_MESSAGE_UPLOAD_COUNT = 20
+export const MAX_MESSAGE_UPLOAD_BYTES = 25 * 1024 * 1024
+
+export const RawTextFileUpload = Schema.Struct({
+  type: Schema.Literal("raw_text_file"),
+  data: Schema.String.pipe(
+    Schema.maxLength(Math.ceil(MAX_TEXT_FILE_UPLOAD_BYTES / 3) * 4),
+  ),
+  filename: Schema.String,
+})
+export type RawTextFileUpload = Schema.Schema.Type<typeof RawTextFileUpload>
+
+export const RawMessageUpload = Schema.Union(
+  RawImageAttachment,
+  RawTextFileUpload,
+)
+export type RawMessageUpload = Schema.Schema.Type<typeof RawMessageUpload>
+
+export const RawMessageUploads = Schema.Array(RawMessageUpload).pipe(
+  Schema.maxItems(MAX_MESSAGE_UPLOAD_COUNT),
+)
+export type RawMessageUploads = Schema.Schema.Type<typeof RawMessageUploads>
 
 export const MentionFileAttachment = Schema.Struct({
   type: Schema.Literal("mention_file"),

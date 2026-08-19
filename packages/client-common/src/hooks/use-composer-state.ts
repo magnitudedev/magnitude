@@ -27,6 +27,7 @@ import {
   pendingUserSubmitAtom,
   composerTextAtom,
   composerAttachmentsAtom,
+  composerUploadsAtom,
   composerHistoryIndexAtom,
   messageHistoryAtom,
   sessionCreateOptionsAtom,
@@ -37,9 +38,12 @@ import {
   useDisplaySpeculator,
 } from "../sync/index"
 import type {
-  RawImageAttachment,
+  DisplayAttachment,
+  RawMessageUpload,
   RawMentionOccurrence,
 } from "@magnitudedev/sdk"
+import { canonicalExtensionForImageMediaType } from "@magnitudedev/sdk"
+import { isRpcOutcomeUnknown } from "@magnitudedev/sdk"
 import { createId } from "@magnitudedev/generate-id"
 import { formatReasoningEffort } from "../utils/model-properties"
 import { isDisplayRootStatusActive } from "../utils/actor-status"
@@ -61,7 +65,7 @@ export interface UseComposerStateResult {
   handleSend: (
     text: string,
     input?: {
-      readonly imageAttachments?: readonly RawImageAttachment[]
+      readonly uploads?: readonly RawMessageUpload[]
       readonly mentions?: readonly RawMentionOccurrence[]
     },
     opts?: { visibleMessage?: string; taskMode?: boolean },
@@ -99,6 +103,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
   const setComposerText = useAtomSet(composerTextAtom)
   const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
+  const composerMentionSegments = useAtomValue(composerAttachmentsAtom)
+  const setComposerUploads = useAtomSet(composerUploadsAtom)
   const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
   const activationPromiseRef = useRef<Promise<string> | null>(null)
   const activatedSessionIdRef = useRef<string | null>(null)
@@ -154,12 +160,12 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const handleSend = useCallback((
     text: string,
     input?: {
-      readonly imageAttachments?: readonly RawImageAttachment[]
+      readonly uploads?: readonly RawMessageUpload[]
       readonly mentions?: readonly RawMentionOccurrence[]
     },
     opts?: { visibleMessage?: string; taskMode?: boolean },
   ): void => {
-    const imageAttachments = input?.imageAttachments ?? []
+    const uploads = input?.uploads ?? []
     const mentions = input?.mentions ?? []
     const taskMode = opts?.taskMode ?? false
     const visibleMessage = opts?.visibleMessage !== undefined ? Option.some(opts.visibleMessage) : Option.none<string>()
@@ -183,17 +189,51 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       activeSessionId,
       draftSessionId: `draft:${draftOwnerId}`,
       cwd: selectedCwd ?? "",
+      attachments: uploads.map((upload): DisplayAttachment => {
+        if (upload.type === "raw_text_file") {
+          return { type: "mention_file", path: upload.filename }
+        }
+        const filename = upload.type === "raw_image_file"
+          ? upload.filename
+          : `clipboard-image.${canonicalExtensionForImageMediaType(upload.mediaType)}`
+        return {
+          type: "image",
+          path: filename,
+          filename,
+          mediaType: upload.mediaType,
+          width: upload.width,
+          height: upload.height,
+        }
+      }),
     })
 
-    const rollback = (err: unknown): void => {
+    const reject = (err: unknown): void => {
       const errMsg = err instanceof Error ? err.message : String(err)
       optimistic.remove()
       setPendingUserSubmit(false)
       activationPromiseRef.current = null
-      setComposerText(opts?.visibleMessage ?? text)
-      setComposerAttachments([])
+      let restoredText = false
+      setComposerText(current => {
+        if (current.length > 0) return current
+        restoredText = true
+        return opts?.visibleMessage ?? text
+      })
+      if (restoredText) setComposerAttachments([...composerMentionSegments])
+      setComposerUploads(current => [...uploads, ...current])
       setComposerHistoryIndex(-1)
       commandContext.showSystemMessage(`Message failed to send: ${errMsg}`)
+    }
+
+    const handleFailure = (err: unknown): void => {
+      if (isRpcOutcomeUnknown(err)) {
+        setPendingUserSubmit(false)
+        activationPromiseRef.current = null
+        commandContext.showSystemMessage(
+          "The connection was lost after sending. Magnitude will keep this message visible while it reconciles with the daemon.",
+        )
+        return
+      }
+      reject(err)
     }
 
     const deliver = async (): Promise<void> => {
@@ -204,7 +244,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
             messageId: Option.some(messageId),
             content: text,
             taskMode,
-            imageAttachments,
+            uploads,
             mentions,
             visibleMessage,
           },
@@ -224,7 +264,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
             messageId: Option.some(messageId),
             content: text,
             taskMode,
-            imageAttachments,
+            uploads,
             mentions,
             visibleMessage,
           },
@@ -245,7 +285,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
             content: text,
             visibleMessage,
             taskMode,
-            imageAttachments,
+            uploads,
             mentions,
           }),
           options: sessionCreateOptions,
@@ -277,8 +317,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       setPendingUserSubmit(false)
     }
 
-    void deliver().catch(rollback)
-  }, [selectedSessionId, selectedCwd, selectedProjectId, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, setComposerAttachments, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
+    void deliver().catch(handleFailure)
+  }, [selectedSessionId, selectedCwd, selectedProjectId, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, composerMentionSegments, setComposerAttachments, setComposerUploads, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
 
   const handleInterrupt = useCallback(() => {
     if (!selectedSessionId) return

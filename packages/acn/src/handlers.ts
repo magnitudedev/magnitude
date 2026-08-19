@@ -380,7 +380,7 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
               messageId: Option.getOrUndefined(payload.messageId),
               content: payload.content,
               taskMode: payload.taskMode,
-              imageAttachments: payload.imageAttachments,
+              uploads: payload.uploads,
               mentions: payload.mentions,
             })
             .pipe(Effect.as({}))

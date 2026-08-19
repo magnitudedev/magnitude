@@ -2,6 +2,7 @@ import { type SessionError, SessionOperationFailed } from "@magnitudedev/acn-pro
 import { Effect, Option } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
+import type { PlatformError } from "@effect/platform/Error"
 import { createId } from "@magnitudedev/generate-id"
 
 // ---------------------------------------------------------------------------
@@ -20,31 +21,20 @@ function sanitizeFilename(name: string): string {
   return base.length > 0 ? base : createId().slice(0, 8)
 }
 
-/** Resolve a non-colliding filename within the attachments directory. */
-function resolveUniqueFilename(
-  attachmentsDir: string,
-  filename: string,
-  exists: (p: string) => Effect.Effect<boolean>,
-): Effect.Effect<string, never, FileSystem.FileSystem | Path.Path> {
-  return Effect.gen(function* () {
-    const path = yield* Path.Path
-    const fullPath = path.join(attachmentsDir, filename)
-    const fileExists = yield* exists(fullPath)
-    if (!fileExists) return filename
+function filenameCandidate(filename: string, index: number): string {
+  if (index === 0) return filename
+  return filenameWithSuffix(filename, String(index))
+}
 
-    const dotIndex = filename.lastIndexOf(".")
-    const stem = dotIndex > 0 ? filename.slice(0, dotIndex) : filename
-    const ext = dotIndex > 0 ? filename.slice(dotIndex) : ""
+function filenameWithSuffix(filename: string, suffix: string): string {
+  const dotIndex = filename.lastIndexOf(".")
+  const stem = dotIndex > 0 ? filename.slice(0, dotIndex) : filename
+  const ext = dotIndex > 0 ? filename.slice(dotIndex) : ""
+  return `${stem}-${suffix}${ext}`
+}
 
-    for (let i = 1; i < 1000; i++) {
-      const candidate = `${stem}-${i}${ext}`
-      const candidatePath = path.join(attachmentsDir, candidate)
-      const candidateExists = yield* exists(candidatePath)
-      if (!candidateExists) return candidate
-    }
-    // Extremely unlikely fallback
-    return `${stem}-${createId().slice(0, 8)}${ext}`
-  })
+function isAlreadyExists(error: PlatformError): boolean {
+  return error._tag === "SystemError" && error.reason === "AlreadyExists"
 }
 
 /**
@@ -63,19 +53,37 @@ export const uploadAttachment = (
     const attachmentsDir = path.join(scratchpadPath, ATTACHMENTS_SUBDIR)
     yield* fs.makeDirectory(attachmentsDir, { recursive: true })
 
-    const exists = (p: string) =>
-      fs.exists(p).pipe(Effect.catchAll(() => Effect.succeed(false)))
-
-    const resolvedFilename = yield* Option.match(filename, {
-      onNone: () => Effect.succeed(createId().slice(0, 12)),
-      onSome: (name) => resolveUniqueFilename(attachmentsDir, sanitizeFilename(name), exists),
+    const bytes = Buffer.from(data, "base64")
+    const preferredFilename = Option.match(filename, {
+      onNone: () => createId().slice(0, 12),
+      onSome: sanitizeFilename,
     })
 
-    const fullPath = path.join(attachmentsDir, resolvedFilename)
-    const bytes = Buffer.from(data, "base64")
-    yield* fs.writeFile(fullPath, bytes)
+    for (let index = 0; index < 1000; index++) {
+      const candidate = filenameCandidate(preferredFilename, index)
+      const fullPath = path.join(attachmentsDir, candidate)
+      const result = yield* Effect.either(Effect.scoped(
+        fs.open(fullPath, { flag: "wx" }).pipe(
+          Effect.flatMap(file => file.writeAll(bytes).pipe(Effect.zipRight(file.sync))),
+        ),
+      ))
+      if (result._tag === "Right") {
+        return { path: attachmentLogicalPath(candidate), filename: candidate }
+      }
+      if (!isAlreadyExists(result.left)) {
+        yield* fs.remove(fullPath, { force: true }).pipe(Effect.ignore)
+        return yield* result.left
+      }
+    }
 
-    return { path: attachmentLogicalPath(resolvedFilename), filename: resolvedFilename }
+    const fallback = filenameWithSuffix(preferredFilename, createId().slice(0, 12))
+    const fullPath = path.join(attachmentsDir, fallback)
+    yield* Effect.scoped(
+      fs.open(fullPath, { flag: "wx" }).pipe(
+        Effect.flatMap(file => file.writeAll(bytes).pipe(Effect.zipRight(file.sync))),
+      ),
+    ).pipe(Effect.onError(() => fs.remove(fullPath, { force: true }).pipe(Effect.ignore)))
+    return { path: attachmentLogicalPath(fallback), filename: fallback }
   }).pipe(
     Effect.mapError(() =>
       new SessionOperationFailed({ operation: "UploadAttachment", reason: "Failed to write attachment file" })

@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { spawn, type ChildProcess } from "node:child_process"
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, copyFile, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import type { AddressInfo } from "node:net"
 import { createRequire } from "node:module"
@@ -72,6 +72,63 @@ function html(title: string, body: string): string {
 await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve))
 const fixtureUrl = `http://127.0.0.1:${(fixture.address() as AddressInfo).port}`
 const tempRoot = await mkdtemp(join(tmpdir(), "magnitude-browser-smoke-"))
+const attachmentRoot = join(tempRoot, "composer-attachments")
+await mkdir(attachmentRoot, { recursive: true })
+const attachmentPaths = {
+  markdown: join(attachmentRoot, "notes.md"),
+  typescript: join(attachmentRoot, "answer.ts"),
+  json: join(attachmentRoot, "config.json"),
+  svg: join(attachmentRoot, "icon.svg"),
+  image: join(attachmentRoot, "pixel.png"),
+  binary: join(attachmentRoot, "binary.bin"),
+  oversized: join(attachmentRoot, "oversized.txt"),
+}
+await Promise.all([
+  writeFile(attachmentPaths.markdown, "# Notes\n\nComposer attachment QA.\n"),
+  writeFile(attachmentPaths.typescript, "export const answer = 42\n"),
+  writeFile(attachmentPaths.json, '{"attachment":true}\n'),
+  writeFile(attachmentPaths.svg, '<svg xmlns="http://www.w3.org/2000/svg"><circle cx="4" cy="4" r="3" /></svg>\n'),
+  writeFile(
+    attachmentPaths.image,
+    Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+  ),
+  writeFile(attachmentPaths.binary, Buffer.from([0x61, 0x00, 0x62])),
+  writeFile(attachmentPaths.oversized, Buffer.alloc(500 * 1024 + 1, 0x61)),
+])
+
+const composerSendQa = process.env["MAGNITUDE_COMPOSER_SEND_QA"] === "1"
+const qaDataDir = join(tempRoot, "magnitude-data")
+if (composerSendQa) {
+  const sourceDataDir = join(process.env["HOME"] ?? "", ".magnitude")
+  await mkdir(join(qaDataDir, "state"), { recursive: true })
+  await Promise.all([
+    copyFile(join(sourceDataDir, "state", "models.json"), join(qaDataDir, "state", "models.json")),
+    copyFile(join(sourceDataDir, "state", "onboarding.json"), join(qaDataDir, "state", "onboarding.json")),
+    copyFile(join(sourceDataDir, "config.json"), join(qaDataDir, "config.json")),
+    cp(join(sourceDataDir, "model-catalog"), join(qaDataDir, "model-catalog"), { recursive: true }),
+    cp(join(sourceDataDir, "local-inference"), join(qaDataDir, "local-inference"), { recursive: true }),
+    cp(join(sourceDataDir, "llamacpp"), join(qaDataDir, "llamacpp"), { recursive: true }),
+  ])
+  await mkdir(join(qaDataDir, "models"), { recursive: true })
+  await Promise.all([
+    copyFile(
+      join(sourceDataDir, "models", "catalog-affiliations.json"),
+      join(qaDataDir, "models", "catalog-affiliations.json"),
+    ),
+    symlink(join(sourceDataDir, "models", "hub"), join(qaDataDir, "models", "hub"), "dir"),
+  ])
+  const now = Date.now()
+  await writeFile(join(qaDataDir, "state", "projects.json"), JSON.stringify({
+    projects: [{
+      projectId: "attachment-qa-project",
+      name: "composer-attachments",
+      sourceDirectory: attachmentRoot,
+      registrationState: "active",
+      createdAt: now,
+      updatedAt: now,
+    }],
+  }))
+}
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const require = createRequire(import.meta.url)
 const electronExecutable = require("electron") as string
@@ -190,6 +247,7 @@ try {
       env: {
         ...process.env,
         ELECTRON_ENABLE_SECURITY_WARNINGS: "true",
+        ...(composerSendQa ? { MAGNITUDE_DEV_DATA_DIR: qaDataDir } : {}),
       },
       stdio: "inherit",
     },
@@ -218,6 +276,106 @@ try {
   await page.waitForTimeout(3_000)
   console.log(`Initial renderer state: ${(await page.locator("body").innerText()).slice(0, 500)}`)
   await page.getByText("What would you like to do", { exact: false }).waitFor({ timeout: 60_000 })
+
+  // Composer attachment ingestion runs in the real Electron renderer. Exercise
+  // the native chooser bridge plus browser drag/drop and paste entry points
+  // before opening the native embedded-browser panel.
+  const attachButton = page.getByRole("button", { name: "Attach files" })
+  const chooserPromise = page.waitForEvent("filechooser")
+  await attachButton.click()
+  const chooser = await chooserPromise
+  assert.equal(chooser.isMultiple(), true)
+  await chooser.setFiles([
+    attachmentPaths.markdown,
+    attachmentPaths.typescript,
+    attachmentPaths.json,
+    attachmentPaths.svg,
+    attachmentPaths.image,
+  ])
+
+  const attachmentRow = page.getByLabel("Attached files")
+  await attachmentRow.waitFor()
+  for (const filename of ["notes.md", "answer.ts", "config.json", "icon.svg", "pixel.png"]) {
+    await attachmentRow.getByLabel(`Reading ${filename}`).waitFor({ state: "detached" })
+    await attachmentRow.getByText(filename).waitFor()
+  }
+  assert.equal(await attachmentRow.locator(":scope > div").count(), 5)
+  const rowBox = await attachmentRow.boundingBox()
+  assert(
+    rowBox !== null && Math.abs(rowBox.height - 72) <= 1,
+    `the attachment row must keep its fixed 72px height: ${JSON.stringify(rowBox)}`,
+  )
+  if (qaArtifacts !== undefined) {
+    await page.emulateMedia({ colorScheme: "light" })
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: join(qaArtifacts, "composer-attachments-light.png") })
+    await page.emulateMedia({ colorScheme: "dark" })
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: join(qaArtifacts, "composer-attachments-dark.png") })
+    await page.emulateMedia({ colorScheme: "light" })
+  }
+
+  await page.getByRole("button", { name: "Remove answer.ts" }).click()
+  await page.getByRole("button", { name: "Remove answer.ts" }).waitFor({ state: "detached" })
+  assert.equal(await attachmentRow.locator(":scope > div").count(), 4)
+
+  const composerSurface = page.locator(".composer > div").first()
+  await composerSurface.evaluate((element) => {
+    const transfer = new DataTransfer()
+    transfer.items.add(new File(["print('dragged')\n"], "dragged.py", { type: "text/x-python" }))
+    element.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer }))
+    element.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer }))
+    element.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }))
+  })
+  await attachmentRow.getByLabel("Reading dragged.py").waitFor({ state: "detached" })
+  await attachmentRow.getByText("dragged.py").waitFor()
+
+  await page.getByRole("textbox", { name: "Message" }).evaluate((element) => {
+    const transfer = new DataTransfer()
+    transfer.items.add(new File(["pasted=true\n"], "pasted.env", { type: "text/plain" }))
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }))
+  })
+  await attachmentRow.getByLabel("Reading pasted.env").waitFor({ state: "detached" })
+  await attachmentRow.getByText("pasted.env").waitFor()
+
+  await page.locator('input[type="file"]').setInputFiles(attachmentPaths.binary)
+  await page.getByRole("alert").getByText("binary.bin: Binary files are not supported.").waitFor()
+  await page.locator('input[type="file"]').setInputFiles(attachmentPaths.oversized)
+  await page.getByRole("alert").getByText("oversized.txt: Text and code files must be 500 KiB or smaller.").waitFor()
+
+  if (composerSendQa) {
+    for (const filename of ["config.json", "icon.svg", "pixel.png", "dragged.py", "pasted.env"]) {
+      await page.getByRole("button", { name: `Remove ${filename}` }).click()
+    }
+    assert.equal(await attachmentRow.locator(":scope > div").count(), 1)
+    await page.getByRole("button", { name: "Send message" }).click()
+    await attachmentRow.waitFor({ state: "detached" })
+    await page.getByText("notes.md", { exact: true }).waitFor()
+    if (qaArtifacts !== undefined) {
+      await page.screenshot({ path: join(qaArtifacts, "sent-attachment-only-message.png") })
+    }
+
+    const sessionsRoot = join(qaDataDir, "sessions")
+    await withTimeout("attachment message persistence", (async () => {
+      while (true) {
+        const entries = await readdir(sessionsRoot, { withFileTypes: true }).catch(() => [])
+        for (const entry of entries) {
+          if (!entry.isDirectory() || entry.name === "index") continue
+          const captured = join(sessionsRoot, entry.name, "scratchpad", "attachments", "notes.md")
+          try {
+            assert.equal(await readFile(captured, "utf8"), "# Notes\n\nComposer attachment QA.\n")
+            return
+          } catch {}
+        }
+        await sleep(50)
+      }
+    })(), 30_000)
+  }
+
+  const removeButtons = page.getByRole("button", { name: /^Remove / })
+  while (await removeButtons.count() > 0) await removeButtons.first().click()
+  await attachmentRow.waitFor({ state: "detached" })
+
   await openBrowser(page)
   if (process.env["MAGNITUDE_BROWSER_EXTERNAL_QA"] === "1") {
     await navigate(page, "magnitude browser smoke test")
@@ -431,7 +589,7 @@ try {
   await activeFixtureGuest.locator("#download").click()
   await waitForFile(downloadedFile)
   assert.equal(await readFile(downloadedFile, "utf8"), "browser download fixture")
-  await page.getByText("Downloaded").waitFor()
+  await page.getByText("Downloaded", { exact: true }).waitFor()
 
   await activeFixtureGuest.locator("#popup").click()
   await page.getByRole("tab", { name: "Fixture Next" }).last().waitFor()

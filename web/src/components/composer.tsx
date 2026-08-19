@@ -45,9 +45,13 @@ import {
   messageHistoryAtom,
   composerTextAtom,
   composerAttachmentsAtom,
+  composerUploadsAtom,
   composerHistoryIndexAtom,
 } from "@magnitudedev/client-common"
-import type { MentionAttachment, RawMentionOccurrence } from "@magnitudedev/sdk"
+import type { MentionAttachment, RawMessageUpload, RawMentionOccurrence } from "@magnitudedev/sdk"
+import { FileCodeIcon, PlusIcon, XIcon } from "@phosphor-icons/react"
+import { Spinner } from "@/components/ui/spinner"
+import { appendMessageUploads, ingestClientFiles, MESSAGE_UPLOAD_ACCEPT } from "@/lib/message-uploads"
 export interface ComposerProps {
   /** Current role label (e.g. "Leader") */
   role?: string
@@ -56,7 +60,13 @@ export interface ComposerProps {
   /** Bash mode active */
   bashMode?: boolean
   /** Send a message */
-  onSend: (text: string, mentions?: RawMentionOccurrence[]) => void
+  onSend: (
+    text: string,
+    mentions?: RawMentionOccurrence[],
+    uploads?: RawMessageUpload[],
+  ) => void
+  /** Surface file-ingestion failures. */
+  onAttachmentError?: (message: string) => void
   /** Interrupt the current turn */
   onInterrupt?: () => void
   /** Run a bash command (bash mode) */
@@ -80,11 +90,18 @@ export interface ComposerProps {
   /** Runtime controls displayed inside the composer's lower edge. */
   footer?: ReactNode
 }
+
+interface PendingClientFile {
+  readonly id: string
+  readonly filename: string
+  readonly image: boolean
+}
 export function Composer({
   role = "Leader",
   isStreaming = false,
   bashMode = false,
   onSend,
+  onAttachmentError,
   onInterrupt,
   onRunBash,
   onSlashCommand,
@@ -101,16 +118,24 @@ export function Composer({
   const setText = useAtomSet(composerTextAtom)
   const attachments = useAtomValue(composerAttachmentsAtom)
   const setAttachments = useAtomSet(composerAttachmentsAtom)
+  const uploads = useAtomValue(composerUploadsAtom)
+  const setUploads = useAtomSet(composerUploadsAtom)
   const historyIndex = useAtomValue(composerHistoryIndexAtom)
   const setHistoryIndex = useAtomSet(composerHistoryIndexAtom)
   const [savedDraft, setSavedDraft] = useState<{
     text: string
     mentions: InputMentionSegment[]
+    uploads: RawMessageUpload[]
   }>({
     text: "",
     mentions: [],
+    uploads: [],
   })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const ingestControllersRef = useRef(new Set<AbortController>())
+  const [pendingFiles, setPendingFiles] = useState<readonly PendingClientFile[]>([])
+  const [dragActive, setDragActive] = useState(false)
   // Track what the user last typed so we can distinguish external restore
   // (queued input / rollback) from normal user input.
   const lastUserTextRef = useRef("")
@@ -137,6 +162,12 @@ export function Composer({
   )
   useAtomMount(restoreFocusAtom)
 
+  const ingestLifetimeAtom = useMemo(() => Atom.make(Effect.addFinalizer(() => Effect.sync(() => {
+      for (const controller of ingestControllersRef.current) controller.abort()
+      ingestControllersRef.current.clear()
+    }))), [])
+  useAtomMount(ingestLifetimeAtom)
+
   // Message history navigation (spec §14.4: ↑/↓ in composer)
   const messageHistory = useAtomValue(messageHistoryAtom)
   const setMessageHistory = useAtomSet(messageHistoryAtom)
@@ -147,10 +178,12 @@ export function Composer({
     if (outcome._tag === "Handled") {
       setText("")
       setAttachments([])
+      setUploads([])
       setHistoryIndex(-1)
       setSavedDraft({
         text: "",
         mentions: [],
+        uploads: [],
       })
       setCursorPosition(0)
       lastUserTextRef.current = ""
@@ -207,12 +240,13 @@ export function Composer({
   )
   const handleSubmit = useCallback(async () => {
     const trimmed = text.trim()
-    if (!trimmed && attachments.length === 0) return
+    if (!trimmed && attachments.length === 0 && uploads.length === 0) return
     if (bashMode && onRunBash) {
       const didRun = await onRunBash(trimmed)
       if (!didRun) return
       setText("")
       setAttachments([])
+      setUploads([])
       lastUserTextRef.current = ""
       return
     }
@@ -224,7 +258,8 @@ export function Composer({
       text,
       attachments.length > 0
         ? attachments.map(mentionOccurrenceFromInputSegment)
-        : undefined
+        : undefined,
+      uploads.length > 0 ? [...uploads] : undefined,
     )
     // Push to message history (most recent first, dedup consecutive)
     setMessageHistory((prev: string[]) =>
@@ -235,15 +270,18 @@ export function Composer({
     setSavedDraft({
       text: "",
       mentions: [],
+      uploads: [],
     })
     setText("")
     setAttachments([])
+    setUploads([])
     // Keep lastUserTextRef in sync so the restore-focus Effect doesn't
     // re-focus after submit clears text.
     lastUserTextRef.current = ""
   }, [
     text,
     attachments,
+    uploads,
     bashMode,
     onRunBash,
     disabledReason,
@@ -253,8 +291,10 @@ export function Composer({
     setHistoryIndex,
     setText,
     setAttachments,
+    setUploads,
   ])
-  const canSend = text.trim().length > 0 || attachments.length > 0
+  const hasSendContent = text.trim().length > 0 || attachments.length > 0 || uploads.length > 0
+  const canSend = pendingFiles.length === 0 && hasSendContent
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       // Update cursor position
@@ -290,8 +330,10 @@ export function Composer({
             setSavedDraft({
               text,
               mentions: attachments,
+              uploads: [...uploads],
             })
             setAttachments([])
+            setUploads([])
             setHistoryIndex(0)
             const entry = messageHistory[0]
             if (entry !== undefined) {
@@ -353,9 +395,11 @@ export function Composer({
               setSavedDraft({
                 text: "",
                 mentions: [],
+                uploads: [],
               })
               setText(savedDraft.text)
               setAttachments(savedDraft.mentions)
+              setUploads(savedDraft.uploads)
               lastUserTextRef.current = savedDraft.text
               requestAnimationFrame(() => {
                 const ta = textareaRef.current
@@ -408,6 +452,8 @@ export function Composer({
       setAttachments,
       setHistoryIndex,
       setSavedDraft,
+      uploads,
+      setUploads,
     ]
   )
   const handleTextareaChange = useCallback(
@@ -484,14 +530,76 @@ export function Composer({
     [attachments, text, cursorPosition, setText, setAttachments]
   )
 
+  const addClientFiles = useCallback((files: readonly File[]) => {
+    if (bashMode || files.length === 0) return
+    const pending: PendingClientFile[] = files.map(file => ({
+      id: crypto.randomUUID(),
+      filename: file.name,
+      image: file.type.startsWith("image/"),
+    }))
+    const pendingIds = new Set<string>(pending.map(item => item.id))
+    setPendingFiles(current => [...current, ...pending])
+
+    const controller = new AbortController()
+    ingestControllersRef.current.add(controller)
+    void Effect.runPromise(ingestClientFiles(files), { signal: controller.signal }).then(results => {
+      const accepted = results.flatMap(result => result._tag === "accepted" ? [result.value] : [])
+      let capacityRejections: readonly { readonly filename: string; readonly reason: string }[] = []
+      if (accepted.length > 0) {
+        setUploads(current => {
+          const appended = appendMessageUploads(current, accepted)
+          capacityRejections = appended.rejected
+          return appended.uploads
+        })
+      }
+      for (const result of results) {
+        if (result._tag === "rejected") {
+          onAttachmentError?.(`${result.error.filename}: ${result.error.reason}`)
+        }
+      }
+      for (const rejection of capacityRejections) {
+        onAttachmentError?.(`${rejection.filename}: ${rejection.reason}`)
+      }
+    }).catch(() => {
+      if (!controller.signal.aborted) onAttachmentError?.("The selected files could not be read.")
+    }).finally(() => {
+      ingestControllersRef.current.delete(controller)
+      if (controller.signal.aborted) return
+      setPendingFiles(current => current.filter(item => !pendingIds.has(item.id)))
+      requestAnimationFrame(() => textareaRef.current?.focus())
+    })
+  }, [bashMode, onAttachmentError, setUploads])
+
+  const removeUpload = useCallback((index: number) => {
+    setUploads(current => current.filter((_, candidate) => candidate !== index))
+  }, [setUploads])
+
+  const handleDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    setDragActive(false)
+    if (bashMode) return
+    addClientFiles(Array.from(event.dataTransfer.files))
+  }, [addClientFiles, bashMode])
+
+  const handlePasteFiles = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData.files)
+    if (files.length === 0 || bashMode) return
+    event.preventDefault()
+    addClientFiles(files)
+  }, [addClientFiles, bashMode])
+
   // Placeholder text
   const placeholder = bashMode
     ? "Run a command..."
     : isStreaming
     ? "Type to queue a message..."
     : "Describe a task or ask a question"
-  const submitTooltip = !canSend && isStreaming ? "Interrupt" : disabledReason ?? "Send"
-  const submitDisabled = !isStreaming && !canSend && !disabledReason
+  const submitTooltip = pendingFiles.length > 0
+    ? "Reading attachments…"
+    : !canSend && isStreaming
+    ? "Interrupt"
+    : disabledReason ?? "Send"
+  const submitDisabled = pendingFiles.length > 0 || (!isStreaming && !canSend && !disabledReason)
 
   return (
     <div
@@ -499,9 +607,22 @@ export function Composer({
       data-bash-mode={bashMode}
     >
       <div
+        onDragEnter={(event) => {
+          event.preventDefault()
+          if (!bashMode && event.dataTransfer.types.includes("Files")) setDragActive(true)
+        }}
+        onDragOver={(event) => {
+          if (!bashMode && event.dataTransfer.types.includes("Files")) event.preventDefault()
+        }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragActive(false)
+        }}
+        onDrop={handleDrop}
         className={`${
           bashMode
             ? "border-orange-700 dark:border-orange-400"
+            : dragActive
+            ? "border-blue-500 ring-2 ring-blue-500/20 dark:border-blue-400 dark:ring-blue-400/20"
             : "border-slate-300 dark:border-slate-750"
         } relative rounded-md border bg-white px-3 py-2.5 dark:bg-slate-800 max-[640px]:!p-2`}
       >
@@ -526,7 +647,23 @@ export function Composer({
           />
         )}
 
-        {/* Attachment pills */}
+        {(pendingFiles.length > 0 || uploads.length > 0) && (
+          <div
+            className="mb-2.5 flex h-[72px] gap-2 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            aria-label="Attached files"
+          >
+            {uploads.map((upload, index) => (
+              <MessageUploadCard
+                key={`${upload.type}:${upload.type === "raw_image_clipboard" ? index : upload.filename}:${index}`}
+                upload={upload}
+                onRemove={() => removeUpload(index)}
+              />
+            ))}
+            {pendingFiles.map(file => <PendingUploadCard key={file.id} file={file} />)}
+          </div>
+        )}
+
+        {/* Inline mention pills */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap [gap:4px] [margin-bottom:6px]">
             {attachments.map((att, i) => (
@@ -543,15 +680,47 @@ export function Composer({
           ref={textareaRef}
           className="composer-textarea field-sizing-fixed box-border min-h-16 max-h-60 w-full resize-none border-0 bg-transparent p-0 pr-[42px] font-sans text-[14px] leading-[1.5] text-slate-900 shadow-none focus-visible:ring-0 dark:bg-transparent dark:text-slate-200"
           value={text}
+          aria-label="Message"
           placeholder={placeholder}
           onChange={handleTextareaChange}
           onKeyDown={handleKeyDown}
           onSelect={handleTextareaSelect}
+          onPaste={handlePasteFiles}
           onClick={(e) => setCursorPosition(e.currentTarget.selectionStart)}
           rows={3}
         />
 
-        {footer}
+        <div className="pl-8">{footer}</div>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept={MESSAGE_UPLOAD_ACCEPT}
+          className="hidden"
+          tabIndex={-1}
+          onChange={(event) => {
+            addClientFiles(Array.from(event.currentTarget.files ?? []))
+            event.currentTarget.value = ""
+          }}
+        />
+        <ActionTooltip
+          label="Attach files"
+          side="top"
+          trigger={(
+            <Button
+              type="button"
+              variant="unstyled"
+              size="unstyled"
+              disabled={bashMode}
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Attach files"
+              className="absolute bottom-[10px] left-[10px] flex size-7 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-150 hover:text-slate-900 focus-visible:bg-slate-150 focus-visible:text-slate-900 disabled:cursor-default disabled:opacity-40 dark:text-slate-400 dark:hover:bg-slate-750 dark:hover:text-slate-100 dark:focus-visible:bg-slate-750 dark:focus-visible:text-slate-100"
+            >
+              <PlusIcon className="size-[18px]" weight="regular" />
+            </Button>
+          )}
+        />
 
         {/* Submit / Stop button */}
         <ActionTooltip
@@ -615,6 +784,95 @@ export function Composer({
 function resizeTextarea(ta: HTMLTextAreaElement) {
   ta.style.height = "auto"
   ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`
+}
+
+function base64ByteSize(data: string): number {
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0
+  return Math.max(0, Math.floor(data.length * 3 / 4) - padding)
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1_000) return `${bytes} B`
+  if (bytes < 1_000_000) return `${Math.max(1, Math.round(bytes / 1_000))} KB`
+  const megabytes = bytes / 1_000_000
+  return `${megabytes >= 10 ? megabytes.toFixed(0) : megabytes.toFixed(1)} MB`
+}
+
+function MessageUploadCard({
+  upload,
+  onRemove,
+}: {
+  readonly upload: RawMessageUpload
+  readonly onRemove: () => void
+}): ReactNode {
+  const filename = upload.type === "raw_image_clipboard" ? "Clipboard image" : upload.filename
+  const image = upload.type !== "raw_text_file"
+  const byteSize = base64ByteSize(upload.data)
+
+  return (
+    <div
+      className="group relative h-[72px] w-36 shrink-0 overflow-hidden rounded-md border border-slate-300 bg-transparent transition-colors hover:border-slate-400 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-500/20 dark:border-slate-700 dark:hover:border-slate-600 dark:focus-within:border-blue-400 dark:focus-within:ring-blue-400/20"
+      aria-label={`${filename}, ${formatFileSize(byteSize)}`}
+    >
+      {image ? (
+        <>
+          <img
+            src={`data:${upload.mediaType};base64,${upload.data}`}
+            alt=""
+            className="h-full w-full object-cover"
+          />
+          <div className="absolute inset-x-0 bottom-0 truncate bg-slate-925/90 px-2 py-1 pr-7 font-sans text-[11px] leading-4 text-slate-100">
+            {filename}
+          </div>
+        </>
+      ) : (
+        <div className="flex h-full min-w-0 items-center gap-2 px-2.5 pr-8">
+          <FileCodeIcon className="size-5 shrink-0 text-slate-500 dark:text-slate-400" aria-hidden="true" />
+          <div className="min-w-0 font-sans">
+            <div className="truncate text-[12px] font-medium leading-4 text-slate-900 dark:text-slate-100">
+              {filename}
+            </div>
+            <div className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+              {formatFileSize(byteSize)}
+            </div>
+          </div>
+        </div>
+      )}
+      <Button
+        type="button"
+        variant="unstyled"
+        size="unstyled"
+        onClick={onRemove}
+        aria-label={`Remove ${filename}`}
+        className="absolute right-1 top-1 flex size-5 items-center justify-center rounded-full border border-slate-300 bg-white/95 text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900 focus-visible:ring-2 focus-visible:ring-blue-500/30 dark:border-slate-600 dark:bg-slate-850/95 dark:text-slate-300 dark:hover:bg-slate-750 dark:hover:text-slate-50"
+      >
+        <XIcon className="size-3" weight="bold" />
+      </Button>
+    </div>
+  )
+}
+
+function PendingUploadCard({ file }: { readonly file: PendingClientFile }): ReactNode {
+  return (
+    <div
+      className="relative flex h-[72px] w-36 shrink-0 items-center gap-2 rounded-md border border-slate-300 bg-transparent px-2.5 dark:border-slate-700"
+      aria-label={`Reading ${file.filename}`}
+    >
+      {file.image ? (
+        <div className="flex size-8 shrink-0 items-center justify-center rounded bg-slate-100 dark:bg-slate-750">
+          <Spinner className="size-4 text-blue-600 dark:text-blue-400" />
+        </div>
+      ) : (
+        <Spinner className="size-5 shrink-0 text-blue-600 dark:text-blue-400" />
+      )}
+      <div className="min-w-0 font-sans">
+        <div className="truncate text-[12px] font-medium leading-4 text-slate-700 dark:text-slate-200">
+          {file.filename}
+        </div>
+        <div className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Reading…</div>
+      </div>
+    </div>
+  )
 }
 
 // ── Slash Command Menu ──

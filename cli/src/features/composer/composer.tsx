@@ -636,7 +636,7 @@ export function Composer(props: ComposerProps) {
       submitUserMessage({
         message: content,
         visibleMessage,
-        imageAttachments: attachments,
+        uploads: attachments,
         mentions: mentionInputs,
       })
     } catch (error) {

@@ -11,7 +11,7 @@
  */
 import { Atom } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import type { ProjectId, SessionOptions } from "@magnitudedev/sdk"
+import type { ProjectId, RawMessageUpload, SessionOptions } from "@magnitudedev/sdk"
 import type { InputMentionSegment } from "../types/store"
 
 /**
@@ -59,6 +59,12 @@ export const composerTextAtom = Atom.keepAlive(Atom.make(""))
  * Restored queued input clears attachments by resetting this atom.
  */
 export const composerAttachmentsAtom = Atom.keepAlive(Atom.make<InputMentionSegment[]>([]))
+
+/**
+ * Client-local file snapshots waiting to be submitted with the composer.
+ * The exact array is restored when message admission definitively fails.
+ */
+export const composerUploadsAtom = Atom.keepAlive(Atom.make<RawMessageUpload[]>([]))
 
 /**
  * Composer history navigation index.

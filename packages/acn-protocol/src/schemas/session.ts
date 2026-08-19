@@ -1,11 +1,14 @@
 import { Schema } from "effect"
-import { RawImageAttachment, RawMentionOccurrence } from "./attachments"
+import { RawMessageUploads, RawMentionOccurrence } from "./attachments"
 import { ProjectIdSchema } from "./project"
 export {
   RawClipboardImageAttachment,
   DisplayAttachment,
   RawFileImageAttachment,
   RawImageAttachment,
+  RawMessageUpload,
+  RawMessageUploads,
+  RawTextFileUpload,
   ImageAttachment,
   ImageMediaType,
   MentionAttachment,
@@ -21,7 +24,7 @@ export const CreateSessionInitialMessage = Schema.TaggedStruct("message", {
   content: Schema.String,
   visibleMessage: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   taskMode: Schema.Boolean,
-  imageAttachments: Schema.Array(RawImageAttachment),
+  uploads: RawMessageUploads,
   mentions: Schema.Array(RawMentionOccurrence),
 })
 export type CreateSessionInitialMessage = Schema.Schema.Type<typeof CreateSessionInitialMessage>

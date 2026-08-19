@@ -5,12 +5,13 @@ import { createId } from "@magnitudedev/generate-id"
 import type { AppEvent } from "@magnitudedev/agent"
 import { SessionStartFailed, type InterruptTarget, type SessionError } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
-import type {
-  SendUserMessageInput,
-  SessionExecutionContext,
-  UserBashCommandEvent,
+import {
+  hasUserMessageContent,
+  type SendUserMessageInput,
+  type SessionExecutionContext,
+  type UserBashCommandEvent,
 } from "./session-types"
-import { captureRawImages } from "./attachments/capture-raw-images"
+import { materializeMessageUploads } from "./attachments/materialize-message-uploads"
 import { collectMentionOccurrences } from "./file-mentions"
 
 export interface SessionCommandsApi {
@@ -51,11 +52,7 @@ export const SessionCommandsLive: Layer.Layer<
     const sendUserMessage = Effect.fn("acn.session-commands.send-user-message")(function* (
       input: SendUserMessageInput,
     ) {
-      if (
-        !input.content.trim() &&
-        input.imageAttachments.length === 0 &&
-        input.mentions.length === 0
-      ) {
+      if (!hasUserMessageContent(input)) {
         return yield* new SessionStartFailed({
           sessionId: input.sessionId,
           reason: "Message content cannot be empty",
@@ -64,42 +61,52 @@ export const SessionCommandsLive: Layer.Layer<
 
       yield* runtime.withSession(input.sessionId, "send-user-message", (entry) =>
         Effect.gen(function* () {
-          const imageParts = yield* captureRawImages({
+          const materialized = yield* materializeMessageUploads({
             scratchpadPath: entry.scratchpadPath,
-            attachments: input.imageAttachments,
+            uploads: input.uploads,
           }).pipe(
             Effect.provideService(FileSystem.FileSystem, fs),
             Effect.provideService(Path.Path, pathService),
           )
-          const mentions = yield* collectMentionOccurrences(
-            entry.cwd,
-            entry.scratchpadPath,
-            input.content,
-            input.mentions,
-          ).pipe(
-            Effect.mapError(
-              (error) =>
-                new SessionStartFailed({
-                  sessionId: input.sessionId,
-                  reason: error instanceof Error ? error.message : "Failed to collect mentions",
-                }),
-            ),
+          const admitMessage = Effect.gen(function* () {
+            const mentions = yield* collectMentionOccurrences(
+              entry.cwd,
+              entry.scratchpadPath,
+              input.content,
+              [...input.mentions, ...materialized.trailingMentions],
+            ).pipe(
+              Effect.mapError(
+                (error) =>
+                  new SessionStartFailed({
+                    sessionId: input.sessionId,
+                    reason: error instanceof Error ? error.message : "Failed to collect mentions",
+                  }),
+              ),
+            )
+            yield* entry.session.send({
+              type: "user_message",
+              messageId: input.messageId ?? createId(),
+              timestamp: Date.now(),
+              forkId: null,
+              text: input.content,
+              mentions,
+              attachments: materialized.images.map((image) => ({
+                type: "image" as const,
+                image,
+              })),
+              mode: "text",
+              synthetic: false,
+              taskMode: input.taskMode,
+            } satisfies AppEvent)
+          })
+
+          yield* admitMessage.pipe(
+            Effect.onError(() => Effect.forEach(
+              materialized.capturedAbsolutePaths,
+              capturedPath => fs.remove(capturedPath).pipe(Effect.catchAll(() => Effect.void)),
+              { discard: true },
+            )),
           )
-          yield* entry.session.send({
-            type: "user_message",
-            messageId: input.messageId ?? createId(),
-            timestamp: Date.now(),
-            forkId: null,
-            text: input.content,
-            mentions,
-            attachments: imageParts.map((image) => ({
-              type: "image" as const,
-              image,
-            })),
-            mode: "text",
-            synthetic: false,
-            taskMode: input.taskMode,
-          } satisfies AppEvent)
         }),
       )
     })

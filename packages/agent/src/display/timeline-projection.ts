@@ -479,16 +479,21 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
         content,
         timestamp: event.timestamp,
         taskMode: event.taskMode,
-        attachments: event.attachments
-          .filter((attachment): attachment is Extract<typeof attachment, { type: 'image' }> => attachment.type === 'image')
-          .map(attachment => ({
-            type: attachment.type,
-            path: attachment.image.path,
-            filename: Option.getOrElse(attachment.image.name, () => attachment.image.path.split('/').pop() ?? 'image'),
-            mediaType: attachment.image.mediaType,
-            width: attachment.image.dimensions.width,
-            height: attachment.image.dimensions.height,
-          })),
+        attachments: [
+          ...event.mentions
+            .filter(mention => mention.placement._tag === 'trailing')
+            .map(mention => mention.attachment),
+          ...event.attachments
+            .filter((attachment): attachment is Extract<typeof attachment, { type: 'image' }> => attachment.type === 'image')
+            .map(attachment => ({
+              type: attachment.type,
+              path: attachment.image.path,
+              filename: Option.getOrElse(attachment.image.name, () => attachment.image.path.split('/').pop() ?? 'image'),
+              mediaType: attachment.image.mediaType,
+              width: attachment.image.dimensions.width,
+              height: attachment.image.dimensions.height,
+            })),
+        ],
       })
     },
 

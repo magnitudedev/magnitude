@@ -85,7 +85,11 @@ const forkId = null
 const toolCallId = Schema.decodeUnknownSync(ToolCallIdSchema)('call-1')
 const providerToolCallId = Schema.decodeUnknownSync(ProviderToolCallIdSchema)('call-1')
 
-const userMessage = (messageId: string, timestamp: number, text: string): TimestampedAppEvent => ({
+const userMessage = (
+  messageId: string,
+  timestamp: number,
+  text: string,
+): Extract<TimestampedAppEvent, { readonly type: 'user_message' }> => ({
   type: 'user_message',
   messageId,
   forkId,
@@ -200,6 +204,30 @@ describe('Display — toolKey routing & no-duplicate steps', () => {
 
     const msg = listMessages(messages).find(m => m.type === 'user_message')
     expect(msg?.id).toBe('client-message-1')
+  })
+
+  it('presents trailing file mentions as user-message attachments without duplicating inline mentions', async () => {
+    const event = userMessage('message-with-files', ts(1), 'review @inline.ts')
+    const messages = await runDisplay([{
+      ...event,
+      mentions: [
+        {
+          occurrenceId: 'inline-mention',
+          attachment: { type: 'mention_file', path: 'inline.ts' },
+          placement: { _tag: 'inline', start: 7, end: 17 },
+        },
+        {
+          occurrenceId: 'uploaded-file',
+          attachment: { type: 'mention_file', path: '$M/attachments/notes.md' },
+          placement: { _tag: 'trailing' },
+        },
+      ],
+    }])
+
+    const msg = listMessages(messages).find(message => message.type === 'user_message')
+    expect(msg?.attachments).toEqual([
+      { type: 'mention_file', path: '$M/attachments/notes.md' },
+    ])
   })
 
   it('keeps the app event message id when rendering queued user messages', async () => {

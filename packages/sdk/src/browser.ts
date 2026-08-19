@@ -23,6 +23,7 @@ export type {
   AcnClientCloseResult,
   AcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
+export { isRpcOutcomeUnknown } from "./mutation-outcome"
 export {
   AcnEnsuranceFailed,
   AcnAdministrationFailed,
@@ -41,6 +42,10 @@ export {
   MagnitudeRpcs,
   StreamEvent as StreamEventSchema,
   canonicalExtensionForImageMediaType,
+  MAX_IMAGE_FILE_UPLOAD_BYTES,
+  MAX_MESSAGE_UPLOAD_BYTES,
+  MAX_MESSAGE_UPLOAD_COUNT,
+  MAX_TEXT_FILE_UPLOAD_BYTES,
   filenameWithImageExtension,
   forkIdToKey,
   imageMediaTypeFromFilename,

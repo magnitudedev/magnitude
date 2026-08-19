@@ -172,7 +172,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
                 content: messagePrompt,
                 visibleMessage: Option.some(messagePrompt),
                 taskMode: false,
-                imageAttachments: [],
+                uploads: [],
                 mentions: [],
               }
 
@@ -189,7 +189,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
                     content: messagePrompt,
                     visibleMessage: Option.some(messagePrompt),
                     taskMode: false,
-                    imageAttachments: [],
+                    uploads: [],
                     mentions: [],
                   },
                   reactivityKeys: ['sessions'],
