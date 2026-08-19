@@ -13,6 +13,7 @@ import type { ArtifactInstallationObserver } from "./installation-progress"
 import { ReleaseAcquisitionError } from "./errors"
 import {
   decodeReleaseManifest,
+  releaseTag,
   type ReleaseArtifact,
   type ReleaseManifest,
 } from "./contracts"
@@ -46,7 +47,10 @@ const failure = (
   transient = false
 ) => new ReleaseAcquisitionError({ stage, message, transient })
 
-const releaseTag = (version: string) => `@magnitudedev/cli@${version}`
+export const releaseBaseUrl = (): string => (
+  process.env.MAGNITUDE_RELEASE_BASE_URL ??
+  "https://github.com/magnitudedev/magnitude/releases/download"
+).replace(/\/+$/, "")
 
 export const releaseUrl = (
   baseUrl: string,

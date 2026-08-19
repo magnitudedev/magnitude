@@ -31,7 +31,7 @@ const acnExecutable = executable("magnitude-acn")
 const cliExecutable = executable("magnitude-cli")
 const acnSource = scriptInvocation("packages/acn/src/binary\\.ts")
 const cliSource = scriptInvocation("cli/src/index\\.tsx")
-const npmCliSource = scriptInvocation("packages/cli/bin/magnitude\\.js")
+const npmCliSource = scriptInvocation("packages/launcher/bin/magnitude\\.js")
 
 export const classifyMagnitudeProcess = (
   command: string,

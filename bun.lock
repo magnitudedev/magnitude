@@ -39,7 +39,9 @@
         "@effect/platform-bun": "^0.90.0",
         "@magnitudedev/client-common": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
+        "@magnitudedev/release": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
+        "@magnitudedev/storage": "workspace:*",
         "@magnitudedev/version": "workspace:*",
         "@opentui/core": "0.5.1",
         "@opentui/react": "0.5.1",
@@ -52,12 +54,14 @@
         "lowlight": "^3.3.0",
         "pino": "^10.3.0",
         "react": "^19.2.0",
+        "semver": "^7.7.3",
         "string-width": "^8.1.1",
       },
       "devDependencies": {
         "@magnitudedev/logger": "workspace:*",
         "@types/react": "^19.2.0",
         "@types/react-dom": "^19.2.3",
+        "@types/semver": "^7.7.1",
         "react-dom": "^19.2.4",
         "typescript": "^5.8.3",
       },
@@ -196,13 +200,6 @@
       },
       "devDependencies": {
         "@types/bun": "latest",
-      },
-    },
-    "packages/cli": {
-      "name": "@magnitudedev/cli",
-      "version": "0.0.6",
-      "bin": {
-        "magnitude": "bin/magnitude.js",
       },
     },
     "packages/client-common": {
@@ -357,6 +354,22 @@
         "tailwindcss": "^4.1.4",
         "typescript": "^5.8.3",
         "vite": "^6.3.2",
+      },
+    },
+    "packages/launcher": {
+      "name": "@magnitudedev/cli",
+      "version": "0.0.6",
+      "bin": {
+        "magnitude": "bin/magnitude.js",
+      },
+      "devDependencies": {
+        "@effect/platform": "^0.96.0",
+        "@effect/platform-node": "0.107.0",
+        "@magnitudedev/release": "workspace:*",
+        "@types/bun": "latest",
+        "@types/tar-stream": "^3.1.4",
+        "effect": "^3.21.2",
+        "tar-stream": "3.2.0",
       },
     },
     "packages/logger": {
@@ -842,7 +855,7 @@
 
     "@magnitudedev/ai": ["@magnitudedev/ai@workspace:packages/ai"],
 
-    "@magnitudedev/cli": ["@magnitudedev/cli@workspace:packages/cli"],
+    "@magnitudedev/cli": ["@magnitudedev/cli@workspace:packages/launcher"],
 
     "@magnitudedev/cli-source": ["@magnitudedev/cli-source@workspace:cli"],
 
@@ -1183,6 +1196,8 @@
     "@types/react-dom": ["@types/react-dom@19.2.4", "", { "peerDependencies": { "@types/react": "^19.2.0" } }, "sha512-Bsc+QHgp+P/F02XDzNCY9jnZNCUuLki36KT7VKrTXXLdHf+vHMNZnW1rVu5DNW/rCK+fya3DATySbLM4yhtKUw=="],
 
     "@types/responselike": ["@types/responselike@1.0.3", "", { "dependencies": { "@types/node": "*" } }, "sha512-H/+L+UkTV33uf49PH5pCAUBVPNj2nDBXTN+qS1dOwyyg24l3CcicicCA7ca+HMvJBZcFgl5r8e+RR6elsb4Lyw=="],
+
+    "@types/semver": ["@types/semver@7.8.0", "", {}, "sha512-1mAINjtQCXXeLkJ9ehXkwOcBpqtLxiVtKhpUf83DdRNdQKV0iXZpaHYqRr7nj+wvxuJzoAmAwXI+sCNMv1CzLQ=="],
 
     "@types/tar-stream": ["@types/tar-stream@3.1.4", "", { "dependencies": { "@types/node": "*" } }, "sha512-921gW0+g29mCJX0fRvqeHzBlE/XclDaAG0Ousy1LCghsOhvaKacDeRGEVzQP9IPfKn8Vysy7FEXAIxycpc/CMg=="],
 

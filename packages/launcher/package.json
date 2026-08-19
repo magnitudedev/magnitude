@@ -6,7 +6,7 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/magnitudedev/magnitude.git",
-    "directory": "packages/cli"
+    "directory": "packages/launcher"
   },
   "homepage": "https://github.com/magnitudedev/magnitude",
   "bugs": {
@@ -32,12 +32,20 @@
     "magnitude": "bin/magnitude.js"
   },
   "files": [
-    "bin/magnitude.js",
-    "lib/download.js",
-    "lib/release-runtime.cjs"
+    "bin/magnitude.js"
   ],
   "scripts": {
-    "prepack": "cp ../../README.md ./README.md && bun run scripts/prepare-release-runtime.ts"
+    "typecheck": "tsc --noEmit",
+    "prepack": "cp ../../README.md ./README.md && bun run scripts/build-launcher.ts"
+  },
+  "devDependencies": {
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-node": "0.107.0",
+    "@magnitudedev/release": "workspace:*",
+    "@types/bun": "latest",
+    "@types/tar-stream": "^3.1.4",
+    "effect": "^3.21.2",
+    "tar-stream": "3.2.0"
   },
   "publishConfig": {
     "access": "public"

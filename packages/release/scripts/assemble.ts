@@ -11,6 +11,7 @@ import {
 import { basename, resolve } from "node:path"
 import { Option, Schema } from "effect"
 import {
+  releaseTag,
   ReleaseArtifactSchema,
   ReleaseManifestSchema,
   type ReleaseArtifact,
@@ -244,7 +245,7 @@ for (const host of candidateHosts.filter((candidate) => candidate.id.startsWith(
 }
 
 const packageJson = JSON.parse(
-  await readFile(resolve(PROJECT_ROOT, "packages/cli/package.json"), "utf8"),
+  await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
 ) as { readonly version?: string }
 const version = required("MAGNITUDE_RELEASE_VERSION", packageJson.version)
 if (packageJson.version !== version) {
@@ -258,7 +259,7 @@ const manifest = Schema.decodeUnknownSync(ReleaseManifestSchema)({
   schemaVersion: 2,
   version,
   acnRevision: ACN_COORDINATION_REVISION,
-  tag: `@magnitudedev/cli@${version}`,
+  tag: releaseTag(version),
   sourceCommit,
   artifacts: artifacts
     .slice()

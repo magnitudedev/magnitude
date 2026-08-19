@@ -14,7 +14,7 @@ describe("classifyMagnitudeProcess", () => {
     ["bun run packages/acn/src/binary.ts serve --debug", "ACN"],
     ["/tmp/bin/magnitude-cli --debug", "CLI"],
     ["bun run cli/src/index.tsx --debug", "CLI"],
-    ["node packages/cli/bin/magnitude.js", "CLI"],
+    ["node packages/launcher/bin/magnitude.js", "CLI"],
   ] as const)("classifies %s as %s", (command, expected) => {
     expect(classifyMagnitudeProcess(command)).toBe(expected)
   })
