@@ -36,6 +36,14 @@ export interface SpeculativeDisplayHandle {
 export interface SpeculativeMutationOptions {
   readonly owner: string;
   readonly label?: string;
+  /**
+   * Exact authoritative postcondition for this projection.
+   *
+   * Transactions with an acknowledgement contract survive coarse accepted
+   * snapshot replacements until that contract is satisfied. Transactions
+   * without one retain write-path conflict reconciliation.
+   */
+  readonly acknowledgedBy?: (accepted: DisplayViewSnapshot) => boolean;
 }
 
 interface SpeculativeDisplayTransaction {
@@ -44,6 +52,7 @@ interface SpeculativeDisplayTransaction {
   readonly label: string | undefined;
   readonly createdAt: number;
   readonly apply: (draft: MutableDisplayViewSnapshot) => void;
+  readonly acknowledgedBy: ((accepted: DisplayViewSnapshot) => boolean) | undefined;
   lastWriteKeys: readonly WriteKey[];
 }
 
@@ -306,6 +315,9 @@ export class SpeculativeDisplayViewStore implements DisplayViewStore {
       diffDecoded(prevAccepted, next, patchMap)
     );
     if (Exit.isFailure(authoritativeOps)) {
+      this.transactions = this.transactions.filter(
+        (tx) => !tx.acknowledgedBy?.(next)
+      );
       this.accepted = next;
       this.recompute();
       return;
@@ -314,11 +326,11 @@ export class SpeculativeDisplayViewStore implements DisplayViewStore {
       authoritativeOps.value,
       prevAccepted
     );
-    if (authoritativeKeys.length > 0) {
-      this.transactions = this.transactions.filter(
-        (tx) => !hasWriteKeyConflict(tx.lastWriteKeys, authoritativeKeys)
-      );
-    }
+    this.transactions = this.transactions.filter((tx) => {
+      if (tx.acknowledgedBy?.(next)) return false;
+      if (tx.acknowledgedBy) return true;
+      return !hasWriteKeyConflict(tx.lastWriteKeys, authoritativeKeys);
+    });
     this.accepted = next;
     this.recompute();
   };
@@ -338,6 +350,7 @@ export class SpeculativeDisplayViewStore implements DisplayViewStore {
       label: options.label,
       createdAt: Date.now(),
       apply,
+      acknowledgedBy: options.acknowledgedBy,
       lastWriteKeys: [],
     };
     this.transactions = [...this.transactions, tx];

@@ -22,3 +22,7 @@ export {
 export { useDisplayView, useDisplayReader, useDisplaySpeculator } from './use-display-view'
 export { applyStreamEvent, type RestoreQueuedMessagesCallback } from './apply-stream-event'
 export { getFork, orderedMessages, lastMessage } from './get-fork'
+export {
+  presentPendingUserMessage,
+  type PendingUserMessageProjection,
+} from './pending-user-message'
