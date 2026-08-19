@@ -296,6 +296,12 @@
   }
 }
 
+@keyframes project-files-open {
+  from {
+    width: 0;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
