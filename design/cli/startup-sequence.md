@@ -56,7 +56,7 @@ magnitude (shell)
     │       Magnitude"
     │    · Starting          daemon spawn                    ~0.5–2s     text only
     │      "Starting          inference launch + backend prep ~1–5s
-    │       Magnitude..."
+    │       Magnitude"
     │    · Failed            stage message                   —           R retry / Q quit
     │    lifecycle Ready ─────────────▶ SessionConnect
     SessionConnect           client connect + onboarding     warm ~10–100ms   silent
@@ -80,7 +80,7 @@ engine download, all narrated under `DaemonStartup`.
 ## Presentation
 
 Every renderable state, phase, and subphase with its exact user copy. Titles are per substate —
-"Installing Magnitude" while installing, "Starting Magnitude..." while starting — with all
+"Installing Magnitude" while installing, "Starting Magnitude" while starting — with all
 further variation in the subtext. Internal architecture terms (ACN, ICN, JIT, daemon, platform,
 preflight) are never user copy.
 
@@ -121,7 +121,7 @@ byte-denominated:
 | `DownloadingInferenceEngine` | "Downloading inference engine" | yes, when exact |
 | `StartingMagnitude` | "Starting Magnitude" | never — time-based synthetic progress (first launch of the freshly installed inference engine; wire value only, never a state name) |
 
-### `DaemonStartup` · Starting — title "Starting Magnitude..."
+### `DaemonStartup` · Starting — title "Starting Magnitude"
 
 Text only — no bar, no spinner. Subtext is the phase label from `Starting.phase`:
 
@@ -173,4 +173,6 @@ is persisted. Corrections continue to apply live through the appearance observat
 All exit paths — signal, fatal event, in-app quit — resolve one typed exit request. The graceful
 path closes the client/platform exactly once, derives exit notices, and unwinds scope finalizers
 in LIFO order (root, listeners, appearance observation, renderer and terminal, registry). Notices
-print after terminal restoration; the process exits naturally.
+print after terminal restoration. The completed command returns one exit code to the outermost CLI
+boundary, which explicitly terminates the process. A successful compatible update returns the
+reserved relaunch code through the same boundary; no inner runtime mutates process exit state.

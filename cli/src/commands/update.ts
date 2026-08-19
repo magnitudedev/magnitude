@@ -12,9 +12,8 @@ const runExplicitUpdate = Effect.gen(function* () {
   if (isDevelopmentBuild()) {
     yield* Effect.sync(() => {
       process.stderr.write("`magnitude update` is not available in development builds.\n")
-      process.exitCode = 1
     })
-    return
+    return 1
   }
 
   const updater = yield* makeCliUpdater({
@@ -26,9 +25,8 @@ const runExplicitUpdate = Effect.gen(function* () {
       process.stderr.write(
         "Could not detect how Magnitude was installed. Update manually with `npm install -g @magnitudedev/cli`.\n",
       )
-      process.exitCode = 1
     })
-    return
+    return 1
   }
   // The explicit command resolves its target the same way the prompt does —
   // channel-selected and readiness-verified — but ignores dismissals: asking
@@ -37,17 +35,16 @@ const runExplicitUpdate = Effect.gen(function* () {
   if (Either.isLeft(checked)) {
     yield* Effect.sync(() => {
       process.stderr.write(`Could not check for updates: ${checked.left.reason}\n`)
-      process.exitCode = 1
     })
-    return
+    return 1
   }
   if (Option.isNone(checked.right)) {
     yield* Effect.sync(() => {
       process.stdout.write("Magnitude is already up to date.\n")
     })
-    return
+    return 0
   }
-  yield* executeUpdate(
+  return yield* executeUpdate(
     updater,
     updateActionFor(updater.packageManager.value, checked.right.value),
   )
@@ -57,5 +54,7 @@ export const registerUpdateCommand = (program: Command): void => {
   program
     .command("update")
     .description("Update Magnitude with the package manager that installed it")
-    .action(() => Effect.runPromise(runExplicitUpdate))
+    .action(() => Effect.runPromise(runExplicitUpdate).then(
+      (exitCode) => process.exit(exitCode),
+    ))
 }
