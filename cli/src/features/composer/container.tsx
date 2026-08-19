@@ -189,12 +189,12 @@ export function ComposerContainer({
   const submitUserMessage = useCallback((payload: {
     message: string
     visibleMessage?: string
-    imageAttachments: RawImageAttachment[]
+    uploads: RawImageAttachment[]
     mentions: RawMentionOccurrence[]
   }): void => {
     composer.handleSend(
       payload.message,
-      { imageAttachments: payload.imageAttachments, mentions: payload.mentions },
+      { uploads: payload.uploads, mentions: payload.mentions },
       { visibleMessage: payload.visibleMessage },
     )
   }, [composer.handleSend])

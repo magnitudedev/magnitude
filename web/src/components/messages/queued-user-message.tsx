@@ -15,6 +15,7 @@ export function QueuedUserMessage({
   message: QueuedUserMessageType
 }): ReactNode {
   const [hovered, setHovered] = useState(false)
+  const hasContent = message.content.trim().length > 0
   const showMetadata = hovered || message.attachments.length > 0
   return (
     <div
@@ -22,23 +23,29 @@ export function QueuedUserMessage({
       onMouseLeave={() => setHovered(false)}
       className="flex flex-col items-end"
     >
-      <div className="[max-width:min(720px,_72%)] bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-750 rounded-[8px] [padding:8px_11px] opacity-[0.7]">
-        <div className="font-sans text-[14px] text-slate-500 leading-[1.55] whitespace-pre-wrap [word-break:break-word]">
-          {message.content}
-        </div>
-      </div>
-      <div
-        className={`${
-          showMetadata ? "opacity-[1]" : "opacity-[0]"
-        }  flex items-center justify-between [gap:12px] [width:min(720px,_72%)] [min-height:22px] [margin-top:3px] [padding:0_2px] [transition:opacity_100ms_ease]`}
-      >
-        <div className="flex items-center [gap:4px] flex-wrap min-w-0">
-          {message.attachments.map((a: DisplayAttachment, i: number) => (
-            <AttachmentPill key={i} attachment={a} />
-          ))}
-        </div>
-        <div className="flex items-center [gap:8px] shrink-0">
-          <CopyButton text={message.content} />
+      <div className="flex w-[min(720px,72%)] flex-col items-end">
+        {hasContent && (
+          <div data-user-message-content="" className="max-w-full rounded-lg border border-slate-300 bg-slate-100 px-[11px] py-2 opacity-70 dark:border-slate-750 dark:bg-slate-800">
+            <div className="whitespace-pre-wrap font-sans text-[14px] leading-[1.55] text-slate-500 [word-break:break-word]">
+              {message.content}
+            </div>
+          </div>
+        )}
+
+        {message.attachments.length > 0 && (
+          <div className={`${hasContent ? "mt-2.5" : ""} flex max-w-full flex-wrap justify-end gap-2`}>
+            {message.attachments.map((attachment: DisplayAttachment, index: number) => (
+              <AttachmentPill key={index} attachment={attachment} />
+            ))}
+          </div>
+        )}
+
+        <div
+          className={`${
+            showMetadata ? "opacity-100" : "opacity-0"
+          } mt-2 flex min-h-[22px] items-center justify-end gap-2 px-0.5 transition-opacity duration-100`}
+        >
+          {hasContent && <CopyButton text={message.content} />}
           <QueuedIndicator />
         </div>
       </div>

@@ -8,8 +8,10 @@ describe("ACN subscription protocol", () => {
     expect(acnSubscriptionTags).toEqual(new Set([
       "StreamActiveSessionStatuses",
       "StreamDisplayView",
+      "StreamProjectChanges",
       "WatchFile",
       "WatchMirroredStates",
+      "WatchProjectFiles",
     ]))
     expect(acnSubscriptionProtocol.isStream("CheckFileExists")).toBe(false)
   })

@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it } from "vitest"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
-import { Effect, Layer, Option, Ref, Scope, Stream } from "effect"
+import { Effect, Exit, Layer, Option, Ref, Scope, Stream } from "effect"
 import type {
   AgentLifecycleState,
   AppEvent,
@@ -10,6 +10,19 @@ import type {
 import { AgentRuntime, type AgentRuntimeApi } from "./agent-runtime"
 import { SessionCommands, SessionCommandsLive } from "./session-commands"
 import type { RuntimeEntry } from "./session-types"
+import { mkdtemp, readdir, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+const roots: string[] = []
+
+afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
+
+async function scratchpad(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "magnitude-session-commands-"))
+  roots.push(root)
+  return root
+}
 
 const idleTurnState: ForkTurnState = {
   _tag: "idle",
@@ -75,6 +88,7 @@ const makeSession = (send: CodingAgentSession["send"]): CodingAgentSession => ({
 const makeEntry = Effect.fn("test.make-session-command-entry")(function* (
   sessionId: string,
   session: CodingAgentSession,
+  scratchpadPath = "/tmp/magnitude-session-commands-scratchpad",
 ) {
   const scope = yield* Scope.make()
   return {
@@ -83,7 +97,7 @@ const makeEntry = Effect.fn("test.make-session-command-entry")(function* (
     updatedAt: 1,
     title: "Session",
     cwd: process.cwd(),
-    scratchpadPath: "/tmp/magnitude-session-commands-scratchpad",
+    scratchpadPath,
     session,
     scope,
   } satisfies RuntimeEntry
@@ -128,7 +142,7 @@ describe("SessionCommands", () => {
             sessionId: "session-a",
             content: "hello after eviction",
             taskMode: false,
-            imageAttachments: [],
+            uploads: [],
             mentions: [],
           })
         }).pipe(Effect.provide(makeLayer(runtime)))
@@ -141,5 +155,97 @@ describe("SessionCommands", () => {
         expect(events[0]?.type).toBe("user_message")
       }),
     )
+  })
+
+  it("materializes an uploaded text file before admitting its trailing mention", async () => {
+    const root = await scratchpad()
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sentEvents = yield* Ref.make<ReadonlyArray<AppEvent>>([])
+        const entry = yield* makeEntry(
+          "session-with-upload",
+          makeSession(event => Ref.update(sentEvents, events => [...events, event])),
+          root,
+        )
+        const runtime: AgentRuntimeApi = {
+          withSession: (_sessionId, _label, use) => use(entry, 1),
+          withSessionRequest: () => Effect.die("unused"),
+          tryWithResident: () => Effect.succeed(Option.none()),
+          tryWithBusyResident: () => Effect.succeed(Option.none()),
+          residentSessions: Effect.succeed([]),
+          dispose: () => Effect.void,
+          deleteSession: (_sessionId, remove) => remove,
+          registerRetirementObserver: () => Effect.succeed(Effect.void),
+          changes: Stream.never,
+        }
+
+        yield* Effect.gen(function* () {
+          const commands = yield* SessionCommands
+          yield* commands.sendUserMessage({
+            sessionId: "session-with-upload",
+            content: "",
+            taskMode: false,
+            uploads: [{
+              type: "raw_text_file",
+              filename: "notes.md",
+              data: Buffer.from("# Notes\n").toString("base64"),
+            }],
+            mentions: [],
+          })
+        }).pipe(Effect.provide(makeLayer(runtime)))
+
+        const events = yield* Ref.get(sentEvents)
+        expect(events[0]).toMatchObject({
+          type: "user_message",
+          mentions: [{
+            attachment: { type: "mention_file", path: "$M/attachments/notes.md" },
+            placement: { _tag: "trailing" },
+          }],
+        })
+      }),
+    )
+  })
+
+  it("removes a materialized upload when message admission fails", async () => {
+    const root = await scratchpad()
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const entry = yield* makeEntry(
+          "session-rejecting-upload",
+          makeSession(() => Effect.die("admission failed")),
+          root,
+        )
+        const runtime: AgentRuntimeApi = {
+          withSession: (_sessionId, _label, use) => use(entry, 1),
+          withSessionRequest: () => Effect.die("unused"),
+          tryWithResident: () => Effect.succeed(Option.none()),
+          tryWithBusyResident: () => Effect.succeed(Option.none()),
+          residentSessions: Effect.succeed([]),
+          dispose: () => Effect.void,
+          deleteSession: (_sessionId, remove) => remove,
+          registerRetirementObserver: () => Effect.succeed(Effect.void),
+          changes: Stream.never,
+        }
+
+        const exit = yield* Effect.gen(function* () {
+          const commands = yield* SessionCommands
+          yield* commands.sendUserMessage({
+            sessionId: "session-rejecting-upload",
+            content: "",
+            taskMode: false,
+            uploads: [{
+              type: "raw_text_file",
+              filename: "notes.md",
+              data: Buffer.from("not admitted").toString("base64"),
+            }],
+            mentions: [],
+          })
+        }).pipe(Effect.provide(makeLayer(runtime)), Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+      }),
+    )
+
+    expect(await readdir(join(root, "attachments"))).toEqual([])
   })
 })

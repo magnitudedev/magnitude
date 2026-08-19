@@ -20,7 +20,7 @@ import { SessionDrafts } from "./session-drafts"
 import { SessionCommands } from "./session-commands"
 import { sessionErrorMessage } from "./session-errors"
 import { SessionStore } from "./session-store"
-import type { SessionExecutionContext } from "./session-types"
+import { hasUserMessageContent, type SessionExecutionContext } from "./session-types"
 import type { ResidentSessionSnapshot } from "./agent-runtime"
 
 export interface SessionLifecycleApi {
@@ -110,7 +110,7 @@ export const SessionLifecycleLive: Layer.Layer<
           draftOwnerId,
           projectId,
         ) {
-          if (initial?._tag === "message" && !initial.content.trim()) {
+          if (initial?._tag === "message" && !hasUserMessageContent(initial)) {
             return yield* new SessionStartFailed({
               sessionId: sessionId ?? "draft",
               reason: "Message content cannot be empty",
@@ -188,7 +188,7 @@ export const SessionLifecycleLive: Layer.Layer<
                   messageId: Option.getOrUndefined(initial.messageId),
                   content: initial.content,
                   taskMode: initial.taskMode,
-                  imageAttachments: initial.imageAttachments,
+                  uploads: initial.uploads,
                   mentions: initial.mentions,
                 })
               } else if (initial?._tag === "goal") {

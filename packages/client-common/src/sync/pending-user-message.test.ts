@@ -71,6 +71,37 @@ describe("presentPendingUserMessage", () => {
     })
   })
 
+  it("presents attachment snapshots immediately", () => {
+    const store = createDisplayViewStore(stateWithRoot(), shapeWithRoot())
+
+    presentPendingUserMessage(store, {
+      messageId: "with-files",
+      content: "review these",
+      taskMode: false,
+      activeSessionId: "session-1",
+      draftSessionId: "unused",
+      cwd: "/project",
+      attachments: [
+        { type: "mention_file", path: "$M/attachments/notes.md" },
+        {
+          type: "image",
+          path: "$M/attachments/diagram.png",
+          filename: "diagram.png",
+          mediaType: "image/png",
+          width: 320,
+          height: 180,
+        },
+      ],
+    })
+
+    expect(store.getSnapshot().state.timelines.root?.messages.byId["with-files"]).toMatchObject({
+      attachments: [
+        { type: "mention_file", path: "$M/attachments/notes.md" },
+        { type: "image", filename: "diagram.png", width: 320, height: 180 },
+      ],
+    })
+  })
+
   it("survives accepted-state resets and reconciles only to the exact message id", () => {
     const store = createDisplayViewStore(EMPTY_DISPLAY_STATE, EMPTY_DISPLAY_VIEW_SHAPE)
     presentPendingUserMessage(store, {

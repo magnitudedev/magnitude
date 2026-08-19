@@ -509,14 +509,17 @@ function ComposerContainer({
   )
   return (
     <Composer
+      key={`${composer.sessionId ?? "draft"}:${composer.cwd ?? ""}`}
       role={composer.roleLabel}
       isStreaming={composer.isStreaming}
       bashMode={composer.bashMode}
-      onSend={(text, mentions) => {
+      onSend={(text, mentions, uploads) => {
         void composer.handleSend(text, {
           mentions,
+          uploads,
         })
       }}
+      onAttachmentError={(message) => notify("error", message)}
       onInterrupt={composer.handleInterrupt}
       onRunBash={composer.handleRunBash}
       onSlashCommand={composer.handleSlashCommand}

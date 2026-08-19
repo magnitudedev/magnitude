@@ -49,7 +49,7 @@ export type ComposerProps = {
   submitUserMessage: (payload: {
     message: string
     visibleMessage?: string
-    imageAttachments: RawImageAttachment[]
+    uploads: RawImageAttachment[]
     mentions: RawMentionOccurrence[]
   }) => void
   runSlashCommand: (commandText: string) => SlashCommandOutcome

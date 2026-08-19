@@ -68,13 +68,19 @@ export function AttachmentPill({
 }): ReactNode {
   if (attachment.type === "image") {
     return (
-      <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-850 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px] text-slate-600 dark:text-slate-400">
-        <ImageIcon size={14} />
-        {attachment.filename}
-        <span className="text-slate-500">
-          {attachment.width}×{attachment.height}
+      <div className="flex h-13 min-w-48 max-w-64 items-center gap-2.5 rounded-lg border border-slate-300 bg-white px-2.5 dark:border-slate-750 dark:bg-slate-850">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-slate-150 text-blue-600 dark:bg-slate-750 dark:text-blue-400">
+          <ImageIcon size={17} />
         </span>
-      </span>
+        <span className="min-w-0 font-sans">
+          <span className="block truncate text-[12px] font-medium leading-4 text-slate-800 dark:text-slate-200">
+            {attachment.filename}
+          </span>
+          <span className="mt-0.5 block text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+            Image · {attachment.width}×{attachment.height}
+          </span>
+        </span>
+      </div>
     )
   }
   const Icon = attachment.type === "mention_directory" ? Folder : FileText
@@ -82,12 +88,30 @@ export function AttachmentPill({
     attachment.type === "mention_file_range"
       ? `:${attachment.startLine}-${attachment.endLine}`
       : ""
+  const label = attachment.path.startsWith("$M/attachments/")
+    ? attachment.path.slice("$M/attachments/".length)
+    : attachment.path
   return (
-    <span className="inline-flex items-center [gap:4px] bg-white dark:bg-slate-850 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:2px_6px] text-[11px] text-slate-600 dark:text-slate-400">
-      <Icon size={14} />
-      {attachment.path}
-      {rangeSuffix && <span className="text-slate-500">{rangeSuffix}</span>}
-    </span>
+    <div
+      className="flex h-13 min-w-44 max-w-64 items-center gap-2.5 rounded-lg border border-slate-300 bg-white px-2.5 dark:border-slate-750 dark:bg-slate-850"
+      title={attachment.path}
+    >
+      <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-slate-150 text-slate-600 dark:bg-slate-750 dark:text-slate-300">
+        <Icon size={17} />
+      </span>
+      <span className="min-w-0 font-sans">
+        <span className="block truncate text-[12px] font-medium leading-4 text-slate-800 dark:text-slate-200">
+          {label}{rangeSuffix}
+        </span>
+        <span className="mt-0.5 block text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+          {attachment.type === "mention_directory"
+            ? "Folder"
+            : attachment.type === "mention_file_range"
+            ? `Lines ${attachment.startLine}–${attachment.endLine}`
+            : "File"}
+        </span>
+      </span>
+    </div>
   )
 }
 

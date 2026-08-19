@@ -23,6 +23,7 @@ import { DisplayReaderContext, DisplaySpeculatorContext } from "../sync/use-disp
 import {
   composerTextAtom,
   composerAttachmentsAtom,
+  composerUploadsAtom,
   composerHistoryIndexAtom,
 } from "../state/session-atoms"
 import { EMPTY_DISPLAY_STATE } from "../state/empty-display-state"
@@ -54,6 +55,7 @@ export function DisplayViewControllerProvider({
   const platform = usePlatform()
   const setComposerText = useAtomSet(composerTextAtom)
   const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
+  const setComposerUploads = useAtomSet(composerUploadsAtom)
   const setComposerHistoryIndex = useAtomSet(composerHistoryIndexAtom)
   const store = useMemo(() => createDisplayViewStore(initial, EMPTY_DISPLAY_VIEW_SHAPE), [initial])
   const controller = useMemo(
@@ -65,10 +67,12 @@ export function DisplayViewControllerProvider({
           if (text != null) {
             setComposerText(text)
             setComposerAttachments([])
+            setComposerUploads([])
             setComposerHistoryIndex(-1)
           } else {
             setComposerText("")
             setComposerAttachments([])
+            setComposerUploads([])
             setComposerHistoryIndex(-1)
           }
         },
@@ -77,6 +81,7 @@ export function DisplayViewControllerProvider({
       platform.protocolLayer,
       setComposerText,
       setComposerAttachments,
+      setComposerUploads,
       setComposerHistoryIndex,
       store,
     ],

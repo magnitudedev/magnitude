@@ -1,6 +1,7 @@
 import type { DisplaySpeculator, SpeculativeDisplayHandle } from "./display-view-store"
 import { appendMessageToTimeline, emptyTimeline } from "./display-view-store"
 import { INITIAL_ROOT_PAGE_SIZE, timelineTail } from "./display-view-shape"
+import type { DisplayAttachment } from "@magnitudedev/sdk"
 
 export interface PendingUserMessageProjection {
   readonly messageId: string
@@ -9,6 +10,7 @@ export interface PendingUserMessageProjection {
   readonly activeSessionId: string | null
   readonly draftSessionId: string
   readonly cwd: string
+  readonly attachments?: readonly DisplayAttachment[]
 }
 
 /**
@@ -47,7 +49,7 @@ export function presentPendingUserMessage(
         content: pending.content,
         timestamp: Date.now(),
         taskMode: pending.taskMode,
-        attachments: [],
+        attachments: [...(pending.attachments ?? [])],
       })
     },
   )

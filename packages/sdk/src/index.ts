@@ -65,6 +65,10 @@ export {
   MagnitudeRpcs,
   StreamEvent as StreamEventSchema,
   canonicalExtensionForImageMediaType,
+  MAX_IMAGE_FILE_UPLOAD_BYTES,
+  MAX_MESSAGE_UPLOAD_BYTES,
+  MAX_MESSAGE_UPLOAD_COUNT,
+  MAX_TEXT_FILE_UPLOAD_BYTES,
   filenameWithImageExtension,
   forkIdToKey,
   imageMediaTypeFromFilename,
@@ -236,6 +240,7 @@ export {
 
 export { isEnvFlagOn } from "@magnitudedev/utils"
 export { normalizeReferencedPath } from "./path-utils"
+export { isRpcOutcomeUnknown } from "./mutation-outcome"
 
 // =============================================================================
 // Provider client surface — the sole provider boundary for agent & ACN

@@ -4,7 +4,7 @@ import type {
   CodingAgentSession,
 } from "@magnitudedev/agent"
 import type {
-  RawImageAttachment,
+  RawMessageUpload,
   RawMentionOccurrence,
   StreamEvent as ProtocolStreamEvent,
 } from "@magnitudedev/acn-protocol"
@@ -25,8 +25,12 @@ export interface SendUserMessageInput {
   readonly messageId?: string
   readonly content: string
   readonly taskMode: boolean
-  readonly imageAttachments: ReadonlyArray<RawImageAttachment>
+  readonly uploads: ReadonlyArray<RawMessageUpload>
   readonly mentions: ReadonlyArray<RawMentionOccurrence>
+}
+
+export function hasUserMessageContent(input: Pick<SendUserMessageInput, "content" | "uploads" | "mentions">): boolean {
+  return input.content.trim().length > 0 || input.uploads.length > 0 || input.mentions.length > 0
 }
 
 export interface SessionExecutionContext {
