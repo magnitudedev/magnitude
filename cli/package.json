@@ -26,6 +26,8 @@
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/client-common": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/storage": "workspace:*",
     "@magnitudedev/version": "workspace:*",
     "@effect/platform": "^0.96.0",
     "@effect/platform-bun": "^0.90.0",
@@ -37,6 +39,7 @@
     "lowlight": "^3.3.0",
     "pino": "^10.3.0",
     "react": "^19.2.0",
+    "semver": "^7.7.3",
     "string-width": "^8.1.1",
     "ansis": "^3.17.0"
   },
@@ -44,6 +47,7 @@
     "@magnitudedev/logger": "workspace:*",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.3",
+    "@types/semver": "^7.7.1",
     "react-dom": "^19.2.4",
     "typescript": "^5.8.3"
   }

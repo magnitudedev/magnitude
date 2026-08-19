@@ -4,7 +4,7 @@
  * Uses Bun APIs for process spawning, clipboard (OSC 52), and terminal size.
  * Stubs for unsupported capabilities (storage, notifications, dialogs).
  */
-import { Array as Arr, Effect, Exit, Layer, Option, Scope } from "effect"
+import { Array as Arr, Effect, Layer, Option, Runtime, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import {
@@ -24,6 +24,7 @@ import type {
   Dialogs,
   TerminalCapabilities,
 } from "@magnitudedev/client-common"
+import type { AcnClientCloseResult } from "@magnitudedev/sdk"
 import { makeCliEffectLoggingLayer } from "./effect-logger"
 
 const noopStorage: Storage = {
@@ -62,7 +63,7 @@ const terminalCapabilities: TerminalCapabilities = {
     return () => { process.stdout.off("resize", cb) }
   },
   async getPalette() {
-    // Palette detection is handled by the renderer in index.tsx
+    // Palette detection is owned by the interactive terminal runtime.
     return null
   },
   setTerminalTitle(title: string): void {
@@ -76,9 +77,13 @@ export interface TerminalPlatformOptions {
   readonly effectLoggingLayer: Option.Option<Layer.Layer<never, never, never>>
 }
 
+export interface TerminalPlatformRuntime {
+  readonly platform: Platform
+  readonly close: Effect.Effect<AcnClientCloseResult>
+}
+
 const makeTerminalAcnInstanceManager = (
   debug: boolean,
-  scope: Scope.CloseableScope,
   launchCommand: Option.Option<Arr.NonEmptyReadonlyArray<string>>,
 ) => makeLocalAcnInstanceManager({
   ...(debug ? { debug: true } : {}),
@@ -93,49 +98,43 @@ const makeTerminalAcnInstanceManager = (
   }),
 }).pipe(
   Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
-  Effect.provideService(Scope.Scope, scope),
   Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
 )
 
-export async function stopTerminalAcn(): Promise<void> {
-  const scope = await Effect.runPromise(Scope.make())
-  const manager = await Effect.runPromise(
-    makeLocalAcnInstanceManager().pipe(
-      Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
-      Effect.provideService(Scope.Scope, scope),
-      Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
-    ),
-  )
-  await Effect.runPromise(manager.stop.pipe(Effect.ensuring(Scope.close(scope, Exit.void))))
-}
+export const stopTerminalAcn = Effect.scoped(
+  makeLocalAcnInstanceManager().pipe(
+    Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
+    Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
+    Effect.flatMap((manager) => manager.stop),
+  ),
+)
 
-export async function createTerminalPlatform(options: TerminalPlatformOptions): Promise<Platform> {
+export const makeTerminalPlatform = (
+  options: TerminalPlatformOptions,
+): Effect.Effect<TerminalPlatformRuntime, never, Scope.Scope> => Effect.gen(function* () {
   const effectLoggingLayer = Option.getOrElse(
     options.effectLoggingLayer,
     () => makeCliEffectLoggingLayer({ debug: options.debug }),
   )
-  const managerScope = await Effect.runPromise(Scope.make())
-  const manager = await Effect.runPromise(
-    makeTerminalAcnInstanceManager(options.debug, managerScope, options.launchCommand),
+  const manager = yield* makeTerminalAcnInstanceManager(
+    options.debug,
+    options.launchCommand,
   )
-  const acn = await Effect.runPromise(
-    makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnInstanceManager, manager),
-      Effect.provideService(Scope.Scope, managerScope),
-      Effect.provide(FetchHttpClient.layer),
-    ),
+  const acn = yield* makeAcnJitRuntime().pipe(
+    Effect.provideService(AcnInstanceManager, manager),
+    Effect.provide(FetchHttpClient.layer),
   )
+  yield* Effect.addFinalizer(() => acn.close.pipe(Effect.ignore))
+  const runtime = yield* Effect.runtime<never>()
+  const runPromise = Runtime.runPromise(runtime)
   const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)
   const protocolLayer = acn.protocolLayer.pipe(Layer.provide(transport))
-  const shutdown = () => Effect.runPromise(
-    acn.close.pipe(Effect.ensuring(Scope.close(managerScope, Exit.void))),
-  )
 
-  return {
+  const platform: Platform = {
     id: "terminal",
     protocolLayer,
     acnStartup: acn.startup,
-    shutdown,
+    shutdown: () => runPromise(acn.close),
     clipboard: osc52Clipboard,
     storage: noopStorage,
     notifications: noopNotifications,
@@ -163,4 +162,6 @@ export async function createTerminalPlatform(options: TerminalPlatformOptions): 
     },
     terminal: terminalCapabilities,
   }
-}
+
+  return { platform, close: acn.close }
+})

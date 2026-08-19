@@ -51,7 +51,7 @@ jobs:
       - id: npm-candidate
         run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - id: version
-        run: echo "version=$(jq -r '.version' packages/cli/package.json)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
       - name: Assemble the Linux x64 candidate
         run: >-
           bun run packages/release/scripts/assemble.ts

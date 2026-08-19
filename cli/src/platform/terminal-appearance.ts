@@ -1,6 +1,7 @@
 import { Registry } from "@effect-atom/atom-react"
 import {
   CliRenderEvents,
+  createTerminalPalette,
   type CliRenderer,
   type TerminalColors,
   type ThemeMode as OpenTuiThemeMode,
@@ -39,18 +40,12 @@ const resolveMode = (
   return rendererMode ?? environmentMode(env) ?? fallbackMode
 }
 
-const optionalPromise = <A>(evaluate: () => Promise<A>): Effect.Effect<A | null> =>
-  Effect.tryPromise(evaluate).pipe(Effect.catchAll(() => Effect.succeed(null)))
-
-export const detectTerminalAppearance = (
-  renderer: CliRenderer,
-  env: CliEnv = collectCliEnv(),
+const resolveAppearance = (
+  colors: TerminalColors | null,
+  rendererMode: OpenTuiThemeMode | null,
+  env: CliEnv,
   previous?: TerminalAppearance,
-): Effect.Effect<TerminalAppearance> => Effect.gen(function* () {
-  const [colors, rendererMode] = yield* Effect.all([
-    optionalPromise(() => renderer.getPalette({ size: 16, timeout: 700 })),
-    optionalPromise(() => renderer.waitForThemeMode(700)),
-  ], { concurrency: "unbounded" })
+): TerminalAppearance => {
   const mode = resolveMode(colors, rendererMode, env, previous?.mode ?? "dark")
   const fallback = fallbackTerminalAppearances[mode]
   const detectedBackground = colors?.defaultBackground
@@ -63,6 +58,61 @@ export const detectTerminalAppearance = (
     mode,
     defaultBackground,
   }
+}
+
+/**
+ * Probes the terminal's colors before the renderer exists, with OpenTUI's own
+ * standalone palette detector on the raw process streams. The support check
+ * settles on the first reply and bounds a silent terminal at 100ms — the
+ * probe's whole budget there; the full color queries run only once support is
+ * proven, where they complete in reply roundtrips. Two boundary duties are
+ * ours here because no renderer owns the terminal yet: raw mode (replies must
+ * bypass canonical line buffering) and returning stdin to its non-flowing
+ * state. Bytes typed during the probe window are consumed with the replies.
+ */
+const PROBE_SUPPORT_TIMEOUT_MILLIS = 100
+
+export const probeTerminalAppearance = (
+  env: CliEnv = collectCliEnv(),
+): Effect.Effect<TerminalAppearance> => Effect.gen(function* () {
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    return resolveAppearance(null, null, env)
+  }
+  const colors = yield* Effect.acquireUseRelease(
+    Effect.sync(() => {
+      process.stdin.setRawMode(true)
+      return createTerminalPalette({
+        stdin: process.stdin,
+        stdout: process.stdout,
+      })
+    }),
+    (detector) => Effect.tryPromise(async () =>
+      (await detector.detectOSCSupport(PROBE_SUPPORT_TIMEOUT_MILLIS))
+        ? detector.detect({ size: 16 })
+        : null,
+    ).pipe(Effect.orElseSucceed((): TerminalColors | null => null)),
+    (detector) => Effect.sync(() => {
+      detector.cleanup()
+      process.stdin.pause()
+      process.stdin.setRawMode(false)
+    }),
+  )
+  return resolveAppearance(colors, null, env)
+})
+
+const optionalPromise = <A>(evaluate: () => Promise<A>): Effect.Effect<A | null> =>
+  Effect.tryPromise(evaluate).pipe(Effect.catchAll(() => Effect.succeed(null)))
+
+export const detectTerminalAppearance = (
+  renderer: CliRenderer,
+  env: CliEnv = collectCliEnv(),
+  previous?: TerminalAppearance,
+): Effect.Effect<TerminalAppearance> => Effect.gen(function* () {
+  const [colors, rendererMode] = yield* Effect.all([
+    optionalPromise(() => renderer.getPalette({ size: 16, timeout: 700 })),
+    optionalPromise(() => renderer.waitForThemeMode(700)),
+  ], { concurrency: "unbounded" })
+  return resolveAppearance(colors, rendererMode, env, previous)
 })
 
 const sameAppearance = (left: TerminalAppearance, right: TerminalAppearance): boolean =>

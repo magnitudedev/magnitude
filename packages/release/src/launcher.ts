@@ -1,28 +1,20 @@
 import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
-import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
-import * as NodeCommandExecutor from "@effect/platform-node/NodeCommandExecutor"
-import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
-import * as NodePath from "@effect/platform-node/NodePath"
 import { homedir } from "node:os"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Effect, Exit, Option } from "effect"
 import {
   acquireRelease,
   installArtifact,
+  releaseBaseUrl,
   selectArtifact,
 } from "./acquisition"
-import { ArchiveExtractor, NodeArchiveExtractor } from "./archive"
+import { ArchiveExtractor } from "./archive"
 import { ReleaseAcquisitionError } from "./errors"
 import { makeLauncherInstallationProgress } from "./launcher-progress"
 import { currentHost } from "./targets"
-
-const releaseBaseUrl = () => (
-  process.env.MAGNITUDE_RELEASE_BASE_URL ??
-  "https://github.com/magnitudedev/magnitude/releases/download"
-).replace(/\/+$/, "")
 
 const releaseRoot = () => `${homedir()}/.magnitude/releases`
 
@@ -147,7 +139,7 @@ const publishPointer = (
     }),
   )
 
-const ensureBinaryEffect = (
+export const ensureBinaryEffect = (
   version: string,
 ): Effect.Effect<
   string,
@@ -206,13 +198,3 @@ const ensureBinaryEffect = (
     return executable
   })
 
-const RuntimeLayer = Layer.mergeAll(
-  NodeFileSystem.layer,
-  NodePath.layer,
-  FetchHttpClient.layer,
-  NodeArchiveExtractor,
-  NodeCommandExecutor.layer.pipe(Layer.provide(NodeFileSystem.layer)),
-)
-
-export const ensureBinary = (version: string): Promise<string> =>
-  Effect.runPromise(ensureBinaryEffect(version).pipe(Effect.provide(RuntimeLayer)))
