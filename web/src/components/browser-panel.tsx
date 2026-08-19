@@ -140,7 +140,7 @@ export function BrowserPanel({
   readonly browser: EmbeddedBrowserCapability
   readonly filesEnabled: boolean
 }): ReactNode {
-  const panelRef = useRef<HTMLElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
   const addressRef = useRef<HTMLInputElement>(null)
   const closingRef = useRef(false)

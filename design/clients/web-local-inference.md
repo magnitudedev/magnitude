@@ -115,29 +115,39 @@ While acquisition is requested or loading, the work-status surface gives model l
 over the generic waiting detail and renders `Loading model`, a spinner, and authoritative progress
 when available.
 
-The composer footer follows the CLI's runtime-information structure without combining independent
-facts into the model label. It presents model identity, reasoning effort, resident memory, and
+The composer footer follows the CLI's runtime-information structure while presenting model identity
+and reasoning effort as one compact configuration control. It also presents resident memory and
 context usage with percentage. Residency is not rendered as a dot or readiness label in the
-composer. Model identity opens an
-upward chooser containing selectable installed model names, reasoning effort opens the same form of
-upward chooser containing the selected model's supported levels, and resident memory routes to
-Hardware. The two choosers are mutually exclusive and keyboard operable. Their triggers have no
-caret, underline, or hover text-color shift; hover is communicated with a restrained background
-change. A selected model retains the ordinary foreground color regardless of residency. Its
-authoritative slot identity remains a selectable chooser entry while the installed-model catalog
-loads, so a selected model never produces a disabled trigger. Loading is communicated by the
-work-status activity instead of muting model identity. The model chooser also reflects authoritative
-inventory and discovery availability: without a selection its trigger identifies loading, and with
-a selection it preserves the selected identity while its menu reports that additional choices are
-still loading. Query failure is distinct from both loading and a successfully loaded empty list.
-Reasoning retains its violet semantic color.
+composer. The combined control has a Phosphor rocket-launch icon, model name, reasoning label, and
+caret, with no separator between the model and reasoning text. It has no persistent border,
+underline, or hover text-color shift; hover is communicated with a restrained background change.
+Its upward root menu contains Model and, when the selected or drafted model supports reasoning,
+Thinking rows whose submenus open to the right by default. Models without configurable reasoning do
+not show a reasoning label or menu row. A reasoning-capable model whose selected effort is `none`
+shows `None` rather than hiding the control.
+Choosing a model advances directly to that model's supported thinking levels. The model and
+reasoning effort are committed together only after the sequence is complete; dismissing an
+incomplete sequence discards its presentation draft. A user may open Thinking directly to change
+only the current model's effort. The menu and submenus are keyboard operable, and resident memory
+routes to Hardware.
+
+A selected model retains the ordinary foreground color regardless of residency. Loading is
+communicated by the work-status activity instead of muting model identity. The combined menu also
+reflects authoritative inventory and discovery availability: without a selection its trigger
+identifies loading, and with a selection it preserves the selected identity while its menu reports
+that additional choices are still loading. Query failure is distinct from both loading and a
+successfully loaded empty list. Model and reasoning text use the slate hierarchy rather than a
+separate semantic accent color.
 
 Context usage is normally a compact circular meter rather than persistent text. Its arc is blue
 below 70 percent usage, orange from 70 through 89 percent, and red at 90 percent or above. Hover or
 keyboard focus reveals a fixed three-line tooltip containing the state label, token count, and
 percent remaining. While the authoritative root actor context reports compaction, the label becomes
 `Compacting...` and the same-length arc turns violet and rotates counterclockwise; the client does
-not infer compaction from token movement or fabricate a reduced usage value.
+not infer compaction from token movement or fabricate a reduced usage value. The composer keeps the
+model control at the right edge beside Send, with a deliberate gap, and places context immediately
+to its left. Context is absent from a truly empty chat and appears once the root timeline contains a
+message, including an optimistically accepted user message.
 
 ## Appearance
 
