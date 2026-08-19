@@ -40,3 +40,28 @@ describe("attachment-only user messages", () => {
     expect(html).not.toContain("Copy")
   })
 })
+
+describe("user message metadata", () => {
+  it("stays below the message, hidden until hover, with time before the copy icon", () => {
+    const message: UserMessageType = {
+      id: "message-2",
+      type: "user_message",
+      content: "Hello",
+      timestamp: Date.now() - 5 * 60_000,
+      taskMode: false,
+      attachments: [],
+    }
+    const html = renderToStaticMarkup(<UserMessage message={message} />)
+
+    const content = html.indexOf("Hello")
+    const metadata = html.indexOf('data-user-metadata=""')
+    const time = html.indexOf("minutes ago")
+    const copy = html.indexOf('aria-label="Copy message"')
+    expect(metadata).toBeGreaterThan(content)
+    expect(time).toBeGreaterThan(metadata)
+    expect(copy).toBeGreaterThan(time)
+    expect(html).toContain("opacity-0")
+    expect(html).toContain("group-hover/user:opacity-100")
+    expect(html).not.toContain(">Copy message</button>")
+  })
+})

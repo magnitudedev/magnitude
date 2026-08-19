@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button"
 /**
  * Shared utilities for message components — copy button, timestamp, attachment pill.
  */
-import { useState, type ReactNode } from "react"
+import { useState, useSyncExternalStore, type ReactNode } from "react"
 import {
   Copy,
   Check,
@@ -13,15 +13,22 @@ import {
   Image as ImageIcon,
 } from "lucide-react"
 import type { DisplayAttachment } from "@magnitudedev/sdk"
-import { formatShortTimestamp } from "@magnitudedev/client-common"
+import {
+  formatShortTimestamp,
+  getTickSnapshot,
+  subscribeTick,
+} from "@magnitudedev/client-common"
+import { formatMessageRelativeTime } from "@/lib/message-relative-time"
 
 /** Copy button with icon-swap feedback */
 export function CopyButton({
   text,
   label = "Copy",
+  iconOnly = false,
 }: {
   text: string
   label?: string
+  iconOnly?: boolean
 }): ReactNode {
   const [copied, setCopied] = useState(false)
   return (
@@ -36,7 +43,7 @@ export function CopyButton({
       data-copied={copied ? "true" : "false"}
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
-      {label}
+      {!iconOnly && label}
     </Button>
   )
 }
@@ -44,8 +51,18 @@ export function CopyButton({
 /** Timestamp display */
 export function Timestamp({ ts }: { ts: number }): ReactNode {
   return (
-    <span className="text-slate-500 font-sans text-[13px]">
+    <span className="font-sans text-[13px] text-slate-500">
       {formatShortTimestamp(ts)}
+    </span>
+  )
+}
+
+/** Live relative timestamp for conversational message metadata. */
+export function RelativeTimestamp({ ts }: { ts: number }): ReactNode {
+  useSyncExternalStore(subscribeTick, getTickSnapshot, getTickSnapshot)
+  return (
+    <span className="whitespace-nowrap font-sans text-[12px] text-slate-500">
+      {formatMessageRelativeTime(ts, Date.now())}
     </span>
   )
 }

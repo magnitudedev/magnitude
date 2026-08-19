@@ -76,6 +76,10 @@ import { TimelineLoadingState } from "./timeline-loading-state"
 import { ChatEmptyState } from "./chat-empty-state"
 import { DiffHunk } from "./diff-hunk"
 import { chatTimelinePlaceholderState } from "./chat-timeline-state"
+import {
+  deriveAssistantResponsePresentation,
+  type AssistantResponsePresentation,
+} from "./assistant-response-presentation"
 const DEFAULT_SHELL_LINE_CAP = 8
 const TOOL_ICONS: Record<ToolIcon, LucideIcon> = {
   file: FileText,
@@ -818,9 +822,11 @@ function needsGutter(
 function TimelineEntryView({
   timeline,
   entry,
+  assistantResponses,
 }: {
   timeline: DisplayTimeline
   entry: DisplayTimelineEntry
+  assistantResponses: AssistantResponsePresentation
 }): ReactNode {
   if (entry.kind === "tool_summary") return <ToolSummaryRow entry={entry} />
   if (entry.kind === "tool_step")
@@ -833,6 +839,11 @@ function TimelineEntryView({
       isStreaming={entry.streaming}
       isInterrupted={entry.interrupted}
       mode={timeline.presentation.mode}
+      assistantWorkSummary={message.type === "assistant_message"
+        ? assistantResponses.summaryByAssistantId.get(message.id) ?? null
+        : null}
+      isLatestAssistant={message.type === "assistant_message"
+        && assistantResponses.latestAssistantId === message.id}
     />
   )
 }
@@ -853,6 +864,13 @@ export function ChatTimeline({
   const selectedSessionId = useSelectedSessionId()
   const displaySession = useDisplayState((state) => state.session)
   const entries = timeline?.presentation.entries ?? []
+  const assistantResponses = useMemo(
+    () => timeline === null ? null : deriveAssistantResponsePresentation(timeline),
+    [timeline],
+  )
+  const presentedEntries = assistantResponses === null
+    ? entries
+    : assistantResponses.entries
   const { isSessionLoading, isEmpty } = chatTimelinePlaceholderState(
     selectedSessionId,
     timelineStatus,
@@ -1004,8 +1022,8 @@ export function ChatTimeline({
                 </span>
               </div>
             )}
-            {entries.map((entry, idx) => {
-              const prev = idx > 0 ? entries[idx - 1] ?? null : null
+            {presentedEntries.map((entry, idx) => {
+              const prev = idx > 0 ? presentedEntries[idx - 1] ?? null : null
               return (
                 <div
                   key={entry.id}
@@ -1018,7 +1036,11 @@ export function ChatTimeline({
                       : "[padding-left:0]"
                   }  [animation:fade-in_100ms_ease-out]`}
                 >
-                  <TimelineEntryView timeline={timeline} entry={entry} />
+                  <TimelineEntryView
+                    timeline={timeline}
+                    entry={entry}
+                    assistantResponses={assistantResponses!}
+                  />
                 </div>
               )
             })}
