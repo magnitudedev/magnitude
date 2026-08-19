@@ -34,6 +34,9 @@ magnitude (shell)
 │     └ download + verify    (fresh install / just updated)  secs–mins   printed progress lines
 │
 └─ CLI ─────────────────────────────────────────(process boot ~100–200ms)
+    AppearanceProbe          terminal color queries          ~1–10ms     silent, concurrent with
+    │                        (100ms cap on silent ttys)                  everything below;
+    │                                                                   joined before first paint
     UpdateDiscovery          version check                   ~200ms–1s   silent, concurrent with
     │                        (30s ceiling, silent failure)               everything below
     UpdatePrompt ─────────────────────────────── TUI state   user-paced  only when an offer exists
@@ -156,9 +159,13 @@ bar is monotonic across phases; byte subtext appears only when the underlying de
 
 ## Appearance
 
-Appearance detection never gates the first frame. The first frame uses the last detected
-appearance (persisted across runs; a fallback on first run); detection runs once the renderer
-exists and corrections apply live through the appearance observation runtime.
+Appearance is probed before the renderer exists, with OpenTUI's standalone palette detector on
+the raw process streams (raw mode and stdin flow are the probe's to manage there — no renderer
+owns the terminal yet). The probe starts with the session, concurrent with discovery and daemon
+work, and settles on the first terminal reply or a 100ms bound on silent ttys — so its answer is
+in before anything paints and the first frame is themed from live detection. No appearance state
+is persisted. Corrections continue to apply live through the appearance observation runtime
+(renderer theme, palette, and focus events).
 
 ## Exit
 
