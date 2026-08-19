@@ -2005,6 +2005,10 @@ export const Timings = S.Struct({
   cache_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   draft_n: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   draft_n_accepted: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  draft_n_with_proposal_distribution: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), {
+    exact: true,
+    as: "Option",
+  }),
   parser_ms: S.Number,
   predicted_ms: S.Number,
   predicted_n: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

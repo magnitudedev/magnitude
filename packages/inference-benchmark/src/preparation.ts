@@ -3,7 +3,7 @@ import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Data, Effect, Schema, Stream } from "effect"
-import { arch, cpus, hostname, platform, release, totalmem } from "node:os"
+import { arch, cpus, homedir, hostname, platform, release, totalmem } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { prepareCorpus } from "./corpus"
 import type { ModelIdentity } from "./domain"
@@ -280,12 +280,48 @@ const prepareMlx = (variantId: VariantId, role: PreparedArtifact["role"], artifa
 
 export const preparedExperimentPath = (experimentId: string) => resolve("benchmark-results", "prepared", `${experimentId}.json`)
 
+// ICN serves models from the Magnitude model store and locates them by SHA-256,
+// so preparation resolves ICN artifacts from that store instead of downloading a
+// second copy into the Hugging Face cache.
+const magnitudeModelStoreRoot = () => resolve(homedir(), ".magnitude", "models")
+
+const resolveInstalledGguf = (variantId: VariantId, role: PreparedArtifact["role"], artifact: Extract<ExperimentDefinition["variants"][number]["artifact"], { kind: "gguf" }>) =>
+  Effect.gen(function* () {
+    const root = magnitudeModelStoreRoot()
+    const files = yield* listRelativeFiles(root).pipe(
+      Effect.mapError(() => new PreparationError({
+        operation: "resolve-installed-artifact",
+        message: `cannot read the Magnitude model store at ${root}`,
+      })),
+    )
+    const fs = yield* FileSystem.FileSystem
+    for (const relative of files) {
+      const path = join(root, relative)
+      const stat = yield* fs.stat(path)
+      if (stat.type !== "File" || Number(stat.size) !== artifact.sizeBytes) continue
+      const digest = yield* hashFileSha256(path).pipe(
+        Effect.mapError((error) => new PreparationError({ operation: "resolve-installed-artifact", message: error.message })),
+      )
+      if (digest !== artifact.sha256) continue
+      return {
+        variantId, role, kind: "gguf" as const, path, repository: artifact.repository,
+        revision: artifact.revision, quantization: artifact.quantization.scheme, digest,
+      }
+    }
+    return yield* new PreparationError({
+      operation: "resolve-installed-artifact",
+      message: `${artifact.file} (sha256 ${artifact.sha256}) is not installed in the Magnitude model store at ${root}; install ${artifact.repository} through Magnitude first`,
+    })
+  })
+
 const prepareArtifact = (
   variant: ExperimentDefinition["variants"][number],
   role: PreparedArtifact["role"],
   artifact = variant.artifact,
 ): Effect.Effect<PreparedArtifact, PreparationError | import("@effect/platform/Error").PlatformError, FileSystem.FileSystem> =>
-  artifact.kind === "gguf" ? prepareGguf(variant.id, role, artifact) : prepareMlx(variant.id, role, artifact)
+  variant.engine.kind === "icn" && artifact.kind === "gguf"
+    ? resolveInstalledGguf(variant.id, role, artifact)
+    : artifact.kind === "gguf" ? prepareGguf(variant.id, role, artifact) : prepareMlx(variant.id, role, artifact)
 
 const prepareEngine = (variant: ExperimentDefinition["variants"][number]): Effect.Effect<PreparedEngineEnvironment, PreparationError, FileSystem.FileSystem | CommandExecutor.CommandExecutor> => {
   const engine = variant.engine
@@ -361,9 +397,13 @@ export const prepareExperiment = (experimentPath: string): Effect.Effect<Prepare
     }, { concurrency: 1 })
     const draftArtifacts = yield* Effect.forEach(experiment.variants, (variant) => {
       const engine = variant.engine
-      return (engine.kind === "llama.cpp" || engine.kind === "mlx-vlm") && engine.speculativeDecoding.kind === "mtp"
-        ? prepareArtifact(variant, "drafter", engine.speculativeDecoding.draftArtifact)
-        : Effect.succeed(null)
+      if ((engine.kind === "llama.cpp" || engine.kind === "mlx-vlm") && engine.speculativeDecoding.kind === "mtp") {
+        return prepareArtifact(variant, "drafter", engine.speculativeDecoding.draftArtifact)
+      }
+      if (engine.kind === "icn" && engine.speculativeDecoding.kind === "dflash") {
+        return prepareArtifact(variant, "drafter", engine.speculativeDecoding.draftArtifact)
+      }
+      return Effect.succeed(null)
     }, { concurrency: 1 }).pipe(Effect.map((values) => values.filter((value): value is PreparedArtifact => value !== null)))
     const allArtifacts = [...artifacts, ...draftArtifacts]
     const gguf = allArtifacts.find((artifact) => artifact.role === "target" && artifact.kind === "gguf")

@@ -5961,6 +5961,12 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "draft_n_with_proposal_distribution": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Draft tokens whose proposals carried sparse proposal distributions,\nenabling distribution-aware verification.",
+            "minimum": 0
           }
         },
         "additionalProperties": false

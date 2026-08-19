@@ -90,6 +90,7 @@ const RawTerminalEvidence = Schema.Struct({
     predicted_ms: NonNegativeFinite,
     draft_n: Schema.optionalWith(NonNegativeInt, { as: "Option", exact: true }),
     draft_n_accepted: Schema.optionalWith(NonNegativeInt, { as: "Option", exact: true }),
+    draft_n_with_proposal_distribution: Schema.optionalWith(NonNegativeInt, { as: "Option", exact: true }),
   }),
 })
 
@@ -119,6 +120,9 @@ export function parseTerminalEvidence(payload: unknown): TerminalEvidence {
       generationMs: terminal.timings.predicted_ms,
       ...(Option.isSome(terminal.timings.draft_n) ? { draftTokens: terminal.timings.draft_n.value } : {}),
       ...(Option.isSome(terminal.timings.draft_n_accepted) ? { acceptedDraftTokens: terminal.timings.draft_n_accepted.value } : {}),
+      ...(Option.isSome(terminal.timings.draft_n_with_proposal_distribution)
+        ? { proposalDistributionDraftTokens: terminal.timings.draft_n_with_proposal_distribution.value }
+        : {}),
     },
   }
   if (evidence.usage.totalTokens !== evidence.usage.promptTokens + evidence.usage.completionTokens) {

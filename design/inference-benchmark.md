@@ -104,8 +104,11 @@ records its workload, checkpoint, repetition, and cache state.
   commit, quantization, files, sizes, and digests. Multi-file snapshots use a complete committed
   lock. Artifact differences make a result product-level rather than invalid.
 - **Engine:** A serving implementation with engine-specific settings and an owned launch adapter.
-- **Acceleration policy:** The decoding mode shared by comparable variants. It is explicitly either
-  no speculation or MTP with an immutable drafter artifact and a candidate-token limit.
+- **Acceleration policy:** The decoding mode declared per variant. It is explicitly no speculation,
+  MTP with an immutable drafter artifact and a candidate-token limit, or ICN DFlash with an
+  immutable drafter artifact. Cross-engine comparisons require one shared policy. A same-engine
+  ICN experiment may deliberately vary only the acceleration policy over one target artifact; that
+  is a controlled acceleration comparison, not an ordinary product comparison.
 - **Variant:** One model artifact, one engine, and the complete serving settings evaluated together.
 - **Experiment:** A TypeScript-authored, serializable definition of variants, workload profile,
   request policy, and execution order. TypeScript is the only authoring format.
@@ -165,6 +168,12 @@ draft candidates. Adapters may translate that value into a native block size whe
 counts its verification token. Terminal evidence must contain native drafted and accepted-token
 counts for every request, accepted counts may not exceed drafted counts, and the run must demonstrate
 nonzero drafting. A target that merely starts with MTP flags does not satisfy this requirement.
+
+ICN DFlash variants resolve the target and the pinned drafter from the Magnitude model store by
+SHA-256; preparation never downloads a second copy of an installed artifact. A DFlash variant's
+terminal evidence must additionally satisfy nonzero accepted drafts across the run, and — whenever
+the request policy samples stochastically — nonzero drafts carrying proposal distributions, which
+certifies that verification was distribution-aware (the DFlash2 path) rather than greedy.
 
 Context sweeps are distinct from server context capacity. The experiment configures one capacity
 large enough for its maximum checkpoint, then constructs separate cache-disjoint requests by

@@ -1058,6 +1058,11 @@ pub struct Timings {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub draft_n_accepted: Option<u64>,
+    /// Draft tokens whose proposals carried sparse proposal distributions,
+    /// enabling distribution-aware verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub draft_n_with_proposal_distribution: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2036,6 +2041,8 @@ fn timing_values(
         draft_n: (metrics.draft_tokens > 0).then_some(metrics.draft_tokens as u64),
         draft_n_accepted: (metrics.draft_tokens > 0)
             .then_some(metrics.accepted_draft_tokens as u64),
+        draft_n_with_proposal_distribution: (metrics.draft_tokens > 0)
+            .then_some(metrics.proposal_distribution_draft_tokens as u64),
     }
 }
 
@@ -3902,6 +3909,7 @@ mod tests {
         let ordinary = timing_values(0, 10, 2, &GenerationMetrics::default());
         assert_eq!(ordinary.draft_n, None);
         assert_eq!(ordinary.draft_n_accepted, None);
+        assert_eq!(ordinary.draft_n_with_proposal_distribution, None);
 
         let speculative = timing_values(
             0,
@@ -3910,11 +3918,13 @@ mod tests {
             &GenerationMetrics {
                 draft_tokens: 3,
                 accepted_draft_tokens: 2,
+                proposal_distribution_draft_tokens: 3,
                 ..GenerationMetrics::default()
             },
         );
         assert_eq!(speculative.draft_n, Some(3));
         assert_eq!(speculative.draft_n_accepted, Some(2));
+        assert_eq!(speculative.draft_n_with_proposal_distribution, Some(3));
     }
 
     #[tokio::test]

@@ -129,6 +129,14 @@ function targetFor(prepared: PreparedExperiment, variantId: string, port: number
       icnExecutable: preparedEngine.executable,
       port,
       maxSequences: prepared.experiment.requestPolicy.parallelSequences,
+      ...(variant.engine.speculativeDecoding.kind === "dflash"
+        ? {
+            speculative: {
+              method: "dflash" as const,
+              draftSha256: artifactFor(prepared, variantId, "drafter").digest,
+            },
+          }
+        : {}),
     })
     return { ...target, id: variant.id, logPath, artifact: artifactIdentity }
   }
@@ -192,42 +200,72 @@ function targetFor(prepared: PreparedExperiment, variantId: string, port: number
   }
 }
 
-export function assertMtpEvidence(experiment: ExperimentDefinition, comparison: ComparisonResult): void {
-  const mtpVariants = new Set<string>(experiment.variants.flatMap((variant) =>
-    (variant.engine.kind === "llama.cpp" || variant.engine.kind === "mlx-vlm")
-      && variant.engine.speculativeDecoding.kind === "mtp"
-      ? [variant.id]
-      : []))
+export function assertSpeculativeEvidence(experiment: ExperimentDefinition, comparison: ComparisonResult): void {
+  const speculativeVariants = new Map<string, "mtp" | "dflash">()
+  for (const variant of experiment.variants) {
+    if ((variant.engine.kind === "llama.cpp" || variant.engine.kind === "mlx-vlm")
+      && variant.engine.speculativeDecoding.kind === "mtp") {
+      speculativeVariants.set(variant.id, "mtp")
+    }
+    if (variant.engine.kind === "icn" && variant.engine.speculativeDecoding.kind === "dflash") {
+      speculativeVariants.set(variant.id, "dflash")
+    }
+  }
   for (const result of comparison.results) {
-    if (!mtpVariants.has(result.target.id)) continue
+    const method = speculativeVariants.get(result.target.id)
+    if (!method) continue
     const requests = result.trials.flatMap((trial) => [
       ...(trial.setupRequests ?? []),
       ...trial.requests,
     ])
     let drafted = 0
+    let accepted = 0
+    let distributionBacked = 0
     for (const request of requests) {
       const draftTokens = request.terminal?.timings.draftTokens
       const acceptedDraftTokens = request.terminal?.timings.acceptedDraftTokens
       if (draftTokens === undefined || acceptedDraftTokens === undefined) {
         throw new RunError({
-          operation: "validate-mtp-evidence",
-          message: `${result.target.id} request ${request.requestId} did not return native MTP draft counters`,
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} request ${request.requestId} did not return native ${method} draft counters`,
         })
       }
+      const proposalDistributionDraftTokens = request.terminal?.timings.proposalDistributionDraftTokens ?? 0
       if (!Number.isSafeInteger(draftTokens) || !Number.isSafeInteger(acceptedDraftTokens)
-        || draftTokens < 0 || acceptedDraftTokens < 0 || acceptedDraftTokens > draftTokens) {
+        || !Number.isSafeInteger(proposalDistributionDraftTokens)
+        || draftTokens < 0 || acceptedDraftTokens < 0 || acceptedDraftTokens > draftTokens
+        || proposalDistributionDraftTokens < 0 || proposalDistributionDraftTokens > draftTokens) {
         throw new RunError({
-          operation: "validate-mtp-evidence",
-          message: `${result.target.id} request ${request.requestId} returned inconsistent MTP draft counters`,
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} request ${request.requestId} returned inconsistent ${method} draft counters`,
         })
       }
       drafted += draftTokens
+      accepted += acceptedDraftTokens
+      distributionBacked += proposalDistributionDraftTokens
     }
     if (requests.length === 0 || drafted === 0) {
       throw new RunError({
-        operation: "validate-mtp-evidence",
-        message: `${result.target.id} did not demonstrate active MTP drafting`,
+        operation: "validate-speculative-evidence",
+        message: `${result.target.id} did not demonstrate active ${method} drafting`,
       })
+    }
+    if (method === "dflash") {
+      if (accepted === 0) {
+        throw new RunError({
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} accepted no DFlash draft tokens`,
+        })
+      }
+      // Under stochastic sampling the DFlash2 drafter emits a proposal distribution
+      // for every draft; zero distribution-backed drafts means the run exercised
+      // only the greedy path and cannot certify distribution-aware verification.
+      if (experiment.requestPolicy.temperature > 0 && distributionBacked === 0) {
+        throw new RunError({
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} produced no proposal-distribution-backed drafts at temperature ${experiment.requestPolicy.temperature}`,
+        })
+      }
     }
   }
 }
@@ -329,7 +367,7 @@ export const runExperiment = (experimentPath: string): Effect.Effect<ExperimentR
           Effect.provideService(EvaluationReporter, reporter),
           Effect.mapError((error) => new RunError({ operation: error.operation, message: error.message })),
         )
-        assertMtpEvidence(prepared.experiment, comparison)
+        assertSpeculativeEvidence(prepared.experiment, comparison)
         blocks.push({ index: block, variantOrder, comparison })
         yield* appendEvent(eventsPath, { type: "block-completed", at: new Date().toISOString(), runId: id, block })
       }
