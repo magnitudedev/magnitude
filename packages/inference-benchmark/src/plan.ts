@@ -26,16 +26,9 @@ interface ProfileShape {
   readonly memoryDepths: readonly number[]
 }
 
-const profiles: Record<ProfileName, ProfileShape> = {
-  smoke: {
-    repetitions: 1,
-    sequentialDepth: 2,
-    forkPrefixDepth: 2,
-    independentConcurrency: [2],
-    concurrencyPressure: [2, 4],
-    memorySessions: 2,
-    memoryDepths: [1, 2],
-  },
+// Smoke is not a workload shape: it qualifies the serving path end to end with
+// exactly one isolated request per variant and is compiled as its own branch.
+const profiles: Record<Exclude<ProfileName, "smoke">, ProfileShape> = {
   standard: {
     repetitions: 3,
     sequentialDepth: 128,
@@ -224,7 +217,8 @@ export function compileTrialPlanSync(
   if (options.profile !== undefined && options.contextSweep !== undefined) {
     throw new PlanError({ message: "choose either an agent-core profile or a context sweep" })
   }
-  const profileName = options.contextSweep ? "context-sweep" as const : options.profile ?? "standard"
+  const workloadProfile = options.profile ?? "standard"
+  const profileName = options.contextSweep ? "context-sweep" as const : workloadProfile
   const requestPolicy = {
     maxOutputTokens: options.maxOutputTokens ?? 128,
     temperature: options.temperature ?? 0,
@@ -250,8 +244,18 @@ export function compileTrialPlanSync(
 
   if (options.contextSweep) {
     trials.push(...compileContextSweepTrials(fixtures, options.contextSweep, requestPolicy))
+  } else if (workloadProfile === "smoke") {
+    trials.push({
+      id: "single-r0",
+      pattern: "single-request",
+      criteria: allCriteria,
+      checkpoint: "one-turn",
+      repetition: 0,
+      state: "cache-disjoint",
+      requests: [isolatedRequest("single-r0-q0", fixtures[cursor++ % fixtures.length]!, 0, requestPolicy)],
+    })
   } else {
-    const profile = profiles[options.profile ?? "standard"]
+    const profile = profiles[workloadProfile]
     for (let repetition = 0; repetition < profile.repetitions; repetition++) {
     const single = fixtures[cursor++ % fixtures.length]!
     trials.push({

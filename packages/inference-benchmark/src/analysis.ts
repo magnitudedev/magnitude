@@ -1,4 +1,4 @@
-import type { MetricSummary, Outcome, TrialAnalysis, TrialObservation } from "./domain"
+import type { MetricSummary, Outcome, SpeculativeAnalysis, TrialAnalysis, TrialObservation } from "./domain"
 
 function quantile(sorted: readonly number[], q: number): number {
   if (sorted.length === 0) return Number.NaN
@@ -70,6 +70,7 @@ export function analyzeTrial(observation: TrialObservation): TrialAnalysis {
   const completion = measured.map((request) => request.completedMs)
   const measuredSeconds = observation.makespanMs / 1_000
   const completionTokens = measured.reduce((sum, request) => sum + (request.terminal?.usage.completionTokens ?? 0), 0)
+  const speculative = summarizeSpeculative(measured.flatMap((request) => request.terminal ? [request.terminal.timings] : []))
   return {
     trialId: observation.trial.id,
     pattern: observation.trial.pattern,
@@ -85,6 +86,21 @@ export function analyzeTrial(observation: TrialObservation): TrialAnalysis {
     cacheReuseRatio: summarize(cacheReuse),
     promptTokens: summarize(promptTokenCounts),
     completionTokens: summarize(completionTokenCounts),
+    ...(speculative ? { speculative } : {}),
     memory: observation.memory,
+  }
+}
+
+function summarizeSpeculative(timings: readonly { readonly draftTokens?: number; readonly acceptedDraftTokens?: number; readonly proposalDistributionDraftTokens?: number }[]): SpeculativeAnalysis | undefined {
+  const drafting = timings.filter((timing) => timing.draftTokens !== undefined)
+  if (drafting.length === 0) return undefined
+  const draftedTokens = drafting.reduce((sum, timing) => sum + (timing.draftTokens ?? 0), 0)
+  const acceptedDraftTokens = drafting.reduce((sum, timing) => sum + (timing.acceptedDraftTokens ?? 0), 0)
+  const proposalDistributionDraftTokens = drafting.reduce((sum, timing) => sum + (timing.proposalDistributionDraftTokens ?? 0), 0)
+  return {
+    draftedTokens,
+    acceptedDraftTokens,
+    proposalDistributionDraftTokens,
+    acceptanceRate: draftedTokens > 0 ? acceptedDraftTokens / draftedTokens : 0,
   }
 }

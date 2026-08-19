@@ -70,8 +70,8 @@ describe("BFCL corpus and trial planning", () => {
   it("compiles every workload pattern into one content-addressed plan", async () => {
     const corpus = await fixtureCorpus()
     const model = { id: "test-model", artifactPath: "/test/model.gguf", artifactSha256: "model", chatTemplateDigest: "template", contextLimit: 32_768 }
-    const first = compileTrialPlanSync(corpus, model, { profile: "smoke" })
-    const second = compileTrialPlanSync(corpus, model, { profile: "smoke" })
+    const first = compileTrialPlanSync(corpus, model, { profile: "standard" })
+    const second = compileTrialPlanSync(corpus, model, { profile: "standard" })
     expect(new Set(first.trials.map((trial) => trial.pattern))).toEqual(new Set([
       "single-request",
       "sequential-session",
@@ -90,8 +90,17 @@ describe("BFCL corpus and trial planning", () => {
       seed: 42,
       enableThinking: false,
     })
-    expect(compileTrialPlanSync(corpus, model, { profile: "smoke", parallelSequences: 4 }).digest)
+    expect(compileTrialPlanSync(corpus, model, { profile: "standard", parallelSequences: 4 }).digest)
       .not.toBe(first.digest)
+  })
+
+  it("compiles smoke as exactly one isolated request", async () => {
+    const corpus = await fixtureCorpus()
+    const model = { id: "test-model", artifactPath: "/test/model.gguf", artifactSha256: "model", chatTemplateDigest: "template", contextLimit: 32_768 }
+    const plan = compileTrialPlanSync(corpus, model, { profile: "smoke" })
+    expect(plan.trials).toHaveLength(1)
+    expect(plan.trials[0]?.pattern).toBe("single-request")
+    expect(plan.trials[0]?.requests).toHaveLength(1)
   })
 
   it("selects deterministic BFCL histories near character-based context targets", async () => {

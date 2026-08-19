@@ -139,6 +139,10 @@ export interface ManagedTarget {
     readonly artifactSha256: string
     readonly contextLimit: number
     readonly instanceId: string
+    readonly speculative?: {
+      readonly method: "dflash"
+      readonly draftSha256: string
+    }
   }
   readonly parallelSequences: number
   readonly artifact?: {
@@ -194,6 +198,7 @@ export interface NativeTimings {
   readonly generationMs: number
   readonly draftTokens?: number
   readonly acceptedDraftTokens?: number
+  readonly proposalDistributionDraftTokens?: number
 }
 
 export interface TerminalEvidence {
@@ -257,7 +262,15 @@ export interface TrialAnalysis {
   readonly cacheReuseRatio?: MetricSummary
   readonly promptTokens?: MetricSummary
   readonly completionTokens?: MetricSummary
+  readonly speculative?: SpeculativeAnalysis
   readonly memory?: MemoryObservation
+}
+
+export interface SpeculativeAnalysis {
+  readonly draftedTokens: number
+  readonly acceptedDraftTokens: number
+  readonly proposalDistributionDraftTokens: number
+  readonly acceptanceRate: number
 }
 
 export interface BenchmarkResult {

@@ -90,6 +90,9 @@ export interface MlxVlmEngineDefinition {
 export interface IcnEngineDefinition {
   readonly kind: "icn"
   readonly executable: "managed" | string
+  readonly speculativeDecoding:
+    | { readonly kind: "none" }
+    | { readonly kind: "dflash"; readonly draftArtifact: ModelArtifactDefinition }
 }
 
 export interface ExistingEndpointEngineDefinition {
@@ -165,6 +168,10 @@ const SpeculativeMtp = Schema.Struct({
   draftArtifact: Artifact,
   maxDraftTokens: PositiveInt,
 })
+const SpeculativeDflash = Schema.Struct({
+  kind: Schema.Literal("dflash"),
+  draftArtifact: Artifact,
+})
 const Engine = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal("llama.cpp"), executable: NonEmptyString,
@@ -186,6 +193,7 @@ const Engine = Schema.Union(
   }),
   Schema.Struct({
     kind: Schema.Literal("icn"), executable: NonEmptyString,
+    speculativeDecoding: Schema.Union(SpeculativeNone, SpeculativeDflash),
   }),
   Schema.Struct({
     kind: Schema.Literal("existing-endpoint"), endpoint: NonEmptyString,
@@ -286,6 +294,14 @@ export function defineExperiment(definition: ExperimentInput): ExperimentDefinit
   for (const variant of decoded.variants) {
     if (variant.engine.kind === "icn" && variant.artifact.kind !== "gguf") {
       throw new Error(`ICN variant ${variant.id} requires a GGUF artifact`)
+    }
+    if (variant.engine.kind === "icn" && variant.engine.speculativeDecoding.kind === "dflash") {
+      if (variant.engine.speculativeDecoding.draftArtifact.kind !== "gguf") {
+        throw new Error(`ICN DFlash variant ${variant.id} requires a GGUF drafter`)
+      }
+      if (variant.engine.speculativeDecoding.draftArtifact.modelId !== variant.artifact.modelId) {
+        throw new Error(`ICN DFlash variant ${variant.id} requires a drafter for the same logical model`)
+      }
     }
     if (variant.engine.kind === "llama.cpp" && variant.engine.speculativeDecoding.kind === "mtp" && variant.engine.speculativeDecoding.draftArtifact.kind !== "gguf") {
       throw new Error(`llama.cpp MTP variant ${variant.id} requires a GGUF drafter`)

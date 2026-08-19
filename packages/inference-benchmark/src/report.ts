@@ -38,7 +38,14 @@ function analysisRow(analysis: TrialAnalysis): string {
   return `| ${analysis.trialId} | ${analysis.pattern} | ${analysis.measuredRequests} | ${analysis.validRequests} | ${nonValid} | ${median(analysis.promptTokens)} | ${median(analysis.completionTokens)} | ${median(analysis.responsivenessMs)} | ${number(analysis.responsivenessMs?.p95)} | ${median(analysis.prefillTokensPerSecond)} | ${median(analysis.decodeTokensPerSecond)} | ${number(analysis.achievedCompletionTokensPerSecond)} | ${number(analysis.cacheReuseRatio?.median, 3)} | ${number(analysis.completionMs?.p95)} | ${bytes(preferredPeakMemory(analysis))} |`
 }
 
+function speculativeRow(analysis: TrialAnalysis): readonly string[] {
+  const speculative = analysis.speculative
+  if (!speculative) return []
+  return [`| ${analysis.trialId} | ${speculative.draftedTokens} | ${speculative.acceptedDraftTokens} | ${number(speculative.acceptanceRate, 3)} | ${speculative.proposalDistributionDraftTokens} |`]
+}
+
 export function renderBenchmarkMarkdown(result: BenchmarkResult): string {
+  const speculativeRows = result.analyses.flatMap(speculativeRow)
   return [
     `# Inference benchmark: ${result.target.id}`,
     "",
@@ -48,6 +55,14 @@ export function renderBenchmarkMarkdown(result: BenchmarkResult): string {
     "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ...result.analyses.map(analysisRow),
     "",
+    ...(speculativeRows.length > 0 ? [
+      "## Speculative decoding",
+      "",
+      "| Trial | Drafted tokens | Accepted tokens | Acceptance rate | Proposal-distribution drafts |",
+      "| --- | ---: | ---: | ---: | ---: |",
+      ...speculativeRows,
+      "",
+    ] : []),
     ...(result.warnings.length > 0 ? ["## Warnings", "", ...result.warnings.map((warning) => `- ${warning}`), ""] : []),
   ].join("\n")
 }

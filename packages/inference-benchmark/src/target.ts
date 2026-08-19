@@ -3,6 +3,7 @@ import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
+import type { ModelBundleInput } from "@magnitudedev/icn-protocol/schemas"
 import { Chunk, Context, Data, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -141,24 +142,41 @@ const provisionIcnModel = (
         }),
       }),
     )
-    const installed = snapshot.packages.find(({ package: modelPackage }) =>
-      modelPackage.files.some(({ sha256 }) => sha256 === load.artifactSha256))
-    if (!installed) {
-      return yield* new TargetError({
-        targetId: target.id,
-        operation: "discover-model",
-        message: `ICN has no installed package containing artifact ${load.artifactSha256}`,
-      })
+    const installedPackage = (sha256: string, role: string) => {
+      const installed = snapshot.packages.find(({ package: modelPackage }) =>
+        modelPackage.files.some((file) => file.sha256 === sha256))
+      return installed
+        ? Effect.succeed(installed)
+        : Effect.fail(new TargetError({
+            targetId: target.id,
+            operation: "discover-model",
+            message: `ICN has no installed package containing the ${role} artifact ${sha256}`,
+          }))
     }
+    const installed = yield* installedPackage(load.artifactSha256, "target")
+    const bundle: ModelBundleInput = load.speculative
+      ? {
+          _tag: "SpeculativeDecoding",
+          target: { _tag: "Installed", packageId: installed.package.id },
+          draftSource: {
+            _tag: "Separate",
+            draft: {
+              _tag: "Installed",
+              packageId: (yield* installedPackage(load.speculative.draftSha256, "draft")).package.id,
+            },
+          },
+          method: { _tag: "DFlash" },
+        }
+      : {
+          _tag: "Standalone",
+          package: { _tag: "Installed", packageId: installed.package.id },
+        }
 
     const assessment = yield* client.models.assessModels({
       payload: {
         requests: [{
           requestId: `benchmark-${target.id}`,
-          bundle: {
-            _tag: "Standalone",
-            package: { _tag: "Installed", packageId: installed.package.id },
-          },
+          bundle,
           profiles: [{
             profile: { contextLength: load.contextLimit },
             performanceContextTokens: [load.contextLimit],
@@ -351,6 +369,10 @@ export interface ManagedComparisonOptions {
   readonly llamaExecutable?: string
   readonly port?: number
   readonly maxSequences?: number
+  readonly speculative?: {
+    readonly method: "dflash"
+    readonly draftSha256: string
+  }
 }
 
 const executable = (path: string | null | undefined) =>
@@ -456,6 +478,7 @@ export function managedIcnTarget(options: ManagedComparisonOptions): ManagedTarg
       artifactSha256: options.model.artifactSha256,
       contextLimit: options.model.contextLimit,
       instanceId: "benchmark",
+      ...(options.speculative ? { speculative: options.speculative } : {}),
     },
     parallelSequences: options.maxSequences ?? 4,
   }

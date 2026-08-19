@@ -62,7 +62,7 @@ describe("TypeScript experiments", () => {
       ...common,
       id: "target-forms",
       variants: [
-        { id: "icn", artifact: model.artifacts.gguf, engine: icn({ executable: "managed" }) },
+        { id: "icn", artifact: model.artifacts.gguf, engine: icn({ executable: "managed", speculativeDecoding: { kind: "none" } }) },
         {
           id: "remote", artifact: model.artifacts.gguf,
           engine: existingEndpoint({ endpoint: "http://127.0.0.1:8080", authentication: { kind: "none" }, requestBody: {} }),
