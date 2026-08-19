@@ -21,6 +21,7 @@ import { ProjectRelativePathSchema, type ProjectDirectoryEntry, type ProjectId, 
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { ResizableEdge } from "@/components/ui/resizable-edge"
+import { ActionTooltip } from "@/components/ui/tooltip"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -451,15 +452,27 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
         />
       ) : null}
       <header className="flex h-11 shrink-0 select-none items-center gap-2 border-b border-slate-200 px-2 dark:border-slate-800 [-webkit-app-region:drag]">
-        <Button variant="ghost" size="icon-sm" onClick={handleCollapse} className="[-webkit-app-region:no-drag]" aria-label="Collapse project files" title="Collapse project files"><PanelRight size={18} /></Button>
-        {selectedPath !== null && <Button variant="ghost" size="icon-sm" onClick={() => {
-          if (dirty) {
-            setDiscardIntent("back")
-            return
-          }
-          setDirty(false)
-          setSelectedPath(null)
-        }} className="[-webkit-app-region:no-drag]" aria-label="Back to project files"><ArrowLeft size={16} /></Button>}
+        <ActionTooltip
+          label="Collapse sidebar"
+          side="bottom"
+          trigger={<Button variant="ghost" size="icon-sm" onClick={handleCollapse} className="[-webkit-app-region:no-drag]" aria-label="Collapse sidebar"><PanelRight size={18} /></Button>}
+        />
+        {selectedPath !== null && (
+          <ActionTooltip
+            label="Back to project files"
+            side="bottom"
+            trigger={
+              <Button variant="ghost" size="icon-sm" onClick={() => {
+                if (dirty) {
+                  setDiscardIntent("back")
+                  return
+                }
+                setDirty(false)
+                setSelectedPath(null)
+              }} className="[-webkit-app-region:no-drag]" aria-label="Back to project files"><ArrowLeft size={16} /></Button>
+            }
+          />
+        )}
         <div className="min-w-0 flex-1 truncate font-sans text-[15px] font-medium text-slate-900 dark:text-slate-200">{selectedPath ?? "Project Files"}</div>
         {snapshot !== null && snapshot._tag !== "unsupported" && (
           <DropdownMenu>
@@ -469,7 +482,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <Button variant="ghost" size="icon-sm" onClick={handleCollapse} className="[-webkit-app-region:no-drag]" aria-label="Close project files" title="Close project files"><X size={16} /></Button>
+        <Button variant="ghost" size="icon-sm" onClick={handleCollapse} className="[-webkit-app-region:no-drag]" aria-label="Close project files"><X size={16} /></Button>
       </header>
       {selectedPath === null ? (
         <div className="relative min-h-0 flex-1 px-1 py-2">

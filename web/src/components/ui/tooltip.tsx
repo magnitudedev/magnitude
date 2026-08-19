@@ -1,6 +1,7 @@
 "use client"
 
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip"
+import type { ReactElement, ReactNode } from "react"
 
 import { cn } from "@/lib/utils"
 
@@ -51,4 +52,33 @@ function TooltipContent({
   )
 }
 
-export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider }
+function ActionTooltip({
+  label,
+  trigger,
+  side = "top",
+  sideOffset,
+  align,
+  alignOffset,
+}: {
+  readonly label: ReactNode
+  readonly trigger: ReactElement
+} & Pick<
+  TooltipPrimitive.Positioner.Props,
+  "align" | "alignOffset" | "side" | "sideOffset"
+>) {
+  return (
+    <Tooltip>
+      <TooltipTrigger render={trigger} />
+      <TooltipContent
+        side={side}
+        sideOffset={sideOffset}
+        align={align}
+        alignOffset={alignOffset}
+      >
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+export { ActionTooltip, Tooltip, TooltipTrigger, TooltipContent, TooltipProvider }

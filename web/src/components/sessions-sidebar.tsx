@@ -48,6 +48,7 @@ import {
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Input } from "@/components/ui/input"
 import { ResizableEdge } from "@/components/ui/resizable-edge"
+import { ActionTooltip } from "@/components/ui/tooltip"
 
 interface SessionItemData {
   readonly sessionId: string
@@ -152,17 +153,22 @@ function SettingsNavigation({
         ))}
       </nav>
       <div className="shrink-0 px-2 pb-2 [-webkit-app-region:no-drag]">
-        <Button
-          variant="unstyled"
-          size="unstyled"
-          type="button"
-          onClick={() => setAppearancePreference(nextAppearance)}
-          className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
-          aria-label={`Theme: ${appearance}`}
-          title={`Theme: ${appearance}`}
-        >
-          <AppearanceIcon size={16} />
-        </Button>
+        <ActionTooltip
+          label={`Theme: ${appearance}`}
+          side="right"
+          trigger={
+            <Button
+              variant="unstyled"
+              size="unstyled"
+              type="button"
+              onClick={() => setAppearancePreference(nextAppearance)}
+              className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
+              aria-label={`Theme: ${appearance}`}
+            >
+              <AppearanceIcon size={16} />
+            </Button>
+          }
+        />
       </div>
     </>
   )
@@ -185,40 +191,55 @@ function SidebarHeaderActions({
 }): ReactNode {
   return (
     <div className={`flex gap-1 [-webkit-app-region:no-drag] ${vertical ? "flex-col" : "items-center"}`}>
-      <Button
-        variant="unstyled"
-        size="unstyled"
-        type="button"
-        onClick={onToggleSettings}
-        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400"
-        aria-label="Settings"
-        aria-current={settingsActive ? "page" : undefined}
-        title="Settings"
-      >
-        <Gear size={17} />
-      </Button>
-      <Button
-        variant="unstyled"
-        size="unstyled"
-        type="button"
-        onClick={onToggleSidebar}
-        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-      >
-        <SidebarSimple size={18} />
-      </Button>
-      <Button
-        variant="unstyled"
-        size="unstyled"
-        type="button"
-        onClick={onCompose}
-        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
-        aria-label="New chat"
-        title="New chat"
-      >
-        <NotePencil size={18} />
-      </Button>
+      <ActionTooltip
+        label="Settings"
+        side={vertical ? "right" : "bottom"}
+        trigger={
+          <Button
+            variant="unstyled"
+            size="unstyled"
+            type="button"
+            onClick={onToggleSettings}
+            className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400"
+            aria-label="Settings"
+            aria-current={settingsActive ? "page" : undefined}
+          >
+            <Gear size={17} />
+          </Button>
+        }
+      />
+      <ActionTooltip
+        label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        side={vertical ? "right" : "bottom"}
+        trigger={
+          <Button
+            variant="unstyled"
+            size="unstyled"
+            type="button"
+            onClick={onToggleSidebar}
+            className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            <SidebarSimple size={18} />
+          </Button>
+        }
+      />
+      <ActionTooltip
+        label="New chat"
+        side={vertical ? "right" : "bottom"}
+        trigger={
+          <Button
+            variant="unstyled"
+            size="unstyled"
+            type="button"
+            onClick={onCompose}
+            className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800"
+            aria-label="New chat"
+          >
+            <NotePencil size={18} />
+          </Button>
+        }
+      />
     </div>
   )
 }
@@ -273,34 +294,42 @@ function SessionRow({
         </span>
       )}
       <div className="pointer-events-none absolute right-1 flex items-center gap-0.5 opacity-0 group-hover/session:pointer-events-auto group-hover/session:opacity-100 group-focus-within/session:pointer-events-auto group-focus-within/session:opacity-100">
-        <Button
-          variant="unstyled"
-          size="unstyled"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation()
-            onSetPinned(!pinned)
-          }}
-          className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 dark:hover:bg-slate-700 dark:hover:text-slate-200"
-          aria-label={`${pinned ? "Unpin" : "Pin"} ${title}`}
-          title={pinned ? "Unpin chat" : "Pin chat"}
-        >
-          {pinned ? <PushPinSlash size={14} /> : <PushPin size={14} />}
-        </Button>
-        <Button
-          variant="unstyled"
-          size="unstyled"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation()
-            onArchive()
-          }}
-          className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 dark:hover:bg-slate-700 dark:hover:text-slate-200"
-          aria-label={`Archive ${title}`}
-          title="Archive chat"
-        >
-          <Archive size={14} />
-        </Button>
+        <ActionTooltip
+          label={pinned ? "Unpin" : "Pin"}
+          trigger={
+            <Button
+              variant="unstyled"
+              size="unstyled"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                onSetPinned(!pinned)
+              }}
+              className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+              aria-label={`${pinned ? "Unpin" : "Pin"} ${title}`}
+            >
+              {pinned ? <PushPinSlash size={14} /> : <PushPin size={14} />}
+            </Button>
+          }
+        />
+        <ActionTooltip
+          label="Archive"
+          trigger={
+            <Button
+              variant="unstyled"
+              size="unstyled"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                onArchive()
+              }}
+              className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+              aria-label={`Archive ${title}`}
+            >
+              <Archive size={14} />
+            </Button>
+          }
+        />
       </div>
     </div>
   )

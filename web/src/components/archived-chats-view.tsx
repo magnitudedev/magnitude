@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
+import { ActionTooltip } from "@/components/ui/tooltip"
 import { notify } from "@/lib/notifications"
 
 const pluralizeChats = (count: number): string =>
@@ -178,7 +179,6 @@ export function ArchivedChatsView(): ReactNode {
               disabled={actionPending}
               onClick={() => void restore([...selectedIds])}
               aria-label="Restore selected chats"
-              title="Restore selected chats"
             >
               <ArchiveRestore data-icon="inline-start" />
               Restore
@@ -246,27 +246,35 @@ export function ArchivedChatsView(): ReactNode {
                     Last active {formatRelativeTime(session.timestamp)}
                   </span>
                   <div className="flex items-center gap-1">
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={actionPending || selectingAll}
-                      onClick={() => void restore([session.id])}
-                      aria-label={`Restore ${session.title}`}
-                      title="Restore chat"
-                    >
-                      <ArchiveRestore />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={actionPending || selectingAll}
-                      onClick={() => setDeleteIds([session.id])}
-                      aria-label={`Permanently delete ${session.title}`}
-                      title="Delete permanently"
-                      className="text-slate-500 hover:text-red-600 dark:hover:text-red-400"
-                    >
-                      <Trash2 />
-                    </Button>
+                    <ActionTooltip
+                      label="Restore chat"
+                      trigger={
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          disabled={actionPending || selectingAll}
+                          onClick={() => void restore([session.id])}
+                          aria-label={`Restore ${session.title}`}
+                        >
+                          <ArchiveRestore />
+                        </Button>
+                      }
+                    />
+                    <ActionTooltip
+                      label="Delete permanently"
+                      trigger={
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          disabled={actionPending || selectingAll}
+                          onClick={() => setDeleteIds([session.id])}
+                          aria-label={`Permanently delete ${session.title}`}
+                          className="text-slate-500 hover:text-red-600 dark:hover:text-red-400"
+                        >
+                          <Trash2 />
+                        </Button>
+                      }
+                    />
                   </div>
                 </div>
               )
