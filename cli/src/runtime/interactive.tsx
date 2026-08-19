@@ -25,6 +25,7 @@ import {
   Array as Arr,
   Deferred,
   Effect,
+  Fiber,
   Option,
   Runtime,
   Schema,
@@ -38,10 +39,8 @@ import { getLastSessionId } from "../state/last-session"
 import { CLI_VERSION } from "../version"
 import { makeCliEffectLoggingLayer } from "../platform/effect-logger"
 import {
-  detectTerminalAppearance,
   installTerminalAppearanceRuntime,
-  persistTerminalAppearance,
-  readPersistedTerminalAppearance,
+  probeTerminalAppearance,
 } from "../platform/terminal-appearance"
 import {
   makeTerminalPlatform,
@@ -53,7 +52,6 @@ import {
   type ProcessExitRequest,
 } from "../platform/process-exit"
 import { terminalAppearanceAtom } from "../hooks/use-theme"
-import { collectCliEnv } from "../utils/env"
 import type { UpdatePromptOutcome } from "../features/update/prompt"
 import { executeUpdate } from "../features/update/execute"
 import { CliUpdater, makeCliUpdater } from "../features/update/updater"
@@ -229,12 +227,12 @@ const runInteractiveSession = (
   const processExit = yield* makeProcessExitSource
   const runtime = yield* Effect.runtime<never>()
 
-  // The first frame never waits on appearance detection: paint with the last
-  // detected appearance, correct live once detection answers.
-  const persistedAppearance = yield* readPersistedTerminalAppearance
-  if (Option.isSome(persistedAppearance)) {
-    registry.set(terminalAppearanceAtom, persistedAppearance.value)
-  }
+  // The appearance probe starts with the session — concurrent with discovery
+  // and daemon work — and self-terminates within one terminal roundtrip
+  // (fence) or its 100ms ceiling, so its answer is in long before anything
+  // paints. It owns terminal input until then; the renderer is only created
+  // after it is joined.
+  const appearanceProbe = yield* Effect.forkScoped(probeTerminalAppearance())
 
   let updateSelectionHandler: (outcome: UpdatePromptOutcome) => void = () => {}
   let daemonRetryHandler: () => void = () => {}
@@ -250,18 +248,9 @@ const runInteractiveSession = (
     current: null,
   }
   const mountPresentation = (initial: CliRootState) => Effect.gen(function* () {
+    registry.set(terminalAppearanceAtom, yield* Fiber.join(appearanceProbe))
     const renderer = yield* acquireRenderer
     yield* installTerminalAppearanceRuntime(renderer, registry)
-    yield* Effect.forkScoped(detectTerminalAppearance(
-      renderer,
-      collectCliEnv(),
-      Option.getOrUndefined(persistedAppearance),
-    ).pipe(
-      Effect.tap((appearance) => Effect.sync(() => {
-        registry.set(terminalAppearanceAtom, appearance)
-      })),
-      Effect.flatMap(persistTerminalAppearance),
-    ))
     const stateAtom = makeCliRootStateAtom(initial)
     const root = yield* acquireRoot(renderer)
     yield* renderRoot(root, registry, stateAtom, callbacks)
