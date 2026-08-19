@@ -4,6 +4,7 @@ import { agentCore, contextSweep, defineExperiment, icn, type ModelArtifactDefin
 // sized as prompt budget + output budget so generation is never squeezed.
 const OUTPUT_BUDGET = 32_768
 const SMOKE_PROMPT_BUDGET = 8_192
+const LONG_CONTEXT_REQUEST_TIMEOUT_MS = 3_600_000
 
 const requestPolicy = (promptBudget: number) => ({
   contextTokensPerSequence: promptBudget + OUTPUT_BUDGET,
@@ -41,7 +42,10 @@ export const defineIcnDflashComparison = (options: {
   id: options.id,
   title: options.title,
   suite: contextSweep({ checkpoints: options.contexts, charactersPerToken: 3.5, samplesPerCheckpoint: 1 }),
-  requestPolicy: requestPolicy(Math.max(...options.contexts)),
+  requestPolicy: {
+    ...requestPolicy(Math.max(...options.contexts)),
+    requestTimeoutMs: LONG_CONTEXT_REQUEST_TIMEOUT_MS,
+  },
   variants: variants(options.target, options.drafter),
   execution: { variantOrder: "balanced", blocks: 2 },
 })
