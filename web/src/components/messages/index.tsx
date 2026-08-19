@@ -6,7 +6,7 @@
  * below are defensive — projection never emits these as message entries.
  */
 import { memo, type ReactNode } from "react"
-import type { DisplayMessage } from "@magnitudedev/sdk"
+import type { DisplayMessage, WorkSummaryMessage } from "@magnitudedev/sdk"
 
 import { UserMessage } from "./user-message"
 import { QueuedUserMessage } from "./queued-user-message"
@@ -25,6 +25,8 @@ export interface MessageDispatchProps {
   isStreaming?: boolean
   isInterrupted?: boolean
   mode?: "default" | "transcript"
+  assistantWorkSummary?: WorkSummaryMessage | null
+  isLatestAssistant?: boolean
 }
 
 /** Render a single (non-clustered) message by dispatching on its type */
@@ -33,6 +35,8 @@ function MessageDispatchImpl({
   isStreaming = false,
   isInterrupted = false,
   mode = "default",
+  assistantWorkSummary = null,
+  isLatestAssistant = false,
 }: MessageDispatchProps): ReactNode {
   switch (message.type) {
     case "user_message":
@@ -47,6 +51,8 @@ function MessageDispatchImpl({
           message={message}
           isStreaming={isStreaming}
           isInterrupted={isInterrupted}
+          isLatest={isLatestAssistant}
+          workSummary={assistantWorkSummary}
         />
       )
     case "thinking":
@@ -82,5 +88,7 @@ export const MessageDispatch = memo(
     prev.message === next.message &&
     prev.isStreaming === next.isStreaming &&
     prev.isInterrupted === next.isInterrupted &&
-    prev.mode === next.mode
+    prev.mode === next.mode &&
+    prev.assistantWorkSummary === next.assistantWorkSummary &&
+    prev.isLatestAssistant === next.isLatestAssistant
 )

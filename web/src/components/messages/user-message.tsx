@@ -3,26 +3,22 @@
  *
  * Compact right-aligned bubble. Attachments row. Metadata with copy + timestamp.
  */
-import { useState, type ReactNode } from "react"
+import { type ReactNode } from "react"
 import type {
   UserMessage as UserMessageType,
   DisplayAttachment,
 } from "@magnitudedev/sdk"
-import { CopyButton, Timestamp, AttachmentPill } from "./shared"
+import { CopyButton, RelativeTimestamp, AttachmentPill } from "./shared"
 export function UserMessage({
   message,
 }: {
   message: UserMessageType
 }): ReactNode {
-  const [hovered, setHovered] = useState(false)
   const hasContent = message.content.trim().length > 0
-  const showMetadata = hovered || message.attachments.length > 0
   return (
     <div
       data-task-mode={message.taskMode}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      className="flex flex-col items-end"
+      className="group/user flex flex-col items-end"
     >
       <div className="flex w-[min(720px,72%)] flex-col items-end">
         {hasContent && (
@@ -49,12 +45,11 @@ export function UserMessage({
         )}
 
         <div
-          className={`${
-            showMetadata ? "opacity-100" : "opacity-0"
-          } mt-2 flex min-h-[22px] items-center justify-end gap-2 px-0.5 transition-opacity duration-100`}
+          data-user-metadata=""
+          className="mt-2 flex min-h-[22px] items-center justify-end gap-2 px-0.5 opacity-0 transition-opacity duration-100 group-hover/user:opacity-100 group-focus-within/user:opacity-100"
         >
-          {hasContent && <CopyButton text={message.content} />}
-          <Timestamp ts={message.timestamp} />
+          <RelativeTimestamp ts={message.timestamp} />
+          {hasContent && <CopyButton text={message.content} label="Copy message" iconOnly />}
         </div>
       </div>
     </div>
