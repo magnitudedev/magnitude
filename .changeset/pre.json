@@ -37,6 +37,7 @@
     "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
-    "cool-clouds-unite"
+    "cool-clouds-unite",
+    "thirty-horses-wink"
   ]
 }
