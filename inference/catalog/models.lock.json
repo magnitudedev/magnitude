@@ -10,7 +10,10 @@
   "laguna-s-2.1": { "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6" },
   "lfm2.5-2.6b": { "target": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc" },
   "lfm2.5-8b-a1b": { "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0" },
-  "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5" },
+  "muse-glimmer-30b": {
+    "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5",
+    "speculativeDraft": "5963a0ad803c2493da70252bb00174cd574bb8bf"
+  },
   "nemotron-3-super-120b-a12b": { "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb" },
   "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
   "nemotron-3.5-lightning-30b-a3b": {
@@ -28,5 +31,8 @@
     "target": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "speculativeDraft": "0e8061d252dbac5a1b4abe506bf2b7613d438f87"
   },
-  "qwen3.8-27b": { "target": "fdd03b8bbd279c1694563650e79d85a2373d9934" }
+  "qwen3.8-27b": {
+    "target": "fdd03b8bbd279c1694563650e79d85a2373d9934",
+    "speculativeDraft": "6cb5872e2cee6b4e780a8414922350be8e42d65c"
+  }
 }

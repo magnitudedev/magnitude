@@ -42,8 +42,8 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaGpuLayers, LlamaModelParams};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::speculative::{
-    SpeculativeMethod as NativeSpeculativeMethod, SpeculativeOperations, SpeculativeParams,
-    SpeculativeSession, SpeculativeVerificationResolution,
+    SpeculativeDraft, SpeculativeMethod as NativeSpeculativeMethod, SpeculativeOperations,
+    SpeculativeParams, SpeculativeSession, SpeculativeVerificationResolution,
 };
 use llama_cpp_2::token::LlamaToken;
 use sha2::{Digest, Sha256};
@@ -428,10 +428,12 @@ struct ActiveRequest<'model> {
     generation_limit: usize,
     generated_tokens: usize,
     speculative_started: bool,
-    speculative_draft: Vec<LlamaToken>,
+    speculative_draft: SpeculativeDraft,
     speculative_indices: Vec<i32>,
     speculative_replaying: bool,
+    sampling_temperature: f32,
     draft_tokens: usize,
+    proposal_distribution_draft_tokens: usize,
     accepted_draft_tokens: usize,
     draft_ms: f64,
     verification_ms: f64,
@@ -2080,6 +2082,8 @@ fn decode_batch<'model>(
                     token,
                     &request.token_history,
                     n_max,
+                    request.sampling_temperature,
+                    request.sampler.seed(),
                 )
                 .map_err(backend_error)?;
             extra_budget -= n_max;
@@ -2097,6 +2101,11 @@ fn decode_batch<'model>(
                 request.draft_tokens = request
                     .draft_tokens
                     .saturating_add(request.speculative_draft.len());
+                if request.speculative_draft.has_proposal_distributions() {
+                    request.proposal_distribution_draft_tokens = request
+                        .proposal_distribution_draft_tokens
+                        .saturating_add(request.speculative_draft.len());
+                }
                 request.draft_ms += elapsed;
             }
         }
@@ -2174,7 +2183,13 @@ fn decode_batch<'model>(
                     commit.record_logits(sequence_id, batch.n_tokens() - 1);
                 } else {
                     let mut indices = vec![batch.n_tokens() - 1];
-                    for (offset, draft) in request.speculative_draft.iter().copied().enumerate() {
+                    for (offset, draft) in request
+                        .speculative_draft
+                        .tokens()
+                        .iter()
+                        .copied()
+                        .enumerate()
+                    {
                         let draft_position = position.advance(offset + 1).ok_or_else(|| {
                             InferenceError::Backend(
                                 "speculative position exceeded its numeric range".into(),
@@ -2300,9 +2315,10 @@ fn verify_speculative_batch<'model>(
         };
         let sampler_checkpoint = request.sampler.snapshot().map_err(backend_error)?;
         let proposed_drafts = request.speculative_draft.len();
+        let has_proposal_distributions = request.speculative_draft.has_proposal_distributions();
         let accepted = request
             .sampler
-            .sample_and_accept_n(
+            .sample_and_accept_draft(
                 context,
                 &request.speculative_indices,
                 &request.speculative_draft,
@@ -2315,6 +2331,13 @@ fn verify_speculative_batch<'model>(
             ));
         }
         let accepted_drafts = accepted.len() - 1;
+        tracing::debug!(
+            sequence_id,
+            proposed_drafts,
+            accepted_drafts,
+            has_proposal_distributions,
+            "verified speculative draft"
+        );
         let next_position = verification_start_position
             .advance(1_usize.saturating_add(accepted_drafts))
             .ok_or_else(|| {
@@ -2335,7 +2358,7 @@ fn verify_speculative_batch<'model>(
                 .sampler
                 .restore(&sampler_checkpoint)
                 .map_err(backend_error)?;
-            request.speculative_draft = accepted;
+            request.speculative_draft = SpeculativeDraft::from_tokens(accepted);
             request.speculative_indices.clear();
             request.speculative_replaying = true;
             continue;
@@ -3292,10 +3315,12 @@ impl<'model> ActiveRequest<'model> {
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
                 speculative_started: false,
-                speculative_draft: Vec::new(),
+                speculative_draft: SpeculativeDraft::default(),
                 speculative_indices: Vec::new(),
                 speculative_replaying: false,
+                sampling_temperature: request.temperature,
                 draft_tokens: 0,
+                proposal_distribution_draft_tokens: 0,
                 accepted_draft_tokens: 0,
                 draft_ms: 0.0,
                 verification_ms: 0.0,
@@ -3482,6 +3507,7 @@ impl<'model> ActiveRequest<'model> {
                 sampler_ms: self.sampler.performance().sample_milliseconds,
                 parser_ms: self.semantic.parser_ms(),
                 draft_tokens: self.draft_tokens,
+                proposal_distribution_draft_tokens: self.proposal_distribution_draft_tokens,
                 accepted_draft_tokens: self.accepted_draft_tokens,
                 draft_ms: self.draft_ms,
                 verification_ms: self.verification_ms,
@@ -4162,6 +4188,93 @@ mod tests {
         fn phase_started(&self, _phase: ModelLoadPhase) {}
 
         fn phase_completed(&self, _phase: ModelLoadPhase) {}
+    }
+
+    #[test]
+    #[ignore = "loads target and DFlash2 GGUFs selected through ICN_DFLASH2_TEST_* variables"]
+    fn dflash2_uses_proposal_distributions_with_real_model() {
+        disable_native_diagnostics();
+        let required_path = |name: &str| {
+            let path = PathBuf::from(
+                std::env::var_os(name).unwrap_or_else(|| panic!("{name} must name a local file")),
+            );
+            assert!(path.is_file(), "missing {}", path.display());
+            path
+        };
+        let model_path = required_path("ICN_DFLASH2_TEST_MODEL");
+        let draft_path = required_path("ICN_DFLASH2_TEST_DRAFT");
+
+        let speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
+            source: icn_contracts::SpeculativeDraftSource::Separate {
+                model_path: draft_path,
+            },
+            method: icn_contracts::SpeculativeMethodConfig::DFlash {
+                min_sample_probability: 0.1,
+            },
+            n_max: 3,
+            n_min: 0,
+            cache_type_k: CacheType::F16,
+            cache_type_v: CacheType::F16,
+        };
+        let native = NativeBackend::initialize().expect("initialize native backend");
+        let hardware = native.discover_hardware(
+            icn_hardware::CapacityPolicy::default(),
+            "real-dflash2-distribution-test",
+            Vec::new(),
+        );
+        let mut defaults = model_plan_defaults();
+        defaults.context_size = 4_096;
+        defaults.physical_context_size = 4_096;
+        defaults.batch_size = 512;
+        defaults.ubatch_size = 512;
+        defaults.max_sequences = 1;
+        defaults.prefill_quantum = 128;
+        let mut intent = execution_intent(model_path, None, &defaults);
+        intent.speculative = speculative.clone();
+        let prepared = native
+            .prepare_load(
+                "installed-dflash2-distribution-test",
+                intent,
+                speculative,
+                hardware,
+            )
+            .expect("prepare DFlash2 model load");
+        let backend = prepared
+            .execute(Arc::new(NoopLoadObserver))
+            .expect("load DFlash2 model");
+
+        let mut completion = request();
+        completion.template.messages = vec![ChatMessage::text(
+            ChatRole::User,
+            "Explain in several sentences why speculative decoding can preserve the target model's sampling distribution.",
+        )];
+        completion.max_tokens = 48;
+        completion.temperature = 0.8;
+        completion.seed = 42;
+        completion.ignore_eos = true;
+        let generation = backend
+            .complete(completion, &mut |_| Ok(()))
+            .expect("complete DFlash2 request");
+
+        assert!(
+            generation.metrics.draft_tokens > 0,
+            "DFlash2 produced no draft tokens"
+        );
+        assert_eq!(
+            generation.metrics.proposal_distribution_draft_tokens, generation.metrics.draft_tokens,
+            "not every DFlash2 draft carried a proposal distribution"
+        );
+        assert!(
+            generation.metrics.accepted_draft_tokens > 0,
+            "DFlash2 accepted no draft tokens"
+        );
+        eprintln!(
+            "dflash2 drafted={} distribution_drafted={} accepted={} generated={}",
+            generation.metrics.draft_tokens,
+            generation.metrics.proposal_distribution_draft_tokens,
+            generation.metrics.accepted_draft_tokens,
+            generation.generated_tokens,
+        );
     }
 
     #[test]
