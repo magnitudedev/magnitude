@@ -1,10 +1,9 @@
-import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { installMethodFromEnvironment } from "./install-context"
 import { updateActionFor, updateCommandString } from "./package-manager-actions"
 
 describe("package-manager update actions", () => {
-  it("maps launcher provenance to Codex-style global update commands", () => {
+  it("maps launcher provenance to version-pinned global update commands", () => {
     expect(installMethodFromEnvironment({ MAGNITUDE_MANAGED_BY: "npm" }))
       .toBe("npm")
     expect(installMethodFromEnvironment({ MAGNITUDE_MANAGED_BY: "bun" }))
@@ -15,12 +14,11 @@ describe("package-manager update actions", () => {
       .toBe("other")
     expect(installMethodFromEnvironment({})).toBe("other")
 
-    expect(updateCommandString(Option.getOrThrow(updateActionFor("npm"))))
-      .toBe("npm install -g @magnitudedev/cli")
-    expect(updateCommandString(Option.getOrThrow(updateActionFor("bun"))))
-      .toBe("bun install -g @magnitudedev/cli")
-    expect(updateCommandString(Option.getOrThrow(updateActionFor("pnpm"))))
-      .toBe("pnpm add -g @magnitudedev/cli")
-    expect(Option.isNone(updateActionFor("other"))).toBe(true)
+    expect(updateCommandString(updateActionFor("npm", "1.2.3")))
+      .toBe("npm install -g @magnitudedev/cli@1.2.3")
+    expect(updateCommandString(updateActionFor("bun", "1.2.3")))
+      .toBe("bun install -g @magnitudedev/cli@1.2.3")
+    expect(updateCommandString(updateActionFor("pnpm", "1.2.3")))
+      .toBe("pnpm add -g @magnitudedev/cli@1.2.3")
   })
 })
