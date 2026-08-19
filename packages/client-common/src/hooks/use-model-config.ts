@@ -97,6 +97,11 @@ export function useModelConfig() {
     providerModelId: ProviderModelId,
   ): void => commit(slotId, Option.some(selectionFor(slotId, providerId, providerModelId))), [commit, selectionFor])
 
+  const updateSlotSelection = useMemo(() => (
+    slotId: SlotId,
+    selection: SlotSelection,
+  ): void => commit(slotId, Option.some(selection)), [commit])
+
   const clearSlot = useMemo(() => (slotId: SlotId) => commit(slotId, Option.none()), [commit])
 
   const updateSlotReasoning = useMemo(() => (slotId: SlotId, effort: ReasoningEffort): void => {
@@ -125,6 +130,7 @@ export function useModelConfig() {
     favoriteModels,
     setModelFavorite,
     updateSlotModel,
+    updateSlotSelection,
     clearSlot,
     updateSlotReasoning,
     resetToDefaults: () => {

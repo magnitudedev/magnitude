@@ -111,6 +111,8 @@ import {
   isRoleId,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
+  ProviderModelCatalogLifecycle,
+  ReasoningEffortSchema,
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
@@ -536,6 +538,9 @@ function FooterBarContainer({
 }: {
   slotProfiles: SlotProfiles | null
 }): ReactNode {
+  const hasMessages = useDisplayState(
+    (state) => (state.timelines.root?.messages.order.length ?? 0) > 0
+  )
   const context = useDisplayState(
     (state) => state.actors["root"]?.context ?? null
   )
@@ -583,13 +588,23 @@ function FooterBarContainer({
       return control._tag === "Available" ? control.options : []
     },
   })
-  const thinkingLevel = profile?.reasoningEffort
+  const thinkingLevel = thinkingOptions.length > 0 && profile?.reasoningEffort
     ? formatReasoningEffort(profile.reasoningEffort)
     : null
   const openHardware = useCallback(() => {
     setSettingsTab("hardware")
   }, [setSettingsTab])
   const localModels = Option.getOrNull(Result.value(localModelsResult))
+  const providerCatalog = Option.match(Result.value(catalogResult), {
+    onNone: () => ({ _tag: "Loading" as const, models: [] }),
+    onSome: (state) => ProviderModelCatalogLifecycle.match(state, {
+      Loading: () => ({ _tag: "Loading" as const, models: [] }),
+      Ready: ({ models }) => ({ _tag: "Ready" as const, models }),
+      Refreshing: ({ models }) => ({ _tag: "Loading" as const, models }),
+      Degraded: ({ models }) => ({ _tag: "Degraded" as const, models }),
+      Unavailable: () => ({ _tag: "Failed" as const, models: [] }),
+    }),
+  })
   const modelOptions = Option.match(Result.value(localModelsResult), {
     onNone: () => [],
     onSome: (state) =>
@@ -601,10 +616,24 @@ function FooterBarContainer({
           ) {
             return []
           }
+          const providerModelId = model.servingState.availabilityState.providerModelId
+          const providerModel = providerCatalog.models.find((candidate) =>
+            candidate.providerId === "local"
+            && candidate.providerModelId === providerModelId)
+          // The compound picker commits model and reasoning atomically. A model
+          // is not selectable until its authoritative reasoning capabilities
+          // have arrived from the provider catalog.
+          if (providerModel === undefined) return []
+          const thinkingControl = reasoningEffortControl(providerModel)
           return [
             {
-              value: model.servingState.availabilityState.providerModelId,
+              value: providerModelId,
               label: formatLocalModelDisplayName(model),
+              thinkingOptions: thinkingControl._tag === "Available" ? thinkingControl.options : [],
+              defaultThinkingEffort: Option.getOrElse(
+                providerModel.capabilities.reasoning.defaultEffort,
+                () => ReasoningEffortSchema.make("none"),
+              ),
             },
           ]
         })
@@ -612,13 +641,17 @@ function FooterBarContainer({
   })
   const modelOptionsState: FooterModelOptionsState =
     Result.isFailure(localModelsResult) ||
-    localModels?.discoveryState._tag === "Failed"
+    Result.isFailure(catalogResult) ||
+    localModels?.discoveryState._tag === "Failed" ||
+    providerCatalog._tag === "Failed"
       ? { _tag: "Failed", options: modelOptions }
-      : localModels?.inventoryState._tag === "Degraded"
+      : localModels?.inventoryState._tag === "Degraded" ||
+        providerCatalog._tag === "Degraded"
       ? { _tag: "Degraded", options: modelOptions }
       : localModels === null ||
         localModels.inventoryState._tag === "Initializing" ||
-        localModels.discoveryState._tag === "Loading"
+        localModels.discoveryState._tag === "Loading" ||
+        providerCatalog._tag === "Loading"
       ? { _tag: "Loading", options: modelOptions }
       : { _tag: "Ready", options: modelOptions }
   const primarySlot = slots?.slots.primary
@@ -637,6 +670,7 @@ function FooterBarContainer({
   return (
     <FooterBar
       context={context}
+      showContext={hasMessages}
       tokenCap={tokenCap}
       model={modelLabel}
       thinkingLevel={thinkingLevel}
@@ -645,12 +679,12 @@ function FooterBarContainer({
       thinkingOptions={thinkingOptions}
       modelOptionsState={modelOptionsState}
       selectedModelId={selectedModelId}
-      onModelSelect={(providerModelId) => {
-        modelConfig.updateSlotModel(
-          PRIMARY_SLOT_ID,
-          ProviderIdSchema.make("local"),
-          providerModelId
-        )
+      onSelectionCommit={(providerModelId, reasoningEffort) => {
+        modelConfig.updateSlotSelection(PRIMARY_SLOT_ID, {
+          providerId: ProviderIdSchema.make("local"),
+          providerModelId,
+          reasoningEffort,
+        })
       }}
       onThinkingSelect={(effort) => {
         modelConfig.updateSlotReasoning(PRIMARY_SLOT_ID, effort)

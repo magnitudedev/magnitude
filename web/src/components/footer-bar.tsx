@@ -8,18 +8,24 @@ import { type ReasoningEffortOption } from "@magnitudedev/client-common"
 import type { ContextUsageDisplay, ProviderModelId, ReasoningEffort } from "@magnitudedev/sdk"
 import { ContextUsageIndicator } from "./context-usage-indicator"
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
-import { Loader2 } from "lucide-react"
+import { Spinner } from "@/components/ui/spinner"
+import { CaretDownIcon, RocketLaunchIcon } from "@phosphor-icons/react"
 
 export interface FooterModelOption {
   readonly value: ProviderModelId
   readonly label: string
+  readonly thinkingOptions: readonly ReasoningEffortOption[]
+  readonly defaultThinkingEffort: ReasoningEffort
 }
 
 export type FooterModelOptionsState =
@@ -31,6 +37,8 @@ export type FooterModelOptionsState =
 export interface FooterBarProps {
   /** Context usage info from timeline */
   context: ContextUsageDisplay | null
+  /** Whether the root chat has sent or restored at least one message. */
+  showContext?: boolean
   /** Token cap (max context window tokens), if known */
   tokenCap?: number | null
   /** Bash mode active */
@@ -49,128 +57,225 @@ export interface FooterBarProps {
   modelOptionsState?: FooterModelOptionsState
   /** Currently selected provider-model identity. */
   selectedModelId?: ProviderModelId | null
-  /** Applies an installed model to the primary model slot. */
-  onModelSelect?: (providerModelId: ProviderModelId) => void
+  /** Atomically applies an installed model and reasoning effort to the primary model slot. */
+  onSelectionCommit?: (
+    providerModelId: ProviderModelId,
+    effort: ReasoningEffort,
+  ) => void
   /** Click handler for resident memory (opens Hardware) */
   onMemoryClick?: () => void
   /** Reasoning efforts supported by the selected model. */
   thinkingOptions?: readonly ReasoningEffortOption[]
   /** Currently selected reasoning effort. */
   thinkingEffort?: ReasoningEffort | null
-  /** Applies a reasoning effort to the primary model slot. */
+  /** Applies a reasoning effort to the currently selected primary model. */
   onThinkingSelect?: (effort: ReasoningEffort) => void
 }
 
-interface FooterDropdownOption<Value extends string> {
-  readonly value: Value
-  readonly label: string
-}
-
-function FooterDropdown<Value extends string>({
-  label,
-  value,
-  options,
-  open,
-  tone,
-  availability = "Ready",
-  onOpenChange,
-  onSelect,
+function ModelThinkingMenu({
+  modelLabel,
+  thinkingLabel,
+  optionsState,
+  selectedModelId,
+  thinkingEffort,
+  currentThinkingOptions,
+  onSelectionCommit,
+  onThinkingSelect,
 }: {
-  readonly label: string
-  readonly value: Value | null
-  readonly options: readonly FooterDropdownOption<Value>[]
-  readonly open: boolean
-  readonly tone: "model" | "reasoning"
-  readonly availability?: "Loading" | "Ready" | "Degraded" | "Failed"
-  readonly onOpenChange: (open: boolean) => void
-  readonly onSelect: (value: Value) => void
+  readonly modelLabel: string
+  readonly thinkingLabel: string | null
+  readonly optionsState: FooterModelOptionsState
+  readonly selectedModelId: ProviderModelId | null
+  readonly thinkingEffort: ReasoningEffort | null
+  readonly currentThinkingOptions: readonly ReasoningEffortOption[]
+  readonly onSelectionCommit?: (providerModelId: ProviderModelId, effort: ReasoningEffort) => void
+  readonly onThinkingSelect?: (effort: ReasoningEffort) => void
 }): React.ReactNode {
-  const selected = value !== null
-  const menuOptions =
-    tone === "model" &&
-    value !== null &&
-    !options.some((option) => option.value === value)
-      ? [{ value, label }, ...options]
-      : options
-  const hasAvailabilityNotice = availability !== "Ready"
-  const enabled = menuOptions.length > 0 || hasAvailabilityNotice
-  const availabilityLabel =
-    availability === "Loading"
+  const [open, setOpen] = useState(false)
+  const [modelOpen, setModelOpen] = useState(false)
+  const [thinkingOpen, setThinkingOpen] = useState(false)
+  const [pendingModelId, setPendingModelId] = useState<ProviderModelId | null>(null)
+  const draftModelId = pendingModelId ?? selectedModelId
+  const draftModel = optionsState.options.find((option) => option.value === draftModelId) ?? null
+  const draftThinkingOptions = draftModel?.thinkingOptions
+    ?? (draftModelId === selectedModelId ? currentThinkingOptions : [])
+  const draftThinkingLabel = draftModelId === selectedModelId
+    ? thinkingLabel
+      ?? draftThinkingOptions.find((option) => option.value === thinkingEffort)?.label
+      ?? "None"
+    : "Choose"
+  const triggerModelLabel = selectedModelId === null
+    ? optionsState._tag === "Loading"
       ? "Loading models…"
-      : availability === "Degraded"
+      : optionsState._tag === "Failed"
+      ? "Models unavailable"
+      : modelLabel
+    : modelLabel
+  const hasAvailabilityNotice = optionsState._tag !== "Ready"
+  const canChooseModel = optionsState.options.length > 0
+  const canChooseThinking = selectedModelId !== null && currentThinkingOptions.length > 0
+  const menuAvailable = canChooseModel || canChooseThinking || hasAvailabilityNotice
+  const availabilityLabel =
+    optionsState._tag === "Loading"
+      ? "Loading models…"
+      : optionsState._tag === "Degraded"
       ? "Some installed models are unavailable."
-      : availability === "Failed"
-      ? menuOptions.length > 0
+      : optionsState._tag === "Failed"
+      ? optionsState.options.length > 0
         ? "Some models could not be loaded."
         : "Unable to load models."
       : null
-  return (
-    <Select
-      value={value}
-      open={open}
-      onOpenChange={onOpenChange}
-      onValueChange={(nextValue) => onSelect(nextValue as Value)}
-      disabled={!enabled}
-    >
-      <SelectTrigger
-        aria-label={`${
-          tone === "model" ? "Model" : "Thinking level"
-        }: ${label}`}
-        aria-busy={availability === "Loading" || undefined}
-        variant="inline"
-        showIcon={false}
-        className={`h-auto min-w-0 px-1.5 py-1 text-[14px] leading-5 ${
-          tone === "reasoning"
-            ? "text-violet-700 enabled:hover:bg-slate-100 dark:text-violet-400 dark:enabled:hover:bg-slate-750"
-            : selected
-            ? "text-slate-900 data-placeholder:text-slate-900 enabled:hover:bg-slate-100 dark:text-slate-50 dark:data-placeholder:text-slate-50 dark:enabled:hover:bg-slate-750"
-            : "text-slate-700 enabled:hover:bg-slate-100 dark:text-slate-300 dark:enabled:hover:bg-slate-750"
-        }`}
+
+  const resetDraft = () => {
+    setPendingModelId(null)
+    setModelOpen(false)
+    setThinkingOpen(false)
+  }
+  const chooseModel = (providerModelId: ProviderModelId) => {
+    const option = optionsState.options.find((candidate) => candidate.value === providerModelId)
+    if (option === undefined) return
+    setPendingModelId(providerModelId)
+    setModelOpen(false)
+    if (option.thinkingOptions.length === 0) {
+      onSelectionCommit?.(providerModelId, option.defaultThinkingEffort)
+      setOpen(false)
+      return
+    }
+    setThinkingOpen(true)
+  }
+  const chooseThinking = (effort: ReasoningEffort) => {
+    if (draftModelId === null) return
+    if (draftModelId === selectedModelId) onThinkingSelect?.(effort)
+    else onSelectionCommit?.(draftModelId, effort)
+    setOpen(false)
+  }
+
+  if (!menuAvailable && selectedModelId !== null) {
+    return (
+      <div
+        className="inline-flex h-auto min-w-0 items-center gap-1.5 px-1.5 py-1 text-[14px] font-medium leading-5 text-slate-900 dark:text-slate-50"
+        aria-label={`Model: ${triggerModelLabel}${thinkingLabel === null ? "" : `. Thinking level: ${thinkingLabel}`}`}
       >
-        {availability === "Loading" && !selected ? (
-          <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+        <RocketLaunchIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" aria-hidden="true" />
+        <span className="min-w-0 truncate">{triggerModelLabel}</span>
+        {thinkingLabel !== null ? (
+          <span className="shrink-0 text-slate-500 dark:text-slate-400">{thinkingLabel}</span>
         ) : null}
-        <SelectValue>{label}</SelectValue>
-      </SelectTrigger>
-      <SelectContent
+      </div>
+    )
+  }
+
+  return (
+    <DropdownMenu
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen)
+        if (!nextOpen) resetDraft()
+      }}
+      disabled={!menuAvailable}
+    >
+      <DropdownMenuTrigger
+        render={(
+          <Button
+            type="button"
+            variant="unstyled"
+            size="unstyled"
+            disabled={!menuAvailable}
+            className="inline-flex h-auto min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-[14px] font-medium leading-5 text-slate-900 outline-none transition-colors hover:bg-slate-150 focus-visible:bg-slate-150 aria-expanded:bg-slate-150 dark:text-slate-50 dark:hover:bg-slate-750 dark:focus-visible:bg-slate-750 dark:aria-expanded:bg-slate-750"
+            aria-label={`Model: ${triggerModelLabel}${thinkingLabel === null ? "" : `. Thinking level: ${thinkingLabel}`}`}
+            aria-busy={optionsState._tag === "Loading" || undefined}
+          >
+            {optionsState._tag === "Loading" && selectedModelId === null ? (
+              <Spinner className="size-3.5 shrink-0 text-slate-500" aria-hidden="true" />
+            ) : (
+              <RocketLaunchIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" aria-hidden="true" />
+            )}
+            <span className="min-w-0 truncate">{triggerModelLabel}</span>
+            {thinkingLabel !== null ? (
+              <span className="shrink-0 text-slate-500 dark:text-slate-400">{thinkingLabel}</span>
+            ) : null}
+            <CaretDownIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" aria-hidden="true" />
+          </Button>
+        )}
+      />
+      <DropdownMenuContent
         side="top"
         sideOffset={9}
         align="start"
-        className={`max-h-[min(320px,calc(100vh-48px))] border border-slate-300 p-1.5 dark:border-slate-600 dark:bg-slate-750 ${
-          tone === "model" ? "w-max min-w-[260px]" : "w-[168px]"
-        }`}
+        className="w-[296px] p-1.5"
       >
-        {menuOptions.map((option) => (
-          <SelectItem
-            key={option.value}
-            value={option.value}
-            className={
-              tone === "reasoning"
-                ? "text-[12px] leading-[1.35] data-selected:bg-violet-200 data-selected:text-violet-700 dark:data-selected:bg-violet-700 dark:data-selected:text-violet-200"
-                : "text-[12px] leading-[1.35] data-selected:bg-blue-200 data-selected:text-slate-900 dark:data-selected:bg-blue-700 dark:data-selected:text-slate-50"
-            }
+        <DropdownMenuSub
+          open={modelOpen}
+          onOpenChange={(nextOpen) => {
+            setModelOpen(nextOpen)
+            if (nextOpen) setThinkingOpen(false)
+          }}
+        >
+          <DropdownMenuSubTrigger
+            openOnHover
+            disabled={optionsState.options.length === 0}
+            className="grid grid-cols-[88px_minmax(0,1fr)_16px] text-[13px] [&>svg:last-child]:ml-0"
           >
-            {option.label}
-          </SelectItem>
-        ))}
+            <span>Model</span>
+            <span className="min-w-0 truncate text-left text-slate-500 dark:text-slate-400">
+              {draftModel?.label ?? triggerModelLabel}
+            </span>
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent side="right" className="max-h-[320px] min-w-[280px] overflow-y-auto p-1.5">
+            <DropdownMenuRadioGroup value={draftModelId} onValueChange={(value) => chooseModel(value as ProviderModelId)}>
+              {optionsState.options.map((option) => (
+                <DropdownMenuRadioItem key={option.value} value={option.value} closeOnClick={false}>
+                  <span className="truncate">{option.label}</span>
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+        {draftThinkingOptions.length > 0 ? (
+          <DropdownMenuSub
+            open={thinkingOpen}
+            onOpenChange={(nextOpen) => {
+              setThinkingOpen(nextOpen)
+              if (nextOpen) setModelOpen(false)
+            }}
+          >
+            <DropdownMenuSubTrigger
+              openOnHover
+              className="grid grid-cols-[88px_minmax(0,1fr)_16px] text-[13px] [&>svg:last-child]:ml-0"
+            >
+              <span>Thinking</span>
+              <span className="min-w-0 truncate text-left text-slate-500 dark:text-slate-400">{draftThinkingLabel}</span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent side="right" className="min-w-[168px] p-1.5">
+              <DropdownMenuRadioGroup value={draftModelId === selectedModelId ? thinkingEffort : null} onValueChange={(value) => chooseThinking(value as ReasoningEffort)}>
+                {draftThinkingOptions.map((option) => (
+                  <DropdownMenuRadioItem key={option.value} value={option.value} closeOnClick>
+                    {option.label}
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ) : null}
         {availabilityLabel ? (
           <div
             role="status"
             className="flex items-center gap-2 px-2 py-2 text-[12px] leading-[1.35] text-slate-500 dark:text-slate-300"
           >
-            {availability === "Loading" ? (
-              <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+            {optionsState._tag === "Loading" ? (
+              <Spinner className="size-3.5 shrink-0" aria-hidden="true" />
             ) : null}
             <span>{availabilityLabel}</span>
           </div>
         ) : null}
-      </SelectContent>
-    </Select>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
 export function FooterBar({
   context,
+  showContext = false,
   tokenCap,
   bashMode,
   model,
@@ -180,15 +285,14 @@ export function FooterBar({
   transcriptMode,
   modelOptionsState = { _tag: "Ready", options: [] },
   selectedModelId,
-  onModelSelect,
+  onSelectionCommit,
   onMemoryClick,
   thinkingOptions = [],
   thinkingEffort,
   onThinkingSelect,
 }: FooterBarProps): React.ReactNode {
-  const [openDropdown, setOpenDropdown] = useState<"model" | "reasoning" | null>(null)
   return (
-    <div className="flex min-h-7 shrink-0 items-center bg-transparent pr-9 font-sans">
+    <div className="flex min-h-7 shrink-0 items-center bg-transparent pr-12 font-sans">
       <div className="flex min-w-0 flex-wrap items-center gap-1">
         {bashMode && (
           <span className="text-[11px] text-orange-700 dark:text-orange-500 shrink-0">
@@ -205,51 +309,21 @@ export function FooterBar({
             Transcript Mode
           </span>
         )}
-
-        {!bashMode && model && (
-          <FooterDropdown
-            label={
-              selectedModelId === null || selectedModelId === undefined
-                ? modelOptionsState._tag === "Loading"
-                  ? "Loading models…"
-                  : modelOptionsState._tag === "Failed"
-                  ? "Models unavailable"
-                  : model
-                : model
-            }
-            value={selectedModelId ?? null}
-            options={onModelSelect ? modelOptionsState.options : []}
-            open={openDropdown === "model"}
-            tone="model"
-            availability={modelOptionsState._tag}
-            onOpenChange={(open) => setOpenDropdown(open ? "model" : null)}
-            onSelect={(providerModelId) => onModelSelect?.(providerModelId)}
-          />
-        )}
-        {!bashMode && thinkingLevel && (
-          <FooterDropdown
-            label={thinkingLevel}
-            value={thinkingEffort ?? null}
-            options={onThinkingSelect ? thinkingOptions : []}
-            open={openDropdown === "reasoning"}
-            tone="reasoning"
-            onOpenChange={(open) => setOpenDropdown(open ? "reasoning" : null)}
-            onSelect={(effort) => onThinkingSelect?.(effort)}
-          />
-        )}
-        {!bashMode && (
-          <>
-            {memoryLabel && (
-              <Button
-                type="button"
-                onClick={onMemoryClick}
-                disabled={!onMemoryClick}
-                variant="ghost"
-                className="h-auto whitespace-nowrap px-1.5 py-1 text-[12px] leading-none text-slate-500"
-              >
-                {memoryLabel}
-              </Button>
-            )}
+      </div>
+      {!bashMode && (
+        <div className="ml-auto flex min-w-0 items-center gap-1">
+          {memoryLabel && (
+            <Button
+              type="button"
+              onClick={onMemoryClick}
+              disabled={!onMemoryClick}
+              variant="ghost"
+              className="h-auto whitespace-nowrap px-1.5 py-1 text-[12px] leading-none text-slate-500"
+            >
+              {memoryLabel}
+            </Button>
+          )}
+          {showContext ? (
             <span className="inline-flex px-1.5 py-1">
               <ContextUsageIndicator
                 context={context}
@@ -260,9 +334,21 @@ export function FooterBar({
                 tooltipPlacement="above-center"
               />
             </span>
-          </>
-        )}
-      </div>
+          ) : null}
+          {model ? (
+            <ModelThinkingMenu
+              modelLabel={model}
+              thinkingLabel={thinkingLevel ?? null}
+              optionsState={modelOptionsState}
+              selectedModelId={selectedModelId ?? null}
+              thinkingEffort={thinkingEffort ?? null}
+              currentThinkingOptions={thinkingOptions}
+              onSelectionCommit={onSelectionCommit}
+              onThinkingSelect={onThinkingSelect}
+            />
+          ) : null}
+        </div>
+      )}
     </div>
   )
 }
