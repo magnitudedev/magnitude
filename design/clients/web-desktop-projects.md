@@ -34,15 +34,34 @@ transition. Removing a Project marks its registration removed from the ordinary 
 Projects without deleting source files, sessions, or Project identity. Selecting the same source
 through New Project restores that record.
 
-Closing a session is non-destructive sidebar membership. Deleting a session remains a distinct
-destructive operation.
+Archiving a session removes it from ordinary Project navigation without deleting its history.
+Archived sessions remain searchable in Settings and can be restored. Normal sidebar navigation and
+search contain active sessions only. Pinning is also durable session metadata:
+the sidebar shows pinned sessions once, in a Pinned section above Projects, newest pin first by the
+stable pin timestamp. Session activity never reorders that section. Archive and pin are mutually
+exclusive: archiving clears a pin, while pinning an archived session through another client or API
+restores and pins it as one server transition. Deleting a session remains a distinct destructive
+operation.
+
+Session rows have no persistent trailing controls or overflow menu. Hover and keyboard focus reveal
+borderless Pin/Unpin and Archive actions. The Pinned section is absent when empty, and a Project
+whose only sessions are pinned reads “No other
+sessions.” Archiving the selected session opens a new Project-owned draft for the same Project.
+
+Settings has a distinct Archived chats section. It searches archived chat titles, Project names,
+and source paths without mixing those results into the normal sidebar. The page supports explicit
+Restore and Permanently delete actions, multi-selection, and selecting every result matching the
+current search. Changing the search clears selection. Permanent deletion requires confirmation and
+is accepted by ACN only while the target remains archived; a restore in another client therefore
+prevents stale destructive intent from deleting an active chat.
 
 The ordinary browser sidebar order is:
 
 1. Settings, sidebar expand/collapse, and New Chat controls in that order;
 2. Search Sessions;
 3. full-row New Project; and
-4. the expandable Project/session hierarchy.
+4. Pinned sessions when any exist; and
+5. the expandable Project/session hierarchy.
 
 Electron places Settings, sidebar expand/collapse, and New Chat in that order in the
 persistent native title-bar row rather than adding a second toolbar inside the sidebar. While
@@ -118,8 +137,10 @@ Existing session metadata is migrated idempotently before normal Project-backed 
 2. ensure one Project per directory with the directory basename as its default name; and
 3. atomically add the exact Project ID to each session metadata record.
 
-The migration boundary may decode the legacy optional field. The normal domain requires Project ID;
-there is no permanent optional fallback. Missing source directories preserve Project and session
+The migration boundary may decode legacy optional fields, including the inverse `sidebarOpen`
+representation of the current archive state. New writes persist only `archived` and `pinnedAt`; the
+normal domain has no legacy session-visibility vocabulary or fallback. The normal domain requires
+Project ID. Missing source directories preserve Project and session
 history while preventing new execution. The legacy session working-directory field remains only as
 migration provenance and a recomputable index input; it is never consulted as current Project source
 authority. A session that references an absent durable Project is a visible state-integrity failure;

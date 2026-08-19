@@ -102,7 +102,8 @@ const makeMeta = (sessionId: string, cwd = "/repo"): StoredSessionMeta => {
   return {
     sessionId,
     projectId: ProjectIdSchema.make("project-a"),
-    sidebarOpen: true,
+    archived: false,
+    pinnedAt: Option.none(),
     created: now,
     updated: now,
     chatName: "Session",
@@ -155,6 +156,7 @@ const makeLayer = (input: {
           listAllProtocolMetas: () => Effect.die("unused"),
           listSessionCwds: () => Effect.die("unused"),
           deleteSessionFiles: () => Effect.die("unused"),
+          deleteArchivedSessionFiles: () => Effect.die("unused"),
           validateCwd: Effect.succeed,
           getScratchpadPath: (sessionId) => Effect.succeed(`/tmp/${sessionId}/scratchpad`),
           getExecutionContext: (sessionId) => Effect.succeed({
@@ -164,7 +166,8 @@ const makeLayer = (input: {
           }),
           ensureProjectForCwd: () => Effect.die("unused"),
           resolveProjectSource: () => input.projectSource ?? Effect.succeed("/repo"),
-          setSidebarOpen: () => Effect.die("unused"),
+          setArchived: () => Effect.die("unused"),
+          setPinned: () => Effect.die("unused"),
           changes: Stream.never,
         } satisfies SessionStoreApi
       }),

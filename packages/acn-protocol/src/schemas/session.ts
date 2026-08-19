@@ -57,13 +57,17 @@ export const SessionMetadata = Schema.Struct({
   projectId: ProjectIdSchema,
   title: Schema.Union(Schema.String, Schema.Null),
   cwd: Schema.String,
-  sidebarOpen: Schema.Boolean,
+  archived: Schema.Boolean,
+  pinnedAt: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
   messageCount: Schema.Number,
   lastMessage: Schema.Union(Schema.String, Schema.Null)
 })
 export type SessionMetadata = Schema.Schema.Type<typeof SessionMetadata>
+
+export const SessionArchiveFilter = Schema.Literal("active", "archived", "all")
+export type SessionArchiveFilter = Schema.Schema.Type<typeof SessionArchiveFilter>
 
 /**
  * CreateSession outcome. When `initial` is provided, the result discriminates
@@ -87,7 +91,8 @@ export type CreateSessionResult = Schema.Schema.Type<typeof CreateSessionResult>
 export const ListSessionsResult = Schema.Struct({
   items: Schema.Array(SessionMetadata),
   nextCursor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  hasMore: Schema.Boolean
+  hasMore: Schema.Boolean,
+  totalCount: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
 })
 export type ListSessionsResult = Schema.Schema.Type<typeof ListSessionsResult>
 

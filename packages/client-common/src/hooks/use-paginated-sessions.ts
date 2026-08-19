@@ -3,7 +3,7 @@
  *
  * Builds on `useSessionsList` for the first page and accumulates subsequent
  * pages via a writable atom. The accumulation atom is recreated when the
- * request key (cwd + query) changes — that recreation IS the reset, no
+ * request identity changes — that recreation IS the reset, no
  * ref-diff or useEffect needed.
  */
 import { useCallback, useMemo } from "react"
@@ -13,14 +13,15 @@ import { useAgentClient } from "../state/agent-client-context"
 import { useSessionsList, type UseSessionsListParams } from "./use-sessions-list"
 import { sessionsToRecentChats } from "../data/recent-chats"
 import type { SessionMetadata } from "@magnitudedev/sdk"
-import type { ProjectId } from "@magnitudedev/sdk"
+import type { ProjectId, SessionArchiveFilter } from "@magnitudedev/sdk"
 import type { RecentChat } from "../data/recent-chats"
 
 export interface UsePaginatedSessionsParams {
   /** Filter by CWD. */
   cwd?: string
   projectId?: ProjectId
-  includeClosed?: boolean
+  archiveFilter?: SessionArchiveFilter
+  prioritizePinned?: boolean
   /** Search title and working directory. */
   query?: string
   /** Number of items per page. */
@@ -38,15 +39,19 @@ export interface UsePaginatedSessionsResult {
   loadingMore: boolean
   /** Whether more pages can be loaded. */
   hasMore: boolean
+  /** Total sessions matching the filter, independent of loaded pages. */
+  totalCount: number
   /** Load the next page. */
   loadMore: () => void
+  /** Load and return every session matching the current filters. */
+  loadAll: () => Promise<RecentChat[]>
 }
 
 /**
  * Design note: viewport-fill auto-loading.
  *
- * This hook intentionally exposes only the core pagination primitive
- * (first-page query + accumulated pages + loadMore). A reusable
+ * This hook intentionally exposes only the core pagination primitives
+ * (first-page query, accumulated pages, loadMore, and loadAll). A reusable
  * viewport-fill layer can be built on top without changing this hook:
  *
  *   const { sessions, hasMore, loadingMore, loadMore } = usePaginatedSessions(...)
@@ -69,6 +74,7 @@ export interface UsePaginatedSessionsResult {
  */
 
 interface AccumulationState {
+  firstPageIdentity: string
   extraSessions: SessionMetadata[]
   nextCursor: string | null
   hasMore: boolean
@@ -93,27 +99,49 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
   const firstPage = useSessionsList({
     cwd: params?.cwd,
     projectId: params?.projectId,
-    includeClosed: params?.includeClosed,
+    archiveFilter: params?.archiveFilter,
+    prioritizePinned: params?.prioritizePinned,
     query: params?.query,
     limit: params?.pageSize ?? 50,
   })
 
+  const firstPageIdentity = firstPage.sessions.map((session) => [
+    session.sessionId,
+    session.archived ? "1" : "0",
+    Option.getOrNull(session.pinnedAt) ?? "",
+    session.updatedAt,
+  ].join(":"))
+    .concat(
+      firstPage.nextCursor ?? "",
+      firstPage.hasMore ? "1" : "0",
+      String(firstPage.totalCount),
+    )
+    .join("\0")
   const accumulationAtom = useMemo(
     () =>
       Atom.make<AccumulationState>({
+        firstPageIdentity,
         extraSessions: [],
         nextCursor: firstPage.nextCursor,
         hasMore: firstPage.hasMore,
       }),
-    [params?.cwd, params?.projectId, params?.includeClosed, params?.query],
+    [params?.cwd, params?.projectId, params?.archiveFilter, params?.prioritizePinned, params?.query],
   )
   const [accumulation, setAccumulation] = useAtom(accumulationAtom)
-  const nextCursor = accumulation.extraSessions.length === 0
+  const currentAccumulation = accumulation.firstPageIdentity === firstPageIdentity
+    ? accumulation
+    : {
+        firstPageIdentity,
+        extraSessions: [],
+        nextCursor: firstPage.nextCursor,
+        hasMore: firstPage.hasMore,
+      }
+  const nextCursor = currentAccumulation.extraSessions.length === 0
     ? firstPage.nextCursor
-    : accumulation.nextCursor
-  const hasMore = accumulation.extraSessions.length === 0
+    : currentAccumulation.nextCursor
+  const hasMore = currentAccumulation.extraSessions.length === 0
     ? firstPage.hasMore
-    : accumulation.hasMore
+    : currentAccumulation.hasMore
 
   const loadMore = useCallback(() => {
     if (loadingMore || !hasMore || !nextCursor) return
@@ -126,7 +154,8 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
         projectId: params?.projectId !== undefined
           ? Option.some(params.projectId)
           : Option.none(),
-        includeClosed: params?.includeClosed ?? true,
+        archiveFilter: params?.archiveFilter ?? "active",
+        prioritizePinned: params?.prioritizePinned ?? false,
         query: params?.query !== undefined ? Option.some(params.query) : Option.none(),
         cursor: Option.some(cursor),
         ...(params?.pageSize !== undefined ? { limit: params.pageSize } : {}),
@@ -134,9 +163,12 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
       reactivityKeys: ["sessions"],
     })
       .then((page) => {
-        setAccumulation((prev) => ({
-          ...prev,
-          extraSessions: [...prev.extraSessions, ...page.items],
+        setAccumulation((previous) => ({
+          firstPageIdentity,
+          extraSessions: [
+            ...(previous.firstPageIdentity === firstPageIdentity ? previous.extraSessions : []),
+            ...page.items,
+          ],
           nextCursor: page.nextCursor._tag === "Some" ? page.nextCursor.value : null,
           hasMore: page.hasMore,
         }))
@@ -152,7 +184,57 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
     nextCursor,
     params?.cwd,
     params?.projectId,
-    params?.includeClosed,
+    params?.archiveFilter,
+    params?.prioritizePinned,
+    params?.query,
+    params?.pageSize,
+    firstPageIdentity,
+    setAccumulation,
+  ])
+
+  const loadAll = useCallback(async (): Promise<RecentChat[]> => {
+    const loadedSessions = [...firstPage.sessions]
+    let cursor = firstPage.nextCursor
+    let more = firstPage.hasMore
+
+    while (more && cursor) {
+      const loadedPage = await listSessionsMutation({
+        payload: {
+          cwd: params?.cwd !== undefined ? Option.some(params.cwd) : Option.none(),
+          projectId: params?.projectId !== undefined
+            ? Option.some(params.projectId)
+            : Option.none(),
+          archiveFilter: params?.archiveFilter ?? "active",
+          prioritizePinned: params?.prioritizePinned ?? false,
+          query: params?.query !== undefined ? Option.some(params.query) : Option.none(),
+          cursor: Option.some(cursor),
+          ...(params?.pageSize !== undefined ? { limit: params.pageSize } : {}),
+        },
+        reactivityKeys: ["sessions"],
+      })
+      loadedSessions.push(...loadedPage.items)
+      cursor = Option.getOrNull(loadedPage.nextCursor)
+      more = loadedPage.hasMore
+    }
+
+    const uniqueLoadedSessions = uniqueSessions(loadedSessions)
+    setAccumulation({
+      firstPageIdentity,
+      extraSessions: uniqueLoadedSessions.slice(firstPage.sessions.length),
+      nextCursor: cursor,
+      hasMore: more,
+    })
+    return sessionsToRecentChats(uniqueLoadedSessions)
+  }, [
+    firstPage.sessions,
+    firstPage.nextCursor,
+    firstPage.hasMore,
+    firstPageIdentity,
+    listSessionsMutation,
+    params?.cwd,
+    params?.projectId,
+    params?.archiveFilter,
+    params?.prioritizePinned,
     params?.query,
     params?.pageSize,
     setAccumulation,
@@ -160,7 +242,7 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
 
   const sessions = sessionsToRecentChats(uniqueSessions([
     ...firstPage.sessions,
-    ...accumulation.extraSessions,
+    ...currentAccumulation.extraSessions,
   ]))
 
   const loading = firstPage.loading && sessions.length === 0
@@ -171,6 +253,8 @@ export function usePaginatedSessions(params?: UsePaginatedSessionsParams): UsePa
     error: firstPage.error,
     loadingMore,
     hasMore,
+    totalCount: firstPage.totalCount,
     loadMore,
+    loadAll,
   }
 }

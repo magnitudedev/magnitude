@@ -1,4 +1,4 @@
-import { Context, Cause, Effect, Layer, Option, PubSub, Stream } from "effect"
+import { Clock, Context, Cause, Effect, Layer, Option, PubSub, Stream } from "effect"
 import { resolve } from "path"
 import { stat } from "fs/promises"
 import { DEFAULT_CHAT_NAME } from "@magnitudedev/agent"
@@ -6,12 +6,14 @@ import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import {
   InvalidSessionPath,
   SessionNotFound,
+  SessionNotArchived,
   SessionOperationFailed,
   type ListSessionsResult,
   type SessionError,
   type SessionCwdSummary,
   type SessionMetadata as ProtocolSessionMetadata,
   type ProjectId,
+  type SessionArchiveFilter,
 } from "@magnitudedev/acn-protocol"
 import type { SessionExecutionContext } from "./session-types"
 import { sessionErrorMessage } from "./session-errors"
@@ -27,7 +29,8 @@ export interface SessionStoreApi {
     options?: {
       readonly cwd?: string
       readonly projectId?: ProjectId
-      readonly includeClosed?: boolean
+      readonly archiveFilter?: SessionArchiveFilter
+      readonly prioritizePinned?: boolean
       readonly query?: string
       readonly cursor?: string
       readonly limit?: number
@@ -39,14 +42,19 @@ export interface SessionStoreApi {
   >
   readonly listSessionCwds: () => Effect.Effect<ReadonlyArray<SessionCwdSummary>, SessionError>
   readonly deleteSessionFiles: (sessionId: string) => Effect.Effect<void, SessionError>
+  readonly deleteArchivedSessionFiles: (sessionId: string) => Effect.Effect<void, SessionError>
   readonly validateCwd: (cwd: string) => Effect.Effect<string, SessionError>
   readonly getScratchpadPath: (sessionId: string) => Effect.Effect<string, SessionError>
   readonly getExecutionContext: (sessionId: string) => Effect.Effect<SessionExecutionContext, SessionError>
   readonly ensureProjectForCwd: (cwd: string) => Effect.Effect<ProjectId, SessionError>
   readonly resolveProjectSource: (projectId: ProjectId) => Effect.Effect<string, SessionError>
-  readonly setSidebarOpen: (
+  readonly setArchived: (
     sessionId: string,
-    open: boolean,
+    archived: boolean,
+  ) => Effect.Effect<ProtocolSessionMetadata, SessionError>
+  readonly setPinned: (
+    sessionId: string,
+    pinned: boolean,
   ) => Effect.Effect<ProtocolSessionMetadata, SessionError>
   readonly changes: Stream.Stream<void>
 }
@@ -62,12 +70,17 @@ function storedMetaToProtocol(
 ): ProtocolSessionMetadata {
   const createdAt = Date.parse(meta.created)
   const updatedAt = Date.parse(meta.updated)
+  const pinnedAt = Option.flatMap(meta.pinnedAt, (value) => {
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? Option.some(parsed) : Option.none()
+  })
   return {
     sessionId: meta.sessionId,
     projectId: meta.projectId,
     title: meta.chatName,
     cwd: sourceDirectory,
-    sidebarOpen: meta.sidebarOpen,
+    archived: meta.archived,
+    pinnedAt,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
     messageCount: meta.messageCount ?? 0,
@@ -76,14 +89,26 @@ function storedMetaToProtocol(
 }
 
 interface SessionCursor {
+  readonly pinnedAt: number | null
   readonly updatedAt: number
   readonly sessionId: string
 }
 
-const compareProtocolMetasNewestFirst = (
+const compareProtocolMetas = (
   left: ProtocolSessionMetadata,
   right: ProtocolSessionMetadata,
+  prioritizePinned: boolean,
 ): number => {
+  if (prioritizePinned) {
+    const leftPinnedAt = Option.getOrNull(left.pinnedAt)
+    const rightPinnedAt = Option.getOrNull(right.pinnedAt)
+    if (leftPinnedAt !== null && rightPinnedAt === null) return -1
+    if (leftPinnedAt === null && rightPinnedAt !== null) return 1
+    if (leftPinnedAt !== null && rightPinnedAt !== null) {
+      const pinnedDelta = rightPinnedAt - leftPinnedAt
+      if (pinnedDelta !== 0) return pinnedDelta
+    }
+  }
   const updatedDelta = right.updatedAt - left.updatedAt
   if (updatedDelta !== 0) return updatedDelta
   return right.sessionId.localeCompare(left.sessionId)
@@ -92,23 +117,49 @@ const compareProtocolMetasNewestFirst = (
 const compareMetaToCursor = (
   meta: ProtocolSessionMetadata,
   cursor: SessionCursor,
+  prioritizePinned: boolean,
 ): number => {
+  if (prioritizePinned) {
+    const pinnedAt = Option.getOrNull(meta.pinnedAt)
+    if (pinnedAt !== null && cursor.pinnedAt === null) return -1
+    if (pinnedAt === null && cursor.pinnedAt !== null) return 1
+    if (pinnedAt !== null && cursor.pinnedAt !== null) {
+      const pinnedDelta = cursor.pinnedAt - pinnedAt
+      if (pinnedDelta !== 0) return pinnedDelta
+    }
+  }
   const updatedDelta = cursor.updatedAt - meta.updatedAt
   if (updatedDelta !== 0) return updatedDelta
   return cursor.sessionId.localeCompare(meta.sessionId)
 }
 
 const encodeSessionCursor = (meta: ProtocolSessionMetadata): string =>
-  `${meta.updatedAt}:${encodeURIComponent(meta.sessionId)}`
+  encodeURIComponent(JSON.stringify({
+    pinnedAt: Option.getOrNull(meta.pinnedAt),
+    updatedAt: meta.updatedAt,
+    sessionId: meta.sessionId,
+  }))
 
 const decodeSessionCursor = (cursor: string): SessionCursor | null => {
-  const separatorIndex = cursor.indexOf(":")
-  if (separatorIndex <= 0) return null
-  const updatedAt = Number(cursor.slice(0, separatorIndex))
-  if (!Number.isFinite(updatedAt)) return null
-  return {
-    updatedAt,
-    sessionId: decodeURIComponent(cursor.slice(separatorIndex + 1)),
+  try {
+    const decoded: unknown = JSON.parse(decodeURIComponent(cursor))
+    if (typeof decoded !== "object" || decoded === null) return null
+    const value = decoded as Record<string, unknown>
+    if (
+      (value.pinnedAt !== null && (
+        typeof value.pinnedAt !== "number" || !Number.isFinite(value.pinnedAt)
+      ))
+      || typeof value.updatedAt !== "number"
+      || !Number.isFinite(value.updatedAt)
+      || typeof value.sessionId !== "string"
+    ) return null
+    return {
+      pinnedAt: value.pinnedAt as number | null,
+      updatedAt: value.updatedAt,
+      sessionId: value.sessionId,
+    }
+  } catch {
+    return null
   }
 }
 
@@ -134,7 +185,8 @@ export const defaultStoredMeta = (
   chatName: DEFAULT_CHAT_NAME,
   workingDirectory,
   visibility,
-  sidebarOpen: true,
+  archived: false,
+  pinnedAt: Option.none(),
   gitBranch: null,
   created: now,
   updated: now,
@@ -240,7 +292,8 @@ export const SessionStoreLive = Layer.scoped(
       listProtocolMetas: Effect.fn("acn.session-store.list-protocol-metas")(function* (options) {
         const cwd = options?.cwd ? resolve(options.cwd) : null
         const projectId = options?.projectId ?? null
-        const includeClosed = options?.includeClosed ?? true
+        const archiveFilter = options?.archiveFilter ?? "active"
+        const prioritizePinned = options?.prioritizePinned ?? false
         const query = options?.query?.trim().toLowerCase() ?? ""
         const cursor = options?.cursor ? decodeSessionCursor(options.cursor) : null
         const limit = clampSessionPageLimit(options?.limit)
@@ -255,16 +308,19 @@ export const SessionStoreLive = Layer.scoped(
         const filtered = metas
           .filter((meta) => !cwd || resolve(meta.cwd) === cwd)
           .filter((meta) => !projectId || meta.projectId === projectId)
-          .filter((meta) => includeClosed || meta.sidebarOpen)
+          .filter((meta) =>
+            archiveFilter === "all"
+            || (archiveFilter === "archived" ? meta.archived : !meta.archived)
+          )
           .filter((meta) =>
             !query ||
             matchingProjectIds.has(meta.projectId) ||
             (meta.title ?? "").toLowerCase().includes(query) ||
             meta.cwd.toLowerCase().includes(query)
           )
-          .sort(compareProtocolMetasNewestFirst)
+          .sort((left, right) => compareProtocolMetas(left, right, prioritizePinned))
         const afterCursor = cursor
-          ? filtered.filter((meta) => compareMetaToCursor(meta, cursor) > 0)
+          ? filtered.filter((meta) => compareMetaToCursor(meta, cursor, prioritizePinned) > 0)
           : filtered
         const pageWindow = afterCursor.slice(0, limit + 1)
         const items = pageWindow.slice(0, limit)
@@ -276,6 +332,7 @@ export const SessionStoreLive = Layer.scoped(
             ? Option.some(encodeSessionCursor(last))
             : Option.none(),
           hasMore,
+          totalCount: filtered.length,
         }
       }),
 
@@ -305,6 +362,14 @@ export const SessionStoreLive = Layer.scoped(
         yield* storage.sessions.deleteSession(sessionId).pipe(
           Effect.mapError(toSessionErrorFromPlatform(`delete session ${sessionId}`))
         )
+        yield* publishChange
+      }),
+
+      deleteArchivedSessionFiles: Effect.fn("acn.session-store.delete-archived-session-files")(function* (sessionId) {
+        const deleted = yield* storage.sessions.deleteArchivedSession(sessionId).pipe(
+          Effect.mapError(toSessionErrorFromPlatform(`delete archived session ${sessionId}`)),
+        )
+        if (!deleted) return yield* new SessionNotArchived({ sessionId })
         yield* publishChange
       }),
 
@@ -363,19 +428,47 @@ export const SessionStoreLive = Layer.scoped(
         )
       }),
 
-      setSidebarOpen: Effect.fn("acn.session-store.set-sidebar-open")(function* (sessionId, open) {
+      setArchived: Effect.fn("acn.session-store.set-archived")(function* (sessionId, archived) {
         const existing = yield* readMeta(sessionId)
         if (!existing) return yield* new SessionNotFound({ sessionId })
-        if (existing.sidebarOpen === open) {
+        if (
+          existing.archived === archived
+          && (!archived || Option.isNone(existing.pinnedAt))
+        ) {
           const unchanged = yield* readProtocolMeta(sessionId)
           if (!unchanged) return yield* new SessionNotFound({ sessionId })
           return unchanged
         }
         yield* storage.sessions.updateMeta(sessionId, (current) => ({
           ...(current ?? existing),
-          sidebarOpen: open,
+          archived,
+          ...(archived ? { pinnedAt: Option.none<string>() } : {}),
         })).pipe(
-          Effect.mapError(toSessionErrorFromPlatform(`set sidebar membership ${sessionId}`)),
+          Effect.mapError(toSessionErrorFromPlatform(`set archive state ${sessionId}`)),
+        )
+        yield* publishChange
+        const updated = yield* readProtocolMeta(sessionId)
+        if (!updated) return yield* new SessionNotFound({ sessionId })
+        return updated
+      }),
+
+      setPinned: Effect.fn("acn.session-store.set-pinned")(function* (sessionId, pinned) {
+        const existing = yield* readMeta(sessionId)
+        if (!existing) return yield* new SessionNotFound({ sessionId })
+        if (Option.isSome(existing.pinnedAt) === pinned && (!pinned || !existing.archived)) {
+          const unchanged = yield* readProtocolMeta(sessionId)
+          if (!unchanged) return yield* new SessionNotFound({ sessionId })
+          return unchanged
+        }
+        const pinnedAt = pinned
+          ? Option.some(new Date(yield* Clock.currentTimeMillis).toISOString())
+          : Option.none<string>()
+        yield* storage.sessions.updateMeta(sessionId, (current) => ({
+          ...(current ?? existing),
+          archived: pinned ? false : (current ?? existing).archived,
+          pinnedAt,
+        })).pipe(
+          Effect.mapError(toSessionErrorFromPlatform(`set pinned state ${sessionId}`)),
         )
         yield* publishChange
         const updated = yield* readProtocolMeta(sessionId)

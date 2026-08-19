@@ -179,7 +179,6 @@ export const ProjectsLive: Layer.Layer<
         return {
           project,
           ...observation,
-          openSessionCount: projectSessions.filter((session) => session.sidebarOpen).length,
           totalSessionCount: projectSessions.length,
           recentActivityAt: projectSessions.reduce(
             (latest, session) => Math.max(latest, session.updatedAt),

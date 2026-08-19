@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import { Effect, Layer, Schema } from 'effect'
+import { Effect, Layer, Option, Schema } from 'effect'
 import { BunFileSystem, BunPath } from '@effect/platform-bun'
 import { describe, expect, test } from 'vitest'
 
@@ -92,6 +92,61 @@ describe('StoredSessionMetaSchema', () => {
     )
 
     expect(result.messageCount).toBe(0)
+  })
+
+  test('migrates legacy sidebar membership to archive state', async () => {
+    const schema = makeStoredSessionMetaSchema(VERSION)
+    const result = await Effect.runPromise(
+      Schema.decodeUnknown(schema)({
+        sessionId: 'session-1',
+        projectId: 'project-1',
+        created: '2026-01-01T00:00:00.000Z',
+        updated: '2026-01-01T00:00:00.000Z',
+        chatName: 'Chat',
+        workingDirectory: '/repo',
+        sidebarOpen: false,
+      }),
+    )
+
+    expect(result.archived).toBe(true)
+    expect(Option.isNone(result.pinnedAt)).toBe(true)
+  })
+
+  test('normalizes archived metadata so it cannot remain pinned', async () => {
+    const schema = makeStoredSessionMetaSchema(VERSION)
+    const result = await Effect.runPromise(
+      Schema.decodeUnknown(schema)({
+        sessionId: 'session-1',
+        projectId: 'project-1',
+        created: '2026-01-01T00:00:00.000Z',
+        updated: '2026-01-01T00:00:00.000Z',
+        chatName: 'Chat',
+        workingDirectory: '/repo',
+        archived: true,
+        pinnedAt: '2026-01-01T00:00:00.000Z',
+      }),
+    )
+
+    expect(result.archived).toBe(true)
+    expect(Option.isNone(result.pinnedAt)).toBe(true)
+  })
+
+  test('repairs malformed serialized Option metadata from schema-less writes', async () => {
+    const schema = makeStoredSessionMetaSchema(VERSION)
+    const result = await Effect.runPromise(
+      Schema.decodeUnknown(schema)({
+        sessionId: 'session-1',
+        projectId: 'project-1',
+        created: '2026-01-01T00:00:00.000Z',
+        updated: '2026-01-01T00:00:00.000Z',
+        chatName: 'Chat',
+        workingDirectory: '/repo',
+        archived: false,
+        pinnedAt: { _id: 'Option', _tag: 'None' },
+      }),
+    )
+
+    expect(Option.isNone(result.pinnedAt)).toBe(true)
   })
 
   test('readMeta returns version defaults for missing fields via StorageLive', async () => {

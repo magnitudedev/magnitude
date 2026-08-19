@@ -63,12 +63,14 @@ const makeLayer = (
     listAllProtocolMetas: () => Effect.succeed([]),
     listSessionCwds: () => Effect.die("unused"),
     deleteSessionFiles: () => Effect.die("unused"),
+    deleteArchivedSessionFiles: () => Effect.die("unused"),
     validateCwd: Effect.succeed,
     getScratchpadPath: () => Effect.die("unused"),
     getExecutionContext: () => Effect.die("unused"),
     ensureProjectForCwd: () => Effect.die("unused"),
     resolveProjectSource: () => Effect.die("unused"),
-    setSidebarOpen: () => Effect.die("unused"),
+    setArchived: () => Effect.die("unused"),
+    setPinned: () => Effect.die("unused"),
     changes: Stream.never,
   }
   const runtime: AgentRuntimeApi = {

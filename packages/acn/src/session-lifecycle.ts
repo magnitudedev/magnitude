@@ -3,6 +3,7 @@ import { resolve } from "path"
 import {
   SessionAlreadyExists,
   SessionNotFound,
+  SessionNotArchived,
   SessionStartFailed,
   type CreateSessionInitial,
   type CreateSessionResult,
@@ -12,6 +13,7 @@ import {
   type SessionMetadata as ProtocolSessionMetadata,
   type SessionOptions,
   type ProjectId,
+  type SessionArchiveFilter,
 } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import { SessionDrafts } from "./session-drafts"
@@ -47,7 +49,8 @@ export interface SessionLifecycleApi {
     options?: {
       readonly cwd?: string
       readonly projectId?: ProjectId
-      readonly includeClosed?: boolean
+      readonly archiveFilter?: SessionArchiveFilter
+      readonly prioritizePinned?: boolean
       readonly query?: string
       readonly cursor?: string
       readonly limit?: number
@@ -55,9 +58,10 @@ export interface SessionLifecycleApi {
   ) => Effect.Effect<ListSessionsResult, SessionError>
   readonly listSessionCwds: () => Effect.Effect<ReadonlyArray<SessionCwdSummary>, SessionError>
   readonly getSessionInfo: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
-  readonly deleteSession: (sessionId: string) => Effect.Effect<void, SessionError>
-  readonly closeSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
-  readonly reopenSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
+  readonly deleteArchivedSession: (sessionId: string) => Effect.Effect<void, SessionError>
+  readonly archiveSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
+  readonly restoreSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
+  readonly setSessionPinned: (sessionId: string, pinned: boolean) => Effect.Effect<ProtocolSessionMetadata, SessionError>
   readonly getSessionExecutionContext: (sessionId: string) => Effect.Effect<SessionExecutionContext, SessionError>
   readonly getSessionCwd: (sessionId: string) => Effect.Effect<string, SessionError>
 }
@@ -72,7 +76,8 @@ const toMetadata = (entry: ResidentSessionSnapshot, stored: ProtocolSessionMetad
   projectId: stored.projectId,
   title: entry.title,
   cwd: entry.cwd,
-  sidebarOpen: stored.sidebarOpen,
+  archived: stored.archived,
+  pinnedAt: stored.pinnedAt,
   createdAt: entry.createdAt,
   updatedAt: stored.updatedAt,
   messageCount: stored.messageCount,
@@ -249,14 +254,16 @@ export const SessionLifecycleLive: Layer.Layer<
           if (!meta) return yield* new SessionNotFound({ sessionId })
           return meta
         }),
-        deleteSession: Effect.fn("acn.session-lifecycle.delete-session")(function* (sessionId) {
+        deleteArchivedSession: Effect.fn("acn.session-lifecycle.delete-archived-session")(function* (sessionId) {
           const live = yield* residentSnapshot(sessionId)
           const meta = yield* store.readMeta(sessionId)
           if (!live && !meta) return yield* new SessionNotFound({ sessionId })
-          yield* runtime.deleteSession(sessionId, store.deleteSessionFiles(sessionId))
+          if (!meta?.archived) return yield* new SessionNotArchived({ sessionId })
+          yield* runtime.deleteSession(sessionId, store.deleteArchivedSessionFiles(sessionId))
         }),
-        closeSession: (sessionId) => store.setSidebarOpen(sessionId, false),
-        reopenSession: (sessionId) => store.setSidebarOpen(sessionId, true),
+        archiveSession: (sessionId) => store.setArchived(sessionId, true),
+        restoreSession: (sessionId) => store.setArchived(sessionId, false),
+        setSessionPinned: (sessionId, pinned) => store.setPinned(sessionId, pinned),
         getSessionExecutionContext: Effect.fn("acn.session-lifecycle.get-session-execution-context")(function* (sessionId) {
           const live = yield* residentSnapshot(sessionId)
           if (live) {

@@ -285,7 +285,8 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
               onNone: () => ({}),
               onSome: (projectId) => ({ projectId }),
             }),
-            includeClosed: payload.includeClosed,
+            archiveFilter: payload.archiveFilter,
+            prioritizePinned: payload.prioritizePinned,
             ...Option.match(payload.query, {
               onNone: () => ({}),
               onSome: (query) => ({ query }),
@@ -312,17 +313,20 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
           sessionLifecycle.getSessionInfo(sessionId)
         ),
 
-      DeleteSession: ({ sessionId }: { sessionId: string }) =>
+      DeleteArchivedSession: ({ sessionId }: { sessionId: string }) =>
         observeRpcDefects(
-          "DeleteSession",
-          sessionLifecycle.deleteSession(sessionId).pipe(Effect.as({}))
+          "DeleteArchivedSession",
+          sessionLifecycle.deleteArchivedSession(sessionId).pipe(Effect.as({}))
         ),
 
-      CloseSession: ({ sessionId }) =>
-        observeRpcDefects("CloseSession", sessionLifecycle.closeSession(sessionId)),
+      ArchiveSession: ({ sessionId }) =>
+        observeRpcDefects("ArchiveSession", sessionLifecycle.archiveSession(sessionId)),
 
-      ReopenSession: ({ sessionId }) =>
-        observeRpcDefects("ReopenSession", sessionLifecycle.reopenSession(sessionId)),
+      RestoreSession: ({ sessionId }) =>
+        observeRpcDefects("RestoreSession", sessionLifecycle.restoreSession(sessionId)),
+
+      SetSessionPinned: ({ sessionId, pinned }) =>
+        observeRpcDefects("SetSessionPinned", sessionLifecycle.setSessionPinned(sessionId, pinned)),
 
       ListProjects: ({ includeRemoved }) =>
         observeRpcDefects("ListProjects", projects.list(includeRemoved)),

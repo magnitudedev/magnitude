@@ -9,6 +9,7 @@ import {
   SessionCwdSummary,
   SessionMetadata,
   SessionOptions,
+  SessionArchiveFilter,
 } from "../schemas/session"
 import { ProjectIdSchema } from "../schemas/project"
 import { makeAcnSubscriptionRpc } from "./subscription"
@@ -17,7 +18,8 @@ import { SessionError } from "../errors"
 const ListSessionsPayloadFields = {
   cwd: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
-  includeClosed: Schema.optionalWith(Schema.Boolean, { default: () => true }),
+  archiveFilter: Schema.optionalWith(SessionArchiveFilter, { default: () => "active" }),
+  prioritizePinned: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   query: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   cursor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   limit: Schema.optionalWith(Schema.Number, { default: () => 50 })
@@ -83,20 +85,29 @@ export const GetSession = Rpc.make("GetSession", {
   error: SessionError
 })
 
-export const DeleteSession = Rpc.make("DeleteSession", {
+export const DeleteArchivedSession = Rpc.make("DeleteArchivedSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: Schema.Struct({}),
   error: SessionError
 })
 
-export const CloseSession = Rpc.make("CloseSession", {
+export const ArchiveSession = Rpc.make("ArchiveSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
   error: SessionError,
 })
 
-export const ReopenSession = Rpc.make("ReopenSession", {
+export const RestoreSession = Rpc.make("RestoreSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
+  success: SessionMetadata,
+  error: SessionError,
+})
+
+export const SetSessionPinned = Rpc.make("SetSessionPinned", {
+  payload: Schema.Struct({
+    sessionId: Schema.String,
+    pinned: Schema.Boolean,
+  }),
   success: SessionMetadata,
   error: SessionError,
 })

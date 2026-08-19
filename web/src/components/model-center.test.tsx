@@ -26,7 +26,7 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   }),
 }))
 
-import { SettingsCenter } from "./model-center"
+import { ModelSettingsCenter } from "./model-center"
 
 beforeEach(() => {
   modelState.localModels = Result.initial(false)
@@ -36,7 +36,7 @@ beforeEach(() => {
 
 describe("Settings query states", () => {
   it("renders the initial query state as loading before a request starts", () => {
-    const html = renderToStaticMarkup(<SettingsCenter tab="catalog" />)
+    const html = renderToStaticMarkup(<ModelSettingsCenter tab="catalog" />)
 
     expect(html).toContain("Loading catalog")
     expect(html).toContain("Checking the model catalog for this computer.")
@@ -52,7 +52,7 @@ describe("Settings model loading states", () => {
       models: [],
     })
 
-    const html = renderToStaticMarkup(<SettingsCenter tab="models" />)
+    const html = renderToStaticMarkup(<ModelSettingsCenter tab="models" />)
 
     expect(html).toContain("Loading models")
     expect(html).toContain("Reading the models installed on this computer.")
@@ -67,7 +67,7 @@ describe("Settings model loading states", () => {
       models: [],
     })
 
-    const html = renderToStaticMarkup(<SettingsCenter tab="models" />)
+    const html = renderToStaticMarkup(<ModelSettingsCenter tab="models" />)
 
     expect(html).toContain("Installed models")
     expect(html).toContain('aria-label="Search installed models"')
@@ -84,7 +84,7 @@ describe("Settings model loading states", () => {
       models: [],
     })
 
-    const html = renderToStaticMarkup(<SettingsCenter tab="catalog" />)
+    const html = renderToStaticMarkup(<ModelSettingsCenter tab="catalog" />)
 
     expect(html).toContain("Loading catalog")
     expect(html).toContain("Assessing local models for this computer.")
@@ -100,7 +100,7 @@ describe("Settings model loading states", () => {
       models: [],
     })
 
-    const html = renderToStaticMarkup(<SettingsCenter tab="catalog" />)
+    const html = renderToStaticMarkup(<ModelSettingsCenter tab="catalog" />)
 
     expect(html).toContain("No local catalog models are currently available.")
     expect(html).toContain('aria-label="Search catalog"')
@@ -120,7 +120,7 @@ describe("Settings model loading states", () => {
       models: [],
     })
 
-    const html = renderToStaticMarkup(<SettingsCenter tab="catalog" />)
+    const html = renderToStaticMarkup(<ModelSettingsCenter tab="catalog" />)
 
     expect(html).toContain("Assessment failed.")
     expect(html).not.toContain("No local catalog models are currently available.")

@@ -81,6 +81,11 @@ export interface SessionStorageShape {
     sessionId: string
   ) => Effect.Effect<void, PlatformError | JsonError>
 
+  /** Deletes only when the metadata is still archived at the storage lock boundary. */
+  readonly deleteArchivedSession: (
+    sessionId: string
+  ) => Effect.Effect<boolean, PlatformError | JsonError>
+
   readonly readCwdIndex: (
     cwd: string
   ) => Effect.Effect<CwdIndex | null, PlatformError | JsonError>

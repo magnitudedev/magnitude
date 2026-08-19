@@ -8,6 +8,7 @@ import { MagnitudeMark } from "./magnitude-mark"
 import { ProjectFormDialog } from "./project-dialogs"
 import { collapsedProjectIdsAtom } from "../state/web-atoms"
 import { Button } from "@/components/ui/button"
+import { Spinner } from "@/components/ui/spinner"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Command,
@@ -67,7 +68,7 @@ export function ChatEmptyState(): ReactNode {
 
   return (
     <div className="flex min-h-0 w-full flex-1 flex-col items-center justify-center px-6 py-8 [animation:fade-in_200ms_ease-out]">
-      <div className="flex w-full max-w-[520px] flex-col items-center text-center">
+      <div className="flex w-full max-w-[800px] flex-col items-center text-center">
         <MagnitudeMark className="mb-6 h-auto w-[68px]" />
         <div className="relative">
           {selected ? (
@@ -127,14 +128,17 @@ export function ChatEmptyState(): ReactNode {
               </PopoverContent>
             </Popover>
           ) : loading ? (
-            <>
-              <h1 className="font-mono text-[24px] font-semibold leading-[1.4] text-slate-900 dark:text-slate-100">
-                What would you like to do?
-              </h1>
-              <span className="mt-4 block font-sans text-[14px] text-slate-500">
-                Loading projects…
+            <h1 className="font-mono text-[24px] font-semibold leading-[1.4] text-slate-900 dark:text-slate-100">
+              What would you like to do in{" "}
+              <span
+                role="status"
+                aria-label="Loading project"
+                className="inline-flex min-w-8 items-center justify-center align-middle"
+              >
+                <Spinner className="size-5 text-blue-600 motion-reduce:animate-none dark:text-blue-400" />
               </span>
-            </>
+              ?
+            </h1>
           ) : error ? (
             <>
               <h1 className="font-mono text-[24px] font-semibold leading-[1.4] text-slate-900 dark:text-slate-100">
