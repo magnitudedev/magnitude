@@ -5,7 +5,24 @@ import { resolve } from "node:path";
 
 export default defineConfig({
   main: {
+    resolve: {
+      alias: {
+        "@magnitudedev/client-common/platform/embedded-browser": resolve(__dirname, "../packages/client-common/src/platform/embedded-browser.ts"),
+        "@magnitudedev/client-common/types/menu-action": resolve(__dirname, "../packages/client-common/src/types/menu-action.ts"),
+      },
+    },
     build: {
+      // Workspace packages publish TypeScript source for Bun. Bundle them for
+      // Electron's Node runtime so production does not depend on repository
+      // source files or Node's TypeScript resolution behavior.
+      externalizeDeps: {
+        exclude: [
+          "@magnitudedev/client-common",
+          "@magnitudedev/client-common/platform/embedded-browser",
+          "@magnitudedev/client-common/types/menu-action",
+          "@magnitudedev/sdk",
+        ],
+      },
       rollupOptions: {
         // sqlite3 is a native CommonJS addon. It must remain a runtime Node
         // dependency; bundling its tracing helper into ESM erases __filename.
@@ -17,7 +34,21 @@ export default defineConfig({
     },
   },
   preload: {
+    resolve: {
+      alias: {
+        "@magnitudedev/client-common/platform/embedded-browser": resolve(__dirname, "../packages/client-common/src/platform/embedded-browser.ts"),
+        "@magnitudedev/client-common/types/menu-action": resolve(__dirname, "../packages/client-common/src/types/menu-action.ts"),
+      },
+    },
     build: {
+      externalizeDeps: {
+        exclude: [
+          "@magnitudedev/client-common",
+          "@magnitudedev/client-common/platform/embedded-browser",
+          "@magnitudedev/client-common/types/menu-action",
+          "@magnitudedev/sdk",
+        ],
+      },
       rollupOptions: {
         input: {
           preload: resolve(__dirname, "src/preload.ts"),

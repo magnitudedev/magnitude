@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "test": "bunx --bun vitest run"
+    "test": "bunx --bun vitest run",
+    "test:browser": "bun run build && node --no-warnings --experimental-strip-types scripts/browser-smoke.ts"
   },
   "dependencies": {
     "@effect/platform": "^0.96.1",
@@ -23,8 +24,9 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^33.0.0",
-    "electron-vite": "^2.3.0",
+    "electron": "^43.4.1",
+    "electron-vite": "^5.0.0",
+    "playwright": "^1.62.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.7.0",
     "vite": "^6.0.0"

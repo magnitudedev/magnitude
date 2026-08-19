@@ -9,9 +9,10 @@ import { Atom } from "@effect-atom/atom-react"
 import type { ProjectId } from "@magnitudedev/sdk"
 import type { ProjectFileRevision, ProjectRelativePath } from "@magnitudedev/sdk"
 import {
-  PROJECT_FILES_BROWSER_WIDTH,
-  PROJECT_FILES_DOCUMENT_WIDTH,
-} from "../lib/project-files-layout"
+  WORKSPACE_BROWSER_WIDTH,
+  WORKSPACE_DOCUMENT_WIDTH,
+  WORKSPACE_FILES_WIDTH,
+} from "../lib/workspace-panel-layout"
 import {
   selectedCwdAtom,
   selectedFilePathAtom,
@@ -65,20 +66,27 @@ export const sidebarVisibleAtom = Atom.make(false)
  */
 export const sidebarSearchAtom = Atom.keepAlive(Atom.make(""))
 
-export const projectFilesPanelOpenAtom = Atom.keepAlive(Atom.make(false))
-export interface ProjectFilesPanelWidths {
-  readonly browser: number
+export const workspacePanelOpenAtom = Atom.keepAlive(Atom.make(false))
+/** True only while the workspace panel is entering from its collapsed state. */
+export const workspacePanelEnteringAtom = Atom.keepAlive(Atom.make(false))
+export const workspacePanelSurfaceAtom = Atom.keepAlive(
+  Atom.make<"files" | "browser">("files"),
+)
+export interface WorkspacePanelWidths {
+  readonly filesTree: number
   readonly document: number
+  readonly browser: number
 }
-export const projectFilesPanelWidthsAtom = Atom.keepAlive(
-  Atom.make<ProjectFilesPanelWidths>({
-    browser: PROJECT_FILES_BROWSER_WIDTH,
-    document: PROJECT_FILES_DOCUMENT_WIDTH,
+export const workspacePanelWidthsAtom = Atom.keepAlive(
+  Atom.make<WorkspacePanelWidths>({
+    filesTree: WORKSPACE_FILES_WIDTH,
+    document: WORKSPACE_DOCUMENT_WIDTH,
+    browser: WORKSPACE_BROWSER_WIDTH,
   }),
 )
 export const projectFileDirtyAtom = Atom.keepAlive(Atom.make(false))
 export const projectFileDiscardIntentAtom = Atom.keepAlive(
-  Atom.make<"back" | "close" | null>(null),
+  Atom.make<"back" | "close" | "browser" | null>(null),
 )
 export interface ProjectFileDraft {
   readonly content: string

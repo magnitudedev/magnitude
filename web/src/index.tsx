@@ -17,6 +17,10 @@ export {
   type Notification,
   type Dialogs,
   type TerminalCapabilities,
+  type EmbeddedBrowserCapability,
+  type BrowserWorkspaceState,
+  type BrowserTabState,
+  type BrowserTabId,
   stopDisplayViewController,
 } from "@magnitudedev/client-common"
 export { createBrowserPlatform } from "./platform/browser"

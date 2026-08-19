@@ -16,7 +16,7 @@ import * as nodePath from "node:path"
 import * as nodeFs from "node:fs"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
-import { Array as Arr, Cause, Duration, Effect, Exit, Layer, Option, PubSub, Schedule, Scope, Stream } from "effect"
+import { Array as Arr, Cause, Duration, Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { layer as nodeFileSystemLayer } from "@effect/platform-node-shared/NodeFileSystem"
@@ -26,6 +26,11 @@ import { inheritLoginShellEnv } from "./shell-env"
 import { DesktopRpcError, DesktopRpcs, type MenuAction } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { NodeSqliteDriverLayer } from "./sqlite-driver"
+import {
+  EmbeddedBrowser,
+  makeEmbeddedBrowserLive,
+  type EmbeddedBrowserService,
+} from "./embedded-browser"
 
 // SDK imports — these run in the main process (Node)
 import {
@@ -41,6 +46,9 @@ import {
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
+let embeddedBrowserRuntime: ManagedRuntime.ManagedRuntime<EmbeddedBrowser, never> | null = null
+let embeddedBrowserPromise: Promise<EmbeddedBrowserService> | null = null
+let embeddedBrowserService: EmbeddedBrowserService | null = null
 let acnManagerPromise: Promise<AcnInstanceManagerService> | null = null
 const acnEnsurerScope = Effect.runPromise(Scope.make())
 const menuActions = Effect.runSync(PubSub.unbounded<MenuAction>())
@@ -381,6 +389,15 @@ function createWindow(): void {
     },
   })
 
+  const browserWindow = mainWindow
+  embeddedBrowserRuntime = ManagedRuntime.make(makeEmbeddedBrowserLive(browserWindow))
+  embeddedBrowserPromise = embeddedBrowserRuntime.runPromise(EmbeddedBrowser).then((browser) => {
+    if (mainWindow === browserWindow && !browserWindow.isDestroyed()) {
+      embeddedBrowserService = browser
+    }
+    return browser
+  })
+
   // CSP header
   mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
     const scriptSrc = app.isPackaged ? "script-src 'self'" : "script-src 'self' 'unsafe-inline'"
@@ -421,9 +438,18 @@ function createWindow(): void {
     mainWindow.loadFile(nodePath.join(__dirname, "../renderer/index.html"))
   }
 
-  // On window close, the renderer sends __magnitude:interrupt-stream
-  // to notify main that the stream should be cleaned up (§5.6)
+  mainWindow.on("close", () => {
+    if (embeddedBrowserService !== null) Effect.runSync(embeddedBrowserService.shutdown)
+  })
+
+  // The browser owner has already released every native guest before this
+  // terminal event; only process-wide references remain to be cleared.
   mainWindow.on("closed", () => {
+    const runtime = embeddedBrowserRuntime
+    embeddedBrowserRuntime = null
+    embeddedBrowserPromise = null
+    embeddedBrowserService = null
+    if (runtime !== null) void runtime.dispose()
     mainWindow = null
   })
 }
@@ -471,6 +497,9 @@ async function getAcnManager(): Promise<AcnInstanceManagerService> {
 const acnManager = Effect.promise(getAcnManager)
 
 function messageFromUnknown(cause: unknown): string {
+  if (typeof cause === "object" && cause !== null && "reason" in cause) {
+    return String(cause.reason)
+  }
   return cause instanceof Error ? cause.message : String(cause)
 }
 
@@ -483,6 +512,24 @@ const promiseRpc = <A>(operation: () => Promise<A>): Effect.Effect<A, DesktopRpc
     try: operation,
     catch: desktopRpcError,
   })
+
+const currentEmbeddedBrowser = Effect.tryPromise({
+  try: () => {
+    if (embeddedBrowserPromise === null) {
+      return Promise.reject(new Error("The embedded browser is unavailable."))
+    }
+    return embeddedBrowserPromise
+  },
+  catch: desktopRpcError,
+})
+
+const browserRpc = <A>(
+  operation: (browser: EmbeddedBrowserService) => Effect.Effect<A, unknown>,
+): Effect.Effect<A, DesktopRpcError> =>
+  currentEmbeddedBrowser.pipe(
+    Effect.flatMap(operation),
+    Effect.mapError(desktopRpcError),
+  )
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
   AcnEnsure: (request) => Stream.unwrap(
@@ -521,6 +568,32 @@ const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
   Quit: () => Effect.sync(() => app.quit()).pipe(Effect.as({})),
   InterruptStream: () => Effect.succeed({}),
   StreamMenuActions: () => Stream.fromPubSub(menuActions),
+  BrowserObserve: () => Stream.unwrap(
+    currentEmbeddedBrowser.pipe(
+      Effect.map((browser) => browser.changes),
+    ),
+  ),
+  BrowserCreateTab: ({ url }) => browserRpc((browser) => browser.createTab(url)).pipe(Effect.as({})),
+  BrowserActivateTab: ({ tabId }) => browserRpc((browser) => browser.activateTab(tabId)).pipe(Effect.as({})),
+  BrowserCloseTab: ({ tabId }) => browserRpc((browser) => browser.closeTab(tabId)).pipe(Effect.as({})),
+  BrowserNavigate: ({ input }) => browserRpc((browser) => browser.navigate(input)).pipe(Effect.as({})),
+  BrowserGoBack: () => browserRpc((browser) => browser.goBack).pipe(Effect.as({})),
+  BrowserGoForward: () => browserRpc((browser) => browser.goForward).pipe(Effect.as({})),
+  BrowserReload: () => browserRpc((browser) => browser.reload).pipe(Effect.as({})),
+  BrowserStop: () => browserRpc((browser) => browser.stop).pipe(Effect.as({})),
+  BrowserContinueInsecureNavigation: () =>
+    browserRpc((browser) => browser.continueInsecureNavigation).pipe(Effect.as({})),
+  BrowserCancelInsecureNavigation: () =>
+    browserRpc((browser) => browser.cancelInsecureNavigation).pipe(Effect.as({})),
+  BrowserSetViewport: ({ bounds }) =>
+    browserRpc((browser) => browser.setViewport(bounds)).pipe(Effect.as({})),
+  BrowserOpenExternal: () => browserRpc((browser) => browser.openExternal).pipe(Effect.as({})),
+  BrowserRespondToPermission: ({ requestId, allow }) =>
+    browserRpc((browser) => browser.respondToPermission(requestId, allow)).pipe(Effect.as({})),
+  BrowserCancelDownload: ({ downloadId }) =>
+    browserRpc((browser) => browser.cancelDownload(downloadId)).pipe(Effect.as({})),
+  BrowserRevealDownload: ({ downloadId }) =>
+    browserRpc((browser) => browser.revealDownload(downloadId)).pipe(Effect.as({})),
 })
 
 function startDesktopRpcServer(): void {

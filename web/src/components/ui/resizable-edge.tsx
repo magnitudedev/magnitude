@@ -5,6 +5,7 @@ import { clampResizableValue } from "@/lib/resizable"
 
 export function ResizableEdge({
   side,
+  placement = "centered",
   value,
   minimum,
   maximum,
@@ -14,6 +15,7 @@ export function ResizableEdge({
   className,
 }: {
   readonly side: "left" | "right"
+  readonly placement?: "centered" | "outside"
   readonly value: number
   readonly minimum: number
   readonly maximum: number
@@ -24,6 +26,7 @@ export function ResizableEdge({
 }): ReactNode {
   const drag = useRef<{ readonly pointerId: number; readonly startX: number; readonly startValue: number } | null>(null)
   const [dragging, setDragging] = useState(false)
+  const [hovered, setHovered] = useState(false)
   const updateDragging = (next: boolean) => {
     setDragging(next)
     onDraggingChange?.(next)
@@ -60,11 +63,22 @@ export function ResizableEdge({
       tabIndex={0}
       data-dragging={dragging || undefined}
       className={cn(
-        "absolute inset-y-0 z-30 w-2 touch-none cursor-col-resize outline-none [-webkit-app-region:no-drag] [&:hover>span]:bg-blue-400 [&:focus-visible>span]:bg-blue-500 data-[dragging=true]:[&>span]:bg-blue-500 dark:[&:hover>span]:bg-blue-500 dark:[&:focus-visible>span]:bg-blue-400 dark:data-[dragging=true]:[&>span]:bg-blue-400",
-        side === "left" ? "-left-1" : "-right-1",
+        "absolute inset-y-0 z-30 w-2 touch-none cursor-col-resize outline-none [-webkit-app-region:no-drag]",
+        placement === "outside"
+          ? cn(
+              "border-transparent transition-colors focus-visible:border-blue-500 dark:focus-visible:border-blue-400",
+              hovered || dragging ? "border-blue-400 dark:border-blue-500" : null,
+              side === "left" ? "border-r" : "border-l",
+            )
+          : "[&:hover>span]:bg-blue-400 [&:focus-visible>span]:bg-blue-500 data-[dragging=true]:[&>span]:bg-blue-500 dark:[&:hover>span]:bg-blue-500 dark:[&:focus-visible>span]:bg-blue-400 dark:data-[dragging=true]:[&>span]:bg-blue-400",
+        side === "left"
+          ? placement === "outside" ? "-left-2" : "-left-1"
+          : placement === "outside" ? "-right-2" : "-right-1",
         className,
       )}
       onKeyDown={handleKeyDown}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
       onPointerDown={(event: PointerEvent<HTMLDivElement>) => {
         if (event.button !== 0) return
         event.preventDefault()
@@ -89,7 +103,9 @@ export function ResizableEdge({
       onPointerCancel={stopDragging}
       onLostPointerCapture={stopDragging}
     >
-      <span className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-transparent transition-colors" />
+      {placement === "centered" ? (
+        <span className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-transparent transition-colors" />
+      ) : null}
     </div>
   )
 }

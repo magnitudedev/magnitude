@@ -26,6 +26,7 @@ import {
   DesktopRpcError,
   DesktopRpcs,
   encodeDesktopAcnEnsureEvent,
+  encodeDesktopBrowserWorkspaceState,
   type DesktopApi,
   type DesktopPlatform,
   type DesktopRpcClient,
@@ -221,6 +222,63 @@ function makeDesktopApi(): DesktopApi {
           .catch((cause) => {
             console.error("[desktop] Notification RPC failed:", cause)
           })
+      },
+    },
+    browser: {
+      observe(onState, onError, onEnd) {
+        return desktopRpc.runStream(
+          (client) => client.BrowserObserve({}),
+          (state) => onState(encodeDesktopBrowserWorkspaceState(state)),
+          onError,
+          onEnd,
+        )
+      },
+      async createTab(url?: string): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserCreateTab({ url: url ?? null }))
+      },
+      async activateTab(tabId): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserActivateTab({ tabId }))
+      },
+      async closeTab(tabId): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserCloseTab({ tabId }))
+      },
+      async navigate(input: string): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserNavigate({ input }))
+      },
+      async goBack(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserGoBack({}))
+      },
+      async goForward(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserGoForward({}))
+      },
+      async reload(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserReload({}))
+      },
+      async stop(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserStop({}))
+      },
+      async continueInsecureNavigation(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserContinueInsecureNavigation({}))
+      },
+      async cancelInsecureNavigation(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserCancelInsecureNavigation({}))
+      },
+      async setViewport(bounds): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserSetViewport({ bounds }))
+      },
+      async openExternal(): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserOpenExternal({}))
+      },
+      async respondToPermission(requestId, allow): Promise<void> {
+        await desktopRpc.run((client) =>
+          client.BrowserRespondToPermission({ requestId, allow }),
+        )
+      },
+      async cancelDownload(downloadId): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserCancelDownload({ downloadId }))
+      },
+      async revealDownload(downloadId): Promise<void> {
+        await desktopRpc.run((client) => client.BrowserRevealDownload({ downloadId }))
       },
     },
   }

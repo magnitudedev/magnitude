@@ -65,6 +65,7 @@ import {
   type FooterModelOptionsState,
 } from "./components/footer-bar"
 import { ProjectFilesPanel } from "./components/project-files/panel"
+import { BrowserPanel } from "./components/browser-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
@@ -85,7 +86,9 @@ import {
   sidebarWidthAtom,
   sidebarVisibleAtom,
   settingsTabAtom,
-  projectFilesPanelOpenAtom,
+  workspacePanelEnteringAtom,
+  workspacePanelOpenAtom,
+  workspacePanelSurfaceAtom,
 } from "./state/web-atoms"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
@@ -681,15 +684,17 @@ function BottomDockContainer({
 }
 function ChatTitleBar({
   onOpenSidebar,
-  onOpenProjectFiles,
-  projectFilesExpanded = false,
+  onOpenWorkspacePanel,
+  workspacePanelExpanded = false,
+  workspacePanelAvailable,
   desktop = false,
   onCompose,
   showTitle = true,
 }: {
   onOpenSidebar?: () => void
-  onOpenProjectFiles: () => void
-  projectFilesExpanded?: boolean
+  onOpenWorkspacePanel: () => void
+  workspacePanelExpanded?: boolean
+  workspacePanelAvailable: boolean
   desktop?: boolean
   onCompose?: () => void
   showTitle?: boolean
@@ -727,20 +732,19 @@ function ChatTitleBar({
   const setSidebarCollapsed = useAtomSet(sidebarCollapsedAtom)
   const settingsTab = useAtomValue(settingsTabAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
-  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
-  const projectFilesButton = (
+  const workspacePanelButton = (
     <ActionTooltip
       label="Expand sidebar"
       side="bottom"
       trigger={
         <span
           className="inline-flex [-webkit-app-region:no-drag]"
-          tabIndex={selectedProjectId === null ? 0 : undefined}
-          aria-label={selectedProjectId === null ? "Expand sidebar" : undefined}
+          tabIndex={!workspacePanelAvailable ? 0 : undefined}
+          aria-label={!workspacePanelAvailable ? "Expand sidebar" : undefined}
         >
           <Button variant="unstyled" size="unstyled" type="button"
-            onClick={onOpenProjectFiles}
-            disabled={selectedProjectId === null}
+            onClick={onOpenWorkspacePanel}
+            disabled={!workspacePanelAvailable}
             className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
             aria-label="Expand sidebar"
           ><PanelRight size={18} /></Button>
@@ -834,8 +838,8 @@ function ChatTitleBar({
             {title}
           </span>
         ) : null}
-        {!projectFilesExpanded ? (
-          <div className="absolute inset-y-0 right-2 flex items-center">{projectFilesButton}</div>
+        {!workspacePanelExpanded ? (
+          <div className="absolute inset-y-0 right-2 flex items-center">{workspacePanelButton}</div>
         ) : null}
       </div>
     )
@@ -864,7 +868,7 @@ function ChatTitleBar({
       <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
         {title}
       </span>
-      {!projectFilesExpanded ? <div className="ml-auto">{projectFilesButton}</div> : null}
+      {!workspacePanelExpanded ? <div className="ml-auto">{workspacePanelButton}</div> : null}
     </div>
   )
 }
@@ -1006,8 +1010,11 @@ function AuthenticatedAppContent({
     : deriveLocalModelLoadActivity(modelSlots, rootSlotId)
   const showOverlaySidebar = isNarrow && sidebarVisible
   const settingsTab = useAtomValue(settingsTabAtom)
-  const projectFilesOpen = useAtomValue(projectFilesPanelOpenAtom)
-  const setProjectFilesOpen = useAtomSet(projectFilesPanelOpenAtom)
+  const workspacePanelOpen = useAtomValue(workspacePanelOpenAtom)
+  const setWorkspacePanelOpen = useAtomSet(workspacePanelOpenAtom)
+  const setWorkspacePanelEntering = useAtomSet(workspacePanelEnteringAtom)
+  const workspacePanelSurface = useAtomValue(workspacePanelSurfaceAtom)
+  const setWorkspacePanelSurface = useAtomSet(workspacePanelSurfaceAtom)
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const { startNewSession } = useSessionActions()
@@ -1015,10 +1022,30 @@ function AuthenticatedAppContent({
   const forkStack = controller.expandedForkStack
   const panelOpen = settingsTab !== null
   const workerDetailOpen = !panelOpen && forkStack.length > 0
-  const projectFilesExpanded = !panelOpen && projectFilesOpen && selectedProjectId !== null
-  const openProjectFiles = () => {
+  const browser = platform.embeddedBrowser
+  const filesAvailable = selectedProjectId !== null
+  const browserAvailable = browser !== undefined
+  const workspacePanelAvailable = filesAvailable || browserAvailable
+  const activeWorkspaceSurface = workspacePanelSurface === "browser" && browserAvailable
+    ? "browser"
+    : filesAvailable
+      ? "files"
+      : browserAvailable
+        ? "browser"
+        : null
+  const workspacePanelExpanded = !panelOpen
+    && !workerDetailOpen
+    && workspacePanelOpen
+    && activeWorkspaceSurface !== null
+  const openWorkspacePanel = () => {
     setSettingsTab(null)
-    setProjectFilesOpen(true)
+    if (workspacePanelSurface === "files" && !filesAvailable && browserAvailable) {
+      setWorkspacePanelSurface("browser")
+    }
+    if (!workspacePanelOpen) {
+      setWorkspacePanelEntering(true)
+      setWorkspacePanelOpen(true)
+    }
   }
   return (
     <div
@@ -1031,8 +1058,9 @@ function AuthenticatedAppContent({
           <ChatTitleBar
             desktop
             showTitle={!panelOpen}
-            projectFilesExpanded={projectFilesExpanded}
-            onOpenProjectFiles={openProjectFiles}
+            workspacePanelExpanded={workspacePanelExpanded}
+            workspacePanelAvailable={workspacePanelAvailable}
+            onOpenWorkspacePanel={openWorkspacePanel}
             onCompose={() => {
               setSettingsTab(null)
               startNewSession()
@@ -1059,8 +1087,9 @@ function AuthenticatedAppContent({
           {!isDesktop ? (
             <ChatTitleBar
               onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
-              projectFilesExpanded={projectFilesExpanded}
-              onOpenProjectFiles={openProjectFiles}
+              workspacePanelExpanded={workspacePanelExpanded}
+              workspacePanelAvailable={workspacePanelAvailable}
+              onOpenWorkspacePanel={openWorkspacePanel}
             />
           ) : null}
           <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
@@ -1122,7 +1151,12 @@ function AuthenticatedAppContent({
         )}
         </div>
       </div>
-      {projectFilesExpanded && <ProjectFilesPanel projectId={selectedProjectId} />}
+      {workspacePanelExpanded && activeWorkspaceSurface === "files" && selectedProjectId !== null
+        ? <ProjectFilesPanel projectId={selectedProjectId} />
+        : null}
+      {workspacePanelExpanded && activeWorkspaceSurface === "browser" && browser !== undefined
+        ? <BrowserPanel browser={browser} filesEnabled={filesAvailable} />
+        : null}
     </div>
   )
 }

@@ -5,6 +5,20 @@
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./platform/embedded-browser": {
+      "types": "./src/platform/embedded-browser.ts",
+      "import": "./src/platform/embedded-browser.ts"
+    },
+    "./types/menu-action": {
+      "types": "./src/types/menu-action.ts",
+      "import": "./src/types/menu-action.ts"
+    }
+  },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },

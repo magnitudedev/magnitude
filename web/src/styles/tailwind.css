@@ -296,9 +296,18 @@
   }
 }
 
-@keyframes project-files-open {
+@keyframes workspace-panel-open {
   from {
     width: 0;
+  }
+}
+
+@keyframes browser-loading {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(400%);
   }
 }
 
