@@ -49,7 +49,7 @@ export const sidebarCollapsedAtom = Atom.keepAlive(Atom.make(false))
 export const collapsedProjectIdsAtom = Atom.keepAlive(
   Atom.make<ReadonlySet<ProjectId>>(new Set<ProjectId>()),
 )
-export type SettingsTab = "models" | "catalog" | "hardware"
+export type SettingsTab = "models" | "catalog" | "hardware" | "archived"
 export const settingsTabAtom = Atom.keepAlive(
   Atom.make<SettingsTab | null>(null)
 )

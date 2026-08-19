@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, test, beforeEach, afterEach } from "vitest"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Layer, Option, Stream } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import {
   GlobalStorage,
@@ -75,7 +75,8 @@ const meta = (
 ): StoredSessionMeta => ({
   sessionId,
   projectId: ProjectIdSchema.make(workingDirectory),
-  sidebarOpen: true,
+  archived: false,
+  pinnedAt: Option.none(),
   chatName: sessionId,
   workingDirectory,
   visibility,
@@ -142,16 +143,17 @@ describe("SessionStore", () => {
     ).then((page) => {
       expect(page.items.map((session) => session.sessionId)).toEqual(["mqa00001", "mqa00000"])
       expect(page.hasMore).toBe(false)
+      expect(page.totalCount).toBe(2)
     })
   })
 
-  test("searches active project names and can include closed sessions", async () => {
+  test("searches project names within an explicit archive filter", async () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage
         yield* storage.sessions.writeMeta(
           "mqa00000",
-          { ...meta("mqa00000", "2026-01-02T00:00:00.000Z", "/repo"), sidebarOpen: false },
+          { ...meta("mqa00000", "2026-01-02T00:00:00.000Z", "/repo"), archived: true },
         )
         yield* storage.sessions.writeMeta(
           "mqa00001",
@@ -159,20 +161,22 @@ describe("SessionStore", () => {
         )
 
         const store = yield* SessionStore
-        const hidden = yield* store.listProtocolMetas({
+        const active = yield* store.listProtocolMetas({
           query: "magnitude",
-          includeClosed: false,
+          archiveFilter: "active",
         })
-        const searchable = yield* store.listProtocolMetas({
+        const archived = yield* store.listProtocolMetas({
           query: "magnitude",
-          includeClosed: true,
+          archiveFilter: "archived",
         })
-        return { hidden, searchable }
+        return { active, archived }
       }),
       tmpDir,
-    ).then(({ hidden, searchable }) => {
-      expect(hidden.items).toEqual([])
-      expect(searchable.items.map((session) => session.sessionId)).toEqual(["mqa00000"])
+    ).then(({ active, archived }) => {
+      expect(active.items).toEqual([])
+      expect(active.totalCount).toBe(0)
+      expect(archived.items.map((session) => session.sessionId)).toEqual(["mqa00000"])
+      expect(archived.totalCount).toBe(1)
     })
   })
 
@@ -243,7 +247,7 @@ describe("SessionStore", () => {
     })
   })
 
-  test("closes and reopens sidebar membership without deleting the session", async () => {
+  test("archives and restores a session without changing its activity time", async () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage
@@ -252,20 +256,89 @@ describe("SessionStore", () => {
           meta("mqa00000", "2026-01-02T00:00:00.000Z"),
         )
         const store = yield* SessionStore
-        const closed = yield* store.setSidebarOpen("mqa00000", false)
-        const hidden = yield* store.listProtocolMetas({ includeClosed: false })
-        const complete = yield* store.listProtocolMetas({ includeClosed: true })
-        const reopened = yield* store.setSidebarOpen("mqa00000", true)
-        return { closed, hidden, complete, reopened }
+        const archived = yield* store.setArchived("mqa00000", true)
+        const hidden = yield* store.listProtocolMetas({ archiveFilter: "active" })
+        const complete = yield* store.listProtocolMetas({ archiveFilter: "all" })
+        const restored = yield* store.setArchived("mqa00000", false)
+        return { archived, hidden, complete, restored }
       }),
       tmpDir,
-    ).then(({ closed, hidden, complete, reopened }) => {
-      expect(closed.sidebarOpen).toBe(false)
-      expect(closed.updatedAt).toBe(Date.parse("2026-01-02T00:00:00.000Z"))
+    ).then(({ archived, hidden, complete, restored }) => {
+      expect(archived.archived).toBe(true)
+      expect(archived.updatedAt).toBe(Date.parse("2026-01-02T00:00:00.000Z"))
       expect(hidden.items).toEqual([])
       expect(complete.items.map((session) => session.sessionId)).toEqual(["mqa00000"])
-      expect(reopened.sidebarOpen).toBe(true)
-      expect(reopened.updatedAt).toBe(Date.parse("2026-01-02T00:00:00.000Z"))
+      expect(restored.archived).toBe(false)
+      expect(restored.updatedAt).toBe(Date.parse("2026-01-02T00:00:00.000Z"))
+    })
+  })
+
+  test("orders newest pins first without reordering them for session activity", async () => {
+    await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage
+        yield* storage.sessions.writeMeta("mqa00000", {
+          ...meta("mqa00000", "2026-01-05T00:00:00.000Z"),
+          pinnedAt: Option.some("1970-01-01T00:00:00.010Z"),
+        })
+        yield* storage.sessions.writeMeta("mqa00001", {
+          ...meta("mqa00001", "2026-01-01T00:00:00.000Z"),
+          pinnedAt: Option.some("1970-01-01T00:00:00.020Z"),
+        })
+        yield* storage.sessions.writeMeta(
+          "mqa00002",
+          meta("mqa00002", "2026-01-06T00:00:00.000Z"),
+        )
+
+        const store = yield* SessionStore
+        const first = yield* store.listProtocolMetas({ prioritizePinned: true, limit: 2 })
+        const second = Option.isSome(first.nextCursor)
+          ? yield* store.listProtocolMetas({
+              prioritizePinned: true,
+              cursor: first.nextCursor.value,
+              limit: 2,
+            })
+          : yield* Effect.die("missing pinned-order cursor")
+        return { first, second }
+      }),
+      tmpDir,
+    ).then(({ first, second }) => {
+      expect(first.items.map((session) => session.sessionId)).toEqual([
+        "mqa00001",
+        "mqa00000",
+      ])
+      expect(first.totalCount).toBe(3)
+      expect(second.items.map((session) => session.sessionId)).toEqual([
+        "mqa00002",
+      ])
+      expect(second.totalCount).toBe(3)
+    })
+  })
+
+  test("archiving clears a pin and pinning an archived session restores it", async () => {
+    await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage
+        yield* storage.sessions.writeMeta(
+          "mqa00000",
+          meta("mqa00000", "2026-01-02T00:00:00.000Z"),
+        )
+        const store = yield* SessionStore
+        const pinned = yield* store.setPinned("mqa00000", true)
+        const pinnedAgain = yield* store.setPinned("mqa00000", true)
+        const archived = yield* store.setArchived("mqa00000", true)
+        const repinned = yield* store.setPinned("mqa00000", true)
+        return { pinned, pinnedAgain, archived, repinned }
+      }),
+      tmpDir,
+    ).then(({ pinned, pinnedAgain, archived, repinned }) => {
+      expect(Option.isSome(pinned.pinnedAt)).toBe(true)
+      expect(pinnedAgain.pinnedAt).toEqual(pinned.pinnedAt)
+      expect(pinned.archived).toBe(false)
+      expect(Option.isNone(archived.pinnedAt)).toBe(true)
+      expect(archived.archived).toBe(true)
+      expect(Option.isSome(repinned.pinnedAt)).toBe(true)
+      expect(repinned.archived).toBe(false)
     })
   })
 })

@@ -11,6 +11,7 @@ import {
 import {
   CaretDown,
   CaretRight,
+  Archive,
   DotsThreeVertical,
   FolderOpen,
   FolderPlus,
@@ -18,6 +19,8 @@ import {
   MagnifyingGlass,
   NotePencil,
   Plus,
+  PushPin,
+  PushPinSlash,
   SidebarSimple,
   X,
 } from "@phosphor-icons/react"
@@ -53,7 +56,7 @@ interface SessionItemData {
   readonly updatedAt: number
   readonly workStatus: "idle" | "working"
   readonly cwd: string
-  readonly sidebarOpen: boolean
+  readonly pinnedAt: number | null
 }
 
 export interface SessionsSidebarProps {
@@ -63,7 +66,8 @@ export interface SessionsSidebarProps {
   readonly loadingMore?: boolean
   readonly hasMore?: boolean
   readonly onSelectSession?: (session: SessionItemData) => void
-  readonly onCloseSession?: (sessionId: string) => void
+  readonly onArchiveSession?: (sessionId: string) => void
+  readonly onSetSessionPinned?: (sessionId: string, pinned: boolean) => void
   readonly onCompose?: () => void
   readonly onCreateProject?: (project: ProjectRecord) => void
   readonly onEditProject?: (project: ProjectRecord) => void
@@ -81,18 +85,21 @@ export interface SessionsSidebarProps {
 }
 
 const settingsSections = [
-  { id: "models", label: "Models", detail: "Runtime & storage", icon: Layers3 },
+  { id: "models", label: "Models", icon: Layers3 },
   {
     id: "catalog",
     label: "Catalog",
-    detail: "Compare & choose",
     icon: SlidersHorizontal,
   },
   {
     id: "hardware",
     label: "Hardware",
-    detail: "Capacity & compute",
     icon: HardDrive,
+  },
+  {
+    id: "archived",
+    label: "Archived Chats",
+    icon: Archive,
   },
 ] as const
 
@@ -127,23 +134,20 @@ function SettingsNavigation({
         className="flex min-h-0 flex-1 flex-col gap-[3px] px-2 py-2.5"
         aria-label="Settings sections"
       >
-        {settingsSections.map(({ id, label, detail, icon: Icon }) => (
+        {settingsSections.map(({ id, label, icon: Icon }) => (
           <Button
+            key={id}
             variant="unstyled"
             size="unstyled"
-            key={id}
             type="button"
             aria-current={activeTab === id ? "page" : undefined}
             onClick={() => onTabChange?.(id)}
-            className="flex min-h-[52px] w-full cursor-pointer items-center gap-[11px] rounded-[7px] border-0 bg-transparent px-2.5 py-2 text-left text-slate-500 hover:bg-slate-150 aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400"
+            className="flex h-9 w-full cursor-pointer items-center gap-[11px] rounded-[7px] border-0 bg-transparent px-2.5 text-left text-slate-500 hover:bg-slate-150 aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400"
           >
             <Icon size={17} />
-            <span className="flex min-w-0 flex-col gap-px">
-              <strong className="text-[13px] font-semibold text-slate-700 dark:text-slate-300">
-                {label}
-              </strong>
-              <small className="text-[11px] text-slate-500">{detail}</small>
-            </span>
+            <strong className="min-w-0 truncate text-[13px] font-semibold text-slate-700 dark:text-slate-300">
+              {label}
+            </strong>
           </Button>
         ))}
       </nav>
@@ -228,54 +232,76 @@ function projectGitLabel(project: ProjectSummary): string | null {
 
 function SessionRow({
   session,
+  projectName,
+  nested = true,
   selected,
   onSelect,
-  onClose,
+  onArchive,
+  onSetPinned,
 }: {
   readonly session: SessionItemData
+  readonly projectName: string
+  readonly nested?: boolean
   readonly selected: boolean
   readonly onSelect: () => void
-  readonly onClose: () => void
+  readonly onArchive: () => void
+  readonly onSetPinned: (pinned: boolean) => void
 }): ReactNode {
   const working = session.workStatus === "working"
+  const pinned = session.pinnedAt !== null
+  const title = session.title || "Untitled session"
   return (
     <div
       data-selected={selected || undefined}
-      className="group/session ml-5 flex h-8 items-center rounded-md pr-1 text-slate-600 hover:bg-slate-150 data-[selected]:bg-blue-100 data-[selected]:text-blue-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:data-[selected]:bg-blue-900/55 dark:data-[selected]:text-blue-300"
+      className={`group/session relative flex h-8 items-center rounded-md pr-1 text-slate-600 hover:bg-slate-150 data-[selected]:bg-blue-100 data-[selected]:text-blue-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:data-[selected]:bg-blue-900/55 dark:data-[selected]:text-blue-300 ${nested ? "ml-5" : ""}`}
     >
       <Button
         variant="unstyled"
         size="unstyled"
         type="button"
         onClick={onSelect}
-        title={session.title ?? "Untitled session"}
-        className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap border-0 bg-transparent px-2 text-left font-sans text-[13px] font-medium text-inherit"
+        title={`${title} — ${projectName}`}
+        className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap border-0 bg-transparent px-2 text-left font-sans text-[13px] font-medium text-inherit group-hover/session:pr-14 group-focus-within/session:pr-14"
       >
-        {session.title || "Untitled session"}
+        {title}
       </Button>
       {working ? (
-        <span className="mr-1 size-1.5 shrink-0 rounded-full bg-blue-500" title="Working" />
+        <span className="mr-1 size-1.5 shrink-0 rounded-full bg-blue-500 group-hover/session:hidden group-focus-within/session:hidden" title="Working" />
       ) : (
-        <span className="mr-1 hidden shrink-0 text-[10px] text-slate-500 group-hover/session:inline group-focus-within/session:inline">
+        <span className="mr-1 shrink-0 text-[10px] text-slate-500 group-hover/session:hidden group-focus-within/session:hidden">
           {formatRelativeTime(session.updatedAt)}
         </span>
       )}
-      {session.sidebarOpen ? (
+      <div className="pointer-events-none absolute right-1 flex items-center gap-0.5 opacity-0 group-hover/session:pointer-events-auto group-hover/session:opacity-100 group-focus-within/session:pointer-events-auto group-focus-within/session:opacity-100">
         <Button
           variant="unstyled"
           size="unstyled"
           type="button"
           onClick={(event) => {
             event.stopPropagation()
-            onClose()
+            onSetPinned(!pinned)
           }}
-          className="hidden size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 group-hover/session:flex group-focus-within/session:flex dark:hover:bg-slate-700 dark:hover:text-slate-200"
-          aria-label={`Close ${session.title || "session"}`}
-          title="Close session"
+          className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+          aria-label={`${pinned ? "Unpin" : "Pin"} ${title}`}
+          title={pinned ? "Unpin chat" : "Pin chat"}
         >
-          <X size={13} />
+          {pinned ? <PushPinSlash size={14} /> : <PushPin size={14} />}
         </Button>
-      ) : null}
+        <Button
+          variant="unstyled"
+          size="unstyled"
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation()
+            onArchive()
+          }}
+          className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-slate-500 hover:bg-slate-250 hover:text-slate-800 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+          aria-label={`Archive ${title}`}
+          title="Archive chat"
+        >
+          <Archive size={14} />
+        </Button>
+      </div>
     </div>
   )
 }
@@ -287,7 +313,8 @@ export function SessionsSidebar({
   loadingMore = false,
   hasMore = false,
   onSelectSession,
-  onCloseSession,
+  onArchiveSession,
+  onSetSessionPinned,
   onCompose,
   onCreateProject,
   onEditProject,
@@ -316,9 +343,22 @@ export function SessionsSidebar({
   const [removeProject, setRemoveProject] = useState<ProjectRecord | null>(null)
   const compact = collapsed && !overlay
 
+  const pinnedSessions = useMemo(
+    () => sessions.filter((session) => session.pinnedAt !== null),
+    [sessions],
+  )
+  const pinnedProjectIds = useMemo(
+    () => new Set(pinnedSessions.map((session) => session.projectId)),
+    [pinnedSessions],
+  )
+  const projectNames = useMemo(
+    () => new Map(projects.map((summary) => [summary.project.projectId, summary.project.name])),
+    [projects],
+  )
   const sessionsByProject = useMemo(() => {
     const grouped = new Map<ProjectId, SessionItemData[]>()
     for (const session of sessions) {
+      if (session.pinnedAt !== null) continue
       const current = grouped.get(session.projectId) ?? []
       current.push(session)
       grouped.set(session.projectId, current)
@@ -455,29 +495,54 @@ export function SessionsSidebar({
             >
               {loading ? (
                 <SidebarLoadingState />
-              ) : visibleProjects.length === 0 ? (
+              ) : visibleProjects.length === 0 && pinnedSessions.length === 0 ? (
                 <SidebarEmptyState searchQuery={search} />
               ) : (
-                visibleProjects.map((summary) => {
-                  const project = summary.project
-                  const projectSessions = sessionsByProject.get(project.projectId) ?? []
-                  const isCollapsed = collapsedProjects.has(project.projectId)
-                  const gitLabel = projectGitLabel(summary)
-                  const sourceWarning =
-                    summary.directoryState._tag === "missing"
-                      ? "Missing"
-                      : summary.directoryState._tag === "inaccessible"
-                      ? "Unavailable"
-                      : null
-                  const revealLabel =
-                    revealKind === "finder" ? "Reveal in Finder" : "Show in folder"
-                  return (
-                    <Collapsible
-                      key={project.projectId}
-                      open={!isCollapsed}
-                      onOpenChange={() => toggleProject(project.projectId)}
-                      className="mt-2"
-                    >
+                <>
+                  {pinnedSessions.length > 0 ? (
+                    <section className="mb-1 mt-1" aria-label="Pinned sessions">
+                      <div className="flex h-7 items-center px-2 font-sans text-[11px] font-semibold text-slate-500">
+                        Pinned
+                      </div>
+                      <div className="space-y-0.5">
+                        {pinnedSessions.map((session) => (
+                          <SessionRow
+                            key={session.sessionId}
+                            session={session}
+                            projectName={projectNames.get(session.projectId) ?? "Project"}
+                            nested={false}
+                            selected={selectedSessionId === session.sessionId}
+                            onSelect={() => {
+                              onSelectSession?.(session)
+                              if (overlay) onCloseOverlay?.()
+                            }}
+                            onArchive={() => onArchiveSession?.(session.sessionId)}
+                            onSetPinned={(pinned) => onSetSessionPinned?.(session.sessionId, pinned)}
+                          />
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
+                  {visibleProjects.map((summary) => {
+                    const project = summary.project
+                    const projectSessions = sessionsByProject.get(project.projectId) ?? []
+                    const isCollapsed = collapsedProjects.has(project.projectId)
+                    const gitLabel = projectGitLabel(summary)
+                    const sourceWarning =
+                      summary.directoryState._tag === "missing"
+                        ? "Missing"
+                        : summary.directoryState._tag === "inaccessible"
+                        ? "Unavailable"
+                        : null
+                    const revealLabel =
+                      revealKind === "finder" ? "Reveal in Finder" : "Show in folder"
+                    return (
+                      <Collapsible
+                        key={project.projectId}
+                        open={!isCollapsed}
+                        onOpenChange={() => toggleProject(project.projectId)}
+                        className="mt-2"
+                      >
                       <div className="group/project flex h-8 items-center rounded-md text-slate-700 hover:bg-slate-150 dark:text-slate-300 dark:hover:bg-slate-800">
                         <CollapsibleTrigger className="flex min-w-0 flex-1 items-center gap-1.5 border-0 bg-transparent px-1.5 text-left text-inherit">
                           {isCollapsed ? (
@@ -543,24 +608,27 @@ export function SessionsSidebar({
                             <SessionRow
                               key={session.sessionId}
                               session={session}
+                              projectName={project.name}
                               selected={selectedSessionId === session.sessionId}
                               onSelect={() => {
                                 onSelectSession?.(session)
                                 if (overlay) onCloseOverlay?.()
                               }}
-                              onClose={() => onCloseSession?.(session.sessionId)}
+                              onArchive={() => onArchiveSession?.(session.sessionId)}
+                              onSetPinned={(pinned) => onSetSessionPinned?.(session.sessionId, pinned)}
                             />
                           ))}
                           {projectSessions.length === 0 ? (
                             <div className="ml-7 px-2 py-1 text-[11px] text-slate-500">
-                              No open sessions
+                              {pinnedProjectIds.has(project.projectId) ? "No other sessions" : "No sessions"}
                             </div>
                           ) : null}
                         </div>
                       </CollapsibleContent>
-                    </Collapsible>
-                  )
-                })
+                      </Collapsible>
+                    )
+                  })}
+                </>
               )}
               {loadingMore ? (
                 <div className="py-3 text-center text-[11px] text-slate-500">Loading…</div>

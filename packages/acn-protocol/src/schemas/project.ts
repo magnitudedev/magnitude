@@ -48,7 +48,6 @@ export const ProjectSummarySchema = Schema.Struct({
   project: ProjectRecordSchema,
   directoryState: ProjectDirectoryStateSchema,
   gitState: ProjectGitStateSchema,
-  openSessionCount: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
   totalSessionCount: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
   recentActivityAt: Schema.Number,
 })

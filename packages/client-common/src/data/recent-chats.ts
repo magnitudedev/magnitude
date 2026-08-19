@@ -6,6 +6,8 @@
  * types and time formatting.
  */
 
+import { Option } from "effect"
+
 export interface RecentChat {
   id: string
   projectId: import("@magnitudedev/sdk").ProjectId
@@ -14,7 +16,8 @@ export interface RecentChat {
   timestamp: number
   messageCount: number
   workingDirectory: string
-  sidebarOpen: boolean
+  archived: boolean
+  pinnedAt: number | null
 }
 
 export interface RecentChatsPage {
@@ -85,6 +88,7 @@ export function sessionsToRecentChats(sessions: readonly SessionMetadata[]): Rec
     timestamp: session.updatedAt,
     messageCount: session.messageCount,
     workingDirectory: session.cwd,
-    sidebarOpen: session.sidebarOpen,
+    archived: session.archived,
+    pinnedAt: Option.getOrNull(session.pinnedAt),
   }))
 }

@@ -68,7 +68,7 @@ import { ProjectFilesPanel } from "./components/project-files/panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
-import { SettingsCenter } from "./components/model-center"
+import { SettingsCenter } from "./components/settings-center"
 import { LocalModelOnboarding } from "./components/local-model-onboarding"
 import { formatBytes } from "./components/local-inference-format"
 import { ChatColumnPage } from "./components/chat-column-page"
@@ -172,7 +172,8 @@ function SessionsSidebarContainer(props?: {
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
   const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
   const sessionPage = usePaginatedSessions({
-    includeClosed: trimmedSearchQuery.length > 0,
+    archiveFilter: "active",
+    prioritizePinned: true,
     ...(trimmedSearchQuery
       ? {
           query: trimmedSearchQuery,
@@ -201,13 +202,13 @@ function SessionsSidebarContainer(props?: {
     []
   )
   useAtomMount(focusSearchAtom)
-  const closeSessionAtom = useMemo(() => client.rpc.mutation("CloseSession"), [client])
-  const reopenSessionAtom = useMemo(() => client.rpc.mutation("ReopenSession"), [client])
+  const archiveSessionAtom = useMemo(() => client.rpc.mutation("ArchiveSession"), [client])
+  const setSessionPinnedAtom = useMemo(() => client.rpc.mutation("SetSessionPinned"), [client])
   const revealProjectAtom = useMemo(() => client.rpc.mutation("RevealProjectSource"), [client])
-  const closeSession = useAtomSet(closeSessionAtom, {
+  const archiveSession = useAtomSet(archiveSessionAtom, {
     mode: "promise",
   })
-  const reopenSession = useAtomSet(reopenSessionAtom, { mode: "promise" })
+  const setSessionPinned = useAtomSet(setSessionPinnedAtom, { mode: "promise" })
   const revealProject = useAtomSet(revealProjectAtom, { mode: "promise" })
   const handleCompose = () => {
     setSettingsTab(null)
@@ -235,7 +236,7 @@ function SessionsSidebarContainer(props?: {
           projectId: s.projectId,
           title: s.title,
           cwd: s.workingDirectory,
-          sidebarOpen: s.sidebarOpen,
+          pinnedAt: s.pinnedAt,
           ...statusFields,
         }
       })}
@@ -249,26 +250,25 @@ function SessionsSidebarContainer(props?: {
           setSelectedCwd(session.cwd)
           resumeSession(session.sessionId)
         }
-        if (session.sidebarOpen) {
-          select()
-          return
-        }
-        void reopenSession({
-          payload: { sessionId: session.sessionId },
-          reactivityKeys: ["sessions", "projects"],
-        }).then(select).catch(() => notify("error", "Could not reopen this session."))
+        select()
       }}
-      onCloseSession={(sessionId) => {
-        void closeSession({
+      onArchiveSession={(sessionId) => {
+        void archiveSession({
           payload: { sessionId },
           reactivityKeys: ["sessions", "projects"],
         }).then(() => {
           if (sessionId !== selectedSessionId) return
-          const closed = sessionPage.sessions.find((session) => session.id === sessionId)
-          startNewSession(closed
-            ? { cwd: closed.workingDirectory, projectId: closed.projectId }
+          const archived = sessionPage.sessions.find((session) => session.id === sessionId)
+          startNewSession(archived
+            ? { cwd: archived.workingDirectory, projectId: archived.projectId }
             : { cwd: null, projectId: null })
-        }).catch(() => notify("error", "Could not close this session."))
+        }).catch(() => notify("error", "Could not archive this session."))
+      }}
+      onSetSessionPinned={(sessionId, pinned) => {
+        void setSessionPinned({
+          payload: { sessionId, pinned },
+          reactivityKeys: ["sessions", "projects"],
+        }).catch(() => notify("error", `Could not ${pinned ? "pin" : "unpin"} this session.`))
       }}
       onCompose={handleCompose}
       onRevealProject={(projectId) => {

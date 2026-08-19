@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Option } from "effect";
 import { BunFileSystem, BunPath } from "@effect/platform-bun";
 
 import { makeGlobalStoragePaths, makeProjectStoragePaths } from "../paths";
@@ -59,7 +59,8 @@ describe("session storage", () => {
   const baseMeta = {
     sessionId,
     projectId: "project-1",
-    sidebarOpen: true,
+    archived: false,
+    pinnedAt: Option.none(),
     chatName: "Chat",
     workingDirectory: "/repo",
     visibility: "visible",
@@ -110,6 +111,43 @@ describe("session storage", () => {
       tmpDir
     );
     expect(result).toEqual(baseMeta);
+    const persisted = JSON.parse(
+      await readFile(paths.sessionMetaFile(sessionId), "utf-8"),
+    ) as Record<string, unknown>;
+    expect("pinnedAt" in persisted).toBe(false);
+  });
+
+  test("decodes legacy sidebar membership once and writes only archive metadata", async () => {
+    await mkdir(paths.sessionDir(sessionId), { recursive: true });
+    await writeFile(
+      paths.sessionMetaFile(sessionId),
+      JSON.stringify({
+        ...baseMeta,
+        archived: undefined,
+        pinnedAt: undefined,
+        sidebarOpen: false,
+      }),
+      "utf-8",
+    );
+
+    const decoded = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        const meta = yield* storage.sessions.readMeta(sessionId);
+        if (meta) yield* storage.sessions.writeMeta(sessionId, meta);
+        return meta;
+      }),
+      tmpDir,
+    );
+
+    expect(decoded?.archived).toBe(true);
+    expect(Option.isNone(decoded!.pinnedAt)).toBe(true);
+    const persisted = JSON.parse(
+      await readFile(paths.sessionMetaFile(sessionId), "utf-8"),
+    ) as Record<string, unknown>;
+    expect(persisted.archived).toBe(true);
+    expect("sidebarOpen" in persisted).toBe(false);
+    expect("pinnedAt" in persisted).toBe(false);
   });
 
   test("updateMeta updates", async () => {
@@ -168,6 +206,30 @@ describe("session storage", () => {
     );
 
     expect(result?.messageCount).toBe(20);
+  });
+
+  test("permanent archive deletion rechecks archive state under the metadata lock", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const storage = yield* MagnitudeStorage;
+        yield* storage.sessions.writeMeta(sessionId, baseMeta as any);
+        const activeDeleted = yield* storage.sessions.deleteArchivedSession(sessionId);
+        const activeStillExists = yield* storage.sessions.readMeta(sessionId);
+        yield* storage.sessions.updateMeta(sessionId, (current) => ({
+          ...current!,
+          archived: true,
+        }));
+        const archivedDeleted = yield* storage.sessions.deleteArchivedSession(sessionId);
+        const archivedStillExists = yield* storage.sessions.readMeta(sessionId);
+        return { activeDeleted, activeStillExists, archivedDeleted, archivedStillExists };
+      }),
+      tmpDir,
+    );
+
+    expect(result.activeDeleted).toBe(false);
+    expect(result.activeStillExists?.sessionId).toBe(sessionId);
+    expect(result.archivedDeleted).toBe(true);
+    expect(result.archivedStillExists).toBeNull();
   });
 
   test("writeMeta prepends new session ids and updateMeta preserves existing index order", async () => {

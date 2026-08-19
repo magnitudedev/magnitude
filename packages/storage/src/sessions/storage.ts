@@ -8,10 +8,11 @@ import { SCRATCHPAD_SUBDIRS } from "@magnitudedev/scratchpad";
 import {
   makeStorageIo,
   SchemaDecodeError,
+  SchemaEncodeError,
   type JsonError,
   type JsonLinesError,
 } from "../io/storage";
-import { readStructuredFile } from "../io/structured-file";
+import { readStructuredFile, writeStructuredFileAtomic } from "../io/structured-file";
 import { GlobalStorage } from "../services";
 import { Version } from "../services/version";
 import {
@@ -75,6 +76,18 @@ export function makeSessionStorage(): Effect.Effect<
         }
         return result.value;
       });
+
+    const writeMetaHelper = (
+      sessionId: string,
+      meta: StoredSessionMeta
+    ): Effect.Effect<void, PlatformError | JsonError> =>
+      writeStructuredFileAtomic(g.sessionMetaFile(sessionId), metaSchema, meta).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.mapError((error) =>
+          error._tag === "StructuredFileEncodeFailed"
+            ? new SchemaEncodeError({ path: error.path, message: error.reason })
+            : error)
+      );
 
     const upsertCwdIndex = (
       meta: StoredSessionMeta
@@ -187,7 +200,7 @@ export function makeSessionStorage(): Effect.Effect<
           g.sessionMetaFile(sessionId),
           Effect.gen(function* () {
             yield* io.ensureDir(g.sessionDir(sessionId));
-            yield* io.writeJsonFile(g.sessionMetaFile(sessionId), meta);
+            yield* writeMetaHelper(sessionId, meta);
             yield* upsertCwdIndex(meta);
           })
         ),
@@ -202,7 +215,7 @@ export function makeSessionStorage(): Effect.Effect<
               yield* removeCwdIndexEntry(current.workingDirectory, sessionId);
             }
             yield* io.ensureDir(g.sessionDir(sessionId));
-            yield* io.writeJsonFile(g.sessionMetaFile(sessionId), next);
+            yield* writeMetaHelper(sessionId, next);
             yield* upsertCwdIndex(next);
             return next;
           })
@@ -255,20 +268,32 @@ export function makeSessionStorage(): Effect.Effect<
                   new SchemaDecodeError({ path: filePath, message: String(error) }),
               ),
             );
-            yield* io.writeJsonFile(filePath, next);
+            yield* writeMetaHelper(sessionId, next);
             yield* upsertCwdIndex(next);
           }),
         ),
 
       deleteSession: (sessionId) =>
         io.withPathLock(
-          g.sessionDir(sessionId),
+          g.sessionMetaFile(sessionId),
           Effect.gen(function* () {
             const meta = yield* readMetaHelper(sessionId);
             yield* io.removeDirectoryIfExists(g.sessionDir(sessionId));
             if (meta) {
               yield* removeCwdIndexEntry(meta.workingDirectory, sessionId);
             }
+          })
+        ),
+
+      deleteArchivedSession: (sessionId) =>
+        io.withPathLock(
+          g.sessionMetaFile(sessionId),
+          Effect.gen(function* () {
+            const meta = yield* readMetaHelper(sessionId);
+            if (!meta?.archived) return false;
+            yield* io.removeDirectoryIfExists(g.sessionDir(sessionId));
+            yield* removeCwdIndexEntry(meta.workingDirectory, sessionId);
+            return true;
           })
         ),
 

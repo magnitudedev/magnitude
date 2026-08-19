@@ -23,6 +23,11 @@ export class SessionOperationFailed extends Schema.TaggedError<SessionOperationF
   { operation: Schema.String, reason: Schema.String }
 ) {}
 
+export class SessionNotArchived extends Schema.TaggedError<SessionNotArchived>()(
+  "SessionNotArchived",
+  { sessionId: Schema.String }
+) {}
+
 export class DisplayViewNotOpen extends Schema.TaggedError<DisplayViewNotOpen>()(
   "DisplayViewNotOpen",
   { sessionId: Schema.String, viewId: Schema.String }
@@ -38,6 +43,7 @@ export const SessionError = Schema.Union(
   SessionAlreadyExists,
   SessionStartFailed,
   SessionOperationFailed,
+  SessionNotArchived,
   DisplayViewNotOpen,
   InvalidSessionPath
 )
