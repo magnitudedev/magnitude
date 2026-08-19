@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.7-alpha.1
+
+### Patch Changes
+
+- [`f6e1a09`](https://github.com/magnitudedev/magnitude/commit/f6e1a090dbc8a46daed20e8e2f6b008d73a92532) Thanks [@anerli](https://github.com/anerli)! - Update Qwen 3.8 27B to use Unsloth Dynamic V3.0 GGUFs
+
 ## 0.0.7-alpha.0
 
 ### Patch Changes
