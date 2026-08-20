@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { ProjectRelativePathSchema } from "@magnitudedev/sdk"
+import { RelativePathSchema } from "@magnitudedev/sdk"
 import {
   canMoveProjectEntryToDirectory,
   isProjectPathWithin,
@@ -7,7 +7,7 @@ import {
   translateProjectPath,
 } from "./project-file-paths"
 
-const path = ProjectRelativePathSchema.make
+const path = RelativePathSchema.make
 
 describe("project file paths", () => {
   it("finds root and nested parents", () => {

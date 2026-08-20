@@ -4,37 +4,37 @@ import {
   CreateSessionInitial,
   CreateSessionResult,
   ActiveSessionStatuses,
-  ListSessionsResult,
+  SessionPageSchema,
+  SessionPageRequestSchema,
+  RecentDirectoryPageRequestSchema,
+  RecentDirectoryPageSchema,
+  SessionChangeSchema,
   PreloadSessionResult,
-  SessionCwdSummary,
   SessionMetadata,
   SessionOptions,
-  SessionArchiveFilter,
 } from "../schemas/session"
-import { ProjectIdSchema } from "../schemas/project"
 import { makeAcnSubscriptionRpc } from "./subscription"
-import { SessionError } from "../errors"
-
-const ListSessionsPayloadFields = {
-  cwd: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
-  archiveFilter: Schema.optionalWith(SessionArchiveFilter, { default: () => "active" }),
-  prioritizePinned: Schema.optionalWith(Schema.Boolean, { default: () => false }),
-  query: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  cursor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  limit: Schema.optionalWith(Schema.Number, { default: () => 50 })
-}
+import {
+  InvalidDirectoryPageCursor,
+  InvalidSessionPageCursor,
+  SessionError,
+  SessionInspectionUnavailable,
+  SessionMetadataUnreadable,
+  SessionMetadataWriteFailed,
+  SessionNotArchived,
+  SessionNotFound,
+} from "../errors"
 
 export const ListSessions = Rpc.make("ListSessions", {
-  payload: ListSessionsPayloadFields,
-  success: ListSessionsResult,
-  error: SessionError
+  payload: SessionPageRequestSchema,
+  success: SessionPageSchema,
+  error: Schema.Union(InvalidSessionPageCursor, SessionInspectionUnavailable),
 })
 
-export const ListSessionCwds = Rpc.make("ListSessionCwds", {
-  payload: Schema.Struct({}),
-  success: Schema.Array(SessionCwdSummary),
-  error: SessionError
+export const ListRecentSessionDirectories = Rpc.make("ListRecentSessionDirectories", {
+  payload: RecentDirectoryPageRequestSchema,
+  success: RecentDirectoryPageSchema,
+  error: Schema.Union(InvalidDirectoryPageCursor, SessionInspectionUnavailable),
 })
 
 export const StreamActiveSessionStatuses = makeAcnSubscriptionRpc("StreamActiveSessionStatuses", {
@@ -43,10 +43,15 @@ export const StreamActiveSessionStatuses = makeAcnSubscriptionRpc("StreamActiveS
   error: SessionError,
 })
 
+export const StreamSessionChanges = makeAcnSubscriptionRpc("StreamSessionChanges", {
+  payload: Schema.Struct({}),
+  success: SessionChangeSchema,
+  error: SessionInspectionUnavailable,
+})
+
 export const CreateSession = Rpc.make("CreateSession", {
   payload: Schema.Struct({
     cwd: Schema.String,
-    projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
     sessionId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
     initial: Schema.optionalWith(CreateSessionInitial, { as: "Option", exact: true }),
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
@@ -59,7 +64,6 @@ export const CreateSession = Rpc.make("CreateSession", {
 export const PreloadSession = Rpc.make("PreloadSession", {
   payload: Schema.Struct({
     cwd: Schema.String,
-    projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
     draftOwnerId: Schema.optionalWith(Schema.String, { as: "Option", exact: true })
   }),
@@ -70,7 +74,6 @@ export const PreloadSession = Rpc.make("PreloadSession", {
 export const ReleaseSessionPreload = Rpc.make("ReleaseSessionPreload", {
   payload: Schema.Struct({
     cwd: Schema.String,
-    projectId: Schema.optionalWith(ProjectIdSchema, { as: "Option", exact: true }),
     sessionId: Schema.String,
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
     draftOwnerId: Schema.optionalWith(Schema.String, { as: "Option", exact: true })
@@ -82,25 +85,36 @@ export const ReleaseSessionPreload = Rpc.make("ReleaseSessionPreload", {
 export const GetSession = Rpc.make("GetSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
-  error: SessionError
+  error: Schema.Union(SessionNotFound, SessionMetadataUnreadable),
 })
 
 export const DeleteArchivedSession = Rpc.make("DeleteArchivedSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: Schema.Struct({}),
-  error: SessionError
+  error: Schema.Union(
+    SessionNotFound,
+    SessionNotArchived,
+    SessionMetadataUnreadable,
+    SessionMetadataWriteFailed,
+  ),
 })
+
+const SessionCommandError = Schema.Union(
+  SessionNotFound,
+  SessionMetadataUnreadable,
+  SessionMetadataWriteFailed,
+)
 
 export const ArchiveSession = Rpc.make("ArchiveSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
-  error: SessionError,
+  error: SessionCommandError,
 })
 
 export const RestoreSession = Rpc.make("RestoreSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
-  error: SessionError,
+  error: SessionCommandError,
 })
 
 export const SetSessionPinned = Rpc.make("SetSessionPinned", {
@@ -109,5 +123,5 @@ export const SetSessionPinned = Rpc.make("SetSessionPinned", {
     pinned: Schema.Boolean,
   }),
   success: SessionMetadata,
-  error: SessionError,
+  error: SessionCommandError,
 })

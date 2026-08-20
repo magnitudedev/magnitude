@@ -2,8 +2,8 @@ import { useMemo, useState, type ReactNode } from "react"
 import { Effect } from "effect"
 import { Atom, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { FolderPlus } from "@phosphor-icons/react"
-import { selectedCwdAtom, selectedProjectIdAtom, useProjects } from "@magnitudedev/client-common"
-import type { ProjectSummary } from "@magnitudedev/sdk"
+import { selectedCwdAtom, selectedProjectIdAtom, useProjectPages } from "@magnitudedev/client-common"
+import type { Project } from "@magnitudedev/sdk"
 import { MagnitudeMark } from "./magnitude-mark"
 import { ProjectFormDialog } from "./project-dialogs"
 import { collapsedProjectIdsAtom } from "../state/web-atoms"
@@ -18,11 +18,8 @@ import {
   CommandList,
 } from "@/components/ui/command"
 
-const isAvailable = (summary: ProjectSummary): boolean =>
-  summary.directoryState._tag === "available"
-
 export function ChatEmptyState(): ReactNode {
-  const { projects, loading, error } = useProjects()
+  const { projects, loading, error } = useProjectPages()
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
   const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
@@ -31,26 +28,25 @@ export function ChatEmptyState(): ReactNode {
   const [query, setQuery] = useState("")
   const [creatingProject, setCreatingProject] = useState(false)
 
-  const selectedById = projects.find(({ project }) => project.projectId === selectedProjectId)
   const selected =
-    selectedById && isAvailable(selectedById) ? selectedById : projects.find(isAvailable) ?? null
+    projects.find((project) => project.projectId === selectedProjectId) ?? projects[0] ?? null
 
   const initializeDraftProjectAtom = useMemo(
     () =>
       Atom.make(
         Effect.sync(() => {
-          if (selected === null || selectedProjectId === selected.project.projectId) return
-          setSelectedProjectId(selected.project.projectId)
-          setSelectedCwd(selected.project.sourceDirectory)
+          if (selected === null || selectedProjectId === selected.projectId) return
+          setSelectedProjectId(selected.projectId)
+          setSelectedCwd(selected.cwd)
         })
       ),
     [selected, selectedProjectId, setSelectedCwd, setSelectedProjectId]
   )
   useAtomMount(initializeDraftProjectAtom)
 
-  const selectProject = (project: ProjectSummary["project"]) => {
+  const selectProject = (project: Project) => {
     setSelectedProjectId(project.projectId)
-    setSelectedCwd(project.sourceDirectory)
+    setSelectedCwd(project.cwd)
     setChooserOpen(false)
     setQuery("")
   }
@@ -58,11 +54,10 @@ export function ChatEmptyState(): ReactNode {
   const visibleProjects = useMemo(() => {
     const normalized = query.trim().toLowerCase()
     return projects.filter(
-      (summary) =>
-        isAvailable(summary) &&
-        (!normalized ||
-          summary.project.name.toLowerCase().includes(normalized) ||
-          summary.project.sourceDirectory.toLowerCase().includes(normalized))
+      (project) =>
+        !normalized ||
+        project.name.toLowerCase().includes(normalized) ||
+        project.cwd.toLowerCase().includes(normalized)
     )
   }, [projects, query])
 
@@ -85,7 +80,7 @@ export function ChatEmptyState(): ReactNode {
                     />
                   }
                 >
-                  {selected.project.name}
+                  {selected.name}
                 </PopoverTrigger>
                 ?
               </h1>
@@ -107,18 +102,18 @@ export function ChatEmptyState(): ReactNode {
                     <CommandEmpty className="text-[12px] text-slate-500">
                       No matching projects.
                     </CommandEmpty>
-                    {visibleProjects.map((summary) => {
-                      const active = summary.project.projectId === selected.project.projectId
+                    {visibleProjects.map((project) => {
+                      const active = project.projectId === selected.projectId
                       return (
                         <CommandItem
-                          key={summary.project.projectId}
-                          value={`${summary.project.name} ${summary.project.sourceDirectory}`}
+                          key={project.projectId}
+                          value={`${project.name} ${project.cwd}`}
                           data-checked={active || undefined}
-                          onSelect={() => selectProject(summary.project)}
+                          onSelect={() => selectProject(project)}
                           className="h-9 px-2.5 text-[13px] text-slate-700 dark:text-slate-200"
                         >
                           <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-                            {summary.project.name}
+                            {project.name}
                           </span>
                         </CommandItem>
                       )
@@ -145,7 +140,7 @@ export function ChatEmptyState(): ReactNode {
                 What would you like to do?
               </h1>
               <span className="mt-4 block font-sans text-[13px] text-red-600 dark:text-red-400">
-                {error}
+                Failed to load projects.
               </span>
             </>
           ) : (

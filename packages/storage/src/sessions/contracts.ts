@@ -1,12 +1,10 @@
 import type { PlatformError } from '@effect/platform/Error'
-import { Context, Effect, Schema } from 'effect'
+import { Context, Effect, Schema, Stream } from 'effect'
 
 import type { JsonError, JsonLinesError } from '../io/storage'
 import type {
   CwdIndex,
-  LegacyStoredSessionProjectRecord,
   MemoryExtractionJobRecord,
-  ProjectId,
   StoredSessionMeta,
 } from '../types'
 
@@ -23,7 +21,12 @@ export interface StoredAddressedEntryStats {
   readonly storedBytes: number
 }
 
+export interface SessionMetadataChange {
+  readonly sessionId: string
+}
+
 export interface SessionStorageShape {
+  readonly metadataChanges: Stream.Stream<SessionMetadataChange>
   readonly paths: {
     readonly root: string
     readonly sessionsRoot: string
@@ -66,16 +69,6 @@ export interface SessionStorageShape {
     sessionId: string,
     updater: (current: StoredSessionMeta | null) => StoredSessionMeta
   ) => Effect.Effect<StoredSessionMeta, PlatformError | JsonError>
-
-  readonly listProjectMigrationRecords: () => Effect.Effect<
-    LegacyStoredSessionProjectRecord[],
-    PlatformError | JsonError
-  >
-
-  readonly assignProjectId: (
-    sessionId: string,
-    projectId: ProjectId
-  ) => Effect.Effect<void, PlatformError | JsonError>
 
   readonly deleteSession: (
     sessionId: string

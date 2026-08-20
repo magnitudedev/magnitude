@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest"
 import { Schema } from "effect"
-import { ProjectEntryMoveSchema, ProjectFilesChangeSchema, ProjectRelativePathSchema } from "./project-files"
+import { ProjectEntryMoveSchema, ProjectFilesChangeSchema } from "./project-files"
+import { RelativePathSchema } from "./paths"
 
-const decode = Schema.decodeUnknownEither(ProjectRelativePathSchema)
+const decode = Schema.decodeUnknownEither(RelativePathSchema)
 
-describe("ProjectRelativePathSchema", () => {
+describe("RelativePathSchema", () => {
   it.each(["", "src/index.ts", ".github/workflows/ci.yml"])("accepts %j", (path) => {
     expect(decode(path)._tag).toBe("Right")
   })

@@ -10,19 +10,13 @@ import { Option } from "effect"
 
 export interface RecentChat {
   id: string
-  projectId: import("@magnitudedev/sdk").ProjectId
   title: string
   lastMessage: string
   timestamp: number
   messageCount: number
-  workingDirectory: string
+  workingDirectory: import("@magnitudedev/sdk").DirectoryPath
   archived: boolean
   pinnedAt: number | null
-}
-
-export interface RecentChatsPage {
-  items: RecentChat[]
-  hasMore: boolean
 }
 
 export interface FormatCwdOptions {
@@ -82,7 +76,6 @@ import type { SessionMetadata } from "@magnitudedev/sdk"
 export function sessionsToRecentChats(sessions: readonly SessionMetadata[]): RecentChat[] {
   return sessions.map((session) => ({
     id: session.sessionId,
-    projectId: session.projectId,
     title: session.title ?? "Untitled",
     lastMessage: session.lastMessage ?? "",
     timestamp: session.updatedAt,

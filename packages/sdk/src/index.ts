@@ -130,8 +130,9 @@ export {
   AssessmentEnvironmentIdSchema,
   LocalModelsStateSchema,
   AcnInstanceIdSchema,
-  ProjectRelativePathSchema,
-  ProjectFileRevisionSchema,
+  DirectoryPathSchema,
+  RelativePathSchema,
+  FileContentHashSchema,
 } from "@magnitudedev/acn-protocol"
 
 export type {
@@ -174,7 +175,6 @@ export type {
   ImageAttachment,
   ImageMediaType,
   InterruptedMessage,
-  ListSessionsResult,
   MentionCandidate,
   MentionAttachment,
   MentionDirectoryAttachment,
@@ -186,7 +186,6 @@ export type {
   PendingInboundCommunication,
   SearchDirectoriesResult,
   SearchMentionsResult,
-  SessionCwdSummary,
   SessionMetadata,
   SessionOptions,
   StreamEvent,

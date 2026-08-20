@@ -1,4 +1,4 @@
-import type { ProjectDirectoryEntry, ProjectRelativePath } from "@magnitudedev/sdk"
+import type { ProjectDirectoryEntry, RelativePath } from "@magnitudedev/sdk"
 
 /**
  * Visit demanded directories breadth-first through authoritative parent entries.
@@ -6,10 +6,10 @@ import type { ProjectDirectoryEntry, ProjectRelativePath } from "@magnitudedev/s
  */
 export function visitProjectDirectoryDemand(
   rootEntries: readonly ProjectDirectoryEntry[],
-  demanded: ReadonlySet<ProjectRelativePath>,
-  visit: (directory: ProjectRelativePath) => readonly ProjectDirectoryEntry[] | undefined,
-): readonly ProjectRelativePath[] {
-  const visited: ProjectRelativePath[] = []
+  demanded: ReadonlySet<RelativePath>,
+  visit: (directory: RelativePath) => readonly ProjectDirectoryEntry[] | undefined,
+): readonly RelativePath[] {
+  const visited: RelativePath[] = []
   let level = rootEntries
 
   while (level.length > 0) {

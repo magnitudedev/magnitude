@@ -12,7 +12,7 @@ import {
   type UserBashCommandEvent,
 } from "./session-types"
 import { materializeMessageUploads } from "./attachments/materialize-message-uploads"
-import { collectMentionOccurrences } from "./file-mentions"
+import { FileMentionSearcher } from "./file-mention-searcher"
 
 export interface SessionCommandsApi {
   readonly sendUserMessage: (input: SendUserMessageInput) => Effect.Effect<void, SessionError>
@@ -41,11 +41,12 @@ export class SessionCommands extends Context.Tag("SessionCommands")<
 export const SessionCommandsLive: Layer.Layer<
   SessionCommands,
   never,
-  AgentRuntime | FileSystem.FileSystem | Path.Path
+  AgentRuntime | FileMentionSearcher | FileSystem.FileSystem | Path.Path
 > = Layer.effect(
   SessionCommands,
   Effect.gen(function* () {
     const runtime = yield* AgentRuntime
+    const mentionSearcher = yield* FileMentionSearcher
     const fs = yield* FileSystem.FileSystem
     const pathService = yield* Path.Path
 
@@ -69,18 +70,17 @@ export const SessionCommandsLive: Layer.Layer<
             Effect.provideService(Path.Path, pathService),
           )
           const admitMessage = Effect.gen(function* () {
-            const mentions = yield* collectMentionOccurrences(
-              entry.cwd,
-              entry.scratchpadPath,
-              input.content,
-              [...input.mentions, ...materialized.trailingMentions],
-            ).pipe(
-              Effect.mapError(
-                (error) =>
-                  new SessionStartFailed({
-                    sessionId: input.sessionId,
-                    reason: error instanceof Error ? error.message : "Failed to collect mentions",
-                  }),
+            const mentions = yield* mentionSearcher.collectMentionOccurrences({
+              cwd: entry.cwd,
+              scratchpadPath: entry.scratchpadPath,
+              content: input.content,
+              provided: [...input.mentions, ...materialized.trailingMentions],
+            }).pipe(
+              Effect.mapError((error) =>
+                new SessionStartFailed({
+                  sessionId: input.sessionId,
+                  reason: `Invalid mention span ${error.start}-${error.end}`,
+                }),
               ),
             )
             yield* entry.session.send({

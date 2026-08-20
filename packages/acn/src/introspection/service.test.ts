@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Fiber, Layer, Option, Queue, Scope, Stream } from "effect"
 import type { AgentIntrospection, CodingAgentSession } from "@magnitudedev/agent"
-import type { DisplayViewShape } from "@magnitudedev/acn-protocol"
+import { DirectoryPathSchema, type DisplayViewShape } from "@magnitudedev/acn-protocol"
 import { AcnActivityTrackerLive } from "../activity-tracker"
 import { AcnServiceLifecycleLive } from "../service-lifecycle"
 import { AgentRuntime, type AgentRuntimeApi } from "../agent-runtime"
@@ -77,7 +77,7 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
       const entry = {
         id: "session-a",
         title: "Session A",
-        cwd: "/tmp/session-a",
+        cwd: DirectoryPathSchema.make("/tmp/session-a"),
         scratchpadPath: "/tmp/session-a/scratchpad.md",
         createdAt: 1,
         updatedAt: 1,

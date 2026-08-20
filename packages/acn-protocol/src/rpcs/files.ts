@@ -13,7 +13,26 @@ import {
   WatchFileEvent
 } from "../schemas/files"
 import { makeAcnSubscriptionRpc } from "./subscription"
-import { SessionError } from "../errors"
+import {
+  DirectoryAccessDenied,
+  DirectoryNotFound,
+  FileAccessDenied,
+  FileNotFound,
+  FileSystemUnavailable,
+  InvalidDirectoryPath,
+  PathNotDirectory,
+  PathNotFile,
+  SessionError,
+} from "../errors"
+
+/** Failures of a traversal rooted at the requested cwd. */
+const TraversalError = Schema.Union(
+  InvalidDirectoryPath,
+  DirectoryNotFound,
+  DirectoryAccessDenied,
+  PathNotDirectory,
+  FileSystemUnavailable,
+)
 
 export const UploadAttachment = Rpc.make("UploadAttachment", {
   payload: Schema.Struct({
@@ -36,41 +55,47 @@ export const ListFiles = Rpc.make("ListFiles", {
     limit: Schema.optionalWith(Schema.Number, { default: () => 100 })
   }),
   success: Schema.Array(Schema.String),
-  error: SessionError
+  error: TraversalError,
 })
 
 export const ReadFile = Rpc.make("ReadFile", {
   payload: ReadFilePayload,
   success: ReadFileResult,
-  error: SessionError
+  error: Schema.Union(
+    InvalidDirectoryPath,
+    FileNotFound,
+    FileAccessDenied,
+    PathNotFile,
+    FileSystemUnavailable,
+  ),
 })
 
 export const CheckFileExists = Rpc.make("CheckFileExists", {
   payload: Schema.Struct({ cwd: Schema.String, path: Schema.String }),
   success: Schema.Boolean,
-  error: SessionError
+  error: InvalidDirectoryPath,
 })
 
 export const WatchFile = makeAcnSubscriptionRpc("WatchFile", {
   payload: WatchFilePayload,
   success: WatchFileEvent,
-  error: SessionError,
+  error: InvalidDirectoryPath,
 })
 
 export const ResolvePath = Rpc.make("ResolvePath", {
   payload: ResolvePathPayload,
   success: ResolvePathResult,
-  error: SessionError
+  error: InvalidDirectoryPath,
 })
 
 export const SearchMentions = Rpc.make("SearchMentions", {
   payload: SearchMentionsPayload,
   success: SearchMentionsResult,
-  error: SessionError
+  error: TraversalError,
 })
 
 export const SearchDirectories = Rpc.make("SearchDirectories", {
   payload: SearchDirectoriesPayload,
   success: SearchDirectoriesResult,
-  error: SessionError
+  error: InvalidDirectoryPath,
 })

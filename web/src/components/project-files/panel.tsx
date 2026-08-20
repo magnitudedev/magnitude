@@ -18,7 +18,7 @@ import {
   useProjectFileSave,
   useProjectFilesWatch,
 } from "@magnitudedev/client-common"
-import { ProjectRelativePathSchema, type ProjectDirectoryEntry, type ProjectId, type ProjectRelativePath } from "@magnitudedev/sdk"
+import { RelativePathSchema, type ProjectDirectoryEntry, type ProjectId, type RelativePath } from "@magnitudedev/sdk"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { ResizableEdge } from "@/components/ui/resizable-edge"
@@ -73,14 +73,14 @@ const ProjectTextEditor = lazy(() => import("./editor").then((module) => ({ defa
 interface FileNode {
   readonly id: string
   readonly name: string
-  readonly path: ProjectRelativePath
+  readonly path: RelativePath
   readonly kind: "directory" | "file"
   readonly loadState?: "idle" | "loading" | "loaded" | "failed"
   readonly children?: readonly FileNode[]
-  readonly openFile: (path: ProjectRelativePath) => void
-  readonly schedulePrefetch: (path: ProjectRelativePath) => void
-  readonly cancelPrefetch: (path: ProjectRelativePath) => void
-  readonly retryDirectory: (path: ProjectRelativePath) => void
+  readonly openFile: (path: RelativePath) => void
+  readonly schedulePrefetch: (path: RelativePath) => void
+  readonly cancelPrefetch: (path: RelativePath) => void
+  readonly retryDirectory: (path: RelativePath) => void
 }
 
 const DIRECTORY_PREFETCH_DELAY_MS = 200
@@ -98,10 +98,10 @@ const buildNodes = (
   entries: readonly ProjectDirectoryEntry[],
   listings: Readonly<Record<string, { readonly entries: readonly ProjectDirectoryEntry[] }>>,
   loadStates: Readonly<Record<string, NonNullable<FileNode["loadState"]>>>,
-  openFile: (path: ProjectRelativePath) => void,
-  schedulePrefetch: (path: ProjectRelativePath) => void,
-  cancelPrefetch: (path: ProjectRelativePath) => void,
-  retryDirectory: (path: ProjectRelativePath) => void,
+  openFile: (path: RelativePath) => void,
+  schedulePrefetch: (path: RelativePath) => void,
+  cancelPrefetch: (path: RelativePath) => void,
+  retryDirectory: (path: RelativePath) => void,
 ): readonly FileNode[] => entries.map((entry) => ({
   id: entry.path,
   name: entry.name,
@@ -213,10 +213,10 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   const closingRef = useRef(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [resizing, setResizing] = useState(false)
-  const [prefetchedDirectories, setPrefetchedDirectories] = useState<ReadonlySet<ProjectRelativePath>>(() => new Set())
+  const [prefetchedDirectories, setPrefetchedDirectories] = useState<ReadonlySet<RelativePath>>(() => new Set())
   const refreshDirectory = useProjectDirectoryRefresh()
-  const scheduledPrefetchRef = useRef<{ readonly path: ProjectRelativePath; readonly timer: number } | null>(null)
-  const prefetchExpiryTimersRef = useRef(new Map<ProjectRelativePath, number>())
+  const scheduledPrefetchRef = useRef<{ readonly path: RelativePath; readonly timer: number } | null>(null)
+  const prefetchExpiryTimersRef = useRef(new Map<RelativePath, number>())
   const close = useAtomSet(workspacePanelOpenAtom)
   const entering = useAtomValue(workspacePanelEnteringAtom)
   const setEntering = useAtomSet(workspacePanelEnteringAtom)
@@ -234,14 +234,14 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   const selectedPath = selectedFile?.projectId === projectId ? selectedFile.path : null
   const expandedByProject = useAtomValue(expandedProjectDirectoriesAtom)
   const setExpandedByProject = useAtomSet(expandedProjectDirectoriesAtom)
-  const expandedDirectories = expandedByProject[projectId] ?? new Set<ProjectRelativePath>()
-  const cancelScheduledPrefetch = useCallback((path?: ProjectRelativePath) => {
+  const expandedDirectories = expandedByProject[projectId] ?? new Set<RelativePath>()
+  const cancelScheduledPrefetch = useCallback((path?: RelativePath) => {
     const scheduled = scheduledPrefetchRef.current
     if (scheduled === null || (path !== undefined && scheduled.path !== path)) return
     window.clearTimeout(scheduled.timer)
     scheduledPrefetchRef.current = null
   }, [])
-  const beginPrefetch = useCallback((path: ProjectRelativePath) => {
+  const beginPrefetch = useCallback((path: RelativePath) => {
     setPrefetchedDirectories((current) => {
       if (current.has(path)) return current
       const next = new Set(current)
@@ -262,7 +262,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
     }, DIRECTORY_PREFETCH_MOUNT_MS)
     prefetchExpiryTimersRef.current.set(path, expiry)
   }, [])
-  const schedulePrefetch = useCallback((path: ProjectRelativePath) => {
+  const schedulePrefetch = useCallback((path: RelativePath) => {
     cancelScheduledPrefetch()
     scheduledPrefetchRef.current = {
       path,
@@ -308,14 +308,14 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
     setDirty(false)
     collapsePanel()
   }, [collapsePanel, dirty, setDirty, setDiscardIntent])
-  const setSelectedPath = useCallback((path: ProjectRelativePath | null) => {
+  const setSelectedPath = useCallback((path: RelativePath | null) => {
     setSelectedFile(path === null ? null : { projectId, path })
   }, [projectId, setSelectedFile])
   const retryDirectory = useCallback(
-    (directory: ProjectRelativePath) => refreshDirectory({ projectId, directory }),
+    (directory: RelativePath) => refreshDirectory({ projectId, directory }),
     [projectId, refreshDirectory],
   )
-  const rootPath = ProjectRelativePathSchema.make("")
+  const rootPath = RelativePathSchema.make("")
   const demandedDirectories = useMemo(
     () => new Set([...expandedDirectories, ...prefetchedDirectories]),
     [expandedDirectories, prefetchedDirectories],
@@ -323,7 +323,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   const directoryTree = useProjectDirectoryTree(projectId, rootPath, demandedDirectories, expandedDirectories)
   const file = useProjectFile(selectedPath === null ? null : { projectId, path: selectedPath })
   const draftKey = selectedPath === null ? null : `${projectId}\0${selectedPath}`
-  const handleSaveSuccess = useCallback((saved: { readonly path: ProjectRelativePath }) => {
+  const handleSaveSuccess = useCallback((saved: { readonly path: RelativePath }) => {
     const savedDraftKey = `${projectId}\0${saved.path}`
     setDrafts((current) => {
       const { [savedDraftKey]: _removed, ...rest } = current
@@ -345,8 +345,8 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   }, [draftKey, setDirty, setDrafts, setSelectedPath])
   const { result: deleteResult, remove } = useProjectFileDelete({ onSuccess: handleDeleteSuccess })
   const handleMoveSuccess = useCallback((moved: {
-    readonly sourcePath: ProjectRelativePath
-    readonly destinationPath: ProjectRelativePath
+    readonly sourcePath: RelativePath
+    readonly destinationPath: RelativePath
     readonly kind: "directory" | "file"
   }) => {
     setSelectedFile((current) => current?.projectId === projectId
@@ -366,7 +366,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
       const next = { ...current }
       for (const [key, value] of Object.entries(current)) {
         if (!key.startsWith(projectPrefix)) continue
-        const path = ProjectRelativePathSchema.make(key.slice(projectPrefix.length))
+        const path = RelativePathSchema.make(key.slice(projectPrefix.length))
         const translated = translateProjectPath(path, moved.sourcePath, moved.destinationPath)
         if (translated === path) continue
         delete next[key]
@@ -444,11 +444,11 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
   ), [nodesById])
   const snapshot = Result.isSuccess(file) ? file.value : null
   const failure = Result.isFailure(saveResult) ? Cause.failureOption(saveResult.cause) : Option.none()
-  const conflict = Option.isSome(failure) && failure.value._tag === "ProjectFileConflict" ? failure.value.current : null
+  const conflict = Option.isSome(failure) && failure.value._tag === "ProjectFileChanged" ? failure.value.current : null
   const draft = draftKey === null ? undefined : drafts[draftKey]
   const activeDraft = snapshot?._tag === "text" && draft?.content !== snapshot.content ? draft : undefined
   const displayedConflict = conflict ?? (
-    snapshot?._tag === "text" && activeDraft !== undefined && activeDraft.baseRevision !== snapshot.revision
+    snapshot?._tag === "text" && activeDraft !== undefined && activeDraft.baseContentHash !== snapshot.contentHash
       ? snapshot
       : null
   )
@@ -589,7 +589,11 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
               {moveFailure.value._tag === "ProjectFileAlreadyExists"
                 ? "A file or folder with that name already exists there."
                 : moveFailure.value._tag === "ProjectFileAccessDenied"
-                  ? moveFailure.value.reason
+                  ? moveFailure.value.kind === "already_in_destination"
+                    ? "The entry is already in that folder."
+                    : moveFailure.value.kind === "self_move"
+                      ? "A folder cannot be moved into itself."
+                      : "This entry cannot be moved."
                   : "The file or folder could not be moved."}
             </div>
           )}
@@ -625,7 +629,8 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
               projectId,
               path: snapshot.path,
               content,
-              expectedRevision: displayedConflict?.revision ?? activeDraft?.baseRevision ?? snapshot.revision,
+              expectedContentHash:
+                displayedConflict?.contentHash ?? activeDraft?.baseContentHash ?? snapshot.contentHash,
             })}
             onDraftChange={(content, isDirty) => {
               setDirty(isDirty)
@@ -636,7 +641,10 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
                   const { [key]: _removed, ...rest } = current
                   return rest
                 }
-                return { ...current, [key]: { content, baseRevision: existing?.baseRevision ?? snapshot.revision } }
+                return {
+                  ...current,
+                  [key]: { content, baseContentHash: existing?.baseContentHash ?? snapshot.contentHash },
+                }
               })
             }}
           />
@@ -661,7 +669,7 @@ function ProjectFilesPanelContent({ projectId }: { readonly projectId: ProjectId
               onClick={(event) => {
                 event.preventDefault()
                 if (snapshot !== null && snapshot._tag !== "unsupported") {
-                  remove({ projectId, path: snapshot.path, expectedRevision: snapshot.revision })
+                  remove({ projectId, path: snapshot.path, expectedContentHash: snapshot.contentHash })
                 }
               }}
             >{Result.isWaiting(deleteResult) ? "Removing…" : "Remove"}</AlertDialogAction>

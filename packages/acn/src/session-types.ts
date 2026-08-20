@@ -4,6 +4,7 @@ import type {
   CodingAgentSession,
 } from "@magnitudedev/agent"
 import type {
+  DirectoryPath,
   RawMessageUpload,
   RawMentionOccurrence,
   StreamEvent as ProtocolStreamEvent,
@@ -14,7 +15,7 @@ export interface RuntimeEntry {
   readonly createdAt: number
   readonly updatedAt: number
   readonly title: string
-  readonly cwd: string
+  readonly cwd: DirectoryPath
   readonly scratchpadPath: string
   readonly session: CodingAgentSession
   readonly scope: CloseableScope

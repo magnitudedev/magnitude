@@ -5,11 +5,14 @@ import { describe, expect, test, beforeEach, afterEach } from "vitest";
 import { Effect, Layer, Option } from "effect";
 import { BunFileSystem, BunPath } from "@effect/platform-bun";
 
+import { DirectoryPathSchema } from "@magnitudedev/acn-protocol";
+
 import { makeGlobalStoragePaths, makeProjectStoragePaths } from "../paths";
 import { GlobalStorage } from "../services/global-storage";
 import { ProjectStorage } from "../services/project-storage";
 import { Version } from "../services/version";
 import { MagnitudeStorage, StorageLive } from "../storage";
+import type { StoredSessionMeta } from "../types/session";
 
 const VERSION = "0.0.1";
 
@@ -56,13 +59,12 @@ describe("session storage", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  const baseMeta = {
+  const baseMeta: StoredSessionMeta = {
     sessionId,
-    projectId: "project-1",
     archived: false,
     pinnedAt: Option.none(),
     chatName: "Chat",
-    workingDirectory: "/repo",
+    workingDirectory: DirectoryPathSchema.make("/repo"),
     visibility: "visible",
     created: "2026-01-01T00:00:00.000Z",
     updated: "2026-01-01T00:00:00.000Z",
@@ -98,7 +100,7 @@ describe("session storage", () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
-        yield* storage.sessions.writeMeta(sessionId, baseMeta as any);
+        yield* storage.sessions.writeMeta(sessionId, baseMeta);
       }),
       tmpDir
     );
@@ -154,15 +156,14 @@ describe("session storage", () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
-        yield* storage.sessions.writeMeta(sessionId, baseMeta as any);
+        yield* storage.sessions.writeMeta(sessionId, baseMeta);
         yield* storage.sessions.updateMeta(
           sessionId,
-          () =>
-            ({
-              ...baseMeta,
-              chatName: "Updated",
-              updated: "2026-01-02T00:00:00.000Z",
-            } as any)
+          () => ({
+            ...baseMeta,
+            chatName: "Updated",
+            updated: "2026-01-02T00:00:00.000Z",
+          })
         );
       }),
       tmpDir
@@ -186,16 +187,15 @@ describe("session storage", () => {
     const result = await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
-        yield* storage.sessions.writeMeta(sessionId, baseMeta as any);
+        yield* storage.sessions.writeMeta(sessionId, baseMeta);
         yield* Effect.all(
           Array.from({ length: 20 }, () =>
             storage.sessions.updateMeta(
               sessionId,
-              (current) =>
-                ({
-                  ...current!,
-                  messageCount: current!.messageCount + 1,
-                } as any)
+              (current) => ({
+                ...(current ?? baseMeta),
+                messageCount: (current ?? baseMeta).messageCount + 1,
+              })
             )
           ),
           { concurrency: "unbounded" }
@@ -212,7 +212,7 @@ describe("session storage", () => {
     const result = await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
-        yield* storage.sessions.writeMeta(sessionId, baseMeta as any);
+        yield* storage.sessions.writeMeta(sessionId, baseMeta);
         const activeDeleted = yield* storage.sessions.deleteArchivedSession(sessionId);
         const activeStillExists = yield* storage.sessions.readMeta(sessionId);
         yield* storage.sessions.updateMeta(sessionId, (current) => ({
@@ -232,7 +232,7 @@ describe("session storage", () => {
     expect(result.archivedStillExists).toBeNull();
   });
 
-  test("writeMeta prepends new session ids and updateMeta preserves existing index order", async () => {
+  test("every successful metadata write moves the session id to the index front", async () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
@@ -240,19 +240,18 @@ describe("session storage", () => {
           ...baseMeta,
           sessionId: "mqa00000",
           updated: "2026-01-01T00:00:00.000Z",
-        } as any);
+        });
         yield* storage.sessions.writeMeta("mqa00001", {
           ...baseMeta,
           sessionId: "mqa00001",
           updated: "2026-01-02T00:00:00.000Z",
-        } as any);
+        });
         yield* storage.sessions.updateMeta(
           "mqa00000",
-          (current) =>
-            ({
-              ...current!,
-              updated: "2026-01-03T00:00:00.000Z",
-            } as any)
+          (current) => ({
+            ...(current ?? { ...baseMeta, sessionId: "mqa00000" }),
+            updated: "2026-01-03T00:00:00.000Z",
+          })
         );
         return yield* storage.sessions.readCwdIndex("/repo");
       }),
@@ -267,7 +266,7 @@ describe("session storage", () => {
       tmpDir
     );
 
-    expect(index?.sessionIds).toEqual(["mqa00001", "mqa00000"]);
+    expect(index?.sessionIds).toEqual(["mqa00000", "mqa00001"]);
   });
 
   test("event appends preserve order", async () => {
@@ -710,7 +709,7 @@ describe("session storage", () => {
     await run(
       Effect.gen(function* () {
         const storage = yield* MagnitudeStorage;
-        yield* storage.sessions.writeMeta(sessionId, baseMeta as any);
+        yield* storage.sessions.writeMeta(sessionId, baseMeta);
       }),
       tmpDir
     );

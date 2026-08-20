@@ -8,17 +8,14 @@
 import { useCallback, type ReactNode } from 'react'
 import { useAtomValue, useAtomSet } from '@effect-atom/atom-react'
 import {
-  useAgentClient,
   useDisplayState,
   getFork,
-  usePaginatedSessions,
-  useSessionsList,
+  useSessionPages,
   useRecentChatsNavigation,
   useSessionActions,
   pendingUserSubmitAtom,
   composerHasContentAtom,
   usageOpenAtom,
-  sessionsToRecentChats,
   type RecentChat,
 } from '@magnitudedev/client-common'
 import { modelMenuStateAtom, showRecentChatsOverlayAtom } from '../../state/cli-atoms'
@@ -50,8 +47,8 @@ export interface RecentChatsWidgetState {
  * keyboard navigation is forwarded through the composer's input handler.
  */
 export function useRecentChatsWidgetState(): RecentChatsWidgetState {
-  const { loading, sessions } = useSessionsList({ limit: 5 })
-  const chats = loading ? null : sessionsToRecentChats(sessions)
+  const { loading, sessions } = useSessionPages({ pageSize: 5 })
+  const chats = loading ? null : [...sessions]
 
   const showOverlay = useAtomValue(showRecentChatsOverlayAtom)
   const modelMenu = useAtomValue(modelMenuStateAtom)
@@ -94,17 +91,17 @@ export function RecentChatsOverlayContainer(): ReactNode {
   const setShowOverlay = useAtomSet(showRecentChatsOverlayAtom)
   const resumeSession = useResumeSession()
 
-  const { sessions, loading, error, loadingMore, hasMore, loadMore } = usePaginatedSessions({ pageSize: 50 })
+  const { sessions, loading, error, loadingMore, hasMore, loadMore } = useSessionPages({ pageSize: 50 })
 
   return (
     <RecentChatsOverlay
       onClose={() => setShowOverlay(false)}
       onSelect={(chat) => resumeSession(chat.id)}
-      chats={sessions}
+      chats={[...sessions]}
       hasMore={hasMore}
       isLoading={loading || loadingMore}
-      error={error}
-      loadMore={loadMore}
+      error={error ? "Failed to load conversations." : null}
+      loadMore={() => loadMore()}
     />
   )
 }

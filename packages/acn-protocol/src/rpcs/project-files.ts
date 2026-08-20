@@ -1,65 +1,92 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
-import { ProjectFileError } from "../errors"
-import { ProjectIdSchema } from "../schemas/project"
+import { makeAcnSubscriptionRpc } from "./subscription"
 import {
+  DirectoryAccessDenied,
+  DirectoryNotFound,
+  FileSystemUnavailable,
+  InvalidProjectFilePath,
+  PathNotDirectory,
+  ProjectFileAccessDenied,
+  ProjectFileAlreadyExists,
+  ProjectFileChanged,
+  ProjectFileNotFound,
+  ProjectFileTooLarge,
+  ProjectNotFound,
+  ProjectStoreUnavailable,
+} from "../errors"
+import { ProjectIdSchema } from "../schemas/project"
+import { RelativePathSchema } from "../schemas/paths"
+import {
+  FileContentHashSchema,
   ProjectDirectoryListingSchema,
   ProjectEntryMoveSchema,
-  ProjectFileRevisionSchema,
   ProjectFileSnapshotSchema,
   ProjectFileTextSnapshotSchema,
   ProjectFilesChangeSchema,
-  ProjectRelativePathSchema,
 } from "../schemas/project-files"
-import { makeAcnSubscriptionRpc } from "./subscription"
 
-const projectPathPayload = Schema.Struct({ projectId: ProjectIdSchema, path: ProjectRelativePathSchema })
+/**
+ * Failures shared by every project-file operation: resolving the Project,
+ * opening its cwd, and resolving the contained path.
+ */
+const ProjectFileAccessError = Schema.Union(
+  ProjectNotFound,
+  ProjectStoreUnavailable,
+  DirectoryNotFound,
+  DirectoryAccessDenied,
+  PathNotDirectory,
+  FileSystemUnavailable,
+  InvalidProjectFilePath,
+  ProjectFileNotFound,
+  ProjectFileAccessDenied,
+)
 
 export const ListProjectDirectory = Rpc.make("ListProjectDirectory", {
-  payload: Schema.Struct({ projectId: ProjectIdSchema, directory: ProjectRelativePathSchema }),
+  payload: Schema.Struct({ projectId: ProjectIdSchema, directory: RelativePathSchema }),
   success: ProjectDirectoryListingSchema,
-  error: ProjectFileError,
+  error: ProjectFileAccessError,
 })
 
 export const WatchProjectFiles = makeAcnSubscriptionRpc("WatchProjectFiles", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: ProjectFilesChangeSchema,
-  error: ProjectFileError,
+  error: ProjectFileAccessError,
 })
 
 export const ReadProjectFile = Rpc.make("ReadProjectFile", {
-  payload: projectPathPayload,
+  payload: Schema.Struct({ projectId: ProjectIdSchema, path: RelativePathSchema }),
   success: ProjectFileSnapshotSchema,
-  error: ProjectFileError,
+  error: ProjectFileAccessError,
 })
 
 export const WriteProjectFile = Rpc.make("WriteProjectFile", {
   payload: Schema.Struct({
     projectId: ProjectIdSchema,
-    path: ProjectRelativePathSchema,
+    path: RelativePathSchema,
     content: Schema.String,
-    expectedRevision: ProjectFileRevisionSchema,
+    expectedContentHash: FileContentHashSchema,
   }),
   success: ProjectFileTextSnapshotSchema,
-  error: ProjectFileError,
+  error: Schema.Union(ProjectFileAccessError, ProjectFileChanged, ProjectFileTooLarge),
 })
 
 export const DeleteProjectFile = Rpc.make("DeleteProjectFile", {
   payload: Schema.Struct({
     projectId: ProjectIdSchema,
-    path: ProjectRelativePathSchema,
-    expectedRevision: ProjectFileRevisionSchema,
+    path: RelativePathSchema,
+    expectedContentHash: FileContentHashSchema,
   }),
   success: Schema.Struct({}),
-  error: ProjectFileError,
+  error: Schema.Union(ProjectFileAccessError, ProjectFileChanged),
 })
 
 export const MoveProjectEntry = Rpc.make("MoveProjectEntry", {
   payload: Schema.Struct({
     projectId: ProjectIdSchema,
-    sourcePath: ProjectRelativePathSchema,
-    destinationDirectory: ProjectRelativePathSchema,
+    sourcePath: RelativePathSchema,
+    destinationDirectory: RelativePathSchema,
   }),
   success: ProjectEntryMoveSchema,
-  error: ProjectFileError,
+  error: Schema.Union(ProjectFileAccessError, ProjectFileAlreadyExists),
 })

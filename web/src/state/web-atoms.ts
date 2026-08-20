@@ -7,7 +7,7 @@
  */
 import { Atom } from "@effect-atom/atom-react"
 import type { ProjectId } from "@magnitudedev/sdk"
-import type { ProjectFileRevision, ProjectRelativePath } from "@magnitudedev/sdk"
+import type { FileContentHash, RelativePath } from "@magnitudedev/sdk"
 import {
   WORKSPACE_BROWSER_WIDTH,
   WORKSPACE_DOCUMENT_WIDTH,
@@ -92,18 +92,18 @@ export const projectFileDiscardIntentAtom = Atom.keepAlive(
 )
 export interface ProjectFileDraft {
   readonly content: string
-  readonly baseRevision: ProjectFileRevision
+  readonly baseContentHash: FileContentHash
 }
 export const projectFileDraftsAtom = Atom.keepAlive(
   Atom.make<Readonly<Record<string, ProjectFileDraft>>>({}),
 )
 export interface SelectedProjectFile {
   readonly projectId: ProjectId
-  readonly path: ProjectRelativePath
+  readonly path: RelativePath
 }
 export const selectedProjectFileAtom = Atom.keepAlive(
   Atom.make<SelectedProjectFile | null>(null),
 )
 export const expandedProjectDirectoriesAtom = Atom.keepAlive(
-  Atom.make<Readonly<Record<string, ReadonlySet<ProjectRelativePath>>>>({}),
+  Atom.make<Readonly<Record<string, ReadonlySet<RelativePath>>>>({}),
 )

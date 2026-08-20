@@ -19,7 +19,6 @@ import { routeSlashCommand, type CommandContext, type SlashCommandOutcome } from
 import type { MentionSearchClient } from "./use-file-mentions"
 import {
   selectedCwdAtom,
-  selectedProjectIdAtom,
   bashModeAtom,
   settingsOpenAtom,
   usageOpenAtom,
@@ -94,7 +93,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const displayController = useDisplayViewControllerCore()
   const displaySpeculator = useDisplaySpeculator()
   const selectedCwd = useAtomValue(selectedCwdAtom)
-  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const bashMode = useAtomValue(bashModeAtom)
   const setBashMode = useAtomSet(bashModeAtom)
   const setSettingsOpen = useAtomSet(settingsOpenAtom)
@@ -277,7 +275,6 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       const promise = createSession({
         payload: {
           cwd: selectedCwd ?? "",
-          projectId: Option.fromNullable(selectedProjectId),
           sessionId: Option.none(),
           initial: Option.some({
             _tag: "message",
@@ -318,7 +315,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     }
 
     void deliver().catch(handleFailure)
-  }, [selectedSessionId, selectedCwd, selectedProjectId, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, composerMentionSegments, setComposerAttachments, setComposerUploads, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
+  }, [selectedSessionId, selectedCwd, displaySpeculator, sendMutation, createSession, displayController, setPendingUserSubmit, setComposerText, composerMentionSegments, setComposerAttachments, setComposerUploads, setComposerHistoryIndex, setMessageHistory, sessionCreateOptions, commandContext])
 
   const handleInterrupt = useCallback(() => {
     if (!selectedSessionId) return

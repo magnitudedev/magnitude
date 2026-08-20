@@ -15,146 +15,98 @@ applies_to:
 
 ## Product model
 
-A Project is the stable, named owner of one source directory and the sessions created for it. Its
-branded ID is identity. Its name and canonical absolute source directory are editable, while the
-current source directory is unique across Project records.
+A Project is a durable named registration of one directory. Its branded ID is identity; its `cwd`
+is the registered absolute, lexically normalized directory, unique across Project records. A
+Project contains no session IDs, session counts, activity, filesystem status, Git status, or cached
+inspection state.
 
-Every persisted session has exactly one Project ID. The Project's current source directory is the
-authority for future session execution. A source rebind therefore applies to every session in the
-Project; session metadata cannot independently retain a competing current execution directory.
+Sessions do not carry a Project ID at any boundary. A session is associated with a Project exactly
+when `session.cwd === project.cwd`; both sides are the shared branded `DirectoryPath`, the
+relationship is derived on demand, and it has no lifecycle of its own. Consequences:
 
-Projects are a web and Electron product surface. The CLI has no Project navigation or commands and
-continues to create sessions from cwd. ACN resolves that cwd to the unique Project, creating a
-default basename-named Project when necessary, so the storage invariant holds for every client.
+- CLI and TUI sessions appear under an existing Project registered for the same cwd with zero
+  write-path work.
+- Changing a Project's cwd changes which sessions associate with it without rewriting sessions.
+- Removing a Project never mutates sessions; sessions whose cwd has no active Project remain valid,
+  inspectable history labeled by their cwd.
+- Resuming a session needs no Project lookup: execution resolves from the session's own stored cwd,
+  which is immutable session identity.
+
+No service creates or mutates a Project because a session was created or read. Project
+registration is always an explicit Project command. The CLI has no Project navigation or commands
+and continues to create sessions from cwd.
 
 ## Lifecycle and presentation
 
-Project collapse is renderer presentation state. It hides child sessions and has no server
-transition. Removing a Project marks its registration removed from the ordinary sidebar and Recent
-Projects without deleting source files, sessions, or Project identity. Selecting the same source
-through New Project restores that record.
+Project collapse is renderer presentation state. Removing a Project flips its registration state
+without deleting source files, sessions, or identity; creating a Project at a removed record's cwd
+restores that identity and applies the submitted name. Creating at an already-active cwd returns
+the existing record unchanged.
 
-Archiving a session removes it from ordinary Project navigation without deleting its history.
-Archived sessions remain searchable in Settings and can be restored. Normal sidebar navigation and
-search contain active sessions only. Pinning is also durable session metadata:
-the sidebar shows pinned sessions once, in a Pinned section above Projects, newest pin first by the
-stable pin timestamp. Session activity never reorders that section. Archive and pin are mutually
-exclusive: archiving clears a pin, while pinning an archived session through another client or API
-restores and pins it as one server transition. Deleting a session remains a distinct destructive
-operation.
+Archiving a session removes it from ordinary navigation without deleting history; archived sessions
+remain searchable in Settings and restorable. Pinning is durable session metadata: the sidebar
+renders pinned sessions once, in a Pinned section above Projects, newest pin first by the stable
+pin timestamp, and excludes them from each Project's nested unpinned list. Archive and pin are
+mutually exclusive: archiving clears a pin; pinning restores an archived session in one server
+transition. Session rows reveal borderless Pin/Unpin and Archive on hover or focus.
 
-Session rows have no persistent trailing controls or overflow menu. Hover and keyboard focus reveal
-borderless Pin/Unpin and Archive actions. The Pinned section is absent when empty, and a Project
-whose only sessions are pinned reads “No other
-sessions.” Archiving the selected session opens a new Project-owned draft for the same Project.
+Sidebar loading is intentionally minimal and explicitly paged:
 
-Settings has a distinct Archived chats section. It searches archived chat titles, Project names,
-and source paths without mixing those results into the normal sidebar. The page supports explicit
-Restore and Permanently delete actions, multi-selection, and selecting every result matching the
-current search. Changing the search clears selection. Permanent deletion requires confirmation and
-is accepted by ACN only while the target remains archived; a restore in another client therefore
-prevents stale destructive intent from deleting an active chat.
+- the first Project page loads through the paginated Project query (twenty per page, server
+  recency order); a "Show more projects" control appears only while another page exists;
+- each expanded Project loads at most five unpinned sessions initially; its "Show more" requests
+  ten more per activation;
+- there is no scroll-driven auto-loading and no global bottom-of-sidebar infinite loader; and
+- Project rows carry no Git branch or directory-availability adornments. Directory and Git state
+  render only where a surface explicitly requests inspection of one Project.
 
-The ordinary browser sidebar order is:
+Search is server-bounded: session title/cwd search runs on the session read authority, while
+Project-name search filters already-loaded Project records client-side. Search results group under
+loaded Projects by cwd; unmatched sessions display their formatted cwd. The Archived-chats page
+derives labels the same way and selects "all matching" by following cursors to completion through
+query effects, never by requesting an unbounded page.
 
-1. Settings, sidebar expand/collapse, and New Chat controls in that order;
-2. Search Sessions;
-3. full-row New Project; and
-4. Pinned sessions when any exist; and
-5. the expandable Project/session hierarchy.
+New Chat opens a draft in the main pane and asks "What would you like to do in {Project}?" with a
+searchable Project chooser. The new-chat selection may retain a Project ID as presentation intent,
+but session requests carry only the selected Project's cwd; the ID is never persisted in session
+metadata and never accepted by session RPCs. Preload release carries the exact draft session ID.
 
-Electron places Settings, sidebar expand/collapse, and New Chat in that order in the
-persistent native title-bar row rather than adding a second toolbar inside the sidebar. While
-expanded, the sidebar background and right border continue through the full title-bar height and
-the three actions sit at the right edge of that region; the current session title starts in the main
-pane. When collapsed, the sidebar region and border disappear and the same ordered actions move
-beside the native window controls, followed by the session title. In dark mode the main pane uses
-slate-900 and the sidebar uses opaque slate-850 on every
-desktop platform; native vibrancy does not alter the sidebar's rendered color. macOS reserves the
-configured traffic-light region. Linux and Windows use Electron's Window
-Controls Overlay safe-area variables because native controls may appear on either side according to
-the desktop environment. A collapsed Electron sidebar has no residual rail: the main pane takes the
-available width. The composer keeps the
-same wide, centered maximum measure whether the sidebar is expanded or collapsed, so collapsing
-changes its position within the main pane rather than its width. The narrower new-chat chooser
-retains its own independent reading measure. Settings keeps the same application chrome but does
-not display the session title as a Settings page heading. Appearance is not a persistent title-bar
-action; its control sits at the bottom-left of the Settings sidebar and is available only while
-Settings is open.
-
-New Chat opens a Project-owned draft in the main pane. It retains the current available Project or,
-when no valid selection exists, defaults to the most recently active available Project. The empty
-draft asks “What would you like to do in {Project}?” as one sentence; the matching inline Project
-name is underlined and opens the searchable Project chooser. The full recent-Project list is not
-part of the default empty state. New Project
-opens a modal first. The modal's Select source action invokes the host directory selector, fills the
-editable Project name from the selected basename, and requires explicit Create new or Cancel. A
-successful creation makes that Project the current new-chat selection.
-
-The new-chat selection retains the Project ID as its stable intent across subsequent New Chat
-actions. Preload and create requests carry that ID, and ACN resolves the Project's current source at
-execution time; a copied renderer path is display context only and cannot become a competing source
-authority.
-Preload release carries the exact draft session ID so cleanup from an older source selection cannot
-release a replacement draft for the same Project and client owner.
-
-Each Project has a vertical-ellipsis menu for Edit Project, host-supported reveal, and Remove
-Project. Edit reuses the Project form. Remove requires a separate confirmation dialog.
-Creating with an already-active canonical source returns that existing record without changing its
-name. Creating with a removed source restores the retained identity and applies the submitted name.
+Each Project has a menu for Edit Project, Reveal folder, and Remove Project. Edit reuses the
+Project form ("Change the name or folder. Chats stay grouped by the folder they ran in."). Reveal
+is an agent-host command that may report itself unsupported. Remove requires confirmation.
 
 ## Authority
 
-ACN owns Project records, canonical path uniqueness, session association, edit/remove/restore
-transitions, current execution-directory resolution, and the product Project summary. Storage owns
-the durable Project state document and required session Project ID.
+`ProjectStore` (ACN) owns durable Project records, id/cwd uniqueness inside one serialized durable
+transition, and bounded recency-ordered pages with opaque cursors. `ProjectManager` owns lifecycle
+commands and validates a newly registered cwd against the host filesystem exactly once, at command
+time. `SessionInspector` is the independent read authority for persisted session metadata: bounded
+fingerprinted pages, exact-cwd pages served from the session cwd index, and recent-directory
+aggregation. The two authorities never depend on each other; clients compose them by cwd.
 
-Directory availability and Git repository/head information are observations of host state. They
-are derived by ACN and never stored as Project truth or reconstructed by clients. Git state supports
-ordinary branches, detached HEAD, nested source directories, and worktrees.
-ACN observes directory and Git changes and emits bounded invalidation notifications; clients always
-reread the complete Project snapshot rather than retaining watch events as state.
+Directory availability and Git state are host observations, never Project record fields. They are
+obtained only through explicit single-Project inspection (`InspectProject`), which runs at most one
+bounded Git command sequence and zero Git commands when the directory is unavailable. Nothing polls,
+nothing probes `git --version` at startup, and Project listing performs zero filesystem or command
+work.
 
-Client-common exposes the ACN-backed Project capability and invalidates authoritative snapshots when
-ACN announces a change. Web owns only presentation state such as the selected draft Project,
-collapsed IDs, open dialog/menu, and sidebar width/collapse.
+Project and session change subscriptions are separate invalidation-only streams; each durable write
+publishes on exactly one. Clients reread bounded authoritative pages on invalidation and never
+retain change events as state. Editing a Project rebinds name and cwd as one minimal record
+transition — it does not inspect sessions, release drafts, stop runtimes, or rewrite session cwd.
 
-## Source rebinding
-
-Renaming does not affect session lifecycle. Source rebinding serializes against new session work,
-rejects while a Project session is working, releases Project draft preloads, and retires idle live
-runtimes before the new source becomes available for resume. It never interrupts agent work.
-
-The mutation validates the new directory and uniqueness before committing. After commit, all new or
-resumed execution resolves through the new source and Project directory/Git observations are
-invalidated.
-
-## Storage migration
-
-Existing session metadata is migrated idempotently before normal Project-backed session use:
-
-1. group legacy sessions by canonical working directory;
-2. ensure one Project per directory with the directory basename as its default name; and
-3. atomically add the exact Project ID to each session metadata record.
-
-The migration boundary may decode legacy optional fields, including the inverse `sidebarOpen`
-representation of the current archive state. New writes persist only `archived` and `pinnedAt`; the
-normal domain has no legacy session-visibility vocabulary or fallback. The normal domain requires
-Project ID. Missing source directories preserve Project and session
-history while preventing new execution. The legacy session working-directory field remains only as
-migration provenance and a recomputable index input; it is never consulted as current Project source
-authority. A session that references an absent durable Project is a visible state-integrity failure;
-recovery does not guess a replacement identity or source.
+There is no session-Project migration, no optional compatibility field, and no orphan repair. A
+stored session whose metadata cannot be decoded is unreadable: skipped with a structured warning in
+pages and reported explicitly by direct reads.
 
 ## Client boundaries
 
-Clients import Project contracts only through SDK/client-common. They never import ACN, storage, or
-Git implementations. Project queries are observational. Mutations synchronize against the exact
-Project identity and expected refreshed state. Renderer state never becomes a second authority for
-Project records, branch, directory availability, or session membership.
+Clients import Project contracts only through SDK/client-common and never import ACN, storage, or
+Git implementations. Pagination is a query capability: the first page plus explicitly requested
+continuations are all reactive query atoms keyed by the complete request identity, deduplicated by
+stable ID, and reset by identity change; loading later pages never uses a mutation path. Server
+truth never lands in component `useState` and is never synchronized with `useEffect`.
 
-Electron and browser render the same React components. Electron supplies a native directory picker.
-A browser file-system handle name is not an absolute daemon path and must never be submitted as cwd;
-without a trusted host bridge, standalone browser source selection uses daemon-visible absolute path
-entry. Revealing a Project source is an agent-host operation submitted through ACN; Electron never
-passes a Project path to a client-host shell API.
+Electron and browser render the same React components. Electron supplies a native directory picker;
+a browser file-system handle name is never submitted as cwd. Revealing a Project folder is an
+agent-host operation through ACN; Electron never passes a Project path to a client-host shell API.

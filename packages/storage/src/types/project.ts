@@ -1,11 +1,10 @@
 export {
   ProjectIdSchema,
-  ProjectRecordSchema,
+  ProjectSchema,
   ProjectRegistrationStateSchema,
   ProjectStateSchema,
   type ProjectId,
-  type ProjectRecord,
+  type Project,
   type ProjectRegistrationState,
   type ProjectState,
 } from "@magnitudedev/acn-protocol"
-

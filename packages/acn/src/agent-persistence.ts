@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import {
   DEFAULT_CHAT_NAME,
   PersistenceError,
@@ -8,14 +8,35 @@ import {
 } from "@magnitudedev/agent"
 import type { EventCursor, Timestamped } from "@magnitudedev/event-core"
 import type { MagnitudeStorageShape, StoredSessionMeta } from "@magnitudedev/storage"
-import type { ProjectId } from "@magnitudedev/acn-protocol"
-import { defaultStoredMeta } from "./session-store"
+import type { DirectoryPath } from "@magnitudedev/acn-protocol"
+
+export const defaultStoredMeta = (
+  sessionId: string,
+  workingDirectory: DirectoryPath,
+  version: string,
+  now: string,
+  visibility: StoredSessionMeta["visibility"] = "visible",
+): StoredSessionMeta => ({
+  sessionId,
+  chatName: DEFAULT_CHAT_NAME,
+  workingDirectory,
+  visibility,
+  archived: false,
+  pinnedAt: Option.none(),
+  gitBranch: null,
+  created: now,
+  updated: now,
+  initialVersion: version,
+  lastActiveVersion: version,
+  firstUserMessage: null,
+  lastMessage: null,
+  messageCount: 0,
+})
 
 export class AcnChatPersistence implements ChatPersistenceService {
   constructor(
     private readonly storage: MagnitudeStorageShape,
-    private readonly workingDirectory: string,
-    private readonly projectId: ProjectId,
+    private readonly workingDirectory: DirectoryPath,
     private readonly sessionId: string,
     private readonly version: string,
     private readonly initialVisibility: StoredSessionMeta["visibility"] = "visible",
@@ -37,7 +58,6 @@ export class AcnChatPersistence implements ChatPersistenceService {
     return defaultStoredMeta(
       this.sessionId,
       this.workingDirectory,
-      this.projectId,
       this.version,
       now,
       this.initialVisibility,
@@ -139,7 +159,8 @@ export class AcnChatPersistence implements ChatPersistenceService {
       return {
         ...base,
         chatName: update.chatName ?? base.chatName,
-        workingDirectory: update.workingDirectory ?? base.workingDirectory,
+        // A session's working directory is immutable identity: it is what
+        // associates the session with a Project, and nothing rewrites it.
         gitBranch: update.gitBranch ?? base.gitBranch,
         updated: update.updated ?? now,
         lastActiveVersion: this.version,

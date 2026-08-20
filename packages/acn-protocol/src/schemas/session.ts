@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { RawMessageUploads, RawMentionOccurrence } from "./attachments"
-import { ProjectIdSchema } from "./project"
+import { DirectoryPathSchema } from "./paths"
 export {
   RawClipboardImageAttachment,
   DisplayAttachment,
@@ -57,9 +57,8 @@ export type PreloadSessionResult = Schema.Schema.Type<typeof PreloadSessionResul
 
 export const SessionMetadata = Schema.Struct({
   sessionId: Schema.String,
-  projectId: ProjectIdSchema,
   title: Schema.Union(Schema.String, Schema.Null),
-  cwd: Schema.String,
+  cwd: DirectoryPathSchema,
   archived: Schema.Boolean,
   pinnedAt: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
   createdAt: Schema.Number,
@@ -71,6 +70,24 @@ export type SessionMetadata = Schema.Schema.Type<typeof SessionMetadata>
 
 export const SessionArchiveFilter = Schema.Literal("active", "archived", "all")
 export type SessionArchiveFilter = Schema.Schema.Type<typeof SessionArchiveFilter>
+
+export const SessionPinFilter = Schema.Literal("pinned", "unpinned", "all")
+export type SessionPinFilter = Schema.Schema.Type<typeof SessionPinFilter>
+
+export const SessionPageCursorSchema = Schema.String.pipe(Schema.brand("SessionPageCursor"))
+export type SessionPageCursor = typeof SessionPageCursorSchema.Type
+
+export const SessionPageRequestSchema = Schema.Struct({
+  cwd: Schema.optionalWith(DirectoryPathSchema, { as: "Option", exact: true }),
+  archive: Schema.optionalWith(SessionArchiveFilter, { default: () => "active" }),
+  pin: Schema.optionalWith(SessionPinFilter, { default: () => "all" }),
+  query: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  cursor: Schema.optionalWith(SessionPageCursorSchema, { as: "Option", exact: true }),
+  limit: Schema.optionalWith(Schema.Number.pipe(Schema.int(), Schema.between(1, 100)), {
+    default: () => 50,
+  }),
+})
+export type SessionPageRequest = typeof SessionPageRequestSchema.Type
 
 /**
  * CreateSession outcome. When `initial` is provided, the result discriminates
@@ -91,20 +108,39 @@ export const CreateSessionResult = Schema.Union(
 )
 export type CreateSessionResult = Schema.Schema.Type<typeof CreateSessionResult>
 
-export const ListSessionsResult = Schema.Struct({
+export const SessionPageSchema = Schema.Struct({
   items: Schema.Array(SessionMetadata),
-  nextCursor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  hasMore: Schema.Boolean,
-  totalCount: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
+  nextCursor: Schema.optionalWith(SessionPageCursorSchema, { as: "Option", exact: true }),
 })
-export type ListSessionsResult = Schema.Schema.Type<typeof ListSessionsResult>
+export type SessionPage = Schema.Schema.Type<typeof SessionPageSchema>
 
-export const SessionCwdSummary = Schema.Struct({
-  cwd: Schema.String,
-  updatedAt: Schema.Number,
-  sessionCount: Schema.Number
+export const DirectoryPageCursorSchema = Schema.String.pipe(Schema.brand("DirectoryPageCursor"))
+export type DirectoryPageCursor = typeof DirectoryPageCursorSchema.Type
+
+export const RecentDirectoryPageRequestSchema = Schema.Struct({
+  cursor: Schema.optionalWith(DirectoryPageCursorSchema, { as: "Option", exact: true }),
+  limit: Schema.optionalWith(Schema.Number.pipe(Schema.int(), Schema.between(1, 100)), {
+    default: () => 20,
+  }),
 })
-export type SessionCwdSummary = Schema.Schema.Type<typeof SessionCwdSummary>
+export type RecentDirectoryPageRequest = typeof RecentDirectoryPageRequestSchema.Type
+
+export const RecentDirectorySchema = Schema.Struct({
+  cwd: DirectoryPathSchema,
+  lastActiveAt: Schema.Number,
+  sessionCount: Schema.Number.pipe(Schema.int(), Schema.positive()),
+})
+export type RecentDirectory = typeof RecentDirectorySchema.Type
+
+export const RecentDirectoryPageSchema = Schema.Struct({
+  items: Schema.Array(RecentDirectorySchema),
+  nextCursor: Schema.optionalWith(DirectoryPageCursorSchema, { as: "Option", exact: true }),
+})
+export type RecentDirectoryPage = typeof RecentDirectoryPageSchema.Type
+
+/** Invalidation-only session metadata change notification. */
+export const SessionChangeSchema = Schema.Struct({})
+export type SessionChange = typeof SessionChangeSchema.Type
 
 export const ActiveSessionStatus = Schema.Struct({
   sessionId: Schema.String,

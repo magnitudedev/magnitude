@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Layer, Option, PubSub, Ref, Stream } from "effect"
-import { ProjectIdSchema, type SessionMetadata } from "@magnitudedev/acn-protocol"
+import {
+  DirectoryPathSchema,
+  SessionNotFound,
+  type SessionMetadata,
+} from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type AgentRuntimeApi, type ResidentSessionSnapshot } from "./agent-runtime"
 import { ActiveSessionStatusesLive, ActiveSessionStatusesService } from "./active-session-statuses"
-import { SessionStore, type SessionStoreApi } from "./session-store"
+import { SessionInspector } from "./session-inspector"
 
 const resident = (
   sessionId: string,
@@ -12,7 +16,7 @@ const resident = (
   sessionId,
   generation: 1,
   title: "Session",
-  cwd: "/tmp",
+  cwd: DirectoryPathSchema.make("/tmp"),
   scratchpadPath: `/tmp/${sessionId}/scratchpad`,
   createdAt: 1,
   updatedAt: 2,
@@ -32,9 +36,8 @@ const resident = (
 
 const protocolMeta = (sessionId: string, updatedAt: number): SessionMetadata => ({
   sessionId,
-  projectId: ProjectIdSchema.make("project-a"),
   title: "Session",
-  cwd: "/tmp",
+  cwd: DirectoryPathSchema.make("/tmp"),
   archived: false,
   pinnedAt: Option.none(),
   createdAt: 1,
@@ -58,25 +61,17 @@ const makeSetup = Effect.gen(function* () {
     registerRetirementObserver: () => Effect.succeed(Effect.void),
     changes: Stream.fromPubSub(changed),
   }
-  const store: SessionStoreApi = {
-    createId: Effect.die("unused"),
-    readMeta: () => Effect.die("unused"),
-    readProtocolMeta: (sessionId) =>
-      Ref.get(metas).pipe(Effect.map((all) => all.get(sessionId) ?? null)),
-    promoteDraft: () => Effect.die("unused"),
-    listDraftSessionIds: () => Effect.die("unused"),
-    listProtocolMetas: () => Effect.die("unused"),
-    listAllProtocolMetas: () => Effect.die("unused"),
-    listSessionCwds: () => Effect.die("unused"),
-    deleteSessionFiles: () => Effect.die("unused"),
-    deleteArchivedSessionFiles: () => Effect.die("unused"),
-    validateCwd: () => Effect.die("unused"),
-    getScratchpadPath: () => Effect.die("unused"),
-    getExecutionContext: () => Effect.die("unused"),
-    ensureProjectForCwd: () => Effect.die("unused"),
-    resolveProjectSource: () => Effect.die("unused"),
-    setArchived: () => Effect.die("unused"),
-    setPinned: () => Effect.die("unused"),
+  const inspector: SessionInspector = {
+    get: (sessionId) => Ref.get(metas).pipe(
+      Effect.flatMap((all) => {
+        const meta = all.get(sessionId)
+        return meta === undefined
+          ? Effect.fail(new SessionNotFound({ sessionId }))
+          : Effect.succeed(meta)
+      }),
+    ),
+    page: () => Effect.die("unused"),
+    recentDirectories: () => Effect.die("unused"),
     changes: Stream.never,
   }
   return {
@@ -85,7 +80,10 @@ const makeSetup = Effect.gen(function* () {
     changed,
     layer: ActiveSessionStatusesLive.pipe(
       Layer.provide(
-        Layer.mergeAll(Layer.succeed(AgentRuntime, runtime), Layer.succeed(SessionStore, store)),
+        Layer.mergeAll(
+          Layer.succeed(AgentRuntime, runtime),
+          Layer.succeed(SessionInspector, inspector),
+        ),
       ),
     ),
   }

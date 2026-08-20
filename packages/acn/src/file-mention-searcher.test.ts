@@ -2,9 +2,26 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, test } from "vitest"
-import { Effect } from "effect"
-import type { RawMentionOccurrence } from "@magnitudedev/acn-protocol"
-import { collectMentionOccurrences } from "./file-mentions"
+import { BunCommandExecutor, BunFileSystem, BunPath } from "@effect/platform-bun"
+import { Effect, Layer } from "effect"
+import { DirectoryPathSchema, type RawMentionOccurrence } from "@magnitudedev/acn-protocol"
+import { FileMentionSearcher, FileMentionSearcherLive } from "./file-mention-searcher"
+import { FileSystemManagerLive } from "./file-system-manager"
+import { GitInspectorLive } from "./git-inspector"
+
+const platform = Layer.mergeAll(
+  BunFileSystem.layer,
+  BunPath.layer,
+  BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
+)
+
+const searcherLayer = FileMentionSearcherLive.pipe(
+  Layer.provide(Layer.mergeAll(
+    FileSystemManagerLive.pipe(Layer.provide(platform)),
+    GitInspectorLive.pipe(Layer.provide(platform)),
+    platform,
+  )),
+)
 
 async function makeCwd(): Promise<string> {
   return mkdtemp(join(tmpdir(), "magnitude-file-mentions-"))
@@ -15,7 +32,18 @@ async function collect(
   text: string,
   provided: readonly RawMentionOccurrence[] = [],
 ): Promise<RawMentionOccurrence[]> {
-  return Effect.runPromise(collectMentionOccurrences(cwd, "", text, provided))
+  return Effect.runPromise(
+    FileMentionSearcher.pipe(
+      Effect.flatMap((searcher) => searcher.collectMentionOccurrences({
+        cwd: DirectoryPathSchema.make(cwd),
+        scratchpadPath: "",
+        content: text,
+        provided,
+      })),
+      Effect.map((occurrences) => [...occurrences]),
+      Effect.provide(searcherLayer),
+    ),
+  )
 }
 
 describe("collectMentionOccurrences", () => {
@@ -38,7 +66,7 @@ describe("collectMentionOccurrences", () => {
         placement: { _tag: "inline", start: text.lastIndexOf("@src/app.ts"), end: text.lastIndexOf("@src/app.ts") + 11 },
       },
     ])
-    expect(mentions[0].occurrenceId).not.toBe(mentions[1].occurrenceId)
+    expect(mentions[0]?.occurrenceId).not.toBe(mentions[1]?.occurrenceId)
   })
 
   test("does not discover mentions inside inline or fenced code", async () => {
@@ -61,11 +89,11 @@ describe("collectMentionOccurrences", () => {
     const mentions = await collect(cwd, text, [trailing])
 
     expect(mentions).toHaveLength(2)
-    expect(mentions[0].placement._tag).toBe("inline")
+    expect(mentions[0]?.placement._tag).toBe("inline")
     expect(mentions[1]).toEqual(trailing)
   })
 
-  test("rejects overlapping or invalid explicit spans as a typed session error", async () => {
+  test("rejects overlapping or invalid explicit spans as a typed placement error", async () => {
     const cwd = await makeCwd()
     await writeFile(join(cwd, "README.md"), "# hi\n")
     const occurrence: RawMentionOccurrence = {
@@ -74,8 +102,19 @@ describe("collectMentionOccurrences", () => {
       placement: { _tag: "inline", start: 0, end: 4 },
     }
 
-    const result = await Effect.runPromise(Effect.either(collectMentionOccurrences(cwd, "", "read @README.md", [occurrence])))
+    const result = await Effect.runPromise(
+      FileMentionSearcher.pipe(
+        Effect.flatMap((searcher) => searcher.collectMentionOccurrences({
+          cwd: DirectoryPathSchema.make(cwd),
+          scratchpadPath: "",
+          content: "read @README.md",
+          provided: [occurrence],
+        })),
+        Effect.either,
+        Effect.provide(searcherLayer),
+      ),
+    )
     expect(result._tag).toBe("Left")
-    if (result._tag === "Left") expect(result.left._tag).toBe("SessionOperationFailed")
+    if (result._tag === "Left") expect(result.left._tag).toBe("InvalidMentionPlacement")
   })
 })

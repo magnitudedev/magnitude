@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Deferred, Effect, Fiber, Layer, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import type { AgentLifecycleState, CodingAgentSession, ForkTurnState } from "@magnitudedev/agent"
-import { type DisplayState, type DisplayViewShape } from "@magnitudedev/acn-protocol"
+import { DirectoryPathSchema, type DisplayState, type DisplayViewShape } from "@magnitudedev/acn-protocol"
 import {
   AgentRuntime,
   type AgentRuntimeApi,
@@ -118,7 +118,7 @@ const makeSetup = Effect.gen(function* () {
       createdAt: 1,
       updatedAt: 1,
       title,
-      cwd: "/tmp",
+      cwd: DirectoryPathSchema.make("/tmp"),
       scratchpadPath: "/tmp/scratchpad.md",
       session: makeSession(title, closed, shapes, displayStream),
       scope,

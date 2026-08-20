@@ -42,7 +42,7 @@ import {
   type ActivityKind,
   TRANSCRIPT_LINE_CAP,
 } from "@magnitudedev/client-common"
-import { ProjectRelativePathSchema, normalizeReferencedPath } from "@magnitudedev/sdk"
+import { RelativePathSchema, normalizeReferencedPath } from "@magnitudedev/sdk"
 import {
   workspacePanelEnteringAtom,
   workspacePanelOpenAtom,
@@ -133,7 +133,7 @@ function PathText({
       type="button"
       onClick={() => {
         if (relativePath === null || projectId === null) return
-        setFilePath({ projectId, path: ProjectRelativePathSchema.make(relativePath) })
+        setFilePath({ projectId, path: RelativePathSchema.make(relativePath) })
         if (!panelOpen) setPanelEntering(true)
         setPanelSurface("files")
         setPanelOpen(true)

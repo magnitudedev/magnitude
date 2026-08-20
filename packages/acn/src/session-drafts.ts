@@ -1,18 +1,20 @@
-import { Context, Effect, Exit, Layer, Option, Ref } from "effect"
-import { resolve } from "node:path"
+import { Context, Effect, Either, Exit, Layer, Option, Ref } from "effect"
 import {
+  InvalidSessionPath,
   SessionAlreadyExists,
   SessionNotFound,
   SessionOperationFailed,
+  type DirectoryPath,
   type SessionError,
   type SessionMetadata as ProtocolSessionMetadata,
   type SessionOptions,
-  type ProjectId,
 } from "@magnitudedev/acn-protocol"
+import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AgentRuntime, type RuntimeStartRequest } from "./agent-runtime"
+import { FileSystemManager } from "./file-system-manager"
 import { sessionErrorMessage } from "./session-errors"
+import { decodeSessionMetadata } from "./session-inspector"
 import { SessionRuntimeOptionsStore, type SessionRuntimeOptions } from "./session-runtime-options"
-import { SessionStore } from "./session-store"
 
 const READY_DRAFT_TTL_MS = 10 * 60 * 1000
 const SWEEP_INTERVAL = "60 seconds"
@@ -21,8 +23,7 @@ type DraftPhase = "preloading" | "ready" | "claiming"
 
 interface DraftEntry {
   readonly key: string
-  readonly cwd: string
-  readonly projectId: ProjectId
+  readonly cwd: DirectoryPath
   readonly options: SessionRuntimeOptions
   readonly ownerId: string | null
   readonly sessionId: string
@@ -31,7 +32,7 @@ interface DraftEntry {
   readonly phase: DraftPhase
 }
 
-type DraftIdentity = Pick<DraftEntry, "key" | "cwd" | "projectId" | "options" | "ownerId">
+type DraftIdentity = Pick<DraftEntry, "key" | "cwd" | "options" | "ownerId">
 
 export interface DraftClaim {
   readonly key: string
@@ -41,28 +42,23 @@ export interface DraftClaim {
 export interface SessionDraftsApi {
   readonly preload: (input: {
     readonly cwd: string
-    readonly projectId?: ProjectId
     readonly options?: SessionOptions
     readonly ownerId?: string | null
   }) => Effect.Effect<{ readonly sessionId: string }, SessionError>
   readonly release: (input: {
     readonly cwd: string
-    readonly projectId?: ProjectId
     readonly sessionId: string
     readonly options?: SessionOptions
     readonly ownerId?: string | null
   }) => Effect.Effect<void, SessionError>
   readonly claim: (input: {
     readonly cwd: string
-    readonly projectId?: ProjectId
     readonly sessionId?: string
     readonly options?: SessionOptions
     readonly ownerId?: string | null
   }) => Effect.Effect<DraftClaim, SessionError>
   readonly promote: (claim: DraftClaim) => Effect.Effect<ProtocolSessionMetadata, SessionError>
   readonly releaseClaim: (claim: DraftClaim) => Effect.Effect<void, SessionError>
-  /** Releases every unclaimed draft owned by a project. Returns false while a claim is in flight. */
-  readonly releaseProject: (projectId: ProjectId) => Effect.Effect<boolean, SessionError>
 }
 
 export class SessionDrafts extends Context.Tag("SessionDrafts")<
@@ -71,7 +67,7 @@ export class SessionDrafts extends Context.Tag("SessionDrafts")<
 >() {}
 
 const makeDraftKey = (input: {
-  readonly projectId: ProjectId
+  readonly cwd: DirectoryPath
   readonly options: SessionRuntimeOptions
   readonly ownerId: string | null
 }): string => JSON.stringify(input)
@@ -85,46 +81,45 @@ const staleDraftError = (sessionId: string, reason: string) =>
 export const SessionDraftsLive: Layer.Layer<
   SessionDrafts,
   never,
-  AgentRuntime | SessionStore | SessionRuntimeOptionsStore
+  AgentRuntime | MagnitudeStorage | FileSystemManager | SessionRuntimeOptionsStore
 > = Layer.scoped(
   SessionDrafts,
   Effect.gen(function* () {
     const runtime = yield* AgentRuntime
-    const store = yield* SessionStore
+    const storage = yield* MagnitudeStorage
+    const fileSystem = yield* FileSystemManager
     const runtimeOptions = yield* SessionRuntimeOptionsStore
     const entries = yield* Ref.make(new Map<string, DraftEntry>())
 
+    const readMeta = (
+      sessionId: string,
+    ): Effect.Effect<StoredSessionMeta | null, SessionOperationFailed> =>
+      storage.sessions.readMeta(sessionId).pipe(
+        Effect.mapError((error) => new SessionOperationFailed({
+          operation: `read session metadata ${sessionId}`,
+          reason: error._tag,
+        })),
+      )
+
     const deriveKey = (input: {
       readonly cwd: string
-      readonly projectId?: ProjectId
       readonly options?: SessionOptions
       readonly ownerId?: string | null
-    }) => {
-      const projectId = input.projectId
-      return (projectId
-        ? store.resolveProjectSource(projectId).pipe(
-            Effect.flatMap(store.validateCwd),
-            Effect.map((cwd) => ({ cwd, projectId })),
-          )
-        : store.validateCwd(resolve(input.cwd)).pipe(
-            Effect.flatMap((cwd) =>
-              store.ensureProjectForCwd(cwd).pipe(Effect.map((projectId) => ({ cwd, projectId }))),
-            ),
-          )
-      ).pipe(
-        Effect.map(({ cwd, projectId }) => {
+    }): Effect.Effect<DraftIdentity, SessionError> =>
+      fileSystem.normalizeDirectory(input.cwd).pipe(
+        Effect.tap((cwd) => fileSystem.openDirectory(cwd)),
+        Effect.mapError(() => new InvalidSessionPath({ path: input.cwd })),
+        Effect.map((cwd) => {
           const options = runtimeOptions.normalize(input.options)
           const ownerId = input.ownerId ?? null
           return {
-            key: makeDraftKey({ projectId, options, ownerId }),
+            key: makeDraftKey({ cwd, options, ownerId }),
             cwd,
-            projectId,
             options,
             ownerId,
           }
         }),
       )
-    }
 
     const removeExact = (entry: DraftEntry, allowed: ReadonlySet<DraftPhase>) =>
       Ref.modify(entries, (current) => {
@@ -140,9 +135,15 @@ export const SessionDraftsLive: Layer.Layer<
     const cleanupEmptyDraft = Effect.fn("acn.session-drafts.cleanup-empty")(function* (
       entry: DraftEntry,
     ) {
-      const meta = yield* store.readMeta(entry.sessionId)
-      if (meta && (meta.messageCount ?? 0) > 0) return false
-      yield* runtime.deleteSession(entry.sessionId, store.deleteSessionFiles(entry.sessionId))
+      const meta = yield* readMeta(entry.sessionId)
+      if (meta && meta.messageCount > 0) return false
+      const removeDurableState = storage.sessions.deleteSession(entry.sessionId).pipe(
+        Effect.mapError((error) => new SessionOperationFailed({
+          operation: `delete draft session ${entry.sessionId}`,
+          reason: error._tag,
+        })),
+      )
+      yield* runtime.deleteSession(entry.sessionId, removeDurableState)
       return true
     })
 
@@ -167,19 +168,14 @@ export const SessionDraftsLive: Layer.Layer<
           })
 
     const ensureRecord = Effect.fn("acn.session-drafts.ensure-record")(function* (
-      input: {
-        readonly cwd: string
-        readonly projectId?: ProjectId
-        readonly sessionId?: string
-        readonly options?: SessionOptions
-        readonly ownerId?: string | null
-      },
+      requestedSessionId: string | undefined,
       derived: DraftIdentity,
     ) {
       const now = Date.now()
       const candidate: DraftEntry = {
         ...derived,
-        sessionId: input.sessionId ?? (yield* store.createId),
+        sessionId: requestedSessionId
+          ?? (yield* Effect.sync(() => storage.sessions.createTimestampSessionId())),
         createdAt: now,
         touchedAt: now,
         phase: "preloading",
@@ -198,13 +194,13 @@ export const SessionDraftsLive: Layer.Layer<
 
     const startRequest = (entry: DraftEntry): RuntimeStartRequest => ({
       sessionId: entry.sessionId,
-      projectId: entry.projectId,
+      cwd: entry.cwd,
       options: entry.options,
       visibility: "draft",
     })
 
     const initialize = Effect.fn("acn.session-drafts.initialize")(function* (entry: DraftEntry) {
-      const meta = yield* store.readMeta(entry.sessionId)
+      const meta = yield* readMeta(entry.sessionId)
       if (meta && meta.visibility !== "draft") {
         return yield* new SessionAlreadyExists({ sessionId: entry.sessionId })
       }
@@ -240,13 +236,12 @@ export const SessionDraftsLive: Layer.Layer<
 
     const preload = Effect.fn("acn.session-drafts.preload")(function (input: {
       readonly cwd: string
-      readonly projectId?: ProjectId
       readonly options?: SessionOptions
       readonly ownerId?: string | null
     }) {
       return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
         const derived = yield* restore(deriveKey(input))
-        const entry = yield* ensureRecord(input, derived)
+        const entry = yield* ensureRecord(undefined, derived)
         const result = yield* restore(initialize(entry)).pipe(Effect.exit)
         if (Exit.isFailure(result)) {
           const removed = yield* removeExact(entry, new Set<DraftPhase>(["preloading", "ready"]))
@@ -262,7 +257,6 @@ export const SessionDraftsLive: Layer.Layer<
 
     const release = Effect.fn("acn.session-drafts.release")(function* (input: {
       readonly cwd: string
-      readonly projectId?: ProjectId
       readonly sessionId: string
       readonly options?: SessionOptions
       readonly ownerId?: string | null
@@ -281,14 +275,13 @@ export const SessionDraftsLive: Layer.Layer<
 
     const claim = Effect.fn("acn.session-drafts.claim")(function (input: {
       readonly cwd: string
-      readonly projectId?: ProjectId
       readonly sessionId?: string
       readonly options?: SessionOptions
       readonly ownerId?: string | null
     }) {
       return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
         const derived = yield* restore(deriveKey(input))
-        const entry = yield* ensureRecord(input, derived)
+        const entry = yield* ensureRecord(input.sessionId, derived)
         const claimed = yield* Ref.modify(entries, (current) => {
           const found = current.get(entry.key)
           if (!found || found.sessionId !== entry.sessionId || found.phase === "claiming") {
@@ -316,7 +309,18 @@ export const SessionDraftsLive: Layer.Layer<
     })
 
     const promote = Effect.fn("acn.session-drafts.promote")(function* (claim: DraftClaim) {
-      yield* store.promoteDraft(claim.sessionId)
+      const existing = yield* readMeta(claim.sessionId)
+      if (!existing) return yield* new SessionNotFound({ sessionId: claim.sessionId })
+      const promoted = yield* storage.sessions.updateMeta(claim.sessionId, (current) => ({
+        ...(current ?? existing),
+        visibility: "visible",
+        updated: new Date().toISOString(),
+      })).pipe(
+        Effect.mapError((error) => new SessionOperationFailed({
+          operation: `promote draft ${claim.sessionId}`,
+          reason: error._tag,
+        })),
+      )
       const current = (yield* Ref.get(entries)).get(claim.key)
       if (current?.sessionId === claim.sessionId && current.phase === "claiming") {
         yield* Ref.update(entries, (all) => {
@@ -325,9 +329,10 @@ export const SessionDraftsLive: Layer.Layer<
           return next
         })
       }
-      const stored = yield* store.readProtocolMeta(claim.sessionId)
-      if (!stored) return yield* new SessionNotFound({ sessionId: claim.sessionId })
-      return stored
+      return yield* Either.match(decodeSessionMetadata(promoted), {
+        onLeft: () => Effect.fail(staleDraftError(claim.sessionId, "session metadata unreadable")),
+        onRight: Effect.succeed,
+      })
     })
 
     const sweepExpiredDrafts = Effect.fn("acn.session-drafts.sweep")(function* () {
@@ -343,31 +348,6 @@ export const SessionDraftsLive: Layer.Layer<
       }
     })
 
-    const releaseProject = Effect.fn("acn.session-drafts.release-project")(function* (
-      projectId: ProjectId,
-    ) {
-      const removed = yield* Ref.modify(entries, (current) => {
-        const projectEntries = [...current.values()].filter(
-          (entry) => entry.projectId === projectId,
-        )
-        if (projectEntries.some((entry) => entry.phase === "claiming")) {
-          return [Option.none<ReadonlyArray<DraftEntry>>(), current] as const
-        }
-        const next = new Map(current)
-        for (const entry of projectEntries) next.delete(entry.key)
-        return [Option.some<ReadonlyArray<DraftEntry>>(projectEntries), next] as const
-      })
-      if (Option.isNone(removed)) return false
-      for (const entry of removed.value) {
-        if (!(yield* cleanupEmptyDraft(entry))) {
-          yield* Ref.update(entries, (current) =>
-            current.has(entry.key) ? current : new Map(current).set(entry.key, entry),
-          )
-        }
-      }
-      return true
-    })
-
     yield* Effect.forever(
       Effect.sleep(SWEEP_INTERVAL).pipe(
         Effect.zipRight(sweepExpiredDrafts()),
@@ -381,7 +361,6 @@ export const SessionDraftsLive: Layer.Layer<
       claim,
       promote,
       releaseClaim: restoreClaim,
-      releaseProject,
     } satisfies SessionDraftsApi
   }),
 )

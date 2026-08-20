@@ -25,8 +25,15 @@ import {
   X,
 } from "@phosphor-icons/react"
 import { useAtomValue, useAtomSet } from "@effect-atom/atom-react"
-import type { ProjectId, ProjectRecord, ProjectSummary } from "@magnitudedev/sdk"
-import { formatRelativeTime, useSelectedSessionId } from "@magnitudedev/client-common"
+import type { DirectoryPath, Project, ProjectId } from "@magnitudedev/sdk"
+import {
+  formatCwdForDisplay,
+  formatRelativeTime,
+  useProjectPages,
+  useSelectedSessionId,
+  useSessionPages,
+  type RecentChat,
+} from "@magnitudedev/client-common"
 import {
   collapsedProjectIdsAtom,
   sidebarCollapsedAtom,
@@ -50,32 +57,30 @@ import { Input } from "@/components/ui/input"
 import { ResizableEdge } from "@/components/ui/resizable-edge"
 import { ActionTooltip } from "@/components/ui/tooltip"
 
-interface SessionItemData {
+export interface SessionItemData {
   readonly sessionId: string
-  readonly projectId: ProjectId
   readonly title: string | null
   readonly updatedAt: number
   readonly workStatus: "idle" | "working"
-  readonly cwd: string
+  readonly cwd: DirectoryPath
   readonly pinnedAt: number | null
 }
 
+export interface SessionLiveStatus {
+  readonly workStatus: "idle" | "working"
+  readonly lastMessageAt: number
+}
+
 export interface SessionsSidebarProps {
-  readonly projects?: ReadonlyArray<ProjectSummary>
-  readonly sessions?: ReadonlyArray<SessionItemData>
-  readonly loading?: boolean
-  readonly loadingMore?: boolean
-  readonly hasMore?: boolean
-  readonly onSelectSession?: (session: SessionItemData) => void
-  readonly onArchiveSession?: (sessionId: string) => void
+  readonly liveStatuses?: Readonly<Record<string, SessionLiveStatus>>
+  readonly onSelectSession?: (session: SessionItemData, project: Project | null) => void
+  readonly onArchiveSession?: (session: SessionItemData) => void
   readonly onSetSessionPinned?: (sessionId: string, pinned: boolean) => void
   readonly onCompose?: () => void
-  readonly onCreateProject?: (project: ProjectRecord) => void
-  readonly onEditProject?: (project: ProjectRecord) => void
-  readonly onRemoveProject?: (project: ProjectRecord) => void
-  readonly revealKind?: "finder" | "folder" | "unsupported"
+  readonly onCreateProject?: (project: Project) => void
+  readonly onEditProject?: (project: Project) => void
+  readonly onRemoveProject?: (project: Project, next: Project | null) => void
   readonly onRevealProject?: (projectId: ProjectId) => void
-  readonly onLoadMore?: () => void
   readonly onOpenSettings?: () => void
   readonly settingsTab?: SettingsTab | null
   readonly onSettingsTabChange?: (tab: SettingsTab) => void
@@ -244,16 +249,9 @@ function SidebarHeaderActions({
   )
 }
 
-function projectGitLabel(project: ProjectSummary): string | null {
-  if (project.gitState._tag !== "repository") return null
-  return project.gitState.head._tag === "branch"
-    ? project.gitState.head.name
-    : project.gitState.head.revision
-}
-
 function SessionRow({
   session,
-  projectName,
+  contextLabel,
   nested = true,
   selected,
   onSelect,
@@ -261,7 +259,7 @@ function SessionRow({
   onSetPinned,
 }: {
   readonly session: SessionItemData
-  readonly projectName: string
+  readonly contextLabel: string
   readonly nested?: boolean
   readonly selected: boolean
   readonly onSelect: () => void
@@ -281,7 +279,7 @@ function SessionRow({
         size="unstyled"
         type="button"
         onClick={onSelect}
-        title={`${title} — ${projectName}`}
+        title={`${title} — ${contextLabel}`}
         className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap border-0 bg-transparent px-2 text-left font-sans text-[13px] font-medium text-inherit group-hover/session:pr-14 group-focus-within/session:pr-14"
       >
         {title}
@@ -335,12 +333,183 @@ function SessionRow({
   )
 }
 
+function ShowMoreRow({
+  label,
+  nested = false,
+  loading,
+  onActivate,
+}: {
+  readonly label: string
+  readonly nested?: boolean
+  readonly loading: boolean
+  readonly onActivate: () => void
+}): ReactNode {
+  return (
+    <Button
+      variant="unstyled"
+      size="unstyled"
+      type="button"
+      disabled={loading}
+      onClick={onActivate}
+      className={`flex h-7 w-full cursor-pointer items-center rounded-md px-2 text-left font-sans text-[12px] font-medium text-slate-500 hover:bg-slate-150 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-300 ${nested ? "ml-5 w-[calc(100%-20px)]" : ""}`}
+    >
+      {loading ? "Loading…" : label}
+    </Button>
+  )
+}
+
+const toSessionItem = (
+  chat: RecentChat,
+  liveStatuses: Readonly<Record<string, SessionLiveStatus>>,
+): SessionItemData => {
+  const live = liveStatuses[chat.id]
+  return {
+    sessionId: chat.id,
+    title: chat.title,
+    updatedAt: live?.lastMessageAt ?? chat.timestamp,
+    workStatus: live?.workStatus ?? "idle",
+    cwd: chat.workingDirectory,
+    pinnedAt: chat.pinnedAt,
+  }
+}
+
+interface SessionRowActions {
+  readonly selectedSessionId: string | null
+  readonly liveStatuses: Readonly<Record<string, SessionLiveStatus>>
+  readonly onSelect: (session: SessionItemData, project: Project | null) => void
+  readonly onArchive: (session: SessionItemData) => void
+  readonly onSetPinned: (sessionId: string, pinned: boolean) => void
+}
+
+/** Nested unpinned sessions of one expanded Project: five first, ten more per activation. */
+function ProjectSessions({
+  project,
+  actions,
+}: {
+  readonly project: Project
+  readonly actions: SessionRowActions
+}): ReactNode {
+  const page = useSessionPages({
+    cwd: project.cwd,
+    pin: "unpinned",
+    archive: "active",
+    pageSize: 5,
+  })
+  return (
+    <div className="mt-0.5 space-y-0.5">
+      {page.sessions.map((chat) => {
+        const session = toSessionItem(chat, actions.liveStatuses)
+        return (
+          <SessionRow
+            key={session.sessionId}
+            session={session}
+            contextLabel={project.name}
+            selected={actions.selectedSessionId === session.sessionId}
+            onSelect={() => actions.onSelect(session, project)}
+            onArchive={() => actions.onArchive(session)}
+            onSetPinned={(pinned) => actions.onSetPinned(session.sessionId, pinned)}
+          />
+        )
+      })}
+      {page.hasMore ? (
+        <ShowMoreRow
+          nested
+          label="Show more"
+          loading={page.loadingMore}
+          onActivate={() => page.loadMore(10)}
+        />
+      ) : null}
+      {!page.loading && page.sessions.length === 0 ? (
+        <div className="ml-7 px-2 py-1 text-[11px] text-slate-500">No sessions</div>
+      ) : null}
+    </div>
+  )
+}
+
+/** Server-bounded search results grouped under loaded Projects by cwd. */
+function SidebarSearchResults({
+  query,
+  projects,
+  actions,
+}: {
+  readonly query: string
+  readonly projects: ReadonlyArray<Project>
+  readonly actions: SessionRowActions
+}): ReactNode {
+  const page = useSessionPages({ archive: "active", query, pageSize: 50 })
+  const normalized = query.toLowerCase()
+  const byCwd = useMemo(() => {
+    const grouped = new Map<string, SessionItemData[]>()
+    for (const chat of page.sessions) {
+      const session = toSessionItem(chat, actions.liveStatuses)
+      const current = grouped.get(session.cwd) ?? []
+      current.push(session)
+      grouped.set(session.cwd, current)
+    }
+    return grouped
+  }, [page.sessions, actions.liveStatuses])
+
+  const projectCwds = new Set<string>(projects.map((project) => project.cwd))
+  const visibleProjects = projects.filter((project) =>
+    project.name.toLowerCase().includes(normalized) || byCwd.has(project.cwd))
+  const ungrouped = [...byCwd.entries()].filter(([cwd]) => !projectCwds.has(cwd))
+
+  if (page.loading) return <SidebarLoadingState />
+  if (visibleProjects.length === 0 && ungrouped.length === 0) {
+    return <SidebarEmptyState searchQuery={query} />
+  }
+
+  const renderGroup = (
+    label: string,
+    key: string,
+    project: Project | null,
+    sessions: ReadonlyArray<SessionItemData>,
+  ) => (
+    <section key={key} className="mt-2" aria-label={label}>
+      <div className="flex h-7 items-center gap-1.5 px-1.5 font-sans text-[13px] font-semibold text-slate-700 dark:text-slate-300">
+        <FolderOpen size={15} weight="regular" className="shrink-0 text-slate-500" />
+        <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+          {label}
+        </span>
+      </div>
+      <div className="mt-0.5 space-y-0.5">
+        {sessions.map((session) => (
+          <SessionRow
+            key={session.sessionId}
+            session={session}
+            contextLabel={label}
+            selected={actions.selectedSessionId === session.sessionId}
+            onSelect={() => actions.onSelect(session, project)}
+            onArchive={() => actions.onArchive(session)}
+            onSetPinned={(pinned) => actions.onSetPinned(session.sessionId, pinned)}
+          />
+        ))}
+        {sessions.length === 0 ? (
+          <div className="ml-7 px-2 py-1 text-[11px] text-slate-500">No matching sessions</div>
+        ) : null}
+      </div>
+    </section>
+  )
+
+  return (
+    <>
+      {visibleProjects.map((project) =>
+        renderGroup(project.name, project.projectId, project, byCwd.get(project.cwd) ?? []))}
+      {ungrouped.map(([cwd, sessions]) =>
+        renderGroup(formatCwdForDisplay(cwd), `cwd:${cwd}`, null, sessions))}
+      {page.hasMore ? (
+        <ShowMoreRow
+          label="Show more results"
+          loading={page.loadingMore}
+          onActivate={() => page.loadMore(50)}
+        />
+      ) : null}
+    </>
+  )
+}
+
 export function SessionsSidebar({
-  projects = [],
-  sessions = [],
-  loading = false,
-  loadingMore = false,
-  hasMore = false,
+  liveStatuses = {},
   onSelectSession,
   onArchiveSession,
   onSetSessionPinned,
@@ -348,9 +517,7 @@ export function SessionsSidebar({
   onCreateProject,
   onEditProject,
   onRemoveProject,
-  revealKind = "unsupported",
   onRevealProject,
-  onLoadMore,
   onOpenSettings,
   settingsTab = null,
   onSettingsTabChange,
@@ -368,50 +535,28 @@ export function SessionsSidebar({
   const setCollapsed = useAtomSet(sidebarCollapsedAtom)
   const collapsedProjects = useAtomValue(collapsedProjectIdsAtom)
   const setCollapsedProjects = useAtomSet(collapsedProjectIdsAtom)
-  const [formProject, setFormProject] = useState<ProjectRecord | "new" | null>(null)
-  const [removeProject, setRemoveProject] = useState<ProjectRecord | null>(null)
+  const [formProject, setFormProject] = useState<Project | "new" | null>(null)
+  const [removeProject, setRemoveProject] = useState<Project | null>(null)
   const compact = collapsed && !overlay
+  const trimmedSearch = search.trim()
 
-  const pinnedSessions = useMemo(
-    () => sessions.filter((session) => session.pinnedAt !== null),
-    [sessions],
+  const projectPage = useProjectPages({ pageSize: 20 })
+  const pinnedPage = useSessionPages({ pin: "pinned", archive: "active" })
+  const projectNamesByCwd = useMemo(
+    () => new Map(projectPage.projects.map((project) => [project.cwd as string, project.name])),
+    [projectPage.projects],
   )
-  const pinnedProjectIds = useMemo(
-    () => new Set(pinnedSessions.map((session) => session.projectId)),
-    [pinnedSessions],
-  )
-  const projectNames = useMemo(
-    () => new Map(projects.map((summary) => [summary.project.projectId, summary.project.name])),
-    [projects],
-  )
-  const sessionsByProject = useMemo(() => {
-    const grouped = new Map<ProjectId, SessionItemData[]>()
-    for (const session of sessions) {
-      if (session.pinnedAt !== null) continue
-      const current = grouped.get(session.projectId) ?? []
-      current.push(session)
-      grouped.set(session.projectId, current)
-    }
-    return grouped
-  }, [sessions])
-  const orderedProjects = useMemo(
-    () =>
-      [...projects].sort(
-        (left, right) =>
-          left.project.createdAt - right.project.createdAt ||
-          left.project.name.localeCompare(right.project.name) ||
-          left.project.projectId.localeCompare(right.project.projectId)
-      ),
-    [projects]
-  )
-  const normalizedSearch = search.trim().toLowerCase()
-  const visibleProjects = normalizedSearch
-    ? orderedProjects.filter(
-        (project) =>
-          project.project.name.toLowerCase().includes(normalizedSearch) ||
-          (sessionsByProject.get(project.project.projectId)?.length ?? 0) > 0
-      )
-    : orderedProjects
+
+  const actions: SessionRowActions = {
+    selectedSessionId,
+    liveStatuses,
+    onSelect: (session, project) => {
+      onSelectSession?.(session, project)
+      if (overlay) onCloseOverlay?.()
+    },
+    onArchive: (session) => onArchiveSession?.(session),
+    onSetPinned: (sessionId, pinned) => onSetSessionPinned?.(sessionId, pinned),
+  }
 
   const toggleProject = (projectId: ProjectId) => {
     setCollapsedProjects((current) => {
@@ -430,6 +575,8 @@ export function SessionsSidebar({
     setCollapsed(false)
     onOpenSettings?.()
   }
+
+  const pinnedSessions = pinnedPage.sessions.map((chat) => toSessionItem(chat, liveStatuses))
 
   const effectiveWidth = compact && titlebarIntegrated ? 0 : compact ? 48 : overlay ? 280 : sidebarWidth
   return (
@@ -513,19 +660,17 @@ export function SessionsSidebar({
                 <Plus size={15} aria-hidden="true" className="shrink-0 text-slate-500" />
               </Button>
             </div>
-            <div
-              className="mac:[-webkit-app-region:no-drag] min-h-0 flex-1 overflow-y-auto px-2 pb-3"
-              onScroll={(event) => {
-                if (!hasMore || loading || loadingMore) return
-                const element = event.currentTarget
-                if (element.scrollHeight - element.scrollTop - element.clientHeight < 96)
-                  onLoadMore?.()
-              }}
-            >
-              {loading ? (
+            <div className="mac:[-webkit-app-region:no-drag] min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+              {trimmedSearch ? (
+                <SidebarSearchResults
+                  query={trimmedSearch}
+                  projects={projectPage.projects}
+                  actions={actions}
+                />
+              ) : projectPage.loading ? (
                 <SidebarLoadingState />
-              ) : visibleProjects.length === 0 && pinnedSessions.length === 0 ? (
-                <SidebarEmptyState searchQuery={search} />
+              ) : projectPage.projects.length === 0 && pinnedSessions.length === 0 ? (
+                <SidebarEmptyState searchQuery="" />
               ) : (
                 <>
                   {pinnedSessions.length > 0 ? (
@@ -538,33 +683,24 @@ export function SessionsSidebar({
                           <SessionRow
                             key={session.sessionId}
                             session={session}
-                            projectName={projectNames.get(session.projectId) ?? "Project"}
+                            contextLabel={
+                              projectNamesByCwd.get(session.cwd) ?? formatCwdForDisplay(session.cwd)
+                            }
                             nested={false}
                             selected={selectedSessionId === session.sessionId}
-                            onSelect={() => {
-                              onSelectSession?.(session)
-                              if (overlay) onCloseOverlay?.()
-                            }}
-                            onArchive={() => onArchiveSession?.(session.sessionId)}
-                            onSetPinned={(pinned) => onSetSessionPinned?.(session.sessionId, pinned)}
+                            onSelect={() => actions.onSelect(
+                              session,
+                              projectPage.projects.find((project) => project.cwd === session.cwd) ?? null,
+                            )}
+                            onArchive={() => actions.onArchive(session)}
+                            onSetPinned={(pinned) => actions.onSetPinned(session.sessionId, pinned)}
                           />
                         ))}
                       </div>
                     </section>
                   ) : null}
-                  {visibleProjects.map((summary) => {
-                    const project = summary.project
-                    const projectSessions = sessionsByProject.get(project.projectId) ?? []
+                  {projectPage.projects.map((project) => {
                     const isCollapsed = collapsedProjects.has(project.projectId)
-                    const gitLabel = projectGitLabel(summary)
-                    const sourceWarning =
-                      summary.directoryState._tag === "missing"
-                        ? "Missing"
-                        : summary.directoryState._tag === "inaccessible"
-                        ? "Unavailable"
-                        : null
-                    const revealLabel =
-                      revealKind === "finder" ? "Reveal in Finder" : "Show in folder"
                     return (
                       <Collapsible
                         key={project.projectId}
@@ -587,15 +723,6 @@ export function SessionsSidebar({
                           <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-sans text-[13px] font-semibold">
                             {project.name}
                           </span>
-                          {sourceWarning ? (
-                            <span className="shrink-0 font-sans text-[10px] font-semibold text-orange-700 dark:text-orange-400">
-                              {sourceWarning}
-                            </span>
-                          ) : gitLabel ? (
-                            <span className="max-w-[72px] overflow-hidden text-ellipsis whitespace-nowrap font-sans text-[10px] text-slate-500">
-                              {gitLabel}
-                            </span>
-                          ) : null}
                         </CollapsibleTrigger>
                         <DropdownMenu>
                           <DropdownMenuTrigger
@@ -614,13 +741,11 @@ export function SessionsSidebar({
                             <DropdownMenuItem onClick={() => setFormProject(project)}>
                               Edit project
                             </DropdownMenuItem>
-                            {revealKind !== "unsupported" ? (
-                              <DropdownMenuItem
-                                onClick={() => onRevealProject?.(project.projectId)}
-                              >
-                                {revealLabel}
-                              </DropdownMenuItem>
-                            ) : null}
+                            <DropdownMenuItem
+                              onClick={() => onRevealProject?.(project.projectId)}
+                            >
+                              Reveal folder
+                            </DropdownMenuItem>
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
                               variant="destructive"
@@ -632,36 +757,24 @@ export function SessionsSidebar({
                         </DropdownMenu>
                       </div>
                       <CollapsibleContent>
-                        <div className="mt-0.5 space-y-0.5">
-                          {projectSessions.map((session) => (
-                            <SessionRow
-                              key={session.sessionId}
-                              session={session}
-                              projectName={project.name}
-                              selected={selectedSessionId === session.sessionId}
-                              onSelect={() => {
-                                onSelectSession?.(session)
-                                if (overlay) onCloseOverlay?.()
-                              }}
-                              onArchive={() => onArchiveSession?.(session.sessionId)}
-                              onSetPinned={(pinned) => onSetSessionPinned?.(session.sessionId, pinned)}
-                            />
-                          ))}
-                          {projectSessions.length === 0 ? (
-                            <div className="ml-7 px-2 py-1 text-[11px] text-slate-500">
-                              {pinnedProjectIds.has(project.projectId) ? "No other sessions" : "No sessions"}
-                            </div>
-                          ) : null}
-                        </div>
+                        {!isCollapsed ? (
+                          <ProjectSessions project={project} actions={actions} />
+                        ) : null}
                       </CollapsibleContent>
                       </Collapsible>
                     )
                   })}
+                  {projectPage.hasMore ? (
+                    <div className="mt-2">
+                      <ShowMoreRow
+                        label="Show more projects"
+                        loading={projectPage.loadingMore}
+                        onActivate={() => projectPage.loadMore(20)}
+                      />
+                    </div>
+                  ) : null}
                 </>
               )}
-              {loadingMore ? (
-                <div className="py-3 text-center text-[11px] text-slate-500">Loading…</div>
-              ) : null}
             </div>
           </>
         )}
@@ -703,7 +816,10 @@ export function SessionsSidebar({
           project={removeProject}
           onDismiss={() => setRemoveProject(null)}
           onRemoved={() => {
-            onRemoveProject?.(removeProject)
+            const next = projectPage.projects.find(
+              (candidate) => candidate.projectId !== removeProject.projectId,
+            ) ?? null
+            onRemoveProject?.(removeProject, next)
             setRemoveProject(null)
           }}
         />
