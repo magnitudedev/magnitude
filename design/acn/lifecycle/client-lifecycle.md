@@ -185,12 +185,15 @@ and application clients share semantic selection/recovery authority, never a pro
 Close is one-way and idempotent. It marks the runtime closed under selection admission, closes the
 selection scope and awaits interruption, stops heartbeat renewal, then freezes the selected exact
 endpoint. Bounded model observation and lease release use a non-recovering protocol bound only to
-that endpoint. Close and scope finalization never ensure, discover, replace, or launch an ACN.
+that endpoint. Those bounded shutdown RPCs run in a fresh operation scope owned by close; they never
+acquire resources into the runtime's owning scope, which may already be finalizing. Close and scope
+finalization never ensure, discover, replace, or launch an ACN.
 
 Selection publication and lease establishment check `open` under the same admission boundary as
 close. If establishment wins, close observes that exact selection and releases its lease; if close
-wins, no lease is established or selection published. Each host invokes runtime close before
-destroying its scope.
+wins, no lease is established or selection published. Each host invokes runtime close as its
+leading teardown action, explicitly or through its registered finalizer, before destroying runtime
+dependencies.
 Browser back/forward-cache suspension is not close; lease expiry remains authoritative if renewal
 cannot run while suspended.
 
