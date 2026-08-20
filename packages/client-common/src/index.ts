@@ -70,6 +70,7 @@ export * from './commands/command-router'
 
 // Data
 export * from './data/recent-chats'
+export * from './data/paginated-query'
 
 // Markdown
 export * from './markdown/parse'
@@ -93,9 +94,8 @@ export * from './hooks/use-esc-interrupt'
 export * from './hooks/use-interrupt-actions'
 export * from './hooks/use-settings-state'
 export * from './hooks/use-usage-state'
-export * from './hooks/use-sessions-list'
-export * from './hooks/use-paginated-sessions'
-export * from './hooks/use-projects'
+export * from './hooks/use-session-pages'
+export * from './hooks/use-project-pages'
 export * from './hooks/use-infinite-scroll'
 export * from './hooks/use-session-actions'
 export * from './hooks/use-session-preload'

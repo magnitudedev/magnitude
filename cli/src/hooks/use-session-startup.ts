@@ -30,6 +30,7 @@ import {
   type SlashCommandDefinition,
   getDraftSessionOwnerId,
 } from '@magnitudedev/client-common'
+import { DirectoryPathSchema, type SessionPageCursor } from '@magnitudedev/sdk'
 import { setLastSessionId } from '../state/last-session'
 import { useTerminalTitle } from './use-terminal-title'
 
@@ -65,10 +66,9 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
     () =>
       sessionStart._tag === 'latest' && Result.isSuccess(runtimeResult)
         ? client.rpc.query('ListSessions', {
-            projectId: Option.none(),
-            cwd: Option.some(process.cwd()),
-            query: Option.none(),
-            cursor: Option.none(),
+            cwd: Option.some(DirectoryPathSchema.make(process.cwd())),
+            query: Option.none<string>(),
+            cursor: Option.none<SessionPageCursor>(),
             limit: 1,
           }, { reactivityKeys: ['sessions'] })
         : idleAtom,
@@ -197,7 +197,6 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
             : createSessionMutation({
                 payload: {
                   cwd: selectedCwd ?? process.cwd(),
-                  projectId: Option.none(),
                   sessionId: Option.none(),
                   initial: Option.some(initial),
                   options: sessionCreateOptions,

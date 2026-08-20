@@ -1,5 +1,9 @@
+import { mkdtemp } from "node:fs/promises"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 import { describe, expect, it } from "vitest"
 import {
+  Context,
   Deferred,
   Duration,
   Effect,
@@ -20,8 +24,12 @@ import type {
   ForkTurnState,
   SessionWorkStatus,
 } from "@magnitudedev/agent"
-import type { StoredSessionMeta } from "@magnitudedev/storage"
-import { ProjectIdSchema, SessionOperationFailed } from "@magnitudedev/acn-protocol"
+import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
+import {
+  DirectoryPathSchema,
+  SessionOperationFailed,
+  type DirectoryPath,
+} from "@magnitudedev/acn-protocol"
 import {
   AcnServiceLifecycle,
   type AcnServiceLifecycleApi,
@@ -33,13 +41,13 @@ import {
   type AgentRuntimeApi,
   type RuntimeStartRequest,
 } from "./agent-runtime"
-import { SessionStore, type SessionStoreApi } from "./session-store"
 import {
   normalizeSessionRuntimeOptions,
   SessionRuntimeOptionsStore,
   type SessionRuntimeOptions,
   type SessionRuntimeOptionsStoreApi,
 } from "./session-runtime-options"
+import { makeTestStorageLayer, testFileSystemManagerLayer } from "./session-test-support"
 
 const idleTurnState: ForkTurnState = {
   _tag: "idle",
@@ -97,11 +105,10 @@ const idleSession: CodingAgentSession = {
   subscribeIntrospection: () => Stream.never,
 }
 
-const makeMeta = (sessionId: string, cwd = "/repo"): StoredSessionMeta => {
+const makeMeta = (sessionId: string, cwd: DirectoryPath): StoredSessionMeta => {
   const now = new Date().toISOString()
   return {
     sessionId,
-    projectId: ProjectIdSchema.make("project-a"),
     archived: false,
     pinnedAt: Option.none(),
     created: now,
@@ -118,133 +125,81 @@ const makeMeta = (sessionId: string, cwd = "/repo"): StoredSessionMeta => {
   }
 }
 
-const request = (sessionId: string): RuntimeStartRequest => ({
-  sessionId,
-  projectId: ProjectIdSchema.make("project-a"),
-  options: normalizeSessionRuntimeOptions(),
-  visibility: "visible",
-})
-
 const residentCount = (runtime: AgentRuntimeApi) =>
   runtime.residentSessions.pipe(Effect.map((sessions) => sessions.length))
 
-const makeLayer = (input: {
+interface TestSetup {
+  readonly cwd: DirectoryPath
+  readonly layer: Layer.Layer<AgentRuntime>
+  readonly request: (sessionId: string) => RuntimeStartRequest
+}
+
+const makeSetup = (input: {
   readonly factory: AgentFactoryApi
-  readonly storedSessions?: ReadonlyArray<StoredSessionMeta>
+  readonly storedSessionIds?: ReadonlyArray<string>
   readonly storedRuntimeOptions?: ReadonlyMap<string, SessionRuntimeOptions>
   readonly retirementAdmissionTimeout?: Duration.DurationInput
   readonly retirementShutdownTimeout?: Duration.DurationInput
   readonly lifecycle?: AcnServiceLifecycleApi
-  readonly projectSource?: Effect.Effect<string>
-}) => {
-  const dependencies = Layer.mergeAll(
-    Layer.succeed(AgentFactory, input.factory),
-    Layer.effect(
-      SessionStore,
-      Effect.gen(function* () {
-        const metas = yield* Ref.make(
-          new Map((input.storedSessions ?? []).map((meta) => [meta.sessionId, meta])),
-        )
-        return {
-          createId: Effect.die("unused"),
-          readMeta: (sessionId) =>
-            Ref.get(metas).pipe(Effect.map((all) => all.get(sessionId) ?? null)),
-          readProtocolMeta: () => Effect.die("unused"),
-          promoteDraft: () => Effect.die("unused"),
-          listDraftSessionIds: () => Effect.die("unused"),
-          listProtocolMetas: () => Effect.die("unused"),
-          listAllProtocolMetas: () => Effect.die("unused"),
-          listSessionCwds: () => Effect.die("unused"),
-          deleteSessionFiles: () => Effect.die("unused"),
-          deleteArchivedSessionFiles: () => Effect.die("unused"),
-          validateCwd: Effect.succeed,
-          getScratchpadPath: (sessionId) => Effect.succeed(`/tmp/${sessionId}/scratchpad`),
-          getExecutionContext: (sessionId) => Effect.succeed({
-            cwd: "/repo",
-            projectRoot: "/repo",
-            scratchpadPath: `/tmp/${sessionId}/scratchpad`,
-          }),
-          ensureProjectForCwd: () => Effect.die("unused"),
-          resolveProjectSource: () => input.projectSource ?? Effect.succeed("/repo"),
-          setArchived: () => Effect.die("unused"),
-          setPinned: () => Effect.die("unused"),
-          changes: Stream.never,
-        } satisfies SessionStoreApi
+}): Effect.Effect<TestSetup> =>
+  Effect.gen(function* () {
+    const root = yield* Effect.promise(() => mkdtemp(join(tmpdir(), "magnitude-runtime-")))
+    const cwd = DirectoryPathSchema.make(root)
+    const storageLayer = makeTestStorageLayer(root)
+    const dependencies = Layer.mergeAll(
+      Layer.succeed(AgentFactory, input.factory),
+      storageLayer,
+      testFileSystemManagerLayer,
+      Layer.effect(
+        SessionRuntimeOptionsStore,
+        Effect.gen(function* () {
+          const values = yield* Ref.make(new Map(input.storedRuntimeOptions ?? []))
+          return {
+            normalize: normalizeSessionRuntimeOptions,
+            read: (sessionId) =>
+              Ref.get(values).pipe(Effect.map((all) => all.get(sessionId) ?? null)),
+            write: (sessionId, options) =>
+              Ref.update(values, (all) => new Map(all).set(sessionId, options)),
+          } satisfies SessionRuntimeOptionsStoreApi
+        }),
+      ),
+      ...(input.lifecycle
+        ? [Layer.succeed(AcnServiceLifecycle, input.lifecycle)]
+        : []),
+    )
+    const withSeed = Layer.tap(dependencies, (context) => Effect.gen(function* () {
+      const storage = Context.get(context, MagnitudeStorage)
+      for (const sessionId of input.storedSessionIds ?? []) {
+        yield* storage.sessions.writeMeta(sessionId, makeMeta(sessionId, cwd))
+      }
+    }))
+    const layer = makeAgentRuntimeLive({
+      idleTimeout: "2 seconds",
+      retirementAdmissionTimeout: input.retirementAdmissionTimeout,
+      retirementShutdownTimeout: input.retirementShutdownTimeout,
+    }).pipe(
+      Layer.provide(Layer.orDie(withSeed)),
+      Layer.provideMerge(TestContext.TestContext),
+    )
+    return {
+      cwd,
+      layer,
+      request: (sessionId): RuntimeStartRequest => ({
+        sessionId,
+        cwd,
+        options: normalizeSessionRuntimeOptions(),
+        visibility: "visible",
       }),
-    ),
-    Layer.effect(
-      SessionRuntimeOptionsStore,
-      Effect.gen(function* () {
-        const values = yield* Ref.make(new Map(input.storedRuntimeOptions ?? []))
-        return {
-          normalize: normalizeSessionRuntimeOptions,
-          read: (sessionId) =>
-            Ref.get(values).pipe(Effect.map((all) => all.get(sessionId) ?? null)),
-          write: (sessionId, options) =>
-            Ref.update(values, (all) => new Map(all).set(sessionId, options)),
-        } satisfies SessionRuntimeOptionsStoreApi
-      }),
-    ),
-    ...(input.lifecycle
-      ? [Layer.succeed(AcnServiceLifecycle, input.lifecycle)]
-      : []),
-  )
-  return makeAgentRuntimeLive({
-    idleTimeout: "2 seconds",
-    retirementAdmissionTimeout: input.retirementAdmissionTimeout,
-    retirementShutdownTimeout: input.retirementShutdownTimeout,
-  }).pipe(
-    Layer.provide(dependencies),
-    Layer.provideMerge(TestContext.TestContext),
-  )
-}
-
-describe("AgentRuntime", () => {
-  it("restarts initialization against the authoritative source when a project is rebound", async () => {
-    const program = Effect.gen(function* () {
-      const source = yield* Ref.make("/old")
-      const entered = yield* Deferred.make<void>()
-      const resume = yield* Deferred.make<void>()
-      const calls = yield* Ref.make<string[]>([])
-      const layer = makeLayer({
-        projectSource: Ref.get(source),
-        factory: {
-          createSession: (input) => Ref.update(calls, (all) => [...all, input.cwd]).pipe(
-            Effect.zipRight(
-              input.cwd === "/old"
-                ? Deferred.succeed(entered, undefined).pipe(
-                    Effect.zipRight(Deferred.await(resume)),
-                  )
-                : Effect.void,
-            ),
-            Effect.as(idleSession),
-          ),
-        },
-      })
-      yield* Effect.gen(function* () {
-        const runtime = yield* AgentRuntime
-        const use = yield* runtime.withSessionRequest(
-          request("rebound"),
-          "use",
-          (entry) => Effect.succeed(entry.cwd),
-        ).pipe(Effect.fork)
-        yield* Deferred.await(entered)
-        yield* Ref.set(source, "/new")
-        yield* Deferred.succeed(resume, undefined)
-        expect(yield* Fiber.join(use)).toBe("/new")
-        expect(yield* Ref.get(calls)).toEqual(["/old", "/new"])
-        expect(yield* residentCount(runtime)).toBe(1)
-      }).pipe(Effect.provide(layer))
-    })
-    await Effect.runPromise(program)
+    }
   })
 
+describe("AgentRuntime", () => {
   it("single-flights startup and publishes one generation", async () => {
     const program = Effect.gen(function* () {
       const calls = yield* Ref.make(0)
       const entered = yield* Deferred.make<void>()
       const resume = yield* Deferred.make<void>()
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: {
           createSession: () =>
             Ref.update(calls, (value) => value + 1).pipe(
@@ -257,13 +212,13 @@ describe("AgentRuntime", () => {
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
         const first = yield* runtime
-          .withSessionRequest(request("single"), "first", (_, generation) =>
+          .withSessionRequest(setup.request("single"), "first", (_, generation) =>
             Effect.succeed(generation),
           )
           .pipe(Effect.fork)
         yield* Deferred.await(entered)
         const second = yield* runtime
-          .withSessionRequest(request("single"), "second", (_, generation) =>
+          .withSessionRequest(setup.request("single"), "second", (_, generation) =>
             Effect.succeed(generation),
           )
           .pipe(Effect.fork)
@@ -272,7 +227,7 @@ describe("AgentRuntime", () => {
         expect(yield* Fiber.join(second)).toBe(1)
         expect(yield* Ref.get(calls)).toBe(1)
         expect(yield* residentCount(runtime)).toBe(1)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -280,11 +235,13 @@ describe("AgentRuntime", () => {
   it("holds in-flight work, then evicts at the exact post-release deadline", async () => {
     const program = Effect.gen(function* () {
       const latch = yield* Deferred.make<void>()
-      const layer = makeLayer({ factory: { createSession: () => Effect.succeed(idleSession) } })
+      const setup = yield* makeSetup({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+      })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
         const inFlight = yield* runtime
-          .withSessionRequest(request("deadline"), "blocked", () => Deferred.await(latch))
+          .withSessionRequest(setup.request("deadline"), "blocked", () => Deferred.await(latch))
           .pipe(Effect.fork)
         yield* Effect.yieldNow()
         yield* TestClock.adjust("1 hour")
@@ -296,7 +253,7 @@ describe("AgentRuntime", () => {
         yield* TestClock.adjust("1 millis")
         yield* Effect.yieldNow()
         expect(yield* residentCount(runtime)).toBe(0)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -320,11 +277,13 @@ describe("AgentRuntime", () => {
           },
         },
       }
-      const layer = makeLayer({ factory: { createSession: () => Effect.succeed(session) } })
+      const setup = yield* makeSetup({
+        factory: { createSession: () => Effect.succeed(session) },
+      })
 
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        yield* runtime.withSessionRequest(request("continuing"), "start-work", () =>
+        yield* runtime.withSessionRequest(setup.request("continuing"), "start-work", () =>
           Ref.set(status, working).pipe(
             Effect.zipRight(PubSub.publish(changes, working)),
           ),
@@ -341,16 +300,16 @@ describe("AgentRuntime", () => {
         yield* TestClock.adjust("1 millis")
         yield* Effect.yieldNow()
         expect(yield* residentCount(runtime)).toBe(0)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
 
   it("rehydrates with a new generation after eviction", async () => {
     const program = Effect.gen(function* () {
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(idleSession) },
-        storedSessions: [makeMeta("rehydrate")],
+        storedSessionIds: ["rehydrate"],
       })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
@@ -359,7 +318,7 @@ describe("AgentRuntime", () => {
         yield* Effect.yieldNow()
         expect(yield* residentCount(runtime)).toBe(0)
         expect(yield* runtime.withSession("rehydrate", "two", (_, generation) => Effect.succeed(generation))).toBe(2)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -367,9 +326,9 @@ describe("AgentRuntime", () => {
   it("bounds admission behind a stalled retirement without blocking other sessions", async () => {
     const program = Effect.gen(function* () {
       const retirementStarted = yield* Deferred.make<void>()
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(idleSession) },
-        storedSessions: [makeMeta("stalled"), makeMeta("independent")],
+        storedSessionIds: ["stalled", "independent"],
         retirementAdmissionTimeout: "1 second",
       })
       yield* Effect.gen(function* () {
@@ -408,7 +367,7 @@ describe("AgentRuntime", () => {
             expect(result.left.reason).toContain("did not finish shutting down")
           }
         }
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -432,9 +391,9 @@ describe("AgentRuntime", () => {
         withActivity: (_label, effect) => effect,
         activity: Effect.die("unused"),
       }
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(idleSession) },
-        storedSessions: [makeMeta("stalled-shutdown")],
+        storedSessionIds: ["stalled-shutdown"],
         retirementShutdownTimeout: "3 seconds",
         lifecycle,
       })
@@ -456,17 +415,19 @@ describe("AgentRuntime", () => {
         expect(yield* Ref.get(shutdownRequest)).toContain(
           "session stalled-shutdown generation 1 retirement stalled",
         )
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
 
   it("does not let passive busy-joins revive or prolong an idle generation", async () => {
     const program = Effect.gen(function* () {
-      const layer = makeLayer({ factory: { createSession: () => Effect.succeed(idleSession) } })
+      const setup = yield* makeSetup({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+      })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        yield* runtime.withSessionRequest(request("passive"), "demand", () => Effect.void)
+        yield* runtime.withSessionRequest(setup.request("passive"), "demand", () => Effect.void)
         yield* TestClock.adjust("1 second")
         const observed = yield* runtime.tryWithBusyResident(
           "passive",
@@ -477,7 +438,7 @@ describe("AgentRuntime", () => {
         yield* TestClock.adjust("1 second")
         yield* Effect.yieldNow()
         expect(yield* residentCount(runtime)).toBe(0)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -486,7 +447,7 @@ describe("AgentRuntime", () => {
     const program = Effect.gen(function* () {
       const calls = yield* Ref.make(0)
       const failure = new SessionOperationFailed({ operation: "start", reason: "boom" })
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: {
           createSession: () =>
             Ref.updateAndGet(calls, (value) => value + 1).pipe(
@@ -497,12 +458,12 @@ describe("AgentRuntime", () => {
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
         const failed = yield* Effect.either(
-          runtime.withSessionRequest(request("retry"), "first", () => Effect.void),
+          runtime.withSessionRequest(setup.request("retry"), "first", () => Effect.void),
         )
         expect(Either.isLeft(failed)).toBe(true)
-        expect(yield* runtime.withSessionRequest(request("retry"), "second", (_, generation) => Effect.succeed(generation))).toBe(2)
+        expect(yield* runtime.withSessionRequest(setup.request("retry"), "second", (_, generation) => Effect.succeed(generation))).toBe(2)
         expect(yield* Ref.get(calls)).toBe(2)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -512,7 +473,7 @@ describe("AgentRuntime", () => {
       const calls = yield* Ref.make(0)
       const entered = yield* Deferred.make<void>()
       const resume = yield* Deferred.make<void>()
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: {
           createSession: () =>
             Ref.updateAndGet(calls, (value) => value + 1).pipe(
@@ -531,19 +492,19 @@ describe("AgentRuntime", () => {
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
         const first = yield* runtime
-          .withSessionRequest(request("interrupted"), "first", () => Effect.void)
+          .withSessionRequest(setup.request("interrupted"), "first", () => Effect.void)
           .pipe(Effect.fork)
         yield* Deferred.await(entered)
         yield* Fiber.interrupt(first)
         expect(
           yield* runtime.withSessionRequest(
-            request("interrupted"),
+            setup.request("interrupted"),
             "second",
             (_, generation) => Effect.succeed(generation),
           ),
         ).toBe(2)
         expect(yield* Ref.get(calls)).toBe(2)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -551,7 +512,7 @@ describe("AgentRuntime", () => {
   it("runs generation finalizers before publishing retirement", async () => {
     const program = Effect.gen(function* () {
       const finalized = yield* Ref.make(false)
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: {
           createSession: ({ scope }) =>
             Scope.addFinalizer(scope, Ref.set(finalized, true)).pipe(Effect.as(idleSession)),
@@ -559,11 +520,11 @@ describe("AgentRuntime", () => {
       })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        yield* runtime.withSessionRequest(request("finalize"), "use", () => Effect.void)
+        yield* runtime.withSessionRequest(setup.request("finalize"), "use", () => Effect.void)
         yield* runtime.dispose("finalize")
         expect(yield* Ref.get(finalized)).toBe(true)
         expect(yield* residentCount(runtime)).toBe(0)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
@@ -582,7 +543,7 @@ describe("AgentRuntime", () => {
             },
           },
         }
-        const layer = makeLayer({
+        const setup = yield* makeSetup({
           factory: {
             createSession: ({ scope }) =>
               Scope.addFinalizer(scope, Ref.set(finalized, true)).pipe(Effect.as(workingSession)),
@@ -591,8 +552,8 @@ describe("AgentRuntime", () => {
 
         yield* Effect.gen(function* () {
           const runtime = yield* AgentRuntime
-          yield* runtime.withSessionRequest(request("working-shutdown"), "start", () => Effect.void)
-        }).pipe(Effect.provide(layer))
+          yield* runtime.withSessionRequest(setup.request("working-shutdown"), "start", () => Effect.void)
+        }).pipe(Effect.provide(setup.layer))
 
         return yield* Ref.get(finalized)
       }),
@@ -609,12 +570,12 @@ describe("AgentRuntime", () => {
       const allowRemoval = yield* Deferred.make<void>()
       const finalized = yield* Ref.make(false)
       const finalizedBeforeRemoval = yield* Ref.make(false)
-      const layer = makeLayer({
+      const setup = yield* makeSetup({
         factory: {
           createSession: ({ scope }) =>
             Scope.addFinalizer(scope, Ref.set(finalized, true)).pipe(Effect.as(idleSession)),
         },
-        storedSessions: [makeMeta("delete")],
+        storedSessionIds: ["delete"],
       })
 
       yield* Effect.gen(function* () {
@@ -652,7 +613,7 @@ describe("AgentRuntime", () => {
         expect(yield* residentCount(runtime)).toBe(0)
         yield* Deferred.succeed(allowRemoval, undefined)
         yield* Fiber.join(deletion)
-      }).pipe(Effect.provide(layer))
+      }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })

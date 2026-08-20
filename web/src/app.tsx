@@ -37,7 +37,6 @@ import {
   useComposerState,
   useSessionPreload,
   useSessionActions,
-  usePaginatedSessions,
   useOnboardingModelSetup,
   useAcnLifecycle,
   useLocalModels,
@@ -53,7 +52,6 @@ import {
   formatReasoningEffort,
   useActiveSessionStatusesSubscription,
   activeSessionStatusesAtom,
-  useProjects,
 } from "@magnitudedev/client-common"
 import { SessionsSidebar } from "./components/sessions-sidebar"
 import { ChatTimeline } from "./components/chat-timeline"
@@ -156,7 +154,7 @@ function useRootSlotProfile(slotProfiles: SlotProfiles | null): {
   }
 }
 
-/** Sessions sidebar container — ListSessions query + shared session actions */
+/** Sessions sidebar container — session/project actions around the sidebar's own queries */
 function SessionsSidebarContainer(props?: {
   overlay?: boolean
   onCloseOverlay?: () => void
@@ -165,25 +163,12 @@ function SessionsSidebarContainer(props?: {
   const client = useAgentClient()
   const { startNewSession, resumeSession } = useSessionActions()
   const selectedSessionId = useSelectedSessionId()
-  const searchQuery = useAtomValue(sidebarSearchAtom)
   const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
   const settingsTab = useAtomValue(settingsTabAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
-  const trimmedSearchQuery = searchQuery.trim()
-  const projects = useProjects()
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const setSelectedCwd = useAtomSet(selectedCwdAtom)
   const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
-  const sessionPage = usePaginatedSessions({
-    archiveFilter: "active",
-    prioritizePinned: true,
-    ...(trimmedSearchQuery
-      ? {
-          query: trimmedSearchQuery,
-        }
-      : {}),
-    pageSize: 50,
-  })
 
   // Listen for __magnitude:focus-search custom event → focus the search input
   const focusSearchAtom = useMemo(
@@ -220,57 +205,26 @@ function SessionsSidebarContainer(props?: {
   }
   return (
     <SessionsSidebar
-      projects={projects.projects}
-      revealKind={projects.revealKind}
-      loading={projects.loading || sessionPage.loading}
-      sessions={sessionPage.sessions.map((s) => {
-        const liveStatus = activeSessionStatuses[s.id]
-        const statusFields = liveStatus
-          ? {
-              updatedAt: liveStatus.lastMessageAt,
-              workStatus: liveStatus.workStatus,
-            }
-          : {
-              updatedAt: s.timestamp,
-              workStatus: "idle" as const,
-            }
-        return {
-          sessionId: s.id,
-          projectId: s.projectId,
-          title: s.title,
-          cwd: s.workingDirectory,
-          pinnedAt: s.pinnedAt,
-          ...statusFields,
-        }
-      })}
-      loadingMore={sessionPage.loadingMore}
-      hasMore={sessionPage.hasMore}
-      onLoadMore={sessionPage.loadMore}
-      onSelectSession={(session) => {
+      liveStatuses={activeSessionStatuses}
+      onSelectSession={(session, project) => {
         setSettingsTab(null)
-        const select = () => {
-          setSelectedProjectId(session.projectId)
-          setSelectedCwd(session.cwd)
-          resumeSession(session.sessionId)
-        }
-        select()
+        setSelectedProjectId(project?.projectId ?? null)
+        setSelectedCwd(session.cwd)
+        resumeSession(session.sessionId)
       }}
-      onArchiveSession={(sessionId) => {
+      onArchiveSession={(session) => {
         void archiveSession({
-          payload: { sessionId },
-          reactivityKeys: ["sessions", "projects"],
+          payload: { sessionId: session.sessionId },
+          reactivityKeys: ["sessions"],
         }).then(() => {
-          if (sessionId !== selectedSessionId) return
-          const archived = sessionPage.sessions.find((session) => session.id === sessionId)
-          startNewSession(archived
-            ? { cwd: archived.workingDirectory, projectId: archived.projectId }
-            : { cwd: null, projectId: null })
+          if (session.sessionId !== selectedSessionId) return
+          startNewSession({ cwd: session.cwd, projectId: null })
         }).catch(() => notify("error", "Could not archive this session."))
       }}
       onSetSessionPinned={(sessionId, pinned) => {
         void setSessionPinned({
           payload: { sessionId, pinned },
-          reactivityKeys: ["sessions", "projects"],
+          reactivityKeys: ["sessions"],
         }).catch(() => notify("error", `Could not ${pinned ? "pin" : "unpin"} this session.`))
       }}
       onCompose={handleCompose}
@@ -282,20 +236,17 @@ function SessionsSidebarContainer(props?: {
       }}
       onCreateProject={(project) => {
         setSettingsTab(null)
-        startNewSession({ cwd: project.sourceDirectory, projectId: project.projectId })
+        startNewSession({ cwd: project.cwd, projectId: project.projectId })
         props?.onCloseOverlay?.()
       }}
       onEditProject={(project) => {
         if (selectedProjectId !== project.projectId) return
-        setSelectedCwd(project.sourceDirectory)
+        setSelectedCwd(project.cwd)
       }}
-      onRemoveProject={(project) => {
+      onRemoveProject={(project, next) => {
         if (selectedProjectId !== project.projectId) return
-        const next = projects.projects.find(
-          (summary) => summary.project.projectId !== project.projectId,
-        )?.project
         startNewSession(next
-          ? { cwd: next.sourceDirectory, projectId: next.projectId }
+          ? { cwd: next.cwd, projectId: next.projectId }
           : { cwd: null, projectId: null })
       }}
       onOpenSettings={() => {

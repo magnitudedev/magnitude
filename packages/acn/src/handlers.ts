@@ -22,19 +22,7 @@ import { makeHealthResponse } from "./identity";
 import { AcnServiceLifecycle } from "./service-lifecycle";
 import { AcnDisplayViewIntrospector } from "./introspection";
 import { uploadAttachment } from "./attachment-upload";
-import {
-  checkFileExists,
-  getGitRecentFiles,
-  getSkill,
-  listFiles,
-  listSkills,
-  readFileOp,
-  resolvePath,
-  runBash,
-  searchDirectories,
-  searchMentions,
-  watchFile,
-} from "./ops";
+import { getSkill, listSkills, runBash } from "./skill-shell-ops";
 import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
 import { createId } from "@magnitudedev/generate-id";
 import { Onboarding } from "./onboarding";
@@ -48,8 +36,14 @@ import { LocalModelConfigurationCoordinator } from "./local-model-configuration-
 import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver";
 import { localCatalogProviderModelId } from "./local-provider-model-id";
 import { IcnModels } from "@magnitudedev/icn";
-import { Projects } from "./projects";
-import { ProjectFiles } from "./project-files";
+import { FileMentionSearcher } from "./file-mention-searcher";
+import { FileSystemManager } from "./file-system-manager";
+import { GitInspector } from "./git-inspector";
+import { ProjectFileManager } from "./project-file-manager";
+import { ProjectInspector } from "./project-inspector";
+import { ProjectManager } from "./project-manager";
+import { ProjectStore } from "./project-store";
+import { SessionInspector } from "./session-inspector";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -63,8 +57,14 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
     const lifecycle = yield* AcnServiceLifecycle;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
-    const projects = yield* Projects;
-    const projectFiles = yield* ProjectFiles;
+    const sessionInspector = yield* SessionInspector;
+    const projectStore = yield* ProjectStore;
+    const projectManager = yield* ProjectManager;
+    const projectInspector = yield* ProjectInspector;
+    const projectFiles = yield* ProjectFileManager;
+    const fileSystemManager = yield* FileSystemManager;
+    const fileMentionSearcher = yield* FileMentionSearcher;
+    const gitInspector = yield* GitInspector;
     const providerCredentials = yield* ProviderCredentials;
     const providerModelCatalog = yield* ProviderModelCatalog;
     const modelSlots = yield* ModelSlotController;
@@ -235,18 +235,17 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       ReleaseClientLease: ({ clientId }) => clientLeases.release(clientId),
 
       // Session lifecycle
-      PreloadSession: ({ cwd, projectId, options, draftOwnerId }) =>
+      PreloadSession: ({ cwd, options, draftOwnerId }) =>
         observeRpcDefects(
           "PreloadSession",
           sessionLifecycle.preloadSession(
             cwd,
             Option.getOrUndefined(options),
-            Option.getOrNull(draftOwnerId),
-            Option.getOrUndefined(projectId)
+            Option.getOrNull(draftOwnerId)
           )
         ),
 
-      ReleaseSessionPreload: ({ cwd, projectId, sessionId, options, draftOwnerId }) =>
+      ReleaseSessionPreload: ({ cwd, sessionId, options, draftOwnerId }) =>
         observeRpcDefects(
           "ReleaseSessionPreload",
           sessionLifecycle
@@ -254,13 +253,12 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
               cwd,
               sessionId,
               Option.getOrUndefined(options),
-              Option.getOrNull(draftOwnerId),
-              Option.getOrUndefined(projectId)
+              Option.getOrNull(draftOwnerId)
             )
             .pipe(Effect.as({}))
         ),
 
-      CreateSession: ({ cwd, projectId, sessionId, initial, options, draftOwnerId }) =>
+      CreateSession: ({ cwd, sessionId, initial, options, draftOwnerId }) =>
         observeRpcDefects(
           "CreateSession",
           sessionLifecycle.createSession(
@@ -268,50 +266,29 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
             Option.getOrUndefined(sessionId),
             Option.getOrUndefined(initial),
             Option.getOrUndefined(options),
-            Option.getOrNull(draftOwnerId),
-            Option.getOrUndefined(projectId)
+            Option.getOrNull(draftOwnerId)
           )
         ),
 
       ListSessions: (payload) =>
-        observeRpcDefects(
-          "ListSessions",
-          sessionLifecycle.listSessions({
-            ...Option.match(payload.cwd, {
-              onNone: () => ({}),
-              onSome: (cwd) => ({ cwd }),
-            }),
-            ...Option.match(payload.projectId, {
-              onNone: () => ({}),
-              onSome: (projectId) => ({ projectId }),
-            }),
-            archiveFilter: payload.archiveFilter,
-            prioritizePinned: payload.prioritizePinned,
-            ...Option.match(payload.query, {
-              onNone: () => ({}),
-              onSome: (query) => ({ query }),
-            }),
-            ...Option.match(payload.cursor, {
-              onNone: () => ({}),
-              onSome: (cursor) => ({ cursor }),
-            }),
-            limit: payload.limit,
-          })
-        ),
+        observeRpcDefects("ListSessions", sessionInspector.page(payload)),
 
-      ListSessionCwds: () =>
+      ListRecentSessionDirectories: (payload) =>
         observeRpcDefects(
-          "ListSessionCwds",
-          sessionLifecycle.listSessionCwds()
+          "ListRecentSessionDirectories",
+          sessionInspector.recentDirectories(payload)
         ),
 
       StreamActiveSessionStatuses: () => activeSessionStatuses.stream,
 
-      GetSession: ({ sessionId }: { sessionId: string }) =>
-        observeRpcDefects(
-          "GetSession",
-          sessionLifecycle.getSessionInfo(sessionId)
+      StreamSessionChanges: () =>
+        observeRpcStreamDefects(
+          "StreamSessionChanges",
+          sessionInspector.changes.pipe(Stream.as({}))
         ),
+
+      GetSession: ({ sessionId }: { sessionId: string }) =>
+        observeRpcDefects("GetSession", sessionInspector.get(sessionId)),
 
       DeleteArchivedSession: ({ sessionId }: { sessionId: string }) =>
         observeRpcDefects(
@@ -328,29 +305,35 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       SetSessionPinned: ({ sessionId, pinned }) =>
         observeRpcDefects("SetSessionPinned", sessionLifecycle.setSessionPinned(sessionId, pinned)),
 
-      ListProjects: ({ includeRemoved }) =>
-        observeRpcDefects("ListProjects", projects.list(includeRemoved)),
+      ListProjects: (payload) =>
+        observeRpcDefects("ListProjects", projectStore.page(payload)),
 
       CreateProject: (payload) =>
-        observeRpcDefects("CreateProject", projects.create(payload)),
+        observeRpcDefects("CreateProject", projectManager.create(payload)),
 
       EditProject: (payload) =>
-        observeRpcDefects("EditProject", projects.edit(payload)),
+        observeRpcDefects("EditProject", projectManager.edit(payload)),
 
       RemoveProject: ({ projectId }) =>
-        observeRpcDefects("RemoveProject", projects.remove(projectId)),
+        observeRpcDefects("RemoveProject", projectManager.remove(projectId)),
 
       RestoreProject: ({ projectId }) =>
-        observeRpcDefects("RestoreProject", projects.restore(projectId)),
+        observeRpcDefects("RestoreProject", projectManager.restore(projectId)),
 
       RevealProjectSource: ({ projectId }) =>
         observeRpcDefects(
           "RevealProjectSource",
-          projects.revealSource(projectId).pipe(Effect.as({})),
+          projectManager.reveal(projectId).pipe(Effect.as({})),
         ),
 
+      InspectProject: ({ projectId }) =>
+        observeRpcDefects("InspectProject", projectInspector.inspect(projectId)),
+
       StreamProjectChanges: () =>
-        observeRpcStreamDefects("StreamProjectChanges", projects.changes),
+        observeRpcStreamDefects(
+          "StreamProjectChanges",
+          projectStore.changes.pipe(Stream.as({})),
+        ),
 
       ListProjectDirectory: ({ projectId, directory }) =>
         observeRpcDefects("ListProjectDirectory", projectFiles.listDirectory(projectId, directory)),
@@ -563,51 +546,96 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
       // Server-side operations
       ListFiles: ({ cwd, glob, limit }) =>
-        observeRpcDefects("ListFiles", listFiles(cwd, glob, limit)),
+        observeRpcDefects(
+          "ListFiles",
+          fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.flatMap((directory) =>
+              fileMentionSearcher.listFiles(directory, { glob, limit })),
+          )
+        ),
 
       ReadFile: ({ cwd, path, format, offset }) =>
-        observeRpcDefects("ReadFile", readFileOp(cwd, path, format, offset)),
+        observeRpcDefects(
+          "ReadFile",
+          fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.flatMap((directory) =>
+              fileMentionSearcher.readFile(directory, { path, format, offset })),
+          )
+        ),
 
       CheckFileExists: ({ cwd, path }) =>
-        observeRpcDefects("CheckFileExists", checkFileExists(cwd, path)),
+        observeRpcDefects(
+          "CheckFileExists",
+          fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.flatMap((directory) => fileMentionSearcher.checkFileExists(directory, path)),
+          )
+        ),
 
       WatchFile: ({ cwd, path }) =>
         observeRpcStreamDefects(
           "WatchFile",
-          watchFile(cwd, path)
+          Stream.unwrap(fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.map((directory) => fileMentionSearcher.watchFile(directory, path)),
+          ))
         ),
 
       ResolvePath: ({ cwd, path, checkExists }) =>
-        observeRpcDefects("ResolvePath", resolvePath(cwd, path, checkExists)),
+        observeRpcDefects(
+          "ResolvePath",
+          fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.flatMap((directory) =>
+              fileMentionSearcher.resolvePath(directory, { path, checkExists })),
+          )
+        ),
 
       SearchMentions: ({ cwd, query, limit, visibleLimit, includeRecent }) =>
         observeRpcDefects(
           "SearchMentions",
-          searchMentions(cwd, query, limit, visibleLimit, includeRecent)
+          fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.flatMap((directory) =>
+              fileMentionSearcher.searchMentions(directory, {
+                query,
+                limit,
+                visibleLimit,
+                includeRecent,
+              })),
+          )
         ),
 
       SearchDirectories: ({ query, limit, includeRecent }) =>
         observeRpcDefects(
           "SearchDirectories",
           Effect.gen(function* () {
-            const cwdSummaries = includeRecent
-              ? yield* sessionLifecycle.listSessionCwds()
+            const recents = includeRecent
+              ? (yield* sessionInspector.recentDirectories({
+                  cursor: Option.none(),
+                  limit: 20,
+                }).pipe(
+                  Effect.map((page) => page.items.map((item) => ({
+                    path: item.cwd,
+                    lastActivity: item.lastActiveAt,
+                  }))),
+                  // Recents are advisory: directory suggestions degrade to
+                  // plain path completion when session inspection fails.
+                  Effect.orElseSucceed(() => []),
+                ))
               : [];
-            const recentDirectories = cwdSummaries.map((summary) => ({
-              path: summary.cwd,
-              lastActivity: summary.updatedAt,
-            }));
-            return yield* searchDirectories(
+            return yield* fileMentionSearcher.searchDirectories({
               query,
-              recentDirectories,
               limit,
-              includeRecent
-            );
+              includeRecent,
+              recentDirectories: recents,
+            });
           })
         ),
 
       GetGitRecentFiles: ({ cwd, limit }) =>
-        observeRpcDefects("GetGitRecentFiles", getGitRecentFiles(cwd, limit)),
+        observeRpcDefects(
+          "GetGitRecentFiles",
+          fileSystemManager.normalizeDirectory(cwd).pipe(
+            Effect.flatMap((directory) => gitInspector.recentFiles(directory, limit)),
+          )
+        ),
 
       ListSkills: ({ cwd }) => observeRpcDefects("ListSkills", listSkills(cwd)),
 

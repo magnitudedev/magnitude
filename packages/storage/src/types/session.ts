@@ -1,7 +1,7 @@
 import { Effect, Option, Schema } from 'effect'
 
 import { Version } from '../services/version'
-import { ProjectIdSchema } from '@magnitudedev/acn-protocol'
+import { DirectoryPathSchema } from '@magnitudedev/acn-protocol'
 
 const LegacySerializedPinnedAtSchema = Schema.Union(
   Schema.String,
@@ -16,11 +16,10 @@ const LegacySerializedPinnedAtSchema = Schema.Union(
 
 const RawStoredSessionMetaSchema = Schema.Struct({
   sessionId: Schema.String,
-  projectId: ProjectIdSchema,
   created: Schema.String,
   updated: Schema.String,
   chatName: Schema.String,
-  workingDirectory: Schema.String,
+  workingDirectory: DirectoryPathSchema,
   archived: Schema.optionalWith(Schema.Boolean, { as: 'Option', exact: true }),
   /** Input-only migration provenance. Newly encoded metadata omits this field. */
   sidebarOpen: Schema.optionalWith(Schema.Boolean, { as: 'Option', exact: true }),
@@ -37,11 +36,10 @@ const RawStoredSessionMetaSchema = Schema.Struct({
 
 const DecodedStoredSessionMetaSchema = Schema.Struct({
   sessionId: Schema.String,
-  projectId: ProjectIdSchema,
   created: Schema.String,
   updated: Schema.String,
   chatName: Schema.String,
-  workingDirectory: Schema.String,
+  workingDirectory: DirectoryPathSchema,
   archived: Schema.Boolean,
   pinnedAt: Schema.OptionFromSelf(Schema.String),
   visibility: Schema.Union(Schema.Literal('draft'), Schema.Literal('visible')),
@@ -131,14 +129,6 @@ export const StoredSessionMetaSchema = Schema.transformOrFail(
   }
 )
 export type StoredSessionMeta = Schema.Schema.Type<typeof StoredSessionMetaSchema>
-
-export const LegacyStoredSessionProjectRecordSchema = Schema.Struct({
-  sessionId: Schema.String,
-  workingDirectory: Schema.String,
-  projectId: Schema.optionalWith(ProjectIdSchema, { as: 'Option', exact: true }),
-})
-export type LegacyStoredSessionProjectRecord =
-  Schema.Schema.Type<typeof LegacyStoredSessionProjectRecordSchema>
 
 export const MemoryExtractionJobRecordSchema = Schema.Struct({
   jobId: Schema.String,

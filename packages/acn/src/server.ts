@@ -90,10 +90,14 @@ import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { OnboardingLive } from "./onboarding"
 import { CustomEndpointsLive } from "./custom-endpoints"
 import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
-import { SessionStoreLive } from "./session-store"
-import { ProjectRegistryLive } from "./project-registry"
-import { ProjectsLive } from "./projects"
-import { ProjectFilesLive } from "./project-files"
+import { FileMentionSearcherLive } from "./file-mention-searcher"
+import { FileSystemManagerLive } from "./file-system-manager"
+import { GitInspectorLive } from "./git-inspector"
+import { ProjectFileManagerLive } from "./project-file-manager"
+import { ProjectInspectorLive } from "./project-inspector"
+import { ProjectManagerLive } from "./project-manager"
+import { ProjectStoreLive } from "./project-store"
+import { SessionInspectorLive } from "./session-inspector"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import {
@@ -328,15 +332,18 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
 
   const storageLayer = StorageLive.pipe(Layer.provide(storageBase))
 
-  const withProjectRegistry = Layer.provideMerge(
-    ProjectRegistryLive,
-    storageLayer,
-  )
+  // The two durable read authorities plus host observation services. Platform
+  // requirements (FileSystem, Path, CommandExecutor) flow from infrastructure.
+  const domainCore = Layer.mergeAll(
+    FileSystemManagerLive,
+    GitInspectorLive,
+    ProjectStoreLive,
+    SessionInspectorLive,
+  ).pipe(Layer.provideMerge(storageLayer))
 
   const storageServices = Layer.mergeAll(
-    SessionStoreLive,
     SessionRuntimeOptionsStoreLive
-  ).pipe(Layer.provideMerge(withProjectRegistry))
+  ).pipe(Layer.provideMerge(domainCore))
 
   const withActivity = Layer.provideMerge(
     AcnActivityTrackerLive,
@@ -450,10 +457,12 @@ const addLocalInferenceServices = <A, E, R>(
 const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
   const withDemand = Layer.provideMerge(AcnRpcDemandLive, services)
   const withClientLeases = Layer.provideMerge(ClientLeaseManagerLive, withDemand)
-  const withCommands = Layer.provideMerge(SessionCommandsLive, withClientLeases)
+  const withMentionSearcher = Layer.provideMerge(FileMentionSearcherLive, withClientLeases)
+  const withCommands = Layer.provideMerge(SessionCommandsLive, withMentionSearcher)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
-  const withProjects = Layer.provideMerge(ProjectsLive, withLifecycle)
-  const withProjectFiles = Layer.provideMerge(ProjectFilesLive, withProjects)
+  const withProjectManager = Layer.provideMerge(ProjectManagerLive, withLifecycle)
+  const withProjectInspector = Layer.provideMerge(ProjectInspectorLive, withProjectManager)
+  const withProjectFiles = Layer.provideMerge(ProjectFileManagerLive, withProjectInspector)
   const withActiveSessionStatuses = Layer.provideMerge(
     ActiveSessionStatusesLive,
     withProjectFiles

@@ -1,15 +1,11 @@
 import { Context, Effect, Layer, Stream } from "effect"
-import type {
-  ActiveSessionStatus,
-  ActiveSessionStatuses,
-  SessionError,
-} from "@magnitudedev/acn-protocol"
+import type { ActiveSessionStatus, ActiveSessionStatuses } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
-import { SessionStore } from "./session-store"
+import { SessionInspector } from "./session-inspector"
 
 export interface ActiveSessionStatusesApi {
-  readonly snapshot: Effect.Effect<ActiveSessionStatuses, SessionError>
-  readonly stream: Stream.Stream<ActiveSessionStatuses, SessionError>
+  readonly snapshot: Effect.Effect<ActiveSessionStatuses>
+  readonly stream: Stream.Stream<ActiveSessionStatuses>
 }
 
 export class ActiveSessionStatusesService extends Context.Tag("ActiveSessionStatuses")<
@@ -33,28 +29,28 @@ const sameSnapshot = (left: ActiveSessionStatuses, right: ActiveSessionStatuses)
 export const ActiveSessionStatusesLive: Layer.Layer<
   ActiveSessionStatusesService,
   never,
-  AgentRuntime | SessionStore
+  AgentRuntime | SessionInspector
 > = Layer.effect(
   ActiveSessionStatusesService,
   Effect.gen(function* () {
     const runtime = yield* AgentRuntime
-    const store = yield* SessionStore
+    const inspector = yield* SessionInspector
 
-    const snapshot: Effect.Effect<ActiveSessionStatuses, SessionError> = Effect.gen(function* () {
+    const snapshot: Effect.Effect<ActiveSessionStatuses> = Effect.gen(function* () {
       const statuses = yield* Effect.forEach(
         yield* runtime.residentSessions,
         (resident) =>
-          store.readProtocolMeta(resident.sessionId).pipe(
-            Effect.map((meta): ActiveSessionStatus | null =>
-              meta
-                ? {
-                    sessionId: resident.sessionId,
-                    workStatus: resident.workStatus._tag === "Working" ? "working" : "idle",
-                    activeWorkerCount: resident.workStatus.workerCount,
-                    lastMessageAt: meta.updatedAt,
-                  }
-                : null,
-            ),
+          inspector.get(resident.sessionId).pipe(
+            Effect.map((meta): ActiveSessionStatus | null => ({
+              sessionId: resident.sessionId,
+              workStatus: resident.workStatus._tag === "Working" ? "working" : "idle",
+              activeWorkerCount: resident.workStatus.workerCount,
+              lastMessageAt: meta.updatedAt,
+            })),
+            Effect.catchTags({
+              SessionNotFound: () => Effect.succeed(null),
+              SessionMetadataUnreadable: () => Effect.succeed(null),
+            }),
           ),
         { concurrency: "unbounded" },
       )

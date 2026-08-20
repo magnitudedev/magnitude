@@ -7,7 +7,7 @@ import {
   type CodingAgentSession,
 } from "@magnitudedev/agent"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
-import type { ProjectId, SessionError } from "@magnitudedev/acn-protocol"
+import type { DirectoryPath, SessionError } from "@magnitudedev/acn-protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
@@ -18,8 +18,7 @@ import { makeModelRequestPreparation } from "./model-request-preparation"
 export interface AgentFactoryApi {
   readonly createSession: (input: {
     readonly sessionId: string
-    readonly cwd: string
-    readonly projectId: ProjectId
+    readonly cwd: DirectoryPath
     readonly scope: CloseableScope
     readonly options: SessionRuntimeOptions
     readonly visibility?: StoredSessionMeta["visibility"]
@@ -48,7 +47,6 @@ export const AgentFactoryLive = (options: {
             const persistence = new AcnChatPersistence(
               storage,
               input.cwd,
-              input.projectId,
               input.sessionId,
               options.version,
               input.visibility ?? "visible",

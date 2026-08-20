@@ -22,7 +22,7 @@ export type AgentClient = AgentClientInstance
 
 class AcnAtomRpcClient {}
 
-const projectWatchReconnect = Schedule.exponential("100 millis").pipe(
+const invalidationWatchReconnect = Schedule.exponential("100 millis").pipe(
   Schedule.modifyDelay((_, delay) => Duration.min(delay, Duration.seconds(5))),
   Schedule.jittered,
 )
@@ -53,18 +53,34 @@ export function createAgentClient(
       () => reactivity.invalidate(directMirrorIds),
       (event) => reactivity.invalidate([event.id]),
     ).pipe(Effect.forkScoped)
-    yield* client("StreamProjectChanges", {}).pipe(
-      Stream.runForEach(() => reactivity.invalidate(["projects", "sessions"])),
+    // Project and session authorities invalidate independently: each durable
+    // write publishes on exactly one of these invalidation-only streams.
+    const watchInvalidations = <A, E>(
+      label: string,
+      changes: Stream.Stream<A, E>,
+      keys: ReadonlyArray<string>,
+    ) => changes.pipe(
+      Stream.runForEach(() => reactivity.invalidate([...keys])),
       Effect.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
         ? Effect.void
-        : Effect.logWarning("Project watch disconnected; retrying").pipe(
+        : Effect.logWarning(`${label} watch disconnected; retrying`).pipe(
             Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 1_000) }),
           )),
-      Effect.retry(projectWatchReconnect),
+      Effect.retry(invalidationWatchReconnect),
       Effect.catchAllCause((cause) => Cause.isInterruptedOnly(cause)
         ? Effect.void
         : Effect.logError(Cause.pretty(cause))),
       Effect.forkScoped,
+    )
+    yield* watchInvalidations(
+      "StreamProjectChanges",
+      client("StreamProjectChanges", {}),
+      ["projects"],
+    )
+    yield* watchInvalidations(
+      "StreamSessionChanges",
+      client("StreamSessionChanges", {}),
+      ["sessions"],
     )
   })).pipe(Layer.provide(rpc.layer)))
   const rpcLayer = Layer.effect(AcnRpcClientTag, rpc).pipe(Layer.provide(rpc.layer))

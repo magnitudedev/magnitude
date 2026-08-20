@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import {
-  ProjectRelativePathSchema,
+  RelativePathSchema,
   type ProjectDirectoryEntry,
-  type ProjectRelativePath,
+  type RelativePath,
 } from "@magnitudedev/sdk"
 import { visitProjectDirectoryDemand } from "./demand"
 
-const path = ProjectRelativePathSchema.make
+const path = RelativePathSchema.make
 const directory = (value: string): ProjectDirectoryEntry => ({
   name: value.slice(value.lastIndexOf("/") + 1),
   path: path(value),
@@ -20,7 +20,7 @@ const file = (value: string): ProjectDirectoryEntry => ({
   kind: "file",
   size: Option.some(1),
 })
-const paths = (...values: string[]): ReadonlySet<ProjectRelativePath> =>
+const paths = (...values: string[]): ReadonlySet<RelativePath> =>
   new Set(values.map((value) => path(value)))
 
 describe("visitProjectDirectoryDemand", () => {

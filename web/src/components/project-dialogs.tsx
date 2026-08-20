@@ -3,7 +3,7 @@ import { useAtomSet, useAtomValue, Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import { FolderOpen } from "@phosphor-icons/react"
 import { useAgentClient, usePlatform } from "@magnitudedev/client-common"
-import type { ProjectRecord } from "@magnitudedev/sdk"
+import type { Project } from "@magnitudedev/sdk"
 import {
   Dialog,
   DialogContent,
@@ -37,13 +37,13 @@ export function ProjectFormDialog({
   onDismiss,
   onSaved,
 }: {
-  readonly project?: ProjectRecord
+  readonly project?: Project
   readonly onDismiss: () => void
-  readonly onSaved: (project: ProjectRecord) => void
+  readonly onSaved: (project: Project) => void
 }): ReactNode {
   const client = useAgentClient()
   const platform = usePlatform()
-  const [sourceDirectory, setSourceDirectory] = useState(project?.sourceDirectory ?? "")
+  const [cwd, setCwd] = useState(project?.cwd ?? "")
   const [name, setName] = useState(project?.name ?? "")
   const [nameWasEdited, setNameWasEdited] = useState(project !== undefined)
   const [sourcePickerFailed, setSourcePickerFailed] = useState(false)
@@ -62,20 +62,22 @@ export function ProjectFormDialog({
       ? project
         ? "Could not update this project."
         : "Could not create this project."
-      : failure._tag === "InvalidProjectSource"
-      ? `That source cannot be used: ${failure.reason}`
-      : failure._tag === "ProjectSourceAlreadyRegistered"
-      ? "That source already belongs to another project."
-      : failure._tag === "ProjectBusy"
-      ? "Wait for this project's active work to finish before changing its source."
       : failure._tag === "InvalidProjectName"
       ? "Enter a project name."
+      : failure._tag === "InvalidDirectoryPath" || failure._tag === "PathNotDirectory"
+      ? "Enter an absolute folder path."
+      : failure._tag === "DirectoryNotFound"
+      ? "That folder does not exist on the agent host."
+      : failure._tag === "DirectoryAccessDenied"
+      ? "That folder cannot be accessed."
+      : failure._tag === "ProjectCwdAlreadyRegistered"
+      ? "That folder already belongs to another project."
       : project
       ? "Could not update this project."
       : "Could not create this project."
 
   const updateSource = (path: string) => {
-    setSourceDirectory(path)
+    setCwd(path)
     if (!nameWasEdited || !name.trim()) setName(basename(path))
   }
 
@@ -91,20 +93,20 @@ export function ProjectFormDialog({
 
   const save = async () => {
     const cleanName = name.trim()
-    const cleanSource = sourceDirectory.trim()
-    if (!cleanName || !cleanSource || pending) return
+    const cleanCwd = cwd.trim()
+    if (!cleanName || !cleanCwd || pending) return
     try {
       const saved = project
         ? await edit({
             payload: {
               projectId: project.projectId,
               name: cleanName,
-              sourceDirectory: cleanSource,
+              cwd: cleanCwd,
             },
             reactivityKeys: ["projects", "sessions"],
           })
         : await create({
-            payload: { name: cleanName, sourceDirectory: cleanSource },
+            payload: { name: cleanName, cwd: cleanCwd },
             reactivityKeys: ["projects", "sessions"],
           })
       onSaved(saved)
@@ -127,7 +129,7 @@ export function ProjectFormDialog({
           </DialogTitle>
           <DialogDescription className="mt-1.5 text-[13px] leading-5 text-slate-600 dark:text-slate-400">
             {project
-              ? "Change the name or source. Every existing chat in this project will use the new source directory."
+              ? "Change the name or folder. Chats stay grouped by the folder they ran in."
               : "Choose a folder for Magnitude to work in."}
           </DialogDescription>
         </DialogHeader>
@@ -138,7 +140,7 @@ export function ProjectFormDialog({
             </Label>
             <div className="flex gap-2">
               <Input
-                value={sourceDirectory}
+                value={cwd}
                 onChange={(event) => updateSource(event.target.value)}
                 placeholder="/path/to/project"
                 readOnly={platform.id === "desktop"}
@@ -210,7 +212,7 @@ export function ProjectFormDialog({
           <Button
             type="button"
             onClick={() => void save()}
-            disabled={pending || !sourceDirectory.trim() || !name.trim()}
+            disabled={pending || !cwd.trim() || !name.trim()}
             className="h-9 bg-blue-700 text-white hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
           >
             {pending ? "Saving…" : project ? "Save changes" : "Create new"}
@@ -226,7 +228,7 @@ export function RemoveProjectDialog({
   onDismiss,
   onRemoved,
 }: {
-  readonly project: ProjectRecord
+  readonly project: Project
   readonly onDismiss: () => void
   readonly onRemoved: () => void
 }): ReactNode {

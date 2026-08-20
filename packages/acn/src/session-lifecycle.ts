@@ -1,27 +1,30 @@
-import { Cause, Context, Effect, Exit, Layer, Option } from "effect"
-import { resolve } from "path"
+import { Cause, Clock, Context, Effect, Either, Exit, Layer, Option } from "effect"
 import {
   SessionAlreadyExists,
-  SessionNotFound,
+  SessionMetadataUnreadable,
+  SessionMetadataWriteFailed,
   SessionNotArchived,
+  SessionNotFound,
+  SessionOperationFailed,
   SessionStartFailed,
   type CreateSessionInitial,
   type CreateSessionResult,
-  type ListSessionsResult,
   type SessionError,
-  type SessionCwdSummary,
   type SessionMetadata as ProtocolSessionMetadata,
   type SessionOptions,
-  type ProjectId,
-  type SessionArchiveFilter,
 } from "@magnitudedev/acn-protocol"
+import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AgentRuntime } from "./agent-runtime"
 import { SessionDrafts } from "./session-drafts"
 import { SessionCommands } from "./session-commands"
 import { sessionErrorMessage } from "./session-errors"
-import { SessionStore } from "./session-store"
+import { decodeSessionMetadata, SessionInspector } from "./session-inspector"
 import { hasUserMessageContent, type SessionExecutionContext } from "./session-types"
-import type { ResidentSessionSnapshot } from "./agent-runtime"
+
+export type SessionCommandError =
+  | SessionNotFound
+  | SessionMetadataUnreadable
+  | SessionMetadataWriteFailed
 
 export interface SessionLifecycleApi {
   readonly createSession: (
@@ -30,39 +33,34 @@ export interface SessionLifecycleApi {
     initial?: CreateSessionInitial,
     options?: SessionOptions,
     draftOwnerId?: string | null,
-    projectId?: ProjectId,
   ) => Effect.Effect<CreateSessionResult, SessionError>
   readonly preloadSession: (
     cwd: string,
     options?: SessionOptions,
     draftOwnerId?: string | null,
-    projectId?: ProjectId,
   ) => Effect.Effect<{ readonly sessionId: string }, SessionError>
   readonly releaseSessionPreload: (
     cwd: string,
     sessionId: string,
     options?: SessionOptions,
     draftOwnerId?: string | null,
-    projectId?: ProjectId,
   ) => Effect.Effect<void, SessionError>
-  readonly listSessions: (
-    options?: {
-      readonly cwd?: string
-      readonly projectId?: ProjectId
-      readonly archiveFilter?: SessionArchiveFilter
-      readonly prioritizePinned?: boolean
-      readonly query?: string
-      readonly cursor?: string
-      readonly limit?: number
-    }
-  ) => Effect.Effect<ListSessionsResult, SessionError>
-  readonly listSessionCwds: () => Effect.Effect<ReadonlyArray<SessionCwdSummary>, SessionError>
-  readonly getSessionInfo: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
-  readonly deleteArchivedSession: (sessionId: string) => Effect.Effect<void, SessionError>
-  readonly archiveSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
-  readonly restoreSession: (sessionId: string) => Effect.Effect<ProtocolSessionMetadata, SessionError>
-  readonly setSessionPinned: (sessionId: string, pinned: boolean) => Effect.Effect<ProtocolSessionMetadata, SessionError>
-  readonly getSessionExecutionContext: (sessionId: string) => Effect.Effect<SessionExecutionContext, SessionError>
+  readonly archiveSession: (
+    sessionId: string,
+  ) => Effect.Effect<ProtocolSessionMetadata, SessionCommandError>
+  readonly restoreSession: (
+    sessionId: string,
+  ) => Effect.Effect<ProtocolSessionMetadata, SessionCommandError>
+  readonly setSessionPinned: (
+    sessionId: string,
+    pinned: boolean,
+  ) => Effect.Effect<ProtocolSessionMetadata, SessionCommandError>
+  readonly deleteArchivedSession: (
+    sessionId: string,
+  ) => Effect.Effect<void, SessionCommandError | SessionNotArchived>
+  readonly getSessionExecutionContext: (
+    sessionId: string,
+  ) => Effect.Effect<SessionExecutionContext, SessionError>
   readonly getSessionCwd: (sessionId: string) => Effect.Effect<string, SessionError>
 }
 
@@ -71,23 +69,10 @@ export class SessionLifecycle extends Context.Tag("SessionLifecycle")<
   SessionLifecycleApi
 >() {}
 
-const toMetadata = (entry: ResidentSessionSnapshot, stored: ProtocolSessionMetadata): ProtocolSessionMetadata => ({
-  sessionId: entry.sessionId,
-  projectId: stored.projectId,
-  title: entry.title,
-  cwd: entry.cwd,
-  archived: stored.archived,
-  pinnedAt: stored.pinnedAt,
-  createdAt: entry.createdAt,
-  updatedAt: stored.updatedAt,
-  messageCount: stored.messageCount,
-  lastMessage: stored.lastMessage,
-})
-
 export const SessionLifecycleLive: Layer.Layer<
   SessionLifecycle,
   never,
-  AgentRuntime | SessionCommands | SessionDrafts | SessionStore
+  AgentRuntime | SessionCommands | SessionDrafts | MagnitudeStorage | SessionInspector
 > =
   Layer.effect(
     SessionLifecycle,
@@ -95,12 +80,61 @@ export const SessionLifecycleLive: Layer.Layer<
       const runtime = yield* AgentRuntime
       const commands = yield* SessionCommands
       const drafts = yield* SessionDrafts
-      const store = yield* SessionStore
+      const storage = yield* MagnitudeStorage
+      const inspector = yield* SessionInspector
 
       const residentSnapshot = (sessionId: string) =>
         runtime.residentSessions.pipe(
           Effect.map((sessions) => sessions.find((session) => session.sessionId === sessionId)),
         )
+
+      /** Visible stored metadata for the create-path existence checks. */
+      const readExisting = (
+        sessionId: string,
+      ): Effect.Effect<ProtocolSessionMetadata | null, SessionStartFailed> =>
+        inspector.get(sessionId).pipe(
+          Effect.map((metadata): ProtocolSessionMetadata | null => metadata),
+          Effect.catchTags({
+            SessionNotFound: () => Effect.succeed(null),
+            SessionMetadataUnreadable: () => Effect.fail(new SessionStartFailed({
+              sessionId,
+              reason: "Session metadata is unreadable",
+            })),
+          }),
+        )
+
+      const readMetaForCommand = (
+        sessionId: string,
+      ): Effect.Effect<StoredSessionMeta | null, SessionMetadataUnreadable> =>
+        storage.sessions.readMeta(sessionId).pipe(
+          Effect.mapError(() => new SessionMetadataUnreadable({ sessionId })),
+          Effect.map((meta) => meta?.visibility === "visible" ? meta : null),
+        )
+
+      const writeMetaForCommand = (
+        sessionId: string,
+        change: (current: StoredSessionMeta) => StoredSessionMeta,
+      ): Effect.Effect<ProtocolSessionMetadata, SessionCommandError> =>
+        Effect.gen(function* () {
+          const existing = yield* readMetaForCommand(sessionId)
+          if (!existing) return yield* new SessionNotFound({ sessionId })
+          const written = yield* storage.sessions.updateMeta(sessionId, (current) =>
+            change(current ?? existing)).pipe(
+            Effect.tapError((error) => Effect.logWarning("Session metadata write failed").pipe(
+              Effect.annotateLogs({ sessionId, errorTag: error._tag }),
+            )),
+            Effect.mapError(() => new SessionMetadataWriteFailed({ sessionId })),
+          )
+          return yield* decodeSessionMetadata(written)
+        })
+
+      const setArchived = (sessionId: string, archived: boolean) =>
+        writeMetaForCommand(sessionId, (current) => ({
+          ...current,
+          archived,
+          ...(archived ? { pinnedAt: Option.none<string>() } : {}),
+        }))
+
       return {
         createSession: Effect.fn("acn.session-lifecycle.create-session")(function* (
           cwd,
@@ -108,7 +142,6 @@ export const SessionLifecycleLive: Layer.Layer<
           initial,
           options,
           draftOwnerId,
-          projectId,
         ) {
           if (initial?._tag === "message" && !hasUserMessageContent(initial)) {
             return yield* new SessionStartFailed({
@@ -127,13 +160,7 @@ export const SessionLifecycleLive: Layer.Layer<
           // Return SessionMetadata directly wrapped as "created".
           if (!initial) {
             if (sessionId) {
-              const live = yield* residentSnapshot(sessionId)
-              if (live) {
-                const stored = yield* store.readProtocolMeta(sessionId)
-                if (!stored) return yield* new SessionNotFound({ sessionId })
-                return { _tag: "created" as const, metadata: toMetadata(live, stored) }
-              }
-              const existing = yield* store.readProtocolMeta(sessionId)
+              const existing = yield* readExisting(sessionId)
               if (existing) {
                 return { _tag: "created" as const, metadata: existing }
               }
@@ -141,8 +168,7 @@ export const SessionLifecycleLive: Layer.Layer<
 
             return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
               const claim = yield* restore(drafts.claim({
-                cwd: cwd ? resolve(cwd) : process.cwd(),
-                projectId,
+                cwd: cwd ?? process.cwd(),
                 sessionId,
                 options,
                 ownerId: draftOwnerId ?? null,
@@ -166,7 +192,7 @@ export const SessionLifecycleLive: Layer.Layer<
             if (live) {
               return yield* new SessionAlreadyExists({ sessionId })
             }
-            const existing = yield* store.readProtocolMeta(sessionId)
+            const existing = yield* readExisting(sessionId)
             if (existing) {
               return yield* new SessionAlreadyExists({ sessionId })
             }
@@ -174,8 +200,7 @@ export const SessionLifecycleLive: Layer.Layer<
 
           return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
             const claim = yield* restore(drafts.claim({
-              cwd: cwd ? resolve(cwd) : process.cwd(),
-              projectId,
+              cwd: cwd ?? process.cwd(),
               sessionId,
               options,
               ownerId: draftOwnerId ?? null,
@@ -224,56 +249,105 @@ export const SessionLifecycleLive: Layer.Layer<
             return { _tag: "created" as const, metadata: promoteResult.value }
           }))
         }),
-        preloadSession: Effect.fn("acn.session-lifecycle.preload-session")(function* (cwd, options, draftOwnerId, projectId) {
-          return yield* drafts.preload({
-            cwd,
-            projectId,
-            options,
-            ownerId: draftOwnerId ?? null,
-          })
+
+        preloadSession: Effect.fn("acn.session-lifecycle.preload-session")(function* (
+          cwd,
+          options,
+          draftOwnerId,
+        ) {
+          return yield* drafts.preload({ cwd, options, ownerId: draftOwnerId ?? null })
         }),
-        releaseSessionPreload: Effect.fn("acn.session-lifecycle.release-session-preload")(function* (cwd, sessionId, options, draftOwnerId, projectId) {
-          return yield* drafts.release({
-            cwd,
-            sessionId,
-            projectId,
-            options,
-            ownerId: draftOwnerId ?? null,
-          })
+
+        releaseSessionPreload: Effect.fn("acn.session-lifecycle.release-session-preload")(
+          function* (cwd, sessionId, options, draftOwnerId) {
+            return yield* drafts.release({ cwd, sessionId, options, ownerId: draftOwnerId ?? null })
+          },
+        ),
+
+        archiveSession: Effect.fn("acn.session-lifecycle.archive-session")(function* (sessionId) {
+          return yield* setArchived(sessionId, true)
         }),
-        listSessions: (options) => store.listProtocolMetas(options),
-        listSessionCwds: () => store.listSessionCwds(),
-        getSessionInfo: Effect.fn("acn.session-lifecycle.get-session-info")(function* (sessionId) {
-          const live = yield* residentSnapshot(sessionId)
-          if (live) {
-            const stored = yield* store.readProtocolMeta(sessionId)
-            if (!stored) return yield* new SessionNotFound({ sessionId })
-            return toMetadata(live, stored)
-          }
-          const meta = yield* store.readProtocolMeta(sessionId)
-          if (!meta) return yield* new SessionNotFound({ sessionId })
-          return meta
+
+        restoreSession: Effect.fn("acn.session-lifecycle.restore-session")(function* (sessionId) {
+          return yield* setArchived(sessionId, false)
         }),
-        deleteArchivedSession: Effect.fn("acn.session-lifecycle.delete-archived-session")(function* (sessionId) {
-          const live = yield* residentSnapshot(sessionId)
-          const meta = yield* store.readMeta(sessionId)
-          if (!live && !meta) return yield* new SessionNotFound({ sessionId })
-          if (!meta?.archived) return yield* new SessionNotArchived({ sessionId })
-          yield* runtime.deleteSession(sessionId, store.deleteArchivedSessionFiles(sessionId))
+
+        setSessionPinned: Effect.fn("acn.session-lifecycle.set-session-pinned")(function* (
+          sessionId,
+          pinned,
+        ) {
+          const pinnedAt = pinned
+            ? Option.some(new Date(yield* Clock.currentTimeMillis).toISOString())
+            : Option.none<string>()
+          return yield* writeMetaForCommand(sessionId, (current) => ({
+            ...current,
+            archived: pinned ? false : current.archived,
+            pinnedAt,
+          }))
         }),
-        archiveSession: (sessionId) => store.setArchived(sessionId, true),
-        restoreSession: (sessionId) => store.setArchived(sessionId, false),
-        setSessionPinned: (sessionId, pinned) => store.setPinned(sessionId, pinned),
-        getSessionExecutionContext: Effect.fn("acn.session-lifecycle.get-session-execution-context")(function* (sessionId) {
-          const live = yield* residentSnapshot(sessionId)
-          if (live) {
-            return { cwd: live.cwd, projectRoot: live.cwd, scratchpadPath: live.scratchpadPath }
-          }
-          return yield* store.getExecutionContext(sessionId)
-        }),
+
+        deleteArchivedSession: Effect.fn("acn.session-lifecycle.delete-archived-session")(
+          function* (sessionId) {
+            const meta = yield* readMetaForCommand(sessionId)
+            if (!meta) return yield* new SessionNotFound({ sessionId })
+            if (!meta.archived) return yield* new SessionNotArchived({ sessionId })
+            const removeDurableState = storage.sessions.deleteArchivedSession(sessionId).pipe(
+              Effect.mapError((error) => new SessionOperationFailed({
+                operation: `delete archived session ${sessionId}`,
+                reason: error._tag,
+              })),
+              Effect.flatMap((deleted) => deleted
+                ? Effect.void
+                : Effect.fail(new SessionNotArchived({ sessionId }))),
+            )
+            // Runtime disposal composes in the runtime's own error domain; it is
+            // translated exactly once at this command boundary.
+            yield* runtime.deleteSession(sessionId, removeDurableState).pipe(
+              Effect.catchAll((error): Effect.Effect<
+                never,
+                SessionNotFound | SessionNotArchived | SessionMetadataWriteFailed
+              > =>
+                error._tag === "SessionNotFound" || error._tag === "SessionNotArchived"
+                  ? Effect.fail(error)
+                  : Effect.logWarning("Archived session deletion failed").pipe(
+                      Effect.annotateLogs({ sessionId, errorTag: error._tag }),
+                      Effect.zipRight(Effect.fail(new SessionMetadataWriteFailed({ sessionId }))),
+                    )),
+            )
+          },
+        ),
+
+        getSessionExecutionContext: Effect.fn("acn.session-lifecycle.get-session-execution-context")(
+          function* (sessionId) {
+            const live = yield* residentSnapshot(sessionId)
+            if (live) {
+              return { cwd: live.cwd, projectRoot: live.cwd, scratchpadPath: live.scratchpadPath }
+            }
+            const meta = yield* storage.sessions.readMeta(sessionId).pipe(
+              Effect.mapError((error) => new SessionOperationFailed({
+                operation: `read session metadata ${sessionId}`,
+                reason: error._tag,
+              })),
+            )
+            if (!meta) return yield* new SessionNotFound({ sessionId })
+            return {
+              cwd: meta.workingDirectory,
+              projectRoot: meta.workingDirectory,
+              scratchpadPath: storage.sessions.paths.sessionScratchpad(sessionId),
+            }
+          },
+        ),
+
         getSessionCwd: Effect.fn("acn.session-lifecycle.get-session-cwd")(function* (sessionId) {
-          return (yield* store.getExecutionContext(sessionId)).cwd
+          const meta = yield* storage.sessions.readMeta(sessionId).pipe(
+            Effect.mapError((error) => new SessionOperationFailed({
+              operation: `read session metadata ${sessionId}`,
+              reason: error._tag,
+            })),
+          )
+          if (!meta) return yield* new SessionNotFound({ sessionId })
+          return meta.workingDirectory
         }),
-      }
+      } satisfies SessionLifecycleApi
     }),
   )

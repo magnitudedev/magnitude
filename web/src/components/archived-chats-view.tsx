@@ -2,10 +2,11 @@ import { useMemo, useState, type ReactNode } from "react"
 import { ArchiveRestore, Search, Trash2 } from "lucide-react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
+  formatCwdForDisplay,
   formatRelativeTime,
   useAgentClient,
-  usePaginatedSessions,
-  useProjects,
+  useProjectPages,
+  useSessionPages,
 } from "@magnitudedev/client-common"
 
 import {
@@ -30,14 +31,14 @@ const pluralizeChats = (count: number): string =>
 
 export function ArchivedChatsView(): ReactNode {
   const client = useAgentClient()
-  const projects = useProjects()
+  const projects = useProjectPages()
   const [search, setSearch] = useState("")
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set())
   const [selectingAll, setSelectingAll] = useState(false)
   const [deleteIds, setDeleteIds] = useState<ReadonlyArray<string> | null>(null)
   const trimmedSearch = search.trim()
-  const page = usePaginatedSessions({
-    archiveFilter: "archived",
+  const page = useSessionPages({
+    archive: "archived",
     query: trimmedSearch || undefined,
     pageSize: 100,
   })
@@ -48,8 +49,8 @@ export function ArchivedChatsView(): ReactNode {
   const restoreSession = useAtomSet(restoreAtom, { mode: "promise" })
   const deleteSession = useAtomSet(deleteAtom, { mode: "promise" })
   const actionPending = Result.isWaiting(restoreResult) || Result.isWaiting(deleteResult)
-  const projectNames = useMemo(
-    () => new Map(projects.projects.map(({ project }) => [project.projectId, project.name])),
+  const projectNamesByCwd = useMemo(
+    () => new Map(projects.projects.map((project) => [project.cwd as string, project.name])),
     [projects.projects],
   )
   const allLoadedSelected = page.sessions.length > 0
@@ -135,7 +136,7 @@ export function ArchivedChatsView(): ReactNode {
           />
         </div>
         <span className="shrink-0 whitespace-nowrap font-sans text-[12px] font-medium text-slate-500">
-          {pluralizeChats(page.totalCount)}
+          {`${pluralizeChats(page.sessions.length)}${page.hasMore ? "+" : ""}`}
         </span>
       </div>
 
@@ -143,7 +144,7 @@ export function ArchivedChatsView(): ReactNode {
         <Checkbox
           checked={allLoadedSelected}
           indeterminate={someSelected && !allLoadedSelected}
-          disabled={page.loading || page.totalCount === 0 || actionPending || selectingAll}
+          disabled={page.loading || page.sessions.length === 0 || actionPending || selectingAll}
           onCheckedChange={(checked) => {
             if (!checked) {
               setSelectingAll(false)
@@ -239,7 +240,8 @@ export function ArchivedChatsView(): ReactNode {
                       {session.title}
                     </div>
                     <div className="mt-0.5 truncate font-sans text-[11px] text-slate-500">
-                      {projectNames.get(session.projectId) ?? session.workingDirectory}
+                      {projectNamesByCwd.get(session.workingDirectory)
+                        ?? formatCwdForDisplay(session.workingDirectory)}
                     </div>
                   </div>
                   <span className="font-sans text-[11px] text-slate-500 max-[760px]:hidden">
@@ -285,7 +287,7 @@ export function ArchivedChatsView(): ReactNode {
 
       {page.hasMore && !selectingAll ? (
         <div className="flex justify-center py-4">
-          <Button variant="outline" disabled={page.loadingMore} onClick={page.loadMore}>
+          <Button variant="outline" disabled={page.loadingMore} onClick={() => page.loadMore()}>
             {page.loadingMore ? <Spinner className="size-4" /> : null}
             {page.loadingMore ? "Loading…" : "Load more"}
           </Button>

@@ -7,8 +7,12 @@ import type {
   CodingAgentSession,
   ForkTurnState,
 } from "@magnitudedev/agent"
+import { DirectoryPathSchema } from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type AgentRuntimeApi } from "./agent-runtime"
+import { FileMentionSearcherLive } from "./file-mention-searcher"
+import { GitInspectorLive } from "./git-inspector"
 import { SessionCommands, SessionCommandsLive } from "./session-commands"
+import { testFileSystemManagerLayer, testPlatformLayer } from "./session-test-support"
 import type { RuntimeEntry } from "./session-types"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -96,17 +100,30 @@ const makeEntry = Effect.fn("test.make-session-command-entry")(function* (
     createdAt: 1,
     updatedAt: 1,
     title: "Session",
-    cwd: process.cwd(),
+    cwd: DirectoryPathSchema.make(process.cwd()),
     scratchpadPath,
     session,
     scope,
   } satisfies RuntimeEntry
 })
 
+const mentionSearcherLayer = FileMentionSearcherLive.pipe(
+  Layer.provide(Layer.mergeAll(
+    testFileSystemManagerLayer,
+    GitInspectorLive.pipe(Layer.provide(testPlatformLayer)),
+    testPlatformLayer,
+  )),
+)
+
 const makeLayer = (runtime: AgentRuntimeApi) =>
   SessionCommandsLive.pipe(
     Layer.provide(
-      Layer.mergeAll(Layer.succeed(AgentRuntime, runtime), BunFileSystem.layer, BunPath.layer),
+      Layer.mergeAll(
+        Layer.succeed(AgentRuntime, runtime),
+        mentionSearcherLayer,
+        BunFileSystem.layer,
+        BunPath.layer,
+      ),
     ),
   )
 

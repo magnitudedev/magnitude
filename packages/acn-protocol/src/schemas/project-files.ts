@@ -1,25 +1,17 @@
 import { Schema } from "effect"
 import { ProjectIdSchema } from "./project"
+import { RelativePathSchema } from "./paths"
 
-const isProjectRelativePath = (value: string): boolean => {
-  if (value === "") return true
-  if (value.includes("\0") || value.includes("\\") || value.startsWith("/")) return false
-  if (/^[A-Za-z]:/.test(value)) return false
-  return value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..")
-}
-
-export const ProjectRelativePathSchema = Schema.String.pipe(
-  Schema.filter(isProjectRelativePath, { message: () => "Expected a normalized project-relative path" }),
-  Schema.brand("ProjectRelativePath"),
-)
-export type ProjectRelativePath = Schema.Schema.Type<typeof ProjectRelativePathSchema>
-
-export const ProjectFileRevisionSchema = Schema.String.pipe(Schema.brand("ProjectFileRevision"))
-export type ProjectFileRevision = Schema.Schema.Type<typeof ProjectFileRevisionSchema>
+/**
+ * Content digest of one project file's bytes, used to prevent stale writes.
+ * It is not a Project revision and not a version of the Project record.
+ */
+export const FileContentHashSchema = Schema.String.pipe(Schema.brand("FileContentHash"))
+export type FileContentHash = Schema.Schema.Type<typeof FileContentHashSchema>
 
 export const ProjectDirectoryEntrySchema = Schema.Struct({
   name: Schema.String,
-  path: ProjectRelativePathSchema,
+  path: RelativePathSchema,
   kind: Schema.Literal("directory", "file"),
   size: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
 })
@@ -27,7 +19,7 @@ export type ProjectDirectoryEntry = Schema.Schema.Type<typeof ProjectDirectoryEn
 
 export const ProjectDirectoryListingSchema = Schema.Struct({
   projectId: ProjectIdSchema,
-  directory: ProjectRelativePathSchema,
+  directory: RelativePathSchema,
   entries: Schema.Array(ProjectDirectoryEntrySchema),
 })
 export type ProjectDirectoryListing = Schema.Schema.Type<typeof ProjectDirectoryListingSchema>
@@ -38,31 +30,31 @@ export const ProjectFilesChangeSchema = Schema.Struct({
 export type ProjectFilesChange = Schema.Schema.Type<typeof ProjectFilesChangeSchema>
 
 export const ProjectEntryMoveSchema = Schema.Struct({
-  sourcePath: ProjectRelativePathSchema,
-  destinationPath: ProjectRelativePathSchema,
+  sourcePath: RelativePathSchema,
+  destinationPath: RelativePathSchema,
   kind: Schema.Literal("directory", "file"),
 })
 export type ProjectEntryMove = Schema.Schema.Type<typeof ProjectEntryMoveSchema>
 
 export const ProjectFileTextSnapshotSchema = Schema.TaggedStruct("text", {
-  path: ProjectRelativePathSchema,
+  path: RelativePathSchema,
   content: Schema.String,
-  revision: ProjectFileRevisionSchema,
+  contentHash: FileContentHashSchema,
   size: Schema.Number,
   newline: Schema.Literal("lf", "crlf", "mixed", "none"),
 })
 export type ProjectFileTextSnapshot = Schema.Schema.Type<typeof ProjectFileTextSnapshotSchema>
 
 export const ProjectFileImageSnapshotSchema = Schema.TaggedStruct("image", {
-  path: ProjectRelativePathSchema,
+  path: RelativePathSchema,
   mediaType: Schema.Literal("image/png", "image/jpeg", "image/gif", "image/webp"),
   data: Schema.String,
-  revision: ProjectFileRevisionSchema,
+  contentHash: FileContentHashSchema,
   size: Schema.Number,
 })
 
 export const ProjectFileUnsupportedSnapshotSchema = Schema.TaggedStruct("unsupported", {
-  path: ProjectRelativePathSchema,
+  path: RelativePathSchema,
   reason: Schema.Literal("binary", "too_large", "unsupported_type"),
   size: Schema.Number,
 })

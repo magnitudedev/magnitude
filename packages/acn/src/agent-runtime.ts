@@ -14,22 +14,23 @@ import {
 } from "effect"
 import { DEFAULT_CHAT_NAME, type SessionWorkStatus } from "@magnitudedev/agent"
 import {
+  InvalidSessionPath,
   SessionNotFound,
   SessionOperationFailed,
+  type DirectoryPath,
   type SessionError,
-  type ProjectId,
 } from "@magnitudedev/acn-protocol"
-import type { StoredSessionMeta } from "@magnitudedev/storage"
+import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AcnServiceLifecycle } from "./service-lifecycle"
 import { AcnActivityTracker } from "./activity-tracker"
 import { AgentFactory } from "./agent-factory"
+import { FileSystemManager } from "./file-system-manager"
 import {
   makeResourceUseGate,
   ResourceRetired,
   type ResourceUseGate,
   type ResourceUseGateSnapshot,
 } from "./resource-use-gate"
-import { SessionStore } from "./session-store"
 import {
   SessionRuntimeOptionsStore,
   normalizeSessionRuntimeOptions,
@@ -39,7 +40,7 @@ import type { RuntimeEntry } from "./session-types"
 
 export interface RuntimeStartRequest {
   readonly sessionId: string
-  readonly projectId: ProjectId
+  readonly cwd: DirectoryPath
   readonly options: SessionRuntimeOptions
   readonly visibility: StoredSessionMeta["visibility"]
 }
@@ -48,7 +49,7 @@ export interface ResidentSessionSnapshot {
   readonly sessionId: string
   readonly generation: number
   readonly title: string
-  readonly cwd: string
+  readonly cwd: DirectoryPath
   readonly scratchpadPath: string
   readonly createdAt: number
   readonly updatedAt: number
@@ -141,12 +142,17 @@ export interface AgentRuntimeOptions {
 
 export const makeAgentRuntimeLive = (
   options: AgentRuntimeOptions = {},
-): Layer.Layer<AgentRuntime, never, AgentFactory | SessionStore | SessionRuntimeOptionsStore> =>
+): Layer.Layer<
+  AgentRuntime,
+  never,
+  AgentFactory | MagnitudeStorage | SessionRuntimeOptionsStore | FileSystemManager
+> =>
   Layer.scoped(
     AgentRuntime,
     Effect.gen(function* () {
       const factory = yield* AgentFactory
-      const store = yield* SessionStore
+      const storage = yield* MagnitudeStorage
+      const fileSystem = yield* FileSystemManager
       const runtimeOptions = yield* SessionRuntimeOptionsStore
       const rootActivity = yield* Effect.serviceOption(AcnActivityTracker)
       const lifecycle = yield* Effect.serviceOption(AcnServiceLifecycle)
@@ -161,6 +167,16 @@ export const makeAgentRuntimeLive = (
       const changes = yield* PubSub.unbounded<void>()
 
       const publishChange = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
+
+      const readStoredMeta = (
+        sessionId: string,
+      ): Effect.Effect<StoredSessionMeta | null, SessionOperationFailed> =>
+        storage.sessions.readMeta(sessionId).pipe(
+          Effect.mapError((error) => new SessionOperationFailed({
+            operation: `read session metadata ${sessionId}`,
+            reason: error._tag,
+          })),
+        )
 
       const nextGeneration = (sessionId: string) =>
         Ref.modify(generations, (current) => {
@@ -288,30 +304,31 @@ export const makeAgentRuntimeLive = (
         const releaseStartup = yield* gate.acquire("session-start").pipe(Effect.orDie)
 
         return yield* Effect.gen(function* () {
-          const requestedCwd = yield* store.resolveProjectSource(request.projectId).pipe(
-            Effect.flatMap(store.validateCwd),
+          // A request's cwd is immutable session identity: validate the host
+          // directory once, then start.
+          yield* fileSystem.openDirectory(request.cwd).pipe(
+            Effect.mapError(() => new InvalidSessionPath({ path: request.cwd })),
           )
           yield* runtimeOptions.write(request.sessionId, request.options)
           const session = yield* factory.createSession({
             sessionId: request.sessionId,
-            cwd: requestedCwd,
-            projectId: request.projectId,
+            cwd: request.cwd,
             scope: generationScope,
             options: request.options,
             visibility: request.visibility,
           })
           const residentSince = Date.now()
-          const storedMeta = yield* store.readMeta(request.sessionId)
+          const storedMeta = yield* readStoredMeta(request.sessionId)
           const createdAt = storedMeta
             ? Date.parse(storedMeta.created) || residentSince
             : residentSince
-          const scratchpadPath = yield* store.getScratchpadPath(request.sessionId)
+          const scratchpadPath = storage.sessions.paths.sessionScratchpad(request.sessionId)
           const entry: RuntimeEntry = {
             id: request.sessionId,
             createdAt,
             updatedAt: residentSince,
             title: storedMeta?.chatName ?? DEFAULT_CHAT_NAME,
-            cwd: requestedCwd,
+            cwd: request.cwd,
             scratchpadPath,
             session,
             scope: generationScope,
@@ -333,13 +350,7 @@ export const makeAgentRuntimeLive = (
           }
           yield* Ref.update(entries, (current) => new Map(current).set(request.sessionId, resident))
           yield* publishChange
-          const currentCwd = yield* store.resolveProjectSource(request.projectId)
-          if (currentCwd !== requestedCwd) {
-            yield* releaseStartup
-            yield* resident.gate.retireNow("project-source-changed-during-start")
-            return { _tag: "retry" as const }
-          }
-          return { _tag: "ready" as const, resident, releaseStartup }
+          return { resident, releaseStartup }
         }).pipe(
           Effect.onExit((exit) =>
             Exit.isSuccess(exit)
@@ -349,14 +360,7 @@ export const makeAgentRuntimeLive = (
         )
       })
 
-      const startResident = Effect.fn("acn.agent-runtime.start")(function* (
-        request: RuntimeStartRequest,
-      ) {
-        while (true) {
-          const attempt = yield* startResidentAttempt(request)
-          if (attempt._tag === "ready") return attempt
-        }
-      })
+      const startResident = startResidentAttempt
 
       const claimStart = (sessionId: string) =>
         Effect.gen(function* () {
@@ -381,11 +385,11 @@ export const makeAgentRuntimeLive = (
 
       const requestForStoredSession = Effect.fn("acn.agent-runtime.request-for-stored-session")(
         function* (sessionId: string) {
-          const meta = yield* store.readMeta(sessionId)
+          const meta = yield* readStoredMeta(sessionId)
           if (!meta) return yield* new SessionNotFound({ sessionId })
           return {
             sessionId,
-            projectId: meta.projectId,
+            cwd: meta.workingDirectory,
             options: (yield* runtimeOptions.read(sessionId)) ?? normalizeSessionRuntimeOptions(),
             visibility: meta.visibility,
           } satisfies RuntimeStartRequest

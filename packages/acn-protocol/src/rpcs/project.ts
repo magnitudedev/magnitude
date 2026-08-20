@@ -1,58 +1,77 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
-import { ProjectError } from "../errors"
 import {
-  ListProjectsResultSchema,
+  InvalidProjectName,
+  InvalidDirectoryPath,
+  DirectoryNotFound,
+  DirectoryAccessDenied,
+  PathNotDirectory,
+  FileSystemUnavailable,
+  InvalidProjectPageCursor,
+  ProjectCwdAlreadyRegistered,
+  ProjectNotFound,
+  ProjectStoreUnavailable,
+  RevealFailed,
+  RevealUnsupported,
+} from "../errors"
+import {
+  ProjectInspectionSchema,
+  ProjectPageRequestSchema,
+  ProjectPageSchema,
   ProjectChangeSchema,
   ProjectIdSchema,
-  ProjectRecordSchema,
+  ProjectSchema,
 } from "../schemas/project"
 import { makeAcnSubscriptionRpc } from "./subscription"
 
 export const ListProjects = Rpc.make("ListProjects", {
-  payload: Schema.Struct({
-    includeRemoved: Schema.optionalWith(Schema.Boolean, { default: () => false }),
-  }),
-  success: ListProjectsResultSchema,
-  error: ProjectError,
+  payload: ProjectPageRequestSchema,
+  success: ProjectPageSchema,
+  error: Schema.Union(InvalidProjectPageCursor, ProjectStoreUnavailable),
 })
 
 export const CreateProject = Rpc.make("CreateProject", {
-  payload: Schema.Struct({ sourceDirectory: Schema.String, name: Schema.String }),
-  success: ProjectRecordSchema,
-  error: ProjectError,
+  payload: Schema.Struct({ cwd: Schema.String, name: Schema.String }),
+  success: ProjectSchema,
+  error: Schema.Union(InvalidProjectName, InvalidDirectoryPath, DirectoryNotFound, DirectoryAccessDenied, PathNotDirectory, FileSystemUnavailable, ProjectCwdAlreadyRegistered, ProjectStoreUnavailable),
 })
 
 export const EditProject = Rpc.make("EditProject", {
   payload: Schema.Struct({
     projectId: ProjectIdSchema,
     name: Schema.String,
-    sourceDirectory: Schema.String,
+    cwd: Schema.String,
   }),
-  success: ProjectRecordSchema,
-  error: ProjectError,
+  success: ProjectSchema,
+  error: Schema.Union(ProjectNotFound, InvalidProjectName, InvalidDirectoryPath, DirectoryNotFound, DirectoryAccessDenied, PathNotDirectory, FileSystemUnavailable, ProjectCwdAlreadyRegistered, ProjectStoreUnavailable),
 })
 
 export const RemoveProject = Rpc.make("RemoveProject", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
-  success: ProjectRecordSchema,
-  error: ProjectError,
+  success: ProjectSchema,
+  error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable),
 })
 
 export const RestoreProject = Rpc.make("RestoreProject", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
-  success: ProjectRecordSchema,
-  error: ProjectError,
+  success: ProjectSchema,
+  error: Schema.Union(ProjectNotFound, ProjectCwdAlreadyRegistered, ProjectStoreUnavailable),
 })
 
 export const RevealProjectSource = Rpc.make("RevealProjectSource", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: Schema.Struct({}),
-  error: ProjectError,
+  error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable, RevealUnsupported, RevealFailed),
+})
+
+export const InspectProject = Rpc.make("InspectProject", {
+  payload: Schema.Struct({ projectId: ProjectIdSchema }),
+  success: ProjectInspectionSchema,
+  error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable),
 })
 
 export const StreamProjectChanges = makeAcnSubscriptionRpc("StreamProjectChanges", {
   payload: Schema.Struct({}),
   success: ProjectChangeSchema,
-  error: ProjectError,
+  error: ProjectStoreUnavailable,
 })

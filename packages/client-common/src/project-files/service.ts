@@ -3,50 +3,51 @@ import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-at
 import * as Reactivity from "@effect/experimental/Reactivity"
 import { Cause, Duration, Effect, Option, Schedule, Stream } from "effect"
 import {
+  RelativePathSchema,
+  type FileContentHash,
   type ProjectDirectoryListing,
   type ProjectEntryMove,
-  type ProjectFileRevision,
   type ProjectFileSnapshot,
   type ProjectFileTextSnapshot,
   type ProjectId,
-  type ProjectRelativePath,
+  type RelativePath,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { visitProjectDirectoryDemand } from "./demand"
 
 export interface ProjectPathInput {
   readonly projectId: ProjectId
-  readonly path: ProjectRelativePath
+  readonly path: RelativePath
 }
 
 export interface ProjectDirectoryInput {
   readonly projectId: ProjectId
-  readonly directory: ProjectRelativePath
+  readonly directory: RelativePath
 }
 
 export interface ProjectFileWriteInput extends ProjectPathInput {
   readonly content: string
-  readonly expectedRevision: ProjectFileRevision
+  readonly expectedContentHash: FileContentHash
 }
 
 export interface ProjectFileDeleteInput extends ProjectPathInput {
-  readonly expectedRevision: ProjectFileRevision
+  readonly expectedContentHash: FileContentHash
 }
 
 export interface ProjectEntryMoveInput {
   readonly projectId: ProjectId
-  readonly sourcePath: ProjectRelativePath
-  readonly destinationDirectory: ProjectRelativePath
+  readonly sourcePath: RelativePath
+  readonly destinationDirectory: RelativePath
 }
 
 const projectFilesKey = (projectId: ProjectId): string => `project-files:${projectId}`
-const projectFileKey = (projectId: ProjectId, path: ProjectRelativePath): string =>
+const projectFileKey = (projectId: ProjectId, path: RelativePath): string =>
   `${projectFilesKey(projectId)}:file:${path}`
-const projectDirectoryKey = (projectId: ProjectId, path: ProjectRelativePath): string =>
+const projectDirectoryKey = (projectId: ProjectId, path: RelativePath): string =>
   `${projectFilesKey(projectId)}:directory:${path}`
-const parentDirectory = (path: ProjectRelativePath): ProjectRelativePath => {
+const parentDirectory = (path: RelativePath): RelativePath => {
   const index = path.lastIndexOf("/")
-  return (index === -1 ? "" : path.slice(0, index)) as ProjectRelativePath
+  return RelativePathSchema.make(index === -1 ? "" : path.slice(0, index))
 }
 const initialFile = Atom.make(Result.initial<ProjectFileSnapshot>())
 const directoryIdleTimeToLive = "2 minutes"
@@ -92,15 +93,15 @@ export function useProjectFilesWatch(projectId: ProjectId): void {
  */
 export function useProjectDirectoryTree(
   projectId: ProjectId,
-  root: ProjectRelativePath,
-  demanded: ReadonlySet<ProjectRelativePath>,
-  expanded: ReadonlySet<ProjectRelativePath>,
+  root: RelativePath,
+  demanded: ReadonlySet<RelativePath>,
+  expanded: ReadonlySet<RelativePath>,
 ) {
   const client = useAgentClient()
   const demandedKey = [...demanded].sort().join("\0")
   const expandedKey = [...expanded].sort().join("\0")
   const tree = useMemo(() => Atom.make((get) => {
-    const read = (directory: ProjectRelativePath) => get(client.rpc.query(
+    const read = (directory: RelativePath) => get(client.rpc.query(
       "ListProjectDirectory",
       { projectId, directory },
       {
@@ -114,7 +115,7 @@ export function useProjectDirectoryTree(
     const rootState = read(root)
     const rootListing = Result.value(rootState)
     const directories: Array<{
-      readonly directory: ProjectRelativePath
+      readonly directory: RelativePath
       readonly state: typeof rootState
     }> = []
     if (Option.isNone(rootListing)) return { root: rootState, directories }
