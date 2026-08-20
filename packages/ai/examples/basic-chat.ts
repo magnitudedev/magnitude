@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Schema, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   Auth,
@@ -17,7 +17,7 @@ const fireworksLlama = NativeChatCompletions.model({
   maxOutputTokens: 16_384,
   options: {
     ...NativeChatCompletions.options,
-    temperature: Option.define((v: number) => ({ temperature: v }), 0.7),
+    temperature: Option.field("temperature", Schema.Number, 0.7),
   },
 })
 

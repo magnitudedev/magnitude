@@ -63,7 +63,7 @@ const manifest = Schema.decodeUnknownSync(
   Schema.parseJson(ReleaseManifestSchema),
 )(await readFile(resolve(candidate, "magnitude-release.json"), "utf8"))
 const changelog = await readFile(
-  resolve(import.meta.dir, "../../cli/CHANGELOG.md"),
+  resolve(import.meta.dir, "../../launcher/CHANGELOG.md"),
   "utf8",
 )
 const changelogTree = fromMarkdown(changelog)

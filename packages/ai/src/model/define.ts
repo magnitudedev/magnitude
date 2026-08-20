@@ -1,10 +1,10 @@
-import { Clock, Effect, Option, Stream } from "effect"
+import { Clock, Effect, Option, Schema, Stream } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
-import { Prompt } from "../prompt/prompt"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
+import type { Prompt } from "../prompt/prompt"
 import type { ToolDefinition } from "../tools/tool-definition"
 import type { AuthApplicator } from "../auth/auth"
 import type { Codec } from "../codec/codec"
-import type { ChatCompletionsRequest } from "../wire/chat-completions"
 import type {
   ProviderCall,
   RejectedHttpResponse,
@@ -32,18 +32,24 @@ import type { RawInputToken, RawOutputToken } from "../response/events"
 
 export interface ModelDefineConfig<
   TCallOptions,
-  TWireReq,
+  TRequestValue,
+  TWireRequest extends JsonRecord,
   TWireChunk,
+  TPromptValue,
+  TPromptContribution extends JsonRecord = JsonRecord,
+  TPromptEncodeError = never,
 > {
   readonly modelId: string
   readonly endpoint: string
   readonly path: string
-  readonly codec: Codec<TWireReq, TWireChunk>
-  readonly buildWireRequest: (
+  readonly codec: Codec<TPromptValue, TPromptContribution, TWireChunk, TPromptEncodeError>
+  readonly requestSchema: Schema.Schema<TRequestValue, TWireRequest, never>
+  readonly buildRequest: (
+    call: ProviderCall,
     prompt: Prompt,
     tools: readonly ToolDefinition[],
     options: TCallOptions,
-  ) => TWireReq
+  ) => Effect.Effect<TRequestValue, StreamStartClientCorrectnessViolation>
   readonly decodePayload: (raw: string) => Effect.Effect<TWireChunk, unknown>
   readonly classifyRejectedResponse?: (
     call: ProviderCall,
@@ -76,10 +82,22 @@ function makeDecodeOptions(
 
 export function modelDefine<
   TCallOptions,
-  TWireReq extends ChatCompletionsRequest,
+  TRequestValue,
+  TWireRequest extends JsonRecord,
   TWireChunk,
+  TPromptValue,
+  TPromptContribution extends JsonRecord = JsonRecord,
+  TPromptEncodeError = never,
 >(
-  config: ModelDefineConfig<TCallOptions, TWireReq, TWireChunk>,
+  config: ModelDefineConfig<
+    TCallOptions,
+    TRequestValue,
+    TWireRequest,
+    TWireChunk,
+    TPromptValue,
+    TPromptContribution,
+    TPromptEncodeError
+  >,
 ): ModelSpec<TCallOptions> {
   const url = joinUrl(config.endpoint, config.path)
   const call: ProviderCall = {
@@ -109,8 +127,8 @@ export function modelDefine<
       return Effect.gen(function* () {
         const listenerOption = yield* Effect.serviceOption(TraceListener)
         const runtimeOptions = options as TCallOptions & { readonly generateToolCallId?: () => ToolCallId }
-        const wireRequest = yield* Effect.try({
-          try: () => config.buildWireRequest(prompt, tools, options),
+        const request = yield* Effect.try({
+          try: () => config.buildRequest(call, prompt, tools, options),
           catch: (cause) => {
             const causeInfo = toCauseInfo(cause)
             return new StreamStartClientCorrectnessViolation({
@@ -120,7 +138,18 @@ export function modelDefine<
               evidence: { _tag: "UnexpectedDefectCaught", cause: causeInfo },
             })
           },
-        })
+        }).pipe(Effect.flatten)
+        const wireRequest = yield* Schema.encode(config.requestSchema)(request).pipe(
+          Effect.mapError((cause) => new StreamStartClientCorrectnessViolation({
+            call,
+            component: "request_body_encoder",
+            message: `Request did not satisfy its protocol Schema: ${String(cause)}`,
+            evidence: {
+              _tag: "RequestSchemaValidationFailed",
+              issue: { message: String(cause) },
+            },
+          })),
+        )
 
         const httpEffect = executeHttpStream({
           call,
@@ -161,7 +190,7 @@ export function modelDefine<
           })),
           Effect.mapError((failure) => {
             // Emit trace for stream-start failures.
-            const trace: ModelCallTrace = {
+            const trace: ModelCallTrace<TWireRequest> = {
               modelId: config.modelId,
               url,
               startedAt,
@@ -236,7 +265,7 @@ export function modelDefine<
               const assembledToolCalls: AssembledToolCall[] = Array.from(toolCallMap.values()).map(
                 (tc) => ({ id: tc.id, providerToolCallId: tc.providerToolCallId, name: tc.name, arguments: tc.args }),
               )
-              const trace: ModelCallTrace = {
+              const trace: ModelCallTrace<TWireRequest> = {
                 modelId: config.modelId,
                 url,
                 startedAt,

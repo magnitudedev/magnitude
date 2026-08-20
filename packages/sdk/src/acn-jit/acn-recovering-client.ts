@@ -167,7 +167,6 @@ export const makeAcnJitRuntime = (): Effect.Effect<
 > => Effect.gen(function* () {
   const manager = yield* AcnInstanceManager
   const httpClient = yield* HttpClient.HttpClient
-  const runtimeScope = yield* Scope.Scope
   const selectionScope = yield* Scope.make()
   yield* Effect.addFinalizer(() => Scope.close(selectionScope, Exit.void))
   const lifecycle = yield* makeAcnLifecycle()
@@ -364,8 +363,22 @@ export const makeAcnJitRuntime = (): Effect.Effect<
           yield* Ref.set(closeResult, Option.some(result))
           return result
         }
-        const closeProtocolContext = yield* Layer.buildWithScope(
-          jitRecoveringProtocolLayer({
+        const result = yield* Effect.scoped(Effect.gen(function* () {
+          const closeClient = yield* RpcClient.make(MagnitudeRpcs)
+          const modelSlots = yield* closeClient.GetModelSlots({}).pipe(
+            Effect.map((result) => result.state),
+            Effect.timeout(CLIENT_CLOSE_OBSERVATION_TIMEOUT),
+            resultOption,
+          )
+          const release = yield* resultOption(owner.releaseThrough(closeClient))
+          return Option.all({ modelSlots, release }).pipe(
+            Option.map(({ modelSlots, release }) => ({
+              modelSlots,
+              connectedClientCount: release.connectedClientCount,
+            })),
+          )
+        }).pipe(
+          Effect.provide(jitRecoveringProtocolLayer({
             endpoint: Effect.succeed(selected.value),
             recover: () => Effect.fail(runtimeClosed()),
             rpcPath: "/rpc",
@@ -374,24 +387,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
             classifyInfraError: unavailableError,
             recoveryPolicy: acnRpcRecoveryPolicy,
           }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, httpClient))),
-          runtimeScope,
-        )
-        const closeClient = yield* RpcClient.make(MagnitudeRpcs).pipe(
-          Effect.provide(closeProtocolContext),
-          Effect.provideService(Scope.Scope, runtimeScope),
-        )
-        const modelSlots = yield* closeClient.GetModelSlots({}).pipe(
-          Effect.map((result) => result.state),
-          Effect.timeout(CLIENT_CLOSE_OBSERVATION_TIMEOUT),
-          resultOption,
-        )
-        const release = yield* resultOption(owner.releaseThrough(closeClient))
-        const result = Option.all({ modelSlots, release }).pipe(
-          Option.map(({ modelSlots, release }) => ({
-            modelSlots,
-            connectedClientCount: release.connectedClientCount,
-          })),
-        )
+        )))
         yield* Ref.set(closeResult, Option.some(result))
         return result
       }),

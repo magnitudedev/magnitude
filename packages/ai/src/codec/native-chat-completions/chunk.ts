@@ -48,13 +48,16 @@ const finishReason = (reason: string): FinishReason => {
 }
 
 const usage = (
-  value: NonNullable<ChatCompletionsStreamChunk["usage"]>,
+  value: Option.Option.Value<ChatCompletionsStreamChunk["usage"]>,
 ): ResponseUsage => ({
   inputTokens: value.prompt_tokens,
   outputTokens: value.completion_tokens,
-  cacheReadTokens: value.prompt_tokens_details?.cached_tokens ?? 0,
+  cacheReadTokens: Option.flatMap(
+    value.prompt_tokens_details,
+    (details) => details.cached_tokens,
+  ).pipe(Option.getOrElse(() => 0)),
   cacheWriteTokens: 0,
-  cost: value.cost ?? null,
+  cost: Option.getOrNull(value.cost),
 })
 
 export const normalizeChatCompletionsChunk = (
@@ -65,21 +68,23 @@ export const normalizeChatCompletionsChunk = (
   const delta = choice === undefined
     ? Option.none<ChatCompletionDelta>()
     : Option.some<ChatCompletionDelta>({
-        text: Option.fromNullable(choice.delta.content).pipe(
+        text: choice.delta.content.pipe(
           Option.filter((text) => text.length > 0),
         ),
         thought: Option.filter(thought, (text) => text.length > 0),
-        toolCalls: (choice.delta.tool_calls ?? []).map((toolCall) => ({
+        toolCalls: Option.getOrElse(choice.delta.tool_calls, () => []).map((toolCall) => ({
           index: toolCall.index,
-          providerToolCallId: Option.fromNullable(toolCall.id),
-          name: Option.fromNullable(toolCall.function?.name).pipe(
+          providerToolCallId: toolCall.id,
+          name: Option.flatMap(toolCall.function, (fn) => fn.name).pipe(
             Option.filter((name) => name.length > 0),
           ),
-          input: Option.fromNullable(toolCall.function?.arguments).pipe(
+          input: Option.flatMap(toolCall.function, (fn) => fn.arguments).pipe(
             Option.filter((input) => input.length > 0),
           ),
         })),
-        logprobs: (choice.logprobs?.content ?? []).map((token) => ({
+        logprobs: Option.flatMap(choice.logprobs, (logprobs) => logprobs.content).pipe(
+          Option.getOrElse(() => []),
+        ).map((token) => ({
           token: token.token,
           logprob: token.logprob,
           topLogprobs: token.top_logprobs.map((candidate) => ({
@@ -91,19 +96,19 @@ export const normalizeChatCompletionsChunk = (
 
   return {
     delta,
-    finishReason: Option.fromNullable(choice?.finish_reason).pipe(
+    finishReason: choice === undefined ? Option.none() : choice.finish_reason.pipe(
       Option.map(finishReason),
     ),
-    usage: Option.fromNullable(chunk.usage).pipe(Option.map(usage)),
-    error: Option.fromNullable(chunk.error).pipe(
+    usage: chunk.usage.pipe(Option.map(usage)),
+    error: chunk.error.pipe(
       Option.map((error) => ({
         message: error.message,
-        type: Option.fromNullable(error.type),
-        code: Option.fromNullable(error.code),
-        param: Option.fromNullable(error.param),
+        type: error.type,
+        code: error.code,
+        param: error.param,
       })),
     ),
-    rawInput: Option.fromNullable(chunk.raw_input),
-    rawOutput: Option.fromNullable(chunk.raw_output),
+    rawInput: chunk.raw_input,
+    rawOutput: chunk.raw_output,
   }
 }

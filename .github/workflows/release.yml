@@ -70,9 +70,9 @@ jobs:
                     sort_by(.mergedAt) | last | .mergeCommit.oid // empty'
             )"
             test -n "$release_commit"
-            current_version="$(jq -r '.version // empty' packages/cli/package.json)"
+            current_version="$(jq -r '.version // empty' packages/launcher/package.json)"
             release_version="$(
-              git show "${release_commit}:packages/cli/package.json" |
+              git show "${release_commit}:packages/launcher/package.json" |
                 jq -r '.version // empty'
             )"
             test -n "$current_version"
@@ -84,12 +84,12 @@ jobs:
           git merge-base --is-ancestor "$release_commit" "$commit"
           git merge-base --is-ancestor "$commit" origin/main
           source_version="$(
-            git show "${commit}:packages/cli/package.json" |
+            git show "${commit}:packages/launcher/package.json" |
               jq -r '.version // empty'
           )"
           test -n "$source_version"
           test "$source_version" = "$(
-            git show "${release_commit}:packages/cli/package.json" |
+            git show "${release_commit}:packages/launcher/package.json" |
               jq -r '.version // empty'
           )"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"

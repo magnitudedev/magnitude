@@ -1,5 +1,23 @@
 # @magnitudedev/cli
 
+## 0.0.7-alpha.2
+
+### Patch Changes
+
+- [`e8d8204`](https://github.com/magnitudedev/magnitude/commit/e8d82048aad277e37e7eb5739f68cfe095fbdf4c) Thanks [@anerli](https://github.com/anerli)! - fix: race condition in rpc finalization sometimes causing defect on auto-update
+
+## 0.0.7-alpha.1
+
+### Patch Changes
+
+- [`f6e1a09`](https://github.com/magnitudedev/magnitude/commit/f6e1a090dbc8a46daed20e8e2f6b008d73a92532) Thanks [@anerli](https://github.com/anerli)! - Update Qwen 3.8 27B to use Unsloth Dynamic V3.0 GGUFs
+
+## 0.0.7-alpha.0
+
+### Patch Changes
+
+- [`413fbdf`](https://github.com/magnitudedev/magnitude/commit/413fbdfd1f73dfec53fe87e89626a3e6034faef3) Thanks [@anerli](https://github.com/anerli)! - auto-update system
+
 ## 0.0.6
 
 ### Patch Changes

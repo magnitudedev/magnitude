@@ -10,12 +10,15 @@ import { TargetLauncherLive } from "../src/target"
 import { digestObject } from "../src/hash"
 import type { TrialPlan } from "../src/domain"
 
+const receivedBodies: Record<string, unknown>[] = []
+
 const server = Bun.serve({
   port: 0,
   routes: {
     "/health": () => Response.json({ status: "ok" }),
     "/v1/chat/completions": async (request) => {
-      const body = await request.json() as { model: string }
+      const body = await request.json() as Record<string, unknown> & { model: string }
+      receivedBodies.push(body)
       const encoder = new TextEncoder()
       const chunks = [
         { id: "1", object: "chat.completion.chunk", created: 0, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_", type: "function", function: { name: "lookup", arguments: "{\"key\":" } }] }, finish_reason: null }] },
@@ -75,6 +78,51 @@ describe("endpoint and memory observation", () => {
     expect(observation.ttftMs).toBeGreaterThanOrEqual(0)
     expect(observation.terminal?.usage.promptTokens).toBe(20)
     expect(observation.terminal?.usage.completionTokens).toBe(6)
+  })
+
+  it("preserves JSON request extensions through finalization", async () => {
+    receivedBodies.length = 0
+    await Effect.runPromise(
+      executeRequest({
+        endpoint: server.url.toString(),
+        servedModel: "test",
+        requestBody: { provider_extension: { enabled: true } },
+      }, planned).pipe(Effect.provide(EndpointClientLive)),
+    )
+
+    expect(receivedBodies.at(-1)).toMatchObject({
+      provider_extension: { enabled: true },
+    })
+  })
+
+  it("rejects request extensions that own standard fields", async () => {
+    receivedBodies.length = 0
+    const observation = await Effect.runPromise(
+      executeRequest({
+        endpoint: server.url.toString(),
+        servedModel: "test",
+        requestBody: { tool_choice: "none" },
+      }, planned).pipe(Effect.provide(EndpointClientLive)),
+    )
+
+    expect(observation.outcome).toBe("error")
+    expect(receivedBodies).toHaveLength(0)
+  })
+
+  it("rejects malformed request messages before fetch", async () => {
+    receivedBodies.length = 0
+    const observation = await Effect.runPromise(
+      executeRequest(
+        { endpoint: server.url.toString(), servedModel: "test" },
+        {
+          ...planned,
+          messages: [{ role: "assistant", content: null }] as never,
+        },
+      ).pipe(Effect.provide(EndpointClientLive)),
+    )
+
+    expect(observation.outcome).toBe("error")
+    expect(receivedBodies).toHaveLength(0)
   })
 
   it("rejects semantically incorrect arguments", () => {

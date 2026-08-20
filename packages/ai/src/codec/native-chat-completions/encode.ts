@@ -1,22 +1,36 @@
 import type { JsonSchemaObject } from "@magnitudedev/utils/schema"
-import { Option } from "effect"
-import { Prompt } from "../../prompt/prompt"
-import type { ProviderToolCallId } from "../../prompt/ids"
-import type { ToolDefinition } from "../../tools/tool-definition"
+import { Data, Effect, Option, Schema } from "effect"
+import type * as ParseResult from "effect/ParseResult"
+import type { Prompt } from "../../prompt/prompt"
 import type {
-  ChatCompletionsRequest,
+  AssistantMessage,
+  Message,
+  ToolResultMessage,
+  UserMessage,
+} from "../../prompt/messages"
+import type { ToolCallPart } from "../../prompt/parts"
+import type { ToolDefinition } from "../../tools/tool-definition"
+import { ChatCompletionsPromptSchema } from "../../wire/chat-completions"
+import type {
   ChatContentPart,
-  ChatMessage,
+  ChatCompletionsPrompt,
   ChatTool,
   ChatToolCall,
 } from "../../wire/chat-completions"
 import { makeNativeToolParametersJsonSchema } from "./tool-json-schema"
+import { toCauseInfo, type CauseInfo } from "../../errors/failure"
+
+export class PromptContributionError extends Data.TaggedError("PromptContributionError")<{
+  readonly failure:
+    | { readonly _tag: "PromptMappingFailed"; readonly cause: CauseInfo }
+    | { readonly _tag: "PromptEncodingFailed"; readonly error: ParseResult.ParseError }
+}> {}
 
 function encodeImageUrl(data: string, mediaType: string): string {
   return `data:${mediaType};base64,${data}`
 }
 
-function encodeUserContent(message: { readonly parts: readonly ({ readonly _tag: "TextPart"; readonly text: string } | { readonly _tag: "ImagePart"; readonly data: string; readonly mediaType: string })[] }): string | readonly ChatContentPart[] {
+function encodeUserContent(message: UserMessage): string | readonly ChatContentPart[] {
   if (message.parts.every((part) => part._tag === "TextPart")) {
     return message.parts.map((part) => part.text).join("\n")
   }
@@ -33,12 +47,7 @@ function encodeUserContent(message: { readonly parts: readonly ({ readonly _tag:
   )
 }
 
-function encodeAssistantToolCall(toolCall: {
-  readonly id: string
-  readonly providerToolCallId: ProviderToolCallId
-  readonly name: string
-  readonly input: unknown
-}): ChatToolCall {
+function encodeAssistantToolCall(toolCall: ToolCallPart): ChatToolCall {
   return {
     id: toolCall.providerToolCallId,
     type: "function",
@@ -49,24 +58,26 @@ function encodeAssistantToolCall(toolCall: {
   }
 }
 
-function encodeAssistantMessage(
-  message: { readonly _tag: "AssistantMessage"; readonly text: Option.Option<string>; readonly reasoning: Option.Option<string>; readonly toolCalls: Option.Option<readonly { readonly id: string; readonly providerToolCallId: ProviderToolCallId; readonly name: string; readonly input: unknown }[]> },
-): ChatMessage {
-  const content = Option.getOrElse(message.text, () => null)
-  const reasoningContent = Option.getOrElse(message.reasoning, () => null)
-  const toolCalls = Option.map(message.toolCalls, (tcs) => tcs.map(encodeAssistantToolCall))
+type ChatCompletionsPromptValue = Schema.Schema.Type<typeof ChatCompletionsPromptSchema>
+type ChatCompletionsRequestMessageValue = ChatCompletionsPromptValue["messages"][number]
+
+function encodeAssistantMessage(message: AssistantMessage): ChatCompletionsRequestMessageValue {
+  const content = Option.getOrElse(message.text, () => "")
+  const reasoningContent = message.reasoning
+  const toolCalls = message.toolCalls.pipe(
+    Option.map((calls) => calls.map(encodeAssistantToolCall)),
+    Option.filter((calls) => calls.length > 0),
+  )
 
   return {
     role: "assistant",
     content,
-    ...(reasoningContent !== null ? { reasoning_content: reasoningContent } : {}),
-    ...(Option.isSome(toolCalls) && toolCalls.value.length > 0 ? { tool_calls: toolCalls.value } : {}),
+    reasoning_content: reasoningContent,
+    tool_calls: toolCalls,
   }
 }
 
-function encodeToolResultContent(
-  message: { readonly parts: readonly ({ readonly _tag: "TextPart"; readonly text: string } | { readonly _tag: "ImagePart"; readonly data: string; readonly mediaType: string })[] },
-): string | readonly ChatContentPart[] {
+function encodeToolResultContent(message: ToolResultMessage): string | readonly ChatContentPart[] {
   if (message.parts.every((part) => part._tag === "TextPart")) {
     return message.parts.map((part) => part.text).join("\n")
   }
@@ -83,7 +94,11 @@ function encodeToolResultContent(
   )
 }
 
-function encodeMessage(message: any): ChatMessage {
+function absurdMessage(message: never): never {
+  throw new Error(`Unknown prompt message: ${String(message)}`)
+}
+
+function encodeMessage(message: Message): ChatCompletionsRequestMessageValue {
   switch (message._tag) {
     case "UserMessage":
       return {
@@ -99,7 +114,7 @@ function encodeMessage(message: any): ChatMessage {
         content: encodeToolResultContent(message),
       }
     default:
-      throw new Error(`Unknown message tag: ${(message as any)._tag}`)
+      return absurdMessage(message)
   }
 }
 
@@ -122,29 +137,38 @@ export function encodePrompt(
   model: string,
   prompt: Prompt,
   tools: readonly ToolDefinition[],
-): Partial<ChatCompletionsRequest> {
-  const messages: ChatMessage[] = []
+): Effect.Effect<ChatCompletionsPrompt, PromptContributionError> {
+  return Effect.try({
+    try: (): ChatCompletionsPromptValue => {
+      const messages: ChatCompletionsRequestMessageValue[] = []
 
-  if (prompt.system.length > 0) {
-    messages.push({
-      role: "system",
-      content: prompt.system,
-    })
-  }
+      if (prompt.system.length > 0) {
+        messages.push({
+          role: "system",
+          content: prompt.system,
+        })
+      }
 
-  for (const message of prompt.messages) {
-    messages.push(encodeMessage(message))
-  }
+      for (const message of prompt.messages) {
+        messages.push(encodeMessage(message))
+      }
 
-  const encodedTools = tools.map(encodeTool)
+      const encodedTools = tools.map(encodeTool)
 
-  return {
-    model,
-    messages,
-    ...(encodedTools.length > 0
-      ? {
-          tools: encodedTools,
-        }
-      : {}),
-  }
+      return {
+        model,
+        messages,
+        tools: encodedTools.length > 0 ? Option.some(encodedTools) : Option.none(),
+      }
+    },
+    catch: (cause) => new PromptContributionError({
+      failure: { _tag: "PromptMappingFailed", cause: toCauseInfo(cause) },
+    }),
+  }).pipe(
+    Effect.flatMap((value) => Schema.encode(ChatCompletionsPromptSchema)(value).pipe(
+      Effect.mapError((error) => new PromptContributionError({
+        failure: { _tag: "PromptEncodingFailed", error },
+      })),
+    )),
+  )
 }

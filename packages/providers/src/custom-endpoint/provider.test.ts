@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect"
+import { Effect, Exit, Option, Schema } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { describe, expect, it } from "vitest"
 import {
@@ -15,11 +15,14 @@ import {
   customEndpointProviderId,
 } from "./provider"
 
-const endpoint = (authentication: unknown) =>
+const endpoint = (
+  authentication: unknown,
+  baseUrl = "https://openrouter.ai/api/v1",
+) =>
   Schema.decodeUnknownSync(CustomEndpointDeclarationSchema)({
     displayName: "OpenRouter",
     connection: {
-      baseUrl: "https://openrouter.ai/api/v1",
+      baseUrl,
       authentication,
     },
     models: {
@@ -53,6 +56,10 @@ const endpointWithoutReasoning = (baseUrl: string) =>
       },
     },
   })
+
+const CapturedRequestSchema = Schema.Struct({
+  messages: Schema.Array(Schema.Record({ key: Schema.String, value: Schema.Unknown })),
+})
 
 describe("custom endpoint provider", () => {
   it("publishes authored models as custom provider catalog entries", async () => {
@@ -143,6 +150,76 @@ describe("custom endpoint provider", () => {
 
       expect(requestBody).toMatchObject({ model: "model", max_tokens: 8192 })
       expect(requestBody).not.toHaveProperty("reasoning_effort")
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  it("sends string content for reasoning-only assistant history", async () => {
+    let assistantMessage: Record<string, unknown> | undefined
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        const requestBody = Schema.decodeUnknownSync(CapturedRequestSchema)(await request.json())
+        assistantMessage = requestBody.messages.find(
+          (message) => message.role === "assistant",
+        )
+
+        // Ollama rejects chat-completions requests when assistant content is null,
+        // including reasoning-only turns replayed as conversation history.
+        if (typeof assistantMessage?.content !== "string") {
+          return new Response("assistant content must be a string", { status: 400 })
+        }
+
+        return new Response("data: [DONE]\n\n", {
+          headers: { "content-type": "text/event-stream" },
+        })
+      },
+    })
+
+    try {
+      const instance = createCustomEndpointProvider(
+        CustomEndpointNameSchema.make("ollama"),
+        endpoint(
+          { type: "none" },
+          `http://127.0.0.1:${server.port}`,
+        ),
+        {},
+      )
+      const model = await Effect.runPromise(instance.provider.bindModel(
+        ProviderModelIdSchema.make("z-ai/glm-5.2"),
+        {
+          defaults: {
+            maxTokens: 8192,
+            reasoningEffort: ReasoningEffortSchema.make("high"),
+          },
+        },
+      ))
+      const prompt = Prompt.from({
+        messages: [
+          {
+            _tag: "AssistantMessage",
+            reasoning: Option.some("thinking"),
+            text: Option.none(),
+            toolCalls: Option.none(),
+          },
+          {
+            _tag: "UserMessage",
+            parts: [{ _tag: "TextPart", text: "Continue" }],
+          },
+        ],
+      })
+
+      const result = await Effect.runPromiseExit(model.stream(prompt, [], {}).pipe(
+        Effect.provide(FetchHttpClient.layer),
+      ))
+
+      expect(assistantMessage).toEqual({
+        role: "assistant",
+        content: "",
+        reasoning_content: "thinking",
+      })
+      expect(Exit.isSuccess(result)).toBe(true)
     } finally {
       server.stop(true)
     }

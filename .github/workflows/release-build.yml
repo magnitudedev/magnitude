@@ -38,7 +38,7 @@ jobs:
         run: bun run packages/release/scripts/matrix.ts
       - id: version
         shell: bash
-        run: echo "version=$(jq -r '.version' packages/cli/package.json)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
 
   catalog:
     runs-on: ubuntu-latest

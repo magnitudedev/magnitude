@@ -1,4 +1,5 @@
 import { Context } from "effect"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
 import type { ChatCompletionsRequest } from "./wire/chat-completions"
 import type { FinishReason } from "./response/events"
 import type { ResponseUsage } from "./response/usage"
@@ -23,12 +24,14 @@ export interface TokenLogprob {
   readonly topLogprobs: readonly { readonly token: string; readonly logprob: number }[]
 }
 
-export interface ModelCallTrace {
+export interface ModelCallTrace<
+  TWireRequest extends JsonRecord = ChatCompletionsRequest,
+> {
   readonly modelId: string
   readonly url: string
   readonly startedAt: number
   readonly durationMs: number
-  readonly request: ChatCompletionsRequest
+  readonly request: TWireRequest
   readonly response: {
     readonly reasoning: string | null
     readonly text: string | null
@@ -48,5 +51,9 @@ export interface ModelCallTrace {
 
 export class TraceListener extends Context.Tag("TraceListener")<
   TraceListener,
-  { readonly onTrace: (trace: ModelCallTrace) => void }
+  {
+    readonly onTrace: <TWireRequest extends JsonRecord>(
+      trace: ModelCallTrace<TWireRequest>,
+    ) => void
+  }
 >() {}

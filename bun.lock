@@ -19,7 +19,7 @@
         "@effect/opentelemetry": "0.63.0",
         "@eslint/js": "^10.0.1",
         "@opentelemetry/exporter-trace-otlp-http": "0.219.0",
-        "@types/bun": "^1.3.14",
+        "@types/bun": "1.3.14",
         "@types/mdast": "^4.0.4",
         "eslint": "^10.6.0",
         "turbo": "^2.5.4",
@@ -39,7 +39,9 @@
         "@effect/platform-bun": "^0.90.0",
         "@magnitudedev/client-common": "workspace:*",
         "@magnitudedev/generate-id": "workspace:*",
+        "@magnitudedev/release": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
+        "@magnitudedev/storage": "workspace:*",
         "@magnitudedev/version": "workspace:*",
         "@opentui/core": "0.5.1",
         "@opentui/react": "0.5.1",
@@ -52,12 +54,14 @@
         "lowlight": "^3.3.0",
         "pino": "^10.3.0",
         "react": "^19.2.0",
+        "semver": "^7.7.3",
         "string-width": "^8.1.1",
       },
       "devDependencies": {
         "@magnitudedev/logger": "workspace:*",
         "@types/react": "^19.2.0",
         "@types/react-dom": "^19.2.3",
+        "@types/semver": "^7.7.1",
         "react-dom": "^19.2.4",
         "typescript": "^5.8.3",
       },
@@ -129,7 +133,7 @@
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^5.0.3",
         "@tailwindcss/vite": "^4.1.4",
-        "@types/bun": "^1.3.14",
+        "@types/bun": "1.3.14",
         "concurrently": "^9.1.2",
         "svelte": "^5.28.2",
         "svelte-check": "^4.2.1",
@@ -181,7 +185,7 @@
         "@effect/vitest": "^0.25.0",
         "@magnitudedev/logger": "workspace:*",
         "@magnitudedev/tracing": "workspace:*",
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "@types/luxon": "^3.7.1",
         "vitest": "^3.2.1",
       },
@@ -197,14 +201,7 @@
         "effect": "^3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
-      },
-    },
-    "packages/cli": {
-      "name": "@magnitudedev/cli",
-      "version": "0.0.6",
-      "bin": {
-        "magnitude": "bin/magnitude.js",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/client-common": {
@@ -240,7 +237,7 @@
         "cheerio": "^1.0.0",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/effect-query": {
@@ -252,7 +249,7 @@
         "effect": "^3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "vitest": "^3.2.4",
       },
     },
@@ -266,7 +263,7 @@
         "immer": "^11.1.3",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/generate-id": {
@@ -286,7 +283,7 @@
         "effect": "^3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/icn": {
@@ -304,7 +301,7 @@
       },
       "devDependencies": {
         "@effect/platform-bun": "^0.90.0",
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "vitest": "^3.2.4",
       },
     },
@@ -319,7 +316,7 @@
       "devDependencies": {
         "@effect/platform": "^0.96.0",
         "@effect/platform-bun": "^0.90.0",
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "vitest": "^3.2.4",
       },
     },
@@ -340,7 +337,7 @@
         "effect": "3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "vitest": "^3.2.4",
       },
     },
@@ -354,13 +351,29 @@
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^5.0.3",
         "@tailwindcss/vite": "^4.1.4",
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "concurrently": "^9.1.2",
         "svelte": "^5.28.2",
         "svelte-check": "^4.2.1",
         "tailwindcss": "^4.1.4",
         "typescript": "^5.8.3",
         "vite": "^6.3.2",
+      },
+    },
+    "packages/launcher": {
+      "name": "@magnitudedev/cli",
+      "version": "0.0.7-alpha.2",
+      "bin": {
+        "magnitude": "bin/magnitude.js",
+      },
+      "devDependencies": {
+        "@effect/platform": "^0.96.0",
+        "@effect/platform-node": "0.107.0",
+        "@magnitudedev/release": "workspace:*",
+        "@types/bun": "1.3.14",
+        "@types/tar-stream": "^3.1.4",
+        "effect": "^3.21.2",
+        "tar-stream": "3.2.0",
       },
     },
     "packages/logger": {
@@ -370,7 +383,7 @@
         "@magnitudedev/storage": "workspace:*",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/markdown-cst": {
@@ -391,7 +404,7 @@
         "prettier": "^2.8.8",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "@types/prettier": "^2.7.3",
         "vitest": "^3.2.4",
       },
@@ -409,7 +422,7 @@
         "effect": "3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/release": {
@@ -425,7 +438,7 @@
         "tar-stream": "3.2.0",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "@types/tar-stream": "^3.1.4",
       },
     },
@@ -433,7 +446,7 @@
       "name": "@magnitudedev/ripgrep",
       "version": "0.0.1",
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/roles": {
@@ -447,14 +460,14 @@
         "effect": "^3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/scratchpad": {
       "name": "@magnitudedev/scratchpad",
       "version": "0.0.1",
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/sdk": {
@@ -486,7 +499,7 @@
         "typescript": "^5.0.0",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/skills": {
@@ -500,7 +513,7 @@
         "remark-parse": "^11.0.0",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/storage": {
@@ -515,7 +528,7 @@
         "effect": "^3.21.2",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
         "vitest": "^3.2.4",
       },
     },
@@ -526,6 +539,7 @@
         "@magnitudedev/ai": "workspace:*",
         "@magnitudedev/logger": "workspace:*",
         "@magnitudedev/storage": "workspace:*",
+        "@magnitudedev/utils": "workspace:*",
       },
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^5.0.3",
@@ -546,7 +560,7 @@
         "fast-json-patch": "^3.1.1",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/vcs": {
@@ -561,7 +575,7 @@
         "just-git": "^1.7.0",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.3.14",
       },
     },
     "packages/version": {
@@ -904,7 +918,7 @@
 
     "@magnitudedev/ai": ["@magnitudedev/ai@workspace:packages/ai"],
 
-    "@magnitudedev/cli": ["@magnitudedev/cli@workspace:packages/cli"],
+    "@magnitudedev/cli": ["@magnitudedev/cli@workspace:packages/launcher"],
 
     "@magnitudedev/cli-source": ["@magnitudedev/cli-source@workspace:cli"],
 
@@ -1287,6 +1301,8 @@
     "@types/react-dom": ["@types/react-dom@19.2.4", "", { "peerDependencies": { "@types/react": "^19.2.0" } }, "sha512-Bsc+QHgp+P/F02XDzNCY9jnZNCUuLki36KT7VKrTXXLdHf+vHMNZnW1rVu5DNW/rCK+fya3DATySbLM4yhtKUw=="],
 
     "@types/react-test-renderer": ["@types/react-test-renderer@19.1.0", "", { "dependencies": { "@types/react": "*" } }, "sha512-XD0WZrHqjNrxA/MaR9O22w/RNidWR9YZmBdRGI7wcnWGrv/3dA8wKCJ8m63Sn+tLJhcjmuhOi629N66W6kgWzQ=="],
+
+    "@types/semver": ["@types/semver@7.8.0", "", {}, "sha512-1mAINjtQCXXeLkJ9ehXkwOcBpqtLxiVtKhpUf83DdRNdQKV0iXZpaHYqRr7nj+wvxuJzoAmAwXI+sCNMv1CzLQ=="],
 
     "@types/tar-stream": ["@types/tar-stream@3.1.4", "", { "dependencies": { "@types/node": "*" } }, "sha512-921gW0+g29mCJX0fRvqeHzBlE/XclDaAG0Ousy1LCghsOhvaKacDeRGEVzQP9IPfKn8Vysy7FEXAIxycpc/CMg=="],
 

@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Option as EffectOption, Schema, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   Auth,
@@ -19,8 +19,9 @@ const fireworksMinimax = NativeChatCompletions.model({
   maxOutputTokens: 196_000,
   options: {
     ...NativeChatCompletions.options,
-    reasoningEffort: Option.define(
-      (val: "none" | "low" | "medium") => ({ reasoning_effort: val }),
+    reasoningEffort: Option.field(
+      "reasoning_effort",
+      Schema.Literal("none", "low", "medium"),
     ),
   },
 
@@ -39,17 +40,16 @@ const deepseekV4 = NativeChatCompletions.model({
   maxOutputTokens: 131_072,
   options: {
     ...NativeChatCompletions.options,
-    thinking: Option.define(
-      (val: DeepSeekThinking) => ({ thinking: val }),
+    thinking: Option.field(
+      "thinking",
+      Schema.Struct({ type: Schema.Literal("enabled", "disabled") }),
     ),
   },
-  compose: (wire, callOpts) => {
-    if (callOpts.thinking?.type === "enabled") {
-      return { ...wire, temperature: undefined }
-    }
-    return wire
-  },
-
+  compose: (request, callOpts) => Effect.succeed(
+    callOpts.thinking?.type === "enabled"
+      ? { ...request, temperature: EffectOption.none() }
+      : request,
+  ),
 })
 
 // ---------------------------------------------------------------------------

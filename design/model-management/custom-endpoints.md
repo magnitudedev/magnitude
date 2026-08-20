@@ -61,6 +61,12 @@ thought stream consumed by the agent. Shared stream reduction remains independen
 field names. When an endpoint supplies equivalent reasoning in more than one representation, the
 decoder emits the text once.
 
+Outbound requests follow the shared
+[native Chat Completions contract](../ai/native-chat-completions.md). Assistant history always
+carries string-valued `content`; a turn with reasoning or tool calls but no visible text uses the
+canonical empty string. Optional request fields are omitted when absent rather than serialized as
+`null` or `undefined`.
+
 ## Selection behavior
 
 Temporary unavailability, including a missing credential, preserves slot intent. Authoritative

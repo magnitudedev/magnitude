@@ -20,6 +20,7 @@ const SerializableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   providers: SerializableOptional(CustomEndpointDeclarationsSchema),
+  checkForUpdateOnStartup: SerializableOptional(Schema.Boolean),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

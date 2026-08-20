@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Layer, Option as EffectOption, Schema, Stream } from "effect"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import {
@@ -25,8 +25,9 @@ describe("Fireworks MiniMax with reasoning effort", () => {
     endpoint: "https://api.fireworks.ai/inference/v1",
     options: {
       ...NativeChatCompletions.options,
-      reasoningEffort: Option.define(
-        (val: "none" | "low" | "medium") => ({ reasoning_effort: val }),
+      reasoningEffort: Option.field(
+        "reasoning_effort",
+        Schema.Literal("none", "low", "medium"),
       ),
     },
   })
@@ -61,7 +62,13 @@ describe("Magnitude gateway — Kimi K2.6 with grammar", () => {
     options: {
       ...NativeChatCompletions.options,
       grammar: Option.define(
-        (g: string) => ({ response_format: { type: "grammar", grammar: g } }),
+        Schema.Struct({
+          response_format: Schema.Struct({
+            type: Schema.Literal("grammar"),
+            grammar: Schema.String,
+          }),
+        }),
+        (grammar: string) => ({ response_format: { type: "grammar" as const, grammar } }),
       ),
     },
   })
@@ -87,19 +94,19 @@ describe("DeepSeek — thinking toggle with compose", () => {
     endpoint: "https://api.deepseek.com/v1",
     options: {
       ...NativeChatCompletions.options,
-      thinking: Option.define(
-        (val: DeepSeekThinking) => ({ thinking: val }),
+      thinking: Option.field(
+        "thinking",
+        Schema.Struct({ type: Schema.Literal("enabled", "disabled") }),
       ),
     },
-    compose: (wire, callOpts) => {
-      if (callOpts.thinking?.type === "enabled") {
-        return { ...wire, temperature: undefined }
-      }
-      return wire
-    },
+    compose: (request, callOpts) => Effect.succeed(
+      callOpts.thinking?.type === "enabled"
+        ? { ...request, temperature: EffectOption.none() }
+        : request,
+    ),
   })
 
-  it("creates spec with compose", () => {
+  it("creates a spec with compose", () => {
     expect(deepseekV4.modelId).toBe("deepseek-v4-pro")
   })
 
@@ -121,8 +128,9 @@ describe("Required option", () => {
     endpoint: "https://api.deepseek.com/v1",
     options: {
       ...NativeChatCompletions.options,
-      thinking: Option.required(
-        (val: { type: "enabled" }) => ({ thinking: val }),
+      thinking: Option.requiredField(
+        "thinking",
+        Schema.Struct({ type: Schema.Literal("enabled") }),
       ),
     },
   })

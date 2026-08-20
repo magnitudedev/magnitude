@@ -34,6 +34,6 @@ web/node_modules
 desktop/out
 desktop/node_modules
 
-packages/cli/lib/release-runtime.cjs
+packages/launcher/bin/magnitude.js
 
 .humanlayer/tasks/
