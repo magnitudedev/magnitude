@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.7-alpha.2
+
+### Patch Changes
+
+- [`e8d8204`](https://github.com/magnitudedev/magnitude/commit/e8d82048aad277e37e7eb5739f68cfe095fbdf4c) Thanks [@anerli](https://github.com/anerli)! - fix: race condition in rpc finalization sometimes causing defect on auto-update
+
 ## 0.0.7-alpha.1
 
 ### Patch Changes
