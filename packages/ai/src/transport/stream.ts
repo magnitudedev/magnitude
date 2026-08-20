@@ -3,6 +3,7 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpBody from "@effect/platform/HttpBody"
 import type * as HttpClientError from "@effect/platform/HttpClientError"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
 import type {
   AcceptedHttpResponse,
   ProviderCall,
@@ -33,11 +34,10 @@ import { sseStream } from "./sse"
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 60_000
 
 export interface ExecuteHttpStreamConfig<
-  TWireReq,
   TWireChunk,
 > {
   readonly call: ProviderCall
-  readonly body: TWireReq
+  readonly body: JsonRecord
   readonly auth: AuthApplicator
   readonly extraHeaders?: Record<string, string>
   readonly decodePayload: (raw: string) => Effect.Effect<TWireChunk, unknown>
@@ -154,10 +154,9 @@ export interface HttpStreamResult<TWireChunk> {
  * - successful startup returns the stream plus the accepted response facts
  */
 export function executeHttpStream<
-  TWireReq,
   TWireChunk,
 >(
-  config: ExecuteHttpStreamConfig<TWireReq, TWireChunk>,
+  config: ExecuteHttpStreamConfig<TWireChunk>,
 ): Effect.Effect<
   HttpStreamResult<TWireChunk>,
   StreamStartFailure,

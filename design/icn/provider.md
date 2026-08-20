@@ -1,6 +1,5 @@
 ---
 applies_to:
-  - packages/ai/src/**
   - packages/harness/src/**
   - packages/icn/src/provider/**
   - packages/acn/src/local-provider-**
@@ -144,9 +143,11 @@ come from `ModelInstancesSnapshot`; the load response stream is never the lifecy
 
 ## Prompt and request boundary
 
-The ICN provider encodes prompts once with the shared native chat-completions codec. The generated
-client validates the request before transport. ICN validates structural inputs before accepting a
-stream and validates tokenizer-dependent constraints under the resident lease.
+The provider follows the shared [native Chat Completions contract](../ai/native-chat-completions.md).
+It uses the shared request builder and encoder before adding the bound model-instance identity. The
+generated ICN client then validates the local extension and transports it. ICN validates structural
+inputs before accepting a stream and validates tokenizer-dependent constraints under the resident
+lease.
 
 Local-model preparation is a scoped agent-request phase injected by ACN. It resolves and observes
 the exact Ready instance, then installs an Effect fiber-local instance binding for the provider

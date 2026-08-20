@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatTool } from "@magnitudedev/ai"
+import type { ChatCompletionsRequestMessage, ChatTool } from "@magnitudedev/ai"
 import { Data, Effect } from "effect"
 import type { PreparedCorpus } from "./corpus"
 import type {
@@ -72,7 +72,7 @@ function mergeTools(fixtures: readonly Fixture[]): readonly ChatTool[] {
   return [...byName.values()]
 }
 
-function completedUnit(fixture: Fixture): readonly ChatMessage[] {
+function completedUnit(fixture: Fixture): readonly ChatCompletionsRequestMessage[] {
   return [...fixture.messages, fixture.canonicalAssistant, ...fixture.canonicalToolMessages]
 }
 

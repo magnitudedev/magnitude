@@ -2,6 +2,8 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { Data, Effect, Schema } from "effect"
 import { basename, dirname, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
+import { ChatCompletionsRequestExtensionsSchema } from "@magnitudedev/ai"
 import type { ProfileName } from "./domain"
 
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
@@ -96,7 +98,7 @@ export interface ExistingEndpointEngineDefinition {
   readonly kind: "existing-endpoint"
   readonly endpoint: string
   readonly authentication: { readonly kind: "none" } | { readonly kind: "bearer-env"; readonly variable: string }
-  readonly requestBody: Readonly<Record<string, unknown>>
+  readonly requestBody: JsonRecord
 }
 
 export type EngineDefinition = LlamaCppEngineDefinition | MlxLmEngineDefinition | MlxVlmEngineDefinition | IcnEngineDefinition | ExistingEndpointEngineDefinition
@@ -193,7 +195,7 @@ const Engine = Schema.Union(
       Schema.Struct({ kind: Schema.Literal("none") }),
       Schema.Struct({ kind: Schema.Literal("bearer-env"), variable: NonEmptyString }),
     ),
-    requestBody: Schema.Record({ key: Schema.String, value: Schema.Unknown }),
+    requestBody: ChatCompletionsRequestExtensionsSchema,
   }),
 )
 export const ExperimentDefinitionSchema = Schema.Struct({

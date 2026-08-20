@@ -1,5 +1,9 @@
 import { Context, Data, Effect, Layer, Option, Schema } from "effect"
-import type { ChatCompletionsRequest } from "@magnitudedev/ai"
+import {
+  ChatCompletionsRequestExtensionsSchema,
+  finalizeChatCompletionsRequest,
+} from "@magnitudedev/ai"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
 import type {
   ExpectedToolCall,
   PlannedRequest,
@@ -19,7 +23,7 @@ export interface EndpointConfiguration {
   readonly servedModel: string
   readonly apiKey?: string
   readonly timeoutMs?: number
-  readonly requestBody?: Readonly<Record<string, unknown>>
+  readonly requestBody?: JsonRecord
 }
 
 interface MutableToolCall { id: string; name: string; arguments: string }
@@ -140,25 +144,6 @@ async function requestWithFetch(config: EndpointConfiguration, request: PlannedR
   const started = performance.now()
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort("request timeout"), config.timeoutMs ?? 300_000)
-  const body: ChatCompletionsRequest & {
-    seed: number
-    parallel_tool_calls: true
-    chat_template_kwargs: { enable_thinking: false }
-  } = {
-    ...config.requestBody,
-    model: config.servedModel,
-    messages: request.messages,
-    tools: request.tools,
-    tool_choice: request.tools.length > 0 ? "required" : undefined,
-    parallel_tool_calls: true,
-    max_tokens: request.maxOutputTokens,
-    temperature: request.temperature ?? 0,
-    top_p: request.topP ?? 1,
-    seed: request.seed ?? 42,
-    stream: true,
-    stream_options: { include_usage: true },
-    chat_template_kwargs: { enable_thinking: request.enableThinking ?? false },
-  }
   const events: { atMs: number; payload: unknown }[] = []
   const toolCalls = new Map<number, MutableToolCall>()
   let status: number | undefined
@@ -171,6 +156,23 @@ async function requestWithFetch(config: EndpointConfiguration, request: PlannedR
   let streamId: string | undefined
 
   try {
+    const extensions = await Effect.runPromise(Schema.decodeUnknown(
+      ChatCompletionsRequestExtensionsSchema,
+    )(config.requestBody ?? {}))
+    const body = await Effect.runPromise(finalizeChatCompletionsRequest({
+      ...extensions,
+      model: config.servedModel,
+      messages: request.messages,
+      ...(request.tools.length > 0 ? { tools: request.tools, tool_choice: "required" } : {}),
+      parallel_tool_calls: true,
+      max_tokens: request.maxOutputTokens,
+      temperature: request.temperature ?? 0,
+      top_p: request.topP ?? 1,
+      seed: request.seed ?? 42,
+      stream: true,
+      stream_options: { include_usage: true },
+      chat_template_kwargs: { enable_thinking: request.enableThinking ?? false },
+    }))
     const response = await fetch(endpointUrl(config.endpoint, "/v1/chat/completions"), {
       method: "POST",
       headers: { "content-type": "application/json", accept: "text/event-stream", ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}) },

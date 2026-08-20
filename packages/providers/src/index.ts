@@ -75,7 +75,12 @@ export {
 } from "./web-search-error"
 export type { WebSearchResult, UsageQuery } from "@magnitudedev/ai"
 export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./magnitude/catalog"
-export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./magnitude/contract"
+export {
+  MagnitudeAdditionalOptionsSchema,
+  MagnitudeModelListResponseSchema,
+  MagnitudeRawModelSchema,
+  TurnConstraintsSchema,
+} from "./magnitude/contract"
 export {
   createMagnitudeCompatibleSpec,
   type MagnitudeCallOptions,
