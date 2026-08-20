@@ -34,7 +34,7 @@ describe("workSummaryLabel", () => {
           }),
         })
       )
-    ).toBe("Qwen3 Coder worked for 1:05 · 20.4 tok/s")
+    ).toBe("Qwen3 Coder worked for 1:05 20.4 tok/s")
   })
 
   it("keeps model and duration when decode rate is unavailable", () => {

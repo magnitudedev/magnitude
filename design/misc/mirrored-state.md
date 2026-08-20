@@ -61,11 +61,12 @@ A backend may bind directly only when it owns the exact public schema and versio
 selection, including favorites and recency. Preference mutations durably commit before the mirror
 publishes the new snapshot.
 
-For direct-mirror domains, client-common owns one Reactivity watch per client connection. Query
-atoms remain distinct by Get RPC tag. Effect Query owns a separate connection-scoped watch; each
-Effect Query domain registers only its own `QueryClient` invalidation callback. The two mechanisms
-may consume the same ACN protocol stream but never share cache adapters or invalidation calls. A
-domain has one canonical client query cache at a time.
+Client-common owns one connection-global invalidation transport and broadcasts its cache-neutral
+events within the connection. The direct-mirror Reactivity adapter and each Effect Query domain
+consume that broadcast independently; an Effect Query domain filters its own mirror identity and
+invalidates its own `QueryClient`. The mechanisms share only transport fan-out: they never share
+cache adapters or invalidation calls. Query atoms remain distinct by Get RPC tag, and a domain has
+one canonical client query cache at a time.
 
 Clients retain each query's waiting, failure, and success Result independently. Screens may derive
 presentation from successful domain values; they do not combine domain Results into an aggregate

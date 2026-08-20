@@ -90,9 +90,11 @@ bounded Git command sequence and zero Git commands when the directory is unavail
 nothing probes `git --version` at startup, and Project listing performs zero filesystem or command
 work.
 
-Project and session change subscriptions are separate invalidation-only streams; each durable write
-publishes on exactly one. Clients reread bounded authoritative pages on invalidation and never
-retain change events as state. Editing a Project rebinds name and cwd as one minimal record
+Project and session changes remain independent invalidation domains, and each durable write
+publishes exactly one notification. Their notifications share the connection-global client
+invalidation transport with mirror invalidations; transport multiplexing does not combine their
+caches or authority. Clients reread bounded authoritative pages on invalidation and never retain
+change events as state. Editing a Project rebinds name and cwd as one minimal record
 transition — it does not inspect sessions, release drafts, stop runtimes, or rewrite session cwd.
 
 There is no session-Project migration, no optional compatibility field, and no orphan repair. A

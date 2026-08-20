@@ -1,5 +1,5 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
-import { Cause, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Effect, Layer, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
@@ -31,6 +31,7 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
+import { makeClientInvalidations } from "../state/client-invalidations"
 import { localModelProviderModelId } from "./projection"
 import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
@@ -440,7 +441,6 @@ const makeHarness = (options: HarnessOptions) => {
   const rpc = ((name: string, payload: any) => Effect.suspend<unknown, unknown, never>(() => {
     calls.push(name)
     switch (name) {
-      case "WatchMirroredStates": return Effect.succeed(Stream.never)
       case "GetLocalModels": {
         if (options.failInitialLocalModelsRead
           && calls.filter((call) => call === "GetLocalModels").length === 1) {
@@ -567,9 +567,10 @@ const makeHarness = (options: HarnessOptions) => {
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
   })) as unknown as AcnRpcClient
+  const invalidations = Effect.runSync(makeClientInvalidations)
   const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
     Layer.succeed(AcnRpcClientTag, rpc),
-    (client) => clientServicesLayer(client, {
+    (client) => clientServicesLayer(client, invalidations, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,
     }),
   )

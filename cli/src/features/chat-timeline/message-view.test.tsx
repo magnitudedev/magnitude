@@ -75,3 +75,29 @@ describe('work summary message', () => {
     expect(html).not.toContain('tok/s')
   })
 })
+
+describe('thinking message visibility', () => {
+  const thinking: DisplayMessage = {
+    id: 'thinking:turn-1:1',
+    type: 'thinking',
+    content: 'Internal reasoning',
+    label: Option.none(),
+    phase: 'completed',
+    completedAt: Option.some(2_000),
+    timestamp: 1_000,
+  }
+
+  it('keeps thinking hidden in normal CLI mode', () => {
+    const html = renderToStaticMarkup(
+      <MessageView message={thinking} isStreaming={false} mode="default" />,
+    )
+    expect(html).not.toContain('Internal reasoning')
+  })
+
+  it('renders thinking in CLI transcript mode', () => {
+    const html = renderToStaticMarkup(
+      <MessageView message={thinking} isStreaming={false} mode="transcript" />,
+    )
+    expect(html).toContain('Internal reasoning')
+  })
+})

@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { Context, Data, Effect, Layer, Option, Schedule } from "effect"
+import { Context, Data, Effect, Layer, Option, Schedule, Stream } from "effect"
 import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
@@ -13,7 +13,7 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
-import { EffectQueryInvalidations } from "../state/effect-query-invalidations"
+import { ClientInvalidations } from "../state/client-invalidations"
 import {
   findLocalModelByConfigurationId,
   localModelConfigurationId,
@@ -252,7 +252,7 @@ const makeLocalModels = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const invalidations = yield* EffectQueryInvalidations
+  const invalidations = yield* ClientInvalidations
   const query = effectQuery.query(localModelsQuery, undefined)
   const install = effectQuery.mutation(installMutation)
   const cancelDownload = effectQuery.mutation(cancelDownloadMutation)
@@ -276,8 +276,10 @@ const makeLocalModels = Effect.gen(function* () {
   })
   const latestInstallationFailed = Atom.make((get) =>
     get(installationInvocations).at(-1)?.failed ?? false)
-  const invalidate = () => queryClient.invalidate(localModelsQuery.match())
-  yield* invalidations.register(LocalModelsMirror.id, invalidate)
+  yield* invalidations.mirrors(LocalModelsMirror.id).pipe(
+    Stream.runForEach(() => queryClient.invalidate(localModelsQuery.match())),
+    Effect.forkScoped,
+  )
   const state = Atom.make((get) => get(query).result)
   const catalog = Atom.make((get) => Result.map(
     get(state),

@@ -8,7 +8,6 @@ import {
   SessionPageRequestSchema,
   RecentDirectoryPageRequestSchema,
   RecentDirectoryPageSchema,
-  SessionChangeSchema,
   PreloadSessionResult,
   SessionMetadata,
   SessionOptions,
@@ -41,12 +40,6 @@ export const StreamActiveSessionStatuses = makeAcnSubscriptionRpc("StreamActiveS
   payload: Schema.Struct({}),
   success: ActiveSessionStatuses,
   error: SessionError,
-})
-
-export const StreamSessionChanges = makeAcnSubscriptionRpc("StreamSessionChanges", {
-  payload: Schema.Struct({}),
-  success: SessionChangeSchema,
-  error: SessionInspectionUnavailable,
 })
 
 export const CreateSession = Rpc.make("CreateSession", {

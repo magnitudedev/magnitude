@@ -14,8 +14,8 @@ import * as Stream from "./stream"
 import * as LocalInference from "./local-inference"
 import * as Onboarding from "./onboarding"
 import * as ClientLease from "./client-lease"
+import { StreamClientInvalidations } from "./client-invalidation"
 import { AcnRpcDemand } from "./middleware"
-import { WatchMirroredStates } from "./mirrored-state"
 import { AcnRpcRecoveryPolicyTag } from "./recovery-policy"
 
 /**
@@ -32,10 +32,8 @@ import { AcnRpcRecoveryPolicyTag } from "./recovery-policy"
  */
 const AcnSubscriptions = RpcGroup.make(
   Stream.StreamDisplayView,
-  WatchMirroredStates,
+  StreamClientInvalidations,
   Session.StreamActiveSessionStatuses,
-  Session.StreamSessionChanges,
-  Project.StreamProjectChanges,
   ProjectFiles.WatchProjectFiles,
   Files.WatchFile,
 )

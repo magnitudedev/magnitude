@@ -5,6 +5,7 @@ import {
   Layers3,
   Monitor,
   Moon,
+  Settings2,
   SlidersHorizontal,
   Sun,
 } from "lucide-react"
@@ -91,6 +92,7 @@ export interface SessionsSidebarProps {
 }
 
 const settingsSections = [
+  { id: "general", label: "General", icon: Settings2 },
   { id: "models", label: "Models", icon: Layers3 },
   {
     id: "catalog",

@@ -1324,7 +1324,7 @@ function HardwareView(): ReactNode {
 export function ModelSettingsCenter({
   tab,
 }: {
-  readonly tab: Exclude<SettingsTab, "archived">
+  readonly tab: Exclude<SettingsTab, "general" | "archived">
 }): ReactNode {
   return (
     <div

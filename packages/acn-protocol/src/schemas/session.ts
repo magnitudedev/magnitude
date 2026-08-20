@@ -138,10 +138,6 @@ export const RecentDirectoryPageSchema = Schema.Struct({
 })
 export type RecentDirectoryPage = typeof RecentDirectoryPageSchema.Type
 
-/** Invalidation-only session metadata change notification. */
-export const SessionChangeSchema = Schema.Struct({})
-export type SessionChange = typeof SessionChangeSchema.Type
-
 export const ActiveSessionStatus = Schema.Struct({
   sessionId: Schema.String,
   workStatus: Schema.Literal("idle", "working"),

@@ -1,9 +1,9 @@
 import { Atom, Registry } from "@effect-atom/atom-react"
-import { Context, Data, Effect, Layer } from "effect"
+import { Context, Data, Effect, Layer, Stream } from "effect"
 import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import { AcnRpcClientTag, OnboardingMirror } from "@magnitudedev/sdk"
 import { ClientEffectQuery } from "../state/client-effect-query"
-import { EffectQueryInvalidations } from "../state/effect-query-invalidations"
+import { ClientInvalidations } from "../state/client-invalidations"
 
 export class OnboardingPersistenceSynchronizationFailed extends Data.TaggedError(
   "OnboardingPersistenceSynchronizationFailed",
@@ -37,12 +37,13 @@ const makeOnboardingPersistence = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const invalidations = yield* EffectQueryInvalidations
+  const invalidations = yield* ClientInvalidations
   const query = effectQuery.query(onboardingQuery, undefined)
   const mutation = effectQuery.mutation(completeOnboardingMutation)
-  const invalidate = () => queryClient.invalidate(onboardingQuery.match())
-
-  yield* invalidations.register(OnboardingMirror.id, invalidate)
+  yield* invalidations.mirrors(OnboardingMirror.id).pipe(
+    Stream.runForEach(() => queryClient.invalidate(onboardingQuery.match())),
+    Effect.forkScoped,
+  )
 
   return {
     state: Atom.make((get) => get(query).result),

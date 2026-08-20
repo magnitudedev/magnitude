@@ -15,7 +15,7 @@ import {
   type ClientServices,
   type ClientServicesOptions,
 } from "./client-services"
-import { runMirroredStateInvalidationWatch } from "./mirrored-state-invalidation"
+import { makeClientInvalidations } from "./client-invalidations"
 
 export type AgentClientInstance = ReturnType<typeof createAgentClient>
 export type AgentClient = AgentClientInstance
@@ -45,25 +45,35 @@ export function createAgentClient(
     LocalInferenceHardwareMirror.id,
     ProviderModelCatalogMirror.id,
   ]
+  const directMirrorIdSet = new Set<string>(directMirrorIds)
+  const invalidations = Effect.runSync(makeClientInvalidations)
   runtime.addGlobalLayer(Layer.scopedDiscard(Effect.gen(function* () {
     const client = yield* rpc
     const reactivity = yield* Reactivity.Reactivity
-    yield* runMirroredStateInvalidationWatch(
-      client,
-      () => reactivity.invalidate(directMirrorIds),
-      (event) => reactivity.invalidate([event.id]),
-    ).pipe(Effect.forkScoped)
-    // Project and session authorities invalidate independently: each durable
-    // write publishes on exactly one of these invalidation-only streams.
-    const watchInvalidations = <A, E>(
-      label: string,
-      changes: Stream.Stream<A, E>,
-      keys: ReadonlyArray<string>,
-    ) => changes.pipe(
-      Stream.runForEach(() => reactivity.invalidate([...keys])),
+    yield* invalidations.events.pipe(
+      Stream.runForEach((event) => {
+        switch (event._tag) {
+          case "Connected":
+            return reactivity.invalidate([...directMirrorIds, "projects", "sessions"])
+          case "MirroredState":
+            return directMirrorIdSet.has(event.invalidation.id)
+              ? reactivity.invalidate([event.invalidation.id])
+              : Effect.void
+          case "Projects":
+            return reactivity.invalidate(["projects"])
+          case "Sessions":
+            return reactivity.invalidate(["sessions"])
+        }
+      }),
+      Effect.forkScoped,
+    )
+    yield* Stream.unwrap(invalidations.publish({ _tag: "Connected" }).pipe(
+      Effect.as(client("StreamClientInvalidations", {})),
+    )).pipe(
+      Stream.runForEach(invalidations.publish),
       Effect.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
         ? Effect.void
-        : Effect.logWarning(`${label} watch disconnected; retrying`).pipe(
+        : Effect.logWarning("Client invalidation watch disconnected; retrying").pipe(
             Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 1_000) }),
           )),
       Effect.retry(invalidationWatchReconnect),
@@ -72,21 +82,11 @@ export function createAgentClient(
         : Effect.logError(Cause.pretty(cause))),
       Effect.forkScoped,
     )
-    yield* watchInvalidations(
-      "StreamProjectChanges",
-      client("StreamProjectChanges", {}),
-      ["projects"],
-    )
-    yield* watchInvalidations(
-      "StreamSessionChanges",
-      client("StreamSessionChanges", {}),
-      ["sessions"],
-    )
   })).pipe(Layer.provide(rpc.layer)))
   const rpcLayer = Layer.effect(AcnRpcClientTag, rpc).pipe(Layer.provide(rpc.layer))
   const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
     rpcLayer,
-    (client) => clientServicesLayer(client, options),
+    (client) => clientServicesLayer(client, invalidations, options),
   )
   return { rpc, effectQuery }
 }

@@ -41,8 +41,13 @@ import {
   type TimelineScrollAdapter,
   type ActivityKind,
   TRANSCRIPT_LINE_CAP,
+  type LocalModelLoadActivity,
 } from "@magnitudedev/client-common"
-import { RelativePathSchema, normalizeReferencedPath } from "@magnitudedev/sdk"
+import {
+  RelativePathSchema,
+  normalizeReferencedPath,
+  type DisplayRootStatus,
+} from "@magnitudedev/sdk"
 import {
   workspacePanelEnteringAtom,
   workspacePanelOpenAtom,
@@ -74,8 +79,9 @@ import type {
 import { MessageDispatch } from "./messages"
 import { TimelineLoadingState } from "./timeline-loading-state"
 import { ChatEmptyState } from "./chat-empty-state"
-import { DiffHunk } from "./diff-hunk"
 import { chatTimelinePlaceholderState } from "./chat-timeline-state"
+import { InlineWorkActivity } from "./inline-work-activity"
+import { useShowThinking } from "@/stores/conversation-preferences"
 import {
   deriveAssistantResponsePresentation,
   type AssistantResponsePresentation,
@@ -128,11 +134,13 @@ function PathText({
   const setPanelOpen = useAtomSet(workspacePanelOpenAtom)
   const setPanelSurface = useAtomSet(workspacePanelSurfaceAtom)
   const relativePath = normalizeReferencedPath(cwd && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path)
+  if (relativePath === null || projectId === null) {
+    return <span className="text-slate-600 dark:text-slate-400">{displayPath ?? path}</span>
+  }
   return (
     <Button variant="unstyled" size="unstyled"
       type="button"
       onClick={() => {
-        if (relativePath === null || projectId === null) return
         setFilePath({ projectId, path: RelativePathSchema.make(relativePath) })
         if (!panelOpen) setPanelEntering(true)
         setPanelSurface("files")
@@ -312,18 +320,6 @@ function FileWriteStep({ step }: { step: FileWritePresentation }): ReactNode {
           </span>
         )}
       </div>
-      {!step.isScratchpad &&
-        step.diff?.hunks.map((hunk, index) => (
-          <DiffHunk
-            key={`filewrite-${index}`}
-            startLine={hunk.startLine}
-            contextBefore={hunk.contextBefore}
-            removedLines={hunk.removedLines}
-            addedLines={hunk.addedLines}
-            contextAfter={hunk.contextAfter}
-            streamingCursor={hunk.streamingCursor}
-          />
-        ))}
     </div>
   )
 }
@@ -370,18 +366,6 @@ function FileEditStep({ step }: { step: FileEditPresentation }): ReactNode {
           <span className="text-slate-500">...</span>
         ) : null}
       </div>
-      {!step.isScratchpad &&
-        step.diff?.hunks.map((hunk, index) => (
-          <DiffHunk
-            key={`fileedit-${index}`}
-            startLine={hunk.startLine}
-            contextBefore={hunk.contextBefore}
-            removedLines={hunk.removedLines}
-            addedLines={hunk.addedLines}
-            contextAfter={hunk.contextAfter}
-            streamingCursor={hunk.streamingCursor}
-          />
-        ))}
     </div>
   )
 }
@@ -838,39 +822,73 @@ function TimelineEntryView({
       message={message}
       isStreaming={entry.streaming}
       isInterrupted={entry.interrupted}
-      mode={timeline.presentation.mode}
       assistantWorkSummary={message.type === "assistant_message"
         ? assistantResponses.summaryByAssistantId.get(message.id) ?? null
         : null}
-      isLatestAssistant={message.type === "assistant_message"
-        && assistantResponses.latestAssistantId === message.id}
+      assistantResponseFooter={message.type === "assistant_message"
+        ? assistantResponses.footerByAssistantId.get(message.id) ?? null
+        : null}
     />
   )
 }
+
+function isThinkingEntry(
+  timeline: DisplayTimeline,
+  entry: DisplayTimelineEntry,
+): boolean {
+  return entry.kind === "message"
+    && messageForEntry(timeline, entry)?.type === "thinking"
+}
+
+function entryOwnsActivePresentation(
+  timeline: DisplayTimeline,
+  entry: DisplayTimelineEntry | undefined,
+): boolean {
+  if (entry === undefined) return false
+  if (entry.kind === "tool_summary") return entry.summary.running
+  if (entry.kind === "tool_step") return entry.step.running
+  if (entry.kind !== "message") return false
+  const message = messageForEntry(timeline, entry)
+  return (message?.type === "thinking" && message.phase === "active")
+    || (message?.type === "assistant_message" && entry.streaming)
+}
+
 export interface ChatTimelineProps {
   forkId?: string | null
   loadingTitle?: string
   loadingSubtitle?: string | null
   isVisible?: boolean
+  rootStatus?: DisplayRootStatus | null
+  modelLoadActivity?: LocalModelLoadActivity | null
+  modelName?: string | null
 }
 export function ChatTimeline({
   forkId = null,
   loadingTitle,
   loadingSubtitle,
   isVisible = true,
+  rootStatus = null,
+  modelLoadActivity = null,
+  modelName = null,
 }: ChatTimelineProps): ReactNode {
   const timeline = useDisplayState((state) => getFork(state, forkId) ?? null)
   const timelineStatus = useTimelineStatus(forkId)
   const selectedSessionId = useSelectedSessionId()
   const displaySession = useDisplayState((state) => state.session)
   const entries = timeline?.presentation.entries ?? []
+  const showThinking = useShowThinking()
   const assistantResponses = useMemo(
     () => timeline === null ? null : deriveAssistantResponsePresentation(timeline),
     [timeline],
   )
-  const presentedEntries = assistantResponses === null
+  const responseEntries = assistantResponses === null
     ? entries
     : assistantResponses.entries
+  const presentedEntries = timeline === null || showThinking
+    ? responseEntries
+    : responseEntries.filter((entry) => !isThinkingEntry(timeline, entry))
+  const suppressGenericActivity = timeline !== null
+    && entryOwnsActivePresentation(timeline, presentedEntries.at(-1))
   const { isSessionLoading, isEmpty } = chatTimelinePlaceholderState(
     selectedSessionId,
     timelineStatus,
@@ -1044,6 +1062,16 @@ export function ChatTimeline({
                 </div>
               )
             })}
+            {forkId === null ? (
+              <div className="mt-3 pl-3">
+                <InlineWorkActivity
+                  rootStatus={rootStatus}
+                  modelLoadActivity={modelLoadActivity}
+                  modelName={modelName}
+                  suppressGeneric={suppressGenericActivity}
+                />
+              </div>
+            ) : null}
           </>
         )}
       </div>

@@ -27,7 +27,11 @@ const summary: WorkSummaryMessage = {
 describe("AssistantMessage metadata", () => {
   it("places work status before left-aligned icon-only metadata", () => {
     const html = renderToStaticMarkup(
-      <AssistantMessage message={message} workSummary={summary} isLatest />,
+      <AssistantMessage
+        message={message}
+        workSummary={summary}
+        responseFooter={{ content: message.content, timestamp: message.timestamp, isLatest: true }}
+      />,
     )
 
     const response = html.indexOf("Finished")
@@ -45,12 +49,23 @@ describe("AssistantMessage metadata", () => {
 
   it("keeps older metadata in the layout but reveals it only on hover or focus", () => {
     const html = renderToStaticMarkup(
-      <AssistantMessage message={message} workSummary={summary} />,
+      <AssistantMessage
+        message={message}
+        workSummary={summary}
+        responseFooter={{ content: message.content, timestamp: message.timestamp, isLatest: false }}
+      />,
     )
 
     expect(html).toContain("opacity-0")
     expect(html).toContain("group-hover/assistant:opacity-100")
     expect(html).toContain("group-focus-within/assistant:opacity-100")
     expect(html).toContain("Worked for 12 seconds")
+  })
+
+  it("does not reserve metadata space when the response footer belongs elsewhere", () => {
+    const html = renderToStaticMarkup(<AssistantMessage message={message} />)
+
+    expect(html).not.toContain('data-assistant-metadata=""')
+    expect(html).not.toContain('aria-label="Copy response"')
   })
 })

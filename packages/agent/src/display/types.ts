@@ -86,6 +86,7 @@ export const DisplayTimelineStateSchema = Schema.Struct({
   _pendingInboundCommunications: Schema.Array(PendingInboundCommunicationSchema),
   _pendingUserActivityCount: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   _thinkingMessageId: Schema.NullOr(Schema.String),
+  _thinkingRunSequence: Schema.Number,
   _activeToolCallIds: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
   _communicationMessageIdsByStreamId: Schema.optionalWith(Schema.Record({
     key: Schema.String,
