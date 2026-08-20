@@ -9,8 +9,8 @@ import {
 } from "@magnitudedev/ai"
 
 const OptionalNullableText = Schema.optionalWith(
-  Schema.NullOr(Schema.String),
-  { as: "Option", exact: true },
+  Schema.String,
+  { as: "Option", exact: true, nullable: true },
 )
 
 const CustomEndpointChunkDeltaSchema = Schema.extend(
@@ -19,11 +19,11 @@ const CustomEndpointChunkDeltaSchema = Schema.extend(
     reasoning: OptionalNullableText,
     thinking: OptionalNullableText,
     reasoning_details: Schema.optionalWith(
-      Schema.NullOr(Schema.Array(Schema.Struct({
+      Schema.Array(Schema.Struct({
         type: Schema.String,
         text: OptionalNullableText,
-      }))),
-      { as: "Option", exact: true },
+      })),
+      { as: "Option", exact: true, nullable: true },
     ),
   }),
 )
@@ -35,15 +35,14 @@ const CustomEndpointChunkSchema = Schema.Struct(
 type CustomEndpointChunk = Schema.Schema.Type<typeof CustomEndpointChunkSchema>
 
 const nullableText = (
-  value: Option.Option<string | null>,
-): Option.Option<string> => Option.flatMap(value, Option.fromNullable).pipe(
+  value: Option.Option<string>,
+): Option.Option<string> => value.pipe(
   Option.filter((text) => text.length > 0),
 )
 
 const reasoningDetailsText = (
   details: CustomEndpointChunk["choices"][number]["delta"]["reasoning_details"],
 ): Option.Option<string> => Option.flatMap(details, (value) => {
-  if (value === null) return Option.none()
   const text = value
     .filter((detail) => detail.type === "reasoning.text")
     .flatMap((detail) => Option.toArray(nullableText(detail.text)))
@@ -54,7 +53,7 @@ const reasoningDetailsText = (
 const thoughtFrom = (
   chunk: CustomEndpointChunk,
 ): Option.Option<string> => {
-  const standard = Option.fromNullable(chunk.choices[0]?.delta.reasoning_content)
+  const standard = chunk.choices[0]?.delta.reasoning_content ?? Option.none()
   const delta = chunk.choices[0]?.delta
   if (delta === undefined) return standard
 

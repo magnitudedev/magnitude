@@ -535,6 +535,7 @@
         "@magnitudedev/ai": "workspace:*",
         "@magnitudedev/logger": "workspace:*",
         "@magnitudedev/storage": "workspace:*",
+        "@magnitudedev/utils": "workspace:*",
       },
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^5.0.3",

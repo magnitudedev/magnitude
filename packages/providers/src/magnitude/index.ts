@@ -3,6 +3,11 @@ export type { WebSearchError } from "../web-search-error"
 export { createMagnitudeCatalog, toMagnitudeModelInfo, type MagnitudeAuthentication } from "./catalog"
 export { createMagnitudeCompatibleSpec, type MagnitudeCallOptions, type MagnitudeModelSpec, type MagnitudeCompatibleSpecConfig } from "./models"
 export { classifyMagnitudeRejectedResponse, tryParseErrorBody, type ParsedMagnitudeApiError } from "./errors"
-export { MagnitudeModelListResponseSchema, MagnitudeRawModelSchema } from "./contract"
+export {
+  MagnitudeAdditionalOptionsSchema,
+  MagnitudeModelListResponseSchema,
+  MagnitudeRawModelSchema,
+  TurnConstraintsSchema,
+} from "./contract"
 export type { MagnitudeModelInfo, MagnitudeRawModel, ModelListResponse, ToolChoice, MagnitudeAdditionalOptions, MagnitudeApiError, MagnitudeErrorType, MagnitudeErrorCode, MagnitudeErrorDetails, UsageLimitDetails, SubscriptionRequiredDetails, BillingWindowBudget, BillingWindowName, ProSubscriptionStatus, ReasoningEffort, ModelPricingInfo } from "./contract"
 export type { CloudUsageResponse, UsagePeriod } from "./usage"

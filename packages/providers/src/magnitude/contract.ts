@@ -12,6 +12,7 @@ import { Schema } from "effect"
 import { ProviderModelIdSchema } from "@magnitudedev/ai"
 
 export type { ReasoningEffort, ModelPricingInfo } from "@magnitudedev/ai"
+export type { ToolChoice } from "@magnitudedev/ai"
 export type { ProviderModelCapabilities as ModelCapabilities } from "@magnitudedev/ai"
 
 /**
@@ -69,47 +70,26 @@ export const MagnitudeModelListResponseSchema = Schema.Struct({
 })
 export type ModelListResponse = Schema.Schema.Type<typeof MagnitudeModelListResponseSchema>
 
-export type ToolChoice =
-  | "none"
-  | "auto"
-  | "required"
-  | NamedFunctionToolChoice
-  | AllowedToolsToolChoice
-  | GrammarToolChoice
+export const TurnConstraintsSchema = Schema.Struct({
+  message: Schema.optionalWith(
+    Schema.Literal("force", "allow", "forbid"),
+    { as: "Option", exact: true },
+  ),
+})
 
-export type NamedFunctionToolChoice = {
-  type: "function"
-  function: { name: string }
-}
+export type TurnConstraints = Schema.Schema.Type<typeof TurnConstraintsSchema>
 
-export type AllowedToolsToolChoice = {
-  type: "allowed_tools"
-  allowed_tools: {
-    mode: "auto" | "required"
-    tools: Array<{ type: "function"; function: { name: string } }>
-  }
-}
+export const MagnitudeAdditionalOptionsSchema = Schema.Struct({
+  traits: Schema.optionalWith(Schema.Array(Schema.String), { as: "Option", exact: true }),
+  forceTrait: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  turn_constraints: Schema.optionalWith(TurnConstraintsSchema, { as: "Option", exact: true }),
+  session_id: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  agent_id: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  include_raw: Schema.optionalWith(Schema.Boolean, { as: "Option", exact: true }),
+  prefer_provider: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+})
 
-export type GrammarToolChoice = {
-  type: "grammar"
-  grammar: string
-}
-
-export type TurnConstraintMessage = "force" | "allow" | "forbid"
-
-export type TurnConstraints = {
-  message?: TurnConstraintMessage
-}
-
-export type MagnitudeAdditionalOptions = {
-  traits?: string[]
-  forceTrait?: string
-  turn_constraints?: TurnConstraints
-  session_id?: string
-  agent_id?: string
-  include_raw?: boolean
-  prefer_provider?: string
-}
+export type MagnitudeAdditionalOptions = Schema.Schema.Type<typeof MagnitudeAdditionalOptionsSchema>
 
 export type {
   BillingWindowBudget,

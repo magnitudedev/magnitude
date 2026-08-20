@@ -1,11 +1,99 @@
 import { FetchHttpClient } from "@effect/platform"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
+import { PromptBuilder, ProviderModelIdSchema } from "@magnitudedev/ai"
 import { Cause, Chunk, Effect, Fiber, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { createMagnitudeProvider } from "./provider"
 
 describe("Magnitude provider authentication", () => {
+  it("Schema-encodes provider-specific bind options into the request", async () => {
+    let requestBody: unknown
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        requestBody = await request.json()
+        return new Response("data: [DONE]\n\n", {
+          headers: { "content-type": "text/event-stream" },
+        })
+      },
+    })
+
+    try {
+      const instance = createMagnitudeProvider({
+        apiKey: "test-key",
+        endpoint: `http://127.0.0.1:${server.port}`,
+        sessionId: "session-1",
+      })
+      const model = await Effect.runPromise(instance.provider.bindModel(
+        ProviderModelIdSchema.make("test-model"),
+        {
+          agentId: "agent-1",
+          traits: ["careful"],
+          preferProvider: "preferred",
+        },
+      ))
+
+      await Effect.runPromise(model.stream(
+        PromptBuilder.empty().user("hello").build(),
+        [],
+        {},
+      ).pipe(Effect.provide(FetchHttpClient.layer)))
+
+      expect(requestBody).toMatchObject({
+        magnitude_additional_options: {
+          agent_id: "agent-1",
+          traits: ["careful"],
+          prefer_provider: "preferred",
+          session_id: "session-1",
+        },
+      })
+      expect(requestBody).not.toHaveProperty(
+        "magnitude_additional_options.forceTrait",
+      )
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  it("preserves omission of empty bind metadata", async () => {
+    let requestBody: unknown
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        requestBody = await request.json()
+        return new Response("data: [DONE]\n\n", {
+          headers: { "content-type": "text/event-stream" },
+        })
+      },
+    })
+
+    try {
+      const instance = createMagnitudeProvider({
+        apiKey: "test-key",
+        endpoint: `http://127.0.0.1:${server.port}`,
+        sessionId: "",
+      })
+      const model = await Effect.runPromise(instance.provider.bindModel(
+        ProviderModelIdSchema.make("test-model"),
+        { agentId: "", preferProvider: "" },
+      ))
+
+      await Effect.runPromise(model.stream(
+        PromptBuilder.empty().user("hello").build(),
+        [],
+        {},
+      ).pipe(Effect.provide(FetchHttpClient.layer)))
+
+      expect(requestBody).toMatchObject({ magnitude_additional_options: {} })
+      expect(requestBody).not.toHaveProperty("magnitude_additional_options.agent_id")
+      expect(requestBody).not.toHaveProperty("magnitude_additional_options.prefer_provider")
+      expect(requestBody).not.toHaveProperty("magnitude_additional_options.session_id")
+    } finally {
+      server.stop(true)
+    }
+  })
+
   it("represents missing authentication through each operation's typed failure channel", async () => {
     const instance = createMagnitudeProvider({ apiKey: " " })
 

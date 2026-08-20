@@ -1,9 +1,9 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Data, Effect, Schema } from "effect"
+import { Array as EffectArray, Data, Effect, Schema } from "effect"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { homedir } from "node:os"
-import type { ChatMessage, ChatTool } from "@magnitudedev/ai"
+import type { ChatCompletionsRequestMessage, ChatTool } from "@magnitudedev/ai"
 import type { ExpectedToolCall, Fixture } from "./domain"
 import { digestObject, sha256 } from "./hash"
 
@@ -159,10 +159,10 @@ function toolsFrom(record: Record<string, unknown>): readonly ChatTool[] {
   })
 }
 
-function messagesFrom(record: Record<string, unknown>): readonly ChatMessage[] {
+function messagesFrom(record: Record<string, unknown>): readonly ChatCompletionsRequestMessage[] {
   const turns = Array.isArray(record.question) ? record.question : []
   const first = Array.isArray(turns[0]) ? turns[0] : turns
-  return first.flatMap((item): ChatMessage[] => {
+  return first.flatMap((item): ChatCompletionsRequestMessage[] => {
     if (!item || typeof item !== "object") return []
     const message = item as Record<string, unknown>
     if (message.role === "system" && typeof message.content === "string") return [{ role: "system", content: message.content }]
@@ -206,8 +206,13 @@ function materialize(
     type: "function" as const,
     function: { name: call.name, arguments: JSON.stringify(canonicalArguments(call)) },
   }))
-  const canonicalAssistant: ChatMessage = { role: "assistant", content: null, tool_calls: toolCalls }
-  const canonicalToolMessages: readonly ChatMessage[] = toolCalls.map((call) => ({
+  if (!EffectArray.isNonEmptyArray(toolCalls)) return undefined
+  const canonicalAssistant: ChatCompletionsRequestMessage = {
+    role: "assistant",
+    content: "",
+    tool_calls: toolCalls,
+  }
+  const canonicalToolMessages: readonly ChatCompletionsRequestMessage[] = toolCalls.map((call) => ({
     role: "tool" as const,
     tool_call_id: call.id,
     content: JSON.stringify({ ok: true, tool: call.function.name, arguments: JSON.parse(call.function.arguments) }),

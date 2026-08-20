@@ -54,7 +54,7 @@ export const standardChatCompletionChunkDecoder: ChatCompletionChunkDecoder = {
       decodeChatCompletionsPayload(ChatCompletionsStreamChunk, payload, raw)),
     Effect.map((chunk) => normalizeChatCompletionsChunk(
       chunk,
-      Option.fromNullable(chunk.choices[0]?.delta.reasoning_content),
+      chunk.choices[0]?.delta.reasoning_content ?? Option.none(),
     )),
   ),
 }

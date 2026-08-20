@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest"
-import { Stream, Effect, Chunk, Option } from "effect"
+import { Stream, Effect, Chunk, Option, Schema } from "effect"
 import { decode } from "../decode"
 import { acceptedHttpResponse, type StreamFailureContext } from "../../../errors/failure"
-import type { ChatCompletionsStreamChunk } from "../../../wire/chat-completions"
+import { ChatCompletionsStreamChunk } from "../../../wire/chat-completions"
 import { normalizeChatCompletionsChunk } from "../chunk"
 import type { ResponseStreamEvent } from "../../../response/events"
 
@@ -10,22 +10,24 @@ import type { ResponseStreamEvent } from "../../../response/events"
 // Helpers
 // ---------------------------------------------------------------------------
 
-function chunkFromData(data: Partial<ChatCompletionsStreamChunk>): ChatCompletionsStreamChunk {
-  return {
+type ChatCompletionsStreamChunkWire = Schema.Schema.Encoded<typeof ChatCompletionsStreamChunk>
+
+function chunkFromData(data: Partial<ChatCompletionsStreamChunkWire>): ChatCompletionsStreamChunk {
+  return Schema.decodeUnknownSync(ChatCompletionsStreamChunk)({
     id: data.id ?? "chatcmpl-test",
     object: data.object ?? "chat.completion.chunk",
     created: data.created ?? 1234567890,
     model: data.model ?? "test-model",
     choices: data.choices ?? [],
-    usage: data.usage,
-    error: data.error,
-  } as ChatCompletionsStreamChunk
+    ...(data.usage === undefined ? {} : { usage: data.usage }),
+    ...(data.error === undefined ? {} : { error: data.error }),
+  })
 }
 
 const normalized = (chunk: ChatCompletionsStreamChunk) =>
   normalizeChatCompletionsChunk(
     chunk,
-    Option.fromNullable(chunk.choices[0]?.delta.reasoning_content),
+    chunk.choices[0]?.delta.reasoning_content ?? Option.none(),
   )
 
 function textChunk(content: string) {
@@ -151,7 +153,7 @@ describe("decode — mid-stream error envelope", () => {
         choices: [],
         // Only required field: message; type, code, param all optional
         error: { message: "something went wrong" },
-      } as Partial<ChatCompletionsStreamChunk> as ChatCompletionsStreamChunk)),
+      })),
     ])
 
     const { events } = decode(chunks, {
