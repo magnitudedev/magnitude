@@ -2,7 +2,7 @@ import { createElement } from "react"
 import { act, create, type ReactTestRenderer } from "react-test-renderer"
 import { Atom, RegistryContext } from "@effect-atom/atom-react"
 import * as Registry from "@effect-atom/atom/Registry"
-import { Context, Deferred, Effect, Layer, PubSub, Stream } from "effect"
+import { Context, Effect, Layer } from "effect"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import { describe, expect, it } from "vitest"
 import {
@@ -13,6 +13,7 @@ import {
 } from "../index"
 import { AcnRpcClientTag, type AcnRpcClient, type LocalModelsState } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
+import { makeClientInvalidations } from "../state/client-invalidations"
 
 const localModelsState: LocalModelsState = {
   inventoryState: { _tag: "Ready" },
@@ -31,12 +32,10 @@ let nextFakeAgentClientId = 0
 
 const makeFakeAgentClient = (
   onGetLocalModels: () => void,
-  onWatchMirroredStates: () => void,
   options?: {
     readonly getLocalModels?: () => Effect.Effect<unknown, unknown>
-    readonly watchMirroredStates?: () => Stream.Stream<unknown, unknown>
   },
-): AgentClientInstance => {
+) => {
   const FakeAgentClient = Context.GenericTag<FakeRpcClient>(
     `FakeAgentClient-${nextFakeAgentClientId++}`,
   )
@@ -45,17 +44,14 @@ const makeFakeAgentClient = (
       onGetLocalModels()
       return options?.getLocalModels?.() ?? Effect.succeed({ state: localModelsState })
     }
-    if (tag === "WatchMirroredStates") {
-      onWatchMirroredStates()
-      return options?.watchMirroredStates?.() ?? Stream.never
-    }
     return Effect.dieMessage(`Unexpected RPC in local-model lifecycle test: ${tag}`)
   }
   const layer = Layer.succeed(FakeAgentClient, service)
   const runtime = Atom.runtime(layer)
+  const invalidations = Effect.runSync(makeClientInvalidations)
   const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
     Layer.succeed(AcnRpcClientTag, service as unknown as AcnRpcClient),
-    (client) => clientServicesLayer(client),
+    (client) => clientServicesLayer(client, invalidations),
   )
   const mutation = () => Atom.fn(() => Effect.void)
   const tag = Object.assign(FakeAgentClient, {
@@ -64,7 +60,10 @@ const makeFakeAgentClient = (
     mutation,
     effectQuery,
   })
-  return { rpc: tag, effectQuery } as unknown as AgentClientInstance
+  return {
+    client: { rpc: tag, effectQuery } as unknown as AgentClientInstance,
+    invalidations,
+  }
 }
 
 const selectModels = (state: LocalModelsState) => state.models
@@ -101,8 +100,7 @@ const renderHarness = (
 describe("local model query lifecycle", () => {
   it("does not refetch GetLocalModels when switching menu consumers", async () => {
     let calls = 0
-    let watches = 0
-    const client = makeFakeAgentClient(() => calls++, () => watches++)
+    const { client } = makeFakeAgentClient(() => calls++)
     const registry = Registry.make({ defaultIdleTTL: 5_000 })
     let renderer!: ReactTestRenderer
 
@@ -110,14 +108,12 @@ describe("local model query lifecycle", () => {
       renderer = create(renderHarness(registry, client, "models"))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
-    expect(watches).toBe(1)
     expect(calls).toBe(1)
 
     await act(async () => {
       renderer.update(renderHarness(registry, client, "catalog"))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
-    expect(watches).toBe(1)
     expect(calls).toBe(1)
 
     await act(async () => {
@@ -131,23 +127,12 @@ describe("local model query lifecycle", () => {
 
   it("keeps invalidation subscribed after the initial GetLocalModels request fails", async () => {
     let calls = 0
-    let watches = 0
-    const watchConnected = Effect.runSync(Deferred.make<void>())
-    const invalidations = Effect.runSync(PubSub.unbounded<{
-      readonly _tag: "changed"
-      readonly id: string
-      readonly revision: number
-    }>())
-    const client = makeFakeAgentClient(
+    const { client, invalidations } = makeFakeAgentClient(
       () => calls++,
-      () => watches++,
       {
         getLocalModels: () => calls === 1
           ? Effect.fail("temporarily unavailable")
           : Effect.succeed({ state: localModelsState }),
-        watchMirroredStates: () => Stream.unwrap(Deferred.await(watchConnected).pipe(
-          Effect.as(Stream.fromPubSub(invalidations)),
-        )),
       },
     )
     const registry = Registry.make({ defaultIdleTTL: 5_000 })
@@ -157,31 +142,31 @@ describe("local model query lifecycle", () => {
       renderer = create(renderHarness(registry, client, "models"))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
-    expect(watches).toBe(1)
     expect(calls).toBe(1)
-
-    await act(async () => {
-      await Effect.runPromise(Deferred.succeed(watchConnected, undefined))
-      await Effect.runPromise(Effect.sleep("10 millis"))
-    })
     const callsBeforeInvalidation = calls
 
     await act(async () => {
-      await Effect.runPromise(PubSub.publish(invalidations, {
-        _tag: "changed",
-        id: "GetModelSlots",
-        revision: 1,
-      } as const))
+      await Effect.runPromise(invalidations.publish({
+        _tag: "MirroredState",
+        invalidation: {
+          _tag: "changed",
+          id: "GetModelSlots",
+          revision: 1,
+        },
+      }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation)
 
     await act(async () => {
-      await Effect.runPromise(PubSub.publish(invalidations, {
-        _tag: "changed",
-        id: "GetLocalModels",
-        revision: 2,
-      } as const))
+      await Effect.runPromise(invalidations.publish({
+        _tag: "MirroredState",
+        invalidation: {
+          _tag: "changed",
+          id: "GetLocalModels",
+          revision: 2,
+        },
+      }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation + 1)

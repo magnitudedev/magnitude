@@ -166,13 +166,16 @@ function forgetCommunicationMessage(
 }
 
 /**
- * Release the fork's active thinking message: flush its held buffer into it,
- * drop it if it ends up empty. The message is located by `_thinkingMessageId`
- * alone — the fork state is the locator.
+ * Complete the fork's contiguous thinking run at an authoritative event
+ * timestamp. A provider-level thinking_end keeps the locator so an adjacent
+ * thought block can resume the same run; a visible timeline boundary releases
+ * it. Empty/suppressed runs never remain in history.
  */
-function releaseActiveThinking(
+function completeActiveThinking(
   messages: DisplayTimelineMessagesHandle,
-  fork: DisplayTimelineState
+  fork: DisplayTimelineState,
+  timestamp: number,
+  release: boolean,
 ) {
   const thinkingMessageId = fork._thinkingMessageId
   if (!thinkingMessageId) return Effect.succeed(fork)
@@ -183,7 +186,14 @@ function releaseActiveThinking(
       if (msg.type !== 'thinking') return msg
       const held = flushHeld(msg.id)
       emptied = msg.content === '' && held === ''
-      return held === '' ? msg : { ...msg, content: msg.content + held }
+      return {
+        ...msg,
+        content: held === '' ? msg.content : msg.content + held,
+        phase: 'completed' as const,
+        completedAt: msg.phase === 'completed' && Option.isSome(msg.completedAt)
+          ? msg.completedAt
+          : Option.some(timestamp),
+      }
     })
     const index = emptied
       ? yield* messages.removeById(flushed, thinkingMessageId)
@@ -192,9 +202,17 @@ function releaseActiveThinking(
     return {
       ...fork,
       messages: index,
-      _thinkingMessageId: null,
+      _thinkingMessageId: emptied || release ? null : thinkingMessageId,
     }
   })
+}
+
+function releaseActiveThinking(
+  messages: DisplayTimelineMessagesHandle,
+  fork: DisplayTimelineState,
+  timestamp: number,
+) {
+  return completeActiveThinking(messages, fork, timestamp, true)
 }
 
 /** Finalize the fork's open tool messages, located by `_activeToolCallIds`. */
@@ -266,6 +284,7 @@ function stopActiveFork(
     mode: 'idle' as const,
     streamingMessageId: null,
     _thinkingMessageId: null,
+    _thinkingRunSequence: 0,
     _activeToolCallIds: [],
     _communicationMessageIdsByStreamId: {},
   }
@@ -454,6 +473,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
     _currentTurnId: null,
     streamingMessageId: null,
     _thinkingMessageId: null,
+    _thinkingRunSequence: 0,
     _activeToolCallIds: [],
     _communicationMessageIdsByStreamId: {},
     _forkActivityMessageIdsByForkId: {},
@@ -552,7 +572,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
     },
 
     turn_started: ({ event, fork, addressed }) => Effect.gen(function* () {
-      let stateWithMessages = yield* releaseActiveThinking(addressed.messages, fork)
+      let stateWithMessages = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
 
       if (stateWithMessages._pendingUserActivityCount > 0) {
         // Pending user activity is by invariant the tail suffix. Promote
@@ -593,7 +613,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
         timestamp: event.timestamp
       }
 
-      const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork)
+      const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
       const withMessage = yield* insertMessageIntoFork(addressed.messages, forkWithFlushedThinking, assistantMessage)
 
       const nextFork = {
@@ -641,6 +661,40 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
       return { ...fork, streamingMessageId: null }
     }),
 
+    thinking_start: ({ event, fork, addressed }) => Effect.gen(function* () {
+      if (fork._currentTurnId !== event.turnId) return fork
+
+      if (fork._thinkingMessageId) {
+        const thinkingMessageId = fork._thinkingMessageId
+        const messages = yield* addressed.messages.updateById(
+          fork.messages,
+          thinkingMessageId,
+          (msg) => msg.type === 'thinking'
+            ? { ...msg, phase: 'active' as const, completedAt: Option.none<number>() }
+            : msg,
+        )
+        return { ...fork, messages }
+      }
+
+      const sequence = fork._thinkingRunSequence + 1
+      const thinkingMessageId = `thinking:${event.turnId}:${sequence}`
+      const message: ThinkingMessage = {
+        id: thinkingMessageId,
+        type: 'thinking',
+        content: '',
+        label: Option.none(),
+        phase: 'active',
+        completedAt: Option.none<number>(),
+        timestamp: event.timestamp,
+      }
+      const nextFork = yield* insertMessageIntoFork(addressed.messages, fork, message)
+      return {
+        ...nextFork,
+        _thinkingMessageId: thinkingMessageId,
+        _thinkingRunSequence: sequence,
+      }
+    }),
+
     thinking_chunk: ({ event, fork, addressed }) => Effect.gen(function* () {
       if (fork._currentTurnId !== event.turnId) return fork
 
@@ -663,7 +717,12 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
 
             if (contentToAppend === '') return msg
 
-            const updated = { ...msg, content: msg.content + contentToAppend }
+            const updated = {
+              ...msg,
+              content: msg.content + contentToAppend,
+              phase: 'active' as const,
+              completedAt: Option.none<number>(),
+            }
             nextContentLength = updated.content.length
             return updated
           }
@@ -685,12 +744,15 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
         return { ...fork, messages }
       }
 
-      const stepId = `thinking:${event.turnId}`
+      const sequence = fork._thinkingRunSequence + 1
+      const stepId = `thinking:${event.turnId}:${sequence}`
       const tempStep: ThinkingMessage = {
         id: stepId,
         type: 'thinking',
         content: '',
         label: Option.none(),
+        phase: 'active',
+        completedAt: Option.none<number>(),
         timestamp: event.timestamp,
       }
       const { contentToAppend, shouldSuppress } = processThinkingChunk(tempStep, event.text)
@@ -706,10 +768,16 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
           type: 'thinking',
           content: '',
           label: Option.none(),
+          phase: 'active',
+          completedAt: Option.none<number>(),
           timestamp: event.timestamp,
         }
         const nextFork = yield* insertMessageIntoFork(addressed.messages, fork, thinkingMsg)
-        return { ...nextFork, _thinkingMessageId: stepId }
+        return {
+          ...nextFork,
+          _thinkingMessageId: stepId,
+          _thinkingRunSequence: sequence,
+        }
       }
 
       const thinkingMsg: ThinkingMessage = {
@@ -717,12 +785,23 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
         type: 'thinking',
         content: contentToAppend,
         label: Option.none(),
+        phase: 'active',
+        completedAt: Option.none<number>(),
         timestamp: event.timestamp,
       }
       const withMessage = yield* insertMessageIntoFork(addressed.messages, fork, thinkingMsg)
-      const withThinking = { ...withMessage, _thinkingMessageId: stepId }
+      const withThinking = {
+        ...withMessage,
+        _thinkingMessageId: stepId,
+        _thinkingRunSequence: sequence,
+      }
       return withThinking
     }),
+
+    thinking_end: ({ event, fork, addressed }) => {
+      if (fork._currentTurnId !== event.turnId) return fork
+      return completeActiveThinking(addressed.messages, fork, event.timestamp, false)
+    },
 
     tool_event: ({ event, fork, read, emit, addressed }) => Effect.gen(function* () {
       const inner = event.event
@@ -746,7 +825,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
               resultFilePath: Option.none(),
               timestamp: event.timestamp,
             }
-            const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork)
+            const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
             const withMessage = yield* insertMessageIntoFork(addressed.messages, forkWithFlushedThinking, toolMsg)
             const withMessages = addActiveToolProducer(
               {
@@ -772,7 +851,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
             resultFilePath: Option.none(),
             timestamp: event.timestamp,
           }
-          const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork)
+          const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
           const withMessage = yield* insertMessageIntoFork(addressed.messages, forkWithFlushedThinking, toolMsg)
           const withMessages = addActiveToolProducer(
             { ...withMessage, _thinkingMessageId: null },
@@ -865,8 +944,13 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
       if (fork._currentTurnId !== event.turnId) return fork
 
       if (event.outcome._tag === 'Completed' && outcomeWillChainContinue(event.outcome)) {
+        const completedThinking = yield* releaseActiveThinking(
+          addressed.messages,
+          fork,
+          event.timestamp,
+        )
         const nextFork = {
-          ...fork,
+          ...completedThinking,
           _thinkingMessageId: null,
           _activeToolCallIds: [],
           _communicationMessageIdsByStreamId: {}
@@ -888,7 +972,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
           style: 'dim' as const,
           timestamp: event.timestamp,
         }
-        const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork)
+        const forkWithFlushedThinking = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
         const withFinalizedTools = yield* finalizeActiveToolMessages(
           addressed.messages,
           forkWithFlushedThinking,
@@ -906,7 +990,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
 
       if (event.outcome._tag === 'Overthinking') {
         const harnessState = read(HarnessStateProjection)
-        const released = yield* releaseActiveThinking(addressed.messages, fork)
+        const released = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
         const withFinalizedTools = yield* finalizeActiveToolMessages(
           addressed.messages,
           released,
@@ -934,7 +1018,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
       }
 
       const harnessState = read(HarnessStateProjection)
-      const cleanedState = yield* releaseActiveThinking(addressed.messages, fork)
+      const cleanedState = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
       const withFinalizedTools = yield* finalizeActiveToolMessages(
         addressed.messages,
         cleanedState,
@@ -1047,7 +1131,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
         (toolCallId) => harnessState.handles.handles.get(toolCallId),
       )
 
-      const cleanedState = yield* releaseActiveThinking(addressed.messages, stateWithInterruptedTools)
+      const cleanedState = yield* releaseActiveThinking(addressed.messages, stateWithInterruptedTools, event.timestamp)
 
       // Restore queued messages to the composer, retain completed user bash
       // activity in history, then append the interrupted marker.
@@ -1087,7 +1171,7 @@ export const DisplayTimelineProjection = Projection.defineForked<AppEvent>()({
       if (event.forkId === null) return fork
 
       return Effect.gen(function* () {
-        const forkWithFlush = yield* releaseActiveThinking(addressed.messages, fork)
+        const forkWithFlush = yield* releaseActiveThinking(addressed.messages, fork, event.timestamp)
         const commMsg: AgentCommunicationMessage = {
           id: `agent_created:${event.agentId}:message`,
           type: 'agent_communication',

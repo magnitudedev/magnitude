@@ -44,6 +44,7 @@ import { ProjectInspector } from "./project-inspector";
 import { ProjectManager } from "./project-manager";
 import { ProjectStore } from "./project-store";
 import { SessionInspector } from "./session-inspector";
+import { mergeClientInvalidations } from "./client-invalidations";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -281,12 +282,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
       StreamActiveSessionStatuses: () => activeSessionStatuses.stream,
 
-      StreamSessionChanges: () =>
-        observeRpcStreamDefects(
-          "StreamSessionChanges",
-          sessionInspector.changes.pipe(Stream.as({}))
-        ),
-
       GetSession: ({ sessionId }: { sessionId: string }) =>
         observeRpcDefects("GetSession", sessionInspector.get(sessionId)),
 
@@ -328,12 +323,6 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
 
       InspectProject: ({ projectId }) =>
         observeRpcDefects("InspectProject", projectInspector.inspect(projectId)),
-
-      StreamProjectChanges: () =>
-        observeRpcStreamDefects(
-          "StreamProjectChanges",
-          projectStore.changes.pipe(Stream.as({})),
-        ),
 
       ListProjectDirectory: ({ projectId, directory }) =>
         observeRpcDefects("ListProjectDirectory", projectFiles.listDirectory(projectId, directory)),
@@ -459,10 +448,14 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       GetLocalModels: () =>
         observeRpcDefects("GetLocalModels", localModels.snapshot),
 
-      WatchMirroredStates: () =>
+      StreamClientInvalidations: () =>
         observeRpcStreamDefects(
-          "WatchMirroredStates",
-          mirroredStateChanges.stream,
+          "StreamClientInvalidations",
+          mergeClientInvalidations({
+            mirrors: mirroredStateChanges.stream,
+            projects: projectStore.changes,
+            sessions: sessionInspector.changes,
+          }),
         ),
 
       ReconcileCatalogModel: ({ modelId, variantId }) =>

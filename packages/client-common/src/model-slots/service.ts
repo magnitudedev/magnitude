@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { Context, Data, Effect, Layer, Option } from "effect"
+import { Context, Data, Effect, Layer, Option, Stream } from "effect"
 import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import {
   AcnRpcClientTag,
@@ -14,7 +14,7 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
-import { EffectQueryInvalidations } from "../state/effect-query-invalidations"
+import { ClientInvalidations } from "../state/client-invalidations"
 
 export class ModelSlotSynchronizationFailed extends Data.TaggedError(
   "ModelSlotSynchronizationFailed",
@@ -184,7 +184,7 @@ const makeModelSlots = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const invalidations = yield* EffectQueryInvalidations
+  const invalidations = yield* ClientInvalidations
   const query = effectQuery.query(modelSlotsQuery, undefined)
   const assign = effectQuery.mutation(assignMutation)
   const clear = effectQuery.mutation(clearMutation)
@@ -202,8 +202,10 @@ const makeModelSlots = Effect.gen(function* () {
       pending: Result.isWaiting(result),
     }),
   })
-  const invalidate = () => queryClient.invalidate(modelSlotsQuery.match())
-  yield* invalidations.register(ModelSlotsMirror.id, invalidate)
+  yield* invalidations.mirrors(ModelSlotsMirror.id).pipe(
+    Stream.runForEach(() => queryClient.invalidate(modelSlotsQuery.match())),
+    Effect.forkScoped,
+  )
   const state = Atom.make((get) => get(query).result)
   const selections = Atom.make((get) => Result.map(get(state), ({ state: current }) => ({
     primary: presentedSlotSelection(current, get(assignments), PRIMARY_SLOT_ID),

@@ -18,11 +18,9 @@ import {
   ProjectInspectionSchema,
   ProjectPageRequestSchema,
   ProjectPageSchema,
-  ProjectChangeSchema,
   ProjectIdSchema,
   ProjectSchema,
 } from "../schemas/project"
-import { makeAcnSubscriptionRpc } from "./subscription"
 
 export const ListProjects = Rpc.make("ListProjects", {
   payload: ProjectPageRequestSchema,
@@ -68,10 +66,4 @@ export const InspectProject = Rpc.make("InspectProject", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: ProjectInspectionSchema,
   error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable),
-})
-
-export const StreamProjectChanges = makeAcnSubscriptionRpc("StreamProjectChanges", {
-  payload: Schema.Struct({}),
-  success: ProjectChangeSchema,
-  error: ProjectStoreUnavailable,
 })

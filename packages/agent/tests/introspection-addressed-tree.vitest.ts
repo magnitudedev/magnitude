@@ -24,6 +24,7 @@ const displayTimelineState = (
   _pendingInboundCommunications: [],
   _pendingUserActivityCount: 0,
   _thinkingMessageId: null,
+  _thinkingRunSequence: 0,
   _activeToolCallIds: [],
   _communicationMessageIdsByStreamId: {},
   _forkActivityMessageIdsByForkId: {},

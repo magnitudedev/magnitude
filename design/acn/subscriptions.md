@@ -7,6 +7,11 @@ applies_to:
   - packages/sdk/src/acn-jit/acn-subscription-protocol.ts
   - packages/sdk/src/jit-rpc/recovering-stream-protocol.ts
   - packages/acn/src/display-view-streams.ts
+  - packages/acn/src/client-invalidations.ts
+  - packages/client-common/src/state/client-invalidations.ts
+  - packages/client-common/src/state/agent-client.ts
+  - packages/acn-protocol/src/rpcs/client-invalidation.ts
+  - packages/acn-protocol/src/schemas/client-invalidation.ts
 ---
 
 # ACN subscriptions
@@ -14,6 +19,11 @@ applies_to:
 An ACN subscription is caller-owned observation. Opening one never starts product work or retains
 ACN or a session runtime. Domain handlers and consumers see only payload values; framing remains a
 transport concern.
+
+Connection-global invalidations for mirrors, Projects, and sessions share one subscription. The
+transport tags each notification with its independent domain identity; client fan-out invalidates
+only that domain's canonical cache. Multiplexing notifications neither combines their state nor
+creates a cross-domain authority.
 
 | Frame | Meaning |
 | --- | --- |
@@ -49,4 +59,5 @@ a closed transport. Session suspension follows the same lock/delivery discipline
 - Session unload preserves observation and last accepted state.
 - Reconnection obtains current truth rather than replaying controls as history.
 - One observer's cancellation cannot affect another observer or domain state.
+- Connection-global invalidations consume one transport subscription without mixing cache authority.
 - Subscriber backpressure cannot retain ACN shutdown.

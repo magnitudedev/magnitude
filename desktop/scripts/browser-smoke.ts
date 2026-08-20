@@ -109,20 +109,22 @@ if (composerSendQa) {
     cp(join(sourceDataDir, "local-inference"), join(qaDataDir, "local-inference"), { recursive: true }),
     cp(join(sourceDataDir, "llamacpp"), join(qaDataDir, "llamacpp"), { recursive: true }),
   ])
-  await mkdir(join(qaDataDir, "models"), { recursive: true })
-  await Promise.all([
-    copyFile(
-      join(sourceDataDir, "models", "catalog-affiliations.json"),
-      join(qaDataDir, "models", "catalog-affiliations.json"),
-    ),
-    symlink(join(sourceDataDir, "models", "hub"), join(qaDataDir, "models", "hub"), "dir"),
-  ])
+  const sourceModelHub = join(sourceDataDir, "models", "hub")
+  const qaModelHub = join(qaDataDir, "models", "hub")
+  await mkdir(qaModelHub, { recursive: true })
+  await copyFile(
+    join(sourceDataDir, "models", "catalog-affiliations.json"),
+    join(qaDataDir, "models", "catalog-affiliations.json"),
+  )
+  await Promise.all((await readdir(sourceModelHub)).map((entry) =>
+    symlink(join(sourceModelHub, entry), join(qaModelHub, entry), "dir")
+  ))
   const now = Date.now()
   await writeFile(join(qaDataDir, "state", "projects.json"), JSON.stringify({
     projects: [{
       projectId: "attachment-qa-project",
       name: "composer-attachments",
-      sourceDirectory: attachmentRoot,
+      cwd: attachmentRoot,
       registrationState: "active",
       createdAt: now,
       updatedAt: now,
@@ -134,6 +136,7 @@ const require = createRequire(import.meta.url)
 const electronExecutable = require("electron") as string
 let browser: Browser | null = null
 let electronProcess: ChildProcess | null = null
+let electronInspectorPort: number | null = null
 const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
 
 async function withTimeout<T>(label: string, promise: Promise<T>, timeout = 10_000): Promise<T> {
@@ -196,6 +199,11 @@ async function waitForFile(path: string, timeout = 30_000): Promise<void> {
   throw new Error(`Timed out waiting for downloaded file: ${path}`)
 }
 
+async function signalFixtureProcesses(signal: "TERM" | "KILL"): Promise<void> {
+  const process = spawn("pkill", [`-${signal}`, "-f", tempRoot], { stdio: "ignore" })
+  await new Promise<void>((resolve) => process.once("exit", () => resolve()))
+}
+
 async function evaluateInElectronMain(port: number, expression: string): Promise<void> {
   const deadline = Date.now() + 30_000
   let inspectorUrl: string | undefined
@@ -241,6 +249,7 @@ async function evaluateInElectronMain(port: number, expression: string): Promise
 try {
   const debuggingPort = 42_000 + Math.floor(Math.random() * 10_000)
   const inspectorPort = 52_000 + Math.floor(Math.random() * 8_000)
+  electronInspectorPort = inspectorPort
   electronProcess = spawn(
       electronExecutable,
     [
@@ -281,7 +290,42 @@ try {
 
   await page.waitForTimeout(3_000)
   console.log(`Initial renderer state: ${(await page.locator("body").innerText()).slice(0, 500)}`)
-  await page.getByText("What would you like to do", { exact: false }).waitFor({ timeout: 60_000 })
+  await page.getByText("What would you like to do", { exact: false }).waitFor({ timeout: 180_000 })
+
+  // General settings are part of the real Electron renderer and persist
+  // through the desktop storage bridge, not browser-local presentation state.
+  await page.getByLabel("Settings", { exact: true }).click()
+  await page.getByRole("heading", { name: "General" }).waitFor()
+  const showThinking = page.getByRole("switch", { name: "Show thinking" })
+  assert.equal(await showThinking.isChecked(), false)
+  await showThinking.click()
+  assert.equal(await showThinking.isChecked(), true)
+  await page.waitForTimeout(150)
+  let restoredShowThinking = showThinking
+  if (!composerSendQa) {
+    await page.reload()
+    await page.getByText("What would you like to do", { exact: false }).waitFor({ timeout: 60_000 })
+    await page.getByLabel("Settings", { exact: true }).click()
+    await page.getByRole("heading", { name: "General" }).waitFor({ timeout: 60_000 })
+    restoredShowThinking = page.getByRole("switch", { name: "Show thinking" })
+    assert.equal(
+      await restoredShowThinking.isChecked(),
+      true,
+      "the desktop Show thinking preference must survive a renderer reload",
+    )
+  }
+  if (qaArtifacts !== undefined) {
+    await page.emulateMedia({ colorScheme: "light" })
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: join(qaArtifacts, "general-settings-light.png") })
+    await page.emulateMedia({ colorScheme: "dark" })
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: join(qaArtifacts, "general-settings-dark.png") })
+    await page.emulateMedia({ colorScheme: "light" })
+  }
+  if (!composerSendQa) await restoredShowThinking.click()
+  await page.getByLabel("Settings", { exact: true }).click()
+  await page.getByRole("button", { name: "Attach files" }).waitFor()
 
   // Composer attachment ingestion runs in the real Electron renderer. Exercise
   // the native chooser bridge plus browser drag/drop and paste entry points
@@ -354,11 +398,50 @@ try {
       await page.getByRole("button", { name: `Remove ${filename}` }).click()
     }
     assert.equal(await attachmentRow.locator(":scope > div").count(), 1)
+    await page.getByRole("textbox", { name: "Message" }).fill(
+      "Read the attached notes and reply with one short sentence summarizing them.",
+    )
+    const workSummary = page.locator(".chat-timeline").getByText(/worked for/i)
+    const initialWorkSummaryCount = await workSummary.count()
+    const inlineActivitySeen = page.waitForFunction(() => {
+      const text = document.querySelector(".chat-timeline")?.textContent ?? ""
+      return /Loading .+|Preparing context|Working|Thinking/.test(text)
+    }, undefined, { timeout: 60_000 })
     await page.getByRole("button", { name: "Send message" }).click()
+    await inlineActivitySeen.catch(async (error) => {
+      console.error(`Composer-send state after timeout: ${(await page.locator("body").innerText()).slice(0, 2_000)}`)
+      if (qaArtifacts !== undefined) {
+        await page.screenshot({ path: join(qaArtifacts, "inline-agent-activity-timeout.png") })
+      }
+      throw error
+    })
+    if (qaArtifacts !== undefined) {
+      await page.screenshot({ path: join(qaArtifacts, "inline-agent-activity.png") })
+    }
     await attachmentRow.waitFor({ state: "detached" })
     await page.getByText("notes.md", { exact: true }).waitFor()
+    const progressSamples: number[] = []
+    const activityDeadline = Date.now() + 600_000
+    while (Date.now() < activityDeadline
+      && await workSummary.count() <= initialWorkSummaryCount) {
+      const activity = page.locator('[data-activity-kind="model-loading"]')
+      if (await activity.count() > 0) {
+        const progressbar = activity.getByRole("progressbar")
+        if (await progressbar.count() > 0) {
+          const raw = await progressbar.getAttribute("aria-valuenow")
+          if (raw !== null) progressSamples.push(Number(raw))
+        }
+      }
+      await page.waitForTimeout(50)
+    }
+    await workSummary.nth(initialWorkSummaryCount).waitFor({ timeout: 600_000 })
+    assert(
+      progressSamples.some((value) => value > 0),
+      `the authoritative model-load activity never advanced beyond zero: ${JSON.stringify(progressSamples)}`,
+    )
+    await page.locator('[data-activity-kind="model-loading"]').waitFor({ state: "detached" })
     if (qaArtifacts !== undefined) {
-      await page.screenshot({ path: join(qaArtifacts, "sent-attachment-only-message.png") })
+      await page.screenshot({ path: join(qaArtifacts, "completed-agent-activity.png") })
     }
 
     const sessionsRoot = join(qaDataDir, "sessions")
@@ -662,6 +745,12 @@ try {
   console.log("Embedded browser Electron smoke test passed")
 } finally {
   if (electronProcess !== null) {
+    if (electronProcess.exitCode === null && electronInspectorPort !== null) {
+      await evaluateInElectronMain(
+        electronInspectorPort,
+        'setTimeout(() => process.getBuiltinModule("module").createRequire(process.cwd() + "/package.json")("electron").app.quit(), 0); true',
+      ).catch(() => undefined)
+    }
     const exited = electronProcess.exitCode === null
       ? new Promise<void>((resolve) => electronProcess?.once("exit", () => resolve()))
       : Promise.resolve()
@@ -673,6 +762,9 @@ try {
     }
   }
   await Promise.race([browser?.close().catch(() => undefined) ?? Promise.resolve(), sleep(1_000)])
+  await signalFixtureProcesses("TERM")
+  await sleep(500)
+  await signalFixtureProcesses("KILL")
   fixture.closeAllConnections()
   await new Promise<void>((resolve) => fixture.close(() => resolve()))
   await rm(tempRoot, { recursive: true, force: true })

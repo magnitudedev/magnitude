@@ -55,7 +55,6 @@ import {
 } from "@magnitudedev/client-common"
 import { SessionsSidebar } from "./components/sessions-sidebar"
 import { ChatTimeline } from "./components/chat-timeline"
-import { WorkStatusBar } from "./components/work-status-bar"
 import { Composer } from "./components/composer"
 import {
   FooterBar,
@@ -64,7 +63,6 @@ import {
 import { ProjectFilesPanel } from "./components/project-files/panel"
 import { BrowserPanel } from "./components/browser-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
-import { WorkStatusBarSkeleton } from "./components/work-status-bar-skeleton"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
 import { SettingsCenter } from "./components/settings-center"
 import { LocalModelOnboarding } from "./components/local-model-onboarding"
@@ -96,12 +94,12 @@ import { Toaster } from "@/components/ui/toast"
 import { ActionTooltip, TooltipProvider } from "@/components/ui/tooltip"
 import { notify } from "@/lib/notifications"
 import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
+import { useInitializeConversationPreferences } from "./stores/conversation-preferences"
 import {
   useSlotProfiles,
   findSlotProfile,
   type SlotProfile,
   type SlotProfiles,
-  type LocalModelLoadActivity,
 } from "@magnitudedev/client-common"
 import {
   isRoleId,
@@ -250,7 +248,7 @@ function SessionsSidebarContainer(props?: {
           : { cwd: null, projectId: null })
       }}
       onOpenSettings={() => {
-        setSettingsTab("models")
+        setSettingsTab("general")
       }}
       settingsTab={settingsTab}
       onSettingsTabChange={(tab) => {
@@ -342,37 +340,6 @@ function deriveWorkerInfo(
   }
 }
 
-/** Work status container — timer + active task table above composer */
-function WorkStatusBarContainer({
-  slotProfiles,
-  modelLoadActivity,
-}: {
-  slotProfiles: SlotProfiles | null
-  modelLoadActivity: LocalModelLoadActivity | null
-}): ReactNode {
-  const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
-  const actors = useDisplayState((state) => state.actors)
-  const tasks = useDisplayState((state) => state.tasks)
-  const selectedSessionId = useSelectedSessionId()
-  const { pushFork } = useDisplayViewController()
-
-  // While a session is selected but display state hasn't populated yet
-  // (root actor not yet received from the stream), show the skeleton to
-  // reserve layout space.
-  if (rootActor === null && selectedSessionId !== null) {
-    return <WorkStatusBarSkeleton />
-  }
-  return (
-    <WorkStatusBar
-      rootActor={rootActor}
-      actors={actors}
-      tasks={tasks}
-      slotProfiles={slotProfiles}
-      modelLoadActivity={modelLoadActivity}
-      onWorkerClick={pushFork}
-    />
-  )
-}
 function ComposerContainer({
   docked = false,
   footer,
@@ -427,7 +394,7 @@ function ComposerContainer({
           "Project initialization is not available in the web app yet."
         )
       },
-      openSettings: () => setSettingsTab("models"),
+      openSettings: () => setSettingsTab("general"),
       openSetup: onboarding.open,
       openModelMenu: (menu) => {
         if (menu === "models" || menu === "catalog" || menu === "hardware") {
@@ -500,7 +467,6 @@ function FooterBarContainer({
   const tokenCap = profile?.contextWindow ?? null
   const bashMode = useAtomValue(bashModeAtom)
   const nextEscWillKillAll = useAtomValue(nextEscWillKillAllAtom)
-  const { displayMode } = useDisplayViewController()
   const localModelsResult = useLocalModels()
   const slotsResult = useModelSlots()
   const catalogResult = useProviderModelCatalog()
@@ -618,23 +584,16 @@ function FooterBarContainer({
       }}
       bashMode={bashMode}
       nextEscWillKillAll={nextEscWillKillAll}
-      transcriptMode={displayMode === "transcript"}
     />
   )
 }
 function BottomDockContainer({
   slotProfiles,
-  modelLoadActivity,
 }: {
   slotProfiles: SlotProfiles | null
-  modelLoadActivity: LocalModelLoadActivity | null
 }): ReactNode {
   return (
-    <div className="mx-auto my-[14px] flex w-[calc(100%-24px)] max-w-[800px] shrink-0 flex-col gap-2">
-      <WorkStatusBarContainer
-        slotProfiles={slotProfiles}
-        modelLoadActivity={modelLoadActivity}
-      />
+    <div className="mx-auto my-[14px] flex w-[calc(100%-24px)] max-w-[800px] shrink-0 flex-col">
       <ComposerContainer
         docked
         footer={<FooterBarContainer slotProfiles={slotProfiles} />}
@@ -727,7 +686,7 @@ function ChatTitleBar({
                   return
                 }
                 setSidebarCollapsed(false)
-                setSettingsTab("models")
+                setSettingsTab("general")
               }}
               className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400 [-webkit-app-region:no-drag]"
               aria-label="Settings"
@@ -954,6 +913,7 @@ function AuthenticatedAppContent({
 }): ReactNode {
   useSessionPreload()
   useActiveSessionStatusesSubscription()
+  useInitializeConversationPreferences()
   const connectionError = useDisplayConnectionError()
   const platform = usePlatform()
   const isDesktop = platform.id === "desktop"
@@ -963,11 +923,14 @@ function AuthenticatedAppContent({
     profiles: slotProfiles,
     slots: slotsResult,
     rootSlotId,
+    rootProfile,
   } = useSlotProfiles()
   const modelSlots = Option.getOrNull(Result.value(slotsResult))?.state ?? null
   const modelLoadActivity = modelSlots === null
     ? null
     : deriveLocalModelLoadActivity(modelSlots, rootSlotId)
+  const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
+  const rootStatus = rootActor?.kind === "root" ? rootActor.status : null
   const showOverlaySidebar = isNarrow && sidebarVisible
   const settingsTab = useAtomValue(settingsTabAtom)
   const workspacePanelOpen = useAtomValue(workspacePanelOpenAtom)
@@ -1052,10 +1015,14 @@ function AuthenticatedAppContent({
               onOpenWorkspacePanel={openWorkspacePanel}
             />
           ) : null}
-          <ChatTimeline isVisible={!panelOpen && !workerDetailOpen} />
+          <ChatTimeline
+            isVisible={!panelOpen && !workerDetailOpen}
+            rootStatus={rootStatus}
+            modelLoadActivity={modelLoadActivity}
+            modelName={rootProfile?.modelDisplayName ?? null}
+          />
           <BottomDockContainer
             slotProfiles={slotProfiles}
-            modelLoadActivity={modelLoadActivity}
           />
         </div>
         {(panelOpen || workerDetailOpen) && (

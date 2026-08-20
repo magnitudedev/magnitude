@@ -186,6 +186,98 @@ describe('display addressed residency', () => {
     }
   })
 
+  it('groups adjacent provider thinking blocks into one completed run', async () => {
+    const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
+    const TestAgent = makeTestAgent('DisplayAdjacentThinkingAgent')
+    const client = await TestAgent.createClient(testRequirements(fixture.store))
+
+    try {
+      await client.send({ type: 'turn_started', forkId: null, turnId: 'turn-thinking', chainId: 'chain-thinking' })
+      await client.send({ type: 'thinking_start', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'thinking_chunk', forkId: null, turnId: 'turn-thinking', text: 'alpha' })
+      await client.send({ type: 'thinking_end', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'thinking_start', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'thinking_chunk', forkId: null, turnId: 'turn-thinking', text: ' beta' })
+      await client.send({ type: 'thinking_end', forkId: null, turnId: 'turn-thinking' })
+      await client.send({
+        type: 'message_start',
+        forkId: null,
+        turnId: 'turn-thinking',
+        id: 'answer',
+        destination: { kind: 'user' },
+      })
+
+      const messages = await client.runEffect(readAllMessages(null))
+      expect(messages).toHaveLength(2)
+      expect(messages[0]).toMatchObject({
+        type: 'thinking',
+        content: 'alpha beta',
+        phase: 'completed',
+      })
+      const thinking = messages[0]
+      expect(thinking?.type).toBe('thinking')
+      if (thinking?.type === 'thinking') {
+        expect(Option.isSome(thinking.completedAt)).toBe(true)
+        if (Option.isSome(thinking.completedAt)) {
+          expect(thinking.completedAt.value).toBeGreaterThanOrEqual(thinking.timestamp)
+        }
+      }
+      expect(messages[1]).toMatchObject({ type: 'assistant_message', id: 'answer' })
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('splits thinking runs at visible assistant-message boundaries', async () => {
+    const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
+    const TestAgent = makeTestAgent('DisplayThinkingBoundaryAgent')
+    const client = await TestAgent.createClient(testRequirements(fixture.store))
+
+    try {
+      await client.send({ type: 'turn_started', forkId: null, turnId: 'turn-thinking', chainId: 'chain-thinking' })
+      await client.send({ type: 'thinking_start', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'thinking_chunk', forkId: null, turnId: 'turn-thinking', text: 'before' })
+      await client.send({ type: 'thinking_end', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'message_start', forkId: null, turnId: 'turn-thinking', id: 'answer', destination: { kind: 'user' } })
+      await client.send({ type: 'message_chunk', forkId: null, turnId: 'turn-thinking', id: 'answer', text: 'response' })
+      await client.send({ type: 'message_end', forkId: null, turnId: 'turn-thinking', id: 'answer' })
+      await client.send({ type: 'thinking_start', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'thinking_chunk', forkId: null, turnId: 'turn-thinking', text: 'after' })
+      await client.send({ type: 'thinking_end', forkId: null, turnId: 'turn-thinking' })
+
+      const messages = await client.runEffect(readAllMessages(null))
+      expect(messages.map((message) => message.type)).toEqual([
+        'thinking',
+        'assistant_message',
+        'thinking',
+      ])
+      expect(messages[0]).toMatchObject({ content: 'before', phase: 'completed' })
+      expect(messages[2]).toMatchObject({ content: 'after', phase: 'completed' })
+      expect(messages[0]?.id).not.toBe(messages[2]?.id)
+    } finally {
+      await client.dispose()
+    }
+  })
+
+  it('removes empty thinking runs when their visible boundary arrives', async () => {
+    const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
+    const TestAgent = makeTestAgent('DisplayEmptyThinkingAgent')
+    const client = await TestAgent.createClient(testRequirements(fixture.store))
+
+    try {
+      await client.send({ type: 'turn_started', forkId: null, turnId: 'turn-thinking', chainId: 'chain-thinking' })
+      await client.send({ type: 'thinking_start', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'thinking_end', forkId: null, turnId: 'turn-thinking' })
+      await client.send({ type: 'message_start', forkId: null, turnId: 'turn-thinking', id: 'answer', destination: { kind: 'user' } })
+
+      const messages = await client.runEffect(readAllMessages(null))
+      expect(messages).toHaveLength(1)
+      expect(messages[0]).toMatchObject({ type: 'assistant_message', id: 'answer' })
+    } finally {
+      await client.dispose()
+    }
+  })
+
   it('active communication chunks do not refetch older offloaded worker segments', async () => {
     const fixture = await Effect.runPromise(makeCountingAddressedEntryStore)
     const TestAgent = makeTestAgent('DisplayAutoPinCommunicationAgent')

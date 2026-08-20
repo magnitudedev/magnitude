@@ -44,8 +44,9 @@ or compatibility machinery, and nothing implicitly creates a Project from sessio
 
 Session cursors are base64url JSON decoded through one Schema transformation and carry a
 fingerprint of the request predicates (not the limit); a cursor reused under different predicates
-fails as invalid rather than silently restarting. Both authorities publish invalidation-only change
-streams (`StreamProjectChanges`, `StreamSessionChanges`) after successful durable transitions.
+fails as invalid rather than silently restarting. Both authorities publish independent
+invalidation-only notifications after successful durable transitions. Those notifications share
+the connection-global client invalidation transport but retain their distinct domain tags.
 
 ## Commands, queries, observations
 

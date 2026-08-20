@@ -64,6 +64,8 @@ export const ThinkingMessage = Schema.Struct({
   type: Schema.Literal("thinking"),
   content: Schema.String,
   label: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  phase: Schema.Literal("active", "completed"),
+  completedAt: Schema.optionalWith(Schema.Number, { as: "Option", exact: true }),
   timestamp: Schema.Number
 })
 export type ThinkingMessage = Schema.Schema.Type<typeof ThinkingMessage>

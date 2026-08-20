@@ -262,6 +262,8 @@ describe('display timeline presentation', () => {
         type: 'thinking',
         content: 'internal notes',
         label: Option.none(),
+        phase: 'completed',
+        completedAt: Option.some(2),
         timestamp: 1,
       },
       {
@@ -281,7 +283,9 @@ describe('display timeline presentation', () => {
       window: windowFor(messages),
     }
 
-    expect(buildDisplayTimelinePresentation({ ...base, mode: 'default' }).entries).toEqual([])
+    expect(buildDisplayTimelinePresentation({ ...base, mode: 'default' }).entries.map((entry) => entry.id)).toEqual([
+      'message:thinking-1',
+    ])
     expect(buildDisplayTimelinePresentation({ ...base, mode: 'transcript' }).entries.map((entry) => entry.id)).toEqual([
       'message:thinking-1',
       'message:status-1',

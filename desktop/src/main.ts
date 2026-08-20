@@ -325,11 +325,6 @@ function buildMenu(): Menu {
           accelerator: "CmdOrCtrl+R",
           click: () => sendMenuAction({ _tag: "toggle-sidebar-search" }),
         },
-        {
-          label: "Toggle Transcript Mode",
-          accelerator: "CmdOrCtrl+T",
-          click: () => sendMenuAction({ _tag: "toggle-transcript-mode" }),
-        },
         { type: "separator" as const },
         { role: "reload" as const },
         { role: "forceReload" as const },

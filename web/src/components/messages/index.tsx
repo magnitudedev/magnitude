@@ -2,8 +2,9 @@
  * Message dispatcher — maps DisplayMessage.type to the correct component.
  *
  * Uses the union discriminant `type` field to route to the appropriate
- * message component. Projection owns visibility/grouping; the null branches
- * below are defensive — projection never emits these as message entries.
+ * message component. The accepted timeline owns grouping; renderer preferences
+ * may omit entries before dispatch. Null branches remain defensive for entries
+ * represented by dedicated timeline components.
  */
 import { memo, type ReactNode } from "react"
 import type { DisplayMessage, WorkSummaryMessage } from "@magnitudedev/sdk"
@@ -19,14 +20,14 @@ import { ErrorMessage } from "./error-message"
 import { AgentCommunication } from "./agent-communication"
 import { UserBashCommand } from "./user-bash-command"
 import { WorkSummary } from "./work-summary"
+import type { AssistantResponseFooter } from "../assistant-response-presentation"
 
 export interface MessageDispatchProps {
   message: DisplayMessage
   isStreaming?: boolean
   isInterrupted?: boolean
-  mode?: "default" | "transcript"
   assistantWorkSummary?: WorkSummaryMessage | null
-  isLatestAssistant?: boolean
+  assistantResponseFooter?: AssistantResponseFooter | null
 }
 
 /** Render a single (non-clustered) message by dispatching on its type */
@@ -34,9 +35,8 @@ function MessageDispatchImpl({
   message,
   isStreaming = false,
   isInterrupted = false,
-  mode = "default",
   assistantWorkSummary = null,
-  isLatestAssistant = false,
+  assistantResponseFooter = null,
 }: MessageDispatchProps): ReactNode {
   switch (message.type) {
     case "user_message":
@@ -51,12 +51,12 @@ function MessageDispatchImpl({
           message={message}
           isStreaming={isStreaming}
           isInterrupted={isInterrupted}
-          isLatest={isLatestAssistant}
+          responseFooter={assistantResponseFooter}
           workSummary={assistantWorkSummary}
         />
       )
     case "thinking":
-      return <ThinkingMessage message={message} mode={mode} />
+      return <ThinkingMessage key={message.phase} message={message} />
     case "status_indicator":
       return <StatusIndicator message={message} />
     case "work_summary":
@@ -88,7 +88,6 @@ export const MessageDispatch = memo(
     prev.message === next.message &&
     prev.isStreaming === next.isStreaming &&
     prev.isInterrupted === next.isInterrupted &&
-    prev.mode === next.mode &&
     prev.assistantWorkSummary === next.assistantWorkSummary &&
-    prev.isLatestAssistant === next.isLatestAssistant
+    prev.assistantResponseFooter === next.assistantResponseFooter
 )

@@ -40,7 +40,6 @@ const ROOT_ONLY_HIDDEN_MESSAGE_TYPES: ReadonlySet<DisplayMessage['type']> = new 
 ])
 
 const DEFAULT_HIDDEN_MESSAGE_TYPES: ReadonlySet<DisplayMessage['type']> = new Set([
-  'thinking',
   'status_indicator',
 ])
 

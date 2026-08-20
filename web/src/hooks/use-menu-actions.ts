@@ -3,7 +3,7 @@
  *
  * Subscribes to platform menu actions (Electron) and local keyboard shortcuts.
  * In browser mode (platform.id === "web"), there's no Electron menu, so we
- * handle Cmd/Ctrl+N, Cmd/Ctrl+R, Cmd/Ctrl+T, Cmd/Ctrl+, directly via a
+ * handle Cmd/Ctrl+N, Cmd/Ctrl+R, and Cmd/Ctrl+, directly via a
  * document-level keydown listener. Esc handling is always local.
  *
  * Uses useAtomMount — effect-atom's lifecycle API. No useEffect.
@@ -32,7 +32,7 @@ function isModKey(e: KeyboardEvent): boolean {
 /**
  * Subscribe to platform menu actions and wire them to UI state.
  * Also handles local keyboard shortcuts (Esc, Esc×2, and browser-mode
- * Cmd/Ctrl+N, R, T, comma).
+ * Cmd/Ctrl+N, R, comma).
  */
 export function useMenuActions(): void {
   const platform = usePlatform()
@@ -40,8 +40,7 @@ export function useMenuActions(): void {
   const setSearchQuery = useAtomSet(sidebarSearchAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const setNextEscWillKillAll = useAtomSet(nextEscWillKillAllAtom)
-  const { popFork, togglePresentationMode, displayMode, expandedForkStack } =
-    useDisplayViewController()
+  const { popFork, expandedForkStack } = useDisplayViewController()
   const settingsTab = useAtomValue(settingsTabAtom)
 
   // Menu subscription atom — subscribes on mount, unsubscribes on dispose.
@@ -63,11 +62,8 @@ export function useMenuActions(): void {
                   new CustomEvent("__magnitude:focus-search")
                 )
                 break
-              case "toggle-transcript-mode":
-                togglePresentationMode()
-                break
               case "open-settings":
-                setSettingsTab("models")
+                setSettingsTab("general")
                 break
               case "quit":
                 platform.quit?.()
@@ -79,10 +75,8 @@ export function useMenuActions(): void {
       ),
     [
       platform,
-      displayMode,
       startNewSession,
       setSearchQuery,
-      togglePresentationMode,
       setSettingsTab,
     ]
   )
@@ -155,15 +149,10 @@ export function useMenuActions(): void {
                     new CustomEvent("__magnitude:focus-search")
                   )
                   break
-                case "t":
-                  // Cmd/Ctrl+T → toggle transcript mode
-                  e.preventDefault()
-                  togglePresentationMode()
-                  break
                 case ",":
                   // Cmd/Ctrl+, → open settings
                   e.preventDefault()
-                  setSettingsTab("models")
+                  setSettingsTab("general")
                   break
               }
             }
@@ -177,12 +166,10 @@ export function useMenuActions(): void {
     [
       expandedForkStack.length,
       platform.id,
-      displayMode,
       settingsTab,
       popFork,
       startNewSession,
       setSearchQuery,
-      togglePresentationMode,
       setSettingsTab,
       setNextEscWillKillAll,
     ]

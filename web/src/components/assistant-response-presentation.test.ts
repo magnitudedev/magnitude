@@ -49,10 +49,16 @@ describe("deriveAssistantResponsePresentation", () => {
       summary("summary-2", 7),
     ]))
 
-    expect(view.latestAssistantId).toBe("assistant-2b")
     expect(view.summaryByAssistantId.get("assistant-1")?.id).toBe("summary-1")
     expect(view.summaryByAssistantId.has("assistant-2a")).toBe(false)
     expect(view.summaryByAssistantId.get("assistant-2b")?.id).toBe("summary-2")
+    expect(view.footerByAssistantId.has("assistant-2a")).toBe(false)
+    expect(view.footerByAssistantId.get("assistant-1")?.isLatest).toBe(false)
+    expect(view.footerByAssistantId.get("assistant-2b")).toEqual({
+      content: "assistant-2a\n\nassistant-2b",
+      timestamp: 6,
+      isLatest: true,
+    })
     expect(view.entries.flatMap((entry) =>
       entry.kind === "message" ? [entry.messageId] : []
     )).toEqual(["user-1", "assistant-1", "user-2", "assistant-2a", "assistant-2b"])
@@ -64,8 +70,8 @@ describe("deriveAssistantResponsePresentation", () => {
       summary("interrupted-summary", 2),
     ]))
 
-    expect(view.latestAssistantId).toBeNull()
     expect(view.summaryByAssistantId.size).toBe(0)
+    expect(view.footerByAssistantId.size).toBe(0)
     expect(view.entries.flatMap((entry) =>
       entry.kind === "message" ? [entry.messageId] : []
     )).toEqual(["user-1", "interrupted-summary"])
@@ -79,7 +85,22 @@ describe("deriveAssistantResponsePresentation", () => {
       summary("summary-2", 4),
     ]))
 
-    expect(view.latestAssistantId).toBe("assistant-1")
     expect(view.summaryByAssistantId.size).toBe(0)
+    expect(view.footerByAssistantId.size).toBe(0)
+  })
+
+  it("does not move a footer between assistant messages while the turn is active", () => {
+    const first = deriveAssistantResponsePresentation(timeline([
+      user("user-1", 1),
+      assistant("assistant-1", 2),
+    ]))
+    const second = deriveAssistantResponsePresentation(timeline([
+      user("user-1", 1),
+      assistant("assistant-1", 2),
+      assistant("assistant-2", 3),
+    ]))
+
+    expect(first.footerByAssistantId.size).toBe(0)
+    expect(second.footerByAssistantId.size).toBe(0)
   })
 })

@@ -72,6 +72,3 @@ export const ProjectInspectionSchema = Schema.Struct({
   git: GitInspectionSchema,
 })
 export type ProjectInspection = typeof ProjectInspectionSchema.Type
-
-export const ProjectChangeSchema = Schema.Struct({})
-export type ProjectChange = typeof ProjectChangeSchema.Type

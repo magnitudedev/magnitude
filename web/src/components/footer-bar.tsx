@@ -49,8 +49,6 @@ export interface FooterBarProps {
   thinkingLevel?: string | null
   /** Next Esc will kill all workers */
   nextEscWillKillAll?: boolean
-  /** Transcript mode active */
-  transcriptMode?: boolean
   /** Authoritative availability of installed models for primary-slot selection. */
   modelOptionsState?: FooterModelOptionsState
   /** Currently selected provider-model identity. */
@@ -277,7 +275,6 @@ export function FooterBar({
   model,
   thinkingLevel,
   nextEscWillKillAll,
-  transcriptMode,
   modelOptionsState = { _tag: "Ready", options: [] },
   selectedModelId,
   onSelectionCommit,
@@ -296,11 +293,6 @@ export function FooterBar({
         {nextEscWillKillAll && (
           <span className="text-[11px] text-orange-700 dark:text-orange-500 shrink-0">
             Press Esc again to interrupt all workers
-          </span>
-        )}
-        {transcriptMode && (
-          <span className="font-sans text-[11px] text-blue-700 dark:text-blue-500 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-750 rounded-[4px] [padding:1px_6px]">
-            Transcript Mode
           </span>
         )}
       </div>
