@@ -1,8 +1,11 @@
 import type { ModelCallTrace, AssembledToolCall, TokenLogprob, RawInputToken, RawOutputToken, RawLogprobEntry } from "@magnitudedev/ai"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
 
 export type { ModelCallTrace, AssembledToolCall, TokenLogprob, RawInputToken, RawOutputToken, RawLogprobEntry } from "@magnitudedev/ai"
 
-export interface AgentCallTrace extends ModelCallTrace {
+export interface AgentCallTrace<
+  TWireRequest extends JsonRecord = ModelCallTrace["request"],
+> extends ModelCallTrace<TWireRequest> {
   readonly traceId: string
   readonly sessionId: string
   readonly actor: AgentTraceActor

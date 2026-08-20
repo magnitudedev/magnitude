@@ -1,111 +1,162 @@
-// ---------------------------------------------------------------------------
-// OptionDef — typed, composable option-to-wire mapping
-// ---------------------------------------------------------------------------
+import { Array as EffectArray, Data, Effect, Option as EffectOption, Schema } from "effect"
+import type * as ParseResult from "effect/ParseResult"
+import type { JsonRecord, JsonValue } from "@magnitudedev/utils/schema"
+import { toCauseInfo, type CauseInfo } from "../errors/failure"
 
-/**
- * Erased form — used in acceptance positions like `Record<string, OptionDef>`.
- * `any` in map parameter is required: contravariant acceptance position (ts-generics Pattern 6).
- */
+export class OptionContributionError extends Data.TaggedError("OptionContributionError")<{
+  readonly option: string
+  readonly failure:
+    | { readonly _tag: "OptionMappingFailed"; readonly cause: CauseInfo }
+    | { readonly _tag: "OptionEncodingFailed"; readonly error: ParseResult.ParseError }
+}> {}
+
+class OptionMapperError extends Data.TaggedError("OptionMapperError")<{
+  readonly cause: CauseInfo
+}> {}
+
 export interface OptionDefErased {
   readonly _tag: "OptionDef"
   readonly required: boolean
   readonly default?: unknown
-  readonly map: (value: any) => Record<string, unknown>
+  readonly contributionSchema: Schema.Schema.Any
+  // Dynamic application erases the caller value type; concrete definitions below remain exact.
+  readonly encodeContribution: (
+    value: any,
+  ) => Effect.Effect<JsonRecord, OptionMapperError | ParseResult.ParseError>
 }
 
-/**
- * Concrete form — carries full type information for a single option.
- */
-export interface OptionDefConcrete<TValue, TWireReq, TRequired extends boolean> {
-  readonly _tag: "OptionDef"
+export interface OptionDefConcrete<
+  TValue,
+  TContributionValue extends object,
+  TContribution extends JsonRecord,
+  TRequired extends boolean,
+> extends OptionDefErased {
   readonly required: TRequired
   readonly default?: TValue
-  readonly map: (value: TValue) => Partial<TWireReq>
+  readonly contributionSchema: Schema.Schema<TContributionValue, TContribution, never>
+  readonly encodeContribution: (
+    value: TValue,
+  ) => Effect.Effect<TContribution, OptionMapperError | ParseResult.ParseError>
 }
 
-/**
- * Never-switched union: bare `OptionDef` resolves to the erased form,
- * while `OptionDef<V, W, R>` resolves to the concrete form.
- */
-export type OptionDef<TValue = never, TWireReq = never, TRequired extends boolean = false> =
-  [TValue] extends [never] ? OptionDefErased : OptionDefConcrete<TValue, TWireReq, TRequired>
+export type OptionDef<
+  TValue = never,
+  TContributionValue extends object = never,
+  TContribution extends JsonRecord = never,
+  TRequired extends boolean = false,
+> = [TValue] extends [never]
+  ? OptionDefErased
+  : OptionDefConcrete<TValue, TContributionValue, TContribution, TRequired>
 
-// ---------------------------------------------------------------------------
-// Type-level utilities
-// ---------------------------------------------------------------------------
+export type ExtractValue<T> = T extends OptionDefConcrete<infer V, any, any, any> ? V : never
 
-/** Extract the value type from a concrete OptionDef. */
-export type ExtractValue<T> = T extends OptionDefConcrete<infer V, any, any> ? V : never
+export type ExtractRequired<T> = T extends OptionDefConcrete<any, any, any, infer R> ? R : false
 
-/** Extract the required flag from a concrete OptionDef. */
-export type ExtractRequired<T> = T extends OptionDefConcrete<any, any, infer R> ? R : false
-
-/** Keys in an option record whose OptionDefs are required. */
 export type RequiredKeys<T extends Record<string, OptionDef>> = {
   [K in keyof T]: ExtractRequired<T[K]> extends true ? K : never
 }[keyof T]
 
-/** Keys in an option record whose OptionDefs are optional. */
 export type OptionalKeys<T extends Record<string, OptionDef>> = {
   [K in keyof T]: ExtractRequired<T[K]> extends true ? never : K
 }[keyof T]
 
-/** Infer the call-site options type from a record of OptionDefs. */
 export type InferCallOptions<T extends Record<string, OptionDef>> =
   & { readonly [K in RequiredKeys<T>]: ExtractValue<T[K]> }
   & { readonly [K in OptionalKeys<T>]?: ExtractValue<T[K]> }
 
-// ---------------------------------------------------------------------------
-// Option namespace — factory functions
-// ---------------------------------------------------------------------------
+const define = <TValue, A extends object, I extends JsonRecord>(
+  contributionSchema: Schema.Schema<A, I, never>,
+  map: (value: TValue) => A,
+  defaultValue?: TValue,
+): OptionDefConcrete<TValue, A, I, false> => ({
+  _tag: "OptionDef",
+  required: false,
+  default: defaultValue,
+  contributionSchema,
+  encodeContribution: (value) => Effect.try({
+    try: () => map(value),
+    catch: (cause) => new OptionMapperError({ cause: toCauseInfo(cause) }),
+  }).pipe(Effect.flatMap(Schema.encode(contributionSchema))),
+})
+
+const required = <TValue, A extends object, I extends JsonRecord>(
+  contributionSchema: Schema.Schema<A, I, never>,
+  map: (value: TValue) => A,
+): OptionDefConcrete<TValue, A, I, true> => ({
+  _tag: "OptionDef",
+  required: true,
+  contributionSchema,
+  encodeContribution: (value) => Effect.try({
+    try: () => map(value),
+    catch: (cause) => new OptionMapperError({ cause: toCauseInfo(cause) }),
+  }).pipe(Effect.flatMap(Schema.encode(contributionSchema))),
+})
+
+const field = <K extends string, A, I extends JsonValue>(
+  key: K,
+  valueSchema: Schema.Schema<A, I, never>,
+  defaultValue?: A,
+): OptionDefConcrete<
+  A,
+  { readonly [P in K]: A },
+  { readonly [P in K]: I },
+  false
+> => {
+  const contributionSchema = Schema.Record({
+    key: Schema.Literal(key),
+    value: valueSchema,
+  })
+  return define(contributionSchema, (value: A) => ({ [key]: value } as {
+    readonly [P in K]: A
+  }), defaultValue)
+}
+
+const requiredField = <K extends string, A, I extends JsonValue>(
+  key: K,
+  valueSchema: Schema.Schema<A, I, never>,
+): OptionDefConcrete<
+  A,
+  { readonly [P in K]: A },
+  { readonly [P in K]: I },
+  true
+> => {
+  const contributionSchema = Schema.Record({
+    key: Schema.Literal(key),
+    value: valueSchema,
+  })
+  return required(contributionSchema, (value: A) => ({ [key]: value } as {
+    readonly [P in K]: A
+  }))
+}
+
+const ignore = <TValue>(): OptionDefConcrete<TValue, {}, {}, false> =>
+  define(Schema.Struct({}), (_value: TValue) => ({}))
 
 export const Option = {
-  /**
-   * Define an optional OptionDef.
-   */
-  define: <TValue, TWireReq>(
-    map: (value: TValue) => Partial<TWireReq>,
-    defaultValue?: TValue,
-  ): OptionDef<TValue, TWireReq, false> => ({
-    _tag: "OptionDef" as const,
-    required: false as const,
-    default: defaultValue,
-    map,
-  }),
-
-  /**
-   * Define a required OptionDef.
-   */
-  required: <TValue, TWireReq>(
-    map: (value: TValue) => Partial<TWireReq>
-  ): OptionDef<TValue, TWireReq, true> => ({
-    _tag: "OptionDef" as const,
-    required: true as const,
-    map,
-  }),
+  define,
+  required,
+  field,
+  requiredField,
+  ignore,
 } as const
 
-// ---------------------------------------------------------------------------
-// applyOptionDefs — internal utility for dynamic option mapping
-// ---------------------------------------------------------------------------
-
-/**
- * Apply a record of erased OptionDefs to an options object, producing wire fragments.
- *
- * The `as Record<string, unknown>` cast is a widening cast backed by the
- * `T extends object` constraint (ts-generics Principle 3: constraint + cast = safe).
- */
 export function applyOptionDefs<T extends object>(
   defs: Record<string, OptionDefErased>,
   options: T,
-): Record<string, unknown> {
-  const opts = options as Record<string, unknown>
-  const result: Record<string, unknown> = {}
-  for (const [key, def] of Object.entries(defs)) {
-    const val = opts[key] ?? def.default
-    if (val !== undefined) {
-      Object.assign(result, def.map(val))
-    }
-  }
-  return result
+): Effect.Effect<readonly JsonRecord[], OptionContributionError> {
+  const values = options as Record<string, unknown>
+  return Effect.forEach(Object.entries(defs), ([key, def]) => {
+    const supplied = values[key]
+    const value = supplied === undefined ? def.default : supplied
+    if (value === undefined) return Effect.succeed(EffectOption.none<JsonRecord>())
+    return def.encodeContribution(value).pipe(
+      Effect.map(EffectOption.some),
+      Effect.mapError((error) => new OptionContributionError({
+        option: key,
+        failure: error instanceof OptionMapperError
+          ? { _tag: "OptionMappingFailed", cause: error.cause }
+          : { _tag: "OptionEncodingFailed", error },
+      })),
+    )
+  }).pipe(Effect.map((contributions) => EffectArray.getSomes(contributions)))
 }

@@ -132,11 +132,17 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
   ): Effect.Effect<BoundModel<BaseCallOptions>, never, never> =>
     Effect.gen(function* () {
       // Build magnitude-specific options from bind options
+      const nonEmpty = (value: string | null | undefined) => Option.fromNullable(value).pipe(
+        Option.filter((text) => text.length > 0),
+      )
       const magnitudeOptions: MagnitudeAdditionalOptions = {
-        ...(options?.agentId ? { agent_id: options.agentId } : {}),
-        ...(options?.traits ? { traits: [...options.traits] } : {}),
-        ...(options?.preferProvider ? { prefer_provider: options.preferProvider } : {}),
-        ...(sessionId ? { session_id: sessionId } : {}),
+        agent_id: nonEmpty(options?.agentId),
+        traits: Option.fromNullable(options?.traits).pipe(Option.map((traits) => [...traits])),
+        prefer_provider: nonEmpty(options?.preferProvider),
+        session_id: nonEmpty(sessionId),
+        forceTrait: Option.none(),
+        turn_constraints: Option.none(),
+        include_raw: Option.none(),
       }
 
       const internal = createMagnitudeCompatibleSpec({ modelId: id, endpoint }).bind({

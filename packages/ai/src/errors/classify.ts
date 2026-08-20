@@ -458,6 +458,10 @@ function formatStreamStartClientCorrectnessEvidence(
     case "AuthApplicationFailed":
     case "UnexpectedDefectCaught":
       return `${evidence._tag}: ${causeInfoText(evidence.cause)}`
+    case "RequestSchemaValidationFailed":
+      return `${evidence._tag}: ${evidence.issue.message}`
+    case "RequestContributionCollision":
+      return `${evidence._tag}: ${evidence.property}`
   }
 }
 

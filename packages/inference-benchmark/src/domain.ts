@@ -1,4 +1,5 @@
-import type { ChatMessage, ChatTool } from "@magnitudedev/ai"
+import type { ChatCompletionsRequestMessage, ChatTool } from "@magnitudedev/ai"
+import type { JsonRecord } from "@magnitudedev/utils/schema"
 
 export const CRITERIA = ["responsiveness", "prefill", "decode", "memory-usage", "distribution"] as const
 export type Criterion = typeof CRITERIA[number]
@@ -31,18 +32,18 @@ export interface BfclProvenance {
 
 export interface Fixture {
   readonly id: string
-  readonly messages: readonly ChatMessage[]
+  readonly messages: readonly ChatCompletionsRequestMessage[]
   readonly tools: readonly ChatTool[]
   readonly expected: readonly ExpectedToolCall[]
-  readonly canonicalAssistant: ChatMessage
-  readonly canonicalToolMessages: readonly ChatMessage[]
+  readonly canonicalAssistant: ChatCompletionsRequestMessage
+  readonly canonicalToolMessages: readonly ChatCompletionsRequestMessage[]
   readonly provenance: BfclProvenance
 }
 
 export interface PlannedRequest {
   readonly id: string
   readonly fixtureId: string
-  readonly messages: readonly ChatMessage[]
+  readonly messages: readonly ChatCompletionsRequestMessage[]
   readonly tools: readonly ChatTool[]
   readonly expected: readonly ExpectedToolCall[]
   readonly releaseOffsetMs: number
@@ -110,7 +111,7 @@ export interface ExistingTarget {
   readonly endpoint: string
   readonly servedModel: string
   readonly apiKey?: string
-  readonly requestBody?: Readonly<Record<string, unknown>>
+  readonly requestBody?: JsonRecord
   readonly requestTimeoutMs?: number
   readonly parallelSequences: number
   readonly artifact?: {
@@ -130,7 +131,7 @@ export interface ManagedTarget {
   readonly endpoint: string
   readonly servedModel: string
   readonly apiKey?: string
-  readonly requestBody?: Readonly<Record<string, unknown>>
+  readonly requestBody?: JsonRecord
   readonly requestTimeoutMs?: number
   readonly env?: Readonly<Record<string, string>>
   readonly readinessPath?: string

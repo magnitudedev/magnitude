@@ -1,6 +1,11 @@
 import { Data, Effect, Option, Schema } from "effect"
 import type { Backend } from "./targets"
 
+export const CLI_PACKAGE_NAME = "@magnitudedev/cli"
+
+export const releaseTag = (version: string): string =>
+  `${CLI_PACKAGE_NAME}@${version}`
+
 const NonEmpty = Schema.String.pipe(Schema.minLength(1))
 const Sha256 = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/))
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0))
@@ -77,7 +82,7 @@ export const validateReleaseManifest = (
   const ids = new Set<string>()
   const names = new Set<string>()
   const fail = (message: string) => Effect.fail(new InvalidReleaseManifest({ message }))
-  if (manifest.tag !== `@magnitudedev/cli@${manifest.version}`) {
+  if (manifest.tag !== releaseTag(manifest.version)) {
     return fail("release tag does not match version")
   }
   for (const artifact of manifest.artifacts) {

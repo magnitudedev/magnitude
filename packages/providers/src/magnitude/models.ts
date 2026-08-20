@@ -6,8 +6,12 @@ import {
   type BaseCallOptions,
   type ToolChoice as AiToolChoice,
 } from "@magnitudedev/ai"
+import { Schema } from "effect"
 import { classifyMagnitudeRejectedResponse } from "./errors"
-import type { MagnitudeAdditionalOptions } from "./contract"
+import {
+  MagnitudeAdditionalOptionsSchema,
+  type MagnitudeAdditionalOptions,
+} from "./contract"
 
 
 export type MagnitudeModelSpec = ModelSpec<MagnitudeCallOptions>
@@ -31,15 +35,12 @@ export type MagnitudeCallOptions = {
 
 const magnitudeOptions = {
   maxTokens: NativeChatCompletions.options.maxTokens,
-  toolChoice: Option.define(
-    (v: AiToolChoice) => ({ tool_choice: v }),
+  toolChoice: NativeChatCompletions.options.toolChoice,
+  magnitudeAdditionalOptions: Option.field(
+    "magnitude_additional_options",
+    MagnitudeAdditionalOptionsSchema,
   ),
-  magnitudeAdditionalOptions: Option.define(
-    (v: MagnitudeAdditionalOptions) => ({ magnitude_additional_options: v }),
-  ),
-  reasoningEffort: Option.define(
-    (v: string) => ({ reasoning_effort: v }),
-  ),
+  reasoningEffort: Option.field("reasoning_effort", Schema.String),
 } as const
 
 export function createMagnitudeCompatibleSpec(config: MagnitudeCompatibleSpecConfig) {
@@ -64,9 +65,7 @@ export function wrapAsBaseModel(
     stream: (prompt, tools, options) =>
       internal.stream(prompt, tools, {
         ...options,
-        magnitudeAdditionalOptions: {
-          ...bakedOptions,
-        },
+        magnitudeAdditionalOptions: bakedOptions,
       }),
   }
 }

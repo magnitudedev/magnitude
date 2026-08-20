@@ -2,13 +2,16 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import {
   PromptBuilder,
+  Prompt,
   ProviderModelIdSchema,
+  defineTool,
   type ModelRequestProgress,
 } from "@magnitudedev/ai"
-import { Effect, Exit, Layer, Option, Stream } from "effect"
+import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnClient } from "../client.js"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
+import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { IcnProvider, IcnProviderModelResolver, makeIcnProvider } from "./source.js"
 import { CurrentModelInstance } from "./contract.js"
 
@@ -92,6 +95,78 @@ describe("ICN local provider", () => {
     expect(chatRequests).toBe(0)
   })
 
+  it("sends canonical reasoning-only assistant history through the generated client", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    let requestJson: string | undefined
+    const http = HttpClient.make((request) => {
+      if (request.url.endsWith("/v1/chat/completions") && request.body._tag === "Uint8Array") {
+        requestJson = new TextDecoder().decode(request.body.body)
+      }
+      return Effect.succeed(sseResponse(request, []))
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
+        instanceId: "instance-test",
+        configurationId: "configuration-test",
+      }))
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      yield* bound.stream(Prompt.from({
+        messages: [
+          {
+            _tag: "AssistantMessage",
+            reasoning: Option.some("thinking"),
+            text: Option.none(),
+            toolCalls: Option.none(),
+          },
+          { _tag: "UserMessage", parts: [{ _tag: "TextPart", text: "Continue" }] },
+        ],
+      }), [])
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    const requestBody = Schema.decodeUnknownSync(
+      Schema.parseJson(Schema.encodedSchema(Generated.ChatCompletionRequest)),
+    )(requestJson)
+    expect(requestBody.messages).toContainEqual({
+      role: "assistant",
+      content: "",
+      reasoning_content: "thinking",
+    })
+  })
+
+  it("omits tool choice when the caller does not supply it", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    let requestJson: string | undefined
+    const http = HttpClient.make((request) => {
+      if (request.url.endsWith("/v1/chat/completions") && request.body._tag === "Uint8Array") {
+        requestJson = new TextDecoder().decode(request.body.body)
+      }
+      return Effect.succeed(sseResponse(request, []))
+    })
+    const tool = defineTool({
+      name: "lookup",
+      description: "Look up a value",
+      inputSchema: Schema.Struct({ query: Schema.String }),
+      outputSchema: Schema.String,
+    })
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
+        instanceId: "instance-test",
+        configurationId: "configuration-test",
+      }))
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      yield* bound.stream(PromptBuilder.empty().user("hello").build(), [tool])
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    const requestBody = Schema.decodeUnknownSync(
+      Schema.parseJson(Schema.encodedSchema(Generated.ChatCompletionRequest)),
+    )(requestJson)
+    expect(requestBody).not.toHaveProperty("tool_choice")
+  })
+
   it("reports native request progress without exposing control chunks as model output", async () => {
     const modelId = ProviderModelIdSchema.make("mdl_test")
     const chunk = {
@@ -124,7 +199,12 @@ describe("ICN local provider", () => {
       {
         ...chunk,
         choices: [],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        usage: {
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          total_tokens: 2,
+          prompt_tokens_details: { cached_tokens: 0 },
+        },
         timings: {
           cache_n: 0,
           prompt_n: 1,

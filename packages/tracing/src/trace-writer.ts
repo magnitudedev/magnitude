@@ -13,6 +13,7 @@ import {
   updateTraceMetaSync,
 } from '@magnitudedev/storage'
 import { logger } from '@magnitudedev/logger'
+import type { JsonRecord } from '@magnitudedev/utils/schema'
 import type { AgentCallTrace, TraceSessionMeta } from './types'
 
 const globalPaths = makeGlobalStoragePaths(defaultGlobalStorageRoot())
@@ -45,7 +46,9 @@ export function initTraceSession(
   }
 }
 
-export function writeTrace(trace: AgentCallTrace): void {
+export function writeTrace<TWireRequest extends JsonRecord>(
+  trace: AgentCallTrace<TWireRequest>,
+): void {
   if (!currentSessionId) {
     logger.warn('[Tracing] writeTrace called before initTraceSession')
     return

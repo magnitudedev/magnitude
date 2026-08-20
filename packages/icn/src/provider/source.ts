@@ -2,7 +2,10 @@ import { Cause, Context, Effect, FiberRef, Layer, Match, Option, Ref, Schema, St
 import {
   ModelCatalogError,
   ModelDiscoveryOperationIdSchema,
+  NativeChatCompletions,
+  Option as CallOption,
   ProviderModelIdSchema,
+  ReasoningEffortSchema,
   StreamClientCorrectnessViolation,
   StreamOperationalFailure,
   StreamProviderCorrectnessViolation,
@@ -16,6 +19,7 @@ import {
   streamStartFailureFromRejectedResponse,
   toCauseInfo,
   nativeChatCompletionsCodec,
+  encodeChatCompletionsRequest,
   normalizeChatCompletionsChunk,
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
@@ -39,6 +43,12 @@ import {
 } from "@magnitudedev/openapi-effect/client-runtime"
 import type { LocalProviderSource } from "./provider.js"
 import { CurrentModelInstance } from "./contract.js"
+
+const icnRequestOptions = {
+  maxTokens: NativeChatCompletions.options.maxTokens,
+  toolChoice: NativeChatCompletions.options.toolChoice,
+  reasoningEffort: CallOption.field("reasoning_effort", ReasoningEffortSchema),
+} as const
 
 const catalogError = <Cause>(
   message: string,
@@ -197,22 +207,31 @@ const bindIcnModel = (
             },
           },
         })),
-        onSome: (target) => Schema.decodeUnknown(Generated.ChatCompletionRequest)({
-          stream: true as const,
-          stream_options: { include_usage: true },
-          model_instance_id: target.instanceId,
-          ...nativeChatCompletionsCodec.encodePrompt(providerModelId, prompt, tools),
-          ...Option.match(maxTokens, { onNone: () => ({}), onSome: (max_tokens) => ({ max_tokens }) }),
-          ...Option.match(toolChoice, { onNone: () => ({}), onSome: (tool_choice) => ({ tool_choice }) }),
-          ...Option.match(reasoningEffort, { onNone: () => ({}), onSome: (reasoning_effort) => ({ reasoning_effort }) }),
-        }).pipe(
+        onSome: (target) => NativeChatCompletions.buildRequest(
+          {
+            call,
+            modelId: providerModelId,
+            options: icnRequestOptions,
+          },
+          prompt,
+          tools,
+          {
+            ...Option.match(maxTokens, { onNone: () => ({}), onSome: (value) => ({ maxTokens: value }) }),
+            ...Option.match(toolChoice, { onNone: () => ({}), onSome: (value) => ({ toolChoice: value }) }),
+            ...Option.match(reasoningEffort, { onNone: () => ({}), onSome: (value) => ({ reasoningEffort: value }) }),
+          },
+        ).pipe(Effect.flatMap((nativeRequest) => encodeChatCompletionsRequest(nativeRequest).pipe(
+          Effect.flatMap((request) => Schema.decodeUnknown(Generated.ChatCompletionRequest)({
+            ...request,
+            model_instance_id: target.instanceId,
+          })),
           Effect.mapError((cause) => new StreamStartClientCorrectnessViolation({
             call,
             component: "request_builder",
             message: "Unable to encode the ICN chat request",
             evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
           })),
-        ),
+        ))),
       })),
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
       Effect.flatMap((payload) =>
@@ -287,7 +306,7 @@ const bindIcnModel = (
                   Effect.flatMap(Schema.decodeUnknown(ChatCompletionsStreamChunk)),
                   Effect.map((chunk) => normalizeChatCompletionsChunk(
                     chunk,
-                    Option.fromNullable(chunk.choices[0]?.delta.reasoning_content),
+                    chunk.choices[0]?.delta.reasoning_content ?? Option.none(),
                   )),
                   Effect.mapError((cause) => new GeneratedClientInvalidResponseError({
                     operationId: "createChatCompletion",

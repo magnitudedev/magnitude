@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { advanceAcnRevision } from "./advance-acn-revision"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..")
-const packagePath = resolve(root, "packages/cli/package.json")
+const packagePath = resolve(root, "packages/launcher/package.json")
 
 const readCliVersion = async (): Promise<string> => {
   const packageJson = JSON.parse(await readFile(packagePath, "utf8")) as {

@@ -123,6 +123,8 @@ export type StreamStartClientCorrectnessEvidence =
   | { readonly _tag: "MessageEncodingFailed"; readonly cause: CauseInfo }
   | { readonly _tag: "ToolSchemaEncodingFailed"; readonly cause: CauseInfo }
   | { readonly _tag: "RequestBodyEncodingFailed"; readonly cause: CauseInfo }
+  | { readonly _tag: "RequestSchemaValidationFailed"; readonly issue: SchemaIssue }
+  | { readonly _tag: "RequestContributionCollision"; readonly property: string }
   | { readonly _tag: "AuthApplicationFailed"; readonly cause: CauseInfo }
   | { readonly _tag: "UnexpectedDefectCaught"; readonly cause: CauseInfo }
 

@@ -5,9 +5,8 @@ applies_to:
   - packages/release/src/artifact-download*.ts
   - packages/release/src/contracts.ts
   - packages/release/src/launcher*.ts
-  - packages/cli/bin/magnitude.js
-  - packages/cli/lib/**
-  - packages/cli/scripts/prepare-release-runtime.ts
+  - packages/launcher/src/wrapper.ts
+  - packages/launcher/scripts/build-launcher.ts
   - packages/sdk/src/binary.ts
   - packages/icn/src/lifecycle/release-installation.ts
 ---

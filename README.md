@@ -1,12 +1,24 @@
-# Magnitude
+<p align="center">
+  <img src="docs/logo-nobg.svg" alt="Magnitude icon" width="120">
+</p>
 
-<a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a>
-<a href="https://discord.gg/EHt48pPWdC" target="_blank"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord" /></a>
-<a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter" /></a>
+<h1 align="center">Magnitude</h1>
 
-Magnitude is an open source agent with local models built in. Fully private and offline. Works out of the box on any hardware.
+<p align="center">Open source agent with local models built in. Fully private and offline. Works out of the box on any hardware.</p>
 
-![Magnitude running a local model](docs/maglocaldemo.gif)
+<p align="center">
+  <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a>
+  <a href="https://discord.gg/EHt48pPWdC" target="_blank"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord" /></a>
+  <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter" /></a>
+  <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars" /></a>
+  <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version" /></a>
+</p>
+
+<p align="center">⭐ Help us reach more developers and grow the Magnitude community. Star this repo!</p>
+
+<p align="center">
+  <img src="docs/maglocaldemo.gif" alt="Magnitude running a local model">
+</p>
 
 ## Get started
 

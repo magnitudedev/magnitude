@@ -153,6 +153,29 @@ describe("AcnJitRuntime", () => {
     expect(tags).not.toContain("RenewClientLease")
   })
 
+  it("closes an admitted runtime from its owning scope finalizer", async () => {
+    const tags: string[] = []
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const runtime = yield* makeAcnJitRuntime().pipe(
+        Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
+          ensure: () => Stream.succeed({ _tag: "Ready" as const, instance: ready }),
+          stop: Effect.void,
+        })),
+        Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
+      )
+
+      // TerminalPlatform owns the runtime this way. Accepting an update exits
+      // its scope without calling close first, so this finalizer performs the
+      // first close after the owning scope has begun finalization.
+      yield* Effect.addFinalizer(() => runtime.close.pipe(Effect.asVoid))
+      yield* runtime.startup.retry
+    })))
+
+    expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(1)
+    expect(tags.filter((tag) => tag === "GetModelSlots")).toHaveLength(1)
+    expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
+  })
+
   it("close interrupts initial selection without starting a lease", async () => {
     const tags: string[] = []
     let entered = 0

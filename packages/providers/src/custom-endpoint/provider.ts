@@ -1,4 +1,4 @@
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
 import {
   Auth,
   AVAILABLE_PROVIDER_MODEL,
@@ -21,7 +21,6 @@ import {
   type ProviderModelBindOptions,
   type RejectedHttpResponse,
   type ProviderCall,
-  type ToolChoice as AiToolChoice,
 } from "@magnitudedev/ai"
 import type {
   CustomEndpointDeclaration,
@@ -36,12 +35,10 @@ export const customEndpointProviderId = (name: CustomEndpointName) =>
 
 const callOptions = (reasoningDeclared: boolean) => ({
   maxTokens: NativeChatCompletions.options.maxTokens,
-  toolChoice: CallOption.define(
-    (value: AiToolChoice) => ({ tool_choice: value }),
-  ),
-  reasoningEffort: CallOption.define(
-    (value: string) => reasoningDeclared ? { reasoning_effort: value } : {},
-  ),
+  toolChoice: NativeChatCompletions.options.toolChoice,
+  reasoningEffort: reasoningDeclared
+    ? CallOption.field("reasoning_effort", Schema.String)
+    : CallOption.ignore<string>(),
 })
 
 const classifyRejectedResponse = (
