@@ -4,6 +4,7 @@
   "type": "module",
   "main": "out/main/main.js",
   "scripts": {
+    "setup": "install-electron --no",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "test": "bunx --bun vitest run",

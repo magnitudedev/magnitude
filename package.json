@@ -48,6 +48,7 @@
     "prepare": "bun run packages/version/scripts/generate-version.ts && effect-language-service patch",
     "els": "effect-language-service",
     "web": "bun run dev:version && bun run web/scripts/dev-server.ts",
+    "desktop:setup": "bun run --cwd desktop setup",
     "desktop": "bun run dev:version && cd desktop && bun run dev",
     "icn:generate": "bun run --cwd packages/icn-protocol generate",
     "icn:check-generated": "bun run --cwd packages/icn-protocol check-generated",
