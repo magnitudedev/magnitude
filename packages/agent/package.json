@@ -38,7 +38,7 @@
     "@effect/vitest": "^0.25.0",
     "@magnitudedev/logger": "workspace:*",
     "@magnitudedev/tracing": "workspace:*",
-    "@types/bun": "latest",
+    "@types/bun": "1.3.14",
     "@types/luxon": "^3.7.1",
     "vitest": "^3.2.1"
   }

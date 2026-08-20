@@ -15,7 +15,7 @@
     "effect": "^3.21.2"
   },
   "devDependencies": {
-    "@types/bun": "latest",
+    "@types/bun": "1.3.14",
     "vitest": "^3.2.4"
   }
 }

@@ -16,6 +16,6 @@
     "immer": "^11.1.3"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "1.3.14"
   }
 }
