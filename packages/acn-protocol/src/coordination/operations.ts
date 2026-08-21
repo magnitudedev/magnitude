@@ -1,27 +1,28 @@
 import { Clock, Duration, Effect } from "effect"
-import type { ExactProcessInspectionFailed } from "./errors"
-import type { ExactProcessController } from "./exact-process"
-import type { ExactProcess } from "./schemas"
+import type { ProcessGroupObservationFailed } from "./errors"
+import type { ProcessGroupController, ProcessGroupObservation } from "./exact-process"
+import type { ProcessGroup } from "./schemas"
 
-/** Shared timing for exact owner-tree retirement. */
-export const TREE_EXIT_POLL_INTERVAL = Duration.millis(50)
-export const TREE_TERM_WAIT = Duration.seconds(2)
-export const TREE_KILL_WAIT = Duration.seconds(2)
+/** Shared timing for process-group retirement. */
+export const PROCESS_GROUP_EXIT_POLL_INTERVAL = Duration.millis(50)
+export const PROCESS_GROUP_TERM_WAIT = Duration.seconds(2)
+export const PROCESS_GROUP_KILL_WAIT = Duration.seconds(2)
 
 /**
- * Polls `treeAbsent` until it returns `true` or the deadline elapses. The final
- * probe after the deadline returns the definitive answer.
+ * Polls until the process group is absent or the deadline elapses. The final
+ * observation after the deadline is returned as the definitive result.
  */
-export const waitForTreeAbsence = (
-  processes: ExactProcessController,
-  process: ExactProcess,
+export const waitForProcessGroupAbsence = (
+  processes: ProcessGroupController,
+  group: ProcessGroup,
   timeout: Duration.DurationInput,
-): Effect.Effect<boolean, ExactProcessInspectionFailed> =>
+): Effect.Effect<ProcessGroupObservation, ProcessGroupObservationFailed> =>
   Effect.gen(function* () {
     const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(Duration.decode(timeout))
     while ((yield* Clock.currentTimeMillis) < deadline) {
-      if (yield* processes.treeAbsent(process)) return true
-      yield* Effect.sleep(TREE_EXIT_POLL_INTERVAL)
+      const observation = yield* processes.observeGroup(group)
+      if (observation._tag === "ProcessGroupAbsent") return observation
+      yield* Effect.sleep(PROCESS_GROUP_EXIT_POLL_INTERVAL)
     }
-    return yield* processes.treeAbsent(process)
+    return yield* processes.observeGroup(group)
   })
