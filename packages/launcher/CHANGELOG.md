@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.7-alpha.3
+
+### Patch Changes
+
+- [`3414375`](https://github.com/magnitudedev/magnitude/commit/3414375095513a1ac5a2bcef0ce543bcd00e0720) Thanks [@anerli](https://github.com/anerli)! - fix: daemon process coordination issues
+
 ## 0.0.7-alpha.2
 
 ### Patch Changes
