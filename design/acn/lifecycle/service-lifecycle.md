@@ -27,7 +27,7 @@ A JIT candidate starts only a stable health/shutdown control server. It remains 
 its exact owner row commits, and may not construct application or ICN services before that.
 
 After binding its control endpoint, the candidate reads the complete current owner, proves that
-predecessor's dedicated process tree absent, then atomically replaces the singleton SQLite owner
+predecessor's dedicated process group absent, then atomically replaces the singleton SQLite owner
 row only if the complete owner remains unchanged. That commit is process admission. Owner mismatch
 makes the candidate stop and exit without expensive initialization. Successful admission removes
 dependence on its launching manager, installs the mandatory lifetime owner monitor, and permits
@@ -37,7 +37,7 @@ An admitted ACN does not poll durable version intent, but it continuously proves
 owner row still equals the row it admitted. A confirmed missing or changed row begins
 `Stopping(ownership-lost)`. Any surfaced owner-store failure means ownership can no longer be
 proven and fails closed through `Stopping(fatal)`. A manager prepares a successor before asking a
-lower-revision live owner to stop, then proves the predecessor ACN/ICN tree absent before the
+lower-revision live owner to stop, then proves the predecessor ACN process group absent before the
 successor may commit ownership. Retirement otherwise begins through exact explicit shutdown, idle
 policy, ownership loss, the ACN's own terminal failure, or process signals.
 
@@ -79,7 +79,7 @@ commit Stopping and close admission
   -> close application and session scopes
   -> terminate and reap private ICN
   -> exit ACN
-  -> external manager proves ACN tree absent and may acquire ownership
+  -> external manager proves ACN process group absent and may acquire ownership
 ```
 
 `beginStopping` completes immediately after the atomic stopping/admission transition; it never
@@ -102,5 +102,5 @@ belongs to manager-side owner and exact-process revalidation, not a required end
 - A confirmed missing or changed owner row stops the admitted ACN, and any store failure fails
   closed rather than leaving an unfenced service alive.
 - Observation cannot retain ACN, and operation duration cannot replace it.
-- The stopping transition is single-flight; cooperative teardown and external exact-tree escalation
+- The stopping transition is single-flight; cooperative teardown and external exact-process-group escalation
   are independently bounded.

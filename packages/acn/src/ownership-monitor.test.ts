@@ -81,7 +81,6 @@ describe("ACN ownership monitor", () => {
       const lifecycle = yield* makeAcnServiceLifecycle()
       yield* installAcnOwnershipMonitor({
         current: Effect.fail(new AcnProcessStoreUnavailable({
-          operation: "current-owner",
           path: "test",
           message: "unavailable",
         })),

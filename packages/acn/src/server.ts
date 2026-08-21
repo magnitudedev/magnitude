@@ -36,8 +36,8 @@ import {
   MagnitudeRpcs,
 } from "@magnitudedev/acn-protocol"
 import {
-  ExactProcessController,
-  ExactProcessControllerLive,
+  ProcessGroupController,
+  ProcessGroupControllerLive,
   makeAcnOwnerStore,
   type AcnOwnerStoreError,
   type AcnOwnerStore,
@@ -509,10 +509,11 @@ const rejectCoordinationFailure = <A>(
 
 const predecessorAbsent = (
   owner: Option.Option<{ readonly pid: number; readonly processStartIdentity: ExactProcess["processStartIdentity"] }>,
-): Effect.Effect<boolean, AcnBootstrapRejected, ExactProcessController> => Option.match(owner, {
+): Effect.Effect<boolean, AcnBootstrapRejected, ProcessGroupController> => Option.match(owner, {
   onNone: () => Effect.succeed(true),
-  onSome: (process) => ExactProcessController.pipe(
-    Effect.flatMap((processes) => processes.treeAbsent(process)),
+  onSome: (process) => ProcessGroupController.pipe(
+    Effect.flatMap((processes) => processes.observeGroup({ leader: process })),
+    Effect.map((observation) => observation._tag === "ProcessGroupAbsent"),
     Effect.mapError((error) => new AcnBootstrapRejected({ reason: error.message })),
   ),
 })
@@ -527,8 +528,8 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       Effect.provide(Layer.merge(BunFileSystem.layer, BunPath.layer)),
     )
 
-    const currentProcess = yield* ExactProcessController.pipe(
-      Effect.flatMap((processes) => processes.current),
+    const currentProcess = yield* ProcessGroupController.pipe(
+      Effect.flatMap((processes) => processes.currentProcess),
       Effect.mapError((error) => new AcnBootstrapRejected({ reason: error.message })),
     )
 
@@ -666,6 +667,6 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     yield* closeApplicationScope
     yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))
   })).pipe(
-    Effect.provideService(ExactProcessController, ExactProcessControllerLive),
+    Effect.provideService(ProcessGroupController, ProcessGroupControllerLive),
     Effect.provide(BunSqliteDriverLayer),
   )

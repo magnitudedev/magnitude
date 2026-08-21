@@ -2,21 +2,21 @@ import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Duration, Effect, Exit, Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { ExactProcessControllerLive } from "./exact-process"
-import type { ExactProcessInspectionFailed } from "./errors"
-import type { ExactProcess } from "./schemas"
+import { ProcessGroupControllerLive } from "./exact-process"
+import type { ProcessGroupObservationFailed } from "./errors"
+import type { ProcessGroup } from "./schemas"
 
-const waitForTreeAbsence = (
-  process: ExactProcess,
-): Effect.Effect<void, ExactProcessInspectionFailed> => Effect.gen(function* () {
+const waitForGroupAbsence = (
+  group: ProcessGroup,
+): Effect.Effect<void, ProcessGroupObservationFailed> => Effect.gen(function* () {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (yield* ExactProcessControllerLive.treeAbsent(process)) return
+    if ((yield* ProcessGroupControllerLive.observeGroup(group))._tag === "ProcessGroupAbsent") return
     yield* Effect.sleep(Duration.millis(20))
   }
-  return yield* Effect.dieMessage(`process tree ${process.pid} remained alive`)
+  return yield* Effect.dieMessage(`process group ${group.leader.pid} remained alive`)
 })
 
-describe("ExactProcessController", () => {
+describe("exact process capabilities", () => {
   it.skipIf(process.platform === "win32")(
     "rejects a stale identity and terminates one real process group",
     async () => {
@@ -35,27 +35,23 @@ describe("ExactProcessController", () => {
         const [pidText] = new TextDecoder().decode(first.value).trim().split(":")
         const pid = Number(pidText)
         const identity = Option.getOrThrow(await Effect.runPromise(
-          ExactProcessControllerLive.inspect(pid),
+          ProcessGroupControllerLive.inspect(pid),
         ))
         const exact = { pid, processStartIdentity: identity }
+        const group = { leader: exact }
 
-        expect(await Effect.runPromise(ExactProcessControllerLive.signal({
-          ...exact,
-          processStartIdentity: `${identity}-stale` as never,
-        }, "term"))).toBe(false)
-        expect(await Effect.runPromise(ExactProcessControllerLive.signalTree({
-          ...exact,
-          processStartIdentity: `${identity}-stale` as never,
-        }, "term"))).toBe(false)
+        expect((await Effect.runPromise(ProcessGroupControllerLive.signalGroup({
+          leader: { ...exact, processStartIdentity: `${identity}-stale` as never },
+        }, "term")))._tag).toBe("ProcessGroupLeaderChanged")
         expect(Option.contains(await Effect.runPromise(
-          ExactProcessControllerLive.inspect(pid),
+          ProcessGroupControllerLive.inspect(pid),
         ), identity)).toBe(true)
 
-        expect(await Effect.runPromise(
-          ExactProcessControllerLive.signalTree(exact, "term"),
-        )).toBe(true)
+        expect((await Effect.runPromise(
+          ProcessGroupControllerLive.signalGroup(group, "term"),
+        ))._tag).toBe("ProcessGroupSignaled")
         await child.exited
-        await Effect.runPromise(waitForTreeAbsence(exact))
+        await Effect.runPromise(waitForGroupAbsence(group))
       } finally {
         try {
           child.kill(9)
@@ -76,14 +72,13 @@ describe("ExactProcessController", () => {
         stderr: "ignore",
       })
       const identity = Option.getOrThrow(await Effect.runPromise(
-        ExactProcessControllerLive.inspect(child.pid),
+        ProcessGroupControllerLive.inspect(child.pid),
       ))
       child.kill(9)
       await child.exited
       const exit = await Effect.runPromise(Effect.exit(
-        ExactProcessControllerLive.treeAbsent({
-          pid: child.pid,
-          processStartIdentity: identity,
+        ProcessGroupControllerLive.observeGroup({
+          leader: { pid: child.pid, processStartIdentity: identity },
         }),
       ))
       expect(Exit.isFailure(exit)).toBe(true)
@@ -100,7 +95,7 @@ describe("ExactProcessController", () => {
         stdout: "pipe",
         stderr: "inherit",
       })
-      let exact: ExactProcess | undefined
+      let group: ProcessGroup | undefined
       try {
         const reader = root.stdout.getReader()
         const first = await reader.read()
@@ -109,22 +104,23 @@ describe("ExactProcessController", () => {
         const [pidText] = new TextDecoder().decode(first.value).trim().split(":")
         const pid = Number(pidText)
         const processStartIdentity = Option.getOrThrow(await Effect.runPromise(
-          ExactProcessControllerLive.inspect(pid),
+          ProcessGroupControllerLive.inspect(pid),
         ))
-        exact = { pid, processStartIdentity }
+        group = { leader: { pid, processStartIdentity } }
 
         expect(await Effect.runPromise(
-          ExactProcessControllerLive.signal(exact, "kill"),
-        )).toBe(true)
+          Effect.sync(() => root.kill(9)),
+        ))
         await root.exited
-        expect(await Effect.runPromise(ExactProcessControllerLive.treeAbsent(exact))).toBe(false)
-        expect(await Effect.runPromise(
-          ExactProcessControllerLive.signalTree(exact, "kill"),
-        )).toBe(true)
-        await Effect.runPromise(waitForTreeAbsence(exact))
+        expect((await Effect.runPromise(ProcessGroupControllerLive.observeGroup(group)))._tag)
+          .toBe("ProcessGroupPresent")
+        expect((await Effect.runPromise(
+          ProcessGroupControllerLive.signalGroup(group, "kill"),
+        ))._tag).toBe("ProcessGroupSignaled")
+        await Effect.runPromise(waitForGroupAbsence(group))
       } finally {
-        if (exact !== undefined) {
-          await Effect.runPromise(ExactProcessControllerLive.signalTree(exact, "kill")).catch(() => undefined)
+        if (group !== undefined) {
+          await Effect.runPromise(ProcessGroupControllerLive.signalGroup(group, "kill")).catch(() => undefined)
         }
         try {
           root.kill(9)

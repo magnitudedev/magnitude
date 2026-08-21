@@ -16,7 +16,7 @@ import * as nodePath from "node:path"
 import * as nodeFs from "node:fs"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
-import { Array as Arr, Cause, Duration, Effect, Exit, Layer, Option, PubSub, Schedule, Scope, Stream } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Layer, Option, PubSub, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import { FetchHttpClient } from "@effect/platform"
 import { layer as nodeFileSystemLayer } from "@effect/platform-node-shared/NodeFileSystem"
@@ -32,7 +32,10 @@ import {
   makeLocalAcnInstanceManager,
   ChildProcessSpawner,
   scopeAcnCandidate,
-  AcnEnsuranceFailed,
+  AcnCandidateBootstrapProcessExitUnproven,
+  AcnCandidateBootstrapProcessStopFailed,
+  AcnCandidateParentChannelReleaseFailed,
+  AcnCandidateSpawnFailed,
   SDK_ACN_TARGET,
   type AcnInstanceManager as AcnInstanceManagerService,
 } from "@magnitudedev/sdk"
@@ -59,7 +62,7 @@ const nodeSpawn: ChildProcessSpawner = {
             readonly proc: ReturnType<typeof spawn>
             readonly exited: Promise<{ readonly code: number; readonly stderr: string }>
           },
-          AcnEnsuranceFailed
+          AcnCandidateSpawnFailed
         >((resume) => {
           const [executable, ...args] = command
           const proc = spawn(executable, args, {
@@ -93,8 +96,8 @@ const nodeSpawn: ChildProcessSpawner = {
           }
           const onError = (cause: Error) => {
             cleanup()
-            resume(Effect.fail(new AcnEnsuranceFailed({
-                reason: `Failed to spawn Magnitude: ${cause.message}`,
+            resume(Effect.fail(new AcnCandidateSpawnFailed({
+                message: cause.message,
             })))
           }
           proc.once("spawn", onSpawn)
@@ -104,70 +107,40 @@ const nodeSpawn: ChildProcessSpawner = {
         const { proc } = spawned
         const pid = proc.pid
         if (pid === undefined) {
-          return yield* new AcnEnsuranceFailed({
-            reason: "Spawned Magnitude daemon has no process ID",
+          return yield* new AcnCandidateSpawnFailed({
+            message: "Spawned Magnitude daemon has no process ID",
           })
         }
         const exited = Effect.promise(() => spawned.exited)
         proc.unref()
 
-        const signalTree = (name: NodeJS.Signals) =>
-          Effect.try({
-            try: () => {
-              try {
-                if (process.platform === "win32") {
-                  if (!proc.kill(name)) throw new Error(`process ${pid} rejected ${name}`)
-                } else {
-                  process.kill(-pid, name)
+        const stopBootstrapProcess = Effect.gen(function* () {
+          if (proc.exitCode === null) {
+            yield* Effect.try({
+              try: () => {
+                if (!proc.kill("SIGKILL") && proc.exitCode === null) {
+                  throw new Error(`process ${pid} rejected SIGKILL`)
                 }
-              } catch (cause) {
-                if (cause instanceof Error && "code" in cause && cause.code === "ESRCH") return
-                throw cause
-              }
-            },
-            catch: (cause) =>
-              new AcnEnsuranceFailed({
-                reason: `Failed to send ${name} to Magnitude daemon ${pid}: ${String(cause)}`,
+              },
+              catch: (cause) => new AcnCandidateBootstrapProcessStopFailed({
+                pid,
+                message: cause instanceof Error ? cause.message : String(cause),
               }),
-          })
-        const treeAbsent = Effect.sync(() => {
-          if (process.platform === "win32") return proc.exitCode !== null
-          try {
-            process.kill(-pid, 0)
-            return false
-          } catch (cause) {
-            if (cause instanceof Error && "code" in cause) {
-              if (cause.code === "ESRCH") return true
-              if (cause.code === "EPERM") return false
-            }
-            throw cause
-          }
-        })
-        const waitForTreeAbsence = (duration: Duration.DurationInput) => treeAbsent.pipe(
-          Effect.flatMap((absent) => absent ? Effect.void : Effect.fail("TreePresent" as const)),
-          Effect.retry(Schedule.spaced(Duration.millis(20))),
-          Effect.timeoutOption(duration),
-          Effect.catchAll(() => Effect.succeed(Option.none())),
-          Effect.map(Option.isSome),
-        )
-        const stopAndReap = Effect.gen(function* () {
-          if (yield* treeAbsent) return
-          yield* signalTree("SIGTERM")
-          if (yield* waitForTreeAbsence(Duration.seconds(2))) return
-          yield* signalTree("SIGKILL")
-          if (!(yield* waitForTreeAbsence(Duration.seconds(2)))) {
-            return yield* new AcnEnsuranceFailed({
-              reason: `Magnitude daemon process tree ${pid} did not exit after SIGKILL`,
             })
           }
+          const stopped = yield* exited.pipe(Effect.timeoutOption("2 seconds"))
+          if (Option.isNone(stopped)) {
+            return yield* new AcnCandidateBootstrapProcessExitUnproven({ pid })
+          }
         })
-        const releaseParentChannel = Effect.async<void, AcnEnsuranceFailed>((resume) => {
+        const releaseParentChannel = Effect.async<void, AcnCandidateParentChannelReleaseFailed>((resume) => {
           const stdin = proc.stdin
           if (stdin === null) {
             resume(
               Effect.fail(
-                new AcnEnsuranceFailed({
-                  reason: "Magnitude daemon bootstrap pipe is unavailable",
+                new AcnCandidateParentChannelReleaseFailed({
+                  pid,
+                  message: "Magnitude daemon bootstrap pipe is unavailable",
                 }),
               ),
             )
@@ -177,8 +150,9 @@ const nodeSpawn: ChildProcessSpawner = {
             stdin.off("error", onError)
             resume(
               Effect.fail(
-                new AcnEnsuranceFailed({
-                  reason: `Failed to hand off Magnitude daemon bootstrap: ${cause.message}`,
+                new AcnCandidateParentChannelReleaseFailed({
+                  pid,
+                  message: cause.message,
                 }),
               ),
             )
@@ -194,7 +168,7 @@ const nodeSpawn: ChildProcessSpawner = {
           pid,
           exited,
           releaseParentChannel,
-          stopAndReap,
+          stopBootstrapProcess,
         })
       }),
     ),
