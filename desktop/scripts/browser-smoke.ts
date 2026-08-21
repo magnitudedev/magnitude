@@ -97,8 +97,15 @@ await Promise.all([
 ])
 
 const composerSendQa = process.env["MAGNITUDE_COMPOSER_SEND_QA"] === "1"
+const workspaceQa = process.env["MAGNITUDE_WORKSPACE_QA"] === "1"
+const isolatedProjectQa = composerSendQa || workspaceQa
 const qaDataDir = join(tempRoot, "magnitude-data")
-if (composerSendQa) {
+if (isolatedProjectQa) {
+  await mkdir(join(attachmentRoot, "nested"), { recursive: true })
+  await Promise.all([
+    writeFile(join(attachmentRoot, "nested", "nested.ts"), "export const nested = true\n"),
+    writeFile(join(attachmentRoot, "delete-me.txt"), "delete this file\n"),
+  ])
   const sourceDataDir = join(process.env["HOME"] ?? "", ".magnitude")
   await mkdir(join(qaDataDir, "state"), { recursive: true })
   await Promise.all([
@@ -163,15 +170,25 @@ async function waitForPage(
 }
 
 async function openBrowser(page: Page): Promise<void> {
+  const address = page.getByRole("textbox", { name: "Address and search" })
+  if (await address.isVisible().catch(() => false)) return
   const expandButtons = page.getByRole("button", { name: "Expand sidebar" })
-  await expandButtons.last().click()
-  await page.waitForTimeout(200)
-  assert.equal(
-    await page.getByRole("tooltip").filter({ hasText: "Collapse sidebar" }).count(),
-    0,
-    "the moving panel-header action must not flash a tooltip during expansion",
-  )
-  await page.getByRole("button", { name: "Browser", exact: true }).click()
+  if (await expandButtons.last().isVisible().catch(() => false)) {
+    await expandButtons.last().click()
+    await page.waitForTimeout(200)
+    assert.equal(
+      await page.getByRole("tooltip").filter({ hasText: "Collapse sidebar" }).count(),
+      0,
+      "the moving panel-header action must not flash a tooltip during expansion",
+    )
+  }
+  if (!await address.isVisible().catch(() => false)) await newBrowserTab(page)
+  await page.getByRole("textbox", { name: "Address and search" }).waitFor()
+}
+
+async function newBrowserTab(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "New workspace tab" }).click()
+  await page.getByRole("menuitem", { name: "Browser", exact: true }).click()
   await page.getByRole("textbox", { name: "Address and search" }).waitFor()
 }
 
@@ -182,7 +199,7 @@ async function navigate(page: Page, value: string): Promise<void> {
 }
 
 async function tabCloseButton(page: Page, title: string): Promise<void> {
-  const tab = page.getByRole("tablist", { name: "Browser tabs" })
+  const tab = page.getByRole("tablist", { name: "Workspace tabs" })
     .getByRole("tab", { name: title })
   await tab.locator("..").locator('[aria-label^="Close "]').evaluate((element: HTMLElement) => element.click())
 }
@@ -262,7 +279,7 @@ try {
       env: {
         ...process.env,
         ELECTRON_ENABLE_SECURITY_WARNINGS: "true",
-        ...(composerSendQa ? { MAGNITUDE_DEV_DATA_DIR: qaDataDir } : {}),
+        ...(isolatedProjectQa ? { MAGNITUDE_DEV_DATA_DIR: qaDataDir } : {}),
       },
       stdio: "inherit",
     },
@@ -392,6 +409,8 @@ try {
   await page.getByRole("alert").getByText("binary.bin: Binary files are not supported.").waitFor()
   await page.locator('input[type="file"]').setInputFiles(attachmentPaths.oversized)
   await page.getByRole("alert").getByText("oversized.txt: Text and code files must be 500 KiB or smaller.").waitFor()
+  const attachmentAlertClose = page.getByRole("alert").getByRole("button")
+  while (await attachmentAlertClose.count() > 0) await attachmentAlertClose.first().click()
 
   if (composerSendQa) {
     for (const filename of ["config.json", "icon.svg", "pixel.png", "dragged.py", "pasted.env"]) {
@@ -465,6 +484,205 @@ try {
   while (await removeButtons.count() > 0) await removeButtons.first().click()
   await attachmentRow.waitFor({ state: "detached" })
 
+  if (workspaceQa) {
+    await evaluateInElectronMain(inspectorPort, `(() => {
+      const { BrowserWindow } = process.getBuiltinModule("module").createRequire(process.cwd() + "/package.json")("electron")
+      BrowserWindow.getAllWindows()[0].setSize(1_600, 900)
+    })()`)
+    await page.waitForFunction(() => window.innerWidth >= 1_590)
+    await page.getByRole("button", { name: "Expand sidebar" }).last().click()
+    const workspace = page.getByRole("complementary", { name: "Workspace" })
+    await workspace.waitFor()
+    await page.waitForTimeout(250)
+    const fileTabs = page.getByRole("tablist", { name: "Workspace tabs" })
+      .locator('[role="tab"][data-workspace-tab-kind="file"]')
+    assert.equal(await fileTabs.count(), 1, "opening the workspace for a project should create one empty file tab")
+    await page.getByText("Select a file", { exact: true }).last().waitFor()
+    await page.getByRole("tree", { name: "Project file tree" }).waitFor()
+
+    const workspaceBox = await workspace.boundingBox()
+    const treeDock = page.getByRole("region", { name: "Project files" })
+    const initialTreeBox = await treeDock.boundingBox()
+    assert(workspaceBox !== null && Math.abs(workspaceBox.width - 600) <= 2, `workspace should begin at 600px: ${JSON.stringify(workspaceBox)}`)
+    assert(initialTreeBox !== null && Math.abs(initialTreeBox.width - 200) <= 2, `project tree should begin at 200px: ${JSON.stringify(initialTreeBox)}`)
+
+    await page.getByText("nested", { exact: true }).click()
+    await page.getByText("nested.ts", { exact: true }).waitFor()
+    const externalFile = join(attachmentRoot, "external-change.txt")
+    await writeFile(externalFile, "created outside Magnitude\n")
+    await page.getByText("external-change.txt", { exact: true }).waitFor()
+    await rm(externalFile)
+    await page.getByText("external-change.txt", { exact: true }).waitFor({ state: "detached" })
+
+    await page.getByText("answer.ts", { exact: true }).click()
+    await page.getByRole("tab", { name: "answer.ts" }).waitFor()
+    assert.equal(await fileTabs.count(), 1, "the first tree selection should fill the active file tab")
+    await page.getByText("nested.ts", { exact: true }).click()
+    await page.getByRole("tab", { name: "nested.ts" }).waitFor()
+    assert.equal(await fileTabs.count(), 1, "later tree selections should replace the active file tab")
+    await page.getByText("answer.ts", { exact: true }).click()
+    await page.getByRole("tab", { name: "answer.ts" }).waitFor()
+    assert.equal(await fileTabs.count(), 1, "tree selection should not create implicit file tabs")
+    const monacoEditor = page.locator(".monaco-editor").last()
+    const saveButton = page.getByRole("button", { name: "Save", exact: true })
+    await monacoEditor.waitFor()
+    await monacoEditor.click()
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A")
+    await page.keyboard.insertText("export const broken =\n")
+    await withTimeout("showing syntax diagnostics", (async () => {
+      while (await monacoEditor.locator(".squiggly-error").count() === 0) await sleep(25)
+    })())
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A")
+    await page.keyboard.insertText('import { Effect } from "effect"\nexport const result = Effect.succeed(42)\n')
+    await withTimeout("clearing syntax diagnostics", (async () => {
+      while (await monacoEditor.locator(".squiggly-error").count() > 0) await sleep(25)
+    })())
+    await sleep(750)
+    assert(await monacoEditor.locator(".squiggly-error").count() === 0, "project-blind Monaco worker should not report unresolved external imports")
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A")
+    await page.keyboard.insertText("export const updated = 84\n")
+    await withTimeout("enabling save after editing", (async () => {
+      while (!(await saveButton.isEnabled())) await sleep(25)
+    })())
+
+    await fileTabs.last().locator("..").locator('[aria-label="Close answer.ts"]').click()
+    await page.getByRole("alertdialog").getByText("Discard unsaved changes?").waitFor()
+    await page.getByRole("button", { name: "Keep editing" }).click()
+    await saveButton.click()
+    await withTimeout("saving an edited project file", (async () => {
+      while (await readFile(attachmentPaths.typescript, "utf8") !== "export const updated = 84\n") await sleep(25)
+    })())
+    await withTimeout("disabling save after persistence", (async () => {
+      while (await saveButton.isEnabled()) await sleep(25)
+    })())
+
+    await monacoEditor.click()
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A")
+    await page.keyboard.insertText("export const draftAcrossTabs = 126\n")
+    await withTimeout("enabling save for a second edit", (async () => {
+      while (!(await saveButton.isEnabled())) await sleep(25)
+    })())
+
+    await page.getByText("notes.md", { exact: true }).click()
+    await page.getByRole("alertdialog").getByText("Discard unsaved changes?").waitFor()
+    await page.getByRole("button", { name: "Keep editing" }).click()
+    await page.getByRole("tab", { name: "answer.ts" }).waitFor()
+    await page.locator(".view-lines").last().getByText(/draftAcrossTabs/).waitFor()
+
+    await page.getByRole("button", { name: "New workspace tab" }).click()
+    await page.getByRole("menuitem", { name: "File", exact: true }).click()
+    await page.getByText("notes.md", { exact: true }).click()
+    await page.getByRole("tab", { name: "notes.md" }).waitFor()
+    await page.getByRole("button", { name: "Preview", exact: true }).waitFor()
+    await page.getByRole("heading", { name: "Notes", exact: true }).waitFor()
+    await page.getByRole("button", { name: "Source", exact: true }).click()
+    await page.locator(".monaco-editor").last().waitFor()
+    await page.getByRole("tab", { name: "answer.ts" }).click()
+    await withTimeout("preserving the dirty draft across tabs", (async () => {
+      while (!(await saveButton.isEnabled())) await sleep(25)
+    })())
+    await page.locator(".view-lines").last().getByText(/draftAcrossTabs/).waitFor()
+    const tabSurfaceStyles = await page.evaluate(() => {
+      const tabs = [...document.querySelectorAll<HTMLElement>('[role="tab"]')]
+      const answer = tabs.find((tab) => tab.textContent?.includes("answer.ts"))?.parentElement
+      const notes = tabs.find((tab) => tab.textContent?.includes("notes.md"))?.parentElement
+      const header = answer?.closest("header")
+      if (answer === undefined || answer === null || notes === undefined || notes === null || header === null || header === undefined) return null
+      const active = getComputedStyle(answer)
+      const inactive = getComputedStyle(notes)
+      const container = getComputedStyle(header)
+      return {
+        activeBackground: active.backgroundColor,
+        inactiveBackground: inactive.backgroundColor,
+        containerBackground: container.backgroundColor,
+        activeRadius: Number.parseFloat(active.borderRadius),
+      }
+    })
+    assert(tabSurfaceStyles !== null, "workspace tab surfaces should be rendered")
+    assert(tabSurfaceStyles.activeBackground !== tabSurfaceStyles.inactiveBackground, `active and inactive tabs should have distinct surfaces: ${JSON.stringify(tabSurfaceStyles)}`)
+    assert(tabSurfaceStyles.inactiveBackground !== tabSurfaceStyles.containerBackground, `tabs should be distinct from the header: ${JSON.stringify(tabSurfaceStyles)}`)
+    assert(tabSurfaceStyles.activeRadius >= 6, `workspace tabs should be rounded: ${JSON.stringify(tabSurfaceStyles)}`)
+    await page.getByRole("treeitem").filter({ hasText: "answer.ts" }).waitFor({ state: "visible" })
+    await withTimeout("synchronizing the project tree selection with the active file tab", (async () => {
+      const answerTreeItem = page.getByRole("treeitem").filter({ hasText: "answer.ts" })
+      while (await answerTreeItem.getAttribute("aria-selected") !== "true") await sleep(25)
+    })())
+    if (qaArtifacts !== undefined) {
+      await page.emulateMedia({ colorScheme: "light" })
+      await page.screenshot({ path: join(qaArtifacts, "workspace-editor-light.png") })
+      await page.emulateMedia({ colorScheme: "dark" })
+      await page.screenshot({ path: join(qaArtifacts, "workspace-editor-dark.png") })
+      await page.emulateMedia({ colorScheme: "light" })
+    }
+    await saveButton.click()
+    await withTimeout("saving a draft after tab switching", (async () => {
+      while (await readFile(attachmentPaths.typescript, "utf8") !== "export const draftAcrossTabs = 126\n") await sleep(25)
+    })())
+
+    await monacoEditor.click()
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A")
+    await page.keyboard.insertText("export const discarded = 999\n")
+    await page.getByText("pixel.png", { exact: true }).click()
+    await page.getByRole("alertdialog").getByText("Discard unsaved changes?").waitFor()
+    await page.getByRole("button", { name: "Discard changes" }).click()
+    await page.getByRole("tab", { name: "pixel.png" }).waitFor()
+    await page.getByRole("img", { name: "pixel.png" }).waitFor()
+    await page.getByText("answer.ts", { exact: true }).click()
+    await page.getByRole("tab", { name: "answer.ts" }).waitFor()
+    await page.locator(".view-lines").last().getByText(/draftAcrossTabs/).waitFor()
+    assert.equal(await page.locator(".view-lines").last().getByText(/discarded/).count(), 0, "discarded edits must not return when the file is reopened")
+    await page.getByText("pixel.png", { exact: true }).click()
+    await page.getByRole("img", { name: "pixel.png" }).waitFor()
+    await page.getByText("binary.bin", { exact: true }).click()
+    await page.getByRole("tab", { name: "binary.bin" }).waitFor()
+    await page.getByText(/This file cannot be displayed/).waitFor()
+
+    await page.getByText("delete-me.txt", { exact: true }).click()
+    await page.getByRole("tab", { name: "delete-me.txt" }).waitFor()
+    await page.getByRole("button", { name: "File actions" }).click()
+    await page.getByRole("menuitem", { name: "Remove file" }).click()
+    await page.getByRole("alertdialog").getByText("Remove this file?").waitFor()
+    await page.getByRole("button", { name: "Remove", exact: true }).click()
+    await withTimeout("deleting a project file", (async () => {
+      while (true) {
+        try {
+          await access(join(attachmentRoot, "delete-me.txt"))
+        } catch {
+          return
+        }
+        await sleep(25)
+      }
+    })())
+    await page.getByRole("tab", { name: "delete-me.txt" }).waitFor({ state: "detached" })
+
+    const tabListBox = await page.getByRole("tablist", { name: "Workspace tabs" }).boundingBox()
+    const newTabButton = page.getByRole("button", { name: "New workspace tab" })
+    const newTabBox = await newTabButton.boundingBox()
+    assert(tabListBox !== null && newTabBox !== null && newTabBox.x + newTabBox.width <= tabListBox.x + tabListBox.width + 1, "the new-tab action must remain visible when tabs overflow")
+    await newTabButton.click()
+    await page.getByRole("menuitem", { name: "File", exact: true }).click()
+    await page.getByText("Select a file", { exact: true }).last().waitFor()
+    const panelBeforeTreeToggle = await workspace.boundingBox()
+    await page.getByRole("button", { name: "Hide project files" }).click()
+    await treeDock.waitFor({ state: "detached" })
+    const panelAfterTreeToggle = await workspace.boundingBox()
+    assert.equal(Math.round(panelAfterTreeToggle?.width ?? 0), Math.round(panelBeforeTreeToggle?.width ?? 0), "the tree must resize content inside the workspace instead of growing the panel")
+    await page.getByRole("button", { name: "Show project files" }).click()
+    await treeDock.waitFor()
+    const treeResizer = page.getByRole("separator", { name: "Resize project files" })
+    const treeWidth = Number(await treeResizer.getAttribute("aria-valuenow"))
+    await treeResizer.press("ArrowLeft")
+    assert.equal(Number(await treeResizer.getAttribute("aria-valuenow")), treeWidth + 16)
+
+    if (qaArtifacts !== undefined) {
+      await page.emulateMedia({ colorScheme: "light" })
+      await page.screenshot({ path: join(qaArtifacts, "workspace-files-light.png") })
+      await page.emulateMedia({ colorScheme: "dark" })
+      await page.screenshot({ path: join(qaArtifacts, "workspace-files-dark.png") })
+      await page.emulateMedia({ colorScheme: "light" })
+    }
+  }
+
   await openBrowser(page)
   if (process.env["MAGNITUDE_BROWSER_EXTERNAL_QA"] === "1") {
     await navigate(page, "magnitude browser smoke test")
@@ -483,7 +701,7 @@ try {
     assert(googleDocument.text.length > 0, "Google should render a non-empty response")
     await page.getByRole("button", { name: "Reload" }).waitFor()
   }
-  const browserResizer = page.getByRole("separator", { name: "Resize browser" })
+  const browserResizer = page.getByRole("separator", { name: "Resize workspace" })
   const initialBrowserWidth = Number(await browserResizer.getAttribute("aria-valuenow"))
   await browserResizer.press("ArrowRight")
   assert.equal(Number(await browserResizer.getAttribute("aria-valuenow")), initialBrowserWidth - 16)
@@ -508,7 +726,7 @@ try {
   await page.waitForTimeout(200)
   const browserViewport = await page.locator("[data-browser-viewport]").boundingBox()
   assert(browserViewport, "the browser viewport should be measurable")
-  const browserResizeHandle = await page.getByRole("separator", { name: "Resize browser" }).boundingBox()
+  const browserResizeHandle = await page.getByRole("separator", { name: "Resize workspace" }).boundingBox()
   assert(browserResizeHandle, "the browser resize handle should be measurable")
   assert(
     Math.abs(browserResizeHandle.x + browserResizeHandle.width - browserViewport.x) <= 1,
@@ -518,7 +736,7 @@ try {
     position: { x: browserResizeHandle.width / 2, y: browserResizeHandle.height - 24 },
   })
   await page.waitForFunction(() => {
-    const element = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize browser"]')
+    const element = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize workspace"]')
     return element !== null && getComputedStyle(element).borderRightColor !== "rgba(0, 0, 0, 0)"
   }, undefined, { timeout: 1_000 }).catch(() => undefined)
   const resizeHoverState = await browserResizer.evaluate((element) => {
@@ -575,7 +793,7 @@ try {
   await page.getByRole("button", { name: "Forward" }).click()
   await page.getByRole("tab", { name: "Fixture Next" }).waitFor()
 
-  await page.getByRole("button", { name: "New tab" }).click()
+  await newBrowserTab(page)
   await navigate(page, fixtureUrl)
   await page.getByRole("tab", { name: "Fixture Home" }).waitFor()
   await tabCloseButton(page, "Fixture Home")
@@ -589,8 +807,8 @@ try {
     }
   })()`)
 
-  await page.getByRole("button", { name: "New tab" }).click()
-  const browserTabs = page.getByRole("tablist", { name: "Browser tabs" }).getByRole("tab")
+  await newBrowserTab(page)
+  const browserTabs = page.getByRole("tablist", { name: "Workspace tabs" }).locator('[role="tab"][data-workspace-tab-kind="browser"]')
   assert.equal(await browserTabs.count(), 2)
   assert.equal(
     await page.getByRole("textbox", { name: "Address and search" }).evaluate((element) => element === document.activeElement),
@@ -599,7 +817,7 @@ try {
   await navigate(page, fixtureUrl)
   const cookieGuest = await waitForPage(context, (candidate) => candidate.url() === `${fixtureUrl}/`)
   await cookieGuest.locator("#cookie").click()
-  await page.getByRole("button", { name: "New tab" }).click()
+  await newBrowserTab(page)
   await navigate(page, fixtureUrl)
   const sharedCookieGuest = context.pages().filter((candidate) => candidate.url() === `${fixtureUrl}/`).at(-1)!
   const sharedCookie = await sharedCookieGuest.evaluate(() => document.cookie)
@@ -698,17 +916,16 @@ try {
   await page.getByText("Insecure connection").waitFor({ state: "hidden" })
   await page.getByRole("tab", { name: "Fixture Next" }).last().waitFor()
 
-  const tabCloseButtons = page.getByRole("tablist", { name: "Browser tabs" }).locator('[aria-label^="Close "]')
-  while (await browserTabs.count() > 1) await tabCloseButtons.last().click()
-  await tabCloseButtons.last().click()
-  assert.equal(await browserTabs.count(), 1)
-  await page.getByRole("tab", { name: "New tab" }).waitFor()
-  assert.equal(
-    await page.getByRole("textbox", { name: "Address and search" }).evaluate((element) => element === document.activeElement),
-    true,
-  )
+  const closeLastBrowserTab = async (): Promise<void> => {
+    await browserTabs.last().locator("..").locator('[aria-label^="Close "]').click()
+  }
+  while (await browserTabs.count() > 1) await closeLastBrowserTab()
+  await closeLastBrowserTab()
+  assert.equal(await browserTabs.count(), 0)
+  await page.getByRole("textbox", { name: "Address and search" }).waitFor({ state: "hidden" })
   if (qaArtifacts !== undefined) await page.screenshot({ path: join(qaArtifacts, "blank-browser.png") })
 
+  await newBrowserTab(page)
   await navigate(page, fixtureUrl)
   await page.getByRole("tab", { name: "Fixture Home" }).waitFor()
   const crashGuest = context.pages().filter((candidate) => candidate.url() === `${fixtureUrl}/`).at(-1)!

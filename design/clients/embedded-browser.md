@@ -10,7 +10,8 @@ applies_to:
   - packages/client-common/src/platform/embedded-browser.ts
   - packages/client-common/src/platform/types.ts
   - web/src/components/browser-panel.tsx
-  - web/src/components/workspace-panel-header.tsx
+  - web/src/components/workspace-panel.tsx
+  - web/src/lib/workspace-tabs.ts
   - web/src/lib/workspace-panel-layout.ts
 ---
 
@@ -26,22 +27,22 @@ standalone web client does not advertise the capability.
 
 Browser tabs are transient application state. They share one persistent browser session for normal
 web cookies and storage, but the tab list and active selection do not survive application restart.
-At least one tab always exists; closing the final tab replaces it with a blank tab.
+The native browser may contain no tabs. Creating a tab returns its authoritative native ID; closing
+the final tab leaves the browser workspace empty instead of manufacturing a replacement tab.
 
 ## Workspace behavior
 
-Browser and project files are peer surfaces in the full-height right workspace panel. The panel
-pushes the chat horizontally rather than covering it. Each surface retains an independent preferred
-width, subject to a minimum chat width and viewport-aware bounds. Narrow windows give the panel the
-available width. Opening, closing, and surface changes preserve the same reduced-motion and resize
-semantics as the project-file surface. The native browser viewport excludes the resize handle's
-hitbox, which sits immediately outside the page with its indicator on the panel boundary, so remote
-content cannot intercept resizing and no visual gap is introduced.
+Browser documents are native-backed tabs in the shared right workspace described by
+`design/clients/right-workspace.md`. The native browser viewport excludes the outer resize handle,
+header and optional project-tree dock. Its resize hitbox sits immediately outside the page with its
+indicator on the panel boundary, so remote content cannot intercept resizing and no visual gap is
+introduced.
 
-The browser surface provides a managed tab strip, location field, history, reload or stop, external
-open, download activity, and explicit blank, loading, navigation-failure, crash, and insecure-HTTP
-states. New-window requests become managed tabs rather than additional Magnitude windows. Browser
-keyboard commands operate while guest content has focus.
+The browser surface provides a location field, history, reload or stop, external open, download
+activity, and explicit blank, loading, navigation-failure, crash, and insecure-HTTP states. The
+shared workspace provides the tab strip. New-window requests become managed workspace browser tabs
+rather than additional Magnitude windows. Browser keyboard commands operate while guest content has
+focus.
 
 ## Guest isolation and navigation policy
 
@@ -89,11 +90,11 @@ tab and recover through reload. Closing or reopening the workspace panel does no
 - Remote pages cannot access Node, Electron, Magnitude preload APIs, or privileged URL schemes.
 - Browser truth has one main-process owner and crosses the renderer boundary only through schemas.
 - Multiple tabs share their dedicated session while retaining independent navigation and form state.
-- Popups become managed tabs, and closing the final tab leaves one blank tab.
+- Popups become managed tabs, and closing the final tab leaves no native browser tab.
 - A newer navigation cannot be overwritten by a stale success, failure, or abort from an older load.
 - Permission requests are origin-visible, time-bounded, allow-once or denied, and always terminalized.
 - Downloads prompt for a destination, report progress and terminal status, cancel, and reveal safely.
-- Collapse, surface switching, resize, narrow-window layout, hidden-tab discard, crash, and shutdown
+- Collapse, mixed-tab switching, resize, narrow-window layout, hidden-tab discard, crash, and shutdown
   preserve their stated ownership and cleanup guarantees.
 - Navigation, history, redirects, forms, cookies, permissions, downloads, popups, prohibited schemes,
   insecure navigation, tabs, panel reopening, isolation, and shutdown have automated verification in

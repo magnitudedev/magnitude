@@ -60,8 +60,7 @@ import {
   FooterBar,
   type FooterModelOptionsState,
 } from "./components/footer-bar"
-import { ProjectFilesPanel } from "./components/project-files/panel"
-import { BrowserPanel } from "./components/browser-panel"
+import { WorkspacePanel } from "./components/workspace-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
 import { SettingsCenter } from "./components/settings-center"
@@ -82,8 +81,9 @@ import {
   settingsTabAtom,
   workspacePanelEnteringAtom,
   workspacePanelOpenAtom,
-  workspacePanelSurfaceAtom,
+  workspacePresentationAtom,
 } from "./state/web-atoms"
+import { addBrowserTab, addEmptyFileTab, changeWorkspaceProject, makeWorkspaceTabId } from "@/lib/workspace-tabs"
 import { useMenuActions } from "./hooks/use-menu-actions"
 import { DaemonConnectionError } from "./components/daemon-connection-error"
 import { AcnBootstrapScreen } from "./components/acn-bootstrap-screen"
@@ -936,8 +936,8 @@ function AuthenticatedAppContent({
   const workspacePanelOpen = useAtomValue(workspacePanelOpenAtom)
   const setWorkspacePanelOpen = useAtomSet(workspacePanelOpenAtom)
   const setWorkspacePanelEntering = useAtomSet(workspacePanelEnteringAtom)
-  const workspacePanelSurface = useAtomValue(workspacePanelSurfaceAtom)
-  const setWorkspacePanelSurface = useAtomSet(workspacePanelSurfaceAtom)
+  const workspacePresentation = useAtomValue(workspacePresentationAtom)
+  const setWorkspacePresentation = useAtomSet(workspacePresentationAtom)
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const { startNewSession } = useSessionActions()
@@ -949,21 +949,29 @@ function AuthenticatedAppContent({
   const filesAvailable = selectedProjectId !== null
   const browserAvailable = browser !== undefined
   const workspacePanelAvailable = filesAvailable || browserAvailable
-  const activeWorkspaceSurface = workspacePanelSurface === "browser" && browserAvailable
-    ? "browser"
-    : filesAvailable
-      ? "files"
-      : browserAvailable
-        ? "browser"
-        : null
   const workspacePanelExpanded = !panelOpen
     && !workerDetailOpen
     && workspacePanelOpen
-    && activeWorkspaceSurface !== null
+    && workspacePanelAvailable
   const openWorkspacePanel = () => {
     setSettingsTab(null)
-    if (workspacePanelSurface === "files" && !filesAvailable && browserAvailable) {
-      setWorkspacePanelSurface("browser")
+    const compatibleTabs = changeWorkspaceProject(workspacePresentation, selectedProjectId).tabs
+    if (compatibleTabs.length === 0) {
+      if (selectedProjectId !== null) {
+        setWorkspacePresentation((current) => {
+          const scoped = changeWorkspaceProject(current, selectedProjectId)
+          return scoped.tabs.length === 0
+            ? addEmptyFileTab(scoped, makeWorkspaceTabId(), selectedProjectId)
+            : scoped
+        })
+      } else if (browser !== undefined) {
+        void browser.createTab().then((browserTabId) => {
+          setWorkspacePresentation((current) => addBrowserTab(current, makeWorkspaceTabId(), browserTabId))
+        }).catch((cause: unknown) => {
+          console.error("[workspace] Could not create a browser tab.", cause)
+          notify("error", "Could not create a browser tab.")
+        })
+      }
     }
     if (!workspacePanelOpen) {
       setWorkspacePanelEntering(true)
@@ -1078,11 +1086,8 @@ function AuthenticatedAppContent({
         )}
         </div>
       </div>
-      {workspacePanelExpanded && activeWorkspaceSurface === "files" && selectedProjectId !== null
-        ? <ProjectFilesPanel projectId={selectedProjectId} />
-        : null}
-      {workspacePanelExpanded && activeWorkspaceSurface === "browser" && browser !== undefined
-        ? <BrowserPanel browser={browser} filesEnabled={filesAvailable} />
+      {workspacePanelExpanded
+        ? <WorkspacePanel projectId={selectedProjectId} browser={browser} />
         : null}
     </div>
   )

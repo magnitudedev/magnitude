@@ -27,6 +27,7 @@ import {
   Data,
   Effect,
   Layer,
+  Option,
   Runtime,
   Stream,
   SubscriptionRef,
@@ -78,7 +79,7 @@ interface InternalDownload {
 
 export interface EmbeddedBrowserService {
   readonly changes: Stream.Stream<BrowserWorkspaceState>
-  readonly createTab: (url: string | null) => Effect.Effect<void, EmbeddedBrowserUnavailable>
+  readonly createTab: (url: string | null) => Effect.Effect<BrowserTabId, EmbeddedBrowserUnavailable>
   readonly activateTab: (tabId: BrowserTabId) => Effect.Effect<void, EmbeddedBrowserUnavailable>
   readonly closeTab: (tabId: BrowserTabId) => Effect.Effect<void, EmbeddedBrowserUnavailable>
   readonly navigate: (input: string) => Effect.Effect<void, EmbeddedBrowserUnavailable>
@@ -157,14 +158,9 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
     const downloads = new Map<BrowserDownloadId, InternalDownload>()
     let revision = 0
     let focusLocationRevision = 0
-    let activeTabId: BrowserTabId
+    let activeTabId: BrowserTabId | null = null
     let viewport: BrowserViewportRect | null = null
     let disposed = false
-
-    const initialTab = makeTab()
-    tabs.set(initialTab.id, initialTab)
-    tabOrder.push(initialTab.id)
-    activeTabId = initialTab.id
 
     const tabState = (tab: InternalTab): BrowserTabState => {
       const contents = tab.view?.webContents
@@ -198,7 +194,7 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
     const snapshot = (): BrowserWorkspaceState => ({
       revision,
       focusLocationRevision,
-      activeTabId,
+      activeTabId: Option.fromNullable(activeTabId),
       tabs: tabOrder.flatMap((id) => {
         const tab = tabs.get(id)
         return tab === undefined ? [] : [tabState(tab)]
@@ -217,6 +213,9 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
     }
 
     const activeTab = (): InternalTab => {
+      if (activeTabId === null) {
+        throw new EmbeddedBrowserUnavailable({ reason: "There is no active browser tab." })
+      }
       const tab = tabs.get(activeTabId)
       if (tab === undefined) {
         throw new EmbeddedBrowserUnavailable({ reason: "The active browser tab is unavailable." })
@@ -421,7 +420,8 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
         const shortcut = embeddedBrowserShortcut(input, process.platform)
         if (shortcut === null) return
         event.preventDefault()
-        if (shortcut === "next-tab" || shortcut === "previous-tab") {
+        if ((shortcut === "next-tab" || shortcut === "previous-tab") && tabOrder.length > 0) {
+          if (activeTabId === null) return
           const currentIndex = tabOrder.indexOf(activeTabId)
           const direction = shortcut === "previous-tab" ? -1 : 1
           const nextIndex = (currentIndex + direction + tabOrder.length) % tabOrder.length
@@ -491,7 +491,7 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
     }
 
     const createTabInternal = (url: string | null): InternalTab => {
-      const previous = tabs.get(activeTabId)
+      const previous = activeTabId === null ? undefined : tabs.get(activeTabId)
       if (previous !== undefined) hideView(previous)
       const tab = makeTab()
       tabs.set(tab.id, tab)
@@ -608,7 +608,7 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
     browserSession.on("will-download", onWillDownload)
 
     const unavailable = (reason: string) => new EmbeddedBrowserUnavailable({ reason })
-    const effect = (operation: () => void): Effect.Effect<void, EmbeddedBrowserUnavailable> =>
+    const effect = <A>(operation: () => A): Effect.Effect<A, EmbeddedBrowserUnavailable> =>
       Effect.try({ try: operation, catch: (cause) => unavailable(cause instanceof Error ? cause.message : String(cause)) })
 
     const shutdown = Effect.sync(() => {
@@ -630,12 +630,12 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
 
     const service: EmbeddedBrowserService = {
       changes: state.changes,
-      createTab: (url) => effect(() => { createTabInternal(url) }),
+      createTab: (url) => effect(() => createTabInternal(url).id),
       activateTab: (tabId) => effect(() => {
         const next = tabs.get(tabId)
         if (next === undefined) throw unavailable("This browser tab no longer exists.")
         if (tabId === activeTabId) return
-        hideView(activeTab())
+        if (activeTabId !== null) hideView(activeTab())
         activeTabId = tabId
         clearDiscardTimer(next)
         if (next.phase === "blank") focusLocationRevision += 1
@@ -654,11 +654,7 @@ const makeEmbeddedBrowser = (window: BrowserWindow) =>
         tabs.delete(tabId)
         tabOrder.splice(index, 1)
         if (tabOrder.length === 0) {
-          const replacement = makeTab()
-          tabs.set(replacement.id, replacement)
-          tabOrder.push(replacement.id)
-          activeTabId = replacement.id
-          focusLocationRevision += 1
+          activeTabId = null
         } else if (wasActive) {
           activeTabId = tabOrder[Math.min(index, tabOrder.length - 1)]!
           if (tabs.get(activeTabId)?.phase === "blank") focusLocationRevision += 1

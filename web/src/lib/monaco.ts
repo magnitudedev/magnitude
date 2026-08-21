@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor"
+import { typescript as monacoTypescript } from "monaco-editor"
 import editorWorker from "monaco-editor/editor/editor.worker?worker"
 import jsonWorker from "monaco-editor/language/json/json.worker?worker"
 import cssWorker from "monaco-editor/language/css/css.worker?worker"
@@ -15,6 +16,18 @@ self.MonacoEnvironment = {
     return new editorWorker()
   },
 }
+
+// Monaco's browser TypeScript worker only sees models opened in this client;
+// it does not own the Project's tsconfig, package graph, or node_modules. Keep
+// syntax validation for the complete file being edited, but do not present
+// project-semantic or suggestion diagnostics that the worker cannot resolve
+// authoritatively (notably false TS2307 "cannot find module" errors).
+const projectAgnosticDiagnostics = {
+  noSemanticValidation: true,
+  noSuggestionDiagnostics: true,
+}
+monacoTypescript.typescriptDefaults.setDiagnosticsOptions(projectAgnosticDiagnostics)
+monacoTypescript.javascriptDefaults.setDiagnosticsOptions(projectAgnosticDiagnostics)
 
 loader.config({ monaco })
 monaco.editor.defineTheme("magnitude-dark", {

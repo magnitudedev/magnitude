@@ -8,7 +8,10 @@ applies_to:
   - packages/acn/src/file-system-manager.ts
   - packages/client-common/src/project-files/**
   - web/src/components/project-files/**
+  - web/src/lib/monaco.ts
+  - web/src/components/workspace-panel.tsx
   - web/src/lib/workspace-panel-layout.ts
+  - web/src/lib/workspace-tabs.ts
   - web/src/state/web-atoms.ts
   - web/src/app.tsx
 ---
@@ -39,9 +42,9 @@ The rendered tree may display drag intent, but it never becomes filesystem autho
 
 ## Client state and interaction
 
-Project file queries and writes use the shared connection-scoped AtomRpc client through client-common. Web presentation state owns only whether the pane is open, expanded tree branches, the selected relative path, and unsaved editor drafts keyed by project and path. Server snapshots and directory listings are not copied into presentation atoms.
+Project file queries and writes use the shared connection-scoped AtomRpc client through client-common. Web presentation state owns only whether the workspace and tree dock are open, mixed tab identity and order, expanded tree branches, and unsaved editor drafts owned by their open file tabs. Server snapshots and directory listings are not copied into presentation atoms.
 
-The project pane is one surface of the full-height right-hand workspace panel. When collapsed, its toggle belongs to the app titlebar's upper-right controls. When expanded, that same control is the first item in the pane header, directly before the surface selector. The pane participates in the horizontal application layout and reduces the chat's available width rather than covering it, matching the left sidebar's layout behavior. Opening and closing animate that width over the same short duration as the left sidebar, while reduced-motion preferences suppress the transition. Its inner edge is pointer- and keyboard-resizable within viewport-aware bounds. The file tree, document, and browser retain independent presentation widths; the tree begins narrowest, a document opens wider, and the browser begins widest. Viewport clamping never overwrites any preference. Narrow layouts use the full width and do not expose a meaningless resize edge. Its tree is the default file view; selecting a file replaces the tree with the document and Back restores it. The complete root listing loads before the tree appears. Folder discovery is demand-loaded one directory level at a time: restored expansion proceeds breadth-first through successful parent listings, while a short pointer-hover or keyboard-focus dwell silently prefetches likely next folders. Prefetch never recursively walks a collapsed subtree. A cold expanded folder shows loading in its disclosure control rather than masquerading as empty, and collapsing it does not immediately discard or interrupt the listing. Text uses locally bundled Monaco. Markdown defaults to formatted preview with a source mode; MDX remains source. Saving is explicit through Save or platform Mod-S. Conflicts remain in the pane and use Monaco diff presentation. File actions provide hash-checked removal behind an explicit confirmation dialog.
+Project documents are file tabs in the shared right workspace described by `design/clients/right-workspace.md`. The project tree is a separately toggled, independently resizable internal dock on the right of the active file or browser content. Creating a File tab opens an empty document surface and the tree. Selecting a tree file always replaces the document in the active file tab, whether that tab is empty or already displaying another file; tree selection never creates or activates a different file tab while a file tab is active. Replacing or closing a dirty file tab requires explicit confirmation; discarding removes that tab's buffer before navigating or closing, while keeping edits cancels the action. Additional file tabs are created explicitly through the workspace's new-tab action. Each file tab owns its editing buffer, including when multiple tabs display the same saved file. Saving remains content-hash guarded, so independently edited tabs cannot silently overwrite a newer save. The complete root listing loads before the tree appears. Folder discovery is demand-loaded one directory level at a time: restored expansion proceeds breadth-first through successful parent listings, while a short pointer-hover or keyboard-focus dwell silently prefetches likely next folders. Prefetch never recursively walks a collapsed subtree. A cold expanded folder shows loading in its disclosure control rather than masquerading as empty, and collapsing it does not immediately discard or interrupt the listing. Text uses locally bundled Monaco. Monaco's browser worker has no authority over the Project's tsconfig, dependency graph, or `node_modules`, so TypeScript and JavaScript project-semantic and suggestion diagnostics are disabled instead of presenting false unresolved-import errors. Syntax diagnostics for the complete open file remain enabled. Markdown defaults to formatted preview with a source mode; MDX remains source. Saving is explicit through Save or platform Mod-S. Conflicts remain in the file tab and use Monaco diff presentation. File actions provide hash-checked removal behind an explicit confirmation dialog.
 
 ## Acceptance guarantees
 
@@ -53,8 +56,8 @@ The project pane is one surface of the full-height right-hand workspace panel. W
 - Dragging a file or directory moves it only within the same Project and never overwrites an existing destination.
 - Dragging within the same directory does not create a fictitious manual order.
 - Moving a directory preserves open-document, draft, and expansion presentation paths beneath it after acknowledgement.
-- Closing a document does not close the project pane.
-- Browser and document widths remain independently adjustable within responsive bounds.
+- Closing a document does not close the workspace or project tree.
+- Browser and document tabs share the workspace width; the internal project tree retains its own width.
 - Opening the project pane reduces the chat layout's available width instead of overlaying it.
 - The resize edge supports pointer and keyboard interaction.
 - No editor assets are loaded from a CDN.

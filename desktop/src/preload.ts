@@ -233,8 +233,8 @@ function makeDesktopApi(): DesktopApi {
           onEnd,
         )
       },
-      async createTab(url?: string): Promise<void> {
-        await desktopRpc.run((client) => client.BrowserCreateTab({ url: url ?? null }))
+      async createTab(url?: string) {
+        return desktopRpc.run((client) => client.BrowserCreateTab({ url: url ?? null }))
       },
       async activateTab(tabId): Promise<void> {
         await desktopRpc.run((client) => client.BrowserActivateTab({ tabId }))

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import {
   BrowserTabIdSchema,
   BrowserViewportRectSchema,
@@ -12,7 +12,7 @@ describe("embedded browser wire schemas", () => {
     const value = {
       revision: 4,
       focusLocationRevision: 2,
-      activeTabId: id,
+      activeTabId: Option.some(id),
       tabs: [{
         id,
         title: "Magnitude",
@@ -30,6 +30,21 @@ describe("embedded browser wire schemas", () => {
     }
 
     const encoded = Schema.encodeSync(BrowserWorkspaceStateSchema)(value)
+    expect(Schema.decodeUnknownSync(BrowserWorkspaceStateSchema)(encoded)).toEqual(value)
+  })
+
+  it("round-trips an empty browser workspace without inventing an active tab", () => {
+    const value = {
+      revision: 0,
+      focusLocationRevision: 0,
+      activeTabId: Option.none(),
+      tabs: [],
+      permissionRequest: null,
+      downloads: [],
+    }
+
+    const encoded = Schema.encodeSync(BrowserWorkspaceStateSchema)(value)
+    expect(encoded).not.toHaveProperty("activeTabId")
     expect(Schema.decodeUnknownSync(BrowserWorkspaceStateSchema)(encoded)).toEqual(value)
   })
 

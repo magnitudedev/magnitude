@@ -64,7 +64,7 @@ export type BrowserDownloadState = typeof BrowserDownloadStateSchema.Type
 export const BrowserWorkspaceStateSchema = Schema.Struct({
   revision: Schema.Int,
   focusLocationRevision: Schema.Int,
-  activeTabId: BrowserTabIdSchema,
+  activeTabId: Schema.optionalWith(BrowserTabIdSchema, { as: "Option", exact: true }),
   tabs: Schema.Array(BrowserTabStateSchema),
   permissionRequest: Schema.NullOr(BrowserPermissionRequestSchema),
   downloads: Schema.Array(BrowserDownloadStateSchema),
@@ -87,7 +87,7 @@ export type BrowserViewportRect = typeof BrowserViewportRectSchema.Type
 export interface EmbeddedBrowserCapability {
   readonly getSnapshot: () => BrowserWorkspaceState
   readonly subscribe: (listener: () => void) => () => void
-  readonly createTab: (url?: string) => Promise<void>
+  readonly createTab: (url?: string) => Promise<BrowserTabId>
   readonly activateTab: (tabId: BrowserTabId) => Promise<void>
   readonly closeTab: (tabId: BrowserTabId) => Promise<void>
   readonly navigate: (input: string) => Promise<void>
