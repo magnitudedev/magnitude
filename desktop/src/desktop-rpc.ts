@@ -105,7 +105,7 @@ export const DesktopRpcs = RpcGroup.make(
   }),
   Rpc.make("BrowserCreateTab", {
     payload: Schema.Struct({ url: Schema.NullOr(Schema.String) }),
-    success: Unit,
+    success: BrowserTabIdSchema,
     error: DesktopRpcError,
   }),
   Rpc.make("BrowserActivateTab", {
@@ -228,7 +228,7 @@ export interface DesktopApi {
       onError: (error: unknown) => void,
       onEnd: () => void,
     ): () => void
-    createTab(url?: string): Promise<void>
+    createTab(url?: string): Promise<BrowserTabId>
     activateTab(tabId: BrowserTabId): Promise<void>
     closeTab(tabId: BrowserTabId): Promise<void>
     navigate(input: string): Promise<void>

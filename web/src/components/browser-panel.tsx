@@ -1,35 +1,23 @@
 import {
-  useCallback,
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type FormEvent,
-  type MouseEvent,
   type ReactNode,
 } from "react"
-import {
-  ArrowLeft,
-  ArrowRight,
-  Download,
-  ExternalLink,
-  FolderOpen,
-  Plus,
-  RotateCw,
-  X,
-} from "lucide-react"
-import { Atom, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { ArrowLeft, ArrowRight, Download, ExternalLink, FolderOpen, RotateCw, X } from "lucide-react"
+import { Atom, useAtomMount } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import {
   formatStorageSize,
   type BrowserDownloadState,
-  type BrowserTabId,
+  type BrowserTabState,
+  type BrowserWorkspaceState,
   type EmbeddedBrowserCapability,
 } from "@magnitudedev/client-common"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
-import { ResizableEdge } from "@/components/ui/resizable-edge"
 import { ActionTooltip } from "@/components/ui/tooltip"
 import {
   AlertDialog,
@@ -41,31 +29,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { WorkspacePanelHeader } from "@/components/workspace-panel-header"
 import { notify } from "@/lib/notifications"
-import {
-  WORKSPACE_BROWSER_MINIMUM_WIDTH,
-  WORKSPACE_CHAT_MINIMUM_WIDTH,
-  WORKSPACE_PANEL_FULL_WIDTH_BREAKPOINT,
-  workspacePanelMaximumWidthForViewport,
-  workspacePanelWidthForViewport,
-} from "@/lib/workspace-panel-layout"
-import {
-  workspacePanelEnteringAtom,
-  workspacePanelOpenAtom,
-  workspacePanelSurfaceAtom,
-  workspacePanelWidthsAtom,
-  sidebarCollapsedAtom,
-  sidebarWidthAtom,
-} from "@/state/web-atoms"
 
-const windowWidth = () => typeof window === "undefined" ? 1_440 : window.innerWidth
-const subscribeWindow = (listener: () => void) => {
-  window.addEventListener("resize", listener)
-  return () => window.removeEventListener("resize", listener)
-}
-
-const runCommand = (command: Promise<void>, failure: string): void => {
+const runCommand = (command: Promise<unknown>, failure: string): void => {
   void command.catch((cause: unknown) => {
     console.error(`[browser] ${failure}`, cause)
     notify("error", failure)
@@ -89,86 +55,40 @@ function BrowserDownload({
       <span className="min-w-0 flex-1 truncate text-slate-700 dark:text-slate-300">{download.fileName}</span>
       <span className="shrink-0 tabular-nums text-slate-500 dark:text-slate-400">
         {download.status === "progressing"
-          ? progress === null
-            ? formatStorageSize(download.receivedBytes)
-            : `${progress}%`
-          : download.status === "completed"
-            ? "Downloaded"
-            : download.status === "cancelled"
-              ? "Cancelled"
-              : "Failed"}
+          ? progress === null ? formatStorageSize(download.receivedBytes) : `${progress}%`
+          : download.status === "completed" ? "Downloaded"
+            : download.status === "cancelled" ? "Cancelled" : "Failed"}
       </span>
       {download.status === "progressing" ? (
-        <ActionTooltip
-          label="Cancel download"
-          side="bottom"
-          trigger={(
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Cancel download"
-              onClick={() => runCommand(browser.cancelDownload(download.id), "Could not cancel download.")}
-            >
-              <X size={13} />
-            </Button>
-          )}
-        />
+        <ActionTooltip label="Cancel download" side="bottom" trigger={(
+          <Button variant="ghost" size="icon-xs" aria-label="Cancel download" onClick={() => runCommand(browser.cancelDownload(download.id), "Could not cancel download.")}>
+            <X size={13} />
+          </Button>
+        )} />
       ) : download.status === "completed" ? (
-        <ActionTooltip
-          label="Reveal download"
-          side="bottom"
-          trigger={(
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Reveal download"
-              onClick={() => runCommand(browser.revealDownload(download.id), "Could not reveal download.")}
-            >
-              <FolderOpen size={13} />
-            </Button>
-          )}
-        />
+        <ActionTooltip label="Reveal download" side="bottom" trigger={(
+          <Button variant="ghost" size="icon-xs" aria-label="Reveal download" onClick={() => runCommand(browser.revealDownload(download.id), "Could not reveal download.")}>
+            <FolderOpen size={13} />
+          </Button>
+        )} />
       ) : null}
     </div>
   )
 }
 
-export function BrowserPanel({
+export function BrowserContent({
   browser,
-  filesEnabled,
+  state,
+  activeTab,
 }: {
   readonly browser: EmbeddedBrowserCapability
-  readonly filesEnabled: boolean
+  readonly state: BrowserWorkspaceState
+  readonly activeTab: BrowserTabState
 }): ReactNode {
-  const panelRef = useRef<HTMLDivElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
   const addressRef = useRef<HTMLInputElement>(null)
-  const closingRef = useRef(false)
-  const [resizing, setResizing] = useState(false)
   const [addressDrafts, setAddressDrafts] = useState<Readonly<Record<string, string>>>({})
-  const state = useSyncExternalStore(browser.subscribe, browser.getSnapshot, browser.getSnapshot)
-  const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0]!
-  const setSurface = useAtomSet(workspacePanelSurfaceAtom)
-  const setOpen = useAtomSet(workspacePanelOpenAtom)
-  const entering = useAtomValue(workspacePanelEnteringAtom)
-  const setEntering = useAtomSet(workspacePanelEnteringAtom)
-  const widths = useAtomValue(workspacePanelWidthsAtom)
-  const setWidths = useAtomSet(workspacePanelWidthsAtom)
-  const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
-  const sidebarWidth = useAtomValue(sidebarWidthAtom)
-  const viewportWidth = useSyncExternalStore(subscribeWindow, windowWidth, windowWidth)
-  const occupiedWidth = WORKSPACE_CHAT_MINIMUM_WIDTH + (sidebarCollapsed ? 0 : sidebarWidth)
-  const fullWidth = viewportWidth <= WORKSPACE_PANEL_FULL_WIDTH_BREAKPOINT
-  const maximumWidth = workspacePanelMaximumWidthForViewport(viewportWidth, occupiedWidth)
-  const panelWidth = workspacePanelWidthForViewport(
-    widths.browser,
-    WORKSPACE_BROWSER_MINIMUM_WIDTH,
-    viewportWidth,
-    occupiedWidth,
-  )
-  const addressValue = addressDrafts[activeTab.id]
-    ?? activeTab.pendingUrl
-    ?? activeTab.url
+  const addressValue = addressDrafts[activeTab.id] ?? activeTab.pendingUrl ?? activeTab.url
   const activeDownloads = state.downloads.filter((download) => download.status === "progressing")
   const latestCompletedDownload = [...state.downloads].reverse().find(
     (download) => download.status !== "progressing",
@@ -218,27 +138,9 @@ export function BrowserPanel({
         void browser.setViewport(null)
       }))
     })),
-    [browser, state.permissionRequest],
+    [activeTab.id, browser, state.permissionRequest],
   )
   useAtomMount(viewportLifecycleAtom)
-
-  const collapse = useCallback(() => {
-    if (closingRef.current) return
-    setEntering(false)
-    void browser.setViewport(null)
-    const panel = panelRef.current
-    if (panel === null || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setOpen(false)
-      return
-    }
-    closingRef.current = true
-    const width = panel.getBoundingClientRect().width
-    const animation = panel.animate(
-      [{ width: `${width}px` }, { width: "0px" }],
-      { duration: 150, easing: "ease-out", fill: "forwards" },
-    )
-    void animation.finished.then(() => setOpen(false), () => setOpen(false))
-  }, [browser, setEntering, setOpen])
 
   const navigate = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -251,123 +153,8 @@ export function BrowserPanel({
     addressRef.current?.blur()
   }
 
-  const closeTab = (event: MouseEvent, tabId: BrowserTabId) => {
-    event.stopPropagation()
-    runCommand(browser.closeTab(tabId), "Could not close this tab.")
-  }
-
   return (
-    <div
-      ref={panelRef}
-      style={{ width: fullWidth ? "100%" : panelWidth }}
-      onAnimationEnd={(event) => {
-        if (event.currentTarget === event.target) setEntering(false)
-      }}
-      className={`relative flex shrink-0 overflow-visible ${entering && !resizing ? "animate-[workspace-panel-open_150ms_ease-out]" : ""} ${resizing || fullWidth ? "" : "transition-[width] duration-150 ease-out"}`}
-    >
-      {!fullWidth ? (
-        <ResizableEdge
-          side="left"
-          placement="outside"
-          value={panelWidth}
-          minimum={WORKSPACE_BROWSER_MINIMUM_WIDTH}
-          maximum={maximumWidth}
-          onValueChange={(width) => setWidths((current) => ({ ...current, browser: width }))}
-          onDraggingChange={setResizing}
-          label="Resize browser"
-        />
-      ) : null}
-      <aside
-        aria-label="Browser"
-        className="flex min-w-0 flex-1 flex-col overflow-hidden border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-850"
-      >
-      <WorkspacePanelHeader
-        surface="browser"
-        filesEnabled={filesEnabled}
-        browserEnabled
-        collapseTooltipDisabled={entering}
-        onSurfaceChange={(next) => {
-          if (next === "browser") return
-          setEntering(false)
-          void browser.setViewport(null)
-          setSurface(next)
-        }}
-        onCollapse={collapse}
-      />
-      <div className="flex h-9 shrink-0 items-end border-b border-slate-200 bg-slate-50 px-1.5 pt-1 dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex min-w-0 flex-1 items-end gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="tablist" aria-label="Browser tabs">
-          {state.tabs.map((tab) => (
-            <div
-              key={tab.id}
-              className={`group flex h-8 min-w-24 max-w-44 flex-1 items-center rounded-t-md font-sans text-xs ${tab.id === state.activeTabId ? "bg-white text-slate-900 dark:bg-slate-850 dark:text-slate-100" : "text-slate-500 hover:bg-slate-150 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"}`}
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={tab.id === state.activeTabId}
-                tabIndex={tab.id === state.activeTabId ? 0 : -1}
-                onClick={() => runCommand(browser.activateTab(tab.id), "Could not switch tabs.")}
-                onAuxClick={(event) => {
-                  if (event.button === 1) closeTab(event, tab.id)
-                }}
-                onKeyDown={(event) => {
-                  const tabList = event.currentTarget.closest('[role="tablist"]')
-                  const tabs = tabList === null
-                    ? []
-                    : [...tabList.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
-                  const index = tabs.indexOf(event.currentTarget)
-                  const target = event.key === "ArrowLeft"
-                    ? tabs[(index - 1 + tabs.length) % tabs.length]
-                    : event.key === "ArrowRight"
-                      ? tabs[(index + 1) % tabs.length]
-                      : event.key === "Home"
-                        ? tabs[0]
-                        : event.key === "End"
-                          ? tabs.at(-1)
-                          : undefined
-                  if (target === undefined) return
-                  event.preventDefault()
-                  target.focus()
-                  target.click()
-                }}
-                className="flex min-w-0 flex-1 items-center gap-1.5 self-stretch pl-2"
-              >
-                {tab.phase === "loading" ? (
-                  <Spinner className="size-3.5 shrink-0 text-blue-600 motion-reduce:animate-none dark:text-blue-400" />
-                ) : tab.faviconUrl !== null ? (
-                  <img src={tab.faviconUrl} alt="" className="size-3.5 shrink-0" />
-                ) : (
-                  <span className="size-3.5 shrink-0 rounded-full border border-slate-300 dark:border-slate-600" />
-                )}
-                <span className="min-w-0 flex-1 truncate text-left">{tab.title}</span>
-              </button>
-              <button
-                type="button"
-                aria-label={`Close ${tab.title}`}
-                onClick={(event) => closeTab(event, tab.id)}
-                className={`mr-1 flex size-5 shrink-0 items-center justify-center rounded hover:bg-slate-200 focus:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-700 ${tab.id === state.activeTabId ? "opacity-100" : "opacity-0"}`}
-              >
-                <X size={12} />
-              </button>
-            </div>
-          ))}
-        </div>
-        <ActionTooltip
-          label="New tab"
-          side="top"
-          trigger={(
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="mb-0.5 ml-1 shrink-0"
-              aria-label="New tab"
-              onClick={() => runCommand(browser.createTab(), "Could not create a tab.")}
-            >
-              <Plus size={15} />
-            </Button>
-          )}
-        />
-      </div>
+    <div className="flex min-h-0 flex-1 flex-col">
       <form onSubmit={navigate} className="relative flex h-11 shrink-0 items-center gap-1.5 border-b border-slate-200 px-2 dark:border-slate-800">
         <Button variant="ghost" size="icon-sm" type="button" disabled={!activeTab.canGoBack} aria-label="Back" onClick={() => runCommand(browser.goBack(), "Could not go back.")}><ArrowLeft size={16} /></Button>
         <Button variant="ghost" size="icon-sm" type="button" disabled={!activeTab.canGoForward} aria-label="Forward" onClick={() => runCommand(browser.goForward(), "Could not go forward.")}><ArrowRight size={16} /></Button>
@@ -401,15 +188,12 @@ export function BrowserPanel({
       </form>
       {activeDownloads.map((download) => <BrowserDownload key={download.id} download={download} browser={browser} />)}
       {activeDownloads.length === 0 && latestCompletedDownload !== undefined
-        ? <BrowserDownload download={latestCompletedDownload} browser={browser} />
-        : null}
+        ? <BrowserDownload download={latestCompletedDownload} browser={browser} /> : null}
       <div ref={viewportRef} data-browser-viewport className="relative min-h-0 flex-1 bg-white dark:bg-slate-900">
         {activeTab.phase === "blank" ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center px-8 text-center">
-            <div>
-              <div className="font-mono text-lg font-semibold text-slate-900 dark:text-slate-100">Browse the web</div>
-              <div className="mt-1 font-sans text-sm text-slate-500 dark:text-slate-400">Search or enter an address above.</div>
-            </div>
+            <div className="font-mono text-lg font-semibold text-slate-900 dark:text-slate-100">Browse the web</div>
+            <div className="mt-1 font-sans text-sm text-slate-500 dark:text-slate-400">Search or enter an address above.</div>
           </div>
         ) : activeTab.phase === "failed" || activeTab.phase === "crashed" ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 px-8 text-center">
@@ -440,9 +224,7 @@ export function BrowserPanel({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Allow site permission?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {state.permissionRequest?.origin} wants permission to use {state.permissionRequest?.permission.replaceAll("-", " ")}.
-            </AlertDialogDescription>
+            <AlertDialogDescription>{state.permissionRequest?.origin} wants permission to use {state.permissionRequest?.permission.replaceAll("-", " ")}.</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => {
@@ -457,7 +239,6 @@ export function BrowserPanel({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      </aside>
     </div>
   )
 }

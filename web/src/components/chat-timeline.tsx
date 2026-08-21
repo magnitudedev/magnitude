@@ -48,13 +48,8 @@ import {
   normalizeReferencedPath,
   type DisplayRootStatus,
 } from "@magnitudedev/sdk"
-import {
-  workspacePanelEnteringAtom,
-  workspacePanelOpenAtom,
-  workspacePanelSurfaceAtom,
-  selectedProjectFileAtom,
-} from "@/state/web-atoms"
-import { useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { useAtomValue } from "@effect-atom/atom-react"
+import { useOpenWorkspaceFile } from "@/hooks/use-open-workspace-file"
 import type {
   DisplayTimeline,
   DisplayTimelineEntry,
@@ -128,11 +123,7 @@ function PathText({
 }): ReactNode {
   const cwd = useAtomValue(selectedCwdAtom)
   const projectId = useAtomValue(selectedProjectIdAtom)
-  const setFilePath = useAtomSet(selectedProjectFileAtom)
-  const panelOpen = useAtomValue(workspacePanelOpenAtom)
-  const setPanelEntering = useAtomSet(workspacePanelEnteringAtom)
-  const setPanelOpen = useAtomSet(workspacePanelOpenAtom)
-  const setPanelSurface = useAtomSet(workspacePanelSurfaceAtom)
+  const openWorkspaceFile = useOpenWorkspaceFile()
   const relativePath = normalizeReferencedPath(cwd && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path)
   if (relativePath === null || projectId === null) {
     return <span className="text-slate-600 dark:text-slate-400">{displayPath ?? path}</span>
@@ -141,10 +132,7 @@ function PathText({
     <Button variant="unstyled" size="unstyled"
       type="button"
       onClick={() => {
-        setFilePath({ projectId, path: RelativePathSchema.make(relativePath) })
-        if (!panelOpen) setPanelEntering(true)
-        setPanelSurface("files")
-        setPanelOpen(true)
+        openWorkspaceFile(projectId, RelativePathSchema.make(relativePath))
       }}
       className="hover-text-accent border-0 [background:transparent] [padding:0px] [margin:0px] text-blue-700 dark:text-blue-500 [font:inherit] cursor-pointer text-left"
     >

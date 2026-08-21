@@ -568,7 +568,7 @@ const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
       Effect.map((browser) => browser.changes),
     ),
   ),
-  BrowserCreateTab: ({ url }) => browserRpc((browser) => browser.createTab(url)).pipe(Effect.as({})),
+  BrowserCreateTab: ({ url }) => browserRpc((browser) => browser.createTab(url)),
   BrowserActivateTab: ({ tabId }) => browserRpc((browser) => browser.activateTab(tabId)).pipe(Effect.as({})),
   BrowserCloseTab: ({ tabId }) => browserRpc((browser) => browser.closeTab(tabId)).pipe(Effect.as({})),
   BrowserNavigate: ({ input }) => browserRpc((browser) => browser.navigate(input)).pipe(Effect.as({})),
