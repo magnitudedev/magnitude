@@ -22,6 +22,7 @@ import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
   createExaWebSearch,
+  createCrwWebSearch,
   makeProviderRegistry,
   WebSearchNotConfigured,
   WebSearchProviderSchema,
@@ -33,6 +34,7 @@ import {
   type MagnitudeClientError,
   type MagnitudeModelInfo,
   type WebSearchError,
+  type WebSearchProvider,
   type FetchUsageOptions,
   type CloudUsageResponse,
   type ProviderCatalogOutcome,
@@ -86,6 +88,8 @@ export interface ProviderClientConfig extends MagnitudeClientConfig {
   readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
   readonly exaApiKey?: string
   readonly exaEndpoint?: string
+  readonly crwApiKey?: string
+  readonly crwBaseUrl?: string
 }
 
 export type {
@@ -126,6 +130,9 @@ export interface ProviderRuntimeConfig {
   readonly preferProvider?: string
   readonly disableTraits: boolean
 }
+
+export { WebSearchProviderSchema }
+export type { WebSearchProvider } from "@magnitudedev/providers"
 
 export const WebSearchSourceSchema = Schema.Union(
   WebSearchProviderSchema,
@@ -194,19 +201,23 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
     ...(config?.exaApiKey === undefined ? {} : { apiKey: config.exaApiKey }),
     ...(config?.exaEndpoint === undefined ? {} : { endpoint: config.exaEndpoint }),
   })
+  const crwInstance = createCrwWebSearch({
+    ...(config?.crwApiKey === undefined ? {} : { apiKey: config.crwApiKey }),
+    ...(config?.crwBaseUrl === undefined ? {} : { baseUrl: config.crwBaseUrl }),
+  })
   const sessionId = config?.sessionId ?? null
-  // Cloud is disabled.
-  const webSearchSource: WebSearchSource = exaInstance.configured
-    ? "exa"
-    : "unavailable"
-  const webSearch = webSearchSource === "exa"
-    ? exaInstance.webSearch
-    : () => Effect.fail(new WebSearchNotConfigured())
-  // const webSearch = webSearchSource === "magnitude"
-  //   ? magnitudeInstance.provider.webSearch
-  //   : webSearchSource === "exa"
-  //     ? exaInstance.webSearch
-  //     : () => Effect.fail(new WebSearchNotConfigured())
+  // Cloud is disabled. First configured source wins, in listed order.
+  const webSearchSources: ReadonlyArray<{
+    readonly source: WebSearchProvider
+    readonly instance: { readonly configured: boolean; readonly webSearch: ProviderClientShape["webSearch"] }
+  }> = [
+    { source: "exa", instance: exaInstance },
+    { source: "crw", instance: crwInstance },
+  ]
+  const selected = webSearchSources.find(({ instance }) => instance.configured)
+  const webSearchSource: WebSearchSource = selected?.source ?? "unavailable"
+  const webSearch = selected?.instance.webSearch
+    ?? (() => Effect.fail(new WebSearchNotConfigured()))
 
   const registry = makeProviderRegistry({
     // magnitude: magnitudeInstance,
