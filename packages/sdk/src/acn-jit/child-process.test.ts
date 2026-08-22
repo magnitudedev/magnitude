@@ -1,11 +1,11 @@
 import { ProcessStartIdentitySchema } from "@magnitudedev/acn-protocol"
 import {
-  ProcessGroupAlreadyAbsent,
   ProcessGroupController,
-  ProcessGroupPresent,
+  ProcessGroupLeaderReplaced,
   ProcessGroupSignalPermissionDenied,
+  ProcessGroupStopped,
 } from "@magnitudedev/acn-protocol/coordination"
-import { Effect, Fiber, Option } from "effect"
+import { Cause, Effect, Exit, Fiber, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { scopeAcnCandidate } from "./child-process"
 import {
@@ -19,13 +19,14 @@ const exact = {
   processStartIdentity: ProcessStartIdentitySchema.make("darwin:test-session:candidate"),
 }
 
-const controller = (onSignal: () => void = () => undefined) => ProcessGroupController.of({
+const controller = (onStop: () => void = () => undefined): ProcessGroupController => ({
   inspect: () => Effect.succeed(Option.none()),
   currentProcess: Effect.succeed(exact),
-  observeGroup: (group) => Effect.succeed(new ProcessGroupPresent({ group })),
-  signalGroup: (group) => Effect.sync(() => {
-    onSignal()
-    return new ProcessGroupAlreadyAbsent({ group })
+  observe: () => Effect.dieMessage("candidate cleanup does not observe process groups"),
+  waitForGroupExit: () => Effect.dieMessage("candidate cleanup does not wait on process groups"),
+  stop: (group) => Effect.sync(() => {
+    onStop()
+    return new ProcessGroupStopped({ group })
   }),
 })
 
@@ -100,7 +101,7 @@ describe("scopeAcnCandidate", () => {
     expect(groupStops).toBe(1)
   })
 
-  it("permits only one admission acknowledgement", async () => {
+  it("treats a second admission acknowledgement as a defect", async () => {
     let releases = 0
     await run(Effect.scoped(Effect.gen(function* () {
       const child = yield* candidate({
@@ -109,7 +110,8 @@ describe("scopeAcnCandidate", () => {
       })
       yield* child.confirmExactProcess(exact)
       yield* child.admit
-      expect((yield* Effect.either(child.admit))._tag).toBe("Left")
+      const second = yield* Effect.exit(child.admit)
+      expect(Exit.isFailure(second) && Cause.isDie(second.cause)).toBe(true)
     })))
     expect(releases).toBe(1)
   })
@@ -131,14 +133,14 @@ describe("scopeAcnCandidate", () => {
     })
   })
 
-  it("preserves process-group termination permission denial", async () => {
-    const denied = ProcessGroupController.of({
+  it("preserves process-group signal permission denial", async () => {
+    const denied: ProcessGroupController = {
       ...controller(),
-      signalGroup: (group) => Effect.fail(new ProcessGroupSignalPermissionDenied({
+      stop: (group) => Effect.fail(new ProcessGroupSignalPermissionDenied({
         group,
         message: "operation not permitted",
       })),
-    })
+    }
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const child = yield* candidate({
         releaseParentChannel: Effect.void,
@@ -150,9 +152,31 @@ describe("scopeAcnCandidate", () => {
     expect(result).toMatchObject({
       _tag: "Left",
       left: {
-        _tag: "AcnCandidateProcessGroupTerminationPermissionDenied",
+        _tag: "ProcessGroupSignalPermissionDenied",
         message: "operation not permitted",
       },
     })
+  })
+
+  it("treats a changed group leader as proof the exact child is already gone", async () => {
+    const changed: ProcessGroupController = {
+      ...controller(),
+      stop: (group) => Effect.succeed(new ProcessGroupLeaderReplaced({
+        group,
+        observedLeader: {
+          pid: exact.pid,
+          processStartIdentity: ProcessStartIdentitySchema.make("darwin:test-session:reused"),
+        },
+      })),
+    }
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const child = yield* candidate({
+        releaseParentChannel: Effect.void,
+        stopBootstrapProcess: Effect.void,
+      })
+      yield* child.confirmExactProcess(exact)
+      return yield* Effect.either(child.stopAndReap)
+    })).pipe(Effect.provideService(ProcessGroupController, changed)))
+    expect(result._tag).toBe("Right")
   })
 })

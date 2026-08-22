@@ -512,8 +512,8 @@ const predecessorAbsent = (
 ): Effect.Effect<boolean, AcnBootstrapRejected, ProcessGroupController> => Option.match(owner, {
   onNone: () => Effect.succeed(true),
   onSome: (process) => ProcessGroupController.pipe(
-    Effect.flatMap((processes) => processes.observeGroup({ leader: process })),
-    Effect.map((observation) => observation._tag === "ProcessGroupAbsent"),
+    Effect.flatMap((processes) => processes.observe({ leader: process })),
+    Effect.map((observed) => observed._tag === "ProcessGroupAbsent"),
     Effect.mapError((error) => new AcnBootstrapRejected({ reason: error.message })),
   ),
 })

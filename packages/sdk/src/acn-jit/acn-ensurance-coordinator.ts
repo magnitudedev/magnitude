@@ -7,17 +7,12 @@ import {
 import { sameAcnOwner, type AcnOwnerRecord } from "@magnitudedev/acn-protocol/coordination"
 import { Array as Arr, Clock, Context, Duration, Effect, Option, Ref } from "effect"
 import { ACN_ENSURE_TIMEOUT, type AcnEnsureEvent } from "./acn-instance-manager"
-import type { AcnCandidateLaunchState, AcnCandidateLaunchSupervisor } from "./acn-candidate-launch-supervisor"
+import type { AcnCandidateLaunchSupervisor } from "./acn-candidate-launch-supervisor"
 import type { AcnDaemonShutdownSupervisor } from "./acn-daemon-shutdown-supervisor"
 import { AcnConvergenceDecider } from "./acn-convergence-decider"
 import type { AcnDaemonLaunchCommandResolver, AcnDaemonLaunchCommand } from "./acn-daemon-launch-command-resolver"
 import type { AcnOwnerObservation, AcnOwnerObserver } from "./acn-owner-observer"
 import {
-  AcnCandidateAdmissionLost,
-  AcnCandidateAdmissionTimedOut,
-  AcnCandidateExitedAfterAdmissionFailure,
-  AcnCandidateExitedBeforeAdmissionFailure,
-  AcnCandidateOwnershipLostAfterAdmission,
   AcnDaemonStartupTimedOut,
   AcnEnsuranceConvergenceTimedOut,
   type AcnEnsuranceError,
@@ -195,18 +190,8 @@ export const makeAcnEnsuranceCoordinator = (
           if (candidate._tag === "Admitted") yield* options.candidateSupervisor.markReady(ready.value)
           return ready.value
         }
-        case "FailCandidateLaunch":
+        case "FailCandidate":
           return yield* decision.failure
-        case "FailCandidateExitedBeforeAdmission":
-          return yield* new AcnCandidateExitedBeforeAdmissionFailure(decision)
-        case "FailCandidateExitedAfterAdmission":
-          return yield* new AcnCandidateExitedAfterAdmissionFailure(decision)
-        case "FailCandidateAdmissionTimedOut":
-          return yield* new AcnCandidateAdmissionTimedOut({ process: decision.process })
-        case "FailCandidateAdmissionLost":
-          return yield* new AcnCandidateAdmissionLost({ process: decision.process })
-        case "FailCandidateOwnershipLostAfterAdmission":
-          return yield* new AcnCandidateOwnershipLostAfterAdmission({ process: decision.process })
       }
     }
   })

@@ -75,9 +75,10 @@ result can be produced. Managers and ACNs do not retry surfaced store failures.
 ## Lifecycle authority boundaries
 
 The OS boundary is generic. `ExactProcess` identifies one process occurrence, `ProcessGroup`
-identifies the group led by that occurrence, and one `ProcessGroupController` inspects process
-identity, observes group presence, and signals the group. This adapter contains no ACN owner,
-revision, health, admission, or convergence policy.
+identifies the group led by that occurrence, and one `ProcessGroupController` inspects what
+occupies a pid, observes a group's state (leader live, leader replaced, survivors only, absent),
+waits for group exit, and stops a group with identity-checked TERM → KILL → absence-proof
+escalation. This adapter contains no ACN owner, revision, health, admission, or convergence policy.
 
 The SDK composes six narrow authorities:
 
@@ -90,15 +91,25 @@ The SDK composes six narrow authorities:
   starting or stopping processes.
 - `AcnEnsuranceCoordinator` executes decisions but owns none of those underlying policies.
 
-The shutdown and candidate supervisors declare their transition graphs with `FSM.defineFSM` and
-store current state in Effect `Ref`s. Process mutation is serialized by scoped Effect semaphores;
-candidate cleanup is scoped and remains armed until durable admission is observed. Before exact
-identity confirmation it may target only the raw bootstrap handle; after confirmation it may target
-only the group led by that exact process occurrence. Known pre-admission terminal paths explicitly
-join typed cleanup, while the scope finalizer is interruption protection and reports rather than
-defects on cleanup failure. Shutdown failures remain in the Effect error channel. Error variants and
-terminal states are distinct tagged types, never records containing secondary operation, code, or
-phase discriminants.
+The candidate supervisor declares its transition graph with `FSM.defineFSM` — the live states
+`NotLaunched → Spawned → Admitted → Ready` plus one terminal `Failed` state that carries the typed
+candidate failure. The shutdown supervisor is a serialized linear protocol, not a state machine: one
+semaphore serializes each complete shutdown occurrence, and `ProcessGroupController.stop` performs
+TERM → KILL → absence proof for daemon shutdown and candidate cleanup alike. Candidate cleanup is scoped and remains armed until durable admission is observed. Before
+exact identity confirmation it may target only the raw bootstrap handle; after confirmation it may
+target only the group led by that exact process occurrence. Known pre-admission terminal paths
+explicitly join typed cleanup, while the scope finalizer is interruption protection and reports
+rather than defects on cleanup failure. Shutdown control failures remain in the Effect error
+channel as one `AcnDaemonShutdownFailed` wrapper whose `failure` member is the typed union of
+underlying store/observation/signal causes.
+
+Failure identity is a tagged type per distinct mechanism; deterministic context — which owner,
+which shutdown reason, which signal — travels as structured fields or a typed nesting wrapper,
+never as prose reasons, pseudo-tag codes, or flattened context × mechanism class products.
+Candidate failures are one taxonomy used both as the `Failed` state payload and as ensure errors;
+the decider passes them through as the single `FailCandidate` decision. Invariant violations the
+composition makes unreachable (double admission, ready before admission, relaunch) are defects,
+not typed errors.
 
 ## Change protocol
 
@@ -155,10 +166,11 @@ either absolute ceiling.
 terminate, kill, and absence-proof protocol to `AcnDaemonShutdownSupervisor`. It does not kill
 clients, resolve an artifact, start an ACN, or directly manage the ACN's private ICN child.
 
-Before shutdown and each signal escalation, the manager rereads the same complete owner and checks
-the root identity. A changed owner is not targeted. Root absence does not suppress process-group
-signaling: a surviving descendant group is still retired and exact group absence is required before
-replacement.
+The supervisor rereads the same complete owner and checks the root identity before the graceful
+attempt and again before signal escalation; within escalation, every signal delivery itself
+revalidates exact leader identity and refuses a changed occurrence. A changed owner or reused PID
+is never targeted. Root absence does not suppress process-group signaling: a surviving descendant
+group is still retired and exact group absence is required before replacement.
 
 ## Guarantees
 
@@ -180,7 +192,8 @@ replacement.
 - Existing-daemon mutation exists only inside `AcnDaemonShutdownSupervisor`.
 - Shutdown-control failures remain typed in the supervisor Effect error channel.
 - Candidate process ownership exists only inside `AcnCandidateLaunchSupervisor`.
-- Every shutdown and candidate transition is admitted by its declared FSM graph.
+- Every candidate transition is admitted by its declared FSM graph; every shutdown occurrence is
+  serialized end to end.
 - Observation uncertainty authorizes neither adoption nor unbounded waiting.
 - One ensure cannot turn a failed launch or startup into an implicit retry loop.
 - Every ensure and candidate occurrence has one finite terminal result.

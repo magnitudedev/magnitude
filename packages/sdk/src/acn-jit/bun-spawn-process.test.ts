@@ -45,10 +45,7 @@ describe("BunDetachedChildProcessSpawner", () => {
           ])
           const identity = yield* ProcessGroupControllerLive.inspect(spawned.pid)
           if (Option.isNone(identity)) return yield* Effect.dieMessage("spawned candidate identity is absent")
-          yield* spawned.confirmExactProcess({
-            pid: spawned.pid,
-            processStartIdentity: identity.value,
-          })
+          yield* spawned.confirmExactProcess(identity.value)
           while (!(yield* Effect.promise(() => Bun.file(childPidPath).exists()))) {
             yield* Effect.sleep(Duration.millis(5))
           }

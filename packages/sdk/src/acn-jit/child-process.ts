@@ -1,29 +1,13 @@
 import {
-  PROCESS_GROUP_KILL_WAIT,
-  PROCESS_GROUP_TERM_WAIT,
   ProcessGroupController,
-  waitForProcessGroupAbsence,
   type ExactProcess,
-  type ExactProcessIdentityObservationFailed,
-  type ProcessGroup,
-  type ProcessGroupSignalOutcome,
+  type ProcessGroupStopError,
 } from "@magnitudedev/acn-protocol/coordination"
 import { Array as Arr, Context, Effect, Ref, Scope } from "effect"
 import {
-  AcnCandidateAdmissionAlreadyAcknowledged,
-  AcnCandidateAdmissionBeforeExactProcessConfirmed,
   type AcnCandidateBootstrapProcessExitUnproven,
   type AcnCandidateBootstrapProcessStopFailed,
-  AcnCandidateExactProcessAlreadyConfirmed,
-  AcnCandidateExactProcessPidMismatch,
   type AcnCandidateParentChannelReleaseFailed,
-  AcnCandidateProcessGroupAbsenceUnproven,
-  AcnCandidateProcessGroupKillFailed,
-  AcnCandidateProcessGroupKillPermissionDenied,
-  AcnCandidateProcessGroupLeaderChanged,
-  AcnCandidateProcessGroupObservationFailed,
-  AcnCandidateProcessGroupTerminationFailed,
-  AcnCandidateProcessGroupTerminationPermissionDenied,
   type AcnCandidateSpawnFailed,
 } from "./errors"
 
@@ -35,32 +19,14 @@ export interface AcnCandidateExit {
 export type AcnCandidateCleanupError =
   | AcnCandidateBootstrapProcessStopFailed
   | AcnCandidateBootstrapProcessExitUnproven
-  | ExactProcessIdentityObservationFailed
-  | AcnCandidateProcessGroupObservationFailed
-  | AcnCandidateProcessGroupTerminationPermissionDenied
-  | AcnCandidateProcessGroupTerminationFailed
-  | AcnCandidateProcessGroupKillPermissionDenied
-  | AcnCandidateProcessGroupKillFailed
-  | AcnCandidateProcessGroupLeaderChanged
-  | AcnCandidateProcessGroupAbsenceUnproven
-
-export type AcnCandidateExactProcessConfirmationError =
-  | AcnCandidateExactProcessPidMismatch
-  | AcnCandidateExactProcessAlreadyConfirmed
+  | ProcessGroupStopError
 
 /** An ACN candidate whose cleanup remains armed until owner admission is observed. */
 export interface SpawnedAcnCandidate {
   readonly pid: number
   readonly exited: Effect.Effect<AcnCandidateExit>
-  readonly confirmExactProcess: (
-    process: ExactProcess,
-  ) => Effect.Effect<void, AcnCandidateExactProcessConfirmationError>
-  readonly admit: Effect.Effect<
-    void,
-    | AcnCandidateAdmissionBeforeExactProcessConfirmed
-    | AcnCandidateAdmissionAlreadyAcknowledged
-    | AcnCandidateParentChannelReleaseFailed
-  >
+  readonly confirmExactProcess: (process: ExactProcess) => Effect.Effect<void>
+  readonly admit: Effect.Effect<void, AcnCandidateParentChannelReleaseFailed>
   readonly stopAndReap: Effect.Effect<void, AcnCandidateCleanupError>
 }
 
@@ -82,80 +48,6 @@ type CandidateOwnershipState =
   | { readonly _tag: "Admitted" }
   | { readonly _tag: "Retired" }
 
-const groupFrom = (process: ExactProcess): ProcessGroup => ({ leader: process })
-
-const candidateObservationFailure = (
-  process: ExactProcess,
-  message: string,
-) => new AcnCandidateProcessGroupObservationFailed({ pid: process.pid, message })
-
-const classifySignal = (
-  process: ExactProcess,
-  result: ProcessGroupSignalOutcome,
-): Effect.Effect<void, AcnCandidateProcessGroupLeaderChanged> => {
-  if (result._tag === "ProcessGroupLeaderChanged") {
-    return Effect.fail(new AcnCandidateProcessGroupLeaderChanged({
-      candidate: process,
-      observedLeader: result.observedLeader,
-    }))
-  }
-  return Effect.void
-}
-
-const stopExactProcessGroup = (
-  processes: ProcessGroupController,
-  process: ExactProcess,
-): Effect.Effect<void, AcnCandidateCleanupError> => Effect.gen(function* () {
-  const group = groupFrom(process)
-  const initial = yield* processes.observeGroup(group).pipe(
-    Effect.mapError((error) => candidateObservationFailure(process, error.message)),
-  )
-  if (initial._tag === "ProcessGroupAbsent") return
-
-  const terminated = yield* processes.signalGroup(group, "term").pipe(
-    Effect.mapError((error) => {
-      switch (error._tag) {
-        case "ExactProcessIdentityObservationFailed": return error
-        case "ProcessGroupSignalPermissionDenied":
-          return new AcnCandidateProcessGroupTerminationPermissionDenied({
-            pid: process.pid,
-            message: error.message,
-          })
-        case "ProcessGroupSignalFailed":
-          return new AcnCandidateProcessGroupTerminationFailed({ pid: process.pid, message: error.message })
-      }
-    }),
-  )
-  yield* classifySignal(process, terminated)
-  if (terminated._tag === "ProcessGroupAlreadyAbsent") return
-
-  const afterTerm = yield* waitForProcessGroupAbsence(processes, group, PROCESS_GROUP_TERM_WAIT).pipe(
-    Effect.mapError((error) => candidateObservationFailure(process, error.message)),
-  )
-  if (afterTerm._tag === "ProcessGroupAbsent") return
-
-  const killed = yield* processes.signalGroup(group, "kill").pipe(
-    Effect.mapError((error) => {
-      switch (error._tag) {
-        case "ExactProcessIdentityObservationFailed": return error
-        case "ProcessGroupSignalPermissionDenied":
-          return new AcnCandidateProcessGroupKillPermissionDenied({ pid: process.pid, message: error.message })
-        case "ProcessGroupSignalFailed":
-          return new AcnCandidateProcessGroupKillFailed({ pid: process.pid, message: error.message })
-      }
-    }),
-  )
-  yield* classifySignal(process, killed)
-  if (killed._tag === "ProcessGroupAlreadyAbsent") return
-
-  const afterKill = yield* waitForProcessGroupAbsence(processes, group, PROCESS_GROUP_KILL_WAIT).pipe(
-    Effect.mapError((error) => candidateObservationFailure(process, error.message)),
-  )
-  if (afterKill._tag === "ProcessGroupPresent") {
-    return yield* new AcnCandidateProcessGroupAbsenceUnproven({ pid: process.pid })
-  }
-})
-
 /** Installs the candidate cleanup/admission boundary shared by platform spawners. */
 export const scopeAcnCandidate = (
   candidate: ScopedAcnCandidate,
@@ -176,7 +68,8 @@ export const scopeAcnCandidate = (
           break
         case "Armed":
         case "AdmissionAttempted":
-          yield* stopExactProcessGroup(processes, current.process)
+          // A leader change proves the exact child's group is gone: cleanup's goal is met.
+          yield* processes.stop({ leader: current.process })
           break
       }
       yield* Ref.set(state, { _tag: "Retired" })
@@ -189,31 +82,25 @@ export const scopeAcnCandidate = (
     const confirmExactProcess: SpawnedAcnCandidate["confirmExactProcess"] = (process) =>
       lock.withPermits(1)(Effect.gen(function* () {
         if (process.pid !== candidate.pid) {
-          return yield* new AcnCandidateExactProcessPidMismatch({
-            candidatePid: candidate.pid,
-            observed: process,
-          })
+          return yield* Effect.dieMessage(
+            `observed ACN process ${process.pid} does not match spawned candidate PID ${candidate.pid}`,
+          )
         }
         const current = yield* Ref.get(state)
-        if (current._tag === "AwaitingExactProcess") {
-          yield* Ref.set(state, { _tag: "Armed", process })
-          return
+        if (current._tag !== "AwaitingExactProcess") {
+          return yield* Effect.dieMessage(
+            `ACN candidate ${candidate.pid} exact process confirmed in state ${current._tag}`,
+          )
         }
-        if (current._tag === "Armed" &&
-          current.process.processStartIdentity === process.processStartIdentity) return
-        const confirmed = current._tag === "Armed" || current._tag === "AdmissionAttempted"
-          ? current.process
-          : process
-        return yield* new AcnCandidateExactProcessAlreadyConfirmed({ confirmed, attempted: process })
+        yield* Ref.set(state, { _tag: "Armed", process })
       }))
 
     const admit = Effect.uninterruptibleMask((restore) => lock.withPermits(1)(Effect.gen(function* () {
       const current = yield* Ref.get(state)
-      if (current._tag === "AwaitingExactProcess") {
-        return yield* new AcnCandidateAdmissionBeforeExactProcessConfirmed({ pid: candidate.pid })
-      }
       if (current._tag !== "Armed") {
-        return yield* new AcnCandidateAdmissionAlreadyAcknowledged({ pid: candidate.pid })
+        return yield* Effect.dieMessage(
+          `ACN candidate ${candidate.pid} admission attempted in state ${current._tag}`,
+        )
       }
       yield* Ref.set(state, { _tag: "AdmissionAttempted", process: current.process })
       yield* restore(candidate.releaseParentChannel)

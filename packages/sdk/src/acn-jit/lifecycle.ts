@@ -278,6 +278,28 @@ const failureStage = (state: InternalState): AcnFailureStage => {
   return "Connect";
 };
 
+const shutdownControlFailureMessage = (
+  error: Extract<AcnEnsuranceError, { readonly _tag: "AcnDaemonShutdownFailed" }>
+): string => {
+  const failure = error.failure;
+  switch (failure._tag) {
+    case "AcnOwnerRecordReadUnavailable":
+      return `could not reread the ACN owner record at ${failure.path}: ${failure.message}`;
+    case "AcnOwnerRecordInvalid":
+      return `the ACN owner record at ${failure.path} is invalid: ${failure.message}`;
+    case "ExactProcessIdentityObservationFailed":
+      return `could not observe exact identity of PID ${failure.pid}: ${failure.message}`;
+    case "ProcessGroupObservationFailed":
+      return `could not observe its process group: ${failure.message}`;
+    case "ProcessGroupSignalPermissionDenied":
+      return `permission denied signaling its process group: ${failure.message}`;
+    case "ProcessGroupSignalFailed":
+      return `could not signal its process group: ${failure.message}`;
+    case "ProcessGroupAbsenceUnproven":
+      return "its process group remained observable after kill";
+  }
+};
+
 const ensuranceErrorMessage = (error: AcnEnsuranceError): string => {
   switch (error._tag) {
     case "AcnEnsuranceFailed":
@@ -286,80 +308,45 @@ const ensuranceErrorMessage = (error: AcnEnsuranceError): string => {
       return `Could not read ACN owner record at ${error.path}: ${error.message}`;
     case "AcnOwnerRecordInvalid":
       return `Invalid ACN owner record at ${error.path}: ${error.message}`;
+    case "ExactProcessIdentityObservationFailed":
+    case "ProcessGroupObservationFailed":
+      return error.message;
+    case "ProcessGroupSignalPermissionDenied":
+      return `Permission denied signaling ACN process group ${error.group.leader.pid}: ${error.message}`;
+    case "ProcessGroupSignalFailed":
+      return `Could not signal ACN process group ${error.group.leader.pid}: ${error.message}`;
+    case "ProcessGroupAbsenceUnproven":
+      return `ACN process group ${error.group.leader.pid} remained observable after kill`;
     case "AcnProcessIdentityObservationTimedOut":
       return `Exact process inspection remained unavailable for PID ${error.pid}`;
     case "AcnCandidateSpawnFailed":
       return `Could not spawn the ACN candidate: ${error.message}`;
-    case "AcnCandidateProcessGroupObservationFailed":
-      return `Could not observe ACN candidate process group ${error.pid}: ${error.message}`;
-    case "AcnCandidateProcessGroupTerminationFailed":
-      return `Could not terminate ACN candidate process group ${error.pid}: ${error.message}`;
-    case "AcnCandidateProcessGroupTerminationPermissionDenied":
-      return `Permission denied terminating ACN candidate process group ${error.pid}: ${error.message}`;
-    case "AcnCandidateProcessGroupKillFailed":
-      return `Could not kill ACN candidate process group ${error.pid}: ${error.message}`;
-    case "AcnCandidateProcessGroupKillPermissionDenied":
-      return `Permission denied killing ACN candidate process group ${error.pid}: ${error.message}`;
-    case "AcnCandidateProcessGroupAbsenceUnproven":
-      return `ACN candidate process group ${error.pid} remained observable after kill`;
-    case "AcnCandidateProcessGroupLeaderChanged":
-      return `ACN candidate process-group leader ${error.candidate.pid} changed identity before cleanup`;
+    case "AcnCandidateIdentityUnavailable":
+      return `ACN candidate ${error.pid} was not available for exact identity observation`;
+    case "AcnCandidateExitedBeforeAdmission":
+      return `Magnitude daemon ${error.pid} exited with code ${error.code} before startup admission${error.stderr ? `:\n${error.stderr}` : ""}`;
+    case "AcnCandidateExitedAfterAdmission":
+      return `Magnitude daemon ${error.pid} exited with code ${error.code} after admission before it became ready${error.stderr ? `:\n${error.stderr}` : ""}`;
+    case "AcnCandidateAdmissionTimedOut":
+      return `Magnitude daemon ${error.pid} did not complete startup admission`;
+    case "AcnCandidateParentChannelReleaseFailed":
+      return `Could not release the parent channel for ACN candidate ${error.pid}: ${error.message}`;
+    case "AcnCandidateOwnershipLost":
+      return `Magnitude daemon ${error.pid} lost ownership after startup admission`;
     case "AcnCandidateBootstrapProcessStopFailed":
       return `Could not stop ACN bootstrap process ${error.pid}: ${error.message}`;
     case "AcnCandidateBootstrapProcessExitUnproven":
       return `Could not prove ACN bootstrap process ${error.pid} exited`;
-    case "AcnCandidateExactProcessPidMismatch":
-      return `Observed ACN process ${error.observed.pid} does not match spawned candidate PID ${error.candidatePid}`;
-    case "AcnCandidateExactProcessAlreadyConfirmed":
-      return `ACN candidate ${error.confirmed.pid} was already confirmed as a different exact process`;
-    case "AcnCandidateAdmissionBeforeExactProcessConfirmed":
-      return `ACN candidate ${error.pid} cannot be admitted before exact process confirmation`;
-    case "AcnCandidateParentChannelReleaseFailed":
-      return `Could not release the parent channel for ACN candidate ${error.pid}: ${error.message}`;
-    case "AcnCandidateAdmissionAlreadyAcknowledged":
-      return `Startup admission was already acknowledged for ACN candidate ${error.pid}`;
-    case "AcnCandidateLaunchAlreadyAttempted":
-      return "An ACN candidate launch was already attempted";
-    case "AcnCandidateIdentityUnavailable":
-      return `ACN candidate ${error.pid} was not available for exact identity observation`;
-    case "AcnCandidateExitedBeforeIdentityObserved":
-      return `ACN candidate ${error.pid} exited with code ${error.code} before identity observation${error.stderr ? `:\n${error.stderr}` : ""}`;
-    case "AcnCandidateAdmissionAcknowledgementTimedOut":
-      return `Startup admission acknowledgement timed out for ACN candidate ${error.pid}`;
-    case "AcnCandidateReadyBeforeAdmission":
-      return "The ACN candidate reported ready before startup admission";
-    case "AcnCandidateReadyInstanceMismatch":
-      return `Ready ACN ${error.ready.pid} is not the supervised candidate ${error.candidate.pid}`;
-    case "AcnDaemonTargetUnsupported":
-      return `This client supports ACN revision ${error.supported.revision}, not requested revision ${error.requested.revision}`;
-    case "AcnLaunchOverrideTargetMismatch":
-      return `The ACN launch override targets revision ${error.override.revision}, not requested revision ${error.requested.revision}`;
-    case "AcnCandidateExitedBeforeAdmissionFailure":
-      return `Magnitude daemon ${error.process.pid} exited with code ${error.code} before startup admission${error.stderr ? `:\n${error.stderr}` : ""}`;
-    case "AcnCandidateExitedAfterAdmissionFailure":
-      return `Magnitude daemon ${error.process.pid} exited with code ${error.code} after admission before it became ready${error.stderr ? `:\n${error.stderr}` : ""}`;
-    case "AcnCandidateAdmissionTimedOut":
-      return `Magnitude daemon ${error.process.pid} did not complete startup admission`;
-    case "AcnCandidateAdmissionLost":
-      return `Magnitude daemon ${error.process.pid} lost startup admission acknowledgement`;
-    case "AcnCandidateOwnershipLostAfterAdmission":
-      return `Magnitude daemon ${error.process.pid} lost ownership after startup admission`;
+    case "AcnDaemonShutdownFailed":
+      return `Could not shut down Magnitude daemon ${error.owner.pid}: ${shutdownControlFailureMessage(error)}`;
     case "AcnDaemonStartupTimedOut":
       return `Magnitude daemon ${error.owner.pid} did not become ready within the startup deadline`;
     case "AcnEnsuranceConvergenceTimedOut":
       return "ACN ensurance did not converge within its absolute deadline";
-    case "ExactProcessIdentityObservationFailed":
-    case "ProcessGroupObservationFailed":
-      return error.message;
-    case "AcnDaemonOwnerObservationFailed":
-    case "AcnDaemonIdentityObservationFailed":
-    case "AcnDaemonProcessGroupObservationFailed":
-    case "AcnDaemonProcessGroupTerminationPermissionDenied":
-    case "AcnDaemonProcessGroupTerminationFailed":
-    case "AcnDaemonProcessGroupKillPermissionDenied":
-    case "AcnDaemonProcessGroupKillFailed":
-    case "AcnDaemonProcessGroupAbsenceUnproven":
-      return error.reason;
+    case "AcnDaemonTargetUnsupported":
+      return `This client supports ACN revision ${error.supported.revision}, not requested revision ${error.requested.revision}`;
+    case "AcnLaunchOverrideTargetMismatch":
+      return `The ACN launch override targets revision ${error.override.revision}, not requested revision ${error.requested.revision}`;
     case "BinaryNotFound":
       return `Magnitude executable was not found at ${error.path}`;
     case "BinaryVersionMismatch":

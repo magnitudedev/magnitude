@@ -45,6 +45,11 @@ export class ProcessGroupSignalFailed extends Schema.TaggedError<ProcessGroupSig
   { group: ProcessGroupSchema, message: Schema.String },
 ) {}
 
+export class ProcessGroupAbsenceUnproven extends Schema.TaggedError<ProcessGroupAbsenceUnproven>()(
+  "ProcessGroupAbsenceUnproven",
+  { group: ProcessGroupSchema },
+) {}
+
 export type ExactProcessObservationError =
   | ExactProcessIdentityObservationFailed
   | ProcessGroupObservationFailed
@@ -53,3 +58,10 @@ export type ProcessGroupSignalError =
   | ExactProcessIdentityObservationFailed
   | ProcessGroupSignalPermissionDenied
   | ProcessGroupSignalFailed
+
+export type ProcessGroupStopError =
+  | ExactProcessIdentityObservationFailed
+  | ProcessGroupObservationFailed
+  | ProcessGroupSignalPermissionDenied
+  | ProcessGroupSignalFailed
+  | ProcessGroupAbsenceUnproven
