@@ -39,7 +39,7 @@ type RpcOf<
 export type GroupRpcs<
   Value extends CoreGroup.Any,
   FiniteMiddleware extends RpcMiddleware.TagClassAny = never,
-> = RpcOf<CoreGroup.Operations<Value>, FiniteMiddleware>
+> = RpcOf<CoreGroup.Operation<Value>, FiniteMiddleware>
 
 /** Stable derived facts exposed to transport integrations without manual RPC declarations. */
 export interface OperationMetadata {
