@@ -12,10 +12,10 @@ import {
 const message = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-const failure = (operation: string, cause: unknown): SqliteDriverError =>
+const failure = (cause: unknown): SqliteDriverError =>
   cause instanceof SQLiteError && cause.code === "SQLITE_BUSY"
-    ? new SqliteDriverBusy({ operation })
-    : new SqliteDriverFailure({ operation, message: message(cause) })
+    ? new SqliteDriverBusy()
+    : new SqliteDriverFailure({ message: message(cause) })
 
 const bindings = (values: readonly SqliteBinding[]): SQLQueryBindings[] =>
   Array.from(values) as SQLQueryBindings[]
@@ -25,11 +25,11 @@ const connection = (database: Database): SqliteConnection => ({
     try: () => {
       database.query(sql).run(...bindings(values))
     },
-    catch: (cause) => failure("execute", cause),
+    catch: failure,
   }),
   query: (sql, values = []) => Effect.try({
     try: () => database.query(sql).all(...bindings(values)),
-    catch: (cause) => failure("query", cause),
+    catch: failure,
   }),
 })
 
@@ -40,7 +40,6 @@ export const BunSqliteDriver: SqliteDriver = {
         ? { create: true }
         : { create: false, readwrite: true }),
       catch: (cause) => new SqliteDriverFailure({
-        operation: "open",
         message: message(cause),
       }),
     }),

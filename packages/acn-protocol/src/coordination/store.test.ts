@@ -104,7 +104,6 @@ describe("ACN coordination database", () => {
       open: () => Effect.sync(() => {
         attempts += 1
       }).pipe(Effect.zipRight(Effect.fail(new SqliteDriverFailure({
-        operation: "open",
         message: "test failure",
       })))),
     })

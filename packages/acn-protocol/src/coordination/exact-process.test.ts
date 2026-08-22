@@ -1,61 +1,55 @@
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { Duration, Effect, Exit, Option } from "effect"
+import { Effect, Exit, Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { ExactProcessControllerLive } from "./exact-process"
-import type { ExactProcessInspectionFailed } from "./errors"
-import type { ExactProcess } from "./schemas"
+import { ProcessGroupControllerLive } from "./exact-process"
+import type { ProcessGroup } from "./schemas"
 
-const waitForTreeAbsence = (
-  process: ExactProcess,
-): Effect.Effect<void, ExactProcessInspectionFailed> => Effect.gen(function* () {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (yield* ExactProcessControllerLive.treeAbsent(process)) return
-    yield* Effect.sleep(Duration.millis(20))
-  }
-  return yield* Effect.dieMessage(`process tree ${process.pid} remained alive`)
-})
+const spawnProcessTree = () => {
+  const fixture = resolve(fileURLToPath(new URL(".", import.meta.url)), "fixtures/process-tree.ts")
+  return Bun.spawn([process.execPath, fixture], {
+    detached: true,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "inherit",
+  })
+}
 
-describe("ExactProcessController", () => {
+const publishedRootPid = async (child: ReturnType<typeof spawnProcessTree>): Promise<number> => {
+  const reader = child.stdout.getReader()
+  const first = await reader.read()
+  reader.releaseLock()
+  if (first.done) throw new Error("process-tree fixture exited before publishing its PID")
+  const [pidText] = new TextDecoder().decode(first.value).trim().split(":")
+  return Number(pidText)
+}
+
+const observedTag = (group: ProcessGroup) =>
+  Effect.runPromise(ProcessGroupControllerLive.observe(group)).then((observed) => observed._tag)
+
+describe("ProcessGroupController", () => {
   it.skipIf(process.platform === "win32")(
-    "rejects a stale identity and terminates one real process group",
+    "refuses a replaced leader and stops one real process group",
     async () => {
-      const fixture = resolve(fileURLToPath(new URL(".", import.meta.url)), "fixtures/process-tree.ts")
-      const child = Bun.spawn([process.execPath, fixture], {
-        detached: true,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "inherit",
-      })
+      const child = spawnProcessTree()
       try {
-        const reader = child.stdout.getReader()
-        const first = await reader.read()
-        reader.releaseLock()
-        if (first.done) throw new Error("process-tree fixture exited before publishing its PID")
-        const [pidText] = new TextDecoder().decode(first.value).trim().split(":")
-        const pid = Number(pidText)
-        const identity = Option.getOrThrow(await Effect.runPromise(
-          ExactProcessControllerLive.inspect(pid),
-        ))
-        const exact = { pid, processStartIdentity: identity }
+        const pid = await publishedRootPid(child)
+        const leader = Option.getOrThrow(await Effect.runPromise(ProcessGroupControllerLive.inspect(pid)))
+        const group: ProcessGroup = { leader }
+        expect(await observedTag(group)).toBe("ProcessGroupLeaderLive")
 
-        expect(await Effect.runPromise(ExactProcessControllerLive.signal({
-          ...exact,
-          processStartIdentity: `${identity}-stale` as never,
-        }, "term"))).toBe(false)
-        expect(await Effect.runPromise(ExactProcessControllerLive.signalTree({
-          ...exact,
-          processStartIdentity: `${identity}-stale` as never,
-        }, "term"))).toBe(false)
-        expect(Option.contains(await Effect.runPromise(
-          ExactProcessControllerLive.inspect(pid),
-        ), identity)).toBe(true)
+        const stale: ProcessGroup = {
+          leader: { pid, processStartIdentity: `${leader.processStartIdentity}-stale` as never },
+        }
+        expect(await observedTag(stale)).toBe("ProcessGroupLeaderReplaced")
+        expect((await Effect.runPromise(ProcessGroupControllerLive.stop(stale)))._tag)
+          .toBe("ProcessGroupLeaderReplaced")
+        expect(await observedTag(group)).toBe("ProcessGroupLeaderLive")
 
-        expect(await Effect.runPromise(
-          ExactProcessControllerLive.signalTree(exact, "term"),
-        )).toBe(true)
+        expect((await Effect.runPromise(ProcessGroupControllerLive.stop(group)))._tag)
+          .toBe("ProcessGroupStopped")
         await child.exited
-        await Effect.runPromise(waitForTreeAbsence(exact))
+        expect(await observedTag(group)).toBe("ProcessGroupAbsent")
       } finally {
         try {
           child.kill(9)
@@ -75,56 +69,35 @@ describe("ExactProcessController", () => {
         stdout: "ignore",
         stderr: "ignore",
       })
-      const identity = Option.getOrThrow(await Effect.runPromise(
-        ExactProcessControllerLive.inspect(child.pid),
+      const leader = Option.getOrThrow(await Effect.runPromise(
+        ProcessGroupControllerLive.inspect(child.pid),
       ))
       child.kill(9)
       await child.exited
-      const exit = await Effect.runPromise(Effect.exit(
-        ExactProcessControllerLive.treeAbsent({
-          pid: child.pid,
-          processStartIdentity: identity,
-        }),
-      ))
+      const exit = await Effect.runPromise(Effect.exit(ProcessGroupControllerLive.observe({ leader })))
       expect(Exit.isFailure(exit)).toBe(true)
     },
   )
 
   it.skipIf(process.platform === "win32")(
-    "can terminate a surviving process group after its recorded root exits",
+    "reports survivors after the recorded root exits and stops them",
     async () => {
-      const fixture = resolve(fileURLToPath(new URL(".", import.meta.url)), "fixtures/process-tree.ts")
-      const root = Bun.spawn([process.execPath, fixture], {
-        detached: true,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "inherit",
-      })
-      let exact: ExactProcess | undefined
+      const root = spawnProcessTree()
+      let group: ProcessGroup | undefined
       try {
-        const reader = root.stdout.getReader()
-        const first = await reader.read()
-        reader.releaseLock()
-        if (first.done) throw new Error("process-tree fixture exited before publishing its PID")
-        const [pidText] = new TextDecoder().decode(first.value).trim().split(":")
-        const pid = Number(pidText)
-        const processStartIdentity = Option.getOrThrow(await Effect.runPromise(
-          ExactProcessControllerLive.inspect(pid),
-        ))
-        exact = { pid, processStartIdentity }
+        const pid = await publishedRootPid(root)
+        const leader = Option.getOrThrow(await Effect.runPromise(ProcessGroupControllerLive.inspect(pid)))
+        group = { leader }
 
-        expect(await Effect.runPromise(
-          ExactProcessControllerLive.signal(exact, "kill"),
-        )).toBe(true)
+        root.kill(9)
         await root.exited
-        expect(await Effect.runPromise(ExactProcessControllerLive.treeAbsent(exact))).toBe(false)
-        expect(await Effect.runPromise(
-          ExactProcessControllerLive.signalTree(exact, "kill"),
-        )).toBe(true)
-        await Effect.runPromise(waitForTreeAbsence(exact))
+        expect(await observedTag(group)).toBe("ProcessGroupSurvivorsOnly")
+        expect((await Effect.runPromise(ProcessGroupControllerLive.stop(group)))._tag)
+          .toBe("ProcessGroupStopped")
+        expect(await observedTag(group)).toBe("ProcessGroupAbsent")
       } finally {
-        if (exact !== undefined) {
-          await Effect.runPromise(ExactProcessControllerLive.signalTree(exact, "kill")).catch(() => undefined)
+        if (group !== undefined) {
+          await Effect.runPromise(ProcessGroupControllerLive.stop(group)).catch(() => undefined)
         }
         try {
           root.kill(9)

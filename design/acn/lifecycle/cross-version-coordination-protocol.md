@@ -2,6 +2,10 @@
 applies_to:
   - packages/acn-protocol/src/coordination/**
   - packages/acn-protocol/src/schemas/acn-health.ts
+  - packages/sdk/src/acn-jit/acn-owner-observer.ts
+  - packages/sdk/src/acn-jit/acn-daemon-shutdown-supervisor.ts
+  - packages/sdk/src/acn-jit/acn-candidate-launch-supervisor.ts
+  - packages/sdk/src/acn-jit/acn-ensurance-coordinator.ts
   - packages/sdk/src/acn-jit/local-acn-instance-manager.ts
   - packages/acn/src/server.ts
   - packages/acn/src/ownership-monitor.ts
@@ -59,7 +63,7 @@ only as the exact predecessor value used for atomic replacement.
 
 Revision belongs to observable live health, not durable coordination. A revision orders two live
 ACN targets: an older client may use an equal or greater live revision, while a newer client must
-replace a lower live revision. No revision continues to constrain launch after its process tree is
+replace a lower live revision. No revision continues to constrain launch after its process group is
 absent.
 
 ## Required store operations
@@ -113,20 +117,20 @@ without waiting for drain, finalizers, child shutdown, or process exit.
 A manager interprets coordination only after combining the owner row with exact process inspection
 and health:
 
-- If the exact owner tree is absent, the row has no authority and may be replaced.
-- If the root is absent but descendants remain, the exact predecessor tree is retired before any
+- If the exact owner process group is absent, the row has no authority and may be replaced.
+- If the root is absent but descendants remain, the exact predecessor process group is retired before any
   successor may acquire ownership.
 - If health is temporarily unavailable, the manager waits only for the bounded health grace before
-  retiring the exact owner tree.
+  retiring the exact owner process group.
 - If live health reports a revision equal to or greater than the client's target, the client waits
   for that occurrence to become ready and adopts it. An older client never replaces a newer owner.
 - If live health reports a lower revision, the client first prepares its own launch material, then
-  retires that exact owner tree and competes to install its candidate.
+  retires that exact owner process group and competes to install its candidate.
 - Ready adoption rereads the same owner row and exact process identity after observing health.
 
 Candidate launch and admission remain separate. Before admission, a candidate binds only its
 health/shutdown endpoint, starts no application or ICN service, and remains parent-bound and
-scope-owned by its manager. It rereads the expected owner, proves the predecessor tree absent, and
+scope-owned by its manager. It rereads the expected owner, proves the predecessor process group absent, and
 calls `replaceOwner`. `OwnerChanged` rejects admission and the candidate exits. `Replaced` transfers
 ownership to the row and permits application startup.
 
@@ -147,11 +151,16 @@ revision wins, older managers adopt it. Process death removes revision authority
 - No stale row or historical revision can block launch.
 - No candidate starts application or ICN work before atomic owner admission.
 - Two candidates observing the same predecessor cannot both commit.
-- A predecessor row is replaced only after exact predecessor-tree absence proof.
+- A predecessor row is replaced only after exact predecessor process-group absence proof.
 - Every raw candidate is scope-owned until exact owner publication.
 - Every admitted ACN remains fenced by a mandatory lifetime owner monitor.
 - A lower live revision is replaced only after successor launch material is prepared.
 - An equal or greater live revision is never downgraded by an older client.
 - No stale manager action targets a changed owner or reused PID.
-- Observation uncertainty authorizes neither endpoint adoption nor overlapping service trees.
+- Every signal delivery revalidates exact process identity immediately before mutation, and the
+  complete expected owner row is revalidated at every shutdown stage boundary; a row cannot
+  lawfully change while the target group persists, because admission requires group-absence proof.
+- Store, observation, and signal failures remain distinct typed causes carried inside one typed
+  shutdown failure; no string or numeric pseudo-tag is interpreted as error identity.
+- Observation uncertainty authorizes neither endpoint adoption nor overlapping service groups.
 - SQLite contention and every convergence state are bounded.

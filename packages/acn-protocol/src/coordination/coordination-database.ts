@@ -56,12 +56,11 @@ const invalid = (path: string, message: string) =>
   new AcnProcessStoreInvalid({ path, message })
 
 const storeError = (
-  operation: string,
   path: string,
   error: SqliteDriverError,
 ): AcnProcessStoreError => error instanceof SqliteDriverBusy
-  ? new AcnProcessStoreBusy({ operation, path })
-  : new AcnProcessStoreUnavailable({ operation, path, message: error.message })
+  ? new AcnProcessStoreBusy({ path })
+  : new AcnProcessStoreUnavailable({ path, message: error.message })
 
 const decodeOne = <A, I>(
   schema: Schema.Schema<A, I>,
@@ -115,7 +114,6 @@ export const makeAcnCoordinationDatabase = (
   const databasePath = paths.join(directory, "coordination.sqlite")
 
   const resolveContention = <A>(
-    operation: string,
     effect: Effect.Effect<A, AcnProcessStoreError>,
   ): Effect.Effect<A, AcnOwnerStoreError> => Effect.gen(function* () {
     const deadline = (yield* Clock.currentTimeMillis) +
@@ -131,7 +129,6 @@ export const makeAcnCoordinationDatabase = (
       const remaining = deadline - (yield* Clock.currentTimeMillis)
       if (remaining <= 0) {
         return yield* new AcnProcessStoreUnavailable({
-          operation,
           path: databasePath,
           message: "SQLite contention did not resolve within the operation deadline",
         })
@@ -142,21 +139,19 @@ export const makeAcnCoordinationDatabase = (
   })
 
   const withConnection = <A>(
-    operation: string,
     use: (connection: SqliteConnection) => Effect.Effect<A, AcnProcessStoreError>,
   ): Effect.Effect<A, AcnProcessStoreError> => Effect.scoped(Effect.gen(function* () {
     yield* fs.makeDirectory(directory, { recursive: true }).pipe(
       Effect.mapError((error) => new AcnProcessStoreUnavailable({
-        operation: "create-directory",
         path: directory,
         message: String(error),
       })),
     )
     const connection = yield* driver.open(databasePath, { create: true }).pipe(
-      Effect.mapError((error) => storeError(operation, databasePath, error)),
+      Effect.mapError((error) => storeError(databasePath, error)),
     )
     const execute = (sql: string) => connection.execute(sql).pipe(
-      Effect.mapError((error) => storeError(operation, databasePath, error)),
+      Effect.mapError((error) => storeError(databasePath, error)),
     )
     yield* execute(Sql.busyTimeout)
     yield* execute(Sql.journalMode)
@@ -166,17 +161,16 @@ export const makeAcnCoordinationDatabase = (
 
   const queryOwner = (
     connection: SqliteConnection,
-    operation: string,
   ): Effect.Effect<Option.Option<AcnOwnerRecord>, AcnProcessStoreError> =>
     Effect.gen(function* () {
       const count = yield* connection.query(Sql.ownerCount).pipe(
-        Effect.mapError((error) => storeError(operation, databasePath, error)),
+        Effect.mapError((error) => storeError(databasePath, error)),
         Effect.flatMap((rows) => decodeOne(CountRowSchema, databasePath, "owner count query", rows)),
       )
       if (count.count > 1) return yield* invalid(databasePath, "owner contains multiple rows")
       if (count.count === 0) return Option.none()
       const rows = yield* connection.query(Sql.currentOwner).pipe(
-        Effect.mapError((error) => storeError(operation, databasePath, error)),
+        Effect.mapError((error) => storeError(databasePath, error)),
       )
       return Option.some(ownerFromRow(yield* decodeOne(
         OwnerRowSchema,
@@ -188,22 +182,20 @@ export const makeAcnCoordinationDatabase = (
 
   return {
     currentOwner: resolveContention(
-      "current-owner",
-      withConnection("current-owner", (connection) => queryOwner(connection, "current-owner")),
+      withConnection((connection) => queryOwner(connection)),
     ),
     replaceOwner: (expectedOwner, candidateOwner) =>
       resolveContention(
-        "replace-owner",
-        withConnection("replace-owner", (connection) => Effect.uninterruptibleMask(() =>
+        withConnection((connection) => Effect.uninterruptibleMask(() =>
           Effect.gen(function* () {
             yield* connection.execute(Sql.beginImmediate).pipe(
-              Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
+              Effect.mapError((error) => storeError(databasePath, error)),
             )
             const transaction = Effect.gen(function* () {
-              const owner = yield* queryOwner(connection, "replace-owner")
+              const owner = yield* queryOwner(connection)
               if (!sameOwner(owner, expectedOwner)) {
                 yield* connection.execute(Sql.rollback).pipe(
-                  Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
+                  Effect.mapError((error) => storeError(databasePath, error)),
                 )
                 return { _tag: "OwnerChanged" as const, owner }
               }
@@ -211,9 +203,9 @@ export const makeAcnCoordinationDatabase = (
                 candidateOwner.pid,
                 candidateOwner.processStartIdentity,
                 candidateOwner.port,
-              ]).pipe(Effect.mapError((error) => storeError("replace-owner", databasePath, error)))
+              ]).pipe(Effect.mapError((error) => storeError(databasePath, error)))
               yield* connection.execute(Sql.commit).pipe(
-                Effect.mapError((error) => storeError("replace-owner", databasePath, error)),
+                Effect.mapError((error) => storeError(databasePath, error)),
               )
               return { _tag: "Replaced" as const }
             })
