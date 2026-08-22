@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer"
 import * as Mutation from "./Mutation.js"
 import * as Query from "./Query.js"
 import * as QueryClient from "./QueryClient.js"
+import * as Subscription from "./Subscription.js"
 
 export interface Client<Provided, RuntimeError> {
   readonly runtime: Atom.AtomRuntime<Provided | QueryClient.QueryClient, RuntimeError>
@@ -16,6 +17,10 @@ export interface Client<Provided, RuntimeError> {
   readonly mutation: <Input, Output, CommandError, Required extends Provided | QueryClient.QueryClient | Reactivity.Reactivity, SynchronizationError>(
     definition: Mutation.Mutation<Input, Output, CommandError, Required, SynchronizationError>
   ) => Mutation.MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
+  readonly subscription: <Input, Event, Error, Required extends Provided | QueryClient.QueryClient | Reactivity.Reactivity>(
+    definition: Subscription.Subscription<Input, Event, Error, Required>,
+    input: Input
+  ) => Subscription.SubscriptionAtom<Input, Event, Error | RuntimeError, Required>
 }
 
 export const make = <Provided, RuntimeError, Additional = never, AdditionalError = never>(
@@ -30,12 +35,25 @@ export const make = <Provided, RuntimeError, Additional = never, AdditionalError
   let runtime!: Client<Provided | Additional, RuntimeError | AdditionalError>["runtime"]
   const queryFamilies = new WeakMap<Query.Query<any, any, any, any>, (input: any) => Query.QueryAtom<any, any, any, any>>()
   const mutations = new WeakMap<Mutation.Mutation<any, any, any, any, any>, Mutation.MutationAtom<any, any, any, any, any>>()
+  const subscriptionFamilies = new WeakMap<
+    Subscription.Subscription<any, any, any, any>,
+    (input: any) => Subscription.SubscriptionAtom<any, any, any, any>
+  >()
 
   const query: Client<Provided | Additional, RuntimeError | AdditionalError>["query"] = (definition, input) => {
     let family = queryFamilies.get(definition)
     if (family === undefined) {
       family = Query.makeAtomFamily(runtime, definition as never)
       queryFamilies.set(definition, family)
+    }
+    return family(input)
+  }
+
+  const subscription: Client<Provided | Additional, RuntimeError | AdditionalError>["subscription"] = (definition, input) => {
+    let family = subscriptionFamilies.get(definition)
+    if (family === undefined) {
+      family = Subscription.makeAtomFamily(runtime, definition as never)
+      subscriptionFamilies.set(definition, family)
     }
     return family(input)
   }
@@ -52,7 +70,8 @@ export const make = <Provided, RuntimeError, Additional = never, AdditionalError
         mutations.set(definition, atom)
       }
       return atom
-    }
+    },
+    subscription
   } as Client<Provided | Additional, RuntimeError | AdditionalError>
 
   const infrastructure = Layer.mergeAll(

@@ -1,12 +1,17 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { Context, Data, Effect, Layer, Option, Stream } from "effect"
-import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
+import { Context, Effect, Layer, Option } from "effect"
+import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
-  AcnRpcClientTag,
-  ModelSlotsMirror,
+  AssignSlot,
+  ClearSlot,
+  GetModelSlots,
+  LoadModel,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
+  SetModelFavorite,
+  StopModel,
+  authoritativeSlotSelection,
   type ModelSlotsState,
   type ProviderModelIdentity,
   type SlotId,
@@ -14,153 +19,15 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
-import { ClientInvalidations } from "../state/client-invalidations"
 
-export class ModelSlotSynchronizationFailed extends Data.TaggedError(
-  "ModelSlotSynchronizationFailed",
-)<{
-  readonly operation: "assign" | "load" | "stop"
-  readonly message: string
-}> {}
-
-interface AssignmentInput {
-  readonly slotId: SlotId
-  readonly selection: SlotSelection
-}
-
-interface SlotInput {
-  readonly slotId: SlotId
-}
-
-interface FavoriteInput {
-  readonly model: ProviderModelIdentity
-  readonly favorite: boolean
-}
-
-const slotSelectionScope = (slotId: SlotId): Mutation.MutationScope =>
-  Mutation.MutationScope(`model-slot-selection:${slotId}`)
-
-const slotLoadScope = (slotId: SlotId): Mutation.MutationScope =>
-  Mutation.MutationScope(`model-slot-load:${slotId}`)
-
-const slotStopScope = (slotId: SlotId): Mutation.MutationScope =>
-  Mutation.MutationScope(`model-slot-stop:${slotId}`)
-
-const favoriteScope = ({ providerId, providerModelId }: ProviderModelIdentity) =>
-  Mutation.MutationScope(`model-favorite:${providerId}:${providerModelId}`)
-
-const modelSlotsQuery = Query.make("ModelSlots", {
-  key: (_: void) => Data.tuple(ModelSlotsMirror.id),
-  staleTime: Infinity,
-  gcTime: Infinity,
-  effect: () => Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("GetModelSlots", {})),
-})
-
-const synchronizeModelSlots = () => QueryClient.invalidate(modelSlotsQuery.match()).pipe(
-  Effect.zipRight(QueryClient.fetch(modelSlotsQuery, undefined)),
-)
-
-export const sameSlotSelection = (left: SlotSelection, right: SlotSelection): boolean =>
-  left.providerId === right.providerId
-  && left.providerModelId === right.providerModelId
-  && left.reasoningEffort === right.reasoningEffort
-
-export const authoritativeSlotSelection = (
-  state: ModelSlotsState,
-  slotId: SlotId,
-): Option.Option<SlotSelection> => {
-  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  return slot._tag === "Unassigned" ? Option.none() : Option.some(slot.selection)
-}
-
-export const slotAssignmentIsVisible = (
-  state: ModelSlotsState,
-  slotId: SlotId,
-  selection: SlotSelection,
-): boolean => Option.exists(authoritativeSlotSelection(state, slotId), (current) =>
-  sameSlotSelection(current, selection))
-
-export const modelLoadIsVisible = (
-  state: ModelSlotsState,
-  slotId: SlotId,
-): boolean => {
-  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  return slot._tag === "ConfiguredLocal"
-    && slot.residency._tag !== "Unloaded"
-}
-
-export const selectedModelStopIsVisible = (
-  state: ModelSlotsState,
-  slotId: SlotId,
-): boolean => {
-  const slot = state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  return slot._tag !== "ConfiguredLocal"
-    || slot.residency._tag !== "Requested"
-      && slot.residency._tag !== "Loading"
-      && slot.residency._tag !== "Ready"
-}
-
-const assignMutation = Mutation.make("AssignSlot", {
-  scope: ({ slotId }: AssignmentInput) => slotSelectionScope(slotId),
-  effect: ({ slotId, selection }: AssignmentInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("AssignSlot", { slotId, selection })),
-  synchronize: (_, { slotId, selection }) => synchronizeModelSlots().pipe(
-    Effect.filterOrFail(
-      ({ state }) => slotAssignmentIsVisible(state, slotId, selection),
-      () => new ModelSlotSynchronizationFailed({
-        operation: "assign",
-        message: "The assigned model selection was absent from ModelSlots.",
-      }),
-    ),
-    Effect.asVoid,
-  ),
-})
-
-const clearMutation = Mutation.make("ClearSlot", {
-  scope: ({ slotId }: SlotInput) => slotSelectionScope(slotId),
-  effect: ({ slotId }: SlotInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("ClearSlot", { slotId })),
-  synchronize: () => synchronizeModelSlots().pipe(Effect.asVoid),
-})
-
-const loadMutation = Mutation.make("LoadModel", {
-  scope: ({ slotId }: SlotInput) => slotLoadScope(slotId),
-  effect: ({ slotId }: SlotInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("LoadModel", { slotId })),
-  synchronize: (_, { slotId }) => synchronizeModelSlots().pipe(
-    Effect.filterOrFail(
-      ({ state }) => modelLoadIsVisible(state, slotId),
-      () => new ModelSlotSynchronizationFailed({
-        operation: "load",
-        message: "The model load request was absent from ModelSlots.",
-      }),
-    ),
-    Effect.asVoid,
-  ),
-})
-
-const stopMutation = Mutation.make("StopModel", {
-  scope: ({ slotId }: SlotInput) => slotStopScope(slotId),
-  effect: ({ slotId }: SlotInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("StopModel", { slotId })),
-  synchronize: (_, { slotId }) => synchronizeModelSlots().pipe(
-    Effect.filterOrFail(
-      ({ state }) => selectedModelStopIsVisible(state, slotId),
-      () => new ModelSlotSynchronizationFailed({
-        operation: "stop",
-        message: "The selected model remained active in ModelSlots.",
-      }),
-    ),
-    Effect.asVoid,
-  ),
-})
-
-const favoriteMutation = Mutation.make("SetModelFavorite", {
-  scope: ({ model }: FavoriteInput) => favoriteScope(model),
-  effect: ({ model, favorite }: FavoriteInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("SetModelFavorite", { model, favorite })),
-  synchronize: () => synchronizeModelSlots().pipe(Effect.asVoid),
-})
+export {
+  ModelSlotSynchronizationFailed,
+  authoritativeSlotSelection,
+  modelLoadIsVisible,
+  sameSlotSelection,
+  selectedModelStopIsVisible,
+  slotAssignmentIsVisible,
+} from "@magnitudedev/sdk"
 
 interface PendingAssignment {
   readonly slotId: SlotId
@@ -168,6 +35,7 @@ interface PendingAssignment {
   readonly pending: boolean
 }
 
+/** The latest pending exact assignment for a slot, presented over authoritative state. */
 export const presentedSlotSelection = (
   state: ModelSlotsState,
   assignments: ReadonlyArray<PendingAssignment>,
@@ -184,28 +52,23 @@ const makeModelSlots = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const invalidations = yield* ClientInvalidations
-  const query = effectQuery.query(modelSlotsQuery, undefined)
-  const assign = effectQuery.mutation(assignMutation)
-  const clear = effectQuery.mutation(clearMutation)
-  const load = effectQuery.mutation(loadMutation)
-  const stop = effectQuery.mutation(stopMutation)
-  const favorite = effectQuery.mutation(favoriteMutation)
+  const query = effectQuery.query(GetModelSlots, {})
+  const assign = effectQuery.mutation(AssignSlot)
+  const clear = effectQuery.mutation(ClearSlot)
+  const load = effectQuery.mutation(LoadModel)
+  const stop = effectQuery.mutation(StopModel)
+  const favorite = effectQuery.mutation(SetModelFavorite)
   const assignResult = Atom.make((get) => get(assign))
   const clearResult = Atom.make((get) => get(clear))
   const favoriteResult = Atom.make((get) => get(favorite))
   const assignments = Mutation.state({
-    filters: { mutation: assignMutation },
-    select: ({ input, result }) => ({
+    filters: { mutation: AssignSlot },
+    select: ({ input, result }): PendingAssignment => ({
       slotId: input.slotId,
       selection: input.selection,
       pending: Result.isWaiting(result),
     }),
   })
-  yield* invalidations.mirrors(ModelSlotsMirror.id).pipe(
-    Stream.runForEach(() => queryClient.invalidate(modelSlotsQuery.match())),
-    Effect.forkScoped,
-  )
   const state = Atom.make((get) => get(query).result)
   const selections = Atom.make((get) => Result.map(get(state), ({ state: current }) => ({
     primary: presentedSlotSelection(current, get(assignments), PRIMARY_SLOT_ID),
@@ -215,6 +78,7 @@ const makeModelSlots = Effect.gen(function* () {
       SECONDARY_SLOT_ID,
     ),
   })))
+  const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
 
   return {
     state,
@@ -222,25 +86,14 @@ const makeModelSlots = Effect.gen(function* () {
     assignResult,
     clearResult,
     favoriteResult,
-    retry: queryClient.invalidate(modelSlotsQuery.match()),
+    retry: queryClient.invalidate(GetModelSlots.match()),
     assign: (slotId: SlotId, selection: SlotSelection) =>
-      Mutation.execute(assign, { slotId, selection }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
-    clear: (slotId: SlotId) => Mutation.execute(clear, { slotId }).pipe(
-      Effect.provideService(Registry.AtomRegistry, registry),
-    ),
-    load: (slotId: SlotId) =>
-      Mutation.execute(load, { slotId }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
-    stop: (slotId: SlotId) => Mutation.execute(stop, { slotId }).pipe(
-      Effect.provideService(Registry.AtomRegistry, registry),
-    ),
+      Mutation.execute(assign, { slotId, selection }).pipe(provideRegistry),
+    clear: (slotId: SlotId) => Mutation.execute(clear, { slotId }).pipe(provideRegistry),
+    load: (slotId: SlotId) => Mutation.execute(load, { slotId }).pipe(provideRegistry),
+    stop: (slotId: SlotId) => Mutation.execute(stop, { slotId }).pipe(provideRegistry),
     setFavorite: (model: ProviderModelIdentity, favoriteValue: boolean) =>
-      Mutation.execute(favorite, { model, favorite: favoriteValue }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
+      Mutation.execute(favorite, { model, favorite: favoriteValue }).pipe(provideRegistry),
   }
 })
 

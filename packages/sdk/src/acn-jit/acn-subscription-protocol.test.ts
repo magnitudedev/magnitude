@@ -7,7 +7,7 @@ describe("ACN subscription protocol", () => {
   it("derives only explicitly declared subscription RPCs", () => {
     expect(acnSubscriptionTags).toEqual(new Set([
       "StreamActiveSessionStatuses",
-      "StreamClientInvalidations",
+      "StreamChanges",
       "StreamDisplayView",
       "WatchFile",
       "WatchProjectFiles",

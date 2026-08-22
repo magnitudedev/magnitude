@@ -33,6 +33,8 @@ and Effect services remain native to this package.
 | `useMutationState` | `Mutation.state({ filters, select })` | Returns a derived `Atom` containing matching mutation states. |
 | `useIsMutating` | `Mutation.isMutating(filters)` | Returns an `Atom<number>`. |
 | Mutation cache retention (`gcTime`) | Mutation `gcTime` | Each invocation's `Mutation.State` remains selectable until collection. |
+| `experimental_streamedQuery` | `Query.fromStream(name, { key, stream, reduce })` | The first element resolves the query; later elements are reduced into the data; refetch reopens the stream. |
+| — (tRPC `useSubscription`) | `Subscription.make(name, { key, stream, reconnect })` | A keyed, shared, reconnecting stream with `status`/`latest`; consumers drain `Subscription.events(atom)`. |
 
 ## Queries
 
@@ -105,60 +107,60 @@ const cacheProgram = Effect.gen(function*() {
 `fetch` and `ensure` preserve the query's exact error type. Broad filtered `refetch`
 instead returns `QueryBatchError`, because matches may have unrelated error types.
 
-## RPC-backed definitions
+## RPC-backed definitions (`@magnitudedev/effect-query/rpc`)
 
-RPC is an Effect service required by static definitions. Provide that service once when creating
-the Effect Query client; no query-specific RPC adapter is needed:
-
-```ts
-import { FetchHttpClient } from "@effect/platform"
-import { RpcClient, RpcClientError, RpcGroup, RpcSerialization } from "@effect/rpc"
-import { Context, Effect, Layer } from "effect"
-import { Client, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
-import { MagnitudeRpcs } from "./protocol.js"
-
-class AcnRpc extends Context.Tag("AcnRpc")<
-  AcnRpc,
-  RpcClient.RpcClient.Flat<RpcGroup.Rpcs<typeof MagnitudeRpcs>, RpcClientError.RpcClientError>
->() {}
-
-const AcnRpcLive = Layer.scoped(
-  AcnRpc,
-  RpcClient.make(MagnitudeRpcs, { flatten: true })
-).pipe(
-  Layer.provide(RpcClient.layerProtocolHttp({ url: "http://127.0.0.1:3030/rpc" }).pipe(
-    Layer.provide(RpcSerialization.layerNdjson),
-    Layer.provide(FetchHttpClient.layer)
-  ))
-)
-
-const sessionQuery = Query.make("Session", {
-  key: ({ sessionId }: { readonly sessionId: string }) => Data.tuple(sessionId),
-  effect: (payload) => Effect.flatMap(AcnRpc, (client) =>
-    client("GetSession", payload))
-})
-
-const effectQuery = Client.make(AcnRpcLive)
-const sessionAtom = effectQuery.query(sessionQuery, { sessionId: "session-1" })
-```
-
-Commands use the same service. `Client.make` supplies `QueryClient` to synchronization Effects:
+The RPC adapter lets a protocol package define one *boundary* (`Boundary.make("Acn")`) whose
+queries, mutations, and subscriptions are defined once. Each definition is a core Effect Query
+definition that also carries its `@effect/rpc` `Rpc`, so the wire group is assembled from the same
+values the client consumes. The core stays transport agnostic; the adapter's only transport
+knowledge is the `Transport` service it asks for.
 
 ```ts
-const deleteSession = Mutation.make("DeleteSession", {
-  effect: (payload: { readonly sessionId: string }) =>
-    Effect.flatMap(AcnRpc, (client) => client("DeleteSession", payload)),
-  synchronize: (_output, payload) =>
-    QueryClient.remove(sessionQuery.match(payload)),
-  scope: ({ sessionId }) => Mutation.MutationScope(`session:${sessionId}`)
+import { RpcGroup } from "@effect/rpc"
+import { Effect, Schema } from "effect"
+import { Client, Mutation, QueryClient } from "@magnitudedev/effect-query"
+import * as Boundary from "@magnitudedev/effect-query/rpc"
+
+export const Acn = Boundary.make("Acn")
+
+export const GetSession = Acn.query("GetSession", {
+  payload: { sessionId: Schema.String },
+  success: SessionSchema,
+  error: SessionError,
+  staleTime: "30 seconds"
 })
 
-const deleteSessionAtom = effectQuery.mutation(deleteSession)
+export const DeleteSession = Acn.mutation("DeleteSession", {
+  payload: { sessionId: Schema.String },
+  success: Schema.Struct({}),
+  error: SessionError,
+  scope: ({ sessionId }) => Mutation.MutationScope(`session:${sessionId}`),
+  synchronize: (_, payload) => QueryClient.remove(GetSession.match(payload))
+})
+
+export const StreamChanges = Acn.subscription("StreamChanges", {
+  payload: {},
+  success: Schema.Struct({ query: Schema.String })
+})
+
+export const MagnitudeRpcs = RpcGroup.make(GetSession.rpc, DeleteSession.rpc, StreamChanges.rpc)
 ```
 
-Payload, success, domain-error, middleware-error, and RPC transport-error types are inferred from
-the RPC group. `effect-query` adds cache policy and synchronization without restating the wire
-contract.
+Servers implement the group as usual (`MagnitudeRpcs.toLayer({...})`). Clients provide the
+boundary's transport — `Acn.layer(MagnitudeRpcs)` builds a flat `RpcClient`, or
+`Acn.transport(flatClient)` adapts an existing one — and use the core `Client` unchanged:
+
+```ts
+const effectQuery = Client.make(Acn.layer(MagnitudeRpcs).pipe(Layer.provide(protocolLayer)))
+const session = effectQuery.query(GetSession, { sessionId: "session-1" })
+const remove = effectQuery.mutation(DeleteSession)
+const changes = effectQuery.subscription(StreamChanges, {})
+```
+
+Cache identity defaults to the canonical structural form of the constructed payload
+(`Key.canonical`); payload, success, error, and transport-error types come from the Rpc. Kinds are
+structural: `effectQuery.query(DeleteSession, …)` does not compile because a mutation is not a
+query. `Acn.queryFromStream` defines a `Query.fromStream` over a stream Rpc.
 
 ## HTTP API-backed definitions
 
@@ -198,6 +200,38 @@ const hardwareAtom = icnQuery.query(hardwareQuery, undefined)
 Endpoint success, declared API errors, HTTP client failures, and Schema parse failures remain in the
 query's inferred error channel. A generated `HttpApiClient` service can be used identically; the
 essential input to `Query.make` is its typed Effect, not a transport-specific adapter.
+
+## Subscriptions
+
+A `Subscription` is a keyed, shared, reconnecting event stream with the same identity discipline as
+a query: one open stream per key while observed, closed `gcTime` after the last observer leaves.
+Its atom carries `status` (`idle | connecting | active | reconnecting | failed | completed`),
+`latest`, `failure`, and `attempt`; `Subscription.events(atom)` exposes the events as a `Stream`
+and keeps the subscription mounted while consumed. Writing `Atom.Reset` reopens it,
+`Atom.Interrupt` closes it, and `QueryClient.reconnect(filter)` reopens matching subscriptions.
+
+Relating a subscription to a query is ordinary code — there is no binding layer:
+
+```ts
+const changes = Subscription.make("Changes", {
+  key: (_: void) => "changes",
+  stream: () => changeStream,
+  reconnect: Schedule.exponential("100 millis")
+})
+
+// poke → refetch
+yield* Subscription.events(client.subscription(changes, undefined)).pipe(
+  Stream.runForEach((change) => queryClient.invalidate({ name: change.query })),
+  Effect.forkScoped
+)
+
+// data over time: a query whose source is a stream
+const totals = Query.fromStream("Totals", {
+  key: (_: void) => "totals",
+  stream: () => totalsStream,
+  reduce: (previous, event) => Option.getOrElse(previous, () => 0) + event
+})
+```
 
 ## Remote atom pattern
 

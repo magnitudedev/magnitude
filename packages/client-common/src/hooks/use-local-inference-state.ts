@@ -2,8 +2,8 @@ import { useCallback, useMemo } from "react"
 import { Effect, Option, type Equivalence } from "effect"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
+  GetModelSlots,
   LocalInferenceHardwareMirror,
-  ModelSlotsMirror,
   ProviderIdSchema,
   ProviderModelCatalogMirror,
   type LocalModelsState,
@@ -77,7 +77,7 @@ export function usePreviewModelLoad(slotId: SlotId) {
     () => client.rpc.query(
       "PreviewModelLoad",
       { slotId },
-      { reactivityKeys: [LocalInferenceHardwareMirror.id, ModelSlotsMirror.id] },
+      { reactivityKeys: [LocalInferenceHardwareMirror.id, GetModelSlots.name] },
     ),
     [client, slotId],
   )

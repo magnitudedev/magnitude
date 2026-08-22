@@ -1,54 +1,22 @@
-import { Atom, Registry } from "@effect-atom/atom-react"
-import { Context, Data, Effect, Layer, Stream } from "effect"
-import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
-import { AcnRpcClientTag, OnboardingMirror } from "@magnitudedev/sdk"
+import { Atom, Registry, Result } from "@effect-atom/atom-react"
+import { Context, Effect, Layer } from "effect"
+import { Mutation, QueryClient } from "@magnitudedev/effect-query"
+import { CompleteOnboarding, GetOnboardingState } from "@magnitudedev/sdk"
 import { ClientEffectQuery } from "../state/client-effect-query"
-import { ClientInvalidations } from "../state/client-invalidations"
 
-export class OnboardingPersistenceSynchronizationFailed extends Data.TaggedError(
-  "OnboardingPersistenceSynchronizationFailed",
-)<{}> {}
-
-const onboardingQuery = Query.make("Onboarding", {
-  key: (_: void) => Data.tuple(OnboardingMirror.id),
-  staleTime: Infinity,
-  gcTime: Infinity,
-  effect: () => Effect.flatMap(AcnRpcClientTag, (rpc) =>
-    rpc("GetOnboardingState", {}).pipe(Effect.map(({ state }) => state))),
-})
-
-const synchronizeOnboarding = () => QueryClient.invalidate(onboardingQuery.match()).pipe(
-  Effect.zipRight(QueryClient.fetch(onboardingQuery, undefined)),
-)
-
-const completeOnboardingMutation = Mutation.make("CompleteOnboarding", {
-  effect: (_: void) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CompleteOnboarding", {})),
-  synchronize: () => synchronizeOnboarding().pipe(
-    Effect.filterOrFail(
-      (state) => state.completed,
-      () => new OnboardingPersistenceSynchronizationFailed(),
-    ),
-    Effect.asVoid,
-  ),
-})
+export { OnboardingPersistenceSynchronizationFailed } from "@magnitudedev/sdk"
 
 const makeOnboardingPersistence = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const invalidations = yield* ClientInvalidations
-  const query = effectQuery.query(onboardingQuery, undefined)
-  const mutation = effectQuery.mutation(completeOnboardingMutation)
-  yield* invalidations.mirrors(OnboardingMirror.id).pipe(
-    Stream.runForEach(() => queryClient.invalidate(onboardingQuery.match())),
-    Effect.forkScoped,
-  )
+  const query = effectQuery.query(GetOnboardingState, {})
+  const complete = effectQuery.mutation(CompleteOnboarding)
 
   return {
-    state: Atom.make((get) => get(query).result),
-    retry: queryClient.invalidate(onboardingQuery.match()),
-    complete: Mutation.execute(mutation, undefined).pipe(
+    state: Atom.make((get) => Result.map(get(query).result, (snapshot) => snapshot.state)),
+    retry: queryClient.invalidate(GetOnboardingState.match()),
+    complete: Mutation.execute(complete, {}).pipe(
       Effect.provideService(Registry.AtomRegistry, registry),
     ),
   }

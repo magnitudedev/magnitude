@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
-  LocalModelsMirror,
+  GetLocalModels,
+  LocalModelsStateSchema,
   ServableModelBundleSchema,
   sameServableModelBundleIdentity,
   servableModelBundlePackageIds,
@@ -367,12 +368,15 @@ export const LocalModelsLive: Layer.Layer<
   const offerings = yield* LocalProviderOfferings
   const hardware = yield* LocalInferenceHardwareService
   const instances = yield* IcnInstances
-  const mirror = yield* makeMirroredState(LocalModelsMirror, {
-    inventoryState: { _tag: "Initializing" },
-    models: [],
-    discoveryState: { _tag: "Loading", progress: [] },
-  })
-  const equivalent = Schema.equivalence(LocalModelsMirror.stateSchema)
+  const mirror = yield* makeMirroredState(
+    { id: GetLocalModels.name, stateSchema: LocalModelsStateSchema },
+    {
+      inventoryState: { _tag: "Initializing" },
+      models: [],
+      discoveryState: { _tag: "Loading", progress: [] },
+    },
+  )
+  const equivalent = Schema.equivalence(LocalModelsStateSchema)
   const lock = yield* Effect.makeSemaphore(1)
 
   const project = lock.withPermits(1)(Effect.gen(function* () {

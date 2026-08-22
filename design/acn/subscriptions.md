@@ -7,11 +7,11 @@ applies_to:
   - packages/sdk/src/acn-jit/acn-subscription-protocol.ts
   - packages/sdk/src/jit-rpc/recovering-stream-protocol.ts
   - packages/acn/src/display-view-streams.ts
-  - packages/acn/src/client-invalidations.ts
-  - packages/client-common/src/state/client-invalidations.ts
+  - packages/acn/src/changes.ts
+  - packages/client-common/src/state/changes.ts
   - packages/client-common/src/state/agent-client.ts
-  - packages/acn-protocol/src/rpcs/client-invalidation.ts
-  - packages/acn-protocol/src/schemas/client-invalidation.ts
+  - packages/acn-protocol/src/rpcs/changes.ts
+  - packages/acn-protocol/src/schemas/changes.ts
 ---
 
 # ACN subscriptions
@@ -20,10 +20,12 @@ An ACN subscription is caller-owned observation. Opening one never starts produc
 ACN or a session runtime. Domain handlers and consumers see only payload values; framing remains a
 transport concern.
 
-Connection-global invalidations for mirrors, Projects, and sessions share one subscription. The
-transport tags each notification with its independent domain identity; client fan-out invalidates
-only that domain's canonical cache. Multiplexing notifications neither combines their state nor
-creates a cross-domain authority.
+Connection-global change notifications share one subscription, `StreamChanges`. Each event is a
+poke in the clients' query-identity space — `{ query, key?, revision? }` naming the query whose
+authoritative data may have changed — so clients invalidate that query and nothing else is derived
+from it. A mirror commit names its own Get RPC tag with its revision; a store commit names every
+query it backs. Multiplexing notifications neither combines their state nor creates a cross-domain
+authority.
 
 | Frame | Meaning |
 | --- | --- |

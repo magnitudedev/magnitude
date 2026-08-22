@@ -10,14 +10,11 @@ import {
   OnboardingPersistence,
   OnboardingPersistenceLive,
 } from "../onboarding/persistence"
+import { ChangesLive } from "./changes"
 import { ClientEffectQuery } from "./client-effect-query"
-import {
-  ClientInvalidations,
-} from "./client-invalidations"
 
 export type ClientServices =
   | ClientEffectQuery
-  | ClientInvalidations
   | LocalModels
   | ModelSlots
   | OnboardingPersistence
@@ -29,14 +26,11 @@ export interface ClientServicesOptions {
 
 export const clientServicesLayer = (
   effectQuery: Context.Tag.Service<typeof ClientEffectQuery>,
-  invalidations: Context.Tag.Service<typeof ClientInvalidations>,
   options: ClientServicesOptions = {},
 ) => {
-  const infrastructure = Layer.mergeAll(
-    Layer.succeed(ClientEffectQuery, effectQuery),
-    Layer.succeed(ClientInvalidations, invalidations),
-  )
+  const infrastructure = Layer.succeed(ClientEffectQuery, effectQuery)
   const domains = Layer.mergeAll(
+    ChangesLive,
     LocalModelsLive,
     ModelSlotsLive,
     OnboardingPersistenceLive,

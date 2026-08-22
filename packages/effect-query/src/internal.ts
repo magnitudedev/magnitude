@@ -18,11 +18,36 @@ import {
   type QueryEntryState,
   type QueryFilter,
   type QueryKey,
-  type QueryMetadata
+  type SubscriptionDefinition,
+  type SubscriptionEntryState,
+  type SubscriptionFilter
 } from "./Model.js"
 
 export const QueryEntryTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/QueryEntry")
 export const MutationInternalTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/MutationInternal")
+export const SubscriptionEntryTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/SubscriptionEntry")
+
+export interface ErasedSubscriptionEntry {
+  readonly stateAtom: Atom.Atom<SubscriptionEntryState>
+  readonly definition: SubscriptionDefinition
+  readonly name: string
+  readonly key: QueryKey
+  readonly keyHash: number
+  readonly reconnect: (registry: AtomRegistry.Registry) => void
+  readonly close: (registry: AtomRegistry.Registry) => void
+}
+
+export interface SubscriptionEntry<Event> extends ErasedSubscriptionEntry {
+  /** Events of the shared stream; keeps the subscription mounted while consumed. */
+  readonly events: (registry: AtomRegistry.Registry) => Stream.Stream<Event>
+}
+
+export interface SubscriptionEntryCarrier<Event> {
+  readonly [SubscriptionEntryTypeId]: SubscriptionEntry<Event>
+}
+
+export const subscriptionEntry = <Event>(carrier: SubscriptionEntryCarrier<Event>): SubscriptionEntry<Event> =>
+  carrier[SubscriptionEntryTypeId]
 
 export interface ErasedQueryEntry {
   readonly stateAtom: Atom.Atom<QueryEntryState>
@@ -82,6 +107,8 @@ export interface ClientCore {
   readonly registry: AtomRegistry.Registry
   readonly entries: Set<ErasedQueryEntry>
   readonly definitions: Map<string, QueryDefinition>
+  readonly subscriptions: Set<ErasedSubscriptionEntry>
+  readonly subscriptionDefinitions: Map<string, SubscriptionDefinition>
   readonly removed: Set<ErasedQueryEntry>
   readonly mutationStates: Array<AnyMutationState>
   readonly mutationScopes: Map<MutationScope, Effect.Semaphore>
@@ -103,6 +130,8 @@ export const getClientCore = (registry: AtomRegistry.Registry): ClientCore => {
     registry,
     entries: new Set(),
     definitions: new Map(),
+    subscriptions: new Set(),
+    subscriptionDefinitions: new Map(),
     removed: new Set(),
     mutationStates: [],
     mutationScopes: new Map(),
@@ -141,6 +170,41 @@ export const registerEntry = (registry: AtomRegistry.Registry, entry: ErasedQuer
   }
 }
 
+export const registerSubscriptionEntry = (
+  registry: AtomRegistry.Registry,
+  entry: ErasedSubscriptionEntry
+): (() => void) => {
+  const core = getClientCore(registry)
+  const conflicting = core.subscriptionDefinitions.get(entry.name)
+  if (conflicting !== undefined && conflicting !== entry.definition) {
+    throw new Error(`Duplicate subscription definition name: ${entry.name}`)
+  }
+  core.subscriptionDefinitions.set(entry.name, entry.definition)
+  if (!core.subscriptions.has(entry)) {
+    core.subscriptions.add(entry)
+    core.touch()
+  }
+  return () => {
+    queueMicrotask(() => {
+      if (registry.getNodes().has(entry.stateAtom) || !core.subscriptions.delete(entry)) return
+      if (![...core.subscriptions].some((candidate) => candidate.definition === entry.definition)) {
+        core.subscriptionDefinitions.delete(entry.name)
+      }
+    })
+  }
+}
+
+export const subscriptionMatches = (
+  entry: ErasedSubscriptionEntry,
+  filter: SubscriptionFilter | undefined
+): boolean => {
+  if (filter === undefined) return true
+  if (filter.definition !== undefined && filter.definition !== entry.definition) return false
+  if (filter.name !== undefined && filter.name !== entry.name) return false
+  if (filter.key !== undefined && !Equal.equals(filter.key, entry.key)) return false
+  return true
+}
+
 const keyMatches = (filterKey: QueryKey, entryKey: QueryKey, exact: boolean): boolean =>
   !exact && Array.isArray(filterKey) && Array.isArray(entryKey)
     ? filterKey.length <= entryKey.length
@@ -154,6 +218,7 @@ export const queryMatches = (
 ): boolean => {
   if (filter === undefined) return true
   if (filter.definition !== undefined && filter.definition !== entry.definition) return false
+  if (filter.name !== undefined && filter.name !== entry.name) return false
   if (filter.key !== undefined && !keyMatches(filter.key, entry.key, filter.exact !== false)) return false
   const state = entry.state(registry)
   if (filter.stale !== undefined && filter.stale !== state.isStale) return false
@@ -221,5 +286,9 @@ export type {
   QueryEntryState,
   QueryFilter,
   QueryKey,
-  QueryMetadata
+  QueryMetadata,
+  SubscriptionDefinition,
+  SubscriptionEntryState,
+  SubscriptionFilter,
+  SubscriptionStatus
 } from "./Model.js"

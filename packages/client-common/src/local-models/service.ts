@@ -1,40 +1,28 @@
 import { useCallback, useMemo } from "react"
 import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { Context, Data, Effect, Layer, Option, Schedule, Stream } from "effect"
-import { Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
+import { Context, Effect, Layer, Option } from "effect"
+import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
-  AcnRpcClientTag,
-  LocalModelsMirror,
+  CancelModelDownload,
+  DeleteLocalModel,
+  DismissModelDownloadFailure,
+  GetLocalModels,
+  LocalModelSynchronizationFailed,
+  ReconcileCatalogModel,
+  findLocalModelByConfigurationId,
+  localModelCatalogIdentity,
+  localModelConfigurationId,
+  synchronizeLocalModels,
+  type CatalogIdentity,
   type ModelDownloadId,
-  type CatalogModelReconciliationAdmission,
   type LocalModelsState,
   type LocalModel,
   type ModelServingConfigurationId,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
-import { ClientInvalidations } from "../state/client-invalidations"
-import {
-  findLocalModelByConfigurationId,
-  localModelConfigurationId,
-  localModelProviderModelId,
-} from "./projection"
 
-export class LocalModelSynchronizationFailed extends Data.TaggedError(
-  "LocalModelSynchronizationFailed",
-)<{ readonly operation: "install" | "cancel" | "delete"; readonly message: string }> {}
-
-interface InstallationInput {
-  readonly configurationId: ModelServingConfigurationId
-}
-
-interface DownloadInput {
-  readonly downloadId: ModelDownloadId
-}
-
-interface DeletionInput {
-  readonly configurationId: ModelServingConfigurationId
-}
+export { LocalModelSynchronizationFailed, installationAdmissionIsVisible } from "@magnitudedev/sdk"
 
 export type CatalogModelReconciliationKind = "Install" | "Update"
 
@@ -58,7 +46,7 @@ export interface CatalogModelsView {
 }
 
 interface ReconciliationInvocationState {
-  readonly configurationId: ModelServingConfigurationId
+  readonly identity: CatalogIdentity
   readonly waiting: boolean
   readonly failed: boolean
 }
@@ -69,13 +57,14 @@ interface DeletionInvocationState {
   readonly failed: boolean
 }
 
+const sameCatalogIdentity = (left: CatalogIdentity, right: CatalogIdentity): boolean =>
+  left.modelId === right.modelId && left.variantId === right.variantId
+
 export const projectCatalogModelsView = (
   state: LocalModelsState,
   invocations: readonly ReconciliationInvocationState[],
   deletions: readonly DeletionInvocationState[] = [],
 ): CatalogModelsView => {
-  const latestByConfigurationId = new Map(invocations.map((invocation) =>
-    [invocation.configurationId, invocation] as const))
   const latestDeletionByConfigurationId = new Map(deletions.map((deletion) =>
     [deletion.configurationId, deletion] as const))
   return {
@@ -84,10 +73,11 @@ export const projectCatalogModelsView = (
       if (model.catalogMembershipState._tag !== "InCatalog") return []
       const acquisition = model.acquisitionState
       const upgrade = model.upgradeState
+      const identity = localModelCatalogIdentity(model)
+      const invocation = Option.isSome(identity)
+        ? invocations.findLast((candidate) => sameCatalogIdentity(candidate.identity, identity.value))
+        : undefined
       const configurationId = Option.getOrUndefined(localModelConfigurationId(model))
-      const invocation = configurationId === undefined
-        ? undefined
-        : latestByConfigurationId.get(configurationId)
       const deletion = configurationId === undefined
         ? undefined
         : latestDeletionByConfigurationId.get(configurationId)
@@ -119,155 +109,25 @@ export const projectCatalogModelsView = (
   }
 }
 
-const installationScope = (
-  configurationId: ModelServingConfigurationId,
-): Mutation.MutationScope => Mutation.MutationScope(configurationId)
-
-const downloadScope = (
-  downloadId: ModelDownloadId,
-): Mutation.MutationScope => Mutation.MutationScope(downloadId)
-
-const localModelsQuery = Query.make("LocalModels", {
-  key: (_: void) => Data.tuple(LocalModelsMirror.id),
-  staleTime: Infinity,
-  gcTime: Infinity,
-  effect: () => Effect.flatMap(AcnRpcClientTag, (rpc) =>
-    rpc("GetLocalModels", {}).pipe(Effect.map(({ state }) => state))),
-})
-
-const synchronizeLocalModels = () => QueryClient.invalidate(localModelsQuery.match()).pipe(
-  Effect.zipRight(QueryClient.fetch(localModelsQuery, undefined)),
-)
-
-const localModelsSynchronizationSchedule = Schedule.spaced("50 millis").pipe(
-  Schedule.intersect(Schedule.recurs(100)),
-)
-
-const synchronizeLocalModelsUntil = (
-  predicate: (state: LocalModelsState) => boolean,
-  error: () => LocalModelSynchronizationFailed,
-) => synchronizeLocalModels().pipe(
-  Effect.filterOrFail(predicate, error),
-  Effect.retry(localModelsSynchronizationSchedule),
-)
-
-export const installationAdmissionIsVisible = (
-  state: LocalModelsState,
-  configurationId: ModelServingConfigurationId,
-  admission: CatalogModelReconciliationAdmission,
-): boolean => Option.exists(
-  findLocalModelByConfigurationId(state.models, configurationId),
-  (model) => {
-    const acquisition = model.acquisitionState
-    const isCurrent = acquisition._tag === "Installed" && model.upgradeState._tag === "Current"
-    if (admission._tag === "Current" || isCurrent) return isCurrent
-    if (acquisition._tag !== "NotInstalled"
-      && acquisition._tag !== "Installed"
-      && acquisition.downloadId === admission.downloadId) return true
-    return model.upgradeState._tag === "Upgrading"
-      && model.upgradeState.downloadId === admission.downloadId
-  },
-)
-
-const installMutation = Mutation.make("ReconcileCatalogModel", {
-  scope: ({ configurationId }: InstallationInput) => installationScope(configurationId),
-  effect: ({ configurationId }: InstallationInput) => synchronizeLocalModels().pipe(
-    Effect.flatMap((state) => findLocalModelByConfigurationId(state.models, configurationId)),
-    Effect.filterOrFail(
-      (model) => model.catalogMembershipState._tag === "InCatalog",
-      () => new LocalModelSynchronizationFailed({
-        operation: "install",
-        message: "Only catalog models can be reconciled.",
-      }),
-    ),
-    Effect.flatMap((model) => {
-      const catalog = model.catalogMembershipState
-      if (catalog._tag !== "InCatalog") return Effect.die("Catalog membership changed")
-      return Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("ReconcileCatalogModel", {
-        modelId: catalog.catalogData.modelId,
-        variantId: catalog.catalogData.variantId,
-      }))
-    }),
-  ),
-  synchronize: (admission, { configurationId }) => synchronizeLocalModelsUntil(
-      (state) => installationAdmissionIsVisible(state, configurationId, admission),
-      () => new LocalModelSynchronizationFailed({
-        operation: "install",
-        message: "The admitted local-model installation was absent from LocalModels.",
-      }),
-    ).pipe(
-    Effect.asVoid,
-  ),
-})
-
-const cancelDownloadMutation = Mutation.make("CancelModelDownload", {
-  scope: ({ downloadId }: DownloadInput) => downloadScope(downloadId),
-  effect: ({ downloadId }: DownloadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("CancelModelDownload", { downloadId })),
-  synchronize: (_, { downloadId }) => synchronizeLocalModelsUntil(
-      (state) => state.models.every((model) => {
-        const acquisition = model.acquisitionState
-        return acquisition._tag === "NotInstalled"
-          || acquisition._tag === "Installed"
-          || acquisition.downloadId !== downloadId
-          || acquisition._tag === "Cancelled"
-          || acquisition._tag === "Failed"
-      }),
-      () => new LocalModelSynchronizationFailed({
-        operation: "cancel",
-        message: "The cancelled model download remained active in LocalModels.",
-      }),
-    ).pipe(
-    Effect.asVoid,
-  ),
-})
-
-const dismissDownloadFailureMutation = Mutation.make("DismissModelDownloadFailure", {
-  scope: ({ downloadId }: DownloadInput) => downloadScope(downloadId),
-  effect: ({ downloadId }: DownloadInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DismissModelDownloadFailure", { downloadId })),
-  synchronize: () => synchronizeLocalModels().pipe(Effect.asVoid),
-})
-
-const deleteModelMutation = Mutation.make("DeleteLocalModel", {
-  scope: ({ configurationId }: DeletionInput) => installationScope(configurationId),
-  effect: ({ configurationId }: DeletionInput) =>
-    Effect.flatMap(AcnRpcClientTag, (rpc) => rpc("DeleteLocalModel", { configurationId })),
-  synchronize: (_, { configurationId }) => synchronizeLocalModelsUntil(
-    (state) => Option.match(
-      findLocalModelByConfigurationId(state.models, configurationId),
-      {
-        onNone: () => true,
-        onSome: (model) => model.acquisitionState._tag !== "Installed",
-      },
-    ),
-    () => new LocalModelSynchronizationFailed({
-      operation: "delete",
-      message: "The deleted local model remained installed in LocalModels.",
-    }),
-  ).pipe(Effect.asVoid),
-})
-
 const makeLocalModels = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const invalidations = yield* ClientInvalidations
-  const query = effectQuery.query(localModelsQuery, undefined)
-  const install = effectQuery.mutation(installMutation)
-  const cancelDownload = effectQuery.mutation(cancelDownloadMutation)
-  const dismissDownloadFailure = effectQuery.mutation(dismissDownloadFailureMutation)
-  const deleteModel = effectQuery.mutation(deleteModelMutation)
+  const query = effectQuery.query(GetLocalModels, {})
+  const install = effectQuery.mutation(ReconcileCatalogModel)
+  const cancelDownload = effectQuery.mutation(CancelModelDownload)
+  const dismissDownloadFailure = effectQuery.mutation(DismissModelDownloadFailure)
+  const deleteModel = effectQuery.mutation(DeleteLocalModel)
   const installationInvocations = Mutation.state({
-    filters: { mutation: installMutation },
+    filters: { mutation: ReconcileCatalogModel },
     select: ({ input, result }): ReconciliationInvocationState => ({
-      configurationId: input.configurationId,
+      identity: input,
       waiting: Result.isWaiting(result),
       failed: Result.isFailure(result),
     }),
   })
   const deletionInvocations = Mutation.state({
-    filters: { mutation: deleteModelMutation },
+    filters: { mutation: DeleteLocalModel },
     select: ({ input, result }): DeletionInvocationState => ({
       configurationId: input.configurationId,
       waiting: Result.isWaiting(result),
@@ -276,11 +136,7 @@ const makeLocalModels = Effect.gen(function* () {
   })
   const latestInstallationFailed = Atom.make((get) =>
     get(installationInvocations).at(-1)?.failed ?? false)
-  yield* invalidations.mirrors(LocalModelsMirror.id).pipe(
-    Stream.runForEach(() => queryClient.invalidate(localModelsQuery.match())),
-    Effect.forkScoped,
-  )
-  const state = Atom.make((get) => get(query).result)
+  const state = Atom.make((get) => Result.map(get(query).result, (snapshot) => snapshot.state))
   const catalog = Atom.make((get) => Result.map(
     get(state),
     (models) => projectCatalogModelsView(
@@ -289,28 +145,36 @@ const makeLocalModels = Effect.gen(function* () {
       get(deletionInvocations),
     ),
   ))
+  const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
+  const provideQueryClient = Effect.provideService(QueryClient.QueryClient, queryClient)
+
+  /** Resolve the catalog identity behind a configuration from fresh inventory, then reconcile it. */
+  const installConfiguration = (configurationId: ModelServingConfigurationId) =>
+    synchronizeLocalModels.pipe(
+      provideQueryClient,
+      Effect.flatMap((current) => findLocalModelByConfigurationId(current.models, configurationId)),
+      Effect.flatMap((model) => localModelCatalogIdentity(model).pipe(
+        Effect.mapError(() => new LocalModelSynchronizationFailed({
+          operation: "install",
+          message: "Only catalog models can be reconciled.",
+        })),
+      )),
+      Effect.flatMap((identity) => Mutation.execute(install, identity)),
+      provideRegistry,
+    )
 
   return {
     state,
     catalog,
     latestInstallationFailed,
-    retry: queryClient.invalidate(localModelsQuery.match()),
-    install: (configurationId: ModelServingConfigurationId) =>
-      Mutation.execute(install, { configurationId }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
+    retry: queryClient.invalidate(GetLocalModels.match()),
+    install: installConfiguration,
     cancelDownload: (downloadId: ModelDownloadId) =>
-      Mutation.execute(cancelDownload, { downloadId }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
+      Mutation.execute(cancelDownload, { downloadId }).pipe(provideRegistry),
     dismissDownloadFailure: (downloadId: ModelDownloadId) =>
-      Mutation.execute(dismissDownloadFailure, { downloadId }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
+      Mutation.execute(dismissDownloadFailure, { downloadId }).pipe(provideRegistry),
     delete: (configurationId: ModelServingConfigurationId) =>
-      Mutation.execute(deleteModel, { configurationId }).pipe(
-        Effect.provideService(Registry.AtomRegistry, registry),
-      ),
+      Mutation.execute(deleteModel, { configurationId }).pipe(provideRegistry),
   }
 })
 

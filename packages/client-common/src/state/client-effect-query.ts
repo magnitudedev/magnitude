@@ -1,9 +1,9 @@
 import { Context } from "effect"
 import type { Client } from "@magnitudedev/effect-query"
-import type { AcnRpcClientTag } from "@magnitudedev/sdk"
+import type { AcnTransport } from "@magnitudedev/sdk"
 
+/** The connection's Effect Query client, as seen by domain services. */
 export interface ClientEffectQuery
-  extends Pick<Client.Client<AcnRpcClientTag, never>, "query" | "mutation"> {}
+  extends Pick<Client.Client<AcnTransport, never>, "query" | "mutation" | "subscription"> {}
 
-/** Connection-local Effect Query materialization used only while building domain services. */
 export const ClientEffectQuery = Context.GenericTag<ClientEffectQuery>("client/EffectQuery")

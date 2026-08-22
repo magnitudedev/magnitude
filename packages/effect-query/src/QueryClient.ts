@@ -17,13 +17,14 @@ import {
   queryEntry,
   queryMatches,
   registerEntry,
+  subscriptionMatches,
   type QueryClientEvent,
   type QueryFilter,
   type QueryMetadata
 } from "./internal.js"
-import type { AnyMutationState, MutationFilter } from "./Model.js"
+import type { AnyMutationState, MutationFilter, SubscriptionFilter } from "./Model.js"
 
-export type { QueryClientEvent, QueryFilter, QueryMetadata }
+export type { QueryClientEvent, QueryFilter, QueryMetadata, SubscriptionFilter }
 
 export interface QueryBatchFailure {
   readonly name: string
@@ -66,6 +67,8 @@ export interface Service {
   readonly isFetching: (filter?: QueryFilter) => Atom.Atom<number>
   readonly isMutating: (filter?: MutationFilter) => Atom.Atom<number>
   readonly mutationState: (filter?: MutationFilter) => Atom.Atom<ReadonlyArray<AnyMutationState>>
+  /** Reopens every matching mounted subscription now (`Atom.Reset`). */
+  readonly reconnect: (filter?: SubscriptionFilter) => Effect.Effect<void>
   readonly events: Stream.Stream<QueryClientEvent>
 }
 
@@ -218,6 +221,11 @@ const makeService = (
       get(core.revision)
       return core.mutationStates.filter((state) => mutationMatches(state, filter))
     }),
+    reconnect: (filter) => Effect.sync(() => {
+      for (const entry of core.subscriptions) {
+        if (subscriptionMatches(entry, filter)) entry.reconnect(registry)
+      }
+    }),
     events: core.events
   }
 }
@@ -283,3 +291,6 @@ export const mutationState = (
   filter?: MutationFilter
 ): Effect.Effect<Atom.Atom<ReadonlyArray<AnyMutationState>>, never, QueryClient> =>
   Effect.map(QueryClient, (client) => client.mutationState(filter))
+
+export const reconnect = (filter?: SubscriptionFilter): Effect.Effect<void, never, QueryClient> =>
+  Effect.flatMap(QueryClient, (client) => client.reconnect(filter))
