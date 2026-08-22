@@ -146,7 +146,7 @@ describe("AcnIntrospector", () => {
       yield* Queue.offer(queue, agentIntrospection)
       yield* Effect.sleep("10 millis")
       yield* Queue.offer(queue, agentIntrospection)
-      yield* displayViews.setShape("session-a", "view-main", rootShape)
+      yield* displayViews.openStream("session-a", "view-main", rootShape)
 
       return yield* Fiber.join(fiber)
     })

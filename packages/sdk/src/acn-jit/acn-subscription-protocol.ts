@@ -1,42 +1,35 @@
-import { Context, Effect, Option, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import {
-  AcnSubscriptionMetadataTag,
   AcnSubscriptionWireItem,
-  MagnitudeRpcs,
   ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS,
+  AcnRpc,
+  AcnBoundary,
 } from "@magnitudedev/acn-protocol"
+import type { JsonValue } from "@magnitudedev/utils/schema"
 import {
   isCleanOrInterruptedExit,
   type RecoveringStreamProtocol,
 } from "../jit-rpc"
 
-export const acnSubscriptionTags: ReadonlySet<string> = new Set(
-  Array.from(MagnitudeRpcs.requests.entries())
-    .filter(([, rpc]) =>
-      Option.isSome(Context.getOption(rpc.annotations, AcnSubscriptionMetadataTag)),
-    )
-    .map(([tag]) => tag),
-)
-
 const decodeWireItem = Schema.decodeUnknown(AcnSubscriptionWireItem)
 
+/**
+ * Consumes ACN subscription controls and unwraps payload frames so Effect RPC
+ * only ever sees encoded domain values. Every stream Rpc of the ACN group is a
+ * subscription; framing is decided by the group, not by annotations.
+ */
 const decodeChunk: RecoveringStreamProtocol["decodeChunk"] = (values) =>
   Effect.gen(function* () {
     const decoded = yield* Effect.forEach(values, (value) => decodeWireItem(value))
-    const payloads: Extract<AcnSubscriptionWireItem, { readonly _tag: "payload" }>[] = []
-    let progressed = false
+    const payloads: JsonValue[] = []
     let terminated = false
 
     for (const item of decoded) {
       switch (item._tag) {
         case "payload":
-          payloads.push(item)
-          progressed = true
+          payloads.push(item.payload)
           break
         case "keepalive":
-          break
-        case "suspended":
-          progressed = true
           break
         case "terminated":
           terminated = true
@@ -46,11 +39,11 @@ const decodeChunk: RecoveringStreamProtocol["decodeChunk"] = (values) =>
 
     return terminated
       ? { _tag: "Terminated" }
-      : { _tag: "Continue", values: payloads, progressed }
+      : { _tag: "Continue", values: payloads, progressed: payloads.length > 0 }
   })
 
 export const acnSubscriptionProtocol: RecoveringStreamProtocol = {
-  isStream: (rpcTag) => acnSubscriptionTags.has(rpcTag),
+  isStream: (tag) => AcnRpc.operation(AcnBoundary, tag)?.stream === true,
   decodeChunk,
   livenessTimeoutMs: ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS,
   isExitWithoutTermination: isCleanOrInterruptedExit,

@@ -3,7 +3,7 @@ import { useAtomSet, useAtomValue, Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import { FolderOpen } from "@phosphor-icons/react"
 import { useAgentClient, usePlatform } from "@magnitudedev/client-common"
-import type { Project } from "@magnitudedev/sdk"
+import { Projects, type Project } from "@magnitudedev/sdk"
 import {
   Dialog,
   DialogContent,
@@ -47,8 +47,8 @@ export function ProjectFormDialog({
   const [name, setName] = useState(project?.name ?? "")
   const [nameWasEdited, setNameWasEdited] = useState(project !== undefined)
   const [sourcePickerFailed, setSourcePickerFailed] = useState(false)
-  const createMutation = useMemo(() => client.rpc.mutation("CreateProject"), [client])
-  const editMutation = useMemo(() => client.rpc.mutation("EditProject"), [client])
+  const createMutation = useMemo(() => client.mutation(Projects.CreateProject), [client])
+  const editMutation = useMemo(() => client.mutation(Projects.EditProject), [client])
   const createState = useAtomValue(createMutation)
   const editState = useAtomValue(editMutation)
   const create = useAtomSet(createMutation, { mode: "promise" })
@@ -98,17 +98,11 @@ export function ProjectFormDialog({
     try {
       const saved = project
         ? await edit({
-            payload: {
-              projectId: project.projectId,
-              name: cleanName,
-              cwd: cleanCwd,
-            },
-            reactivityKeys: ["projects", "sessions"],
+            projectId: project.projectId,
+            name: cleanName,
+            cwd: cleanCwd,
           })
-        : await create({
-            payload: { name: cleanName, cwd: cleanCwd },
-            reactivityKeys: ["projects", "sessions"],
-          })
+        : await create({ name: cleanName, cwd: cleanCwd })
       onSaved(saved)
     } catch {
       // Mutation Result owns the rendered failure state.
@@ -233,17 +227,14 @@ export function RemoveProjectDialog({
   readonly onRemoved: () => void
 }): ReactNode {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.rpc.mutation("RemoveProject"), [client])
+  const mutation = useMemo(() => client.mutation(Projects.RemoveProject), [client])
   const state = useAtomValue(mutation)
   const remove = useAtomSet(mutation, { mode: "promise" })
   const pending = Result.isWaiting(state)
   const failed = Result.isFailure(state)
   const confirm = async () => {
     try {
-      await remove({
-        payload: { projectId: project.projectId },
-        reactivityKeys: ["projects", "sessions"],
-      })
+      await remove({ projectId: project.projectId })
       onRemoved()
     } catch {
       // Mutation Result owns the rendered failure state.

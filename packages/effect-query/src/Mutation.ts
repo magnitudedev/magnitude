@@ -8,6 +8,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
+import * as Schema from "effect/Schema"
 import {
   addMutationState,
   getClientCore,
@@ -27,6 +28,7 @@ import {
   type MutationState,
   type MutationFilter
 } from "./Model.js"
+import * as Operation from "./Operation.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Mutation")
 const OptionsTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Mutation/options")
@@ -135,6 +137,26 @@ export interface Options<Input, Output, CommandError, CommandRequirements, Synch
   readonly gcTime?: Duration.DurationInput
 }
 
+export type DeclarationOptions<
+  Payload extends Operation.PayloadInput,
+  Success extends Schema.Schema.Any,
+  Error extends Schema.Schema.All,
+  Policy extends object,
+  Input,
+  Output,
+  CommandError,
+  SynchronizationError,
+  SynchronizationRequirements,
+> = Operation.Shape<Payload, Success, Error, Policy> & {
+  readonly synchronize?: (
+    output: Output,
+    input: Input,
+  ) => Effect.Effect<void, SynchronizationError, SynchronizationRequirements>
+  readonly scope?: (input: Input) => MutationScope
+  readonly retry?: Schedule.Schedule<unknown, CommandError, never>
+  readonly gcTime?: Duration.DurationInput
+}
+
 interface Invocation<Input, Output, Error> {
   readonly id: MutationStateId
   readonly input: Input
@@ -147,7 +169,7 @@ interface Invocation<Input, Output, Error> {
 
 let nextMutationStateId = 0
 
-export const make = <
+export function make<
   Input,
   Output,
   CommandError,
@@ -163,28 +185,60 @@ export const make = <
     CommandRequirements,
     SynchronizationError,
     SynchronizationRequirements
-  >
+  >,
 ): Mutation<
   Input,
   Output,
   CommandError,
   CommandRequirements | SynchronizationRequirements,
   SynchronizationError
-> => {
-  let definition!: Mutation<
-    Input,
-    Output,
-    CommandError,
-    CommandRequirements | SynchronizationRequirements,
-    SynchronizationError
-  >
+>
+export function make<
+  const Name extends string,
+  Payload extends Operation.PayloadInput = typeof Schema.Void,
+  Success extends Schema.Schema.Any = typeof Schema.Void,
+  Error extends Schema.Schema.All = typeof Schema.Never,
+  Policy extends object = {},
+  SynchronizationError = never,
+  SynchronizationRequirements = never,
+>(
+  name: Name,
+  options: DeclarationOptions<
+    Payload,
+    Success,
+    Error,
+    Policy,
+    Operation.PayloadConstructor<Payload>,
+    Schema.Schema.Type<Success>,
+    Schema.Schema.Type<Error>,
+    SynchronizationError,
+    SynchronizationRequirements
+  >,
+): Mutation<
+  Operation.PayloadConstructor<Payload>,
+  Schema.Schema.Type<Success>,
+  Schema.Schema.Type<Error>,
+  Operation.Implementations<any> | SynchronizationRequirements,
+  SynchronizationError
+> & Operation.Declared<Name, "mutation", Payload, Success, Error, Policy>
+export function make(
+  name: string,
+  options: Options<any, any, any, any, any, any> | (DeclarationOptions<any, any, any, any, any, any, any, any, any> & object),
+): Mutation<any, any, any, any, any> {
+  const declared = !("effect" in options)
+  let definition!: Mutation<any, any, any, any, any>
+  const effect = declared
+    ? (input: unknown) => Operation.execute(definition as Mutation<any, any, any, any, any> & Operation.Any, input) as never
+    : (options as Options<any, any, any, any, any, any>).effect
   definition = {
     [MutationDefinitionTypeId]: true,
-    [OptionsTypeId]: options,
+    [OptionsTypeId]: { ...options, effect },
     name,
     match: (): MutationFilter => ({ mutation: definition })
   }
-  return definition
+  return declared
+    ? Operation.attach(definition, name, "mutation", options as never) as never
+    : definition
 }
 
 export const makeAtom = <

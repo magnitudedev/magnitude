@@ -4,9 +4,10 @@
  * GetCloudUsage query. Both apps use this identically.
  */
 import { useMemo, useState } from "react"
-import { useAtomValue, Result } from "@effect-atom/atom-react"
+import { Atom, useAtomValue, Result } from "@effect-atom/atom-react"
+import { Configuration, type CloudUsageResponse, type UsagePeriod } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import type { CloudUsageResponse, UsagePeriod } from "@magnitudedev/sdk"
+
 
 export interface UseUsageStateResult {
   /** Whether the query is loading */
@@ -26,7 +27,7 @@ export function useUsageState(): UseUsageStateResult {
   const [period, setPeriod] = useState<UsagePeriod>("24h")
 
   const usageAtom = useMemo(
-    () => client.rpc.query("GetCloudUsage", { period }),
+    () => Atom.make((get) => get(client.query(Configuration.GetCloudUsage, { period })).result),
     [client, period],
   )
   const result = useAtomValue(usageAtom)

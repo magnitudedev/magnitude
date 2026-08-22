@@ -1,13 +1,16 @@
 /**
- * Paginated Project list. First page loads through one reactive query;
+ * Paginated Project list. First page loads through one query;
  * "Show more" explicitly requests continuation pages. Never auto-loads.
+ * Pages stay fresh through the connection's change pokes.
  */
 import { useCallback, useMemo } from "react"
 import { Option } from "effect"
-import { useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import type { Project, ProjectPageCursor } from "@magnitudedev/sdk"
+import { Atom, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Key } from "@magnitudedev/effect-query"
+import { Projects, type Project, type ProjectPageCursor } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { appendRequestedPage, makePageSet } from "../data/paginated-query"
+import { appendRequestedPage, makePageSet, type RequestedPage } from "../data/paginated-query"
+
 
 const DEFAULT_PROJECT_PAGE_SIZE = 20
 
@@ -30,19 +33,23 @@ export function useProjectPages(params?: UseProjectPagesParams): UseProjectPages
   const includeRemoved = params?.includeRemoved ?? false
   const pageSize = params?.pageSize ?? DEFAULT_PROJECT_PAGE_SIZE
 
-  const pageSet = useMemo(() => makePageSet<Project, ProjectPageCursor>({
-    firstPage: client.rpc.query(
-      "ListProjects",
-      { includeRemoved, cursor: Option.none<ProjectPageCursor>(), limit: pageSize },
-      { reactivityKeys: ["projects"] },
-    ),
-    continuationPage: ({ cursor, limit }) => client.rpc.query(
-      "ListProjects",
-      { includeRemoved, cursor: Option.some(cursor), limit: limit ?? pageSize },
-      { reactivityKeys: ["projects"] },
-    ),
-    itemKey: (project) => project.projectId,
-  }), [client, includeRemoved, pageSize])
+  const pageSet = useMemo(() => {
+    const page = (cursor: Option.Option<ProjectPageCursor>, limit: number) =>
+      Atom.make((get) => get(client.query(Projects.ListProjects, { includeRemoved, cursor, limit })).result)
+    const continuations = new Map<string, ReturnType<typeof page>>()
+    return makePageSet<Project, ProjectPageCursor>({
+      firstPage: page(Option.none(), pageSize),
+      continuationPage: (request: RequestedPage<ProjectPageCursor>) => {
+        const key = Key.canonical(request)
+        const existing = continuations.get(key)
+        if (existing !== undefined) return existing
+        const created = page(Option.some(request.cursor), request.limit ?? pageSize)
+        continuations.set(key, created)
+        return created
+      },
+      itemKey: (project) => project.projectId,
+    })
+  }, [client, includeRemoved, pageSize])
 
   const snapshot = useAtomValue(pageSet.snapshot)
   const setRequested = useAtomSet(pageSet.requestedPages)

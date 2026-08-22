@@ -4,6 +4,7 @@ import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Mutation from "./Mutation.js"
+import * as Operation from "./Operation.js"
 import * as Query from "./Query.js"
 import * as QueryClient from "./QueryClient.js"
 import * as Subscription from "./Subscription.js"
@@ -13,14 +14,14 @@ export interface Client<Provided, RuntimeError> {
   readonly query: <Input, Data, Error, Required extends Provided | QueryClient.QueryClient | Reactivity.Reactivity>(
     definition: Query.Query<Input, Data, Error, Required>,
     input: Input
-  ) => Query.QueryAtom<Input, Data, Error | RuntimeError, Required>
+  ) => Query.QueryAtom<Input, Data, Error | RuntimeError | Operation.ImplementationError<Provided>, Required>
   readonly mutation: <Input, Output, CommandError, Required extends Provided | QueryClient.QueryClient | Reactivity.Reactivity, SynchronizationError>(
     definition: Mutation.Mutation<Input, Output, CommandError, Required, SynchronizationError>
-  ) => Mutation.MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
+  ) => Mutation.MutationAtom<Input, Output, CommandError | RuntimeError | Operation.ImplementationError<Provided>, Required, SynchronizationError>
   readonly subscription: <Input, Event, Error, Required extends Provided | QueryClient.QueryClient | Reactivity.Reactivity>(
     definition: Subscription.Subscription<Input, Event, Error, Required>,
     input: Input
-  ) => Subscription.SubscriptionAtom<Input, Event, Error | RuntimeError, Required>
+  ) => Subscription.SubscriptionAtom<Input, Event, Error | RuntimeError | Operation.ImplementationError<Provided>, Required>
 }
 
 export const make = <Provided, RuntimeError, Additional = never, AdditionalError = never>(

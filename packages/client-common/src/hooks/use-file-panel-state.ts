@@ -1,15 +1,18 @@
 /**
  * File panel state hook — shared container logic for the file viewer panel.
  *
- * Uses ResolvePath + ReadFile as atom queries (with reactivityKeys for file
- * watching via the WatchFile bridge). All state is declarative — no
- * useState, no useEffect, no refs. All nullable values use Option.
+ * Reads the selected file through the `Files` service: `resolve` and `read`
+ * queries that stay fresh while observed (the service drains `WatchFile`).
+ * All state is declarative — no useState, no useEffect, no refs. All nullable
+ * values use Option.
  *
  * Design: $M/designs/file-panel-state.md
  */
 import { useMemo } from "react"
 import { useAtomValue, useAtomSet, Result, Atom } from "@effect-atom/atom-react"
 import { Option } from "effect"
+import type { ReadFileResult, ResolvePathResult } from "@magnitudedev/sdk"
+import { Files } from "../files/service"
 import { useAgentClient } from "../state/agent-client-context"
 import {
   selectedCwdAtom,
@@ -41,7 +44,7 @@ export interface UseFilePanelStateResult {
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg"]
 
-/** Idle atom — returns null Result when no file is selected. */
+/** Idle atom — null when no file is selected or the service is not ready. */
 const idleAtom = Atom.make(() => null)
 
 export function useFilePanelState(): UseFilePanelStateResult {
@@ -49,6 +52,7 @@ export function useFilePanelState(): UseFilePanelStateResult {
   const setFilePath = useAtomSet(selectedFilePathAtom)
   const client = useAgentClient()
   const selectedCwdRaw = useAtomValue(selectedCwdAtom)
+  const files = useMemo(() => client.runtime.atom(Files), [client])
 
   const filePath = Option.fromNullable(filePathRaw)
   const selectedCwd = Option.fromNullable(selectedCwdRaw)
@@ -59,21 +63,17 @@ export function useFilePanelState(): UseFilePanelStateResult {
     onSome: (path) => IMAGE_EXTENSIONS.includes(path.split(".").pop() ?? ""),
   })
 
-  // ResolvePath — atom query, reactivity-keyed so non-existent files
-  // recover when created (WatchFile fires → "files" invalidated → re-resolve)
+  // ResolvePath — live while observed, so a non-existent file recovers when created.
   const resolvePathAtom = useMemo(
-    () => Option.match(filePath, {
+    () => Option.match(Option.all([filePath, selectedCwd]), {
       onNone: () => idleAtom,
-      onSome: (path) => Option.match(selectedCwd, {
-        onNone: () => idleAtom,
-        onSome: (cwd) => client.rpc.query("ResolvePath", {
-          cwd,
-          path,
-          checkExists: true,
-        }, { reactivityKeys: ["files"] }),
-      }),
+      onSome: ([path, cwd]) => Atom.make((get): Result.Result<ResolvePathResult, unknown> | null =>
+        Option.match(Result.value(get(files)), {
+          onNone: () => null,
+          onSome: (service) => get(service.resolve({ cwd, path })).result,
+        })),
     }),
-    [client, selectedCwd, filePath],
+    [files, selectedCwd, filePath],
   )
   const resolveResult = useAtomValue(resolvePathAtom)
 
@@ -88,24 +88,21 @@ export function useFilePanelState(): UseFilePanelStateResult {
       ? Option.some(resolveResult.value.resolved)
       : Option.none()
 
-  // ReadFile — gated on resolvedPath to skip the RPC when the file doesn't exist.
-  // Reactivity-keyed via "files" — the WatchFile bridge invalidates on disk change.
+  // ReadFile — gated on resolvedPath to skip the read when the file doesn't exist.
   const readFileAtom = useMemo(
-    () => Option.match(filePath, {
+    () => Option.match(Option.all([filePath, selectedCwd, resolvedPath]), {
       onNone: () => idleAtom,
-      onSome: (path) => Option.match(selectedCwd, {
-        onNone: () => idleAtom,
-        onSome: (cwd) => Option.match(resolvedPath, {
-          onNone: () => idleAtom,
-          onSome: () => client.rpc.query("ReadFile", {
+      onSome: ([path, cwd]) => Atom.make((get): Result.Result<ReadFileResult, unknown> | null =>
+        Option.match(Result.value(get(files)), {
+          onNone: () => null,
+          onSome: (service) => get(service.read({
             cwd,
             path,
             format: isImageFile ? "base64" : "text",
-          }, { reactivityKeys: ["files"] }),
-        }),
-      }),
+          })).result,
+        })),
     }),
-    [client, selectedCwd, filePath, resolvedPath, isImageFile],
+    [files, selectedCwd, filePath, resolvedPath, isImageFile],
   )
   const readResult = useAtomValue(readFileAtom)
 

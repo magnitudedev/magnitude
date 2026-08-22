@@ -25,7 +25,6 @@ import {
   selectedCwdAtom,
   sessionCreateOptionsAtom,
   useSessionPreload,
-  useFileWatchBridge,
   useOnboardingModelSetup,
   isModelSlotConfigured,
   deriveLocalModelLoadActivity,
@@ -235,7 +234,6 @@ function CliAppContent(
   }
 ): ReactNode {
   useSessionPreload(!props.onboardingSetupOpen);
-  useFileWatchBridge();
   useSessionStartup({
     sessionStart: props.sessionStart,
     initialPrompt: props.initialPrompt,

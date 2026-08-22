@@ -1,62 +1,48 @@
 ---
 applies_to:
   - packages/acn-protocol/src/schemas/mirrored-state.ts
-  - packages/acn-protocol/src/rpcs/config.ts
-  - packages/acn-protocol/src/rpcs/local-inference.ts
-  - packages/acn-protocol/src/rpcs/onboarding.ts
+  - packages/acn-protocol/src/boundary/configuration.ts
+  - packages/acn-protocol/src/boundary/local-inference.ts
+  - packages/acn-protocol/src/boundary/onboarding.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - packages/acn-protocol/src/rpcs/group.ts
   - packages/acn/src/mirrored-state.ts
-  - packages/acn/src/observed-state.ts
   - packages/acn/src/provider-model-catalog.ts
-  - packages/acn/src/local-model-packages.ts
-  - packages/acn/src/local-model-recommendations.ts
   - packages/acn/src/local-models.ts
   - packages/acn/src/model-slot-controller.ts
   - packages/acn/src/local-inference-hardware.ts
   - packages/acn/src/onboarding/**
-  - packages/acn/src/handlers.ts
-  - packages/acn/src/server.ts
-  - packages/client-common/src/hooks/use-mirrored-state.ts
-  - packages/client-common/src/hooks/use-model-config.ts
-  - packages/client-common/src/hooks/use-slot-profiles.ts
-  - packages/client-common/src/hooks/use-settings-state.ts
   - packages/client-common/src/hooks/use-local-inference-state.ts
 ---
 
 # Mirrored state
 
-A mirror is a versioned authoritative backend snapshot plus an invalidation-only watch. Watch events
-are not an event log; clients refetch the latest snapshot.
+A mirror is an ACN-owned versioned authoritative snapshot whose commits publish change pokes. To
+clients it is an ordinary contract query with infinite freshness; "mirror" is not a client concept.
 
 ## Definition and identity
 
-One definition owns the state schema, error schema, and typed Get RPC. The Get RPC tag is the sole
-mirror identity: it is the query name a change poke carries (`Change.query`) and, for direct-mirror
-domains, the client reactivity key. Migrated mirrors are ordinary contract queries
-(`Acn.query("GetModelSlots", …)` with infinite freshness); `defineMirroredState` remains for
-direct-mirror domains. Encoded schemas are JSON-safe.
+The boundary query (`Query.make("GetModelSlots", …)` with `staleTime: Infinity`, `gcTime: Infinity`)
+owns the snapshot schema `{ revision, state }`; its name is the sole identity a change poke carries
+(`Change.query`). The ACN's versioned state is constructed with that query name. Encoded schemas
+are JSON-safe.
 
 ## Updates
 
 State and revision commit atomically. A semantic change increments revision once, stores the new
-snapshot, then publishes `{ Get-RPC tag, revision }`. A no-op publishes nothing.
-
-The shared watch is bounded and coalescing, so intermediate revisions may be skipped. Subscription
-keepalives are consumed below the domain stream. Initial connection and reconnection invalidate all
-currently consumed mirrors.
+snapshot, then publishes `{ query, revision }` on the ACN change registry. A no-op publishes
+nothing. The registry stream is bounded and coalescing, so intermediate revisions may be skipped.
+Reconnection invalidates every consumed query.
 
 ## Ownership
 
-ACN owns the public product mirrors: `ProviderModelCatalog`, `LocalModels`, `ModelSlots`,
-`LocalInferenceHardware`, and `Onboarding`. `LocalModels` groups by servable-bundle identity and
-publishes acquisition, serving, recommendation, provider availability, and advisory memory facets
-on the same row. Every catalog bundle and independently servable installed package contributes the
-same `LocalModel` shape. Raw package and package-attempt state, model-download records,
-recommendation-policy, provider-offering,
-and memory-observation working state remain private ACN observations. Private ICN types, native
-paths, and native field names do not cross the protocol boundary. The complete local-model
-projection is defined by
+ACN owns the public product mirrors: `GetProviderModelCatalog`, `GetLocalModels`, `GetModelSlots`,
+`GetLocalInferenceHardware`, and `GetOnboardingState`. `LocalModels` groups by servable-bundle
+identity and publishes acquisition, serving, recommendation, provider availability, and advisory
+memory facets on the same row. Every catalog bundle and independently servable installed package
+contributes the same `LocalModel` shape. Raw package and package-attempt state, model-download
+records, recommendation-policy, provider-offering, and memory-observation working state remain
+private ACN observations. Private ICN types, native paths, and native field names do not cross the
+protocol boundary. The complete local-model projection is defined by
 [Local-model product projection](../model-management/local-model-product-projection.md).
 A backend may bind directly only when it owns the exact public schema and versioned replay.
 
@@ -64,16 +50,14 @@ A backend may bind directly only when it owns the exact public schema and versio
 selection, including favorites and recency. Preference mutations durably commit before the mirror
 publishes the new snapshot.
 
-The ACN publishes every mirror change on `StreamChanges` as `{ query: <Get RPC tag>, revision }`.
-The connection's Effect Query client drains that subscription once and invalidates the named query;
-Effect Query domains own no invalidation code. The direct-mirror Reactivity adapter maps the same
-events to reactivity keys while those domains migrate. Query atoms remain distinct by Get RPC tag,
-and a domain has one canonical client query cache at a time.
+The connection's Effect Query client drains `StreamChanges` once and invalidates the named query;
+no domain code owns invalidation. Query atoms remain distinct by query name, and a domain has one
+canonical client query cache.
 
 Clients retain each query's waiting, failure, and success Result independently. Screens may derive
 presentation from successful domain values; they do not combine domain Results into an aggregate
-authority or reconstruct state. An initial snapshot failure does not terminate the corresponding
-invalidation subscription. A later watch event or reconnection retries the same canonical query.
+authority or reconstruct state. An initial snapshot failure does not terminate the change
+subscription. A later poke or reconnection retries the same canonical query.
 
 ## Client retention and rendering
 
@@ -103,8 +87,7 @@ or recommendation observation cannot erase a successful `LocalModels` value.
 Client surfaces subscribe through read-only selector atoms when they consume only part of a mirror.
 A selector may retain its prior result reference while its newly derived value is semantically
 equivalent. This is an equality cache over the same query atom, not copied state: it has no writer,
-authority, synchronization, or independent lifetime. Volatile source fields therefore invalidate
-only consumers whose selected meaning changed.
+authority, synchronization, or independent lifetime.
 
 A mirrored nonterminal state is valid only while its owning backend service has a live operation
 capable of terminalizing it. The initiating RPC and its progress stream are never the owner.
@@ -120,5 +103,3 @@ authoritative current snapshot.
 - One mirror's observation lifecycle cannot erase another mirror's successful value.
 - Selector atoms preserve one mirror authority while preventing unrelated source-field changes from
   invalidating a complete presentation surface.
-- Direct-mirror invalidation never writes to Effect Query, and Effect Query invalidation never calls
-  direct-mirror Reactivity.

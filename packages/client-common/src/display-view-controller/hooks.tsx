@@ -7,10 +7,10 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react"
-import { Atom, useAtomMount, useAtomSet } from "@effect-atom/atom-react"
+import { Atom, RegistryContext, useAtomMount, useAtomSet } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import type { DisplayState } from "@magnitudedev/sdk"
-import { usePlatform } from "../platform/platform-context"
+import { useAgentClient } from "../state/agent-client-context"
 import {
   createDisplayViewStore,
   EMPTY_DISPLAY_VIEW_SHAPE,
@@ -52,7 +52,8 @@ export function DisplayViewControllerProvider({
   children,
   initial = EMPTY_DISPLAY_STATE,
 }: DisplayViewControllerProviderProps): ReactNode {
-  const platform = usePlatform()
+  const client = useAgentClient()
+  const registry = useContext(RegistryContext)
   const setComposerText = useAtomSet(composerTextAtom)
   const setComposerAttachments = useAtomSet(composerAttachmentsAtom)
   const setComposerUploads = useAtomSet(composerUploadsAtom)
@@ -61,7 +62,8 @@ export function DisplayViewControllerProvider({
   const controller = useMemo(
     () =>
       new DisplayViewControllerCore({
-        protocolLayer: platform.protocolLayer,
+        client,
+        registry,
         displaySync: store,
         onRestoreQueuedInputText: (text: string | null) => {
           if (text != null) {
@@ -78,7 +80,8 @@ export function DisplayViewControllerProvider({
         },
       }),
     [
-      platform.protocolLayer,
+      client,
+      registry,
       setComposerText,
       setComposerAttachments,
       setComposerUploads,

@@ -3,12 +3,8 @@ import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/a
 import { Context, Effect, Layer, Option } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
-  CancelModelDownload,
-  DeleteLocalModel,
-  DismissModelDownloadFailure,
-  GetLocalModels,
+  LocalInference,
   LocalModelSynchronizationFailed,
-  ReconcileCatalogModel,
   findLocalModelByConfigurationId,
   localModelCatalogIdentity,
   localModelConfigurationId,
@@ -113,13 +109,13 @@ const makeLocalModels = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const query = effectQuery.query(GetLocalModels, {})
-  const install = effectQuery.mutation(ReconcileCatalogModel)
-  const cancelDownload = effectQuery.mutation(CancelModelDownload)
-  const dismissDownloadFailure = effectQuery.mutation(DismissModelDownloadFailure)
-  const deleteModel = effectQuery.mutation(DeleteLocalModel)
+  const query = effectQuery.query(LocalInference.GetLocalModels, {})
+  const install = effectQuery.mutation(LocalInference.ReconcileCatalogModel)
+  const cancelDownload = effectQuery.mutation(LocalInference.CancelModelDownload)
+  const dismissDownloadFailure = effectQuery.mutation(LocalInference.DismissModelDownloadFailure)
+  const deleteModel = effectQuery.mutation(LocalInference.DeleteLocalModel)
   const installationInvocations = Mutation.state({
-    filters: { mutation: ReconcileCatalogModel },
+    filters: { mutation: LocalInference.ReconcileCatalogModel },
     select: ({ input, result }): ReconciliationInvocationState => ({
       identity: input,
       waiting: Result.isWaiting(result),
@@ -127,7 +123,7 @@ const makeLocalModels = Effect.gen(function* () {
     }),
   })
   const deletionInvocations = Mutation.state({
-    filters: { mutation: DeleteLocalModel },
+    filters: { mutation: LocalInference.DeleteLocalModel },
     select: ({ input, result }): DeletionInvocationState => ({
       configurationId: input.configurationId,
       waiting: Result.isWaiting(result),
@@ -167,7 +163,7 @@ const makeLocalModels = Effect.gen(function* () {
     state,
     catalog,
     latestInstallationFailed,
-    retry: queryClient.invalidate(GetLocalModels.match()),
+    retry: queryClient.invalidate(LocalInference.GetLocalModels.match()),
     install: installConfiguration,
     cancelDownload: (downloadId: ModelDownloadId) =>
       Mutation.execute(cancelDownload, { downloadId }).pipe(provideRegistry),
@@ -189,13 +185,13 @@ export const LocalModelsLive = Layer.scoped(LocalModels, makeLocalModels)
 
 export function useLocalModelMutations() {
   const client = useAgentClient()
-  const service = useMemo(() => client.effectQuery.runtime.atom(LocalModels), [client])
+  const service = useMemo(() => client.runtime.atom(LocalModels), [client])
   const latestFailureAtom = useMemo(() => Atom.make((get) =>
     Result.map(get(service), (localModels) => get(localModels.latestInstallationFailed))), [service])
-  const installAction = useMemo(() => client.effectQuery.runtime.fn<ModelServingConfigurationId>()(
+  const installAction = useMemo(() => client.runtime.fn<ModelServingConfigurationId>()(
     (configurationId) => Effect.flatMap(LocalModels, (models) => models.install(configurationId)),
   ), [client])
-  const downloadAction = useMemo(() => client.effectQuery.runtime.fn<{
+  const downloadAction = useMemo(() => client.runtime.fn<{
     readonly operation: "cancel" | "dismiss"
     readonly downloadId: ModelDownloadId
   }>()(({ operation, downloadId }) => Effect.flatMap(
@@ -204,7 +200,7 @@ export function useLocalModelMutations() {
       ? models.cancelDownload(downloadId)
       : models.dismissDownloadFailure(downloadId),
   )), [client])
-  const deleteAction = useMemo(() => client.effectQuery.runtime.fn<ModelServingConfigurationId>()(
+  const deleteAction = useMemo(() => client.runtime.fn<ModelServingConfigurationId>()(
     (configurationId) => Effect.flatMap(LocalModels, (models) => models.delete(configurationId)),
   ), [client])
   const latestFailureResult = useAtomValue(latestFailureAtom)

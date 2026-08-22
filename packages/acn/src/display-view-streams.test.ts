@@ -7,8 +7,7 @@ import {
   type AgentRuntimeApi,
   type SessionRetirementObserver,
 } from "./agent-runtime"
-import { DisplayViewStreams, DisplayViewStreamsLive } from "./display-view-streams"
-import { AcnSubscriptionsLive } from "./acn-subscriptions"
+import { DisplayViewStreams, DisplayViewStreamsLive, displayViewId } from "./display-view-streams"
 import type { RuntimeEntry } from "./session-types"
 
 const rootShape: DisplayViewShape = {
@@ -64,7 +63,7 @@ const idleAgents: AgentLifecycleState = {
 const makeSession = (
   title: string,
   closed: Ref.Ref<string[]>,
-  shapes: Ref.Ref<DisplayViewShape[]>,
+  shapes: Ref.Ref<ReadonlyArray<readonly [string, DisplayViewShape]>>,
   displayStream: Stream.Stream<{ shape: DisplayViewShape; state: DisplayState }> = Stream.succeed({
     shape: rootShape,
     state: displayState(title),
@@ -88,7 +87,7 @@ const makeSession = (
   displayView: {
     stream: () => displayStream,
     snapshot: () => Effect.succeed({ shape: rootShape, state: displayState(title) }),
-    setShape: (_viewId, shape) => Ref.update(shapes, (all) => [...all, shape]),
+    setShape: (viewId, shape) => Ref.update(shapes, (all) => [...all, [viewId, shape] as const]),
     close: (viewId) => Ref.update(closed, (all) => [...all, viewId]),
   },
   send: () => Effect.void,
@@ -101,7 +100,7 @@ const makeSession = (
 
 const makeSetup = Effect.gen(function* () {
   const closed = yield* Ref.make<string[]>([])
-  const shapes = yield* Ref.make<DisplayViewShape[]>([])
+  const shapes = yield* Ref.make<ReadonlyArray<readonly [string, DisplayViewShape]>>([])
   const generation = yield* Ref.make(1)
   const entry = yield* Ref.make<RuntimeEntry | null>(null)
   const busy = yield* Ref.make(false)
@@ -168,10 +167,7 @@ const makeSetup = Effect.gen(function* () {
   }
 
   const layer = DisplayViewStreamsLive.pipe(
-    Layer.provide(Layer.mergeAll(
-      Layer.succeed(AgentRuntime, runtime),
-      AcnSubscriptionsLive,
-    )),
+    Layer.provide(Layer.succeed(AgentRuntime, runtime)),
   )
   return {
     layer,
@@ -182,68 +178,66 @@ const makeSetup = Effect.gen(function* () {
     observers,
     changes,
     withSessionCalls,
+    busy,
     makeEntry,
   }
 })
 
+const firstTitle = (stream: Stream.Stream<{ readonly _tag: string }, unknown>) =>
+  stream.pipe(
+    Stream.filter((event): event is { readonly _tag: "state"; readonly state: DisplayState } => event._tag === "state"),
+    Stream.runHead,
+    Effect.map((event) => Option.map(event, (value) => value.state.session.title)),
+  )
+
 describe("DisplayViewStreams", () => {
-  it("keeps a passive outer stream without materializing an idle runtime", async () => {
+  it("derives one stable view identity per shape", () => {
+    expect(displayViewId(rootShape)).toBe(displayViewId({ ...rootShape }))
+    expect(displayViewId(rootShape)).not.toBe(displayViewId(compactShape))
+  })
+
+  it("materializes the view on subscription and emits the authoritative full state first", async () => {
     const program = Effect.gen(function* () {
       const setup = yield* makeSetup
       yield* Effect.gen(function* () {
         const streams = yield* DisplayViewStreams
-        const fiber = yield* streams
-          .getDisplayViewStream("s1", "view-a", rootShape)
-          .pipe(Stream.runDrain, Effect.fork)
-        yield* Effect.yieldNow()
-        expect(yield* Ref.get(setup.withSessionCalls)).toBe(0)
+        const received = yield* Queue.unbounded<string>()
+        const fiber = yield* streams.stream("s1", rootShape).pipe(
+          Stream.runForEach((event) => Queue.offer(received, event._tag)),
+          Effect.fork,
+        )
+        expect(yield* Queue.take(received)).toBe("state")
+        expect(yield* Ref.get(setup.withSessionCalls)).toBe(1)
+        expect((yield* Ref.get(setup.shapes)).at(-1)).toEqual([displayViewId(rootShape), rootShape])
         yield* Fiber.interrupt(fiber)
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
 
-  it("materializes shape demand and returns the authoritative full state", async () => {
-    const program = Effect.gen(function* () {
-      const setup = yield* makeSetup
-      const event = yield* Effect.gen(function* () {
-        const streams = yield* DisplayViewStreams
-        return yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
-      }).pipe(Effect.provide(setup.layer))
-      expect(event._tag).toBe("state")
-      expect(event.state.session.title).toBe("generation-1")
-      expect(yield* Ref.get(setup.withSessionCalls)).toBe(1)
-    })
-    await Effect.runPromise(program)
-  })
-
-  it("does not let a passive reconnect mutate the desired shape", async () => {
+  it("rereads a complete snapshot for each new subscriber of a shared view", async () => {
     const program = Effect.gen(function* () {
       const setup = yield* makeSetup
       yield* Effect.gen(function* () {
         const streams = yield* DisplayViewStreams
-        yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
-        const reconnect = yield* streams
-          .getDisplayViewStream("s1", "view-a", compactShape)
-          .pipe(Stream.runDrain, Effect.fork)
-        yield* Effect.yieldNow()
-        yield* streams.requestDisplayViewSnapshot("s1", "view-a")
-        const shapes = yield* Ref.get(setup.shapes)
-        expect(shapes.at(-1)).toEqual(rootShape)
-        yield* Fiber.interrupt(reconnect)
+        const first = yield* streams.stream("s1", rootShape).pipe(Stream.runDrain, Effect.fork)
+        yield* Effect.sleep("5 millis")
+        const second = yield* firstTitle(streams.stream("s1", rootShape))
+        expect(Option.getOrThrow(second)).toBe("generation-1")
+        expect(yield* Ref.get(setup.withSessionCalls)).toBe(2)
+        yield* Fiber.interrupt(first)
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
 
-  it("detaches on eviction without clearing the outer stream, then reattaches a new generation", async () => {
+  it("detaches on eviction without clearing the outer stream, then reopening materializes the new generation", async () => {
     const program = Effect.gen(function* () {
       const setup = yield* makeSetup
       yield* Effect.gen(function* () {
         const streams = yield* DisplayViewStreams
-        yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
         const received = yield* Queue.unbounded<string | null>()
-        const streamFiber = yield* streams.getDisplayViewStream("s1", "view-a", rootShape).pipe(
+        const streamFiber = yield* streams.stream("s1", rootShape).pipe(
           Stream.tap((event) =>
             event._tag === "state"
               ? Queue.offer(received, event.state.session.title)
@@ -261,7 +255,8 @@ describe("DisplayViewStreams", () => {
 
         yield* Ref.set(setup.generation, 2)
         yield* Ref.set(setup.entry, yield* setup.makeEntry("generation-2"))
-        yield* streams.requestDisplayViewSnapshot("s1", "view-a")
+        const reopened = yield* firstTitle(streams.stream("s1", rootShape))
+        expect(Option.getOrThrow(reopened)).toBe("generation-2")
         expect(yield* Queue.take(received)).toBe("generation-2")
         yield* Fiber.interrupt(streamFiber)
       }).pipe(Effect.provide(setup.layer))
@@ -284,7 +279,8 @@ describe("DisplayViewStreams", () => {
 
       yield* Effect.gen(function* () {
         const streams = yield* DisplayViewStreams
-        yield* streams.setDisplayViewShape("s1", "view-a", rootShape)
+        const fiber = yield* streams.stream("s1", rootShape).pipe(Stream.runDrain, Effect.fork)
+        yield* Effect.sleep("5 millis")
         const observer = [...(yield* Ref.get(setup.observers))][0]
         if (!observer) return yield* Effect.die("missing retirement observer")
 
@@ -294,50 +290,32 @@ describe("DisplayViewStreams", () => {
         )
         yield* Deferred.succeed(releaseFinalizer, undefined)
         expect(retired).toBe(true)
+        yield* Fiber.interrupt(fiber)
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
 
-  it("retains a shared registration until the final subscriber leaves", async () => {
+  it("retains a shared view until the final subscriber leaves, and keeps shapes apart", async () => {
     const program = Effect.gen(function* () {
       const setup = yield* makeSetup
       yield* Effect.gen(function* () {
         const streams = yield* DisplayViewStreams
-        yield* streams.setDisplayViewShape("s1", "shared", rootShape)
-        const subscribed = yield* Queue.unbounded<void>()
-        const observeSubscription = (shape: DisplayViewShape) =>
-          streams.getDisplayViewStream("s1", "shared", shape).pipe(
-            Stream.tap(() => Queue.offer(subscribed, undefined)),
-            Stream.runDrain,
-            Effect.fork,
-          )
-        const first = yield* streams
-          .getDisplayViewStream("s1", "shared", rootShape)
-          .pipe(
-            Stream.tap(() => Queue.offer(subscribed, undefined)),
-            Stream.runDrain,
-            Effect.fork,
-          )
-        const second = yield* observeSubscription(rootShape)
-        yield* Queue.take(subscribed)
-        yield* Queue.take(subscribed)
+        const first = yield* streams.stream("s1", rootShape).pipe(Stream.runDrain, Effect.fork)
+        const second = yield* streams.stream("s1", rootShape).pipe(Stream.runDrain, Effect.fork)
+        const compact = yield* streams.stream("s1", compactShape).pipe(Stream.runDrain, Effect.fork)
+        yield* Effect.sleep("5 millis")
+        const materialized = (yield* Ref.get(setup.shapes)).map(([viewId]) => viewId)
+        expect(new Set(materialized)).toEqual(new Set([displayViewId(rootShape), displayViewId(compactShape)]))
 
+        // The close runs through the busy-resident path; keep the fake resident busy.
+        yield* Ref.set(setup.busy, true)
         yield* Fiber.interrupt(first)
-        const whileShared = yield* observeSubscription(compactShape)
-        yield* Queue.take(subscribed)
-        yield* streams.requestDisplayViewSnapshot("s1", "shared")
-        expect((yield* Ref.get(setup.shapes)).at(-1)).toEqual(rootShape)
-
+        expect(yield* Ref.get(setup.closed)).toEqual([])
         yield* Fiber.interrupt(second)
-        yield* Fiber.interrupt(whileShared)
-        const successor = yield* streams
-          .getDisplayViewStream("s1", "shared", compactShape)
-          .pipe(Stream.runDrain, Effect.fork)
-        yield* Effect.sleep("1 millis")
-        yield* streams.requestDisplayViewSnapshot("s1", "shared")
-        expect((yield* Ref.get(setup.shapes)).at(-1)).toEqual(compactShape)
-        yield* Fiber.interrupt(successor)
+        expect(yield* Ref.get(setup.closed)).toEqual([displayViewId(rootShape)])
+        yield* Fiber.interrupt(compact)
+        expect(yield* Ref.get(setup.closed)).toEqual([displayViewId(rootShape), displayViewId(compactShape)])
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)

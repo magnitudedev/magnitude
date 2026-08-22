@@ -1,6 +1,7 @@
 import { Schema } from "effect"
-import { Rpc, RpcClientError } from "@effect/rpc"
-import { AcnTargetSchema, StreamDisplayView, WatchFile } from "@magnitudedev/acn-protocol"
+import { RpcClientError } from "@effect/rpc"
+import type { Subscription } from "@magnitudedev/effect-query"
+import { AcnTargetSchema, Display, Files } from "@magnitudedev/acn-protocol"
 import {
   AcnOwnerRecordSchema,
   ExactProcessIdentityObservationFailed,
@@ -228,11 +229,11 @@ export const AcnEnsuranceError = Schema.Union(
 export type AcnEnsuranceError = typeof AcnEnsuranceError.Type
 
 export type StreamDisplayViewFailure =
-  | Rpc.ErrorExit<typeof StreamDisplayView>
+  | Subscription.Error<typeof Display.StreamDisplayView>
   | RpcClientError.RpcClientError
   | AcnEnsuranceError
 
 export type WatchFileFailure =
-  | Rpc.ErrorExit<typeof WatchFile>
+  | Subscription.Error<typeof Files.WatchFile>
   | RpcClientError.RpcClientError
   | AcnEnsuranceError

@@ -1,14 +1,16 @@
 import { Context, Data, Effect, Layer, Match, Option, Schema, Scope, Stream } from "effect"
 import {
+  LocalInference,
   LocalInferenceAcceleratorIdSchema,
-  LocalInferenceHardwareMirror,
+  LocalInferenceHardwareSchema,
   LocalInferenceMemoryDomainIdSchema,
   type LocalInferenceHardware as LocalInferenceHardwareState,
   type MirroredSnapshot,
 } from "@magnitudedev/acn-protocol"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { IcnHardware, IcnInstances } from "@magnitudedev/icn"
-import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
+import { AcnChanges } from "./changes"
+import { makeMirroredState } from "./mirrored-state"
 
 export class LocalInferenceHardwareProjectionFailure extends Data.TaggedError("LocalInferenceHardwareProjectionFailure")<{
   readonly message: string
@@ -93,27 +95,27 @@ export class LocalInferenceHardware extends Context.Tag("LocalInferenceHardware"
 export const LocalInferenceHardwareLive: Layer.Layer<
   LocalInferenceHardware,
   LocalInferenceHardwareProjectionFailure,
-  IcnHardware | IcnInstances | MirroredStateChanges
+  IcnHardware | IcnInstances | AcnChanges
 > = Layer.scoped(LocalInferenceHardware, Effect.gen(function* () {
   const hardware = yield* IcnHardware
   const instances = yield* IcnInstances
   const scope = yield* Scope.Scope
   const mirror = yield* makeMirroredState(
-    LocalInferenceHardwareMirror,
+    { name: LocalInference.GetLocalInferenceHardware.name },
     yield* projectLocalInferenceHardware((yield* hardware.get).state),
   )
   const rebuild = hardware.get.pipe(
     Effect.flatMap(({ state }) => projectLocalInferenceHardware(state)),
     Effect.flatMap((state) => mirror.setIfChanged(
       state,
-      Schema.equivalence(LocalInferenceHardwareMirror.stateSchema),
+      Schema.equivalence(LocalInferenceHardwareSchema),
     )),
   )
   yield* Effect.forkIn(hardware.changes.pipe(
     Stream.runForEach(({ state }) => projectLocalInferenceHardware(state).pipe(
       Effect.flatMap((projected) => mirror.setIfChanged(
         projected,
-        Schema.equivalence(LocalInferenceHardwareMirror.stateSchema),
+        Schema.equivalence(LocalInferenceHardwareSchema),
       )),
       Effect.catchAll((error) => Effect.logWarning("Unable to project local inference hardware").pipe(
         Effect.annotateLogs({ cause: error.message }),

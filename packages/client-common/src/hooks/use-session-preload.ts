@@ -1,6 +1,7 @@
 import { Option, Effect } from "effect"
 import { useMemo } from "react"
 import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Sessions } from "@magnitudedev/sdk"
 import {
   selectedCwdAtom,
   sessionCreateOptionsAtom,
@@ -9,15 +10,16 @@ import { useAgentClient } from "../state/agent-client-context"
 import { getDraftSessionOwnerId } from "./draft-session-owner"
 import { useSelectedSessionId } from "../display-view-controller/hooks"
 
+
 export function useSessionPreload(enabled = true): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
   const selectedCwd = useAtomValue(selectedCwdAtom)
   const sessionCreateOptions = useAtomValue(sessionCreateOptionsAtom)
-  const runtimeResult = useAtomValue(client.rpc.runtime)
+  const runtimeResult = useAtomValue(client.runtime)
   const runtimeReady = Result.isSuccess(runtimeResult)
-  const preloadMutationAtom = useMemo(() => client.rpc.mutation("PreloadSession"), [client])
-  const releaseMutationAtom = useMemo(() => client.rpc.mutation("ReleaseSessionPreload"), [client])
+  const preloadMutationAtom = useMemo(() => client.mutation(Sessions.PreloadSession), [client])
+  const releaseMutationAtom = useMemo(() => client.mutation(Sessions.ReleaseSessionPreload), [client])
   const preloadSession = useAtomSet(preloadMutationAtom, { mode: "promise" })
   const releaseSessionPreload = useAtomSet(releaseMutationAtom, { mode: "promise" })
 
@@ -32,7 +34,7 @@ export function useSessionPreload(enabled = true): void {
             draftOwnerId: Option.some(getDraftSessionOwnerId()),
           }
           const preloaded = yield* Effect.promise(() =>
-            preloadSession({ payload, reactivityKeys: [] }).catch((error: unknown) => {
+            preloadSession(payload).catch((error: unknown) => {
               console.debug("[SessionPreload] preload failed:", error)
               return null
             }),
@@ -40,10 +42,7 @@ export function useSessionPreload(enabled = true): void {
           if (preloaded === null) return
           yield* Effect.addFinalizer(() =>
             Effect.promise(() =>
-              releaseSessionPreload({
-                payload: { ...payload, sessionId: preloaded.sessionId },
-                reactivityKeys: [],
-              }).catch(() => {
+              releaseSessionPreload({ ...payload, sessionId: preloaded.sessionId }).catch(() => {
                 // Best-effort cleanup; ACN also has owner replacement, TTL, and startup sweeps.
               }),
             ),

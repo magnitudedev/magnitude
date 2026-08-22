@@ -1,5 +1,6 @@
-import { Context, Effect, Layer, PubSub, Schema, Stream, SubscriptionRef, type Equivalence } from "effect"
-import type { MirroredSnapshot, MirroredStateInvalidation } from "@magnitudedev/acn-protocol"
+import { Effect, Stream, SubscriptionRef, type Equivalence } from "effect"
+import type { MirroredSnapshot } from "@magnitudedev/acn-protocol"
+import { AcnChanges } from "./changes"
 
 export interface MirroredStateTransition<State, Result> {
   readonly state: State
@@ -29,11 +30,6 @@ export interface MirroredStateReader<State> {
   readonly get: Effect.Effect<MirroredSnapshot<State>>
 }
 
-export interface MirroredStateChangesApi {
-  readonly publish: (event: MirroredStateInvalidation) => Effect.Effect<void>
-  readonly stream: Stream.Stream<MirroredStateInvalidation>
-}
-
 export interface ObservedState<State> {
   readonly get: Effect.Effect<MirroredSnapshot<State>>
   readonly changes: Stream.Stream<MirroredSnapshot<State>>
@@ -43,32 +39,21 @@ export interface ObservedState<State> {
   ) => Effect.Effect<void>
 }
 
-export class MirroredStateChanges extends Context.Tag("MirroredStateChanges")<
-  MirroredStateChanges,
-  MirroredStateChangesApi
->() {}
+/** The query a versioned state backs: its change pokes name this query. */
+export interface MirroredStateDefinition {
+  readonly name: string
+}
 
-export const MirroredStateChangesLive = Layer.effect(
-  MirroredStateChanges,
+/**
+ * Authoritative versioned state whose commits publish `{ query, revision }`
+ * pokes on the ACN change registry. Clients reread the named query.
+ */
+export const makeMirroredState = <State>(
+  definition: MirroredStateDefinition,
+  initial: State,
+): Effect.Effect<MirroredState<State>, never, AcnChanges> =>
   Effect.gen(function* () {
-    const events = yield* PubSub.sliding<MirroredStateInvalidation>(256)
-    return MirroredStateChanges.of({
-      publish: (event) => PubSub.publish(events, event).pipe(Effect.asVoid),
-      stream: Stream.fromPubSub(events),
-    })
-  }),
-)
-
-/** Authoritative versioned state with a coalescing invalidation-only stream. */
-export const makeMirroredState = <const Id extends string, State, StateEncoded, StateRequirements>(
-  definition: {
-    readonly id: Id
-    readonly stateSchema: Schema.Schema<State, StateEncoded, StateRequirements>
-  },
-  initial: NoInfer<State>,
-): Effect.Effect<MirroredState<State>, never, MirroredStateChanges> =>
-  Effect.gen(function* () {
-    const stateChanges = yield* MirroredStateChanges
+    const changes = yield* AcnChanges
     const state = yield* SubscriptionRef.make<MirroredSnapshot<State>>({ revision: 0, state: initial })
     const lock = yield* Effect.makeSemaphore(1)
 
@@ -78,11 +63,7 @@ export const makeMirroredState = <const Id extends string, State, StateEncoded, 
         state: nextState,
       }
       yield* SubscriptionRef.set(state, next)
-      yield* stateChanges.publish({
-        _tag: "changed",
-        id: definition.id,
-        revision: next.revision,
-      })
+      yield* changes.publish({ query: definition.name, revision: next.revision })
       return next
     }))
 
@@ -133,22 +114,18 @@ export const makeObservedState = <State>(initial: State): Effect.Effect<Observed
   })
 
 /**
- * Exposes an already authoritative, versioned source through the ACN mirror
- * invalidation channel without copying or re-versioning its state.
+ * Exposes an already authoritative, versioned source through the ACN change
+ * registry without copying or re-versioning its state.
  */
-export const bindMirroredState = <const Id extends string, State>(
-  definition: { readonly id: Id },
+export const bindMirroredState = <State>(
+  definition: MirroredStateDefinition,
   source: MirroredStateSource<State>,
 ) => Effect.gen(function* () {
-  const stateChanges = yield* MirroredStateChanges
+  const changes = yield* AcnChanges
   const initial = yield* source.get
   yield* source.changes.pipe(
     Stream.dropWhile((snapshot) => snapshot.revision <= initial.revision),
-    Stream.runForEach((snapshot) => stateChanges.publish({
-      _tag: "changed",
-      id: definition.id,
-      revision: snapshot.revision,
-    })),
+    Stream.runForEach((snapshot) => changes.publish({ query: definition.name, revision: snapshot.revision })),
     Effect.forkScoped,
   )
   return { get: source.get } satisfies MirroredStateReader<State>

@@ -3,34 +3,14 @@ import type {
   FromClientEncoded,
   FromServerEncoded,
 } from "@effect/rpc/RpcMessage"
-import {
-  AcnSubscriptionMetadataTag,
-  MagnitudeRpcs,
-} from "@magnitudedev/acn-protocol"
-import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
+import { AcnBoundary, AcnRpc } from "@magnitudedev/acn-protocol/boundary"
+import { Array as Arr, Context, Effect, Layer, Ref } from "effect"
 import { AcnSubscriptions } from "./acn-subscriptions"
 
 class RawAcnRpcProtocol extends Context.Tag("RawAcnRpcProtocol")<
   RawAcnRpcProtocol,
   RpcServer.Protocol["Type"]
 >() {}
-
-const SessionScopedPayload = Schema.Struct({ sessionId: Schema.String })
-const decodeSessionScopedPayload = Schema.decodeUnknown(SessionScopedPayload)
-
-const subscriptionMetadata = (tag: string) => {
-  const rpc = MagnitudeRpcs.requests.get(tag)
-  return rpc
-    ? Context.getOption(rpc.annotations, AcnSubscriptionMetadataTag)
-    : Option.none()
-}
-
-const requestSessionId = (
-  request: Extract<FromClientEncoded, { readonly _tag: "Request" }>
-) =>
-  decodeSessionScopedPayload(request.payload).pipe(
-    Effect.map((payload) => payload.sessionId)
-  )
 
 export const acnSubscriptionProtocolLayer = <Error, Requirements>(
   rawProtocol: Layer.Layer<RpcServer.Protocol, Error, Requirements>
@@ -48,6 +28,13 @@ export const acnSubscriptionProtocolLayer = <Error, Requirements>(
   ).pipe(Layer.provide(raw))
 }
 
+/**
+ * Decorates the RPC server protocol with the ACN subscription wire protocol.
+ *
+ * Every stream Rpc of the ACN group is a subscription: its encoded chunk
+ * values are wrapped in `payload` frames, keepalives are interleaved, and
+ * shutdown emits the terminal control. Handlers and clients see domain values.
+ */
 export const makeAcnSubscriptionProtocol = (
   protocol: RpcServer.Protocol["Type"]
 ): Effect.Effect<RpcServer.Protocol["Type"], never, AcnSubscriptions> =>
@@ -56,6 +43,23 @@ export const makeAcnSubscriptionProtocol = (
     const finalizers = yield* Ref.make(
       new Map<number, ReadonlyMap<string, Effect.Effect<void>>>()
     )
+    const subscriptionRequests = yield* Ref.make(new Map<number, ReadonlySet<string>>())
+
+    const track = (clientId: number, requestId: string, tracked: boolean) =>
+      Ref.update(subscriptionRequests, (all) => {
+        const client = new Set(all.get(clientId) ?? [])
+        if (tracked) client.add(requestId)
+        else client.delete(requestId)
+        const next = new Map(all)
+        if (client.size === 0) next.delete(clientId)
+        else next.set(clientId, client)
+        return next
+      })
+
+    const isSubscriptionRequest = (clientId: number, requestId: string) =>
+      Ref.get(subscriptionRequests).pipe(
+        Effect.map((all) => all.get(clientId)?.has(requestId) === true),
+      )
 
     const remove = (clientId: number, requestId: string) =>
       Ref.modify(finalizers, (all) => {
@@ -69,26 +73,18 @@ export const makeAcnSubscriptionProtocol = (
         if (nextClient.size === 0) next.delete(clientId)
         else next.set(clientId, nextClient)
         return [finalizer, next] as const
-      }).pipe(Effect.flatten)
+      }).pipe(Effect.flatten, Effect.zipRight(track(clientId, requestId, false)))
 
     const register = (
       clientId: number,
       request: Extract<FromClientEncoded, { readonly _tag: "Request" }>
     ) =>
       Effect.gen(function* () {
-        const metadata = subscriptionMetadata(request.tag)
-        if (Option.isNone(metadata)) return
-        const sessionId =
-          metadata.value.scope === "session"
-            ? Option.some(yield* requestSessionId(request))
-            : Option.none<string>()
+        if (AcnRpc.operation(AcnBoundary, request.tag)?.stream !== true) return
+        yield* track(clientId, request.id, true)
         const handle = yield* subscriptions.register({
           clientId,
           requestId: request.id,
-          ...Option.match(sessionId, {
-            onNone: () => ({}),
-            onSome: (value) => ({ sessionId: value }),
-          }),
           emit: (control) =>
             protocol.send(clientId, {
               _tag: "Chunk",
@@ -119,19 +115,31 @@ export const makeAcnSubscriptionProtocol = (
       }
     }
 
-    const send = (clientId: number, response: FromServerEncoded) =>
-      response._tag === "Exit"
-        ? protocol
+    const send = (clientId: number, response: FromServerEncoded) => {
+      switch (response._tag) {
+        case "Chunk":
+          return isSubscriptionRequest(clientId, response.requestId).pipe(
+            Effect.flatMap((subscription) => protocol.send(clientId, subscription
+              ? {
+                  ...response,
+                  values: Arr.map(response.values, (value) => ({ _tag: "payload", payload: value })),
+                }
+              : response)),
+          )
+        case "Exit":
+          return protocol
             .send(clientId, response)
             .pipe(Effect.ensuring(remove(clientId, response.requestId)))
-        : protocol.send(clientId, response)
+        default:
+          return protocol.send(clientId, response)
+      }
+    }
 
     return RpcServer.Protocol.of({
       ...protocol,
       run: (writeRequest) =>
         protocol.run((clientId, request) =>
           onRequest(clientId, request).pipe(
-            Effect.catchAll(() => Effect.void),
             Effect.zipRight(writeRequest(clientId, request))
           )
         ),

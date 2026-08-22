@@ -1,9 +1,17 @@
+/**
+ * Project files: directory listings and file snapshots kept fresh by
+ * `WatchProjectFiles`. Freshness is a dependency of observation — a project's
+ * watch is open exactly while one of its listings or files is observed.
+ * Writes, deletions, and moves are contract mutations whose postconditions
+ * invalidate the affected queries.
+ */
 import { useCallback, useMemo } from "react"
-import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import * as Reactivity from "@effect/experimental/Reactivity"
-import { Cause, Duration, Effect, Option, Schedule, Stream } from "effect"
+import type { RpcClientError } from "@effect/rpc/RpcClientError"
+import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Context, Effect, Fiber, Layer, Option, Runtime, Stream } from "effect"
+import { Key, QueryClient, Subscription, type Query } from "@magnitudedev/effect-query"
 import {
-  RelativePathSchema,
+  ProjectFiles as ProjectFilesBoundary,
   type FileContentHash,
   type ProjectDirectoryListing,
   type ProjectEntryMove,
@@ -13,6 +21,7 @@ import {
   type RelativePath,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
+import { ClientEffectQuery } from "../state/client-effect-query"
 import { visitProjectDirectoryDemand } from "./demand"
 
 export interface ProjectPathInput {
@@ -40,48 +49,97 @@ export interface ProjectEntryMoveInput {
   readonly destinationDirectory: RelativePath
 }
 
-const projectFilesKey = (projectId: ProjectId): string => `project-files:${projectId}`
-const projectFileKey = (projectId: ProjectId, path: RelativePath): string =>
-  `${projectFilesKey(projectId)}:file:${path}`
-const projectDirectoryKey = (projectId: ProjectId, path: RelativePath): string =>
-  `${projectFilesKey(projectId)}:directory:${path}`
-const parentDirectory = (path: RelativePath): RelativePath => {
-  const index = path.lastIndexOf("/")
-  return RelativePathSchema.make(index === -1 ? "" : path.slice(0, index))
-}
-const initialFile = Atom.make(Result.initial<ProjectFileSnapshot>())
-const directoryIdleTimeToLive = "2 minutes"
-const projectFilesWatchReconnect = Schedule.exponential("100 millis").pipe(
-  Schedule.modifyDelay((_, delay) => Duration.min(delay, Duration.seconds(5))),
-  Schedule.jittered,
-)
+type DirectoryState = Query.State<ProjectDirectoryListing, Query.Error<typeof ProjectFilesBoundary.ListProjectDirectory> | RpcClientError>
+type FileState = Query.State<ProjectFileSnapshot, Query.Error<typeof ProjectFilesBoundary.ReadProjectFile> | RpcClientError>
 
-export function useProjectFilesWatch(projectId: ProjectId): void {
-  const client = useAgentClient()
-  const watchAtom = useMemo(() => client.rpc.runtime.atom(
-    Effect.gen(function* () {
-      const rpc = yield* client.rpc
-      yield* Effect.gen(function* () {
-        yield* Reactivity.invalidate([projectFilesKey(projectId)])
-        yield* rpc("WatchProjectFiles", { projectId }).pipe(
-          Stream.tap(() => Reactivity.invalidate([projectFilesKey(projectId)])),
-          Stream.runDrain,
-        )
-      }).pipe(
-        Effect.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
-          ? Effect.void
-          : Effect.logWarning("Project-files watch disconnected; retrying").pipe(
-              Effect.annotateLogs({ projectId, cause: Cause.pretty(cause).slice(0, 1_000) }),
-            )),
-        Effect.retry(projectFilesWatchReconnect),
-      )
-    }).pipe(
-      Effect.catchAllCause((cause) => Cause.isInterruptedOnly(cause)
-        ? Effect.void
-        : Effect.logError(Cause.pretty(cause))),
-    ),
-  ), [client, projectId])
-  useAtomMount(watchAtom)
+const memoized = <Input, A extends object>(key: (input: Input) => string, make: (input: Input) => A) => {
+  const entries = new Map<string, A>()
+  return (input: Input): A => {
+    const id = key(input)
+    const existing = entries.get(id)
+    if (existing !== undefined) return existing
+    const created = make(input)
+    entries.set(id, created)
+    return created
+  }
+}
+
+const makeProjectFiles = Effect.gen(function* () {
+  const effectQuery = yield* ClientEffectQuery
+  const queryClient = yield* QueryClient.QueryClient
+  const runtime = yield* Effect.runtime<Registry.AtomRegistry>()
+  const runFork = Runtime.runFork(runtime)
+
+  /** A change notification rereads every observed listing and file (one project is open at a time). */
+  const invalidateProject = queryClient.invalidate(ProjectFilesBoundary.ListProjectDirectory.match()).pipe(
+    Effect.zipRight(queryClient.invalidate(ProjectFilesBoundary.ReadProjectFile.match())),
+  )
+
+  /**
+   * Open while observed: drains `WatchProjectFiles` for the project into
+   * invalidation, and rereads on every (re)connection since events may have
+   * been missed.
+   */
+  const watch = memoized(
+    (projectId: ProjectId) => projectId,
+    (projectId: ProjectId) => Atom.make((get): void => {
+      const subscription = effectQuery.subscription(ProjectFilesBoundary.WatchProjectFiles, { projectId })
+      let attempt = 0
+      get.subscribe(subscription, (state) => {
+        if (state.attempt === attempt) return
+        attempt = state.attempt
+        if (attempt > 1) runFork(invalidateProject)
+      }, { immediate: true })
+      const fiber = runFork(Subscription.events(subscription).pipe(
+        Stream.runForEach(() => invalidateProject),
+      ))
+      get.addFinalizer(() => {
+        runFork(Fiber.interrupt(fiber))
+      })
+    }),
+  )
+
+  const directory = memoized(
+    (input: ProjectDirectoryInput) => Key.canonical(input),
+    (input: ProjectDirectoryInput): Atom.Atom<DirectoryState> => Atom.make((get) => {
+      get(watch(input.projectId))
+      return get(effectQuery.query(ProjectFilesBoundary.ListProjectDirectory, input))
+    }),
+  )
+
+  const file = memoized(
+    (input: ProjectPathInput) => Key.canonical(input),
+    (input: ProjectPathInput): Atom.Atom<FileState> => Atom.make((get) => {
+      get(watch(input.projectId))
+      return get(effectQuery.query(ProjectFilesBoundary.ReadProjectFile, input))
+    }),
+  )
+
+  return {
+    /** One directory listing, live while observed. */
+    directory,
+    /** One file snapshot, live while observed. */
+    file,
+    /** Rereads one directory listing now. */
+    refresh: (input: ProjectDirectoryInput) => queryClient.invalidate(ProjectFilesBoundary.ListProjectDirectory.match(input)),
+  }
+})
+
+export interface ProjectFiles extends Effect.Effect.Success<typeof makeProjectFiles> {}
+
+export const ProjectFiles = Context.GenericTag<ProjectFiles>("client/ProjectFiles")
+
+export const ProjectFilesLive = Layer.scoped(ProjectFiles, makeProjectFiles)
+
+const initialFile: Result.Result<ProjectFileSnapshot, unknown> = Result.initial()
+const initialDirectory: Result.Result<ProjectDirectoryListing, unknown> = Result.initial()
+
+export interface ProjectDirectoryTree {
+  readonly root: Result.Result<ProjectDirectoryListing, unknown>
+  readonly directories: ReadonlyArray<{
+    readonly directory: RelativePath
+    readonly state: Result.Result<ProjectDirectoryListing, unknown>
+  }>
 }
 
 /**
@@ -96,22 +154,15 @@ export function useProjectDirectoryTree(
   root: RelativePath,
   demanded: ReadonlySet<RelativePath>,
   expanded: ReadonlySet<RelativePath>,
-) {
+): ProjectDirectoryTree {
   const client = useAgentClient()
+  const service = useMemo(() => client.runtime.atom(ProjectFiles), [client])
   const demandedKey = [...demanded].sort().join("\0")
   const expandedKey = [...expanded].sort().join("\0")
-  const tree = useMemo(() => Atom.make((get) => {
-    const read = (directory: RelativePath) => get(client.rpc.query(
-      "ListProjectDirectory",
-      { projectId, directory },
-      {
-        timeToLive: directoryIdleTimeToLive,
-        reactivityKeys: [
-          projectFilesKey(projectId),
-          projectDirectoryKey(projectId, directory),
-        ],
-      },
-    ))
+  const tree = useMemo(() => Atom.make((get): ProjectDirectoryTree => {
+    const files = Result.value(get(service))
+    if (Option.isNone(files)) return { root: initialDirectory, directories: [] }
+    const read = (directory: RelativePath) => get(files.value.directory({ projectId, directory })).result
     const rootState = read(root)
     const rootListing = Result.value(rootState)
     const directories: Array<{
@@ -129,29 +180,27 @@ export function useProjectDirectoryTree(
     })
 
     return { root: rootState, directories }
-  }), [client, projectId, root, demandedKey, expandedKey])
+  }), [service, projectId, root, demandedKey, expandedKey])
   return useAtomValue(tree)
 }
 
 export function useProjectDirectoryRefresh() {
   const client = useAgentClient()
-  const refreshAtom = useMemo(() => client.rpc.runtime.fn<ProjectDirectoryInput>()(
-    (input) => Reactivity.invalidate([projectDirectoryKey(input.projectId, input.directory)]),
+  const refreshAtom = useMemo(() => client.runtime.fn<ProjectDirectoryInput>()(
+    (input) => Effect.flatMap(ProjectFiles, (files) => files.refresh(input)),
   ), [client])
   return useAtomSet(refreshAtom)
 }
 
 export function useProjectFile(input: ProjectPathInput | null) {
   const client = useAgentClient()
-  const query = useMemo(() => input === null
-    ? initialFile
-    : client.rpc.query("ReadProjectFile", input, {
-        timeToLive: "0 millis",
-        reactivityKeys: [
-          projectFilesKey(input.projectId),
-          projectFileKey(input.projectId, input.path),
-        ],
-      }), [client, input?.projectId, input?.path])
+  const service = useMemo(() => client.runtime.atom(ProjectFiles), [client])
+  const query = useMemo(() => Atom.make((get): Result.Result<ProjectFileSnapshot, unknown> => {
+    if (input === null) return initialFile
+    const files = Result.value(get(service))
+    if (Option.isNone(files)) return initialFile
+    return get(files.value.file(input)).result
+  }), [service, input?.projectId, input?.path])
   return useAtomValue(query)
 }
 
@@ -159,18 +208,12 @@ export function useProjectFileSave(options: {
   readonly onSuccess?: (snapshot: ProjectFileTextSnapshot) => void
 } = {}) {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.rpc.mutation("WriteProjectFile"), [client])
+  const mutation = useMemo(() => client.mutation(ProjectFilesBoundary.WriteProjectFile), [client])
   const result = useAtomValue(mutation)
   const execute = useAtomSet(mutation, { mode: "promise" })
   const save = useCallback(async (input: ProjectFileWriteInput) => {
     try {
-      const snapshot = await execute({
-        payload: input,
-        reactivityKeys: [
-          projectFileKey(input.projectId, input.path),
-          projectDirectoryKey(input.projectId, parentDirectory(input.path)),
-        ],
-      })
+      const snapshot = await execute(input)
       options.onSuccess?.(snapshot)
     } catch {
       // The mutation Result is the rendered failure authority.
@@ -183,18 +226,12 @@ export function useProjectFileDelete(options: {
   readonly onSuccess?: () => void
 } = {}) {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.rpc.mutation("DeleteProjectFile"), [client])
+  const mutation = useMemo(() => client.mutation(ProjectFilesBoundary.DeleteProjectFile), [client])
   const result = useAtomValue(mutation)
   const execute = useAtomSet(mutation, { mode: "promise" })
   const remove = useCallback(async (input: ProjectFileDeleteInput) => {
     try {
-      await execute({
-        payload: input,
-        reactivityKeys: [
-          projectFileKey(input.projectId, input.path),
-          projectDirectoryKey(input.projectId, parentDirectory(input.path)),
-        ],
-      })
+      await execute(input)
       options.onSuccess?.()
     } catch {
       // The mutation Result is the rendered failure authority.
@@ -207,15 +244,12 @@ export function useProjectEntryMove(options: {
   readonly onSuccess?: (move: ProjectEntryMove) => void
 } = {}) {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.rpc.mutation("MoveProjectEntry"), [client])
+  const mutation = useMemo(() => client.mutation(ProjectFilesBoundary.MoveProjectEntry), [client])
   const result = useAtomValue(mutation)
   const execute = useAtomSet(mutation, { mode: "promise" })
   const move = useCallback(async (input: ProjectEntryMoveInput) => {
     try {
-      const moved = await execute({
-        payload: input,
-        reactivityKeys: [projectFilesKey(input.projectId)],
-      })
+      const moved = await execute(input)
       options.onSuccess?.(moved)
     } catch {
       // The mutation Result is the rendered failure authority.

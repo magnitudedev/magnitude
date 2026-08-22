@@ -4,7 +4,7 @@ import stringWidth from 'string-width'
 import { Effect } from 'effect'
 import { Atom, useAtomMount, useAtomSet, useAtomValue as useAtomValueClientCommon } from '@effect-atom/atom-react'
 import type { RawImageAttachment, RawMentionOccurrence } from '@magnitudedev/sdk'
-import { filenameWithImageExtension, useAgentClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
+import { filenameWithImageExtension, useFileReads, useMentionSearchClient, mentionOccurrenceFromInputSegment, imageMediaTypeFromMime } from '@magnitudedev/client-common'
 import { createId } from '@magnitudedev/generate-id'
 import { Button } from '../../components/button'
 import { ChatSurfaceKeyboard } from './chat-surface-keyboard'
@@ -219,10 +219,7 @@ export function Composer(props: ComposerProps) {
     onCloseFilePanel,
   } = props
 
-  const atomClient = useAgentClient()
-  const resolvePathMutation = useAtomSet(atomClient.rpc.mutation('ResolvePath'), { mode: 'promise' })
-  const readFileMutation = useAtomSet(atomClient.rpc.mutation('ReadFile'), { mode: 'promise' })
-  const searchMentionsMutation = useAtomSet(atomClient.rpc.mutation('SearchMentions'), { mode: 'promise' })
+  const fileReads = useFileReads()
 
   const composerText = useAtomValueClientCommon(composerTextAtom)
   const setComposerText = useAtomSet(composerTextAtom)
@@ -233,20 +230,7 @@ export function Composer(props: ComposerProps) {
   // historyIndex: null = not navigating history, number = current index
   const historyIndex = composerHistoryIndex === -1 ? null : composerHistoryIndex
 
-  // Mention search client — uses mutation setter
-  const mentionClient = useMemo<MentionSearchClient>(() => ({
-    searchMentions(payload) {
-      return searchMentionsMutation({
-        payload: {
-          cwd: payload.cwd,
-          query: payload.query,
-          ...(payload.limit !== undefined ? { limit: payload.limit } : {}),
-          ...(payload.visibleLimit !== undefined ? { visibleLimit: payload.visibleLimit } : {}),
-          ...(payload.includeRecent !== undefined ? { includeRecent: payload.includeRecent } : {}),
-        },
-      })
-    },
-  }), [searchMentionsMutation])
+  const mentionClient: MentionSearchClient = useMentionSearchClient()
 
   const [inputValue, setInputValue] = useState<InputValue>({
     ...EMPTY_INPUT,
@@ -454,11 +438,11 @@ export function Composer(props: ComposerProps) {
       },
       readPastedImageParams: {
         cwd,
-        resolvePath: (params) => resolvePathMutation({ payload: params }),
-        readFile: (params) => readFileMutation({ payload: params }),
+        resolvePath: fileReads.resolvePath,
+        readFile: fileReads.readFile,
       },
     })
-  }, [cwd, resolvePathMutation, readFileMutation])
+  }, [cwd, fileReads])
 
   const removeAttachment = useCallback((index: number) => {
     setAttachments(prev => {

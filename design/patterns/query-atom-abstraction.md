@@ -10,10 +10,10 @@ applies_to:
 
 ## Purpose
 
-Effect Query is one client-common mechanism for observing and changing backend-owned state. Direct
-mirrored queries are another. A backend domain chooses one mechanism completely; neither cache
-adapts, invalidates, or compensates for the other. In either case, a feature exposes the product
-capability built with the mechanism rather than propagating mechanism-level representations.
+Effect Query is the client-common mechanism for observing and changing backend-owned state: every
+client↔ACN interaction is a boundary-group query, mutation, or subscription materialized through the
+connection's Effect Query client. A feature exposes the product capability built with the mechanism
+rather than propagating mechanism-level representations.
 
 ```text
 backend authority
@@ -24,10 +24,8 @@ backend authority
 | ACN-backed client service |
 |                           |
 | private                   |
-| - Query definitions       |
-| - Mutation definitions    |
 | - materialized atoms      |
-| - invalidation Effect     |
+| - keyed watch dependency  |
 | - mutation-state lookup   |
 |                           |
 | public                    |
@@ -54,24 +52,26 @@ Service identity, construction, dependencies, and lifetime follow
 [Client dependency injection](./client-di.md). This document defines the state-mechanism boundary;
 the DI document defines how the services at that boundary are acquired and composed.
 
-## Vertical ownership
+## Ownership
 
 ```text
-direct-mirror domain                     Effect Query domain
-
-Get RPC + ACN invalidation watch         Query/Mutation + ACN invalidation watch
-              |                                        |
-              v                                        v
-      AtomRpc + Reactivity                     QueryClient only
-              |                                        |
-              +------------- semantic API -------------+
+core operation definitions (Query / Mutation / Subscription)
+              |
+              v
+   connection Effect Query client (AgentClient)
+              |
+   +----------+-----------------------------+
+   |                                        |
+   v                                        v
+domain service (when warranted)       hook materializing a definition directly
+   |                                        |
+   +------------- semantic API -------------+
 ```
 
 The ACN change stream (`StreamChanges`) carries pokes that name a query. The Effect Query client
-drains it once per connection and invalidates the named query entries; Effect Query domains own no
-invalidation code. Direct-mirror code maps the same events to `Reactivity` keys while it migrates.
-An Effect Query domain never imports the direct-mirror client implementation, and a direct-mirror
-domain never imports Effect Query.
+drains it once per connection and invalidates the named query entries; domains own no invalidation
+code for poked state. A keyed watch that keeps a domain's queries fresh is a dependency of those
+query atoms inside the domain's service. There is no second client state mechanism for ACN data.
 
 ## When Query and Mutation exist
 
@@ -154,20 +154,25 @@ operation progress. It exposes observational queries, mutations, and invalidatio
 
 ### Effect Query definitions
 
-Query, Mutation, and Subscription definitions live in the ACN contract (`Acn.query`,
-`Acn.mutation`, `Acn.subscription` in `packages/acn-protocol`). Each is a core Effect Query
-definition that also carries its Rpc: cache identity derives from the payload, execution from the
-Rpc, and a mutation's scope and synchronization postcondition are declared with the command. They
-capture no client instance, Atom registry, React lifecycle, or feature workflow.
+Query, Mutation, and Subscription definitions live in the ACN boundary groups in
+`packages/acn-protocol` and are constructed with the core Effect Query primitives. Cache identity
+derives from the payload; a mutation's scope and synchronization postcondition are declared with
+the command. The ACN RPC adapter derives RPCs from the root `AcnBoundary` group and supplies an
+implementation layer to clients. Definitions capture no client instance, RPC, Atom registry,
+React lifecycle, or feature workflow.
 
-Definitions are consumed only by their ACN-backed client service; UI and composed services see the
-service's semantic surface, not definitions.
+When a domain has a client service (the client-di criteria: connection-lifetime state, a resident
+resource such as a keyed watch, reusable operations with dependencies, or a stateful use case), its
+definitions are consumed only by that service; UI and composed services see the service's semantic
+surface. When no service is warranted (sessions, projects, provider auth, usage, skills), a hook
+materializes the definition directly through the connection client; that hook is the domain's
+terminal adapter and still returns values and callbacks, not atoms or clients.
 
 ### ACN-backed client service
 
 One service instance exists per client connection and owns materialization of a backend domain. It:
 
-- materializes the domain's contract definitions with that connection's Effect Query client;
+- materializes the domain's boundary operations with that connection's Effect Query client;
 - exposes one read-only Atom containing the domain query Result;
 - exposes domain operations as functions returning Effects;
 - exposes semantic derived state or status selectors when presentation needs mutation intent; and
@@ -276,14 +281,14 @@ mutationStates.at(-1)
 4. Query observation supplies authoritative state; mutation state supplies only command intent and
    outcome.
 5. A public selector expresses domain meaning and hides registry ordering and mutation identity.
-6. Freshness is owned by the connection: one scoped `StreamChanges` subscription invalidates
-   queries by name. Domain services register no invalidation; public state mounting is
-   observational, and callers never mount synchronization separately.
-7. No Effect Query domain imports direct-mirror client infrastructure or calls `Reactivity`.
-8. No direct-mirror domain imports Effect Query or invalidates its cache.
-9. A query remains observational. Creating or mounting a service cannot install, assign, load,
+6. Freshness of poked state is owned by the connection: one scoped `StreamChanges` subscription
+   invalidates queries by name. Domain services register no invalidation for it; public state
+   mounting is observational, and callers never mount synchronization separately.
+7. A keyed watch is a dependency of the query atoms it keeps fresh, inside the owning service: open
+   while observed, closed when unobserved. No hook or component mounts a watch.
+8. A query remains observational. Creating or mounting a service cannot install, assign, load,
    stop, delete, or complete anything.
-10. A composed service exists only for a stateful cross-domain use case. One-shot composition is a
+9. A composed service exists only for a stateful cross-domain use case. One-shot composition is a
    plain domain Effect, not a new controller or workflow abstraction.
 
 ## Why this boundary
@@ -305,7 +310,7 @@ the type-level dependency chain and the behavior the user observes.
 - No client or composed service imports a domain's Query definition, Mutation definition, or
   materialized atom.
 - No public client-common barrel exports domain materialization internals.
-- No caller mounts invalidation or mirror-watch atoms for an abstracted domain.
+- No caller mounts invalidation or watch atoms; keyed watches are dependencies of service query atoms.
 - No caller reads registry-wide mutation history to determine domain state or causal identity.
 - Every dependent command consumes the exact prior command output.
 - Every long-running wait is correlated by the identity returned at admission.

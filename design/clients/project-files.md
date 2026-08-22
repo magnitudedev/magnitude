@@ -3,7 +3,7 @@ title: Project file browsing and editing
 status: implemented
 applies_to:
   - packages/acn-protocol/src/schemas/project-files.ts
-  - packages/acn-protocol/src/rpcs/project-files.ts
+  - packages/acn-protocol/src/boundary/project-files.ts
   - packages/acn/src/project-file-manager.ts
   - packages/acn/src/file-system-manager.ts
   - packages/client-common/src/project-files/**
@@ -42,7 +42,7 @@ The rendered tree may display drag intent, but it never becomes filesystem autho
 
 ## Client state and interaction
 
-Project file queries and writes use the shared connection-scoped AtomRpc client through client-common. Web presentation state owns only whether the workspace and tree dock are open, mixed tab identity and order, expanded tree branches, and unsaved editor drafts owned by their open file tabs. Server snapshots and directory listings are not copied into presentation atoms.
+Project file listings, snapshots, and writes are contract queries and mutations materialized through the connection's Effect Query client in client-common; the project's change watch is a dependency of its listing and file queries, open while any of them is observed. Web presentation state owns only whether the workspace and tree dock are open, mixed tab identity and order, expanded tree branches, and unsaved editor drafts owned by their open file tabs. Server snapshots and directory listings are not copied into presentation atoms.
 
 Project documents are file tabs in the shared right workspace described by `design/clients/right-workspace.md`. The project tree is a separately toggled, independently resizable internal dock on the right of the active file or browser content. Creating a File tab opens an empty document surface and the tree. Selecting a tree file always replaces the document in the active file tab, whether that tab is empty or already displaying another file; tree selection never creates or activates a different file tab while a file tab is active. Replacing or closing a dirty file tab requires explicit confirmation; discarding removes that tab's buffer before navigating or closing, while keeping edits cancels the action. Additional file tabs are created explicitly through the workspace's new-tab action. Each file tab owns its editing buffer, including when multiple tabs display the same saved file. Saving remains content-hash guarded, so independently edited tabs cannot silently overwrite a newer save. The complete root listing loads before the tree appears. Folder discovery is demand-loaded one directory level at a time: restored expansion proceeds breadth-first through successful parent listings, while a short pointer-hover or keyboard-focus dwell silently prefetches likely next folders. Prefetch never recursively walks a collapsed subtree. A cold expanded folder shows loading in its disclosure control rather than masquerading as empty, and collapsing it does not immediately discard or interrupt the listing. Text uses locally bundled Monaco. Monaco's browser worker has no authority over the Project's tsconfig, dependency graph, or `node_modules`, so TypeScript and JavaScript project-semantic and suggestion diagnostics are disabled instead of presenting false unresolved-import errors. Syntax diagnostics for the complete open file remain enabled. Markdown defaults to formatted preview with a source mode; MDX remains source. Saving is explicit through Save or platform Mod-S. Conflicts remain in the file tab and use Monaco diff presentation. File actions provide hash-checked removal behind an explicit confirmation dialog.
 

@@ -1,8 +1,8 @@
 ---
 applies_to:
-  - packages/acn-protocol/src/rpcs/onboarding.ts
+  - packages/acn-protocol/src/boundary/onboarding.ts
   - packages/acn/src/onboarding/**
-  - packages/acn/src/handlers.ts
+  - packages/acn/src/boundary/**
   - packages/client-common/src/onboarding/**
   - packages/client-common/src/local-models/setup*
   - packages/client-common/src/state/agent-client.ts

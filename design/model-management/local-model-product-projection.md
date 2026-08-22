@@ -4,7 +4,7 @@ applies_to:
   - inference/crates/icn-models/**
   - packages/icn/src/models/**
   - packages/acn/src/local-model-**
-  - packages/acn-protocol/src/rpcs/local-inference.ts
+  - packages/acn-protocol/src/boundary/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/**
   - cli/src/features/local-inference/**

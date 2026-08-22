@@ -47,7 +47,7 @@ import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
-import { MirroredStateChangesLive } from "./mirrored-state"
+import { AcnChangesLive } from "./changes"
 import {
   ModelSlotController,
   ModelSlotControllerLive,
@@ -318,7 +318,7 @@ const makeHarness = (options: {
       initialized: Effect.succeed(true),
       refresh: Effect.void,
     })),
-    MirroredStateChangesLive,
+    AcnChangesLive,
   )
 
   return {

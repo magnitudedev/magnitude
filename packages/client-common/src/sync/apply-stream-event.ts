@@ -8,10 +8,8 @@ export type RestoreQueuedMessagesCallback = (payload: {
   messages: readonly { id: string; content: string; taskMode: boolean }[];
 }) => void;
 
-export type ResyncDisplayViewCallback = (
-  sessionId: string,
-  viewId: string
-) => void;
+/** Requests a complete snapshot; the display subscription reopens and rereads. */
+export type ResyncCallback = () => void;
 
 // Compile the patch map once at module level for the DisplayViewSnapshot schema.
 const patchMap = compilePatchMap(DisplayViewSnapshot);
@@ -19,9 +17,8 @@ const patchMap = compilePatchMap(DisplayViewSnapshot);
 export function applyStreamEvent(
   store: DisplaySyncSink,
   event: StreamEvent,
-  resync: ResyncDisplayViewCallback | null,
+  resync: ResyncCallback | null,
   sessionId: string,
-  viewId: string,
   onRestoreQueuedMessages?: RestoreQueuedMessagesCallback
 ): Effect.Effect<void> {
   switch (event._tag) {
@@ -45,7 +42,7 @@ export function applyStreamEvent(
             if (resync) {
               // A thrown callback is a programming defect. Preserve it as a
               // defect instead of logging it and pretending resync succeeded.
-              yield* Effect.sync(() => resync(sessionId, viewId));
+              yield* Effect.sync(() => resync());
             }
           })
         )

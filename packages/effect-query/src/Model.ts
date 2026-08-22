@@ -65,7 +65,7 @@ export interface QueryMetadata {
 
 export interface QueryFilter {
   readonly definition?: QueryDefinition
-  /** Definition name; lets transports address a query without holding its definition. */
+  /** Definition name; lets integrations address a query without holding its definition. */
   readonly name?: string
   readonly key?: QueryKey
   readonly exact?: boolean

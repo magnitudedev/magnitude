@@ -3,14 +3,10 @@ import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/a
 import { Context, Effect, Layer, Option } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
-  AssignSlot,
-  ClearSlot,
-  GetModelSlots,
-  LoadModel,
+  Configuration,
+  LocalInference,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
-  SetModelFavorite,
-  StopModel,
   authoritativeSlotSelection,
   type ModelSlotsState,
   type ProviderModelIdentity,
@@ -52,17 +48,17 @@ const makeModelSlots = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const query = effectQuery.query(GetModelSlots, {})
-  const assign = effectQuery.mutation(AssignSlot)
-  const clear = effectQuery.mutation(ClearSlot)
-  const load = effectQuery.mutation(LoadModel)
-  const stop = effectQuery.mutation(StopModel)
-  const favorite = effectQuery.mutation(SetModelFavorite)
+  const query = effectQuery.query(Configuration.GetModelSlots, {})
+  const assign = effectQuery.mutation(Configuration.AssignSlot)
+  const clear = effectQuery.mutation(Configuration.ClearSlot)
+  const load = effectQuery.mutation(LocalInference.LoadModel)
+  const stop = effectQuery.mutation(LocalInference.StopModel)
+  const favorite = effectQuery.mutation(Configuration.SetModelFavorite)
   const assignResult = Atom.make((get) => get(assign))
   const clearResult = Atom.make((get) => get(clear))
   const favoriteResult = Atom.make((get) => get(favorite))
   const assignments = Mutation.state({
-    filters: { mutation: AssignSlot },
+    filters: { mutation: Configuration.AssignSlot },
     select: ({ input, result }): PendingAssignment => ({
       slotId: input.slotId,
       selection: input.selection,
@@ -86,7 +82,7 @@ const makeModelSlots = Effect.gen(function* () {
     assignResult,
     clearResult,
     favoriteResult,
-    retry: queryClient.invalidate(GetModelSlots.match()),
+    retry: queryClient.invalidate(Configuration.GetModelSlots.match()),
     assign: (slotId: SlotId, selection: SlotSelection) =>
       Mutation.execute(assign, { slotId, selection }).pipe(provideRegistry),
     clear: (slotId: SlotId) => Mutation.execute(clear, { slotId }).pipe(provideRegistry),
@@ -109,13 +105,13 @@ export const ModelSlotsLive = Layer.scoped(ModelSlots, makeModelSlots)
 
 export function useModelSlotMutations() {
   const client = useAgentClient()
-  const service = useMemo(() => client.effectQuery.runtime.atom(ModelSlots), [client])
+  const service = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const resultAtom = useMemo(() => Atom.make((get) => Result.map(get(service), (slots) => ({
     assign: get(slots.assignResult),
     clear: get(slots.clearResult),
     favorite: get(slots.favoriteResult),
   }))), [service])
-  const action = useMemo(() => client.effectQuery.runtime.fn<
+  const action = useMemo(() => client.runtime.fn<
     | { readonly _tag: "Assign"; readonly slotId: SlotId; readonly selection: SlotSelection }
     | { readonly _tag: "Clear"; readonly slotId: SlotId }
     | { readonly _tag: "Favorite"; readonly model: ProviderModelIdentity; readonly favorite: boolean }
@@ -126,7 +122,7 @@ export function useModelSlotMutations() {
       case "Favorite": return slots.setFavorite(input.model, input.favorite)
     }
   })), [client])
-  const controlAction = useMemo(() => client.effectQuery.runtime.fn<
+  const controlAction = useMemo(() => client.runtime.fn<
     | { readonly _tag: "Load"; readonly slotId: SlotId }
     | { readonly _tag: "Stop"; readonly slotId: SlotId }
   >()((input) => Effect.flatMap(ModelSlots, (slots): Effect.Effect<unknown, unknown> =>

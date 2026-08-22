@@ -19,9 +19,8 @@ describe("AcnDisplayViewIntrospector", () => {
     const program = Effect.gen(function* () {
       const introspector = yield* AcnDisplayViewIntrospector
 
-      yield* introspector.setShape("session-a", "view-main", rootShape)
-      yield* introspector.openStream("session-a", "view-main")
-      yield* introspector.openStream("session-a", "view-main")
+      yield* introspector.openStream("session-a", "view-main", rootShape)
+      yield* introspector.openStream("session-a", "view-main", rootShape)
       const during = yield* introspector.current("session-a")
 
       yield* introspector.closeStream("session-a", "view-main")
@@ -47,8 +46,8 @@ describe("AcnDisplayViewIntrospector", () => {
     const program = Effect.gen(function* () {
       const introspector = yield* AcnDisplayViewIntrospector
 
-      yield* introspector.setShape("session-a", "view-a", rootShape)
-      yield* introspector.setShape("session-b", "view-b", rootShape)
+      yield* introspector.openStream("session-a", "view-a", rootShape)
+      yield* introspector.openStream("session-b", "view-b", rootShape)
 
       return yield* introspector.current("session-a")
     }).pipe(Effect.provide(AcnDisplayViewIntrospectorLive))
@@ -74,7 +73,7 @@ describe("AcnDisplayViewIntrospector", () => {
       )
 
       yield* Effect.sleep("10 millis")
-      yield* introspector.setShape("session-a", "view-a", rootShape)
+      yield* introspector.openStream("session-a", "view-a", rootShape)
 
       const sessionAChanges = yield* Fiber.join(sessionAFiber)
       const sessionBDone = yield* Fiber.poll(sessionBFiber)

@@ -7,11 +7,12 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
-import type { CloudUsageResponse, UsagePeriod } from '@magnitudedev/sdk'
+import { Configuration, type CloudUsageResponse, type UsagePeriod } from '@magnitudedev/sdk'
 import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
 import { authSourceAtom } from '../../state/cli-atoms'
 import { hasCloudUsageAuth } from './usage-auth'
 import { useAnimationStep } from '../../hooks/use-animation-time'
+
 
 interface UsageOverlayProps {
   isVisible: boolean
@@ -186,7 +187,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   const client = useAgentClient()
   const settings = useSettingsState()
   const authSource = useAtomValue(authSourceAtom)
-  const runtimeResult = useAtomValue(client.rpc.runtime)
+  const runtimeResult = useAtomValue(client.runtime)
   const [period, setPeriod] = useState<UsagePeriod>('7d')
 
   const tz = useMemo(getLocalTimeZone, [])
@@ -195,8 +196,9 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
 
   const usageAtom = useMemo(
     () => isVisible && runtimeReady && cloudConfigured
-      ? client.rpc.query('GetCloudUsage', { period, days: DAILY_DAYS, tz })
-      : Atom.make<Result.Result<CloudUsageResponse, never>>(() => Result.initial()),
+      ? Atom.make((get): Result.Result<CloudUsageResponse, unknown> =>
+          get(client.query(Configuration.GetCloudUsage, { period, days: DAILY_DAYS, tz })).result)
+      : Atom.make<Result.Result<CloudUsageResponse, unknown>>(() => Result.initial()),
     [client, cloudConfigured, isVisible, period, runtimeReady, tz],
   )
   const result = useAtomValue(usageAtom)

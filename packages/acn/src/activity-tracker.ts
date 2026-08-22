@@ -1,5 +1,5 @@
 import { Context, Effect, Layer, Option } from "effect"
-import { AcnRpcDemand } from "@magnitudedev/acn-protocol"
+import { AcnRpcDemand, AcnRpcDemandPolicyTag } from "@magnitudedev/acn-protocol"
 import {
   type ResourceUseGateSnapshot,
   type ResourceRetired,
@@ -57,7 +57,11 @@ export const AcnRpcDemandLive: Layer.Layer<AcnRpcDemand, never, AcnActivityTrack
   Effect.map(
     AcnActivityTracker,
     (activity) =>
-      ({ rpc, next }) =>
-        withDemand(activity, rpc._tag, next),
+      ({ rpc, next }) => {
+        const demand = Context.getOption(rpc.annotations, AcnRpcDemandPolicyTag)
+        return Option.isSome(demand) && demand.value
+          ? withDemand(activity, rpc._tag, next)
+          : next
+      },
   ),
 )

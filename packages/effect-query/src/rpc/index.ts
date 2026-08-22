@@ -1,388 +1,175 @@
-/**
- * Effect RPC adapter for Effect Query.
- *
- * A boundary defines queries, mutations, and subscriptions. Each definition is
- * a core Effect Query definition (usable with `Client.query` / `Client.mutation`
- * / `Client.subscription` unchanged) that also carries its `@effect/rpc` `Rpc`,
- * so the wire group is assembled from the same values the client consumes.
- *
- * The only transport knowledge lives in `Transport`: a per-boundary service
- * that executes one Rpc and returns values typed by that Rpc. Anything that
- * can satisfy `Transport` (an `RpcClient`, an in-process handler, a test fake)
- * is a valid transport.
- */
+/** Effect RPC projection for transport-neutral Effect Query operation groups. */
 import * as Rpc from "@effect/rpc/Rpc"
 import * as RpcClient from "@effect/rpc/RpcClient"
 import type { RpcClientError } from "@effect/rpc/RpcClientError"
-import type * as RpcGroup from "@effect/rpc/RpcGroup"
+import * as RpcGroup from "@effect/rpc/RpcGroup"
+import type * as RpcMiddleware from "@effect/rpc/RpcMiddleware"
+import * as RpcServer from "@effect/rpc/RpcServer"
 import * as Context from "effect/Context"
-import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import type * as Option from "effect/Option"
-import type * as Schedule from "effect/Schedule"
 import type * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
-import * as Key from "../Key.js"
-import type { MutationScope, QueryKey } from "../Model.js"
-import * as Mutation from "../Mutation.js"
-import * as Query from "../Query.js"
-import * as Subscription from "../Subscription.js"
+import type * as Scope from "effect/Scope"
+import * as CoreGroup from "../Group.js"
+import * as Operation from "../Operation.js"
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
-/** Executes Rpcs of one boundary. Result types come from the Rpc, never from the transport. */
-export interface Transport<TransportError> {
-  readonly request: <R extends Rpc.Any>(
-    rpc: R,
-    payload: Rpc.PayloadConstructor<R>
-  ) => Effect.Effect<Rpc.Success<R>, Rpc.Error<R> | TransportError>
-  readonly stream: <R extends Rpc.Any>(
-    rpc: R,
-    payload: Rpc.PayloadConstructor<R>
-  ) => Stream.Stream<Rpc.SuccessChunk<R>, Rpc.ErrorExit<R> | TransportError>
-}
-
-/** The transport service of one boundary; the `Id` keeps boundaries distinct in the Effect context. */
-export interface Client<Id extends string, TransportError> extends Transport<TransportError> {
-  readonly boundary: Id
-}
-
-// ---------------------------------------------------------------------------
-// Definitions
-// ---------------------------------------------------------------------------
-
-type PayloadInput = Schema.Schema.AnyNoContext | Schema.Struct.Fields
 type MadeRpc<
-  Tag extends string,
-  Payload extends PayloadInput,
+  Name extends string,
+  Payload extends Operation.PayloadInput,
   Success extends Schema.Schema.Any,
   Error extends Schema.Schema.All,
-  IsStream extends boolean
-> = ReturnType<typeof Rpc.make<Tag, Payload, Success, Error, IsStream>>
+  Stream extends boolean,
+> = ReturnType<typeof Rpc.make<Name, Payload, Success, Error, Stream>>
 
-export interface QueryRpc<R extends Rpc.Any, Id extends string, TransportError> extends
-  Query.Query<Rpc.PayloadConstructor<R>, Rpc.Success<R>, Rpc.Error<R> | TransportError, Client<Id, TransportError>>
-{
-  readonly rpc: R
+type WithMiddleware<R extends Rpc.Any, Middleware extends RpcMiddleware.TagClassAny> =
+  [Middleware] extends [never] ? R : Rpc.AddMiddleware<R, Middleware>
+
+type RpcOf<
+  Value extends Operation.Any,
+  FiniteMiddleware extends RpcMiddleware.TagClassAny,
+> = Value extends Operation.Any
+  ? Operation.OperationKind<Value> extends "subscription" | "queryFromStream"
+    ? MadeRpc<Operation.Name<Value>, Operation.Payload<Value>, Operation.SuccessSchema<Value>, Operation.ErrorSchema<Value>, true>
+    : WithMiddleware<
+        MadeRpc<Operation.Name<Value>, Operation.Payload<Value>, Operation.SuccessSchema<Value>, Operation.ErrorSchema<Value>, false>,
+        FiniteMiddleware
+      >
+  : never
+
+export type GroupRpcs<
+  Value extends CoreGroup.Any,
+  FiniteMiddleware extends RpcMiddleware.TagClassAny = never,
+> = RpcOf<CoreGroup.Operations<Value>, FiniteMiddleware>
+
+/** Stable derived facts exposed to transport integrations without manual RPC declarations. */
+export interface OperationMetadata {
+  readonly name: string
+  readonly kind: Operation.Kind
+  readonly stream: boolean
+  readonly annotations: Context.Context<never>
 }
 
-export interface StreamQueryRpc<R extends Rpc.Any, Data, Id extends string, TransportError> extends
-  Query.Query<Rpc.PayloadConstructor<R>, Data, Rpc.ErrorExit<R> | TransportError, Client<Id, TransportError>>
-{
-  readonly rpc: R
+export interface MakeOptions<FiniteMiddleware extends RpcMiddleware.TagClassAny> {
+  readonly decorate?: (operation: Operation.Any, rpc: Rpc.AnyWithProps) => unknown
 }
 
-export interface MutationRpc<
-  R extends Rpc.Any,
-  Id extends string,
-  TransportError,
-  SynchronizationError,
-  SynchronizationRequirements
-> extends
-  Mutation.Mutation<
-    Rpc.PayloadConstructor<R>,
-    Rpc.Success<R>,
-    Rpc.Error<R> | TransportError,
-    Client<Id, TransportError> | SynchronizationRequirements,
-    SynchronizationError
-  >
-{
-  readonly rpc: R
+interface Projection<Rpcs extends Rpc.Any> {
+  readonly group: RpcGroup.RpcGroup<Rpcs>
+  readonly byOperation: ReadonlyMap<Operation.Any, Rpc.Any>
+  readonly metadata: ReadonlyMap<string, OperationMetadata>
 }
 
-export interface SubscriptionRpc<R extends Rpc.Any, Id extends string, TransportError> extends
-  Subscription.Subscription<
-    Rpc.PayloadConstructor<R>,
-    Rpc.SuccessChunk<R>,
-    Rpc.ErrorExit<R> | TransportError,
-    Client<Id, TransportError>
-  >
-{
-  readonly rpc: R
-}
-
-export type AnyDefinition = { readonly rpc: Rpc.Any }
-
-interface RpcShape<Payload extends PayloadInput, Success extends Schema.Schema.Any, Error extends Schema.Schema.All> {
-  readonly payload?: Payload
-  readonly success?: Success
-  readonly error?: Error
-  /** Runtime annotations merged onto the Rpc (transport metadata, recovery policy, …). */
-  readonly annotations?: Context.Context<never>
-}
-
-export interface QueryOptions<Payload extends PayloadInput, Success extends Schema.Schema.Any, Error extends Schema.Schema.All, Input, Err>
-  extends RpcShape<Payload, Success, Error>
-{
-  /** Cache identity; defaults to the canonical structural form of the constructed payload. */
-  readonly key?: (input: Input) => QueryKey
-  readonly staleTime?: Duration.DurationInput
-  readonly gcTime?: Duration.DurationInput
-  readonly retry?: Schedule.Schedule<unknown, Err, never>
-  readonly refresh?: Schedule.Schedule<unknown, void, never>
-}
-
-export interface MutationOptions<
-  Payload extends PayloadInput,
-  Success extends Schema.Schema.Any,
-  Error extends Schema.Schema.All,
-  Input,
-  Output,
-  Err,
-  SynchronizationError,
-  SynchronizationRequirements
-> extends RpcShape<Payload, Success, Error> {
-  readonly scope?: (input: Input) => MutationScope
-  readonly synchronize?: (
-    output: Output,
-    input: Input
-  ) => Effect.Effect<void, SynchronizationError, SynchronizationRequirements>
-  readonly retry?: Schedule.Schedule<unknown, Err, never>
-  readonly gcTime?: Duration.DurationInput
-}
-
-export interface SubscriptionOptions<Payload extends PayloadInput, Success extends Schema.Schema.Any, Error extends Schema.Schema.All, Input, Err>
-  extends RpcShape<Payload, Success, Error>
-{
-  readonly key?: (input: Input) => QueryKey
-  readonly reconnect?: Schedule.Schedule<unknown, Err, never>
-  readonly gcTime?: Duration.DurationInput
-}
-
-export interface StreamQueryOptions<
-  Payload extends PayloadInput,
-  Success extends Schema.Schema.Any,
-  Error extends Schema.Schema.All,
-  Input,
-  Event,
-  Data,
-  Err
-> extends RpcShape<Payload, Success, Error> {
-  readonly key?: (input: Input) => QueryKey
-  readonly reduce: (previous: Option.Option<Data>, event: Event) => Data
-  readonly reconnect?: Schedule.Schedule<unknown, Err, never>
-  readonly gcTime?: Duration.DurationInput
-}
-
-// ---------------------------------------------------------------------------
-// Boundary
-// ---------------------------------------------------------------------------
-
-/** One RPC boundary: the transport service its definitions call, and the constructors that define them. */
-export interface Boundary<Id extends string, TransportError> {
-  readonly id: Id
-  readonly Client: Context.Tag<Client<Id, TransportError>, Client<Id, TransportError>>
-
-  readonly query: <
-    const Tag extends string,
-    Payload extends PayloadInput = typeof Schema.Void,
-    Success extends Schema.Schema.Any = typeof Schema.Void,
-    Error extends Schema.Schema.All = typeof Schema.Never
-  >(
-    tag: Tag,
-    options: QueryOptions<
-      Payload,
-      Success,
-      Error,
-      Rpc.PayloadConstructor<MadeRpc<Tag, Payload, Success, Error, false>>,
-      Rpc.Error<MadeRpc<Tag, Payload, Success, Error, false>> | TransportError
-    >
-  ) => QueryRpc<MadeRpc<Tag, Payload, Success, Error, false>, Id, TransportError>
-
-  readonly mutation: <
-    const Tag extends string,
-    Payload extends PayloadInput = typeof Schema.Void,
-    Success extends Schema.Schema.Any = typeof Schema.Void,
-    Error extends Schema.Schema.All = typeof Schema.Never,
-    SynchronizationError = never,
-    SynchronizationRequirements = never
-  >(
-    tag: Tag,
-    options: MutationOptions<
-      Payload,
-      Success,
-      Error,
-      Rpc.PayloadConstructor<MadeRpc<Tag, Payload, Success, Error, false>>,
-      Rpc.Success<MadeRpc<Tag, Payload, Success, Error, false>>,
-      Rpc.Error<MadeRpc<Tag, Payload, Success, Error, false>> | TransportError,
-      SynchronizationError,
-      SynchronizationRequirements
-    >
-  ) => MutationRpc<
-    MadeRpc<Tag, Payload, Success, Error, false>,
-    Id,
-    TransportError,
-    SynchronizationError,
-    SynchronizationRequirements
-  >
-
-  readonly subscription: <
-    const Tag extends string,
-    Payload extends PayloadInput = typeof Schema.Void,
-    Success extends Schema.Schema.Any = typeof Schema.Void,
-    Error extends Schema.Schema.All = typeof Schema.Never
-  >(
-    tag: Tag,
-    options: SubscriptionOptions<
-      Payload,
-      Success,
-      Error,
-      Rpc.PayloadConstructor<MadeRpc<Tag, Payload, Success, Error, true>>,
-      Rpc.ErrorExit<MadeRpc<Tag, Payload, Success, Error, true>> | TransportError
-    >
-  ) => SubscriptionRpc<MadeRpc<Tag, Payload, Success, Error, true>, Id, TransportError>
-
-  /** A query whose data is folded from a stream Rpc (first element = data, later elements reduced). */
-  readonly queryFromStream: <
-    const Tag extends string,
-    Data,
-    Payload extends PayloadInput = typeof Schema.Void,
-    Success extends Schema.Schema.Any = typeof Schema.Void,
-    Error extends Schema.Schema.All = typeof Schema.Never
-  >(
-    tag: Tag,
-    options: StreamQueryOptions<
-      Payload,
-      Success,
-      Error,
-      Rpc.PayloadConstructor<MadeRpc<Tag, Payload, Success, Error, true>>,
-      Rpc.SuccessChunk<MadeRpc<Tag, Payload, Success, Error, true>>,
-      Data,
-      Rpc.ErrorExit<MadeRpc<Tag, Payload, Success, Error, true>> | TransportError
-    >
-  ) => StreamQueryRpc<MadeRpc<Tag, Payload, Success, Error, true>, Data, Id, TransportError>
-
-  /** Adapts a flat `RpcClient` of a group containing this boundary's Rpcs. */
-  readonly transport: <Rpcs extends Rpc.Any>(
-    client: RpcClient.RpcClient.Flat<Rpcs, TransportError>
-  ) => Client<Id, TransportError>
-
-  /** Builds the flat `RpcClient` for `group` and provides it as this boundary's `Client`. */
-  readonly layer: <Rpcs extends Rpc.Any>(
-    group: RpcGroup.RpcGroup<Rpcs>
-  ) => Layer.Layer<
-    Client<Id, TransportError>,
+export interface Adapter<FiniteMiddleware extends RpcMiddleware.TagClassAny = never> {
+  /** Derive the Effect RPC group. Intended for low-level protocol and test integration. */
+  readonly toRpcGroup: <Value extends CoreGroup.Any>(group: Value) => RpcGroup.RpcGroup<GroupRpcs<Value, FiniteMiddleware>>
+  readonly implementations: <Value extends CoreGroup.Any>(
+    group: Value,
+    client: RpcClient.RpcClient.Flat<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
+  ) => Operation.ImplementationService<RpcClientError>
+  readonly layer: <Value extends CoreGroup.Any>(group: Value) => Layer.Layer<
+    Operation.Implementations<RpcClientError>,
     never,
-    RpcClient.Protocol | Rpc.MiddlewareClient<Rpcs> | Rpc.Context<Rpcs>
+    RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Context<GroupRpcs<Value, FiniteMiddleware>>
   >
+  readonly makeRpcClient: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
+    RpcClient.RpcClient<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
+    never,
+    RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Scope.Scope
+  >
+  readonly toLayer: <
+    Value extends CoreGroup.Any,
+    Rpcs extends GroupRpcs<Value, FiniteMiddleware>,
+    Handlers extends RpcGroup.HandlersFrom<Rpcs>,
+    Error = never,
+    Requirements = never,
+  >(
+    group: Value,
+    handlers: Handlers | Effect.Effect<Handlers, Error, Requirements>,
+  ) => Layer.Layer<Rpc.ToHandler<Rpcs>, Error, Exclude<Requirements, Scope.Scope> | RpcGroup.HandlersContext<Rpcs, Handlers>>
+  readonly makeRpcServer: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
+    never,
+    never,
+    RpcServer.Protocol | Rpc.ToHandler<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Middleware<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Context<GroupRpcs<Value, FiniteMiddleware>>
+  >
+  readonly operations: <Value extends CoreGroup.Any>(group: Value) => ReadonlyArray<OperationMetadata>
+  readonly operation: <Value extends CoreGroup.Any>(group: Value, name: string) => OperationMetadata | undefined
 }
 
-interface Constructible {
-  readonly make: (input: unknown) => unknown
-}
+const annotate = <R extends Rpc.AnyWithProps>(rpc: R, annotations: Context.Context<never>): R =>
+  (rpc as unknown as { annotateContext: (context: Context.Context<never>) => R }).annotateContext(annotations)
 
-const isConstructible = (schema: object): schema is Constructible =>
-  "make" in schema && typeof schema.make === "function"
+export const make = <FiniteMiddleware extends RpcMiddleware.TagClassAny = never>(
+  options?: MakeOptions<FiniteMiddleware>,
+): Adapter<FiniteMiddleware> => {
+  const projections = new WeakMap<object, Projection<Rpc.Any>>()
 
-/** Canonical identity of a payload: the constructed (schema-normalized) value, structurally encoded. */
-const payloadKey = (rpc: Rpc.AnyWithProps) => (input: unknown): QueryKey => {
-  const schema: object = rpc.payloadSchema
-  return Key.canonical(isConstructible(schema) ? schema.make(input) : input)
-}
+  const project = <Value extends CoreGroup.Any>(group: Value): Projection<GroupRpcs<Value, FiniteMiddleware>> => {
+    const cached = projections.get(group)
+    if (cached !== undefined) return cached as unknown as Projection<GroupRpcs<Value, FiniteMiddleware>>
 
-const annotated = <
-  Tag extends string,
-  Payload extends Schema.Schema.Any,
-  Success extends Schema.Schema.Any,
-  Error extends Schema.Schema.All
->(
-  rpc: Rpc.Rpc<Tag, Payload, Success, Error>,
-  annotations: Context.Context<never> | undefined
-): Rpc.Rpc<Tag, Payload, Success, Error> =>
-  annotations === undefined ? rpc : rpc.annotateContext(annotations)
+    const rpcs: Rpc.Any[] = []
+    const byOperation = new Map<Operation.Any, Rpc.Any>()
+    const metadata = new Map<string, OperationMetadata>()
+    for (const operation of CoreGroup.operations(group)) {
+      const declaration = Operation.declaration(operation)
+      const stream = declaration.kind === "subscription" || declaration.kind === "queryFromStream"
+      const base = annotate(Rpc.make(declaration.name, {
+        payload: declaration.payload,
+        success: declaration.success,
+        error: declaration.error,
+        stream,
+      }), declaration.annotations)
+      const rpc = (options?.decorate?.(operation, base) ?? base) as Rpc.Any & Rpc.AnyWithProps
+      rpcs.push(rpc)
+      byOperation.set(operation, rpc)
+      metadata.set(declaration.name, {
+        name: declaration.name,
+        kind: declaration.kind,
+        stream,
+        annotations: rpc.annotations,
+      })
+    }
+    const projection: Projection<Rpc.Any> = {
+      group: RpcGroup.make(...rpcs),
+      byOperation,
+      metadata,
+    }
+    projections.set(group, projection)
+    return projection as unknown as Projection<GroupRpcs<Value, FiniteMiddleware>>
+  }
 
-export const make = <const Id extends string, TransportError = RpcClientError>(id: Id): Boundary<Id, TransportError> => {
-  const Client = Context.GenericTag<Client<Id, TransportError>>(`@magnitudedev/effect-query/rpc/${id}`)
-
-  const request = <R extends Rpc.Any>(rpc: R, input: Rpc.PayloadConstructor<R>) =>
-    Effect.flatMap(Client, (client) => client.request(rpc, input))
-  const stream = <R extends Rpc.Any>(rpc: R, input: Rpc.PayloadConstructor<R>) =>
-    Stream.unwrap(Effect.map(Client, (client) => client.stream(rpc, input)))
-
-  const transport: Boundary<Id, TransportError>["transport"] = (client) => ({
-    boundary: id,
-    // The flat client is defined for every Rpc of its group; the Rpc passed here
-    // carries the types. This is the single typed/untyped seam of the adapter.
-    request: (rpc, payload) => client(rpc._tag as never, payload as never) as never,
-    stream: (rpc, payload) => client(rpc._tag as never, payload as never) as never
-  })
+  const implementations = <Value extends CoreGroup.Any>(
+    group: Value,
+    client: RpcClient.RpcClient.Flat<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
+  ): Operation.ImplementationService<RpcClientError> => {
+    const projection = project(group)
+    return {
+      execute: (operation, payload) => {
+        const rpc = projection.byOperation.get(operation)
+        if (rpc === undefined) return Effect.dieMessage("Operation is not part of this RPC group")
+        return client(rpc._tag as never, payload as never) as never
+      },
+      stream: (operation, payload) => {
+        const rpc = projection.byOperation.get(operation)
+        if (rpc === undefined) return Effect.dieMessage("Operation is not part of this RPC group") as never
+        return client(rpc._tag as never, payload as never) as never
+      },
+    }
+  }
 
   return {
-    id,
-    Client,
-    query: (tag, options) => {
-      const rpc = annotated(
-        Rpc.make(tag, { payload: options.payload, success: options.success, error: options.error }),
-        options.annotations
-      )
-      const definition = Query.make(tag, {
-        key: options.key ?? payloadKey(rpc),
-        staleTime: options.staleTime,
-        gcTime: options.gcTime,
-        retry: options.retry,
-        refresh: options.refresh,
-        effect: (input) => request(rpc, input)
-      })
-      return Object.assign(definition, { rpc })
+    toRpcGroup: (group) => project(group).group,
+    implementations,
+    layer: (group) => {
+      return Layer.scoped(
+        Operation.implementationsTag<RpcClientError>(),
+        Effect.map(RpcClient.make(project(group).group, { flatten: true }), (client) => implementations(group, client as never)),
+      ) as never
     },
-    mutation: (tag, options) => {
-      const rpc = annotated(
-        Rpc.make(tag, { payload: options.payload, success: options.success, error: options.error }),
-        options.annotations
-      )
-      const definition = Mutation.make(tag, {
-        effect: (input) => request(rpc, input),
-        synchronize: options.synchronize,
-        scope: options.scope,
-        retry: options.retry,
-        gcTime: options.gcTime
-      })
-      return Object.assign(definition, { rpc })
-    },
-    subscription: (tag, options) => {
-      const rpc = annotated(
-        Rpc.make(tag, {
-          payload: options.payload,
-          success: options.success,
-          error: options.error,
-          stream: true
-        }),
-        options.annotations
-      )
-      const definition = Subscription.make(tag, {
-        key: options.key ?? payloadKey(rpc),
-        stream: (input) => stream(rpc, input),
-        reconnect: options.reconnect,
-        gcTime: options.gcTime
-      })
-      return Object.assign(definition, { rpc })
-    },
-    queryFromStream: (tag, options) => {
-      const rpc = annotated(
-        Rpc.make(tag, {
-          payload: options.payload,
-          success: options.success,
-          error: options.error,
-          stream: true
-        }),
-        options.annotations
-      )
-      const definition = Query.fromStream(tag, {
-        key: options.key ?? payloadKey(rpc),
-        stream: (input) => stream(rpc, input),
-        reduce: options.reduce,
-        reconnect: options.reconnect,
-        gcTime: options.gcTime
-      })
-      return Object.assign(definition, { rpc })
-    },
-    transport,
-    layer: (group) => Layer.scoped(
-      Client,
-      Effect.map(RpcClient.make(group, { flatten: true }), (client) => transport(client))
-    )
+    makeRpcClient: (group) => RpcClient.make(project(group).group),
+    toLayer: (group, handlers) => project(group).group.toLayer(handlers as never) as never,
+    makeRpcServer: (group) => RpcServer.make(project(group).group) as never,
+    operations: (group) => [...project(group).metadata.values()],
+    operation: (group, name) => project(group).metadata.get(name),
   }
 }

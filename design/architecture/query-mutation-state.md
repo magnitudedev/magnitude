@@ -371,14 +371,17 @@ local interaction  -> presentation atom
 - Shared atoms choose disposable or keep-alive lifetime intentionally.
 - CLI, web, and desktop share state behavior through client-common.
 
-Effect Query is the client cache and command-state authority for a subsystem that adopts it.
-A subsystem defines each query, mutation, and subscription once, in the ACN contract, through the
-Effect Query RPC adapter (`Acn.query`, `Acn.mutation`, `Acn.subscription`): each definition is a
-core Effect Query definition that also carries its Rpc, and mutations declare their scope and
-synchronization postcondition there. One connection-scoped Effect Query client provides the
-transport service and materializes definitions into query, mutation, and subscription atoms.
-Components consume those atoms; they do not construct runtimes or wrap them in parallel request
-atoms or writable status state.
+Effect Query is the client cache and command-state authority for every client↔ACN interaction.
+Each interaction is defined once with the core Effect Query primitives: `Query.make`,
+`Query.fromStream`, `Mutation.make`, or `Subscription.make`. Domain definitions compose through
+the core `Group.make`, and the root `AcnBoundary` group is the sole complete protocol witness.
+The ACN RPC adapter derives its RPC projection from that group; it does not provide another
+operation-definition or grouping mechanism. Queries declare freshness, while mutations declare
+their scope, recovery policy, and synchronization postcondition on the same values. One
+connection-scoped Effect Query client (the `AgentClient`) provides RPC-backed operation
+implementations and materializes definitions
+into query, mutation, and subscription atoms. Components consume those atoms; they do not construct
+runtimes or wrap them in parallel request atoms or writable status state.
 
 Mutation states are retained per invocation and keyed by the mutation definition and, when
 concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports
@@ -393,30 +396,33 @@ acquisition. Mutation synchronization does not wait for the admitted download or
 publication to finish; progress, physical completion, and serving readiness remain authoritative
 query state consumed by the dependent Effect.
 
-Adoption is vertical and explicit. A subsystem may use Effect Query while unrelated subsystems
-continue to use AtomRpc queries and mutations. Within an adopted subsystem, however, there is one
-canonical query cache and one mutation-state registry; mixing a second cache or command-state
-mechanism for the same data is prohibited.
+There is one canonical query cache and one mutation-state registry per connection; a second cache,
+request system, or command-state mechanism for ACN data is prohibited. Definers know the `Acn`
+boundary, not the transport; callers know the three primitives, not the transport.
 
 ### AgentClient and RPC
 
 ```text
 component
-   +-- contract query definition ----> Effect Query client ----> ACN transport
-   +-- contract mutation definition -> Effect Query client ----> ACN transport
+   +-- domain-group query member ----> Effect Query client ----> ACN transport
+   +-- domain-group mutation member -> Effect Query client ----> ACN transport
                                                 ^
                                                 +-- StreamChanges poke invalidates the named query
 ```
 
-- The ACN RPC service owns typed transport access, not query or mutation state.
-- One Effect Query client per connection owns the Atom runtime, query cache, and mutation history.
-- Definitions are contract values: transport-using, independent of connection and runtime lifetime.
-- AtomRpc and Effect Query may serve different domains over the same transport during migration;
-  adopted domains do not use AtomRpc or the mirror cache as a second state authority.
+- The ACN transport service executes Rpcs; it owns no query or mutation state. Its
+  implementation (the JIT runtime, recovering HTTP protocol, subscription framing) is the only
+  place that knows Effect RPC.
+- One Effect Query client per connection owns the Atom runtime, query cache, mutation history, and
+  the domain service Layers.
+- Definitions are transport-neutral values requiring a generic operation implementation through
+  Effect DI. The connection installs the RPC-backed implementation layer.
 - Freshness is owned by the connection: one `StreamChanges` subscription carries pokes that name a
-  query, and the Effect Query client invalidates by name. A migrated mirror is an ordinary contract
-  query with infinite freshness. Domains migrate vertically and delete their direct-mirror
-  ownership once query, mutation, and freshness semantics have moved together.
+  query, and the Effect Query client invalidates by name. ACN-owned snapshots are boundary queries
+  with infinite freshness.
+- A keyed subscription that keeps queries fresh (`WatchFile`, `WatchProjectFiles`) is a dependency
+  of the query atoms it serves, owned by that domain's client service: open while observed, closed
+  when unobserved. Components and hooks mount no watches and own no stream fibers.
 - Components do not own RPC clients, request caches, retries, or invalidation wiring.
 - Mutation receipts may await query visibility; they do not create another resource state.
 - Reconnection preserves client state and rereads authoritative ACN state.
@@ -439,13 +445,15 @@ mutation -> append committed event -> event log
 ### Display views
 
 ```text
-client requested shape --mutation--> agent
-agent accepted shape + projections --> display query --> client
+client requested shape --subscription(sessionId, shape)--> ACN --> agent view
+agent accepted shape + projections --> display events --> client
 ```
 
-- Requested shape and accepted display state have different owners.
-- Opening a stream cannot mutate display shape.
-- Resync rereads a full accepted snapshot.
+- Requested shape and accepted display state have different owners: the client's requested shape is
+  the subscription argument; a different shape is a different subscription.
+- Opening a subscription materializes the view for its shape; it cannot change another view's shape.
+- Resync and retry reopen the subscription, which rereads a full accepted snapshot.
+- The subscription's status is the connection phase.
 - Display state does not become a second session or agent authority.
 
 ### Service and process lifecycle

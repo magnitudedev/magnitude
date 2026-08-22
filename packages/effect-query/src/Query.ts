@@ -13,6 +13,7 @@ import * as Exit from "effect/Exit"
 import * as Hash from "effect/Hash"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
+import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import {
@@ -28,6 +29,7 @@ import {
   type QueryDefinition,
   type QueryKey
 } from "./Model.js"
+import * as Operation from "./Operation.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Query")
 const SetInputTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Query/setInput")
@@ -105,6 +107,37 @@ export interface FromStreamOptions<Input, Event, Data, Error, Requirements> {
   readonly reduce: (previous: Option.Option<Data>, event: Event) => Data
   /** Retry policy applied to the stream while it is open; defaults to no retry. */
   readonly reconnect?: Schedule.Schedule<unknown, Error, never>
+  readonly gcTime?: Duration.DurationInput
+}
+
+export type DeclarationOptions<
+  Payload extends Operation.PayloadInput,
+  Success extends Schema.Schema.Any,
+  Error extends Schema.Schema.All,
+  Policy extends object,
+  Input,
+  QueryError,
+> = Operation.Shape<Payload, Success, Error, Policy> & {
+  readonly key?: (input: Input) => QueryKey
+  readonly staleTime?: Duration.DurationInput
+  readonly gcTime?: Duration.DurationInput
+  readonly retry?: Schedule.Schedule<unknown, QueryError, never>
+  readonly refresh?: Schedule.Schedule<unknown, void, never>
+}
+
+export type StreamDeclarationOptions<
+  Payload extends Operation.PayloadInput,
+  Success extends Schema.Schema.Any,
+  Error extends Schema.Schema.All,
+  Policy extends object,
+  Input,
+  Event,
+  Data,
+  QueryError,
+> = Operation.Shape<Payload, Success, Error, Policy> & {
+  readonly key?: (input: Input) => QueryKey
+  readonly reduce: (previous: Option.Option<Data>, event: Event) => Data
+  readonly reconnect?: Schedule.Schedule<unknown, QueryError, never>
   readonly gcTime?: Duration.DurationInput
 }
 
@@ -189,32 +222,126 @@ const makeDefinition = <Input, Data, Error, Requirements>(
   return definition
 }
 
-export const make = <Input, Data, Error, Requirements>(
+export function make<Input, Data, Error, Requirements>(
   name: string,
   options: Options<Input, Data, Error, Requirements>
-): Query<Input, Data, Error, Requirements> => makeDefinition(name, {
-  key: options.key,
-  staleTime: options.staleTime,
-  gcTime: options.gcTime,
-  refresh: options.refresh,
-  source: { _tag: "Effect", effect: options.effect, retry: options.retry }
-})
+): Query<Input, Data, Error, Requirements>
+export function make<
+  const Name extends string,
+  Payload extends Operation.PayloadInput = typeof Schema.Void,
+  Success extends Schema.Schema.Any = typeof Schema.Void,
+  Error extends Schema.Schema.All = typeof Schema.Never,
+  Policy extends object = {},
+>(
+  name: Name,
+  options: DeclarationOptions<
+    Payload,
+    Success,
+    Error,
+    Policy,
+    Operation.PayloadConstructor<Payload>,
+    Schema.Schema.Type<Error>
+  >,
+): Query<
+  Operation.PayloadConstructor<Payload>,
+  Schema.Schema.Type<Success>,
+  Schema.Schema.Type<Error>,
+  Operation.Implementations<any>
+> & Operation.Declared<Name, "query", Payload, Success, Error, Policy>
+export function make(
+  name: string,
+  options: Options<unknown, unknown, unknown, unknown> | (DeclarationOptions<any, any, any, any, any, any> & object),
+): Query<any, any, any, any> {
+  if (!("effect" in options)) {
+    const declaration = options as DeclarationOptions<any, any, any, any, any, any>
+    let definition!: Query<any, any, any, any> & Operation.Any
+    definition = makeDefinition(name, {
+      key: declaration.key ?? Operation.payloadKey(declaration.payload ?? Schema.Void),
+      staleTime: declaration.staleTime,
+      gcTime: declaration.gcTime,
+      refresh: declaration.refresh,
+      source: {
+        _tag: "Effect",
+        effect: (input) => Operation.execute(definition, input) as never,
+        retry: declaration.retry,
+      },
+    }) as never
+    return Operation.attach(definition, name, "query", declaration as never) as never
+  }
+  const local = options as Options<any, any, any, any>
+  return makeDefinition(name, {
+    key: local.key,
+    staleTime: local.staleTime,
+    gcTime: local.gcTime,
+    refresh: local.refresh,
+    source: { _tag: "Effect", effect: local.effect, retry: local.retry }
+  })
+}
 
-export const fromStream = <Input, Event, Data, Error, Requirements>(
+export function fromStream<Input, Event, Data, Error, Requirements>(
   name: string,
   options: FromStreamOptions<Input, Event, Data, Error, Requirements>
-): Query<Input, Data, Error, Requirements> => makeDefinition(name, {
-  key: options.key,
-  staleTime: Number.POSITIVE_INFINITY,
-  gcTime: options.gcTime,
-  refresh: undefined,
-  source: {
-    _tag: "Fold",
-    fold: (input) => Stream.map(options.stream(input), (event) => (previous: Option.Option<Data>) =>
-      options.reduce(previous, event)),
-    reconnect: options.reconnect
+): Query<Input, Data, Error, Requirements>
+export function fromStream<
+  const Name extends string,
+  Data,
+  Payload extends Operation.PayloadInput = typeof Schema.Void,
+  Success extends Schema.Schema.Any = typeof Schema.Void,
+  Error extends Schema.Schema.All = typeof Schema.Never,
+  Policy extends object = {},
+>(
+  name: Name,
+  options: StreamDeclarationOptions<
+    Payload,
+    Success,
+    Error,
+    Policy,
+    Operation.PayloadConstructor<Payload>,
+    Schema.Schema.Type<Success>,
+    Data,
+    Schema.Schema.Type<Error>
+  >,
+): Query<
+  Operation.PayloadConstructor<Payload>,
+  Data,
+  Schema.Schema.Type<Error>,
+  Operation.Implementations<any>
+> & Operation.Declared<Name, "queryFromStream", Payload, Success, Error, Policy>
+export function fromStream(
+  name: string,
+  options: FromStreamOptions<any, any, any, any, any> | (StreamDeclarationOptions<any, any, any, any, any, any, any, any> & object),
+): Query<any, any, any, any> {
+  if (!("stream" in options)) {
+    const declaration = options as StreamDeclarationOptions<any, any, any, any, any, any, any, any>
+    let definition!: Query<any, any, any, any> & Operation.Any
+    definition = makeDefinition(name, {
+      key: declaration.key ?? Operation.payloadKey(declaration.payload ?? Schema.Void),
+      staleTime: Number.POSITIVE_INFINITY,
+      gcTime: declaration.gcTime,
+      refresh: undefined,
+      source: {
+        _tag: "Fold",
+        fold: (input) => Stream.map(Operation.stream(definition, input) as Stream.Stream<any, any, any>, (event) =>
+          (previous: Option.Option<any>) => declaration.reduce(previous, event)),
+        reconnect: declaration.reconnect,
+      },
+    }) as never
+    return Operation.attach(definition, name, "queryFromStream", declaration as never) as never
   }
-})
+  const local = options as FromStreamOptions<any, any, any, any, any>
+  return makeDefinition(name, {
+    key: local.key,
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: local.gcTime,
+    refresh: undefined,
+    source: {
+      _tag: "Fold",
+      fold: (input) => Stream.map(local.stream(input), (event) => (previous: Option.Option<any>) =>
+        local.reduce(previous, event)),
+      reconnect: local.reconnect
+    }
+  })
+}
 
 export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Required extends Provided | Reactivity.Reactivity>(
   runtime: Atom.AtomRuntime<Provided, RuntimeError>,

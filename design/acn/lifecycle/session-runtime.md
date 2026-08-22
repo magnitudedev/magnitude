@@ -5,7 +5,7 @@ applies_to:
   - packages/acn/src/active-session-statuses.ts
   - packages/acn/src/display-view-streams.ts
   - packages/acn/src/agent-persistence.ts
-  - packages/acn-protocol/src/rpcs/shell.ts
+  - packages/acn-protocol/src/boundary/shell.ts
   - packages/acn-protocol/src/schemas/shell.ts
   - packages/agent/src/events.ts
   - packages/agent/src/session-work-status.ts
@@ -28,8 +28,8 @@ closes admission before publication, and cleanup from an old generation cannot a
 replacement.
 
 A resident runtime unloads after two minutes without session work. Commands, agent execution,
-display materialization, shape changes, resynchronization, and preload count as work. Merely
-watching a session does not. The final claim starts that generation's idle timer.
+display materialization (opening or reopening a display subscription), and preload count as work.
+Holding an open display subscription does not. The final claim starts that generation's idle timer.
 
 Agent work has one authoritative status covering accepted messages awaiting resolution, turns,
 queued triggers, workers, compaction, and owned detached processes. Runtime retention and UI
@@ -73,14 +73,17 @@ command.
 
 ## Display attachment
 
-The display subscription belongs to ACN; its live attachment belongs to one runtime generation.
-Unload invalidates the attachment generation before stopping its forwarding fiber, then emits
-session suspension through the [ACN subscription protocol](../subscriptions.md). It does not wait
-on downstream finalizers. Late output from the old generation
-is rejected while cleanup finishes asynchronously.
+The display subscription (`StreamDisplayView(sessionId, shape)`) belongs to ACN; one view exists
+per session and shape, and its live attachment belongs to one runtime generation. Opening a
+subscription materializes its view — loading the runtime if needed, setting the view's shape, and
+emitting a complete snapshot first — and every later subscriber of the same view rereads a complete
+snapshot. Unload invalidates the attachment generation before stopping its forwarding fiber; it
+does not wait on downstream finalizers, and late output from the old generation is rejected while
+cleanup finishes asynchronously. The subscription stays open through unload.
 
-The client retains its last display state. Later materialization, shape change, or resync reloads the
-runtime, reattaches the display, and emits a complete snapshot.
+The client retains its last display state. Reopening the subscription (a shape change, resync, or
+retry) or work that makes the session busy again reattaches the display and emits a complete
+snapshot.
 
 ## Guarantees
 

@@ -2,7 +2,7 @@
 applies_to:
   - packages/acn/src/client-lease-*.ts
   - packages/acn/src/model-residency-policy.ts
-  - packages/acn-protocol/src/rpcs/client-lease.ts
+  - packages/acn-protocol/src/boundary/client-lease.ts
   - packages/acn-protocol/src/schemas/client-lease.ts
   - packages/sdk/src/acn-jit/**
   - packages/client-common/src/utils/cli-exit-notice.ts

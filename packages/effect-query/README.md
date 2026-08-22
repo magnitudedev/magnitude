@@ -109,28 +109,28 @@ instead returns `QueryBatchError`, because matches may have unrelated error type
 
 ## RPC-backed definitions (`@magnitudedev/effect-query/rpc`)
 
-The RPC adapter lets a protocol package define one *boundary* (`Boundary.make("Acn")`) whose
-queries, mutations, and subscriptions are defined once. Each definition is a core Effect Query
-definition that also carries its `@effect/rpc` `Rpc`, so the wire group is assembled from the same
-values the client consumes. The core stays transport agnostic; the adapter's only transport
-knowledge is the `Transport` service it asks for.
+Core Effect Query defines the runtime operation values and grouping mechanism. A protocol package
+uses `Query.make`, `Mutation.make`, `Subscription.make`, `Query.fromStream`, and `Group.make` once,
+then gives the resulting group to the RPC adapter. The adapter derives `@effect/rpc` clients and
+servers from those same values; application code never declares a parallel RPC registry. Core
+Effect Query has no RPC or transport concept. Execution is supplied through its generic
+implementation service.
 
 ```ts
-import { RpcGroup } from "@effect/rpc"
 import { Effect, Schema } from "effect"
-import { Client, Mutation, QueryClient } from "@magnitudedev/effect-query"
-import * as Boundary from "@magnitudedev/effect-query/rpc"
+import { Client, Group, Mutation, Query, QueryClient, Subscription } from "@magnitudedev/effect-query"
+import * as RpcAdapter from "@magnitudedev/effect-query/rpc"
 
-export const Acn = Boundary.make("Acn")
+export const AcnRpc = RpcAdapter.make()
 
-export const GetSession = Acn.query("GetSession", {
+const GetSession = Query.make("GetSession", {
   payload: { sessionId: Schema.String },
   success: SessionSchema,
   error: SessionError,
   staleTime: "30 seconds"
 })
 
-export const DeleteSession = Acn.mutation("DeleteSession", {
+const DeleteSession = Mutation.make("DeleteSession", {
   payload: { sessionId: Schema.String },
   success: Schema.Struct({}),
   error: SessionError,
@@ -138,29 +138,33 @@ export const DeleteSession = Acn.mutation("DeleteSession", {
   synchronize: (_, payload) => QueryClient.remove(GetSession.match(payload))
 })
 
-export const StreamChanges = Acn.subscription("StreamChanges", {
+const StreamChanges = Subscription.make("StreamChanges", {
   payload: {},
   success: Schema.Struct({ query: Schema.String })
 })
 
-export const MagnitudeRpcs = RpcGroup.make(GetSession.rpc, DeleteSession.rpc, StreamChanges.rpc)
+export const Sessions = Group.make({ GetSession, DeleteSession })
+export const Changes = Group.make({ StreamChanges })
+export const AcnBoundary = Group.make({ Sessions, Changes })
 ```
 
-Servers implement the group as usual (`MagnitudeRpcs.toLayer({...})`). Clients provide the
-boundary's transport — `Acn.layer(MagnitudeRpcs)` builds a flat `RpcClient`, or
-`Acn.transport(flatClient)` adapts an existing one — and use the core `Client` unchanged:
+Servers implement the derived group through `AcnRpc.toLayer(AcnBoundary, handlers)` and serve it
+with `AcnRpc.makeRpcServer(AcnBoundary)`. Clients install RPC-backed implementations with
+`AcnRpc.layer(AcnBoundary)` and use the core `Client` unchanged:
 
 ```ts
-const effectQuery = Client.make(Acn.layer(MagnitudeRpcs).pipe(Layer.provide(protocolLayer)))
-const session = effectQuery.query(GetSession, { sessionId: "session-1" })
-const remove = effectQuery.mutation(DeleteSession)
-const changes = effectQuery.subscription(StreamChanges, {})
+const effectQuery = Client.make(AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)))
+const session = effectQuery.query(Sessions.GetSession, { sessionId: "session-1" })
+const remove = effectQuery.mutation(Sessions.DeleteSession)
+const changes = effectQuery.subscription(Changes.StreamChanges, {})
 ```
 
 Cache identity defaults to the canonical structural form of the constructed payload
-(`Key.canonical`); payload, success, error, and transport-error types come from the Rpc. Kinds are
+(`Key.canonical`); payload, success, and domain-error types come from the operation declaration,
+while implementation failures such as RPC client errors come from the installed implementation
+layer. Kinds are
 structural: `effectQuery.query(DeleteSession, …)` does not compile because a mutation is not a
-query. `Acn.queryFromStream` defines a `Query.fromStream` over a stream Rpc.
+query. Declarative `Query.fromStream` defines a query folded over a derived stream RPC.
 
 ## HTTP API-backed definitions
 

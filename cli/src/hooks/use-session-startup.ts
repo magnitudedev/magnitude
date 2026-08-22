@@ -8,9 +8,8 @@
  *    registration, session logger, terminal title.
  * 3. One-shot --prompt / --goal send after the first display arrives.
  *
- * Reads use client.query() (declarative). Mutations use useAtomSet with
- * { mode: "promise" } where the return value is needed. No runRpc, no
- * Runtime.runPromise, and no unsafe casts.
+ * Reads are contract queries (declarative). Mutations use useAtomSet with
+ * { mode: "promise" } where the return value is needed.
  */
 import { useMemo } from 'react'
 import { Effect, Option } from 'effect'
@@ -30,7 +29,13 @@ import {
   type SlashCommandDefinition,
   getDraftSessionOwnerId,
 } from '@magnitudedev/client-common'
-import { DirectoryPathSchema, type SessionPageCursor } from '@magnitudedev/sdk'
+import {
+  Agent,
+  DirectoryPathSchema,
+  Sessions,
+  Skills,
+  type SessionPageCursor,
+} from '@magnitudedev/sdk'
 import { setLastSessionId } from '../state/last-session'
 import { useTerminalTitle } from './use-terminal-title'
 
@@ -57,7 +62,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const sessionCreateOptions = useAtomValue(sessionCreateOptionsAtom)
   const hasReceivedDisplay = useHasReceivedDisplay()
   const setPendingUserSubmit = useAtomSet(pendingUserSubmitAtom)
-  const runtimeResult = useAtomValue(client.rpc.runtime)
+  const runtimeResult = useAtomValue(client.runtime)
   const sessionTitle = useDisplayState((state) => state.session.title)
   useTerminalTitle(renderer, sessionId, sessionTitle)
 
@@ -65,12 +70,12 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const latestSessionAtom = useMemo(
     () =>
       sessionStart._tag === 'latest' && Result.isSuccess(runtimeResult)
-        ? client.rpc.query('ListSessions', {
+        ? Atom.make((get) => get(client.query(Sessions.ListSessions, {
             cwd: Option.some(DirectoryPathSchema.make(process.cwd())),
             query: Option.none<string>(),
             cursor: Option.none<SessionPageCursor>(),
             limit: 1,
-          }, { reactivityKeys: ['sessions'] })
+          })).result)
         : idleAtom,
     [client, sessionStart, runtimeResult],
   )
@@ -112,7 +117,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const skillsAtom = useMemo(
     () =>
       selectedCwd && Result.isSuccess(runtimeResult)
-        ? client.rpc.query('ListSkills', { cwd: selectedCwd }, { reactivityKeys: ['skills'] })
+        ? Atom.make((get) => get(client.query(Skills.ListSkills, { cwd: selectedCwd })).result)
         : idleAtom,
     [client, selectedCwd, runtimeResult],
   )
@@ -145,9 +150,9 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   useAtomMount(skillRegistrationAtom)
 
   // ── 3. One-shot --prompt / --goal — true mutations needing return value
-  const startGoalAtom = useMemo(() => client.rpc.mutation('StartGoal'), [client])
-  const sendMessageAtom = useMemo(() => client.rpc.mutation('SendMessage'), [client])
-  const createSessionAtom = useMemo(() => client.rpc.mutation('CreateSession'), [client])
+  const startGoalAtom = useMemo(() => client.mutation(Agent.StartGoal), [client])
+  const sendMessageAtom = useMemo(() => client.mutation(Agent.SendMessage), [client])
+  const createSessionAtom = useMemo(() => client.mutation(Sessions.CreateSession), [client])
   const startGoalMutation = useAtomSet(startGoalAtom, { mode: 'promise' })
   const sendMessageMutation = useAtomSet(sendMessageAtom, { mode: 'promise' })
   const createSessionMutation = useAtomSet(createSessionAtom, { mode: 'promise' })
@@ -178,31 +183,22 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
 
           const work = sessionId
             ? goalObjective
-              ? startGoalMutation({
-                  payload: { sessionId, objective: goalObjective },
-                  reactivityKeys: ['sessions'],
-                })
+              ? startGoalMutation({ sessionId, objective: goalObjective })
               : sendMessageMutation({
-                  payload: {
-                    sessionId,
-                    messageId: Option.none<string>(),
-                    content: messagePrompt,
-                    visibleMessage: Option.some(messagePrompt),
-                    taskMode: false,
-                    uploads: [],
-                    mentions: [],
-                  },
-                  reactivityKeys: ['sessions'],
+                  sessionId,
+                  messageId: Option.none<string>(),
+                  content: messagePrompt,
+                  visibleMessage: Option.some(messagePrompt),
+                  taskMode: false,
+                  uploads: [],
+                  mentions: [],
                 })
             : createSessionMutation({
-                payload: {
-                  cwd: selectedCwd ?? process.cwd(),
-                  sessionId: Option.none(),
-                  initial: Option.some(initial),
-                  options: sessionCreateOptions,
-                  draftOwnerId: Option.some(getDraftSessionOwnerId()),
-                },
-                reactivityKeys: ['sessions'],
+                cwd: selectedCwd ?? process.cwd(),
+                sessionId: Option.none(),
+                initial: Option.some(initial),
+                options: sessionCreateOptions,
+                draftOwnerId: Option.some(getDraftSessionOwnerId()),
               }).then((result) => {
                 if (result._tag === 'created') {
                   controller.selectSession(result.metadata.sessionId)

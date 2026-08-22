@@ -4,7 +4,8 @@ import {
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   ProviderModelCatalogLoading,
-  ProviderModelCatalogMirror,
+  ProviderModelCatalogStateSchema,
+  Configuration,
   SECONDARY_SLOT_ID,
   type MirroredSnapshot,
   type ProviderCatalogEntry,
@@ -21,7 +22,8 @@ import {
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
+import { AcnChanges } from "./changes"
+import { makeMirroredState } from "./mirrored-state"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { AcnActivityTracker } from "./activity-tracker"
 import { makeServiceOperationCoordinator } from "./service-operation-coordinator"
@@ -182,7 +184,7 @@ const sameRefreshTarget = (
 export const ProviderModelCatalogLive: Layer.Layer<
   ProviderModelCatalog,
   never,
-  ProviderClient | LocalProviderOfferings | MirroredStateChanges | AcnActivityTracker
+  ProviderClient | LocalProviderOfferings | AcnChanges | AcnActivityTracker
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
   const localOfferings = yield* LocalProviderOfferings
@@ -192,8 +194,11 @@ export const ProviderModelCatalogLive: Layer.Layer<
     Option.Option<ProviderId>,
     never
   >(sameRefreshTarget)
-  const mirror = yield* makeMirroredState(ProviderModelCatalogMirror, new ProviderModelCatalogLoading({}))
-  const equivalent = Schema.equivalence(ProviderModelCatalogMirror.stateSchema)
+  const mirror = yield* makeMirroredState<ProviderModelCatalogState>(
+    { name: Configuration.GetProviderModelCatalog.name },
+    new ProviderModelCatalogLoading({}),
+  )
+  const equivalent = Schema.equivalence(ProviderModelCatalogStateSchema)
 
   const updateCatalog = (update: (state: ProviderModelCatalogState) => ProviderModelCatalogState) =>
     mirror.modify((state) => {

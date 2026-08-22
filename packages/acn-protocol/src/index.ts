@@ -1,5 +1,6 @@
 export * from "./schemas/index"
-export * from "./rpcs/index"
+export * from "./boundary/index"
+export * from "./transport/index"
 export * from "./errors"
 export * from "./acn-identity"
 export * from "./acn-revision"

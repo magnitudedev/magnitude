@@ -17,6 +17,7 @@ import { useSlotProfiles } from "./use-slot-profiles"
 import { getDraftSessionOwnerId } from "./draft-session-owner"
 import { routeSlashCommand, type CommandContext, type SlashCommandOutcome } from "../commands/command-router"
 import type { MentionSearchClient } from "./use-file-mentions"
+import { useMentionSearchClient } from "./use-mention-search"
 import {
   selectedCwdAtom,
   bashModeAtom,
@@ -36,10 +37,13 @@ import {
   presentPendingUserMessage,
   useDisplaySpeculator,
 } from "../sync/index"
-import type {
-  DisplayAttachment,
-  RawMessageUpload,
-  RawMentionOccurrence,
+import {
+  Agent,
+  Sessions,
+  Shell,
+  type DisplayAttachment,
+  type RawMessageUpload,
+  type RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { canonicalExtensionForImageMediaType } from "@magnitudedev/sdk"
 import { isRpcOutcomeUnknown } from "@magnitudedev/sdk"
@@ -130,30 +134,15 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   })), [selectedSessionId])
   useAtomMount(selectedSessionSyncAtom)
 
-  const sendAtom = useMemo(() => client.rpc.mutation("SendMessage"), [client])
-  const createSessionAtom = useMemo(() => client.rpc.mutation("CreateSession"), [client])
-  const interruptAtom = useMemo(() => client.rpc.mutation("Interrupt"), [client])
-  const runBashAtom = useMemo(() => client.rpc.mutation("RunBash"), [client])
-  const searchMentionsAtom = useMemo(() => client.rpc.mutation("SearchMentions"), [client])
+  const sendAtom = useMemo(() => client.mutation(Agent.SendMessage), [client])
+  const createSessionAtom = useMemo(() => client.mutation(Sessions.CreateSession), [client])
+  const interruptAtom = useMemo(() => client.mutation(Agent.Interrupt), [client])
+  const runBashAtom = useMemo(() => client.mutation(Shell.RunBash), [client])
   const sendMutation = useAtomSet(sendAtom, { mode: "promise" })
   const createSession = useAtomSet(createSessionAtom, { mode: "promise" })
   const interruptMutation = useAtomSet(interruptAtom)
   const runBashMutation = useAtomSet(runBashAtom, { mode: "promise" })
-  const searchMentionsMutation = useAtomSet(searchMentionsAtom, { mode: "promise" })
-  // Mention client — uses mutation setter, no manual runtime extraction
-  const mentionClient = useMemo<MentionSearchClient>(() => ({
-    searchMentions(payload: Parameters<MentionSearchClient["searchMentions"]>[0]) {
-      return searchMentionsMutation({
-        payload: {
-          cwd: payload.cwd,
-          query: payload.query,
-          ...(payload.limit !== undefined ? { limit: payload.limit } : {}),
-          ...(payload.visibleLimit !== undefined ? { visibleLimit: payload.visibleLimit } : {}),
-          ...(payload.includeRecent !== undefined ? { includeRecent: payload.includeRecent } : {}),
-        },
-      })
-    },
-  }), [searchMentionsMutation])
+  const mentionClient: MentionSearchClient = useMentionSearchClient()
 
   const handleSend = useCallback((
     text: string,
@@ -237,16 +226,13 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     const deliver = async (): Promise<void> => {
       if (activeSessionId) {
         await sendMutation({
-          payload: {
-            sessionId: activeSessionId,
-            messageId: Option.some(messageId),
-            content: text,
-            taskMode,
-            uploads,
-            mentions,
-            visibleMessage,
-          },
-          reactivityKeys: ["sessions"],
+          sessionId: activeSessionId,
+          messageId: Option.some(messageId),
+          content: text,
+          taskMode,
+          uploads,
+          mentions,
+          visibleMessage,
         })
         setPendingUserSubmit(false)
         return
@@ -257,38 +243,32 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
       if (inFlightActivation) {
         const sessionId = await inFlightActivation
         await sendMutation({
-          payload: {
-            sessionId,
-            messageId: Option.some(messageId),
-            content: text,
-            taskMode,
-            uploads,
-            mentions,
-            visibleMessage,
-          },
-          reactivityKeys: ["sessions"],
+          sessionId,
+          messageId: Option.some(messageId),
+          content: text,
+          taskMode,
+          uploads,
+          mentions,
+          visibleMessage,
         })
         setPendingUserSubmit(false)
         return
       }
 
       const promise = createSession({
-        payload: {
-          cwd: selectedCwd ?? "",
-          sessionId: Option.none(),
-          initial: Option.some({
-            _tag: "message",
-            messageId: Option.some(messageId),
-            content: text,
-            visibleMessage,
-            taskMode,
-            uploads,
-            mentions,
-          }),
-          options: sessionCreateOptions,
-          draftOwnerId: Option.some(getDraftSessionOwnerId()),
-        },
-        reactivityKeys: ["sessions"],
+        cwd: selectedCwd ?? "",
+        sessionId: Option.none(),
+        initial: Option.some({
+          _tag: "message",
+          messageId: Option.some(messageId),
+          content: text,
+          visibleMessage,
+          taskMode,
+          uploads,
+          mentions,
+        }),
+        options: sessionCreateOptions,
+        draftOwnerId: Option.some(getDraftSessionOwnerId()),
       }).then((result) => {
         if (result._tag === "created") {
           activatedSessionIdRef.current = result.metadata.sessionId
@@ -320,10 +300,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   const handleInterrupt = useCallback(() => {
     if (!selectedSessionId) return
     interruptMutation({
-      payload: {
-        sessionId: selectedSessionId,
-        target: { _tag: "fork", forkId: null },
-      },
+      sessionId: selectedSessionId,
+      target: { _tag: "fork", forkId: null },
     })
   }, [selectedSessionId, interruptMutation])
 
@@ -334,10 +312,8 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
     }
     try {
       await runBashMutation({
-        payload: {
-          sessionId: selectedSessionId,
-          command,
-        },
+        sessionId: selectedSessionId,
+        command,
       })
       return true
     } catch (err) {

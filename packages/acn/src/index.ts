@@ -1,5 +1,5 @@
 export { launchAcnServer } from "./server"
-export { HandlersLive } from "./handlers"
+export { AcnBoundaryLive } from "./boundary/acn"
 export { ProviderCredentials, ProviderCredentialsLive } from "./provider-credentials"
 export { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 export { ModelSlotController, ModelSlotControllerLive } from "./model-slot-controller"

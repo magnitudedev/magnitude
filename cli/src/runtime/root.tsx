@@ -1,7 +1,7 @@
 import type { ReactNode } from "react"
 import { Atom, useAtomValue } from "@effect-atom/atom-react"
 import type {
-  AgentClientInstance,
+  AgentClient,
   Platform,
 } from "@magnitudedev/client-common"
 import {
@@ -32,7 +32,7 @@ export type CliRootState =
   | {
       readonly _tag: "Application"
       readonly platform: Platform
-      readonly agentClient: AgentClientInstance
+      readonly agentClient: AgentClient
       readonly app: CliAppProps
     }
 

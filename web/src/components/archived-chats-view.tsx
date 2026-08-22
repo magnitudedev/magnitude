@@ -8,6 +8,8 @@ import {
   useProjectPages,
   useSessionPages,
 } from "@magnitudedev/client-common"
+import { Sessions } from "@magnitudedev/sdk"
+
 
 import {
   AlertDialog,
@@ -42,8 +44,8 @@ export function ArchivedChatsView(): ReactNode {
     query: trimmedSearch || undefined,
     pageSize: 100,
   })
-  const restoreAtom = useMemo(() => client.rpc.mutation("RestoreSession"), [client])
-  const deleteAtom = useMemo(() => client.rpc.mutation("DeleteArchivedSession"), [client])
+  const restoreAtom = useMemo(() => client.mutation(Sessions.RestoreSession), [client])
+  const deleteAtom = useMemo(() => client.mutation(Sessions.DeleteArchivedSession), [client])
   const restoreResult = useAtomValue(restoreAtom)
   const deleteResult = useAtomValue(deleteAtom)
   const restoreSession = useAtomSet(restoreAtom, { mode: "promise" })
@@ -71,10 +73,7 @@ export function ArchivedChatsView(): ReactNode {
     const failed: string[] = []
     for (const sessionId of sessionIds) {
       try {
-        await restoreSession({
-          payload: { sessionId },
-          reactivityKeys: ["sessions", "projects"],
-        })
+        await restoreSession({ sessionId })
       } catch {
         failed.push(sessionId)
       }
@@ -91,10 +90,7 @@ export function ArchivedChatsView(): ReactNode {
     const failed: string[] = []
     for (const sessionId of sessionIds) {
       try {
-        await deleteSession({
-          payload: { sessionId },
-          reactivityKeys: ["sessions", "projects"],
-        })
+        await deleteSession({ sessionId })
       } catch {
         failed.push(sessionId)
       }

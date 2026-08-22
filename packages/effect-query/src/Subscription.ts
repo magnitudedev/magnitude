@@ -10,6 +10,7 @@ import * as Hash from "effect/Hash"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Schedule from "effect/Schedule"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import {
   registerSubscriptionEntry,
@@ -25,6 +26,7 @@ import {
   type SubscriptionFilter,
   type SubscriptionStatus
 } from "./Model.js"
+import * as Operation from "./Operation.js"
 
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Subscription")
 const SetInputTypeId: unique symbol = Symbol("@magnitudedev/effect-query/Subscription/setInput")
@@ -92,6 +94,19 @@ export interface Options<Input, Event, Error, Requirements> {
   readonly gcTime?: Duration.DurationInput
 }
 
+export type DeclarationOptions<
+  Payload extends Operation.PayloadInput,
+  Success extends Schema.Schema.Any,
+  Error extends Schema.Schema.All,
+  Policy extends object,
+  Input,
+  StreamError,
+> = Operation.Shape<Payload, Success, Error, Policy> & {
+  readonly key?: (input: Input) => QueryKey
+  readonly reconnect?: Schedule.Schedule<unknown, StreamError, never>
+  readonly gcTime?: Duration.DurationInput
+}
+
 export const defaultReconnect: Schedule.Schedule<unknown, unknown, never> = Schedule.exponential("100 millis").pipe(
   Schedule.modifyDelay((_, delay) => Duration.min(delay, Duration.seconds(5))),
   Schedule.jittered
@@ -107,13 +122,48 @@ const afterEvaluation: Effect.Effect<void> = Effect.async<void>((resume) => {
   queueMicrotask(() => resume(Effect.void))
 })
 
-export const make = <Input, Event, Error, Requirements>(
+export function make<Input, Event, Error, Requirements>(
   name: string,
   options: Options<Input, Event, Error, Requirements>
-): Subscription<Input, Event, Error, Requirements> => {
-  let definition!: Subscription<Input, Event, Error, Requirements>
-  const keyFor = (input: Input): QueryKey => {
-    const key = options.key(input)
+): Subscription<Input, Event, Error, Requirements>
+export function make<
+  const Name extends string,
+  Payload extends Operation.PayloadInput = typeof Schema.Void,
+  Success extends Schema.Schema.Any = typeof Schema.Void,
+  Error extends Schema.Schema.All = typeof Schema.Never,
+  Policy extends object = {},
+>(
+  name: Name,
+  options: DeclarationOptions<
+    Payload,
+    Success,
+    Error,
+    Policy,
+    Operation.PayloadConstructor<Payload>,
+    Schema.Schema.Type<Error>
+  >,
+): Subscription<
+  Operation.PayloadConstructor<Payload>,
+  Schema.Schema.Type<Success>,
+  Schema.Schema.Type<Error>,
+  Operation.Implementations<any>
+> & Operation.Declared<Name, "subscription", Payload, Success, Error, Policy>
+export function make(
+  name: string,
+  options: Options<any, any, any, any> | (DeclarationOptions<any, any, any, any, any, any> & object),
+): Subscription<any, any, any, any> {
+  const declared = !("stream" in options)
+  let definition!: Subscription<any, any, any, any>
+  const resolvedOptions: Options<any, any, any, any> = declared
+    ? {
+        key: options.key ?? Operation.payloadKey(options.payload ?? Schema.Void),
+        stream: (input) => Operation.stream(definition as Subscription<any, any, any, any> & Operation.Any, input) as never,
+        reconnect: options.reconnect,
+        gcTime: options.gcTime,
+      }
+    : options as Options<any, any, any, any>
+  const keyFor = (input: any): QueryKey => {
+    const key = resolvedOptions.key(input)
     if ((typeof key === "object" && key !== null) && !Equal.isEqual(key)) {
       throw new TypeError(`Subscription ${name} returned a structured key without Effect Equal semantics`)
     }
@@ -121,13 +171,15 @@ export const make = <Input, Event, Error, Requirements>(
   }
   definition = {
     [SubscriptionDefinitionTypeId]: true,
-    [OptionsTypeId]: options,
+    [OptionsTypeId]: resolvedOptions,
     name,
-    match: (input?: Input): SubscriptionFilter => input === undefined
+    match: (input?: any): SubscriptionFilter => input === undefined
       ? { definition }
       : { definition, key: keyFor(input) }
   }
-  return definition
+  return declared
+    ? Operation.attach(definition, name, "subscription", options as never) as never
+    : definition
 }
 
 export const makeAtomFamily = <Provided, RuntimeError, Input, Event, Error, Required extends Provided | Reactivity.Reactivity>(

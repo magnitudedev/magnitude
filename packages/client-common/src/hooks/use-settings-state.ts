@@ -5,10 +5,11 @@
  * Both apps use this identically.
  */
 import { useMemo } from "react"
-import { useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
+import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import { GetModelSlots, ProviderModelCatalogMirror, ProviderIdSchema } from "@magnitudedev/sdk"
+import { Configuration, ProviderIdSchema } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
+
 
 export interface ApiKeyState {
   readonly status: "none" | "loading" | "config"
@@ -52,12 +53,12 @@ export function useSettingsState(): UseSettingsStateResult {
   const client = useAgentClient()
 
   const queryAtom = useMemo(
-    () => client.rpc.query("GetProviderAuth", { providerId: MAGNITUDE_PROVIDER_ID }, { reactivityKeys: ["apiKey"] }),
+    () => Atom.make((get) => get(client.query(Configuration.GetProviderAuth, { providerId: MAGNITUDE_PROVIDER_ID })).result),
     [client],
   )
   const result = useAtomValue(queryAtom)
 
-  const updateProviderAuthAtom = useMemo(() => client.rpc.mutation("UpdateProviderAuth"), [client])
+  const updateProviderAuthAtom = useMemo(() => client.mutation(Configuration.UpdateProviderAuth), [client])
   const updateProviderAuthResult = useAtomValue(updateProviderAuthAtom)
   const updateProviderAuth = useAtomSet(updateProviderAuthAtom)
 
@@ -84,18 +85,12 @@ export function useSettingsState(): UseSettingsStateResult {
   })
 
   function saveApiKey(key: string): void {
-    updateProviderAuth({
-      payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } },
-      reactivityKeys: ["apiKey", ProviderModelCatalogMirror.id, GetModelSlots.name],
-    })
+    updateProviderAuth({ providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key } })
   }
 
   function disconnectApiKey(): void {
     // Clear by setting an empty key — the server can handle this
-    updateProviderAuth({
-      payload: { providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } },
-      reactivityKeys: ["apiKey", ProviderModelCatalogMirror.id, GetModelSlots.name],
-    })
+    updateProviderAuth({ providerId: MAGNITUDE_PROVIDER_ID, auth: { type: "api", key: "" } })
   }
 
   return {
