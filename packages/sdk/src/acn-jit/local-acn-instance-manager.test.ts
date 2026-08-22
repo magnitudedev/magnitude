@@ -18,11 +18,11 @@ import {
 import {
   ProcessGroupAbsent,
   ProcessGroupController,
-  ProcessGroupControllerLive,
   ProcessGroupLeaderLive,
   ProcessGroupStopped,
   makeAcnOwnerStore,
 } from "@magnitudedev/acn-protocol/coordination"
+import { ProcessGroupControllerLive } from "@magnitudedev/acn-protocol/coordination/exact-process"
 import { Duration, Effect, Exit, Fiber, Layer, Option, Schema, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { runAcnEnsure } from "./acn-instance-manager"

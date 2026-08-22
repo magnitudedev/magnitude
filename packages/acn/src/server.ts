@@ -37,13 +37,13 @@ import {
 } from "@magnitudedev/acn-protocol"
 import {
   ProcessGroupController,
-  ProcessGroupControllerLive,
   makeAcnOwnerStore,
   type AcnOwnerStoreError,
   type AcnOwnerStore,
   type ExactProcess,
 } from "@magnitudedev/acn-protocol/coordination"
 import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bun"
+import { ProcessGroupControllerLive } from "@magnitudedev/acn-protocol/coordination/exact-process"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { HandlersLive } from "./handlers"
 import { defaultDataDir } from "./data-dir"
