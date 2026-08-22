@@ -16,15 +16,21 @@ import {
   type AcnTarget,
 } from "@magnitudedev/acn-protocol"
 import {
-  ExactProcessController,
-  ExactProcessControllerLive,
+  ProcessGroupAbsent,
+  ProcessGroupController,
+  ProcessGroupControllerLive,
+  ProcessGroupLeaderLive,
+  ProcessGroupStopped,
   makeAcnOwnerStore,
 } from "@magnitudedev/acn-protocol/coordination"
 import { Duration, Effect, Exit, Fiber, Layer, Option, Schema, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { runAcnEnsure } from "./acn-instance-manager"
 import { ChildProcessSpawner } from "./child-process"
-import { AcnEnsuranceFailed } from "./errors"
+import {
+  AcnCandidateParentChannelReleaseFailed,
+  AcnCandidateSpawnFailed,
+} from "./errors"
 import {
   makeLocalAcnInstanceManager,
   makeLocalAcnInstanceManagerWithProcessController,
@@ -35,26 +41,21 @@ import { SDK_ACN_TARGET, SDK_VERSION } from "../version"
 const platform = Layer.mergeAll(BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer)
 
 const makeExactProcessFixture = Effect.gen(function* () {
-  const exact = yield* ExactProcessControllerLive.current
+  const exact = yield* ProcessGroupControllerLive.currentProcess
   let live = true
   const stop = () => { live = false }
-  const controller = ExactProcessController.of({
-    inspect: (pid) => Effect.succeed(pid === exact.pid && live
-      ? Option.some(exact.processStartIdentity)
-      : Option.none()),
-    current: Effect.succeed(exact),
-    signal: () => Effect.sync(() => {
-      const wasLive = live
+  const controller: ProcessGroupController = {
+    inspect: (pid) => Effect.succeed(pid === exact.pid && live ? Option.some(exact) : Option.none()),
+    currentProcess: Effect.succeed(exact),
+    observe: (group) => Effect.succeed(live
+      ? new ProcessGroupLeaderLive({ group })
+      : new ProcessGroupAbsent({ group })),
+    waitForGroupExit: () => Effect.succeed(!live),
+    stop: (group) => Effect.sync(() => {
       stop()
-      return wasLive
+      return new ProcessGroupStopped({ group })
     }),
-    signalTree: () => Effect.sync(() => {
-      const wasLive = live
-      stop()
-      return wasLive
-    }),
-    treeAbsent: () => Effect.succeed(!live),
-  })
+  }
   return { controller, exact, stop }
 })
 
@@ -104,7 +105,7 @@ describe("LocalAcnInstanceManager", () => {
       }
       const selected = AcnRevisionSchema.make(2_000_000)
       const identity = AcnIdentitySchema.make("2.0.0")
-      const exact = yield* ExactProcessControllerLive.current
+      const exact = yield* ProcessGroupControllerLive.currentProcess
       const owners = yield* makeAcnOwnerStore(dataDir)
       const id = AcnInstanceIdSchema.make("selected-owner")
       const server = Bun.serve({
@@ -140,7 +141,7 @@ describe("LocalAcnInstanceManager", () => {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-upgrade-" })
       const selected = AcnRevisionSchema.make(SDK_ACN_TARGET.revision - 1)
-      const exact = yield* ExactProcessControllerLive.current
+      const exact = yield* ProcessGroupControllerLive.currentProcess
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
@@ -191,7 +192,7 @@ describe("LocalAcnInstanceManager", () => {
         launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, http.client),
-        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ProcessGroupController, processFixture.controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.sync(() => { spawns += 1 }).pipe(Effect.zipRight(Effect.never)),
         })),
@@ -210,7 +211,7 @@ describe("LocalAcnInstanceManager", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-launch-" })
-      const exact = yield* ExactProcessControllerLive.current
+      const exact = yield* ProcessGroupControllerLive.currentProcess
       const id = AcnInstanceIdSchema.make("launched-owner")
       const server = Bun.serve({
         hostname: "127.0.0.1",
@@ -245,9 +246,11 @@ describe("LocalAcnInstanceManager", () => {
           return {
             pid: exact.pid,
             exited: Effect.never,
+            confirmExactProcess: () => Effect.void,
             admit: Effect.void,
+            stopAndReap: Effect.void,
           }
-        }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+        }).pipe(Effect.mapError((error) => new AcnCandidateSpawnFailed({ message: String(error) }))),
       })
       const manager = yield* makeLocalAcnInstanceManager({
         dataDir,
@@ -274,7 +277,7 @@ describe("LocalAcnInstanceManager", () => {
         dataDir,
         launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
       }).pipe(
-        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ProcessGroupController, processFixture.controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.gen(function* () {
             const expected = yield* owners.current
@@ -288,12 +291,14 @@ describe("LocalAcnInstanceManager", () => {
             return {
               pid: processFixture.exact.pid,
               exited: Effect.succeed({ code: 17, stderr: "fatal startup detail" }),
+              confirmExactProcess: () => Effect.void,
               admit: Effect.sync(() => {
                 admissions += 1
                 processFixture.stop()
               }),
+              stopAndReap: Effect.void,
             }
-          }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+          }).pipe(Effect.mapError((error) => new AcnCandidateSpawnFailed({ message: String(error) }))),
         })),
       )
 
@@ -301,7 +306,10 @@ describe("LocalAcnInstanceManager", () => {
       expect(result).toMatchObject({
         _tag: "Left",
         left: {
-          reason: `Magnitude daemon ${processFixture.exact.pid} exited with code 17 after admission before it became ready:\nfatal startup detail`,
+          _tag: "AcnCandidateExitedAfterAdmission",
+          pid: processFixture.exact.pid,
+          code: 17,
+          stderr: "fatal startup detail",
         },
       })
       expect(admissions).toBe(1)
@@ -312,22 +320,22 @@ describe("LocalAcnInstanceManager", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-replaced-owner-exit-" })
-      const current = yield* ExactProcessControllerLive.current
+      const current = yield* ProcessGroupControllerLive.currentProcess
       const candidate = current
       const successor = { ...current, pid: current.pid + 1 }
       const owners = yield* makeAcnOwnerStore(dataDir)
       const successorId = AcnInstanceIdSchema.make("successor-owner")
-      const controller = ExactProcessController.of({
+      const controller: ProcessGroupController = {
         inspect: (pid) => Effect.succeed(
           pid === candidate.pid || pid === successor.pid
-            ? Option.some(current.processStartIdentity)
+            ? Option.some({ pid, processStartIdentity: current.processStartIdentity })
             : Option.none(),
         ),
-        current: Effect.succeed(current),
-        signal: () => Effect.succeed(false),
-        signalTree: () => Effect.succeed(false),
-        treeAbsent: () => Effect.succeed(false),
-      })
+        currentProcess: Effect.succeed(current),
+        observe: (group) => Effect.succeed(new ProcessGroupLeaderLive({ group })),
+        waitForGroupExit: () => Effect.succeed(false),
+        stop: (group) => Effect.succeed(new ProcessGroupStopped({ group })),
+      }
       const http = HttpClient.make((request) => Effect.succeed(
         request.url.includes(":49153/")
           ? HttpClientResponse.fromWeb(request, Response.json(
@@ -347,7 +355,7 @@ describe("LocalAcnInstanceManager", () => {
         launchOverride: { target: SDK_ACN_TARGET, command: ["unused-test-acn"] },
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, http),
-        Effect.provideService(ExactProcessController, controller),
+        Effect.provideService(ProcessGroupController, controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.gen(function* () {
             const replaced = yield* owners.replaceOwner(
@@ -360,17 +368,22 @@ describe("LocalAcnInstanceManager", () => {
             return {
               pid: candidate.pid,
               exited: Effect.succeed({ code: 23, stderr: "original daemon failed" }),
+              confirmExactProcess: () => Effect.void,
               admit: owners.replaceOwner(
                 Option.some({ ...candidate, port: 49_152 }),
                 { ...successor, port: 49_153 },
               ).pipe(
-                Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) })),
+                Effect.mapError((error) => new AcnCandidateParentChannelReleaseFailed({
+                  pid: candidate.pid,
+                  message: String(error),
+                })),
                 Effect.flatMap((result) => result._tag === "Replaced"
                   ? Effect.void
                   : Effect.dieMessage("successor did not replace admitted candidate")),
               ),
+              stopAndReap: Effect.void,
             }
-          }).pipe(Effect.mapError((error) => new AcnEnsuranceFailed({ reason: String(error) }))),
+          }).pipe(Effect.mapError((error) => new AcnCandidateSpawnFailed({ message: String(error) }))),
         })),
       )
 
@@ -378,7 +391,10 @@ describe("LocalAcnInstanceManager", () => {
       expect(result).toMatchObject({
         _tag: "Left",
         left: {
-          reason: `Magnitude daemon ${candidate.pid} exited with code 23 after admission before it became ready:\noriginal daemon failed`,
+          _tag: "AcnCandidateExitedAfterAdmission",
+          pid: candidate.pid,
+          code: 23,
+          stderr: "original daemon failed",
         },
       })
     }).pipe(Effect.provide(platform))))
@@ -402,7 +418,7 @@ describe("LocalAcnInstanceManager", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "acn-instance-manager-timeout-" })
-      const exact = yield* ExactProcessControllerLive.current
+      const exact = yield* ProcessGroupControllerLive.currentProcess
       let spawns = 0
       let cleanups = 0
       const manager = yield* makeLocalAcnInstanceManager({
@@ -415,7 +431,13 @@ describe("LocalAcnInstanceManager", () => {
           Effect.zipRight(Effect.addFinalizer(() => Effect.sync(() => {
             cleanups += 1
           }))),
-          Effect.as({ pid: exact.pid, exited: Effect.never, admit: Effect.void }),
+          Effect.as({
+            pid: exact.pid,
+            exited: Effect.never,
+            confirmExactProcess: () => Effect.void,
+            admit: Effect.void,
+            stopAndReap: Effect.void,
+          }),
         ),
       })))
       const ensuring = yield* runAcnEnsure(manager.ensure({ target: SDK_ACN_TARGET })).pipe(
@@ -424,6 +446,8 @@ describe("LocalAcnInstanceManager", () => {
       )
       while (spawns === 0) yield* Effect.yieldNow()
       yield* TestClock.adjust(Duration.seconds(31))
+      yield* Effect.yieldNow()
+      yield* TestClock.adjust(Duration.seconds(1))
       const result = yield* Fiber.join(ensuring)
       expect(Exit.isFailure(result)).toBe(true)
       expect(spawns).toBe(1)
@@ -459,7 +483,7 @@ describe("LocalAcnInstanceManager", () => {
         binaryPath: `${dataDir}/must-not-be-resolved`,
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, http.client),
-        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ProcessGroupController, processFixture.controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.dieMessage("live starting owner must not spawn"),
         })),
@@ -498,7 +522,7 @@ describe("LocalAcnInstanceManager", () => {
         binaryPath: `${dataDir}/must-not-be-resolved`,
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, http.client),
-        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ProcessGroupController, processFixture.controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.dieMessage("expired starting owner must not spawn"),
         })),
@@ -517,7 +541,7 @@ describe("LocalAcnInstanceManager", () => {
       const result = yield* Fiber.join(ensuring)
       expect(result).toMatchObject({
         _tag: "Left",
-        left: { reason: "Magnitude daemon did not become ready within the startup deadline" },
+        left: { _tag: "AcnDaemonStartupTimedOut", owner: exact },
       })
     }).pipe(Effect.provide(Layer.merge(platform, TestContext.TestContext)))))
   }, 15_000)
@@ -537,7 +561,7 @@ describe("LocalAcnInstanceManager", () => {
         binaryPath: `${dataDir}/must-not-be-resolved`,
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, http.client),
-        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ProcessGroupController, processFixture.controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.dieMessage("unobservable owner must not spawn during grace"),
         })),
@@ -575,7 +599,7 @@ describe("LocalAcnInstanceManager", () => {
         binaryPath: `${dataDir}/must-not-be-resolved`,
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, http.client),
-        Effect.provideService(ExactProcessController, processFixture.controller),
+        Effect.provideService(ProcessGroupController, processFixture.controller),
         Effect.provideService(ChildProcessSpawner, ChildProcessSpawner.of({
           spawn: () => Effect.dieMessage("stopping owner must not spawn during grace"),
         })),

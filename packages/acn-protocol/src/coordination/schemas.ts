@@ -13,6 +13,11 @@ export const ExactProcessSchema = Schema.Struct({
 })
 export type ExactProcess = typeof ExactProcessSchema.Type
 
+export const ProcessGroupSchema = Schema.Struct({
+  leader: ExactProcessSchema,
+})
+export type ProcessGroup = typeof ProcessGroupSchema.Type
+
 export const AcnOwnerRecordSchema = Schema.Struct({
   pid: PositiveSafeInteger,
   processStartIdentity: ProcessStartIdentitySchema,

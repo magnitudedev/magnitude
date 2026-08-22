@@ -3,6 +3,7 @@ applies_to:
   - packages/sdk/src/acn-jit/acn-recovering-client.ts
   - packages/sdk/src/acn-jit/acn-instance-manager.ts
   - packages/sdk/src/acn-jit/local-acn-instance-manager.ts
+  - packages/sdk/src/acn-jit/acn-ensurance-coordinator.ts
   - packages/sdk/src/acn-jit/remote-acn-instance-manager.ts
   - packages/sdk/src/jit-rpc/**
   - packages/client-common/src/state/acn-lifecycle.ts
@@ -77,11 +78,11 @@ Client bootstrap
 |   |   |
 |   |   +-- read owner store                      normally immediate; SQLite contention <= 30s
 |   |   +-- inspect exact process                 normally immediate; facility retry <= 30s
-|   |   +-- classify owner/process tree           one coordination pass
+|   |   +-- classify owner/process group          one coordination pass
 |   |   +-- probe owner health                    <= 2s per request
 |   |   +-- wait between observations             1s polling interval
 |   |   +-- tolerate unobservable live health     <= 30s
-|   |   +-- retire stale/obsolete owner tree       <= 2s shutdown request + 5s graceful
+|   |   +-- supervise stale/obsolete daemon shutdown <= 2s shutdown request + 5s graceful
 |   |   |                                           + 2s TERM + 2s KILL
 |   |   +-- resolve daemon launch material         variable; ensurance remains <= 10m total
 |   |   +-- spawn and inspect candidate            normally immediate

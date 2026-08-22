@@ -2,12 +2,9 @@ import { Context, Data, Effect, type Scope } from "effect"
 
 export type SqliteBinding = string | number | bigint | boolean | null | Uint8Array
 
-export class SqliteDriverBusy extends Data.TaggedError("SqliteDriverBusy")<{
-  readonly operation: string
-}> {}
+export class SqliteDriverBusy extends Data.TaggedError("SqliteDriverBusy")<{}> {}
 
 export class SqliteDriverFailure extends Data.TaggedError("SqliteDriverFailure")<{
-  readonly operation: string
   readonly message: string
 }> {}
 
