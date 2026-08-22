@@ -10,7 +10,6 @@ export {
   AgentClientProvider,
   useAgentClient,
   type AgentClient,
-  type AgentClientInstance,
   type Platform,
   type Storage,
   type Clipboard,

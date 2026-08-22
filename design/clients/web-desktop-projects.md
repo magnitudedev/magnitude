@@ -91,9 +91,9 @@ nothing probes `git --version` at startup, and Project listing performs zero fil
 work.
 
 Project and session changes remain independent invalidation domains, and each durable write
-publishes exactly one notification. Their notifications share the connection-global client
-invalidation transport with mirror invalidations; transport multiplexing does not combine their
-caches or authority. Clients reread bounded authoritative pages on invalidation and never retain
+publishes exactly one notification. Their notifications are pokes on the connection-global
+`StreamChanges` subscription, naming the queries they back, alongside snapshot change pokes;
+transport multiplexing does not combine their caches or authority. Clients reread bounded authoritative pages on invalidation and never retain
 change events as state. Editing a Project rebinds name and cwd as one minimal record
 transition — it does not inspect sessions, release drafts, stop runtimes, or rewrite session cwd.
 

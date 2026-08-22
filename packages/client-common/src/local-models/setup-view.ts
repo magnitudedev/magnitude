@@ -1,15 +1,15 @@
 import { Atom, Result } from "@effect-atom/atom-react"
-import type { AgentClientInstance } from "../state/agent-client"
+import type { AgentClient } from "../state/agent-client"
 import { OnboardingModelSetup } from "./setup"
 
-const makeSetupView = (client: AgentClientInstance) => {
-  const service = client.effectQuery.runtime.atom(OnboardingModelSetup)
+const makeSetupView = (client: AgentClient) => {
+  const service = client.runtime.atom(OnboardingModelSetup)
   return Atom.make((get) => Result.flatMap(get(service), (setup) => get(setup.view)))
 }
 
-const setupViews = new WeakMap<AgentClientInstance, ReturnType<typeof makeSetupView>>()
+const setupViews = new WeakMap<AgentClient, ReturnType<typeof makeSetupView>>()
 
-export const onboardingModelSetupViewAtom = (client: AgentClientInstance) => {
+export const onboardingModelSetupViewAtom = (client: AgentClient) => {
   const existing = setupViews.get(client)
   if (existing !== undefined) return existing
   const view = makeSetupView(client)

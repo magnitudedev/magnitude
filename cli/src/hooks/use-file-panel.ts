@@ -1,13 +1,12 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
-import { Effect, Stream, Cause, Fiber, Runtime } from 'effect'
-import { useAgentClient, selectedFilePathAtom } from '@magnitudedev/client-common'
-import { Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import { useCallback, useMemo } from 'react'
+import { Option } from 'effect'
+import { Files, useAgentClient, selectedFilePathAtom } from '@magnitudedev/client-common'
+import { Atom, Result, useAtomValue, useAtomSet } from '@effect-atom/atom-react'
+import type { ReadFileResult, ResolvePathResult } from '@magnitudedev/sdk'
 import { selectedFileSectionAtom } from '../state/cli-atoms'
 import type { TurnState } from '../utils/file-panel-utils'
-import { logger } from '@magnitudedev/logger'
 import { useFrozenBaseContent } from './use-frozen-base-content'
 import { findActiveFileStream } from '../utils/file-panel-utils'
-import type { ReadFileResult, ResolvePathResult } from '@magnitudedev/sdk'
 
 export interface SelectedFileRef {
   path: string
@@ -50,15 +49,19 @@ export interface UseFilePanelResult {
   closeFilePanel: () => void
 }
 
+/** Null while nothing is selected or the files service is not ready. */
+const idleAtom = Atom.make(() => null)
+
+/**
+ * The selected file's resolution and content are contract queries kept fresh
+ * by the `Files` service while observed; this hook only selects and derives.
+ */
 export function useFilePanel({
   cwd,
   toolState,
-  projectRoot,
 }: UseFilePanelParams): UseFilePanelResult {
-  const atomClient = useAgentClient()
-  const observationRuntimeResult = useAtomValue(atomClient.rpc.runtime)
-  const resolvePathMutation = useAtomSet(atomClient.rpc.mutation('ResolvePath'), { mode: 'promise' })
-  const readFileMutation = useAtomSet(atomClient.rpc.mutation('ReadFile'), { mode: 'promise' })
+  const client = useAgentClient()
+  const files = useMemo(() => client.runtime.atom(Files), [client])
 
   // Selected file is atom state: the path is the shared selectedFilePathAtom
   // (any feature can open a file), the section anchor is CLI-only.
@@ -70,102 +73,38 @@ export function useFilePanel({
     () => (selectedFilePath ? { path: selectedFilePath, section: selectedFileSection } : null),
     [selectedFilePath, selectedFileSection],
   )
-  const [selectedFileResolvedPath, setSelectedFileResolvedPath] = useState<string | null>(null)
-  const [selectedFileContent, setSelectedFileContent] = useState<string | null>(null)
 
-  // Refs to track previous values for imperative side effects (no useEffect)
-  const prevFileRef = useRef<SelectedFileRef | null>(null)
-  const prevResolvedPathRef = useRef<string | null>(null)
-  const hasActiveStreamRef = useRef(false)
-  const watchFiberRef = useRef<Fiber.RuntimeFiber<void, unknown> | null>(null)
+  const resolveAtom = useMemo(
+    () => selectedFilePath && cwd
+      ? Atom.make((get): Result.Result<ResolvePathResult, unknown> | null =>
+          Option.match(Result.value(get(files)), {
+            onNone: () => null,
+            onSome: (service) => get(service.resolve({ cwd, path: selectedFilePath })).result,
+          }))
+      : idleAtom,
+    [files, cwd, selectedFilePath],
+  )
+  const resolveResult = useAtomValue(resolveAtom)
+  const selectedFileResolvedPath = resolveResult !== null
+    && Result.isSuccess(resolveResult)
+    && resolveResult.value.exists
+      ? resolveResult.value.resolved
+      : null
 
-  const readFile = useCallback(async (path: string): Promise<string | null> => {
-    if (!cwd) return null
-    try {
-      const result = await readFileMutation({ payload: { cwd, path } }) as ReadFileResult
-      return result.content
-    } catch (err) {
-      logger.error({ path, error: err instanceof Error ? err.message : String(err) }, 'Failed to read file')
-      return null
-    }
-  }, [cwd, readFileMutation])
-
-  // Resolve path when selectedFile changes — imperative during render
-  if (prevFileRef.current !== selectedFile) {
-    prevFileRef.current = selectedFile
-
-    if (!selectedFile || !cwd) {
-      setSelectedFileResolvedPath(null)
-    } else {
-      void (async () => {
-        try {
-          const result = await resolvePathMutation({
-            payload: { cwd: cwd!, path: selectedFile.path, checkExists: true },
-          }) as ResolvePathResult
-          if (!result.exists) {
-            logger.warn({ path: selectedFile.path, cwd: projectRoot }, 'Selected file does not exist')
-            setSelectedFileResolvedPath(null)
-          } else {
-            setSelectedFileResolvedPath(result.resolved)
-          }
-        } catch (err) {
-          logger.error({ path: selectedFile.path, cwd: projectRoot, error: err instanceof Error ? err.message : String(err) }, 'Failed to resolve selected file')
-          setSelectedFileResolvedPath(null)
-        }
-      })()
-    }
-  }
-
-  // Read file + set up watch when resolved path changes — imperative during render
-  if (prevResolvedPathRef.current !== selectedFileResolvedPath) {
-    prevResolvedPathRef.current = selectedFileResolvedPath
-
-    // Clean up previous watch fiber
-    if (watchFiberRef.current) {
-      Effect.runFork(Fiber.interrupt(watchFiberRef.current))
-      watchFiberRef.current = null
-    }
-
-    if (!selectedFile || !selectedFileResolvedPath || !cwd) {
-      setSelectedFileContent(null)
-    } else {
-      const path = selectedFile.path
-      const watchCwd = cwd
-
-      // Read file
-      void readFile(path).then((content) => {
-        if (content !== null) setSelectedFileContent(content)
-      })
-
-      // Set up file watch via streaming RPC
-      if (Result.isSuccess(observationRuntimeResult)) {
-        const watchEffect = Effect.gen(function* () {
-          const c = yield* atomClient.rpc
-          yield* c('WatchFile', { cwd: watchCwd, path }).pipe(
-            Stream.runForEach((_event) =>
-              Effect.sync(() => {
-                if (hasActiveStreamRef.current) return
-                void readFile(path).then((content) => {
-                  if (content !== null) setSelectedFileContent(content)
-                })
-              })
-            ),
-          )
-        }).pipe(
-          Effect.catchAllCause((cause) =>
-            Cause.isInterruptedOnly(cause)
-              ? Effect.void
-              : Effect.sync(() => {
-                  const message = Cause.pretty(cause)
-                  logger.error({ path, error: message }, 'File watch error')
-                })
-          ),
-          Effect.provide(observationRuntimeResult.value),
-        )
-        watchFiberRef.current = Runtime.runFork(observationRuntimeResult.value)(watchEffect)
-      }
-    }
-  }
+  const readAtom = useMemo(
+    () => selectedFilePath && cwd && selectedFileResolvedPath !== null
+      ? Atom.make((get): Result.Result<ReadFileResult, unknown> | null =>
+          Option.match(Result.value(get(files)), {
+            onNone: () => null,
+            onSome: (service) => get(service.read({ cwd, path: selectedFilePath, format: 'text' })).result,
+          }))
+      : idleAtom,
+    [files, cwd, selectedFilePath, selectedFileResolvedPath],
+  )
+  const readResult = useAtomValue(readAtom)
+  const selectedFileContent = readResult !== null && Result.isSuccess(readResult)
+    ? readResult.value.content
+    : null
 
   const activeStream = useMemo(() => {
     if (!selectedFile || !toolState) return null
@@ -181,18 +120,8 @@ export function useFilePanel({
     return null
   }, [selectedFile, selectedFileResolvedPath, toolState])
 
-  // Track active stream via ref (no useEffect)
-  hasActiveStreamRef.current = activeStream != null
-
-  const readSelectedFile = useCallback(async () => {
-    if (!selectedFile || !cwd) {
-      setSelectedFileContent(null)
-      return null
-    }
-    const content = await readFile(selectedFile.path)
-    if (content !== null) setSelectedFileContent(content)
-    return content
-  }, [selectedFile, cwd, readFile])
+  // The read query is live; the latest content is the disk content.
+  const readSelectedFile = useCallback(() => selectedFileContent, [selectedFileContent])
 
   const frozenBaseContent = useFrozenBaseContent(
     activeStream ? { toolCallId: activeStream.toolCallId } : null,

@@ -4,7 +4,7 @@ import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import type { AcnSubscriptionControl } from "@magnitudedev/acn-protocol"
 
 describe("AcnSubscriptions", () => {
-  it("targets session suspension and broadcasts ACN termination", async () => {
+  it("broadcasts ACN termination to every registered subscription", async () => {
     const program = Effect.gen(function* () {
       const subscriptions = yield* AcnSubscriptions
       const first = yield* Ref.make<AcnSubscriptionControl[]>([])
@@ -15,19 +15,16 @@ describe("AcnSubscriptions", () => {
       const firstHandle = yield* subscriptions.register({
         clientId: 1,
         requestId: "1",
-        sessionId: "session-a",
         emit: emit(first),
         close: Effect.void,
       })
       const secondHandle = yield* subscriptions.register({
         clientId: 2,
         requestId: "2",
-        sessionId: "session-b",
         emit: emit(second),
         close: Effect.void,
       })
 
-      yield* subscriptions.suspendSession("session-a")
       yield* subscriptions.terminate
       yield* firstHandle.unregister
       yield* secondHandle.unregister
@@ -37,13 +34,8 @@ describe("AcnSubscriptions", () => {
     }).pipe(Effect.provide(AcnSubscriptionsLive))
     const result = await Effect.runPromise(Effect.scoped(program))
 
-    expect(result[0]).toEqual([
-      { _tag: "suspended", reason: "session-offloaded" },
-      { _tag: "terminated", reason: "acn-shutdown" },
-    ])
-    expect(result[1]).toEqual([
-      { _tag: "terminated", reason: "acn-shutdown" },
-    ])
+    expect(result[0]).toEqual([{ _tag: "terminated", reason: "acn-shutdown" }])
+    expect(result[1]).toEqual([{ _tag: "terminated", reason: "acn-shutdown" }])
   })
 
   it("terminates subscriptions admitted after shutdown begins", async () => {

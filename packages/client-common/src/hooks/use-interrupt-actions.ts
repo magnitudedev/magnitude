@@ -6,8 +6,10 @@
  */
 import { useAtomSet } from "@effect-atom/atom-react"
 import { useMemo } from "react"
+import { Agent } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { useSelectedSessionId } from "../display-view-controller/hooks"
+
 
 export interface UseInterruptActionsResult {
   /** Interrupt a specific fork, or the root agent if forkId is null */
@@ -19,26 +21,22 @@ export interface UseInterruptActionsResult {
 export function useInterruptActions(): UseInterruptActionsResult {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptAtom = useMemo(() => client.rpc.mutation("Interrupt"), [client])
+  const interruptAtom = useMemo(() => client.mutation(Agent.Interrupt), [client])
   const interruptMutation = useAtomSet(interruptAtom)
 
   function interrupt(forkId?: string | null): void {
     if (!selectedSessionId) return
     interruptMutation({
-      payload: {
-        sessionId: selectedSessionId,
-        target: { _tag: "fork", forkId: forkId ?? null },
-      },
+      sessionId: selectedSessionId,
+      target: { _tag: "fork", forkId: forkId ?? null },
     })
   }
 
   function interruptAll(): void {
     if (!selectedSessionId) return
     interruptMutation({
-      payload: {
-        sessionId: selectedSessionId,
-        target: { _tag: "all" },
-      },
+      sessionId: selectedSessionId,
+      target: { _tag: "all" },
     })
   }
 

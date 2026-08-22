@@ -48,7 +48,6 @@ class FakeCore {
 
   getSnapshot = (): DisplayViewControllerSnapshot => ({
     selectedSessionId: "session-a",
-    viewId: "main:session-a",
     expandedForkStack: [],
     rootTailLimit: this.rootTailLimit,
     displayMode: "default",

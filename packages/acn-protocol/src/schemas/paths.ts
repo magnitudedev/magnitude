@@ -56,3 +56,9 @@ export const RelativePathSchema = Schema.String.pipe(
   Schema.brand("RelativePath"),
 )
 export type RelativePath = typeof RelativePathSchema.Type
+
+/** The directory containing `path`; the root ("") for a top-level entry. */
+export const parentDirectory = (path: RelativePath): RelativePath => {
+  const index = path.lastIndexOf("/")
+  return RelativePathSchema.make(index === -1 ? "" : path.slice(0, index))
+}

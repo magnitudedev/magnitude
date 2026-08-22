@@ -8,7 +8,7 @@ applies_to:
   - packages/acn/src/local-model-**
   - packages/acn/src/local-provider-**
   - packages/acn/src/model-slot-**
-  - packages/acn-protocol/src/rpcs/local-inference.ts
+  - packages/acn-protocol/src/boundary/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
 ---
 

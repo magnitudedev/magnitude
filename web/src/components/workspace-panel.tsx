@@ -11,7 +11,6 @@ import { FilePlus2, FileText, FolderTree, Globe2, PanelRight, Plus, X } from "lu
 import { Atom, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Effect, Option } from "effect"
 import {
-  useProjectFilesWatch,
   type BrowserTabId,
   type BrowserWorkspaceState,
   type EmbeddedBrowserCapability,
@@ -97,11 +96,6 @@ const runCommand = <A,>(command: Promise<A>, failure: string, onSuccess?: (value
 type PendingDiscard =
   | { readonly kind: "close"; readonly tab: WorkspaceFileTab }
   | { readonly kind: "open"; readonly tab: WorkspaceFileTab; readonly path: RelativePath }
-
-function ProjectFilesWatch({ projectId }: { readonly projectId: ProjectId }): null {
-  useProjectFilesWatch(projectId)
-  return null
-}
 
 function WorkspaceTabView({
   tab,
@@ -281,7 +275,6 @@ export function WorkspacePanel({
       }}
       className={`relative flex shrink-0 overflow-visible ${entering && !resizing ? "animate-[workspace-panel-open_150ms_ease-out]" : ""}`}
     >
-      {projectId !== null ? <ProjectFilesWatch projectId={projectId} /> : null}
       {!fullWidth ? (
         <ResizableEdge
           side="left"

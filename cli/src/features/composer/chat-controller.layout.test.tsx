@@ -98,13 +98,12 @@ vi.mock('@magnitudedev/client-common', async () => {
       setSelectedIndex: () => {},
       handleKeyIntercept: () => false,
     }),
-    useAgentClient: () => ({
-      rpc: {
-        query: () => ({ pipe: () => {} }),
-        mutation: () => ({ pipe: () => {} }),
-        runtime: { pipe: () => {} },
-        pipe: () => {},
-      },
+    useFileReads: () => ({
+      resolvePath: () => Promise.reject(new Error('unused in layout test')),
+      readFile: () => Promise.reject(new Error('unused in layout test')),
+    }),
+    useMentionSearchClient: () => ({
+      searchMentions: () => Promise.resolve({ items: [], recentItems: [], overflowCount: 0 }),
     }),
   }
 })

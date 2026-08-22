@@ -1,35 +1,59 @@
+import { Context, Effect, Layer, PubSub, Stream } from "effect"
 import {
-  projectChangeQueries,
-  sessionChangeQueries,
+  Projects,
+  Sessions,
   type Change,
-  type MirroredStateInvalidation,
 } from "@magnitudedev/acn-protocol"
-import { Stream } from "effect"
+import { ProjectStore } from "./project-store"
+import { SessionInspector } from "./session-inspector"
 
 /**
- * Multiplexes every ACN change source onto one stream of pokes in the
- * clients' query-identity space. A mirror commit names its own query (the
- * mirror id is the query's tag) with its revision; a store commit names every
- * query it backs.
+ * The ACN change registry: every change source publishes pokes in the
+ * clients' query-identity space, and `StreamChanges` serves the multiplexed
+ * stream. Publishing is fire-and-forget; the stream is bounded and coalescing,
+ * so a late subscriber rereads authoritative state instead of replaying history.
  */
-export const mergeChanges = <MirrorError, ProjectError, SessionError>(sources: {
-  readonly mirrors: Stream.Stream<MirroredStateInvalidation, MirrorError>
-  readonly projects: Stream.Stream<unknown, ProjectError>
-  readonly sessions: Stream.Stream<unknown, SessionError>
-}): Stream.Stream<Change, MirrorError | ProjectError | SessionError> => {
-  type ChangeError = MirrorError | ProjectError | SessionError
-  return Stream.mergeAll([
-    sources.mirrors.pipe(
-      Stream.map((invalidation): Change => ({ query: invalidation.id, revision: invalidation.revision })),
-      Stream.mapError((error): ChangeError => error),
-    ),
-    sources.projects.pipe(
-      Stream.mapConcat((): ReadonlyArray<Change> => projectChangeQueries.map((query) => ({ query }))),
-      Stream.mapError((error): ChangeError => error),
-    ),
-    sources.sessions.pipe(
-      Stream.mapConcat((): ReadonlyArray<Change> => sessionChangeQueries.map((query) => ({ query }))),
-      Stream.mapError((error): ChangeError => error),
-    ),
-  ], { concurrency: 3 })
+export interface AcnChangesApi {
+  readonly publish: (change: Change) => Effect.Effect<void>
+  readonly stream: Stream.Stream<Change>
 }
+
+export class AcnChanges extends Context.Tag("AcnChanges")<AcnChanges, AcnChangesApi>() {}
+
+export const AcnChangesLive: Layer.Layer<AcnChanges> = Layer.effect(
+  AcnChanges,
+  Effect.gen(function* () {
+    const events = yield* PubSub.sliding<Change>(256)
+    return AcnChanges.of({
+      publish: (change) => PubSub.publish(events, change).pipe(Effect.asVoid),
+      stream: Stream.fromPubSub(events),
+    })
+  }),
+)
+
+/** Queries whose authoritative data a project-store commit may change. */
+export const projectChangeQueries: ReadonlyArray<string> = [Projects.ListProjects.name, Projects.InspectProject.name]
+/** Queries whose authoritative data a session-metadata commit may change. */
+export const sessionChangeQueries: ReadonlyArray<string> = [
+  Sessions.ListSessions.name,
+  Sessions.ListRecentSessionDirectories.name,
+  Sessions.GetSession.name,
+]
+
+/**
+ * Forwards storage-level change streams into the registry: a store commit
+ * names every query it backs. Versioned snapshots publish their own pokes.
+ */
+export const AcnStorageChangesLive: Layer.Layer<never, never, AcnChanges | ProjectStore | SessionInspector> =
+  Layer.scopedDiscard(Effect.gen(function* () {
+    const changes = yield* AcnChanges
+    const projects = yield* ProjectStore
+    const sessions = yield* SessionInspector
+    const forward = (source: Stream.Stream<unknown>, queries: ReadonlyArray<string>) =>
+      source.pipe(
+        Stream.runForEach(() => Effect.forEach(queries, (query) => changes.publish({ query }), { discard: true })),
+        Effect.forkScoped,
+      )
+    yield* forward(projects.changes, projectChangeQueries)
+    yield* forward(sessions.changes, sessionChangeQueries)
+  }))

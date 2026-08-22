@@ -1,33 +1,41 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Exit } from "effect"
-import { ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS } from "@magnitudedev/acn-protocol"
-import { acnSubscriptionProtocol, acnSubscriptionTags } from "./acn-subscription-protocol"
+import { ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS, AcnRpc, AcnBoundary } from "@magnitudedev/acn-protocol"
+import { acnSubscriptionProtocol } from "./acn-subscription-protocol"
 
 describe("ACN subscription protocol", () => {
-  it("derives only explicitly declared subscription RPCs", () => {
-    expect(acnSubscriptionTags).toEqual(new Set([
+  it("treats exactly the group's stream Rpcs as subscriptions", () => {
+    const subscriptions = AcnRpc.operations(AcnBoundary)
+      .map((operation) => operation.name)
+      .filter(acnSubscriptionProtocol.isStream)
+      .sort()
+    expect(subscriptions).toEqual([
       "StreamActiveSessionStatuses",
       "StreamChanges",
       "StreamDisplayView",
       "WatchFile",
       "WatchProjectFiles",
-    ]))
+    ])
     expect(acnSubscriptionProtocol.isStream("CheckFileExists")).toBe(false)
   })
 
-  it("consumes controls and forwards only encoded payload frames", async () => {
-    const payload = { _tag: "payload" as const, payload: { event: "changed", path: "/x" } }
+  it("consumes controls and unwraps payload frames to encoded domain values", async () => {
     const decoded = await Effect.runPromise(acnSubscriptionProtocol.decodeChunk([
       { _tag: "keepalive" },
-      { _tag: "suspended", reason: "session-offloaded" },
-      payload,
+      { _tag: "payload", payload: { event: "changed", path: "/x" } },
+      { _tag: "payload", payload: 42 },
     ]))
 
     expect(decoded).toEqual({
       _tag: "Continue",
-      values: [payload],
+      values: [{ event: "changed", path: "/x" }, 42],
       progressed: true,
     })
+  })
+
+  it("reports keepalive-only chunks as no progress", async () => {
+    const decoded = await Effect.runPromise(acnSubscriptionProtocol.decodeChunk([{ _tag: "keepalive" }]))
+    expect(decoded).toEqual({ _tag: "Continue", values: [], progressed: false })
   })
 
   it("reports authoritative termination without forwarding it", async () => {

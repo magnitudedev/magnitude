@@ -13,7 +13,7 @@ import {
   type ProviderModel,
 } from "@magnitudedev/sdk"
 import { LocalProviderOfferings } from "./local-provider-offerings"
-import { MirroredStateChangesLive } from "./mirrored-state"
+import { AcnChangesLive } from "./changes"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderClient } from "@magnitudedev/sdk"
 import { AcnActivityTrackerLive } from "./activity-tracker"
@@ -112,7 +112,7 @@ describe("provider model catalog", () => {
           catalogChanges: Stream.fromPubSub(localChanges),
           resolve: () => Effect.die("unused"),
         })),
-        MirroredStateChangesLive,
+        AcnChangesLive,
         AcnActivityTrackerLive.pipe(
           Layer.provide(AcnServiceLifecycleLive("30 minutes")),
         ),

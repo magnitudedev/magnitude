@@ -1,6 +1,6 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
-  GetLocalModels,
+  LocalInference,
   LocalModelsStateSchema,
   ServableModelBundleSchema,
   sameServableModelBundleIdentity,
@@ -26,7 +26,8 @@ import {
 import type { ProviderModelId } from "@magnitudedev/ai"
 import { IcnInstances, IcnModels } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
-import { makeMirroredState, MirroredStateChanges } from "./mirrored-state"
+import { AcnChanges } from "./changes"
+import { makeMirroredState } from "./mirrored-state"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
@@ -359,7 +360,7 @@ export const LocalModelsLive: Layer.Layer<
   never,
   IcnModels | LocalModelPackages | LocalModelRecommendations
     | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
-    | IcnInstances | MirroredStateChanges
+    | IcnInstances | AcnChanges
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const icnModels = yield* IcnModels
   const packages = yield* LocalModelPackages
@@ -368,8 +369,8 @@ export const LocalModelsLive: Layer.Layer<
   const offerings = yield* LocalProviderOfferings
   const hardware = yield* LocalInferenceHardwareService
   const instances = yield* IcnInstances
-  const mirror = yield* makeMirroredState(
-    { id: GetLocalModels.name, stateSchema: LocalModelsStateSchema },
+  const mirror = yield* makeMirroredState<LocalModelsState>(
+    { name: LocalInference.GetLocalModels.name },
     {
       inventoryState: { _tag: "Initializing" },
       models: [],

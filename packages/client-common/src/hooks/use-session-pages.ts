@@ -1,24 +1,27 @@
 /**
  * Paginated session list over `SessionInspector` pages.
  *
- * The first page is one reactive query; "Show more" explicitly requests
+ * The first page is one query; "Show more" explicitly requests
  * continuation pages (optionally with a different page size — cursors
  * fingerprint predicates, not limits). `loadAll` follows cursors to
- * exhaustion through plain read RPCs for select-all flows. Nothing here
- * auto-loads on scroll or issues a mutation.
+ * exhaustion through plain reads for select-all flows. Nothing here
+ * auto-loads on scroll or issues a mutation. Pages stay fresh through the
+ * connection's change pokes.
  */
 import { useCallback, useMemo } from "react"
 import { Effect, Option } from "effect"
-import { useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import type {
-  DirectoryPath,
-  SessionArchiveFilter,
-  SessionMetadata,
-  SessionPageCursor,
-  SessionPinFilter,
+import { Atom, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Key, QueryClient } from "@magnitudedev/effect-query"
+import {
+  Sessions,
+  type DirectoryPath,
+  type SessionArchiveFilter,
+  type SessionMetadata,
+  type SessionPageCursor,
+  type SessionPinFilter,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-import { appendRequestedPage, makePageSet } from "../data/paginated-query"
+import { appendRequestedPage, makePageSet, type RequestedPage } from "../data/paginated-query"
 import { sessionsToRecentChats, type RecentChat } from "../data/recent-chats"
 
 const DEFAULT_SESSION_PAGE_SIZE = 50
@@ -61,19 +64,23 @@ export function useSessionPages(params?: UseSessionPagesParams): UseSessionPages
     limit,
   }), [cwd, archive, pin, query])
 
-  const pageSet = useMemo(() => makePageSet<SessionMetadata, SessionPageCursor>({
-    firstPage: client.rpc.query(
-      "ListSessions",
-      payload(Option.none(), pageSize),
-      { reactivityKeys: ["sessions"] },
-    ),
-    continuationPage: ({ cursor, limit }) => client.rpc.query(
-      "ListSessions",
-      payload(Option.some(cursor), limit ?? pageSize),
-      { reactivityKeys: ["sessions"] },
-    ),
-    itemKey: (session) => session.sessionId,
-  }), [client, payload, pageSize])
+  const pageSet = useMemo(() => {
+    const page = (cursor: Option.Option<SessionPageCursor>, limit: number) =>
+      Atom.make((get) => get(client.query(Sessions.ListSessions, payload(cursor, limit))).result)
+    const continuations = new Map<string, ReturnType<typeof page>>()
+    return makePageSet<SessionMetadata, SessionPageCursor>({
+      firstPage: page(Option.none(), pageSize),
+      continuationPage: (request: RequestedPage<SessionPageCursor>) => {
+        const key = Key.canonical(request)
+        const existing = continuations.get(key)
+        if (existing !== undefined) return existing
+        const created = page(Option.some(request.cursor), request.limit ?? pageSize)
+        continuations.set(key, created)
+        return created
+      },
+      itemKey: (session) => session.sessionId,
+    })
+  }, [client, payload, pageSize])
 
   const snapshot = useAtomValue(pageSet.snapshot)
   const setRequested = useAtomSet(pageSet.requestedPages)
@@ -83,13 +90,12 @@ export function useSessionPages(params?: UseSessionPagesParams): UseSessionPages
     setRequested((current) => appendRequestedPage(current, nextCursor, limit))
   }, [nextCursor, setRequested])
 
-  const loadAllAtom = useMemo(() => client.rpc.runtime.fn<void>()(() =>
+  const loadAllAtom = useMemo(() => client.runtime.fn<void>()(() =>
     Effect.gen(function* () {
-      const rpc = yield* client.rpc
       const all: SessionMetadata[] = []
       let cursor = Option.none<SessionPageCursor>()
       while (true) {
-        const page = yield* rpc("ListSessions", payload(cursor, 100))
+        const page = yield* QueryClient.fetch(Sessions.ListSessions, payload(cursor, 100))
         all.push(...page.items)
         if (Option.isNone(page.nextCursor)) break
         cursor = Option.some(page.nextCursor.value)

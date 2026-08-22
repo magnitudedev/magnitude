@@ -33,7 +33,8 @@ import {
 } from "@magnitudedev/storage"
 import {
   AcnHealthResponseSchema,
-  MagnitudeRpcs,
+  AcnBoundary,
+  AcnRpc,
 } from "@magnitudedev/acn-protocol"
 import {
   ProcessGroupController,
@@ -45,7 +46,7 @@ import {
 import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bun"
 import { ProcessGroupControllerLive } from "@magnitudedev/acn-protocol/coordination/exact-process"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
-import { HandlersLive } from "./handlers"
+import { AcnBoundaryLive } from "./boundary/acn"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
@@ -104,7 +105,7 @@ import {
   ACN_INSTANCE_ID,
   makeHealthResponse,
 } from "./identity"
-import { MirroredStateChangesLive } from "./mirrored-state"
+import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
 import {
@@ -353,12 +354,14 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     AcnSubscriptionsLive,
     withActivity
   )
-  const withMirroredStateChanges = Layer.provideMerge(
-    MirroredStateChangesLive,
-    withSubscriptions
+  // The change registry serves `StreamChanges`; storage change streams are
+  // forwarded into it here, versioned snapshots publish their own pokes.
+  const withChanges = Layer.provideMerge(
+    AcnStorageChangesLive,
+    Layer.provideMerge(AcnChangesLive, withSubscriptions),
   )
   const localServices = addLocalInferenceServices(
-    withMirroredStateChanges,
+    withChanges,
     dataDir
   )
   const withSharedClient = Layer.provideMerge(
@@ -632,7 +635,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
             })),
           )
       const serviceContext = Context.merge(infrastructure, builtServices.context)
-      const handlers = yield* Layer.buildWithScope(HandlersLive, applicationScope).pipe(
+      const handlers = yield* Layer.buildWithScope(AcnBoundaryLive, applicationScope).pipe(
         Effect.provide(serviceContext),
       )
       const applicationContext = Context.merge(serviceContext, handlers)
@@ -644,7 +647,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
         Effect.provide(applicationContext),
       )
-      yield* RpcServer.make(MagnitudeRpcs).pipe(
+      yield* AcnRpc.makeRpcServer(AcnBoundary).pipe(
         Effect.provideService(RpcServer.Protocol, protocol),
         Effect.provide(applicationContext),
         Effect.forkIn(applicationScope),

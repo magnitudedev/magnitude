@@ -50,8 +50,7 @@ import {
   selectedSlotModel,
   reasoningEffortControl,
   formatReasoningEffort,
-  useActiveSessionStatusesSubscription,
-  activeSessionStatusesAtom,
+  useActiveSessionStatuses,
 } from "@magnitudedev/client-common"
 import { SessionsSidebar } from "./components/sessions-sidebar"
 import { ChatTimeline } from "./components/chat-timeline"
@@ -102,13 +101,16 @@ import {
   type SlotProfiles,
 } from "@magnitudedev/client-common"
 import {
+  Agent,
   isRoleId,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
+  Projects,
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
+  Sessions,
 } from "@magnitudedev/sdk"
 import type {
   AcnLifecycleState,
@@ -161,7 +163,7 @@ function SessionsSidebarContainer(props?: {
   const client = useAgentClient()
   const { startNewSession, resumeSession } = useSessionActions()
   const selectedSessionId = useSelectedSessionId()
-  const activeSessionStatuses = useAtomValue(activeSessionStatusesAtom)
+  const activeSessionStatuses = useActiveSessionStatuses()
   const settingsTab = useAtomValue(settingsTabAtom)
   const setSettingsTab = useAtomSet(settingsTabAtom)
   const selectedProjectId = useAtomValue(selectedProjectIdAtom)
@@ -188,9 +190,9 @@ function SessionsSidebarContainer(props?: {
     []
   )
   useAtomMount(focusSearchAtom)
-  const archiveSessionAtom = useMemo(() => client.rpc.mutation("ArchiveSession"), [client])
-  const setSessionPinnedAtom = useMemo(() => client.rpc.mutation("SetSessionPinned"), [client])
-  const revealProjectAtom = useMemo(() => client.rpc.mutation("RevealProjectSource"), [client])
+  const archiveSessionAtom = useMemo(() => client.mutation(Sessions.ArchiveSession), [client])
+  const setSessionPinnedAtom = useMemo(() => client.mutation(Sessions.SetSessionPinned), [client])
+  const revealProjectAtom = useMemo(() => client.mutation(Projects.RevealProjectSource), [client])
   const archiveSession = useAtomSet(archiveSessionAtom, {
     mode: "promise",
   })
@@ -211,26 +213,19 @@ function SessionsSidebarContainer(props?: {
         resumeSession(session.sessionId)
       }}
       onArchiveSession={(session) => {
-        void archiveSession({
-          payload: { sessionId: session.sessionId },
-          reactivityKeys: ["sessions"],
-        }).then(() => {
+        void archiveSession({ sessionId: session.sessionId }).then(() => {
           if (session.sessionId !== selectedSessionId) return
           startNewSession({ cwd: session.cwd, projectId: null })
         }).catch(() => notify("error", "Could not archive this session."))
       }}
       onSetSessionPinned={(sessionId, pinned) => {
-        void setSessionPinned({
-          payload: { sessionId, pinned },
-          reactivityKeys: ["sessions"],
-        }).catch(() => notify("error", `Could not ${pinned ? "pin" : "unpin"} this session.`))
+        void setSessionPinned({ sessionId, pinned })
+          .catch(() => notify("error", `Could not ${pinned ? "pin" : "unpin"} this session.`))
       }}
       onCompose={handleCompose}
       onRevealProject={(projectId) => {
-        void revealProject({
-          payload: { projectId },
-          reactivityKeys: [],
-        }).catch(() => notify("error", "Could not reveal this project folder."))
+        void revealProject({ projectId })
+          .catch(() => notify("error", "Could not reveal this project folder."))
       }}
       onCreateProject={(project) => {
         setSettingsTab(null)
@@ -624,15 +619,7 @@ function ChatTitleBar({
   const selectedSessionAtom = useMemo(
     () =>
       selectedSessionId
-        ? client.rpc.query(
-            "GetSession",
-            {
-              sessionId: selectedSessionId,
-            },
-            {
-              reactivityKeys: ["sessions"],
-            }
-          )
+        ? Atom.make((get) => get(client.query(Sessions.GetSession, { sessionId: selectedSessionId })).result)
         : Atom.make(() => null),
     [client, selectedSessionId]
   )
@@ -796,7 +783,7 @@ function ChatTitleBar({
 function useInterruptAllListener(): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptMutation = useAtomSet(client.rpc.mutation("Interrupt"))
+  const interruptMutation = useAtomSet(client.mutation(Agent.Interrupt))
   const interruptAtom = useMemo(
     () =>
       Atom.make(
@@ -804,11 +791,9 @@ function useInterruptAllListener(): void {
           const handler = () => {
             if (!selectedSessionId) return
             interruptMutation({
-              payload: {
-                sessionId: selectedSessionId,
-                target: {
-                  _tag: "all",
-                },
+              sessionId: selectedSessionId,
+              target: {
+                _tag: "all",
               },
             })
           }
@@ -912,7 +897,6 @@ function AuthenticatedAppContent({
   isNarrow: boolean
 }): ReactNode {
   useSessionPreload()
-  useActiveSessionStatusesSubscription()
   useInitializeConversationPreferences()
   const connectionError = useDisplayConnectionError()
   const platform = usePlatform()

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Layer } from "effect"
-import { RpcClient } from "@effect/rpc"
-import type { DisplayTimeline } from "@magnitudedev/sdk"
+import * as Registry from "@effect-atom/atom/Registry"
+import { Client } from "@magnitudedev/effect-query"
+import { type DisplayTimeline } from "@magnitudedev/sdk"
 import {
   createDisplayViewStore,
   displayShapeFor,
@@ -10,26 +11,21 @@ import {
   WORKER_TIMELINE_LIMIT,
 } from "../sync/index"
 import { EMPTY_DISPLAY_STATE } from "../state/empty-display-state"
+import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"
 import {
   desiredShapeForSnapshot,
   DisplayViewControllerCore,
   timelineStatusFor,
 } from "./controller"
 
-const protocolLayer: Layer.Layer<RpcClient.Protocol, never, never> = Layer.scoped(
-  RpcClient.Protocol,
-  RpcClient.Protocol.make(() =>
-    Effect.succeed({
-      send: () => Effect.void,
-      supportsAck: false,
-      supportsTransferables: false,
-    }),
-  ),
+const client = Client.make(
+  fakeAcnImplementationsLayer((tag) => Effect.dieMessage(`Unexpected RPC ${tag}`)),
 )
 
 const makeController = (): DisplayViewControllerCore =>
   new DisplayViewControllerCore({
-    protocolLayer,
+    client,
+    registry: Registry.make(),
     displaySync: createDisplayViewStore(EMPTY_DISPLAY_STATE, EMPTY_DISPLAY_VIEW_SHAPE),
   })
 

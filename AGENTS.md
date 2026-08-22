@@ -10,7 +10,7 @@ clients (cli/web) → client-common → sdk → acn (daemon)
 ```
 
 - **Clients** import only from `@magnitudedev/client-common` and `@magnitudedev/sdk`. Never from `acn`, `agent`, `acn-protocol`, `ai`, or `providers` directly.
-- **client-common** — shared state, hooks, display sync. Uses `AgentClient` (AtomRpc over `MagnitudeRpcs`).
+- **client-common** — shared state, hooks, display sync. Uses one connection-scoped Effect Query `AgentClient` over the SDK-provided ACN transport.
 - **sdk** — typed RPC client, daemon lifecycle (`DaemonSpawner`), `ProviderClient`, binary resolution. Re-exports ACN protocol types.
 - **acn** — server daemon hosting agent runtime, sessions, file ops, display streams. Implements ACN protocol RPCs.
 - **acn-protocol** — wire contract (RPCs, schemas) shared by SDK and ACN. Not imported by clients.
@@ -21,7 +21,7 @@ clients (cli/web) → client-common → sdk → acn (daemon)
 - **roles** — role/slot definitions for worker specialization.
 - **storage** — persistent session/config/auth storage.
 
-If a client needs something not in the SDK/ACN: add an RPC to `packages/acn-protocol/src/rpcs/`, wire into `MagnitudeRpcs` in `group.ts`, implement handler in `packages/acn/src/handlers.ts`. SDK exposes it automatically. Add a `client-common` hook if shared.
+If a client needs something not in the SDK/ACN: declare it once with a core Effect Query primitive in the appropriate `packages/acn-protocol/src/boundary/` domain group, implement its handler under `packages/acn/src/boundary/`, and consume the group member through the SDK. `AcnRpc` derives the complete RPC protocol from `AcnBoundary` automatically. Add a `client-common` hook if shared.
 
 ## Session Inspection
 

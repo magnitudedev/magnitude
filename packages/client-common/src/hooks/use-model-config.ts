@@ -2,10 +2,9 @@ import { useMemo } from "react"
 import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
-  GetModelSlots,
+  Configuration,
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
-  ProviderModelCatalogMirror,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
   type ProviderId,
@@ -17,12 +16,12 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
-import { useMirroredState } from "./use-mirrored-state"
 
 export function useModelConfig() {
   const client = useAgentClient()
-  const catalog = useMirroredState(ProviderModelCatalogMirror)
-  const slotService = useMemo(() => client.effectQuery.runtime.atom(ModelSlots), [client])
+  const catalogAtom = useMemo(() => Atom.make((get) => get(client.query(Configuration.GetProviderModelCatalog, {})).result), [client])
+  const catalog = useAtomValue(catalogAtom)
+  const slotService = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const slotState = useMemo(() => Atom.make((get) => Result.flatMap(
     get(slotService),
     (slots) => get(slots.state),
@@ -33,7 +32,7 @@ export function useModelConfig() {
   )), [slotService])
   const slotMutations = useModelSlotMutations()
   const slots = useAtomValue(slotState)
-  const refreshAtom = useMemo(() => client.rpc.mutation("RefreshModelCatalog"), [client])
+  const refreshAtom = useMemo(() => client.mutation(Configuration.RefreshModelCatalog), [client])
   const catalogRefresh = useAtomValue(refreshAtom)
   const selections = Result.value(useAtomValue(slotSelections))
   const refresh = useAtomSet(refreshAtom)
@@ -137,10 +136,7 @@ export function useModelConfig() {
       clearSlot(PRIMARY_SLOT_ID)
       clearSlot(SECONDARY_SLOT_ID)
     },
-    refreshModels: () => refresh({
-      payload: { providerId: Option.none() },
-      reactivityKeys: [ProviderModelCatalogMirror.id, GetModelSlots.name],
-    }),
+    refreshModels: () => refresh({ providerId: Option.none() }),
   }
 }
 

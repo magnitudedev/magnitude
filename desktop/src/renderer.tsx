@@ -2,7 +2,7 @@
  * Desktop renderer entry — spec §5.2
  *
  * Reads `window.__magnitudeDesktop`, creates the DesktopPlatform,
- * creates the AgentClient AtomRpc tag with the desktop daemon services, and mounts App
+ * creates the AgentClient (the connection's Effect Query client) over the daemon transport, and mounts App
  * inside PlatformProvider + RegistryProvider + AgentClientProvider.
  *
  * The scoped client lease is the first RPC consumer and establishes ACN

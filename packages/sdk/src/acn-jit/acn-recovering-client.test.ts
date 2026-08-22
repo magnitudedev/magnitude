@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest"
 import {
   AcnInstanceIdSchema,
+  AcnRpc,
   type AcnInstance,
   AcnReady,
-  MagnitudeRpcs,
+  AcnBoundary,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
   ProcessStartIdentitySchema,
@@ -13,7 +14,6 @@ import {
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
-import { Rpc, RpcClient } from "@effect/rpc"
 import {
   Deferred,
   Duration,
@@ -67,8 +67,7 @@ const rpcClient = (
       cause: new Error("connection refused"),
     }))
   }
-  const rpc = MagnitudeRpcs.requests.get(message.tag)
-  if (rpc === undefined) throw new Error(`Unknown RPC ${message.tag}`)
+  if (AcnRpc.operation(AcnBoundary, message.tag) === undefined) throw new Error(`Unknown RPC ${message.tag}`)
   const success = message.tag === "Health"
     ? {
         service: "magnitude-acn" as const,
@@ -99,7 +98,11 @@ const rpcClient = (
   const rpcExit = failRpcTags.has(message.tag)
     ? Exit.die(`Simulated ${message.tag} failure`)
     : Exit.succeed(success)
-  const exit = Schema.encodeUnknownSync(Rpc.exitSchema(rpc))(rpcExit)
+  const exit = Schema.encodeUnknownSync(Schema.Exit({
+    success: Schema.Unknown,
+    failure: Schema.Unknown,
+    defect: Schema.Defect,
+  }))(rpcExit)
   return Effect.succeed(HttpClientResponse.fromWeb(request, new Response(`${JSON.stringify({
     _tag: "Exit",
     requestId: message.id,
@@ -305,7 +308,7 @@ describe("AcnJitRuntime", () => {
       )
       yield* runtime.startup.retry
       expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
-      const client = yield* RpcClient.make(MagnitudeRpcs).pipe(
+      const client = yield* AcnRpc.makeRpcClient(AcnBoundary).pipe(
         Effect.provide(runtime.protocolLayer.pipe(
           Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
         )),

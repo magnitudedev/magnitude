@@ -1,19 +1,18 @@
 /**
- * ACN client context. Domains use either AtomRpc or Effect Query according to
- * their state ownership; a single domain never uses both.
+ * ACN client context: the connection's Effect Query client, provided once at
+ * renderer startup.
  *
- * At renderer startup:
  * 1. Call createAgentClient(protocolLayer)
- * 2. Wrap the app in <AgentClientProvider tag={tag}>
- * 3. Effect Query domains materialize static definitions through .effectQuery
+ * 2. Wrap the app in <AgentClientProvider tag={client}>
+ * 3. Hooks and services materialize boundary operations through the client
  */
 import { createContext, useContext, type ReactNode } from "react"
-import type { AgentClientInstance } from "./agent-client"
+import type { AgentClient } from "./agent-client"
 
-const AgentClientContext = createContext<AgentClientInstance | null>(null)
+const AgentClientContext = createContext<AgentClient | null>(null)
 
 export interface AgentClientProviderProps {
-  readonly tag: AgentClientInstance
+  readonly tag: AgentClient
   readonly children: ReactNode
 }
 
@@ -28,7 +27,7 @@ export function AgentClientProvider({ tag, children }: AgentClientProviderProps)
 /**
  * Get the connection client from context.
  */
-export function useAgentClient(): AgentClientInstance {
+export function useAgentClient(): AgentClient {
   const client = useContext(AgentClientContext)
   if (!client) {
     throw new Error("useAgentClient must be used within an AgentClientProvider")

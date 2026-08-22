@@ -1,6 +1,5 @@
 import {
   AcnSubscriptionKeepalive,
-  AcnSubscriptionSuspended,
   AcnSubscriptionTerminated,
   ACN_SUBSCRIPTION_KEEPALIVE_INTERVAL_MS,
   type AcnSubscriptionControl,
@@ -10,7 +9,6 @@ import { Context, Effect, Fiber, Layer, Option, Ref, Scope } from "effect"
 export interface AcnSubscriptionRegistration {
   readonly clientId: number
   readonly requestId: string
-  readonly sessionId?: string
   readonly emit: (control: AcnSubscriptionControl) => Effect.Effect<void>
   readonly close: Effect.Effect<void>
 }
@@ -24,8 +22,6 @@ export interface AcnSubscriptionsApi {
   readonly register: (
     registration: AcnSubscriptionRegistration,
   ) => Effect.Effect<AcnSubscriptionHandle>
-  /** Notifies only display subscriptions attached to the retired session. */
-  readonly suspendSession: (sessionId: string) => Effect.Effect<void>
   /** Stops admission and emits the authoritative terminal control to every subscription. */
   readonly terminate: Effect.Effect<void>
 }
@@ -127,22 +123,6 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
         ),
       )
 
-    const suspendSession = (sessionId: string) =>
-      Ref.get(state).pipe(
-        Effect.flatMap((current) =>
-          Effect.forEach(
-            values(current).filter(
-              (subscription) => subscription.sessionId === sessionId,
-            ),
-            (subscription) =>
-              subscription.emit(
-                AcnSubscriptionSuspended.make({ reason: "session-offloaded" }),
-            ),
-            { discard: true, concurrency: "unbounded" },
-          ).pipe(Effect.ignore, runBounded),
-        ),
-      )
-
     const detach = semaphore.withPermits(1)(
       Effect.gen(function* () {
         const current = yield* Ref.get(state)
@@ -180,6 +160,6 @@ export const AcnSubscriptionsLive: Layer.Layer<AcnSubscriptions> = Layer.scoped(
       ).pipe(Effect.ignore, runBounded)
     })
 
-    return { register, suspendSession, terminate }
+    return { register, terminate }
   }),
 )

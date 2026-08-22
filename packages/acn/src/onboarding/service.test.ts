@@ -4,7 +4,7 @@ import {
   MagnitudeStorage,
   type MagnitudeStorageShape,
 } from "@magnitudedev/storage"
-import { MirroredStateChangesLive } from "../mirrored-state"
+import { AcnChangesLive } from "../changes"
 import { makeOnboarding, Onboarding, OnboardingLive } from "./service"
 
 describe("Onboarding", () => {
@@ -51,7 +51,7 @@ describe("Onboarding", () => {
       const storage = { onboarding: onboardingState } as unknown as MagnitudeStorageShape
       const layer = OnboardingLive.pipe(Layer.provide(Layer.mergeAll(
         Layer.succeed(MagnitudeStorage, storage),
-        MirroredStateChangesLive,
+        AcnChangesLive,
       )))
       return yield* Effect.gen(function* () {
         const onboarding = yield* Onboarding

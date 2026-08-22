@@ -2,9 +2,10 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import {
   ClientIdSchema,
-  MagnitudeRpcs,
+  AcnRpc,
+  AcnBoundary,
   AcnReady,
-  acnRpcRecoveryPolicy,
+  AcnRpcRecoveryPolicyTag,
   type AcnInstance,
   type AcnIdentity,
   type AcnTarget,
@@ -15,6 +16,7 @@ import {
 import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
 import {
   Cause,
+  Context,
   Data,
   Deferred,
   Duration,
@@ -32,7 +34,6 @@ import {
 } from "effect"
 import { isInterruptedExit, recoveringProtocolLayer as jitRecoveringProtocolLayer } from "../jit-rpc"
 import { SDK_ACN_TARGET } from "../version"
-import type { AcnClient } from "../protocol"
 import {
   ACN_ENSURE_TIMEOUT,
   AcnInstanceManager,
@@ -44,6 +45,15 @@ import { makeAcnLifecycle, type AcnLifecycle, type AcnLifecycleState } from "./l
 
 type ReadyInstance = AcnInstance<AcnReady>
 
+const makeAcnRpcClient = () => AcnRpc.makeRpcClient(AcnBoundary)
+const recoveryPolicy = (tag: string) => {
+  const operation = AcnRpc.operation(AcnBoundary, tag)
+  if (operation === undefined) throw new TypeError(`Unknown ACN operation ${tag}`)
+  const policy = Context.getOption(operation.annotations, AcnRpcRecoveryPolicyTag)
+  if (Option.isNone(policy)) throw new TypeError(`Finite ACN operation ${tag} has no recovery policy`)
+  return policy.value
+}
+
 const CLIENT_LEASE_RENEWAL_INTERVAL = Duration.seconds(15)
 const CLIENT_LEASE_ESTABLISH_TIMEOUT = Duration.seconds(5)
 const CLIENT_LEASE_ESTABLISH_RETRY_DELAY = Duration.millis(250)
@@ -54,6 +64,8 @@ type ReleaseClientLeaseThrough = (client: ClientLeaseRpcClient) => Effect.Effect
   ClientLeaseMutationResult,
   RpcClientError.RpcClientError | Cause.TimeoutException
 >
+/** The transport-internal RPC client; lease and close observation run through it. */
+type AcnClient = Effect.Effect.Success<ReturnType<typeof makeAcnRpcClient>>
 type ClientLeaseRpcClient = Pick<AcnClient, "RenewClientLease" | "ReleaseClientLease">
 
 export interface AcnClientLeaseOwner {
@@ -195,7 +207,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     ),
     selectionScope,
   ).pipe(
-    Effect.flatMap((context) => RpcClient.make(MagnitudeRpcs).pipe(
+    Effect.flatMap((context) => makeAcnRpcClient().pipe(
       Effect.provide(context),
       Effect.provideService(Scope.Scope, selectionScope),
     )),
@@ -321,7 +333,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     streamProtocol: acnSubscriptionProtocol,
     isEndpointRetirementExit: isInterruptedExit,
     classifyInfraError: unavailableError,
-    recoveryPolicy: acnRpcRecoveryPolicy,
+    recoveryPolicy,
   })
 
   yield* lifecycle.report({ _tag: "Starting", phase: "PreparingAcn" })
@@ -364,7 +376,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
           return result
         }
         const result = yield* Effect.scoped(Effect.gen(function* () {
-          const closeClient = yield* RpcClient.make(MagnitudeRpcs)
+          const closeClient = yield* makeAcnRpcClient()
           const modelSlots = yield* closeClient.GetModelSlots({}).pipe(
             Effect.map((result) => result.state),
             Effect.timeout(CLIENT_CLOSE_OBSERVATION_TIMEOUT),
@@ -385,7 +397,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
             streamProtocol: acnSubscriptionProtocol,
             isEndpointRetirementExit: isInterruptedExit,
             classifyInfraError: unavailableError,
-            recoveryPolicy: acnRpcRecoveryPolicy,
+            recoveryPolicy,
           }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, httpClient))),
         )))
         yield* Ref.set(closeResult, Option.some(result))

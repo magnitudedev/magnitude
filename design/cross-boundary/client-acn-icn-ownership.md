@@ -180,7 +180,7 @@ does not introduce a second domain contract.
 
 Client-common owns shared client infrastructure:
 
-- typed access to SDK operations and mirrored states;
+- the connection's Effect Query client over the ACN contract (queries, mutations, subscriptions);
 - reactive query, mutation, invalidation, and subscription behavior;
 - reusable hooks and identity-safe selectors;
 - shared interaction infrastructure; and
@@ -191,15 +191,12 @@ Client-common imports application contracts through the SDK. It does not redefin
 domain unions, calculate backend policy, or become a second application backend in the client
 process.
 
-For an Effect Query-adopted subsystem, client-common owns the canonical query definitions,
-mutation definitions, semantic mutation scopes, and the invalidation Effect consuming ACN mirror
-events. The events are notification only; the Query rereads the ACN snapshot. Effect Query mutation
-states describe exact client command invocations and do not duplicate ACN installation or ICN
-download lifecycle state.
-
-Effect Query and direct-mirror domains are independent vertical client-state implementations. An
-Effect Query domain consumes ACN notifications directly into `QueryClient`; it does not subscribe
-through, invalidate, or otherwise compensate for the direct-mirror Reactivity implementation.
+Every client↔ACN interaction is a contract query, mutation, or subscription (defined in the ACN
+protocol through the Effect Query RPC adapter) materialized by the connection's Effect Query client
+that client-common creates. ACN change pokes are notification only; the connection drains them into
+`QueryClient` and the Query rereads the ACN snapshot. Effect Query mutation states describe exact
+client command invocations and do not duplicate ACN installation or ICN download lifecycle state.
+There is no second client cache, request mechanism, or invalidation channel.
 
 Client-common must not:
 

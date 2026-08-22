@@ -142,7 +142,6 @@ describe('applyStreamEvent', () => {
       { _tag: 'patch', ops: [{ op: 'replace', path: ['state', 'tasks', 'byId', 'root', 'parentId'], value: 'parent' }] },
       null,
       's1',
-      'view-1',
     ))
 
     const root = store.getSnapshot().state.tasks.byId.root
@@ -194,7 +193,6 @@ describe('applyStreamEvent', () => {
       },
       null,
       's1',
-      'view-1',
     ))
 
     expect(store.getSnapshot().shape.timelines['worker-1']).toEqual({ kind: 'tail', limit: 200, live: true, presentation: 'default' })
@@ -226,7 +224,6 @@ describe('applyStreamEvent', () => {
       },
       null,
       's1',
-      'view-1',
     ))
 
     expect(store.getSnapshot().state.timelines.root?.presentation.entries).toEqual([entry])
@@ -243,7 +240,6 @@ describe('applyStreamEvent', () => {
       },
       null,
       's1',
-      'view-1',
     ))
 
     expect(store.getSnapshot().state.timelines.root?.presentation.entries[0]).toEqual({
@@ -265,7 +261,6 @@ describe('applyStreamEvent', () => {
       },
       null,
       's1',
-      'view-1',
       (payload) => restored.push(payload),
     ))
 

@@ -128,20 +128,18 @@ for connection-specific state is prohibited.
 ## Resource ownership
 
 Resident work belongs in `Layer.scoped` or `Layer.scopedDiscard`. Acquisition must establish the
-resource before the service is available, and scope release must stop it. A backend invalidation
-watch is therefore owned by the relevant ACN-backed service Layer, not by a mounted component or a
+resource before the service is available, and scope release must stop it. A keyed backend watch is
+owned by the ACN-backed service Layer that exposes the queries it keeps fresh — as a dependency of
+those query atoms, open exactly while one of them is observed — not by a mounted component or a
 hidden resident Atom.
 
-Effect Query and direct mirrors remain separate state mechanisms:
-
 ```text
-Effect Query domain: StreamChanges (one Acn.subscription per connection) -> QueryClient.invalidate by query name -> canonical Query
-direct-mirror domain: the same events -> Reactivity.invalidate -> canonical AtomRpc query
+connection: StreamChanges (one Subscription) -> QueryClient.invalidate by query name -> canonical Query
+service:    WatchX(key) (one Subscription per observed key) -> QueryClient.invalidate -> that service's queries
 ```
 
-They may depend on the same transport service but never adapt or retain one another's cache. The
-change subscription is owned by the connection (`state/changes.ts` for Effect Query,
-`createAgentClient` for the Reactivity mapping); domain services own no invalidation.
+The change subscription is owned by the connection (`state/changes.ts`); domain services own no
+invalidation for poked state.
 
 ## React boundary
 
@@ -183,8 +181,8 @@ Layer scope.
 The onboarding model setup capability is the proof case for this pattern:
 
 - local models, model slots, and onboarding persistence are separate ACN-backed service Tags;
-- each service privately owns its Effect Query materialization and registered invalidation
-  callback; one connection-scoped infrastructure service owns the ACN notification stream;
+- each service privately owns its Effect Query materialization; the connection owns the change
+  subscription and invalidation;
 - onboarding model setup is a Layer requiring those three Tags;
 - its client-owned execution state is retained in keep-alive Atoms in the connection registry;
 - each command is one Effect program passing exact outputs to dependent operations; and

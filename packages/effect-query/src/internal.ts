@@ -126,6 +126,10 @@ export const getClientCore = (registry: AtomRegistry.Registry): ClientCore => {
 
   const pubsub = Effect.runSync(PubSub.unbounded<QueryClientEvent>())
   const revision = Atom.keepAlive(Atom.make(0))
+  // Entries register while an atom is being evaluated (possibly during a React
+  // render); the registry-wide revision therefore advances after the current
+  // evaluation, coalescing concurrent touches into one write.
+  let touchPending = false
   const core: ClientCore = {
     registry,
     entries: new Set(),
@@ -140,7 +144,16 @@ export const getClientCore = (registry: AtomRegistry.Registry): ClientCore => {
     emit: (event) => {
       Effect.runSync(PubSub.publish(pubsub, event))
     },
-    touch: () => registry.update(revision, (value) => value + 1)
+    touch: () => {
+      if (touchPending) return
+      touchPending = true
+      queueMicrotask(() => {
+        touchPending = false
+        // Nothing observes the revision until something read it; a disposed
+        // registry has no nodes at all.
+        if (registry.getNodes().has(revision)) registry.update(revision, (value) => value + 1)
+      })
+    }
   }
   clients.set(registry, core)
   return core

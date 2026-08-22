@@ -28,7 +28,7 @@ import {
   ModelSlotMutationFailed,
   ModelSlotMutationRejected,
   ModelSlotUnassigned,
-  GetModelSlots,
+  Configuration,
   ModelSlotsStateSchema,
   ModelServingConfigurationIdSchema,
   ModelServingConfigurationSchema,
@@ -69,7 +69,7 @@ import {
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { ModelSelection } from "./model-selection"
-import { MirroredStateChanges } from "./mirrored-state"
+import { AcnChanges } from "./changes"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
@@ -251,14 +251,14 @@ export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
   ModelSelection | MagnitudeStorage | LocalModelPackages | LocalProviderOfferings
-    | ProviderModelCatalog | MirroredStateChanges | IcnClient | IcnInstances
+    | ProviderModelCatalog | AcnChanges | IcnClient | IcnInstances
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
   const modelSelection = yield* ModelSelection
   const storage = yield* MagnitudeStorage
   const localPackages = yield* LocalModelPackages
   const localOfferings = yield* LocalProviderOfferings
   const catalog = yield* ProviderModelCatalog
-  const mirroredChanges = yield* MirroredStateChanges
+  const changes = yield* AcnChanges
   const client = yield* IcnClient
   const observedInstances = yield* IcnInstances
   const scope = yield* Scope.Scope
@@ -364,11 +364,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     }
     yield* SubscriptionRef.set(aggregate, next)
     if (stateChanged) {
-      yield* mirroredChanges.publish({
-        _tag: "changed",
-        id: GetModelSlots.name,
-        revision,
-      })
+      yield* changes.publish({ query: Configuration.GetModelSlots.name, revision })
     }
     return next
   })

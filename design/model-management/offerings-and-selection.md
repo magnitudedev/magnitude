@@ -5,8 +5,8 @@ applies_to:
   - packages/acn/src/model-selection.ts
   - packages/acn/src/model-slot-**
   - packages/acn/src/local-model-**
-  - packages/acn/src/handlers.ts
-  - packages/acn-protocol/src/rpcs/local-inference.ts
+  - packages/acn/src/boundary/**
+  - packages/acn-protocol/src/boundary/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts

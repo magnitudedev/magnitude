@@ -3,7 +3,6 @@ import { Cause, Effect, Layer, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
-  Acn,
   AssessmentEnvironmentIdSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
@@ -22,7 +21,6 @@ import {
   RecommendationIdSchema,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
-  type AcnTransport,
   type LocalModel,
   type ModelDownloadFailure,
   type LocalModelsState,
@@ -30,7 +28,8 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
-import { fakeAcnTransport } from "../state/fake-acn-transport"
+import type { AcnClientRequirements } from "../state/agent-client"
+import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"
 import { localModelProviderModelId } from "./projection"
 import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
@@ -564,8 +563,8 @@ const makeHarness = (options: HarnessOptions) => {
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
   }))
-  const effectQuery = EffectQueryClient.make<AcnTransport, never, ClientServices, never>(
-    Layer.succeed(Acn.Client, fakeAcnTransport(rpc)),
+  const effectQuery = EffectQueryClient.make<AcnClientRequirements, never, ClientServices, never>(
+    fakeAcnImplementationsLayer(rpc),
     (client) => clientServicesLayer(client, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,
     }),
