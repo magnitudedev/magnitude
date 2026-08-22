@@ -67,10 +67,11 @@ Get RPC + ACN invalidation watch         Query/Mutation + ACN invalidation watch
               +------------- semantic API -------------+
 ```
 
-The ACN invalidation stream is shared protocol, not shared cache infrastructure. Direct-mirror
-code maps its events to `Reactivity`. An Effect Query domain maps its own events to its own Query
-definitions. An Effect Query domain never imports the direct-mirror client implementation, and a
-direct-mirror domain never imports Effect Query.
+The ACN change stream (`StreamChanges`) carries pokes that name a query. The Effect Query client
+drains it once per connection and invalidates the named query entries; Effect Query domains own no
+invalidation code. Direct-mirror code maps the same events to `Reactivity` keys while it migrates.
+An Effect Query domain never imports the direct-mirror client implementation, and a direct-mirror
+domain never imports Effect Query.
 
 ## When Query and Mutation exist
 
@@ -153,21 +154,20 @@ operation progress. It exposes observational queries, mutations, and invalidatio
 
 ### Effect Query definitions
 
-Static Query and Mutation definitions describe the ACN interaction: cache identity, freshness,
-mutation scope, RPC execution, and post-mutation synchronization. They capture no client instance,
-Atom registry, React lifecycle, or feature workflow.
+Query, Mutation, and Subscription definitions live in the ACN contract (`Acn.query`,
+`Acn.mutation`, `Acn.subscription` in `packages/acn-protocol`). Each is a core Effect Query
+definition that also carries its Rpc: cache identity derives from the payload, execution from the
+Rpc, and a mutation's scope and synchronization postcondition are declared with the command. They
+capture no client instance, Atom registry, React lifecycle, or feature workflow.
 
-Definitions are private to their ACN-backed client service. Tests may exercise exported domain
-predicates without making definitions part of the client-facing contract.
+Definitions are consumed only by their ACN-backed client service; UI and composed services see the
+service's semantic surface, not definitions.
 
 ### ACN-backed client service
 
 One service instance exists per client connection and owns materialization of a backend domain. It:
 
-- materializes the domain's Query and Mutation definitions with that connection's Effect Query
-  client;
-- registers its own mirror identity and Query invalidation Effect with the connection-scoped ACN
-  invalidation service;
+- materializes the domain's contract definitions with that connection's Effect Query client;
 - exposes one read-only Atom containing the domain query Result;
 - exposes domain operations as functions returning Effects;
 - exposes semantic derived state or status selectors when presentation needs mutation intent; and
@@ -276,8 +276,8 @@ mutationStates.at(-1)
 4. Query observation supplies authoritative state; mutation state supplies only command intent and
    outcome.
 5. A public selector expresses domain meaning and hides registry ordering and mutation identity.
-6. Acquiring the domain service Layer registers its cache-specific invalidation. One scoped
-   connection subscription dispatches notifications by mirror identity; public state mounting is
+6. Freshness is owned by the connection: one scoped `StreamChanges` subscription invalidates
+   queries by name. Domain services register no invalidation; public state mounting is
    observational, and callers never mount synchronization separately.
 7. No Effect Query domain imports direct-mirror client infrastructure or calls `Reactivity`.
 8. No direct-mirror domain imports Effect Query or invalidates its cache.

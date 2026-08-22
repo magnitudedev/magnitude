@@ -21,6 +21,28 @@ export interface MutationDefinition {
   readonly name: string
 }
 
+export const SubscriptionDefinitionTypeId: unique symbol = Symbol.for(
+  "@magnitudedev/effect-query/SubscriptionDefinition"
+)
+
+export interface SubscriptionDefinition {
+  readonly [SubscriptionDefinitionTypeId]: true
+  readonly name: string
+}
+
+export type SubscriptionStatus = "idle" | "connecting" | "active" | "reconnecting" | "failed" | "completed"
+
+export interface SubscriptionEntryState {
+  readonly status: SubscriptionStatus
+  readonly attempt: number
+}
+
+export interface SubscriptionFilter {
+  readonly definition?: SubscriptionDefinition
+  readonly name?: string
+  readonly key?: QueryKey
+}
+
 export type QueryKeyPrimitive = string | number | bigint | boolean | symbol | null | undefined
 
 export type QueryKey =
@@ -43,6 +65,8 @@ export interface QueryMetadata {
 
 export interface QueryFilter {
   readonly definition?: QueryDefinition
+  /** Definition name; lets transports address a query without holding its definition. */
+  readonly name?: string
   readonly key?: QueryKey
   readonly exact?: boolean
   readonly stale?: boolean

@@ -69,30 +69,31 @@ root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
 
 ### Effect Query adoption
 
-A subsystem may adopt `@magnitudedev/effect-query` without migrating unrelated domains. Its query
-and mutation definitions belong as static values in one domain module in client-common. Definitions
-require `AcnRpcClientTag` as an ordinary Effect service; they never capture an `AgentClient`, Atom
-runtime, or React lifecycle. `createAgentClient` creates one connection-scoped Effect Query client,
-and domain modules materialize definitions through
-`client.effectQuery.query(...)` and `client.effectQuery.mutation(...)`. Do not construct domain-local
-query runtimes in feature code.
+A subsystem may adopt `@magnitudedev/effect-query` without migrating unrelated domains. Its
+queries, mutations, and subscriptions are defined in the ACN contract (`packages/acn-protocol`)
+through `Acn.query`, `Acn.mutation`, and `Acn.subscription` from `@magnitudedev/effect-query/rpc`:
+each definition is a core Effect Query definition that also carries its Rpc, so the wire group and
+the client consume the same value. Contract definitions carry the command's `scope` and
+`synchronize` postcondition; client-common never re-declares keys, fetch effects, or invalidation.
+`createAgentClient` creates one connection-scoped Effect Query client over the shared transport
+(`Acn.Client`), and domain services materialize definitions through
+`client.effectQuery.query(...)`, `.mutation(...)`, and `.subscription(...)`. Do not construct
+domain-local query runtimes in feature code.
 
 Once adopted, that subsystem uses Effect Query as its only query cache and mutation-state authority;
-do not retain an AtomRpc query or writable pending/error atom for the same operation. `Query.make`
-and `Mutation.make` define domain behavior; the Effect Query client owns cache identity, mutation
-history, and the service runtime for one connection.
+do not retain an AtomRpc query or writable pending/error atom for the same operation. The Effect
+Query client owns cache identity, mutation history, and the service runtime for one connection.
 
 Use semantic mutation scopes for resource-specific concurrency, typed mutation-state selectors for
 pending and rejection presentation, and mutation synchronization for promised query visibility.
-Long-running resource progress still comes from the authoritative query. Do not implement the
-generic mirror abstraction in terms of Effect Query or make one domain authoritative in both
-systems. Migration is vertical: move a domain's query, mutations, and invalidation ownership
-together, then remove its mirror ownership.
+Long-running resource progress still comes from the authoritative query. Migration is vertical:
+move a domain's query, mutations, and freshness together, then remove its direct-mirror ownership.
 
-An Effect Query domain consumes ACN invalidation events in its own scoped Effect and invalidates
-only its own Query definitions through `QueryClient`. It never subscribes through the direct-mirror
-client implementation and never calls `Reactivity`. A direct-mirror domain invalidates only
-AtomRpc queries through `Reactivity` and never calls `QueryClient`.
+Freshness of Effect Query domains is owned by the connection, not by domains: `StreamChanges` is one
+`Acn.subscription` whose events name a query (`{ query, key?, revision? }`), and
+`state/changes.ts` drains it into `QueryClient.invalidate` by name. A domain service writes no
+invalidation code. A direct-mirror (AtomRpc) domain still invalidates through `Reactivity`; during
+migration `createAgentClient` maps the same change events onto Reactivity keys.
 
 ### Queries
 
@@ -113,8 +114,9 @@ AtomRpc queries through `Reactivity` and never calls `QueryClient`.
 ### Streams and invalidation
 
 - If a stream announces changes to state available from a query, treat the stream only as an invalidation channel. Consume it in an Effect owned by `useAtomMount`, call `Reactivity.invalidate(...)`, and continue rendering from the query atom.
-- The preceding `Reactivity` rule applies to direct-mirror/AtomRpc queries. Effect Query domains use
-  their domain-owned `QueryClient` invalidation Effect described above.
+- The preceding `Reactivity` rule applies to direct-mirror/AtomRpc queries. Effect Query domains are
+  kept fresh by the connection's `StreamChanges` drain described above and write no invalidation code;
+  a keyed stream that feeds one domain is an `Acn.subscription` drained in that domain's scoped Layer.
 - Do not copy stream events into React state when the same facts exist in a query snapshot.
 - Use `Effect.addFinalizer` or interruption-safe stream scope for cleanup. Interruption on unmount is normal; handle other failures through Effect's error channel.
 - A raw `RpcClient` is permitted only inside such an Effect-scoped bridge when AtomRpc's query/mutation abstraction cannot express the resident stream lifecycle. Keep that bridge in client-common when more than one client surface can use it.

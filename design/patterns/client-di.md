@@ -135,13 +135,13 @@ hidden resident Atom.
 Effect Query and direct mirrors remain separate state mechanisms:
 
 ```text
-Effect Query domain: watch -> QueryClient.invalidate -> canonical Query
-direct-mirror domain: watch -> Reactivity.invalidate -> canonical AtomRpc query
+Effect Query domain: StreamChanges (one Acn.subscription per connection) -> QueryClient.invalidate by query name -> canonical Query
+direct-mirror domain: the same events -> Reactivity.invalidate -> canonical AtomRpc query
 ```
 
-They may depend on the same transport service but never invalidate, adapt, or retain one another's
-cache. A shared transport-level subscription service is valid only when it multiplexes connection
-events without choosing cache semantics; each domain still owns its cache-specific invalidation.
+They may depend on the same transport service but never adapt or retain one another's cache. The
+change subscription is owned by the connection (`state/changes.ts` for Effect Query,
+`createAgentClient` for the Reactivity mapping); domain services own no invalidation.
 
 ## React boundary
 

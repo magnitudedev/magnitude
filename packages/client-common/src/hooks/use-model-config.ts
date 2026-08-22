@@ -2,7 +2,7 @@ import { useMemo } from "react"
 import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
-  ModelSlotsMirror,
+  GetModelSlots,
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   ProviderModelCatalogMirror,
@@ -139,7 +139,7 @@ export function useModelConfig() {
     },
     refreshModels: () => refresh({
       payload: { providerId: Option.none() },
-      reactivityKeys: [ProviderModelCatalogMirror.id, ModelSlotsMirror.id],
+      reactivityKeys: [ProviderModelCatalogMirror.id, GetModelSlots.name],
     }),
   }
 }

@@ -1,34 +1,50 @@
 /** Shared ACN transport with AtomRpc and Effect Query materializations. */
-import { Atom, AtomRpc } from "@effect-atom/atom-react"
+import { Atom, AtomRpc, Registry } from "@effect-atom/atom-react"
 import * as Reactivity from "@effect/experimental/Reactivity"
 import { RpcClient } from "@effect/rpc"
-import { Cause, Duration, Effect, Layer, Schedule, Stream } from "effect"
-import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
+import { Effect, Layer, Stream } from "effect"
+import { Client as EffectQueryClient, Subscription } from "@magnitudedev/effect-query"
 import {
-  AcnRpcClientTag,
+  Acn,
   LocalInferenceHardwareMirror,
   MagnitudeRpcs,
   ProviderModelCatalogMirror,
+  StreamChanges,
+  projectChangeQueries,
+  sessionChangeQueries,
+  type AcnTransport,
 } from "@magnitudedev/sdk"
 import {
   clientServicesLayer,
   type ClientServices,
   type ClientServicesOptions,
 } from "./client-services"
-import { makeClientInvalidations } from "./client-invalidations"
 
 export type AgentClientInstance = ReturnType<typeof createAgentClient>
 export type AgentClient = AgentClientInstance
 
 class AcnAtomRpcClient {}
 
-const invalidationWatchReconnect = Schedule.exponential("100 millis").pipe(
-  Schedule.modifyDelay((_, delay) => Duration.min(delay, Duration.seconds(5))),
-  Schedule.jittered,
-)
+/**
+ * Domains still materialized by AtomRpc observe pokes through Reactivity keys.
+ * This mapping exists only until those domains move to the contract.
+ */
+const reactivityKeysFor = (query: string): ReadonlyArray<string> => {
+  if (query === LocalInferenceHardwareMirror.id || query === ProviderModelCatalogMirror.id) return [query]
+  if (projectChangeQueries.includes(query)) return ["projects"]
+  if (sessionChangeQueries.includes(query)) return ["sessions"]
+  return []
+}
+
+const allReactivityKeys: ReadonlyArray<string> = [
+  LocalInferenceHardwareMirror.id,
+  ProviderModelCatalogMirror.id,
+  "projects",
+  "sessions",
+]
 
 /**
- * Create one flat RPC service. AtomRpc and Effect Query share that service;
+ * Create one flat RPC service. AtomRpc and Effect Query share that transport;
  * each domain chooses one state system and never mixes both for the same data.
  */
 export function createAgentClient(
@@ -41,52 +57,35 @@ export function createAgentClient(
     protocol: protocolLayer,
     runtime,
   })
-  const directMirrorIds = [
-    LocalInferenceHardwareMirror.id,
-    ProviderModelCatalogMirror.id,
-  ]
-  const directMirrorIdSet = new Set<string>(directMirrorIds)
-  const invalidations = Effect.runSync(makeClientInvalidations)
+  const transportLayer = Layer.effect(Acn.Client, Effect.map(rpc, (client) => Acn.transport(client))).pipe(
+    Layer.provide(rpc.layer),
+  )
+  const effectQuery = EffectQueryClient.make<AcnTransport, never, ClientServices, never>(
+    transportLayer,
+    (client) => clientServicesLayer(client, options),
+  )
   runtime.addGlobalLayer(Layer.scopedDiscard(Effect.gen(function* () {
-    const client = yield* rpc
     const reactivity = yield* Reactivity.Reactivity
-    yield* invalidations.events.pipe(
-      Stream.runForEach((event) => {
-        switch (event._tag) {
-          case "Connected":
-            return reactivity.invalidate([...directMirrorIds, "projects", "sessions"])
-          case "MirroredState":
-            return directMirrorIdSet.has(event.invalidation.id)
-              ? reactivity.invalidate([event.invalidation.id])
-              : Effect.void
-          case "Projects":
-            return reactivity.invalidate(["projects"])
-          case "Sessions":
-            return reactivity.invalidate(["sessions"])
-        }
+    const registry = yield* Registry.AtomRegistry
+    const changes = effectQuery.subscription(StreamChanges, {})
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        let attempt = 0
+        return registry.subscribe(changes, (state) => {
+          if (state.attempt === attempt) return
+          attempt = state.attempt
+          if (attempt > 1) queueMicrotask(() => reactivity.unsafeInvalidate([...allReactivityKeys]))
+        })
+      }),
+      (unsubscribe) => Effect.sync(unsubscribe),
+    )
+    yield* Subscription.events(changes).pipe(
+      Stream.runForEach((change) => {
+        const keys = reactivityKeysFor(change.query)
+        return keys.length === 0 ? Effect.void : reactivity.invalidate([...keys])
       }),
       Effect.forkScoped,
     )
-    yield* Stream.unwrap(invalidations.publish({ _tag: "Connected" }).pipe(
-      Effect.as(client("StreamClientInvalidations", {})),
-    )).pipe(
-      Stream.runForEach(invalidations.publish),
-      Effect.tapErrorCause((cause) => Cause.isInterruptedOnly(cause)
-        ? Effect.void
-        : Effect.logWarning("Client invalidation watch disconnected; retrying").pipe(
-            Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 1_000) }),
-          )),
-      Effect.retry(invalidationWatchReconnect),
-      Effect.catchAllCause((cause) => Cause.isInterruptedOnly(cause)
-        ? Effect.void
-        : Effect.logError(Cause.pretty(cause))),
-      Effect.forkScoped,
-    )
-  })).pipe(Layer.provide(rpc.layer)))
-  const rpcLayer = Layer.effect(AcnRpcClientTag, rpc).pipe(Layer.provide(rpc.layer))
-  const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
-    rpcLayer,
-    (client) => clientServicesLayer(client, invalidations, options),
-  )
+  })))
   return { rpc, effectQuery }
 }

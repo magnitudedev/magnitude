@@ -1,5 +1,6 @@
 import { Rpc } from "@effect/rpc"
-import { Context, Schema } from "effect"
+import { Context, type Schedule, Schema } from "effect"
+import { Acn } from "../boundary"
 import { AcnSubscriptionPayload } from "../schemas/subscription"
 
 export interface AcnSubscriptionMetadata {
@@ -40,3 +41,33 @@ export const makeAcnSubscriptionRpc = <
     error: options.error,
     stream: true,
   }).annotate(AcnSubscriptionMetadataTag, { scope: options.scope ?? "global" })
+
+/**
+ * An ACN subscription defined through the contract: a core Effect Query
+ * subscription whose Rpc carries the ACN subscription wire protocol.
+ */
+export const acnSubscription = <
+  const Tag extends string,
+  PayloadType,
+  PayloadEncoded,
+  SuccessType,
+  SuccessEncoded,
+  SuccessRequirements,
+  Error extends Schema.Schema.All,
+>(
+  tag: Tag,
+  options: {
+    readonly payload: Schema.Schema<PayloadType, PayloadEncoded, never>
+    readonly success: Schema.Schema<SuccessType, SuccessEncoded, SuccessRequirements>
+    readonly error: Error
+    readonly scope?: "global" | "session"
+    readonly reconnect?: Schedule.Schedule<unknown, unknown, never>
+  },
+) =>
+  Acn.subscription(tag, {
+    payload: options.payload,
+    success: AcnSubscriptionPayload(options.success),
+    error: options.error,
+    annotations: Context.make(AcnSubscriptionMetadataTag, { scope: options.scope ?? "global" }),
+    reconnect: options.reconnect,
+  })

@@ -372,11 +372,13 @@ local interaction  -> presentation atom
 - CLI, web, and desktop share state behavior through client-common.
 
 Effect Query is the client cache and command-state authority for a subsystem that adopts it.
-A subsystem defines each query and mutation once in client-common as static domain values whose
-Effects require the stable ACN RPC client service. One connection-scoped Effect Query client
-provides that service and materializes definitions into query and mutation atoms. Components
-consume those atoms; they do not construct runtimes or wrap them in parallel request atoms or
-writable status state.
+A subsystem defines each query, mutation, and subscription once, in the ACN contract, through the
+Effect Query RPC adapter (`Acn.query`, `Acn.mutation`, `Acn.subscription`): each definition is a
+core Effect Query definition that also carries its Rpc, and mutations declare their scope and
+synchronization postcondition there. One connection-scoped Effect Query client provides the
+transport service and materializes definitions into query, mutation, and subscription atoms.
+Components consume those atoms; they do not construct runtimes or wrap them in parallel request
+atoms or writable status state.
 
 Mutation states are retained per invocation and keyed by the mutation definition and, when
 concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports
@@ -400,20 +402,21 @@ mechanism for the same data is prohibited.
 
 ```text
 component
-   +-- static query definition ----> Effect Query client ----> ACN RPC service
-   +-- static mutation definition -> Effect Query client ----> ACN RPC service
+   +-- contract query definition ----> Effect Query client ----> ACN transport
+   +-- contract mutation definition -> Effect Query client ----> ACN transport
                                                 ^
-                                                +-- watch invalidates query
+                                                +-- StreamChanges poke invalidates the named query
 ```
 
 - The ACN RPC service owns typed transport access, not query or mutation state.
 - One Effect Query client per connection owns the Atom runtime, query cache, and mutation history.
-- Definitions are transport-using Effects but are independent of connection and runtime lifetime.
+- Definitions are contract values: transport-using, independent of connection and runtime lifetime.
 - AtomRpc and Effect Query may serve different domains over the same transport during migration;
   adopted domains do not use AtomRpc or the mirror cache as a second state authority.
-- The generic mirror abstraction is not implemented on top of Effect Query. Domains migrate
-  vertically and delete their mirror ownership once query, mutation, and invalidation semantics
-  have moved together.
+- Freshness is owned by the connection: one `StreamChanges` subscription carries pokes that name a
+  query, and the Effect Query client invalidates by name. A migrated mirror is an ordinary contract
+  query with infinite freshness. Domains migrate vertically and delete their direct-mirror
+  ownership once query, mutation, and freshness semantics have moved together.
 - Components do not own RPC clients, request caches, retries, or invalidation wiring.
 - Mutation receipts may await query visibility; they do not create another resource state.
 - Reconnection preserves client state and rereads authoritative ACN state.

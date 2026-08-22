@@ -28,7 +28,8 @@ import {
   ModelSlotMutationFailed,
   ModelSlotMutationRejected,
   ModelSlotUnassigned,
-  ModelSlotsMirror,
+  GetModelSlots,
+  ModelSlotsStateSchema,
   ModelServingConfigurationIdSchema,
   ModelServingConfigurationSchema,
   PRIMARY_SLOT_ID,
@@ -319,7 +320,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   ) => Effect.gen(function* () {
     const previous = yield* SubscriptionRef.get(aggregate)
     const stateChanged = !Schema.equivalence(
-      ModelSlotsMirror.stateSchema,
+      ModelSlotsStateSchema,
     )(previous.snapshot.state, state)
     const candidateAgentConfiguration = buildConfigStateFromSlots(
       catalogModels,
@@ -365,7 +366,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     if (stateChanged) {
       yield* mirroredChanges.publish({
         _tag: "changed",
-        id: ModelSlotsMirror.id,
+        id: GetModelSlots.name,
         revision,
       })
     }

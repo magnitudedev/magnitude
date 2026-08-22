@@ -44,7 +44,7 @@ import { ProjectInspector } from "./project-inspector";
 import { ProjectManager } from "./project-manager";
 import { ProjectStore } from "./project-store";
 import { SessionInspector } from "./session-inspector";
-import { mergeClientInvalidations } from "./client-invalidations";
+import { mergeChanges } from "./changes";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -448,10 +448,10 @@ export const HandlersLive = MagnitudeRpcs.toLayer(
       GetLocalModels: () =>
         observeRpcDefects("GetLocalModels", localModels.snapshot),
 
-      StreamClientInvalidations: () =>
+      StreamChanges: () =>
         observeRpcStreamDefects(
-          "StreamClientInvalidations",
-          mergeClientInvalidations({
+          "StreamChanges",
+          mergeChanges({
             mirrors: mirroredStateChanges.stream,
             projects: projectStore.changes,
             sessions: sessionInspector.changes,

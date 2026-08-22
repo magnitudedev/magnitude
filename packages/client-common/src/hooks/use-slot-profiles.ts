@@ -3,7 +3,7 @@ import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   isRoleId,
-  ModelSlotsMirror,
+  GetModelSlots,
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   ProviderModelCatalogMirror,
@@ -63,7 +63,7 @@ export function useSlotProfiles() {
   const refresh = useAtomSet(refreshAtom)
   const retry = useCallback(() => refresh({
     payload: { providerId: Option.none() },
-    reactivityKeys: [ProviderModelCatalogMirror.id, ModelSlotsMirror.id],
+    reactivityKeys: [ProviderModelCatalogMirror.id, GetModelSlots.name],
   }), [refresh])
 
   const profiles = Option.flatMap(Result.value(slots), ({ state: slotState }) =>

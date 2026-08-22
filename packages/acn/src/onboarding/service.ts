@@ -1,9 +1,9 @@
 import { Context, Effect, Layer, Schema, Stream } from "effect"
 import {
+  GetOnboardingState,
   OnboardingError,
-  OnboardingMirror,
+  OnboardingState,
   type MirroredSnapshot,
-  type OnboardingState,
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import type { StateHandle } from "@magnitudedev/storage"
@@ -52,11 +52,14 @@ export const OnboardingLive: Layer.Layer<
     const storage = yield* MagnitudeStorage
     const persisted = makeOnboarding(storage.onboarding)
     const initial = yield* persisted.state.pipe(Effect.orDie)
-    const mirror = yield* makeMirroredState(OnboardingMirror, initial)
+    const mirror = yield* makeMirroredState(
+      { id: GetOnboardingState.name, stateSchema: OnboardingState },
+      initial,
+    )
     const refresh = persisted.state.pipe(
       Effect.flatMap((state) => mirror.setIfChanged(
         state,
-        Schema.equivalence(OnboardingMirror.stateSchema),
+        Schema.equivalence(OnboardingState),
       )),
       Effect.asVoid,
     )

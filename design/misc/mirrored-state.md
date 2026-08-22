@@ -32,7 +32,10 @@ are not an event log; clients refetch the latest snapshot.
 ## Definition and identity
 
 One definition owns the state schema, error schema, and typed Get RPC. The Get RPC tag is the sole
-mirror identity and client reactivity key. Encoded schemas are JSON-safe.
+mirror identity: it is the query name a change poke carries (`Change.query`) and, for direct-mirror
+domains, the client reactivity key. Migrated mirrors are ordinary contract queries
+(`Acn.query("GetModelSlots", …)` with infinite freshness); `defineMirroredState` remains for
+direct-mirror domains. Encoded schemas are JSON-safe.
 
 ## Updates
 
@@ -61,12 +64,11 @@ A backend may bind directly only when it owns the exact public schema and versio
 selection, including favorites and recency. Preference mutations durably commit before the mirror
 publishes the new snapshot.
 
-Client-common owns one connection-global invalidation transport and broadcasts its cache-neutral
-events within the connection. The direct-mirror Reactivity adapter and each Effect Query domain
-consume that broadcast independently; an Effect Query domain filters its own mirror identity and
-invalidates its own `QueryClient`. The mechanisms share only transport fan-out: they never share
-cache adapters or invalidation calls. Query atoms remain distinct by Get RPC tag, and a domain has
-one canonical client query cache at a time.
+The ACN publishes every mirror change on `StreamChanges` as `{ query: <Get RPC tag>, revision }`.
+The connection's Effect Query client drains that subscription once and invalidates the named query;
+Effect Query domains own no invalidation code. The direct-mirror Reactivity adapter maps the same
+events to reactivity keys while those domains migrate. Query atoms remain distinct by Get RPC tag,
+and a domain has one canonical client query cache at a time.
 
 Clients retain each query's waiting, failure, and success Result independently. Screens may derive
 presentation from successful domain values; they do not combine domain Results into an aggregate

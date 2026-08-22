@@ -1,9 +1,9 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
-import { Cause, Effect, Layer, Option, Schema } from "effect"
+import { Cause, Effect, Layer, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
-  AcnRpcClientTag,
+  Acn,
   AssessmentEnvironmentIdSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
@@ -16,14 +16,13 @@ import {
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
   ModelVariantLabelSchema,
-  OnboardingMirror,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
   RecommendationIdSchema,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
-  type AcnRpcClient,
+  type AcnTransport,
   type LocalModel,
   type ModelDownloadFailure,
   type LocalModelsState,
@@ -31,7 +30,7 @@ import {
   type SlotSelection,
 } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
-import { makeClientInvalidations } from "../state/client-invalidations"
+import { fakeAcnTransport } from "../state/fake-acn-transport"
 import { localModelProviderModelId } from "./projection"
 import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
@@ -458,11 +457,11 @@ const makeHarness = (options: HarnessOptions) => {
       case "GetOnboardingState": {
         if (options.failInitialOnboardingRead
           && calls.filter((call) => call === "GetOnboardingState").length === 1) {
-          return Effect.fail(Schema.decodeUnknownSync(OnboardingMirror.errorSchema)({
+          return Effect.fail({
             _tag: "OnboardingError",
             operation: "get onboarding state",
             message: "temporarily unavailable",
-          }))
+          })
         }
         return Effect.succeed({
           revision: revision++,
@@ -555,22 +554,19 @@ const makeHarness = (options: HarnessOptions) => {
         return Effect.succeed({})
       case "CompleteOnboarding":
         if (options.keepCompleting) return Effect.never
-        if (options.failCompletion) return Effect.fail(Schema.decodeUnknownSync(
-          OnboardingMirror.errorSchema,
-        )({
+        if (options.failCompletion) return Effect.fail({
           _tag: "OnboardingError",
           operation: "complete onboarding",
           message: "completion failed",
-        }))
+        })
         onboardingCompleted = true
         return Effect.succeed({})
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
-  })) as unknown as AcnRpcClient
-  const invalidations = Effect.runSync(makeClientInvalidations)
-  const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
-    Layer.succeed(AcnRpcClientTag, rpc),
-    (client) => clientServicesLayer(client, invalidations, {
+  }))
+  const effectQuery = EffectQueryClient.make<AcnTransport, never, ClientServices, never>(
+    Layer.succeed(Acn.Client, fakeAcnTransport(rpc)),
+    (client) => clientServicesLayer(client, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,
     }),
   )

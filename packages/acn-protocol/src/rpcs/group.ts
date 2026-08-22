@@ -14,7 +14,7 @@ import * as Stream from "./stream"
 import * as LocalInference from "./local-inference"
 import * as Onboarding from "./onboarding"
 import * as ClientLease from "./client-lease"
-import { StreamClientInvalidations } from "./client-invalidation"
+import { StreamChanges } from "./changes"
 import { AcnRpcDemand } from "./middleware"
 import { AcnRpcRecoveryPolicyTag } from "./recovery-policy"
 
@@ -32,7 +32,7 @@ import { AcnRpcRecoveryPolicyTag } from "./recovery-policy"
  */
 const AcnSubscriptions = RpcGroup.make(
   Stream.StreamDisplayView,
-  StreamClientInvalidations,
+  StreamChanges.rpc,
   Session.StreamActiveSessionStatuses,
   ProjectFiles.WatchProjectFiles,
   Files.WatchFile,
@@ -58,16 +58,16 @@ const ReplaySafeDemandRpcs = RpcGroup.make(
   Config.GetProviderAuth,
   Config.ListProviderAuth,
   Config.ProviderModelCatalogMirror.getRpc,
-  Config.ModelSlotsMirror.getRpc,
-  Config.AssignSlot,
-  Config.ClearSlot,
-  Config.SetModelFavorite,
+  Config.GetModelSlots.rpc,
+  Config.AssignSlot.rpc,
+  Config.ClearSlot.rpc,
+  Config.SetModelFavorite.rpc,
   Config.GetCloudUsage,
   LocalInference.LocalInferenceHardwareMirror.getRpc,
-  LocalInference.LocalModelsMirror.getRpc,
+  LocalInference.GetLocalModels.rpc,
   LocalInference.PreviewModelLoad,
-  Onboarding.OnboardingMirror.getRpc,
-  Onboarding.CompleteOnboarding,
+  Onboarding.GetOnboardingState.rpc,
+  Onboarding.CompleteOnboarding.rpc,
   Files.ListFiles,
   Files.ReadFile,
   Files.CheckFileExists,
@@ -94,12 +94,12 @@ const AtMostOnceDemandRpcs = RpcGroup.make(
   Agent.Interrupt,
   Files.UploadAttachment,
   Config.RefreshModelCatalog,
-  LocalInference.ReconcileCatalogModel,
-  LocalInference.CancelModelDownload,
-  LocalInference.DismissModelDownloadFailure,
-  LocalInference.DeleteLocalModel,
-  LocalInference.LoadModel,
-  LocalInference.StopModel,
+  LocalInference.ReconcileCatalogModel.rpc,
+  LocalInference.CancelModelDownload.rpc,
+  LocalInference.DismissModelDownloadFailure.rpc,
+  LocalInference.DeleteLocalModel.rpc,
+  LocalInference.LoadModel.rpc,
+  LocalInference.StopModel.rpc,
   Shell.RunBash,
 ).annotateRpcs(AcnRpcRecoveryPolicyTag, "AtMostOnce")
 

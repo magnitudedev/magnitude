@@ -11,9 +11,10 @@ import {
   useLocalModelsSelector,
   type AgentClientInstance,
 } from "../index"
-import { AcnRpcClientTag, type AcnRpcClient, type LocalModelsState } from "@magnitudedev/sdk"
+import { Acn, type AcnTransport, type Change, type LocalModelsState } from "@magnitudedev/sdk"
+import { Queue, Stream } from "effect"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
-import { makeClientInvalidations } from "../state/client-invalidations"
+import { fakeAcnTransport } from "../state/fake-acn-transport"
 
 const localModelsState: LocalModelsState = {
   inventoryState: { _tag: "Ready" },
@@ -25,7 +26,7 @@ const localModelsState: LocalModelsState = {
   .IS_REACT_ACT_ENVIRONMENT = true
 
 interface FakeRpcClient {
-  (tag: string): unknown
+  (tag: string): Effect.Effect<unknown, unknown>
 }
 
 let nextFakeAgentClientId = 0
@@ -48,11 +49,18 @@ const makeFakeAgentClient = (
   }
   const layer = Layer.succeed(FakeAgentClient, service)
   const runtime = Atom.runtime(layer)
-  const invalidations = Effect.runSync(makeClientInvalidations)
-  const effectQuery = EffectQueryClient.make<AcnRpcClientTag, never, ClientServices, never>(
-    Layer.succeed(AcnRpcClientTag, service as unknown as AcnRpcClient),
-    (client) => clientServicesLayer(client, invalidations),
+  const changes = Effect.runSync(Queue.unbounded<Change>())
+  const transport = fakeAcnTransport(
+    (tag) => service(tag),
+    (tag) => tag === "StreamChanges" ? Stream.fromQueue(changes) : Stream.never,
   )
+  const effectQuery = EffectQueryClient.make<AcnTransport, never, ClientServices, never>(
+    Layer.succeed(Acn.Client, transport),
+    (client) => clientServicesLayer(client),
+  )
+  const invalidations = {
+    publish: (change: Change) => Queue.offer(changes, change).pipe(Effect.asVoid),
+  }
   const mutation = () => Atom.fn(() => Effect.void)
   const tag = Object.assign(FakeAgentClient, {
     layer,
@@ -146,27 +154,13 @@ describe("local model query lifecycle", () => {
     const callsBeforeInvalidation = calls
 
     await act(async () => {
-      await Effect.runPromise(invalidations.publish({
-        _tag: "MirroredState",
-        invalidation: {
-          _tag: "changed",
-          id: "GetModelSlots",
-          revision: 1,
-        },
-      }))
+      await Effect.runPromise(invalidations.publish({ query: "GetModelSlots", revision: 1 }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation)
 
     await act(async () => {
-      await Effect.runPromise(invalidations.publish({
-        _tag: "MirroredState",
-        invalidation: {
-          _tag: "changed",
-          id: "GetLocalModels",
-          revision: 2,
-        },
-      }))
+      await Effect.runPromise(invalidations.publish({ query: "GetLocalModels", revision: 2 }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation + 1)
