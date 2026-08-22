@@ -5,10 +5,10 @@ import * as Path from "@effect/platform/Path"
 import { AcnReady, type AcnInstance, type AcnTarget } from "@magnitudedev/acn-protocol"
 import {
   ProcessGroupController,
-  ProcessGroupControllerLive,
   makeAcnOwnerStore,
   SqliteDriver,
 } from "@magnitudedev/acn-protocol/coordination"
+import { ProcessGroupControllerLive } from "@magnitudedev/acn-protocol/coordination/exact-process"
 import { Effect, Scope, Stream } from "effect"
 import { defaultDataDir } from "../binary"
 import { AcnInstanceManager, type AcnEnsureEvent } from "./acn-instance-manager"

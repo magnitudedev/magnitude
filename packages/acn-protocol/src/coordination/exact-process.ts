@@ -1,8 +1,13 @@
+/**
+ * Node implementation of `ProcessGroupController` (exact process identity via
+ * `ps` and `/proc`; group retirement via signals). Platform-bound: exported as
+ * `@magnitudedev/acn-protocol/coordination/exact-process`, never from the
+ * platform-free coordination index.
+ */
 import { execFile } from "node:child_process"
 import { readFile } from "node:fs/promises"
-import { Clock, Context, Data, Duration, Effect, Option, Schema } from "effect"
+import { Clock, Data, Duration, Effect, Option } from "effect"
 import { ProcessStartIdentitySchema } from "../acn-identity"
-import { ExactProcessSchema, ProcessGroupSchema } from "./schemas"
 import {
   ExactProcessIdentityObservationFailed,
   ProcessGroupAbsenceUnproven,
@@ -12,77 +17,34 @@ import {
   type ProcessGroupSignalError,
   type ProcessGroupStopError,
 } from "./errors"
+import {
+  PROCESS_GROUP_EXIT_POLL_INTERVAL,
+  PROCESS_GROUP_KILL_WAIT,
+  PROCESS_GROUP_TERM_WAIT,
+  ProcessGroupAbsent,
+  ProcessGroupLeaderLive,
+  ProcessGroupLeaderReplaced,
+  ProcessGroupStopped,
+  ProcessGroupSurvivorsOnly,
+  type ProcessGroupController,
+  type ProcessGroupStopOutcome,
+} from "./process-group"
 import type { ExactProcess, ProcessGroup } from "./schemas"
 
-/** Shared timing for process-group retirement. */
-export const PROCESS_GROUP_EXIT_POLL_INTERVAL = Duration.millis(50)
-export const PROCESS_GROUP_TERM_WAIT = Duration.seconds(2)
-export const PROCESS_GROUP_KILL_WAIT = Duration.seconds(2)
-
-/** The recorded leader occurrence is alive. */
-export class ProcessGroupLeaderLive extends Schema.TaggedClass<ProcessGroupLeaderLive>()(
-  "ProcessGroupLeaderLive",
-  { group: ProcessGroupSchema },
-) {}
-/** The leader pid is occupied by a different process occurrence; the recorded group may still have members. */
-export class ProcessGroupLeaderReplaced extends Schema.TaggedClass<ProcessGroupLeaderReplaced>()(
-  "ProcessGroupLeaderReplaced",
-  { group: ProcessGroupSchema, observedLeader: ExactProcessSchema },
-) {}
-/** The leader occurrence is gone but descendants of the group remain. */
-export class ProcessGroupSurvivorsOnly extends Schema.TaggedClass<ProcessGroupSurvivorsOnly>()(
-  "ProcessGroupSurvivorsOnly",
-  { group: ProcessGroupSchema },
-) {}
-/** No member of the group remains. */
-export class ProcessGroupAbsent extends Schema.TaggedClass<ProcessGroupAbsent>()(
-  "ProcessGroupAbsent",
-  { group: ProcessGroupSchema },
-) {}
-export type ProcessGroupObservation =
-  | ProcessGroupLeaderLive
-  | ProcessGroupLeaderReplaced
-  | ProcessGroupSurvivorsOnly
-  | ProcessGroupAbsent
-export type ProcessGroupObservationError =
-  | ExactProcessIdentityObservationFailed
-  | ProcessGroupObservationFailed
-
-export class ProcessGroupStopped extends Schema.TaggedClass<ProcessGroupStopped>()(
-  "ProcessGroupStopped",
-  { group: ProcessGroupSchema },
-) {}
-export type ProcessGroupStopOutcome = ProcessGroupStopped | ProcessGroupLeaderReplaced
-
-export interface ProcessGroupController {
-  /** Detects the exact process currently occupying `pid`, or none if the pid is free. */
-  readonly inspect: (
-    pid: number,
-  ) => Effect.Effect<Option.Option<ExactProcess>, ExactProcessIdentityObservationFailed>
-  /** This process's own exact identity. */
-  readonly currentProcess: Effect.Effect<ExactProcess, ExactProcessIdentityObservationFailed>
-  /** The state of the group led by that exact process occurrence. */
-  readonly observe: (
-    group: ProcessGroup,
-  ) => Effect.Effect<ProcessGroupObservation, ProcessGroupObservationError>
-  /** Polls until no member of the group remains or the deadline passes; `true` when it is gone. */
-  readonly waitForGroupExit: (
-    group: ProcessGroup,
-    timeout: Duration.DurationInput,
-  ) => Effect.Effect<boolean, ProcessGroupObservationFailed>
-  /**
-   * Retires the group: TERM, wait, KILL, wait, prove absence. The leader's exact identity is
-   * checked before every signal; a replaced leader ends the retirement as
-   * `ProcessGroupLeaderReplaced` because the recorded group can no longer be targeted safely.
-   */
-  readonly stop: (
-    group: ProcessGroup,
-  ) => Effect.Effect<ProcessGroupStopOutcome, ProcessGroupStopError>
-}
-
-export const ProcessGroupController = Context.GenericTag<ProcessGroupController>(
-  "@magnitudedev/acn-protocol/coordination/ProcessGroupController",
-)
+export {
+  PROCESS_GROUP_EXIT_POLL_INTERVAL,
+  PROCESS_GROUP_KILL_WAIT,
+  PROCESS_GROUP_TERM_WAIT,
+  ProcessGroupAbsent,
+  ProcessGroupLeaderLive,
+  ProcessGroupLeaderReplaced,
+  ProcessGroupStopped,
+  ProcessGroupSurvivorsOnly,
+  type ProcessGroupController,
+  type ProcessGroupObservation,
+  type ProcessGroupObservationError,
+  type ProcessGroupStopOutcome,
+} from "./process-group"
 
 type ProcessGroupSignal = "term" | "kill"
 
