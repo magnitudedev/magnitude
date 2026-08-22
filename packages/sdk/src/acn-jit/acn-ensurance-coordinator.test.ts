@@ -1,8 +1,9 @@
 import { AcnIdentitySchema, AcnRevisionSchema, ProcessStartIdentitySchema } from "@magnitudedev/acn-protocol"
+import { ProcessGroupSignalPermissionDenied } from "@magnitudedev/acn-protocol/coordination"
 import { Effect, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { AcnCandidateNotLaunched, type AcnCandidateLaunchSupervisor } from "./acn-candidate-launch-supervisor"
-import { AcnDaemonProcessGroupTerminationPermissionDenied } from "./errors"
+import { AcnDaemonShutdownFailed } from "./errors"
 import type { AcnDaemonShutdownSupervisor } from "./acn-daemon-shutdown-supervisor"
 import { makeAcnEnsuranceCoordinator } from "./acn-ensurance-coordinator"
 import type { AcnDaemonLaunchCommandResolver } from "./acn-daemon-launch-command-resolver"
@@ -20,11 +21,13 @@ describe("AcnEnsuranceCoordinator", () => {
       observe: Effect.succeed(new AcnRecordedOwnerProcessGroupSurvives({ owner })),
       confirmReady: () => Effect.dieMessage("process-group survival cannot be ready"),
     }
-    const permissionDenied = new AcnDaemonProcessGroupTerminationPermissionDenied({
-      reason: "Permission denied signaling daemon",
-      expectedOwner: owner,
-      shutdownReason: "SurvivingProcessGroup",
-      message: "Operation not permitted",
+    const permissionDenied = new AcnDaemonShutdownFailed({
+      owner,
+      reason: "SurvivingProcessGroup",
+      failure: new ProcessGroupSignalPermissionDenied({
+        group: { leader: { pid: owner.pid, processStartIdentity: owner.processStartIdentity } },
+        message: "Operation not permitted",
+      }),
     })
     const shutdownSupervisor: AcnDaemonShutdownSupervisor = {
       shutdown: () => Effect.fail(permissionDenied),
@@ -53,10 +56,13 @@ describe("AcnEnsuranceCoordinator", () => {
     expect(result).toMatchObject({
       _tag: "Left",
       left: {
-        _tag: "AcnDaemonProcessGroupTerminationPermissionDenied",
-        expectedOwner: owner,
-        shutdownReason: "SurvivingProcessGroup",
-        message: "Operation not permitted",
+        _tag: "AcnDaemonShutdownFailed",
+        owner,
+        reason: "SurvivingProcessGroup",
+        failure: {
+          _tag: "ProcessGroupSignalPermissionDenied",
+          message: "Operation not permitted",
+        },
       },
     })
   })

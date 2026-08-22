@@ -2,7 +2,6 @@ import { FSM } from "@magnitudedev/utils"
 import { AcnReady, type AcnInstance } from "@magnitudedev/acn-protocol"
 import {
   ExactProcessSchema,
-  ExactProcessIdentityObservationFailed,
   ProcessGroupController,
   type AcnOwnerRecord,
   type ExactProcess,
@@ -20,26 +19,16 @@ import {
   Stream,
   SubscriptionRef,
 } from "effect"
+import { type AcnCandidateCleanupError, type ChildProcessSpawner, type SpawnedAcnCandidate } from "./child-process"
 import {
-  type AcnCandidateCleanupError,
-  type AcnCandidateExactProcessConfirmationError,
-  type ChildProcessSpawner,
-  type SpawnedAcnCandidate,
-} from "./child-process"
-import {
-  AcnCandidateAdmissionAcknowledgementTimedOut,
-  type AcnCandidateAdmissionAlreadyAcknowledged,
-  type AcnCandidateAdmissionBeforeExactProcessConfirmed,
-  AcnCandidateExitedBeforeIdentityObserved,
-  AcnCandidateExactProcessAlreadyConfirmed,
-  AcnCandidateExactProcessPidMismatch,
+  AcnCandidateAdmissionTimedOut,
+  AcnCandidateExitedAfterAdmission,
+  AcnCandidateExitedBeforeAdmission,
+  AcnCandidateFailureSchema,
   AcnCandidateIdentityUnavailable,
-  AcnCandidateLaunchAlreadyAttempted,
-  type AcnCandidateParentChannelReleaseFailed,
-  AcnCandidateReadyBeforeAdmission,
-  AcnCandidateReadyInstanceMismatch,
-  AcnCandidateSpawnFailed,
-  AcnProcessIdentityObservationTimedOut,
+  AcnCandidateOwnershipLost,
+  AcnCandidateParentChannelReleaseFailed,
+  type AcnCandidateFailure,
 } from "./errors"
 import { inspectExactProcess } from "./acn-owner-observer"
 
@@ -59,51 +48,8 @@ export class AcnCandidateAdmitted extends Schema.TaggedClass<AcnCandidateAdmitte
 export class AcnCandidateReady extends Schema.TaggedClass<AcnCandidateReady>()(
   "Ready", { process: ExactProcessSchema, launchedAt: Schema.Number, admittedAt: Schema.Number },
 ) {}
-export const AcnCandidateLaunchFailureSchema = Schema.Union(
-  AcnCandidateSpawnFailed,
-  ExactProcessIdentityObservationFailed,
-  AcnProcessIdentityObservationTimedOut,
-  AcnCandidateIdentityUnavailable,
-  AcnCandidateExitedBeforeIdentityObserved,
-  AcnCandidateExactProcessPidMismatch,
-  AcnCandidateExactProcessAlreadyConfirmed,
-)
-export type AcnCandidateLaunchFailure = typeof AcnCandidateLaunchFailureSchema.Type
-export class AcnCandidateLaunchFailed extends Schema.TaggedClass<AcnCandidateLaunchFailed>()(
-  "LaunchFailed", { failure: AcnCandidateLaunchFailureSchema },
-) {}
-const CandidateExitFields = {
-  process: ExactProcessSchema,
-  launchedAt: Schema.Number,
-  code: Schema.Number,
-  stderr: Schema.String,
-}
-export class AcnCandidateExitedBeforeAdmission extends Schema.TaggedClass<AcnCandidateExitedBeforeAdmission>()(
-  "ExitedBeforeAdmission", CandidateExitFields,
-) {}
-export class AcnCandidateExitedAfterAdmission extends Schema.TaggedClass<AcnCandidateExitedAfterAdmission>()(
-  "ExitedAfterAdmission", {
-    ...CandidateExitFields,
-    admittedAt: Schema.Number,
-  },
-) {}
-export class AcnCandidateAdmissionAcknowledgementLost extends Schema.TaggedClass<AcnCandidateAdmissionAcknowledgementLost>()(
-  "AdmissionAcknowledgementLost", {
-    process: ExactProcessSchema,
-    launchedAt: Schema.Number,
-    lostAt: Schema.Number,
-  },
-) {}
-export class AcnCandidateAdmissionExpired extends Schema.TaggedClass<AcnCandidateAdmissionExpired>()(
-  "AdmissionExpired", { process: ExactProcessSchema, launchedAt: Schema.Number },
-) {}
-export class AcnCandidateLostAfterAdmission extends Schema.TaggedClass<AcnCandidateLostAfterAdmission>()(
-  "LostAfterAdmission", {
-    process: ExactProcessSchema,
-    launchedAt: Schema.Number,
-    admittedAt: Schema.Number,
-    lostAt: Schema.Number,
-  },
+export class AcnCandidateFailed extends Schema.TaggedClass<AcnCandidateFailed>()(
+  "Failed", { failure: AcnCandidateFailureSchema },
 ) {}
 
 export const AcnCandidateLaunchStateSchema = Schema.Union(
@@ -111,29 +57,9 @@ export const AcnCandidateLaunchStateSchema = Schema.Union(
   AcnCandidateSpawned,
   AcnCandidateAdmitted,
   AcnCandidateReady,
-  AcnCandidateLaunchFailed,
-  AcnCandidateExitedBeforeAdmission,
-  AcnCandidateExitedAfterAdmission,
-  AcnCandidateAdmissionAcknowledgementLost,
-  AcnCandidateAdmissionExpired,
-  AcnCandidateLostAfterAdmission,
+  AcnCandidateFailed,
 )
 export type AcnCandidateLaunchState = typeof AcnCandidateLaunchStateSchema.Type
-export type AcnCandidateSupervisionError =
-  | AcnCandidateSpawnFailed
-  | AcnCandidateLaunchAlreadyAttempted
-  | AcnCandidateIdentityUnavailable
-  | AcnCandidateExitedBeforeIdentityObserved
-  | AcnCandidateAdmissionAlreadyAcknowledged
-  | AcnCandidateAdmissionBeforeExactProcessConfirmed
-  | AcnCandidateParentChannelReleaseFailed
-  | AcnCandidateAdmissionAcknowledgementTimedOut
-  | AcnCandidateReadyBeforeAdmission
-  | AcnCandidateReadyInstanceMismatch
-  | AcnCandidateCleanupError
-  | AcnCandidateExactProcessConfirmationError
-  | ExactProcessIdentityObservationFailed
-  | AcnProcessIdentityObservationTimedOut
 
 export const AcnCandidateLaunchFsm = FSM.defineFSM(
   {
@@ -141,24 +67,14 @@ export const AcnCandidateLaunchFsm = FSM.defineFSM(
     Spawned: AcnCandidateSpawned,
     Admitted: AcnCandidateAdmitted,
     Ready: AcnCandidateReady,
-    LaunchFailed: AcnCandidateLaunchFailed,
-    ExitedBeforeAdmission: AcnCandidateExitedBeforeAdmission,
-    ExitedAfterAdmission: AcnCandidateExitedAfterAdmission,
-    AdmissionAcknowledgementLost: AcnCandidateAdmissionAcknowledgementLost,
-    AdmissionExpired: AcnCandidateAdmissionExpired,
-    LostAfterAdmission: AcnCandidateLostAfterAdmission,
+    Failed: AcnCandidateFailed,
   },
   {
-    NotLaunched: ["Spawned", "LaunchFailed"],
-    Spawned: ["Admitted", "ExitedBeforeAdmission", "AdmissionExpired", "AdmissionAcknowledgementLost"],
-    Admitted: ["Ready", "ExitedAfterAdmission", "LostAfterAdmission"],
+    NotLaunched: ["Spawned", "Failed"],
+    Spawned: ["Admitted", "Failed"],
+    Admitted: ["Ready", "Failed"],
     Ready: [],
-    LaunchFailed: [],
-    ExitedBeforeAdmission: [],
-    ExitedAfterAdmission: [],
-    AdmissionAcknowledgementLost: [],
-    AdmissionExpired: [],
-    LostAfterAdmission: [],
+    Failed: [],
   } as const,
 )
 
@@ -172,11 +88,11 @@ export interface AcnCandidateLaunchSupervisor {
   readonly changes: Stream.Stream<AcnCandidateLaunchState>
   readonly launch: (
     command: Arr.NonEmptyReadonlyArray<string>,
-  ) => Effect.Effect<void, AcnCandidateSupervisionError>
+  ) => Effect.Effect<void, AcnCandidateCleanupError>
   readonly reconcile: (
     owner: Option.Option<AcnOwnerRecord>,
-  ) => Effect.Effect<AcnCandidateLaunchState, AcnCandidateSupervisionError>
-  readonly markReady: (instance: AcnInstance<AcnReady>) => Effect.Effect<void, AcnCandidateSupervisionError>
+  ) => Effect.Effect<AcnCandidateLaunchState, AcnCandidateCleanupError>
+  readonly markReady: (instance: AcnInstance<AcnReady>) => Effect.Effect<void>
 }
 
 export const AcnCandidateLaunchSupervisor = Context.GenericTag<AcnCandidateLaunchSupervisor>(
@@ -186,11 +102,8 @@ export const AcnCandidateLaunchSupervisor = Context.GenericTag<AcnCandidateLaunc
 const ownerNamesProcess = (owner: AcnOwnerRecord, process: ExactProcess): boolean =>
   owner.pid === process.pid && owner.processStartIdentity === process.processStartIdentity
 
-const stopThenFail = <E>(
-  child: SpawnedAcnCandidate,
-  failure: E,
-): Effect.Effect<never, E | AcnCandidateCleanupError> => child.stopAndReap.pipe(
-  Effect.zipRight(Effect.fail(failure)),
+const monotonicMillis = Clock.currentTimeNanos.pipe(
+  Effect.map((nanos) => Number(nanos / 1_000_000n)),
 )
 
 export const makeAcnCandidateLaunchSupervisor = (
@@ -202,12 +115,24 @@ export const makeAcnCandidateLaunchSupervisor = (
   const runtime = yield* Ref.make<Option.Option<CandidateRuntime>>(Option.none())
   const lock = yield* Effect.makeSemaphore(1)
 
+  const failFrom = (
+    from: AcnCandidateLaunchState,
+    failure: AcnCandidateFailure,
+  ): Effect.Effect<AcnCandidateFailed> => Effect.gen(function* () {
+    if (from._tag === "Ready" || from._tag === "Failed") {
+      return yield* Effect.dieMessage(`ACN candidate failure recorded in terminal state ${from._tag}`)
+    }
+    const next = AcnCandidateLaunchFsm.transition(from, "Failed", { failure })
+    yield* SubscriptionRef.set(lifecycle, next)
+    return next
+  })
+
   const launch: AcnCandidateLaunchSupervisor["launch"] = (command) => lock.withPermits(1)(
     Effect.gen(function* () {
       const now = yield* monotonicMillis
       const current = yield* SubscriptionRef.get(lifecycle)
       if (current._tag !== "NotLaunched") {
-        return yield* new AcnCandidateLaunchAlreadyAttempted({})
+        return yield* Effect.dieMessage(`ACN candidate launch attempted in state ${current._tag}`)
       }
       const spawned = yield* spawner.spawn(command).pipe(
         Effect.provideService(Scope.Scope, scope),
@@ -215,41 +140,30 @@ export const makeAcnCandidateLaunchSupervisor = (
         Effect.either,
       )
       if (spawned._tag === "Left") {
-        yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "LaunchFailed", {
-          failure: spawned.left,
-        }))
-        return yield* spawned.left
+        yield* failFrom(current, spawned.left)
+        return
       }
       const child = spawned.right
       const inspected = yield* inspectExactProcess(processes, child.pid).pipe(Effect.either)
       if (inspected._tag === "Left") {
-        yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "LaunchFailed", {
-          failure: inspected.left,
-        }))
-        return yield* stopThenFail(child, inspected.left)
+        yield* failFrom(current, inspected.left)
+        return yield* child.stopAndReap
       }
       const identity = inspected.right
       if (Option.isNone(identity)) {
         const exit = yield* child.exited.pipe(Effect.timeoutOption(Duration.millis(100)))
-        const failure = Option.match(exit, {
+        yield* failFrom(current, Option.match(exit, {
           onNone: () => new AcnCandidateIdentityUnavailable({ pid: child.pid }),
-          onSome: ({ code, stderr }) => new AcnCandidateExitedBeforeIdentityObserved({
+          onSome: ({ code, stderr }) => new AcnCandidateExitedBeforeAdmission({
             pid: child.pid,
             code,
             stderr,
           }),
-        })
-        yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "LaunchFailed", { failure }))
-        return yield* stopThenFail(child, failure)
-      }
-      const process = { pid: child.pid, processStartIdentity: identity.value }
-      const confirmed = yield* child.confirmExactProcess(process).pipe(Effect.either)
-      if (confirmed._tag === "Left") {
-        yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "LaunchFailed", {
-          failure: confirmed.left,
         }))
-        return yield* stopThenFail(child, confirmed.left)
+        return yield* child.stopAndReap
       }
+      const process = identity.value
+      yield* child.confirmExactProcess(process)
       yield* Ref.set(runtime, Option.some({ process, child }))
       yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "Spawned", {
         process,
@@ -263,19 +177,21 @@ export const makeAcnCandidateLaunchSupervisor = (
       const now = yield* monotonicMillis
       let current = yield* SubscriptionRef.get(lifecycle)
       const active = yield* Ref.get(runtime)
-      if (Option.isNone(active)) return current
+      if (Option.isNone(active) || current._tag === "Failed" || current._tag === "Ready") return current
       const { child, process } = active.value
 
       if (current._tag === "Spawned" && Option.exists(owner, (value) => ownerNamesProcess(value, process))) {
         const admission = yield* child.admit.pipe(Effect.timeoutFail({
           duration: CANDIDATE_PARENT_RELEASE_TIMEOUT,
-          onTimeout: () => new AcnCandidateAdmissionAcknowledgementTimedOut({ pid: process.pid }),
+          onTimeout: () => new AcnCandidateParentChannelReleaseFailed({
+            pid: process.pid,
+            message: "parent channel release timed out",
+          }),
         }), Effect.either)
         if (admission._tag === "Left") {
-          yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "AdmissionAcknowledgementLost", {
-            lostAt: now,
-          }))
-          return yield* stopThenFail(child, admission.left)
+          const failed = yield* failFrom(current, admission.left)
+          yield* child.stopAndReap
+          return failed
         }
         current = AcnCandidateLaunchFsm.transition(current, "Admitted", { admittedAt: now })
         yield* SubscriptionRef.set(lifecycle, current)
@@ -284,43 +200,38 @@ export const makeAcnCandidateLaunchSupervisor = (
       if (current._tag === "Spawned") {
         const exited = yield* child.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
         if (Option.isSome(exited)) {
-          const next = AcnCandidateLaunchFsm.transition(current, "ExitedBeforeAdmission", {
+          const failed = yield* failFrom(current, new AcnCandidateExitedBeforeAdmission({
+            pid: process.pid,
             ...exited.value,
-          })
-          yield* SubscriptionRef.set(lifecycle, next)
+          }))
           yield* child.stopAndReap
-          return next
+          return failed
         }
         if (now - current.launchedAt >= Duration.toMillis(CANDIDATE_ADMISSION_TIMEOUT)) {
-          const next = AcnCandidateLaunchFsm.transition(current, "AdmissionExpired", {})
-          yield* SubscriptionRef.set(lifecycle, next)
+          const failed = yield* failFrom(current, new AcnCandidateAdmissionTimedOut({ pid: process.pid }))
           yield* child.stopAndReap
-          return next
+          return failed
         }
       }
 
       if (current._tag === "Admitted" && !Option.exists(owner, (value) => ownerNamesProcess(value, process))) {
         const exited = yield* child.exited.pipe(Effect.timeoutOption(CANDIDATE_EXIT_DIAGNOSTIC_TIMEOUT))
-        const next = Option.match(exited, {
-          onNone: () => AcnCandidateLaunchFsm.transition(current, "LostAfterAdmission", {
-            lostAt: now,
-          }),
-          onSome: (exit) => AcnCandidateLaunchFsm.transition(current, "ExitedAfterAdmission", {
+        return yield* failFrom(current, Option.match(exited, {
+          onNone: () => new AcnCandidateOwnershipLost({ pid: process.pid }),
+          onSome: (exit): AcnCandidateFailure => new AcnCandidateExitedAfterAdmission({
+            pid: process.pid,
             ...exit,
           }),
-        })
-        yield* SubscriptionRef.set(lifecycle, next)
-        return next
+        }))
       }
 
       if (current._tag === "Admitted") {
         const exited = yield* child.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
         if (Option.isSome(exited)) {
-          const next = AcnCandidateLaunchFsm.transition(current, "ExitedAfterAdmission", {
+          return yield* failFrom(current, new AcnCandidateExitedAfterAdmission({
+            pid: process.pid,
             ...exited.value,
-          })
-          yield* SubscriptionRef.set(lifecycle, next)
-          return next
+          }))
         }
       }
       return current
@@ -330,17 +241,13 @@ export const makeAcnCandidateLaunchSupervisor = (
   const markReady: AcnCandidateLaunchSupervisor["markReady"] = (instance) => lock.withPermits(1)(Effect.gen(function* () {
     const current = yield* SubscriptionRef.get(lifecycle)
     if (current._tag !== "Admitted") {
-      return yield* new AcnCandidateReadyBeforeAdmission({})
+      return yield* Effect.dieMessage(`ACN candidate marked ready in state ${current._tag}`)
     }
     if (current.process.pid !== instance.pid ||
       current.process.processStartIdentity !== instance.processStartIdentity) {
-      return yield* new AcnCandidateReadyInstanceMismatch({
-        candidate: current.process,
-        ready: {
-          pid: instance.pid,
-          processStartIdentity: instance.processStartIdentity,
-        },
-      })
+      return yield* Effect.dieMessage(
+        `ready ACN ${instance.pid} is not the supervised candidate ${current.process.pid}`,
+      )
     }
     yield* SubscriptionRef.set(lifecycle, AcnCandidateLaunchFsm.transition(current, "Ready", {}))
   }))
@@ -353,6 +260,3 @@ export const makeAcnCandidateLaunchSupervisor = (
     markReady,
   })
 })
-const monotonicMillis = Clock.currentTimeNanos.pipe(
-  Effect.map((nanos) => Number(nanos / 1_000_000n)),
-)

@@ -3,10 +3,14 @@ import { Rpc, RpcClientError } from "@effect/rpc"
 import { AcnTargetSchema, StreamDisplayView, WatchFile } from "@magnitudedev/acn-protocol"
 import {
   AcnOwnerRecordSchema,
-  ExactProcessSchema,
   ExactProcessIdentityObservationFailed,
+  ProcessGroupAbsenceUnproven,
   ProcessGroupObservationFailed,
+  ProcessGroupSignalFailed,
+  ProcessGroupSignalPermissionDenied,
 } from "@magnitudedev/acn-protocol/coordination"
+
+const ProcessIdSchema = Schema.Number.pipe(Schema.int(), Schema.positive())
 
 export class AcnEnsuranceFailed extends Schema.TaggedError<AcnEnsuranceFailed>()(
   "AcnEnsuranceFailed",
@@ -25,7 +29,7 @@ export class AcnOwnerRecordInvalid extends Schema.TaggedError<AcnOwnerRecordInva
 
 export class AcnProcessIdentityObservationTimedOut extends Schema.TaggedError<AcnProcessIdentityObservationTimedOut>()(
   "AcnProcessIdentityObservationTimedOut",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
+  { pid: ProcessIdSchema },
 ) {}
 
 export class AcnCandidateSpawnFailed extends Schema.TaggedError<AcnCandidateSpawnFailed>()(
@@ -33,111 +37,64 @@ export class AcnCandidateSpawnFailed extends Schema.TaggedError<AcnCandidateSpaw
   { message: Schema.String },
 ) {}
 
-export class AcnCandidateProcessGroupObservationFailed extends Schema.TaggedError<AcnCandidateProcessGroupObservationFailed>()(
-  "AcnCandidateProcessGroupObservationFailed",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
+export class AcnCandidateIdentityUnavailable extends Schema.TaggedError<AcnCandidateIdentityUnavailable>()(
+  "AcnCandidateIdentityUnavailable",
+  { pid: ProcessIdSchema },
 ) {}
 
-export class AcnCandidateProcessGroupTerminationFailed extends Schema.TaggedError<AcnCandidateProcessGroupTerminationFailed>()(
-  "AcnCandidateProcessGroupTerminationFailed",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
+const CandidateExitFields = {
+  pid: ProcessIdSchema,
+  code: Schema.Number,
+  stderr: Schema.String,
+}
+
+export class AcnCandidateExitedBeforeAdmission extends Schema.TaggedError<AcnCandidateExitedBeforeAdmission>()(
+  "AcnCandidateExitedBeforeAdmission",
+  CandidateExitFields,
 ) {}
 
-export class AcnCandidateProcessGroupTerminationPermissionDenied extends Schema.TaggedError<AcnCandidateProcessGroupTerminationPermissionDenied>()(
-  "AcnCandidateProcessGroupTerminationPermissionDenied",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
+export class AcnCandidateExitedAfterAdmission extends Schema.TaggedError<AcnCandidateExitedAfterAdmission>()(
+  "AcnCandidateExitedAfterAdmission",
+  CandidateExitFields,
 ) {}
 
-export class AcnCandidateProcessGroupKillFailed extends Schema.TaggedError<AcnCandidateProcessGroupKillFailed>()(
-  "AcnCandidateProcessGroupKillFailed",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
-) {}
-
-export class AcnCandidateProcessGroupKillPermissionDenied extends Schema.TaggedError<AcnCandidateProcessGroupKillPermissionDenied>()(
-  "AcnCandidateProcessGroupKillPermissionDenied",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
-) {}
-
-export class AcnCandidateProcessGroupAbsenceUnproven extends Schema.TaggedError<AcnCandidateProcessGroupAbsenceUnproven>()(
-  "AcnCandidateProcessGroupAbsenceUnproven",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
-) {}
-
-export class AcnCandidateProcessGroupLeaderChanged extends Schema.TaggedError<AcnCandidateProcessGroupLeaderChanged>()(
-  "AcnCandidateProcessGroupLeaderChanged",
-  { candidate: ExactProcessSchema, observedLeader: ExactProcessSchema },
-) {}
-
-export class AcnCandidateBootstrapProcessStopFailed extends Schema.TaggedError<AcnCandidateBootstrapProcessStopFailed>()(
-  "AcnCandidateBootstrapProcessStopFailed",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
-) {}
-
-export class AcnCandidateBootstrapProcessExitUnproven extends Schema.TaggedError<AcnCandidateBootstrapProcessExitUnproven>()(
-  "AcnCandidateBootstrapProcessExitUnproven",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
-) {}
-
-export class AcnCandidateExactProcessPidMismatch extends Schema.TaggedError<AcnCandidateExactProcessPidMismatch>()(
-  "AcnCandidateExactProcessPidMismatch",
-  {
-    candidatePid: Schema.Number.pipe(Schema.int(), Schema.positive()),
-    observed: ExactProcessSchema,
-  },
-) {}
-
-export class AcnCandidateExactProcessAlreadyConfirmed extends Schema.TaggedError<AcnCandidateExactProcessAlreadyConfirmed>()(
-  "AcnCandidateExactProcessAlreadyConfirmed",
-  { confirmed: ExactProcessSchema, attempted: ExactProcessSchema },
-) {}
-
-export class AcnCandidateAdmissionBeforeExactProcessConfirmed extends Schema.TaggedError<AcnCandidateAdmissionBeforeExactProcessConfirmed>()(
-  "AcnCandidateAdmissionBeforeExactProcessConfirmed",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
+export class AcnCandidateAdmissionTimedOut extends Schema.TaggedError<AcnCandidateAdmissionTimedOut>()(
+  "AcnCandidateAdmissionTimedOut",
+  { pid: ProcessIdSchema },
 ) {}
 
 export class AcnCandidateParentChannelReleaseFailed extends Schema.TaggedError<AcnCandidateParentChannelReleaseFailed>()(
   "AcnCandidateParentChannelReleaseFailed",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()), message: Schema.String },
+  { pid: ProcessIdSchema, message: Schema.String },
 ) {}
 
-export class AcnCandidateAdmissionAlreadyAcknowledged extends Schema.TaggedError<AcnCandidateAdmissionAlreadyAcknowledged>()(
-  "AcnCandidateAdmissionAlreadyAcknowledged",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
+export class AcnCandidateOwnershipLost extends Schema.TaggedError<AcnCandidateOwnershipLost>()(
+  "AcnCandidateOwnershipLost",
+  { pid: ProcessIdSchema },
 ) {}
 
-export class AcnCandidateLaunchAlreadyAttempted extends Schema.TaggedError<AcnCandidateLaunchAlreadyAttempted>()(
-  "AcnCandidateLaunchAlreadyAttempted",
-  {},
+/** Every way one supervised candidate occurrence terminates without becoming ready. */
+export const AcnCandidateFailureSchema = Schema.Union(
+  AcnCandidateSpawnFailed,
+  AcnCandidateIdentityUnavailable,
+  AcnCandidateExitedBeforeAdmission,
+  AcnCandidateExitedAfterAdmission,
+  AcnCandidateAdmissionTimedOut,
+  AcnCandidateParentChannelReleaseFailed,
+  AcnCandidateOwnershipLost,
+  ExactProcessIdentityObservationFailed,
+  AcnProcessIdentityObservationTimedOut,
+)
+export type AcnCandidateFailure = typeof AcnCandidateFailureSchema.Type
+
+export class AcnCandidateBootstrapProcessStopFailed extends Schema.TaggedError<AcnCandidateBootstrapProcessStopFailed>()(
+  "AcnCandidateBootstrapProcessStopFailed",
+  { pid: ProcessIdSchema, message: Schema.String },
 ) {}
 
-export class AcnCandidateIdentityUnavailable extends Schema.TaggedError<AcnCandidateIdentityUnavailable>()(
-  "AcnCandidateIdentityUnavailable",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
-) {}
-
-export class AcnCandidateExitedBeforeIdentityObserved extends Schema.TaggedError<AcnCandidateExitedBeforeIdentityObserved>()(
-  "AcnCandidateExitedBeforeIdentityObserved",
-  {
-    pid: Schema.Number.pipe(Schema.int(), Schema.positive()),
-    code: Schema.Number,
-    stderr: Schema.String,
-  },
-) {}
-
-export class AcnCandidateAdmissionAcknowledgementTimedOut extends Schema.TaggedError<AcnCandidateAdmissionAcknowledgementTimedOut>()(
-  "AcnCandidateAdmissionAcknowledgementTimedOut",
-  { pid: Schema.Number.pipe(Schema.int(), Schema.positive()) },
-) {}
-
-export class AcnCandidateReadyBeforeAdmission extends Schema.TaggedError<AcnCandidateReadyBeforeAdmission>()(
-  "AcnCandidateReadyBeforeAdmission",
-  {},
-) {}
-
-export class AcnCandidateReadyInstanceMismatch extends Schema.TaggedError<AcnCandidateReadyInstanceMismatch>()(
-  "AcnCandidateReadyInstanceMismatch",
-  { candidate: ExactProcessSchema, ready: ExactProcessSchema },
+export class AcnCandidateBootstrapProcessExitUnproven extends Schema.TaggedError<AcnCandidateBootstrapProcessExitUnproven>()(
+  "AcnCandidateBootstrapProcessExitUnproven",
+  { pid: ProcessIdSchema },
 ) {}
 
 export class AcnDaemonTargetUnsupported extends Schema.TaggedError<AcnDaemonTargetUnsupported>()(
@@ -148,46 +105,6 @@ export class AcnDaemonTargetUnsupported extends Schema.TaggedError<AcnDaemonTarg
 export class AcnLaunchOverrideTargetMismatch extends Schema.TaggedError<AcnLaunchOverrideTargetMismatch>()(
   "AcnLaunchOverrideTargetMismatch",
   { requested: AcnTargetSchema, override: AcnTargetSchema },
-) {}
-
-const CandidateExitFailureFields = {
-  process: ExactProcessSchema,
-  code: Schema.Number,
-  stderr: Schema.String,
-}
-export class AcnCandidateExitedBeforeAdmissionFailure extends Schema.TaggedError<AcnCandidateExitedBeforeAdmissionFailure>()(
-  "AcnCandidateExitedBeforeAdmissionFailure",
-  CandidateExitFailureFields,
-) {}
-
-export class AcnCandidateExitedAfterAdmissionFailure extends Schema.TaggedError<AcnCandidateExitedAfterAdmissionFailure>()(
-  "AcnCandidateExitedAfterAdmissionFailure",
-  CandidateExitFailureFields,
-) {}
-
-export class AcnCandidateAdmissionTimedOut extends Schema.TaggedError<AcnCandidateAdmissionTimedOut>()(
-  "AcnCandidateAdmissionTimedOut",
-  { process: ExactProcessSchema },
-) {}
-
-export class AcnCandidateAdmissionLost extends Schema.TaggedError<AcnCandidateAdmissionLost>()(
-  "AcnCandidateAdmissionLost",
-  { process: ExactProcessSchema },
-) {}
-
-export class AcnCandidateOwnershipLostAfterAdmission extends Schema.TaggedError<AcnCandidateOwnershipLostAfterAdmission>()(
-  "AcnCandidateOwnershipLostAfterAdmission",
-  { process: ExactProcessSchema },
-) {}
-
-export class AcnDaemonStartupTimedOut extends Schema.TaggedError<AcnDaemonStartupTimedOut>()(
-  "AcnDaemonStartupTimedOut",
-  { owner: AcnOwnerRecordSchema },
-) {}
-
-export class AcnEnsuranceConvergenceTimedOut extends Schema.TaggedError<AcnEnsuranceConvergenceTimedOut>()(
-  "AcnEnsuranceConvergenceTimedOut",
-  {},
 ) {}
 
 export const AcnDaemonShutdownReasonSchema = Schema.Literal(
@@ -201,84 +118,35 @@ export const AcnDaemonShutdownReasonSchema = Schema.Literal(
 )
 export type AcnDaemonShutdownReason = typeof AcnDaemonShutdownReasonSchema.Type
 
-export class AcnDaemonOwnerObservationFailed extends Schema.TaggedError<AcnDaemonOwnerObservationFailed>()(
-  "AcnDaemonOwnerObservationFailed",
+/** The typed control failures the shutdown supervisor can hit while retiring one daemon. */
+export const AcnDaemonShutdownControlFailureSchema = Schema.Union(
+  AcnOwnerRecordReadUnavailable,
+  AcnOwnerRecordInvalid,
+  ExactProcessIdentityObservationFailed,
+  ProcessGroupObservationFailed,
+  ProcessGroupSignalPermissionDenied,
+  ProcessGroupSignalFailed,
+  ProcessGroupAbsenceUnproven,
+)
+export type AcnDaemonShutdownControlFailure = typeof AcnDaemonShutdownControlFailureSchema.Type
+
+export class AcnDaemonShutdownFailed extends Schema.TaggedError<AcnDaemonShutdownFailed>()(
+  "AcnDaemonShutdownFailed",
   {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    path: Schema.String,
-    message: Schema.String,
+    owner: AcnOwnerRecordSchema,
+    reason: AcnDaemonShutdownReasonSchema,
+    failure: AcnDaemonShutdownControlFailureSchema,
   },
 ) {}
 
-export class AcnDaemonIdentityObservationFailed extends Schema.TaggedError<AcnDaemonIdentityObservationFailed>()(
-  "AcnDaemonIdentityObservationFailed",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    message: Schema.String,
-  },
+export class AcnDaemonStartupTimedOut extends Schema.TaggedError<AcnDaemonStartupTimedOut>()(
+  "AcnDaemonStartupTimedOut",
+  { owner: AcnOwnerRecordSchema },
 ) {}
 
-export class AcnDaemonProcessGroupObservationFailed extends Schema.TaggedError<AcnDaemonProcessGroupObservationFailed>()(
-  "AcnDaemonProcessGroupObservationFailed",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    message: Schema.String,
-  },
-) {}
-
-export class AcnDaemonProcessGroupTerminationPermissionDenied extends Schema.TaggedError<AcnDaemonProcessGroupTerminationPermissionDenied>()(
-  "AcnDaemonProcessGroupTerminationPermissionDenied",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    message: Schema.String,
-  },
-) {}
-
-export class AcnDaemonProcessGroupTerminationFailed extends Schema.TaggedError<AcnDaemonProcessGroupTerminationFailed>()(
-  "AcnDaemonProcessGroupTerminationFailed",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    message: Schema.String,
-  },
-) {}
-
-export class AcnDaemonProcessGroupKillPermissionDenied extends Schema.TaggedError<AcnDaemonProcessGroupKillPermissionDenied>()(
-  "AcnDaemonProcessGroupKillPermissionDenied",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    message: Schema.String,
-  },
-) {}
-
-export class AcnDaemonProcessGroupKillFailed extends Schema.TaggedError<AcnDaemonProcessGroupKillFailed>()(
-  "AcnDaemonProcessGroupKillFailed",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-    message: Schema.String,
-  },
-) {}
-
-export class AcnDaemonProcessGroupAbsenceUnproven extends Schema.TaggedError<AcnDaemonProcessGroupAbsenceUnproven>()(
-  "AcnDaemonProcessGroupAbsenceUnproven",
-  {
-    reason: Schema.String.pipe(Schema.minLength(1)),
-    expectedOwner: AcnOwnerRecordSchema,
-    shutdownReason: AcnDaemonShutdownReasonSchema,
-  },
+export class AcnEnsuranceConvergenceTimedOut extends Schema.TaggedError<AcnEnsuranceConvergenceTimedOut>()(
+  "AcnEnsuranceConvergenceTimedOut",
+  {},
 ) {}
 
 export class AcnAdministrationFailed extends Schema.TaggedError<AcnAdministrationFailed>()(
@@ -331,47 +199,26 @@ export const AcnEnsuranceError = Schema.Union(
   AcnEnsuranceFailed,
   AcnOwnerRecordReadUnavailable,
   AcnOwnerRecordInvalid,
-  AcnProcessIdentityObservationTimedOut,
-  AcnCandidateSpawnFailed,
-  AcnCandidateProcessGroupObservationFailed,
-  AcnCandidateProcessGroupTerminationFailed,
-  AcnCandidateProcessGroupTerminationPermissionDenied,
-  AcnCandidateProcessGroupKillFailed,
-  AcnCandidateProcessGroupKillPermissionDenied,
-  AcnCandidateProcessGroupAbsenceUnproven,
-  AcnCandidateProcessGroupLeaderChanged,
-  AcnCandidateBootstrapProcessStopFailed,
-  AcnCandidateBootstrapProcessExitUnproven,
-  AcnCandidateExactProcessPidMismatch,
-  AcnCandidateExactProcessAlreadyConfirmed,
-  AcnCandidateAdmissionBeforeExactProcessConfirmed,
-  AcnCandidateParentChannelReleaseFailed,
-  AcnCandidateAdmissionAlreadyAcknowledged,
-  AcnCandidateLaunchAlreadyAttempted,
-  AcnCandidateIdentityUnavailable,
-  AcnCandidateExitedBeforeIdentityObserved,
-  AcnCandidateAdmissionAcknowledgementTimedOut,
-  AcnCandidateReadyBeforeAdmission,
-  AcnCandidateReadyInstanceMismatch,
-  AcnDaemonTargetUnsupported,
-  AcnLaunchOverrideTargetMismatch,
-  AcnCandidateExitedBeforeAdmissionFailure,
-  AcnCandidateExitedAfterAdmissionFailure,
-  AcnCandidateAdmissionTimedOut,
-  AcnCandidateAdmissionLost,
-  AcnCandidateOwnershipLostAfterAdmission,
-  AcnDaemonStartupTimedOut,
-  AcnEnsuranceConvergenceTimedOut,
   ExactProcessIdentityObservationFailed,
   ProcessGroupObservationFailed,
-  AcnDaemonOwnerObservationFailed,
-  AcnDaemonIdentityObservationFailed,
-  AcnDaemonProcessGroupObservationFailed,
-  AcnDaemonProcessGroupTerminationPermissionDenied,
-  AcnDaemonProcessGroupTerminationFailed,
-  AcnDaemonProcessGroupKillPermissionDenied,
-  AcnDaemonProcessGroupKillFailed,
-  AcnDaemonProcessGroupAbsenceUnproven,
+  ProcessGroupSignalPermissionDenied,
+  ProcessGroupSignalFailed,
+  ProcessGroupAbsenceUnproven,
+  AcnProcessIdentityObservationTimedOut,
+  AcnCandidateSpawnFailed,
+  AcnCandidateIdentityUnavailable,
+  AcnCandidateExitedBeforeAdmission,
+  AcnCandidateExitedAfterAdmission,
+  AcnCandidateAdmissionTimedOut,
+  AcnCandidateParentChannelReleaseFailed,
+  AcnCandidateOwnershipLost,
+  AcnCandidateBootstrapProcessStopFailed,
+  AcnCandidateBootstrapProcessExitUnproven,
+  AcnDaemonShutdownFailed,
+  AcnDaemonStartupTimedOut,
+  AcnEnsuranceConvergenceTimedOut,
+  AcnDaemonTargetUnsupported,
+  AcnLaunchOverrideTargetMismatch,
   BinaryNotFound,
   BinaryVersionMismatch,
   BinaryRevisionMismatch,

@@ -8,7 +8,9 @@ import {
 import {
   AcnOwnerRecordSchema,
   sameAcnOwner,
+  type ExactProcess,
   type ExactProcessIdentityObservationFailed,
+  type ProcessGroupObservation,
   type ProcessGroupObservationFailed,
   type AcnOwnerRecord,
   type AcnOwnerStore,
@@ -67,20 +69,34 @@ const groupFrom = (owner: AcnOwnerRecord): ProcessGroup => ({
   leader: { pid: owner.pid, processStartIdentity: owner.processStartIdentity },
 })
 
-export const inspectExactProcess = (
-  processes: ProcessGroupController,
+/** Retries transient process-observation failures for a bounded time before failing typed. */
+const boundedObservation = <A, E>(
+  observation: Effect.Effect<A, E>,
   pid: number,
-): Effect.Effect<
-  Option.Option<AcnOwnerRecord["processStartIdentity"]>,
-  ExactProcessIdentityObservationFailed | AcnProcessIdentityObservationTimedOut
-> =>
-  processes.inspect(pid).pipe(
+): Effect.Effect<A, E | AcnProcessIdentityObservationTimedOut> =>
+  observation.pipe(
     Effect.retry(Schedule.spaced(PROCESS_INSPECTION_RETRY_INTERVAL)),
     Effect.timeoutFail({
       duration: PROCESS_OPERATION_TIMEOUT,
       onTimeout: () => new AcnProcessIdentityObservationTimedOut({ pid }),
     }),
   )
+
+export const inspectExactProcess = (
+  processes: ProcessGroupController,
+  pid: number,
+): Effect.Effect<
+  Option.Option<ExactProcess>,
+  ExactProcessIdentityObservationFailed | AcnProcessIdentityObservationTimedOut
+> => boundedObservation(processes.inspect(pid), pid)
+
+const observeOwnerGroup = (
+  processes: ProcessGroupController,
+  owner: AcnOwnerRecord,
+): Effect.Effect<
+  ProcessGroupObservation,
+  ExactProcessIdentityObservationFailed | ProcessGroupObservationFailed | AcnProcessIdentityObservationTimedOut
+> => boundedObservation(processes.observe(groupFrom(owner)), owner.pid)
 
 export type AcnOwnerObservationError =
   | AcnOwnerRecordReadUnavailable
@@ -135,12 +151,15 @@ export const makeAcnOwnerObserver = (
       return new AcnRecordedOwnerAbsent({ expectedOwner: Option.none() })
     }
     const owner = current.value
-    const identity = yield* inspectExactProcess(processes, owner.pid)
-    if (!Option.contains(identity, owner.processStartIdentity)) {
-      const group = yield* processes.observeGroup(groupFrom(owner))
-      return group._tag === "ProcessGroupAbsent"
-        ? new AcnRecordedOwnerAbsent({ expectedOwner: Option.some(owner) })
-        : new AcnRecordedOwnerProcessGroupSurvives({ owner })
+    const group = yield* observeOwnerGroup(processes, owner)
+    switch (group._tag) {
+      case "ProcessGroupAbsent":
+        return new AcnRecordedOwnerAbsent({ expectedOwner: Option.some(owner) })
+      case "ProcessGroupSurvivorsOnly":
+      case "ProcessGroupLeaderReplaced":
+        return new AcnRecordedOwnerProcessGroupSurvives({ owner })
+      case "ProcessGroupLeaderLive":
+        break
     }
     return Option.match(yield* probeHealth(owner), {
       onNone: () => new AcnRecordedOwnerLiveWithoutHealth({ owner }),
@@ -153,8 +172,7 @@ export const makeAcnOwnerObserver = (
     if (status !== 200 || health.state._tag !== "Ready") return Option.none()
     const confirmedOwner = yield* readCurrentOwner
     if (!Option.exists(confirmedOwner, (current) => sameAcnOwner(current, owner))) return Option.none()
-    const identity = yield* inspectExactProcess(processes, owner.pid)
-    if (!Option.contains(identity, owner.processStartIdentity)) return Option.none()
+    if ((yield* observeOwnerGroup(processes, owner))._tag !== "ProcessGroupLeaderLive") return Option.none()
     return Option.some({
       revision: health.revision,
       id: health.id,

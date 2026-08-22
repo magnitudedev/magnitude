@@ -157,9 +157,10 @@ revision wins, older managers adopt it. Process death removes revision authority
 - A lower live revision is replaced only after successor launch material is prepared.
 - An equal or greater live revision is never downgraded by an older client.
 - No stale manager action targets a changed owner or reused PID.
-- Every destructive daemon action revalidates the complete expected owner row and exact process
-  identity immediately before mutation.
-- Process observation, termination, and kill failures remain distinct typed outcomes; no string or
-  numeric pseudo-tag is interpreted as their error identity.
+- Every signal delivery revalidates exact process identity immediately before mutation, and the
+  complete expected owner row is revalidated at every shutdown stage boundary; a row cannot
+  lawfully change while the target group persists, because admission requires group-absence proof.
+- Store, observation, and signal failures remain distinct typed causes carried inside one typed
+  shutdown failure; no string or numeric pseudo-tag is interpreted as error identity.
 - Observation uncertainty authorizes neither endpoint adoption nor overlapping service groups.
 - SQLite contention and every convergence state are bounded.

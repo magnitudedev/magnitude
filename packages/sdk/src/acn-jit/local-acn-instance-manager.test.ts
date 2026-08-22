@@ -17,11 +17,10 @@ import {
 } from "@magnitudedev/acn-protocol"
 import {
   ProcessGroupAbsent,
-  ProcessGroupAlreadyAbsent,
   ProcessGroupController,
   ProcessGroupControllerLive,
-  ProcessGroupPresent,
-  ProcessGroupSignaled,
+  ProcessGroupLeaderLive,
+  ProcessGroupStopped,
   makeAcnOwnerStore,
 } from "@magnitudedev/acn-protocol/coordination"
 import { Duration, Effect, Exit, Fiber, Layer, Option, Schema, TestClock, TestContext } from "effect"
@@ -45,20 +44,18 @@ const makeExactProcessFixture = Effect.gen(function* () {
   const exact = yield* ProcessGroupControllerLive.currentProcess
   let live = true
   const stop = () => { live = false }
-  const controller = ProcessGroupController.of({
-    inspect: (pid) => Effect.succeed(pid === exact.pid && live
-      ? Option.some(exact.processStartIdentity)
-      : Option.none()),
+  const controller: ProcessGroupController = {
+    inspect: (pid) => Effect.succeed(pid === exact.pid && live ? Option.some(exact) : Option.none()),
     currentProcess: Effect.succeed(exact),
-    observeGroup: (group) => Effect.succeed(live
-      ? new ProcessGroupPresent({ group })
+    observe: (group) => Effect.succeed(live
+      ? new ProcessGroupLeaderLive({ group })
       : new ProcessGroupAbsent({ group })),
-    signalGroup: (group) => Effect.sync(() => {
-      if (!live) return new ProcessGroupAlreadyAbsent({ group })
+    waitForGroupExit: () => Effect.succeed(!live),
+    stop: (group) => Effect.sync(() => {
       stop()
-      return new ProcessGroupSignaled({ group })
+      return new ProcessGroupStopped({ group })
     }),
-  })
+  }
   return { controller, exact, stop }
 })
 
@@ -309,8 +306,8 @@ describe("LocalAcnInstanceManager", () => {
       expect(result).toMatchObject({
         _tag: "Left",
         left: {
-          _tag: "AcnCandidateExitedAfterAdmissionFailure",
-          process: processFixture.exact,
+          _tag: "AcnCandidateExitedAfterAdmission",
+          pid: processFixture.exact.pid,
           code: 17,
           stderr: "fatal startup detail",
         },
@@ -328,16 +325,17 @@ describe("LocalAcnInstanceManager", () => {
       const successor = { ...current, pid: current.pid + 1 }
       const owners = yield* makeAcnOwnerStore(dataDir)
       const successorId = AcnInstanceIdSchema.make("successor-owner")
-      const controller = ProcessGroupController.of({
+      const controller: ProcessGroupController = {
         inspect: (pid) => Effect.succeed(
           pid === candidate.pid || pid === successor.pid
-            ? Option.some(current.processStartIdentity)
+            ? Option.some({ pid, processStartIdentity: current.processStartIdentity })
             : Option.none(),
         ),
         currentProcess: Effect.succeed(current),
-        observeGroup: (group) => Effect.succeed(new ProcessGroupPresent({ group })),
-        signalGroup: (group) => Effect.succeed(new ProcessGroupAlreadyAbsent({ group })),
-      })
+        observe: (group) => Effect.succeed(new ProcessGroupLeaderLive({ group })),
+        waitForGroupExit: () => Effect.succeed(false),
+        stop: (group) => Effect.succeed(new ProcessGroupStopped({ group })),
+      }
       const http = HttpClient.make((request) => Effect.succeed(
         request.url.includes(":49153/")
           ? HttpClientResponse.fromWeb(request, Response.json(
@@ -393,8 +391,8 @@ describe("LocalAcnInstanceManager", () => {
       expect(result).toMatchObject({
         _tag: "Left",
         left: {
-          _tag: "AcnCandidateExitedAfterAdmissionFailure",
-          process: candidate,
+          _tag: "AcnCandidateExitedAfterAdmission",
+          pid: candidate.pid,
           code: 23,
           stderr: "original daemon failed",
         },
