@@ -1,5 +1,4 @@
 import type { AgentIntrospection } from "@magnitudedev/agent"
-import type { AcnActivityState } from "../activity-tracker"
 import type { SessionRetirementSnapshot } from "../agent-runtime"
 import type { ResourceUseGateSnapshot } from "../resource-use-gate"
 import type { AcnDisplayViewIntrospection } from "./display-views"
@@ -15,20 +14,19 @@ export interface AcnIntrospectionSession {
   readonly residentSince: number
   readonly gate: ResourceUseGateSnapshot
   readonly retirement: SessionRetirementSnapshot | null
+  readonly continuingWorkOwned: boolean
 }
 
 export interface AcnIntrospectionOverview {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 2
   readonly timestamp: number
   readonly sessions: readonly AcnIntrospectionSession[]
-  readonly activity: AcnActivityState
 }
 
 export interface AcnSessionIntrospection {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 2
   readonly timestamp: number
   readonly session: AcnIntrospectionSession
-  readonly activity: AcnActivityState
   readonly displayViews: readonly AcnDisplayViewIntrospection[]
   readonly introspection: AgentIntrospection | null
 }

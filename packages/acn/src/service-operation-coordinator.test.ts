@@ -3,21 +3,14 @@ import {
   Effect,
   Exit,
   Fiber,
-  Layer,
   Option,
   Ref,
 } from "effect"
 import { describe, expect, it } from "vitest"
-import { AcnActivityTracker, AcnActivityTrackerLive } from "./activity-tracker"
-import { AcnServiceLifecycleLive } from "./service-lifecycle"
 import {
   makeServiceOperationCoordinator,
   type ServiceOperationDefinition,
 } from "./service-operation-coordinator"
-
-const layer = AcnActivityTrackerLive.pipe(
-  Layer.provide(AcnServiceLifecycleLive("30 minutes")),
-)
 
 describe("ServiceOperationCoordinator", () => {
   it("owns one operation while equivalent callers join and conflicting callers observe it", async () => {
@@ -25,12 +18,10 @@ describe("ServiceOperationCoordinator", () => {
       const coordinator = yield* makeServiceOperationCoordinator<string, string>(
         (left, right) => left === right,
       )
-      const activity = yield* AcnActivityTracker
       const release = yield* Deferred.make<void>()
       const runs = yield* Ref.make(0)
       const terminalized = yield* Ref.make(0)
       const definition: ServiceOperationDefinition<string> = {
-        activityLabel: "test:service-operation",
         commit: Effect.void,
         operation: Ref.update(runs, (count) => count + 1).pipe(
           Effect.zipRight(Deferred.await(release)),
@@ -48,7 +39,6 @@ describe("ServiceOperationCoordinator", () => {
       expect(first._tag).toBe("Current")
       expect(joined._tag).toBe("Current")
       expect(conflicting._tag).toBe("Conflicting")
-      expect((yield* activity.current).leaseLabels).toContain("test:service-operation")
 
       const interruptedWaiter = joined._tag === "Current"
         ? yield* joined.outcome.pipe(Effect.fork)
@@ -59,9 +49,7 @@ describe("ServiceOperationCoordinator", () => {
       yield* Deferred.succeed(release, undefined)
       if (first._tag === "Current") expect(Exit.isSuccess(yield* first.outcome)).toBe(true)
       expect(yield* Ref.get(terminalized)).toBe(1)
-      yield* Effect.yieldNow()
-      expect((yield* activity.current).leaseLabels).not.toContain("test:service-operation")
-    }).pipe(Effect.provide(layer))))
+    })))
   })
 
   it("keeps preparation interruptible until the masked admission commit", async () => {
@@ -79,7 +67,6 @@ describe("ServiceOperationCoordinator", () => {
         whenIdle: Deferred.succeed(entered, undefined).pipe(
           Effect.zipRight(Deferred.await(releasePreparation)),
           Effect.as(Option.some({
-            activityLabel: "test:interruptible-admission",
             commit: Ref.update(commits, (count) => count + 1),
             operation: Ref.update(runs, (count) => count + 1),
             terminalize: () => Effect.void,
@@ -93,7 +80,7 @@ describe("ServiceOperationCoordinator", () => {
       yield* Effect.yieldNow()
       expect(yield* Ref.get(commits)).toBe(0)
       expect(yield* Ref.get(runs)).toBe(0)
-    }).pipe(Effect.provide(layer))))
+    })))
   })
 
   it("shares typed failure and terminalizes defects before admitting the next operation", async () => {
@@ -106,7 +93,6 @@ describe("ServiceOperationCoordinator", () => {
         Effect.succeed({
           key,
           whenIdle: Effect.succeed(Option.some({
-            activityLabel: `test:${key}`,
             commit: Effect.void,
             operation,
             terminalize: (exit: Exit.Exit<void, string>) =>
@@ -130,7 +116,7 @@ describe("ServiceOperationCoordinator", () => {
         whenIdle: Effect.succeed(Option.none()),
       }))
       expect(satisfied._tag).toBe("Satisfied")
-    }).pipe(Effect.provide(layer))))
+    })))
   })
 
   it("releases ownership when the admission commit defects", async () => {
@@ -142,7 +128,6 @@ describe("ServiceOperationCoordinator", () => {
       const failedAdmission = yield* Effect.exit(coordinator.admit(Effect.succeed({
         key: "failed-commit",
         whenIdle: Effect.succeed(Option.some({
-          activityLabel: "test:failed-commit",
           commit: Effect.die("commit defect"),
           operation: Effect.void,
           terminalize: () => Ref.update(terminalizations, (count) => count + 1),
@@ -156,6 +141,6 @@ describe("ServiceOperationCoordinator", () => {
         whenIdle: Effect.succeed(Option.none()),
       }))
       expect(next._tag).toBe("Satisfied")
-    }).pipe(Effect.provide(layer))))
+    })))
   })
 })

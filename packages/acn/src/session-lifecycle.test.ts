@@ -31,6 +31,7 @@ describe("SessionLifecycle initial messages", () => {
       const sent = yield* Ref.make<SendUserMessageInput[]>([])
       const runtime: AgentRuntimeApi = {
         withSession: () => Effect.die("unused"),
+        withSessionWork: () => Effect.die("unused"),
         withSessionRequest: () => Effect.die("unused"),
         tryWithResident: () => Effect.succeed(Option.none()),
         tryWithBusyResident: () => Effect.succeed(Option.none()),

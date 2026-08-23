@@ -22,7 +22,6 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AcnServiceLifecycle } from "./service-lifecycle"
-import { AcnActivityTracker } from "./activity-tracker"
 import { AgentFactory } from "./agent-factory"
 import { FileSystemManager } from "./file-system-manager"
 import {
@@ -55,6 +54,7 @@ export interface ResidentSessionSnapshot {
   readonly updatedAt: number
   readonly residentSince: number
   readonly workStatus: SessionWorkStatus
+  readonly continuingWorkOwned: boolean
   readonly gate: ResourceUseGateSnapshot
   readonly retirement: SessionRetirementSnapshot | null
 }
@@ -85,6 +85,11 @@ export interface AgentRuntimeApi {
   ) => Effect.Effect<A, E | SessionError, R>
   readonly withSessionRequest: <A, E, R>(
     request: RuntimeStartRequest,
+    label: string,
+    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | SessionError, R>
+  readonly withSessionWork: <A, E, R>(
+    sessionId: string,
     label: string,
     use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | SessionError, R>
@@ -120,6 +125,10 @@ interface ResidentGeneration {
   readonly residentSince: number
   readonly workStatus: Ref.Ref<SessionWorkStatus>
   readonly reconcileWork: Effect.Effect<void>
+  readonly withWorkAdmission: <A, E, R>(
+    use: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | ResourceRetired, R>
+  readonly continuingWorkOwned: Effect.Effect<boolean>
 }
 
 type StartDeferred = Deferred.Deferred<ResidentGeneration, SessionError>
@@ -154,7 +163,6 @@ export const makeAgentRuntimeLive = (
       const storage = yield* MagnitudeStorage
       const fileSystem = yield* FileSystemManager
       const runtimeOptions = yield* SessionRuntimeOptionsStore
-      const rootActivity = yield* Effect.serviceOption(AcnActivityTracker)
       const lifecycle = yield* Effect.serviceOption(AcnServiceLifecycle)
       const managerScope = yield* Effect.scope
       const entries = yield* Ref.make(new Map<string, ResidentGeneration>())
@@ -198,49 +206,6 @@ export const makeAgentRuntimeLive = (
       let retireGeneration = (_sessionId: string, _generation: number): Effect.Effect<boolean> =>
         Effect.succeed(true)
 
-      const acquireContinuingLease = (
-        sessionId: string,
-        generation: number,
-        gate: ResourceUseGate,
-      ): Effect.Effect<Effect.Effect<void>> => {
-        const requireBusy = (
-          source: Pick<ResourceUseGate, "joinIfBusy">,
-          label: string,
-          missingMessage: string,
-        ) =>
-          source.joinIfBusy(label).pipe(
-            Effect.flatMap(
-              Option.match({
-                onNone: () => Effect.die(new Error(missingMessage)),
-                onSome: Effect.succeed,
-              }),
-            ),
-          )
-
-        return Effect.gen(function* () {
-          let releaseRoot = Effect.void
-          if (Option.isSome(rootActivity)) {
-            releaseRoot = yield* requireBusy(
-              rootActivity.value,
-              `session-work:${sessionId}:${generation}`,
-              `Session ${sessionId} became working without ACN demand`,
-            )
-          }
-
-          const releaseSession = yield* requireBusy(
-            gate,
-            `continuing-work:${sessionId}:${generation}`,
-            `Session ${sessionId} became working without admitted session use`,
-          ).pipe(Effect.onError(() => releaseRoot))
-
-          return yield* Effect.succeed(
-            releaseSession.pipe(Effect.zipRight(releaseRoot)),
-          )
-        }).pipe(
-          Effect.catchTag("ResourceRetired", () => Effect.interrupt),
-        )
-      }
-
       const makeWorkBridge = (
         sessionId: string,
         generation: number,
@@ -253,41 +218,163 @@ export const makeAgentRuntimeLive = (
             _tag: "Quiescent",
             workerCount: 0,
           })
-          const continuingRelease = yield* Ref.make<Effect.Effect<void> | null>(null)
+          interface ContinuingWorkOwnership {
+            readonly release: Effect.Effect<void>
+            readonly phase: "AwaitingWorking" | "Working"
+            readonly admitting: boolean
+          }
+          const ownership = yield* Ref.make<ContinuingWorkOwnership | null>(null)
+          const setOwnership = (value: ContinuingWorkOwnership | null) =>
+            Ref.set(ownership, value)
           const serialize = yield* Effect.makeSemaphore(1)
+          const admission = yield* Effect.makeSemaphore(1)
 
-          const reconcileWork = serialize.withPermits(1)(
+          const acquireOwnership = gate.acquire(
+            `continuing-work:${sessionId}:${generation}`,
+          )
+
+          const releaseOwnership = (current: ContinuingWorkOwnership) =>
+            setOwnership(null).pipe(
+              Effect.zipRight(current.release),
+              Effect.zipRight(publishChange),
+            )
+
+          const recordStatus = (next: SessionWorkStatus) => Effect.gen(function* () {
+            const previous = yield* Ref.get(workStatus)
+            yield* Ref.set(workStatus, next)
+            if (
+              previous._tag !== next._tag ||
+              previous.workerCount !== next.workerCount
+            ) {
+              yield* publishChange
+            }
+            return next
+          })
+
+          const readStatus = entry.session.state.work.get().pipe(
+            Effect.flatMap(recordStatus),
+          )
+
+          const restoreInitialOwnership = serialize.withPermits(1)(
             Effect.gen(function* () {
-              const next = yield* entry.session.state.work.get()
-              yield* Ref.set(workStatus, next)
-              const release = yield* Ref.get(continuingRelease)
-              if (next._tag === "Working" && release === null) {
-                const acquired = yield* acquireContinuingLease(sessionId, generation, gate)
-                yield* Ref.set(continuingRelease, acquired)
-                yield* publishChange
+              const next = yield* readStatus
+              if (next._tag === "Quiescent") return
+              const release = yield* acquireOwnership
+              yield* setOwnership({
+                release,
+                phase: "Working",
+                admitting: false,
+              })
+              yield* publishChange
+            }),
+          )
+
+          const reconcileStatus = (nextStatus: SessionWorkStatus) => serialize.withPermits(1)(
+            Effect.gen(function* () {
+              const next = yield* recordStatus(nextStatus)
+              const current = yield* Ref.get(ownership)
+              if (next._tag === "Working") {
+                if (current === null) {
+                  return yield* Effect.dieMessage(
+                    `Session ${sessionId} generation ${generation} has work without an owner`,
+                  )
+                }
+                if (current.phase !== "Working") {
+                  yield* setOwnership({ ...current, phase: "Working" })
+                }
                 return
               }
-              if (next._tag === "Quiescent" && release !== null) {
-                yield* Ref.set(continuingRelease, null)
-                yield* release
-                yield* publishChange
+              if (
+                current !== null &&
+                current.phase === "Working" &&
+                !current.admitting
+              ) {
+                yield* releaseOwnership(current)
               }
             }),
           )
 
-          yield* reconcileWork
+          const reconcileWork = entry.session.state.work.get().pipe(
+            Effect.flatMap(reconcileStatus),
+          )
+
+          const withWorkAdmission = <A, E, R>(
+            use: Effect.Effect<A, E, R>,
+          ): Effect.Effect<A, E | ResourceRetired, R> =>
+            admission.withPermits(1)(
+              Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  yield* serialize.withPermits(1)(
+                    Effect.gen(function* () {
+                      const current = yield* Ref.get(ownership)
+                      if (current === null) {
+                        const release = yield* acquireOwnership
+                        yield* setOwnership({
+                          release,
+                          phase: "AwaitingWorking",
+                          admitting: true,
+                        })
+                        yield* publishChange
+                      } else {
+                        yield* setOwnership({
+                          ...current,
+                          phase: "AwaitingWorking",
+                          admitting: true,
+                        })
+                      }
+                    }),
+                  )
+
+                  const result = yield* restore(use).pipe(Effect.exit)
+                  yield* serialize.withPermits(1)(
+                    Effect.gen(function* () {
+                      const next = yield* readStatus
+                      const current = yield* Ref.get(ownership)
+                      if (current === null) return
+                      if (next._tag === "Working") {
+                        yield* setOwnership({
+                          ...current,
+                          phase: "Working",
+                          admitting: false,
+                        })
+                        return
+                      }
+                      if (Exit.isFailure(result) || current.phase === "Working") {
+                        yield* releaseOwnership(current)
+                        return
+                      }
+                      yield* setOwnership({ ...current, admitting: false })
+                    }),
+                  )
+                  if (Exit.isSuccess(result)) return result.value
+                  return yield* Effect.failCause(result.cause)
+                }),
+              ),
+            )
+
+          yield* restoreInitialOwnership.pipe(Effect.orDie)
           yield* Effect.forkIn(
             entry.session.state.work.subscribe.pipe(
-              Stream.runForEach(() => reconcileWork),
+              Stream.runForEach(reconcileStatus),
               Effect.ensuring(
-                Ref.getAndSet(continuingRelease, null).pipe(
-                  Effect.flatMap((release) => release ?? Effect.void),
+                Ref.getAndSet(ownership, null).pipe(
+                  Effect.flatMap((current) => current?.release ?? Effect.void),
                 ),
               ),
             ),
             generationScope,
           )
-          return { workStatus, reconcileWork }
+          // Let the scoped subscriber acquire its upstream subscription before
+          // this generation is published to callers that can commit work.
+          yield* Effect.yieldNow()
+          return {
+            workStatus,
+            reconcileWork,
+            withWorkAdmission,
+            continuingWorkOwned: Ref.get(ownership).pipe(
+              Effect.map((current) => current !== null),
+            ),
+          }
         })
 
       const startResidentAttempt = Effect.fn("acn.agent-runtime.start-attempt")(function* (
@@ -514,6 +601,28 @@ export const makeAgentRuntimeLive = (
           Effect.flatMap((request) => withRequest(request, label, use)),
         )
 
+      const withSessionWork = <A, E, R>(
+        sessionId: string,
+        label: string,
+        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | SessionError, R> =>
+        requestForStoredSession(sessionId).pipe(
+          Effect.flatMap((request) =>
+            Effect.suspend(() =>
+              acquireResident(request, label).pipe(
+                Effect.flatMap(([resident, release]) =>
+                  resident.withWorkAdmission(
+                    use(resident.entry, resident.generation),
+                  ).pipe(Effect.ensuring(release)),
+                ),
+                Effect.catchTag("ResourceRetired", () =>
+                  withSessionWork(sessionId, label, use),
+                ),
+              ),
+            ),
+          ),
+        )
+
       const tryWithResident = <A, E, R>(
         sessionId: string,
         label: string,
@@ -703,6 +812,7 @@ export const makeAgentRuntimeLive = (
       return {
         withSession,
         withSessionRequest: withRequest,
+        withSessionWork,
         tryWithResident,
         tryWithBusyResident,
         residentSessions: Effect.gen(function* () {
@@ -718,6 +828,7 @@ export const makeAgentRuntimeLive = (
               updatedAt: resident.entry.updatedAt,
               residentSince: resident.residentSince,
               workStatus: yield* Ref.get(resident.workStatus),
+              continuingWorkOwned: yield* resident.continuingWorkOwned,
               gate: yield* resident.gate.snapshot,
               retirement: (yield* Ref.get(retirements)).get(resident.entry.id) ?? null,
             })

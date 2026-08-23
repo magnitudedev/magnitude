@@ -125,6 +125,7 @@ const makeSetup = Effect.gen(function* () {
           return entry ? use(entry, 1) : Effect.die("missing fake session")
         }),
       ),
+    withSessionWork: () => Effect.die("unused"),
     withSessionRequest,
     tryWithResident: () => Effect.succeed(Option.none()),
     tryWithBusyResident: () => Effect.succeed(Option.none()),

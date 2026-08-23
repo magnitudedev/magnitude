@@ -65,28 +65,6 @@ describe("ResourceUseGate", () => {
     await Effect.runPromise(program);
   });
 
-  it("joinIfBusy cannot turn an idle resource into demand", async () => {
-    const program = Effect.scoped(
-      Effect.gen(function* () {
-        const gate = yield* makeResourceUseGate({
-          resource: "test",
-          generation: 3,
-          idleTimeout: "2 minutes",
-          retire: () => Effect.succeed(true),
-        });
-        expect(Option.isNone(yield* gate.joinIfBusy("passive"))).toBe(true);
-        const releaseDemand = yield* gate.acquire("demand");
-        const passive = yield* gate.joinIfBusy("passive");
-        expect(Option.isSome(passive)).toBe(true);
-        yield* releaseDemand;
-        expect((yield* gate.snapshot).leaseCount).toBe(1);
-        if (Option.isSome(passive)) yield* passive.value;
-        expect((yield* gate.snapshot).leaseCount).toBe(0);
-      })
-    );
-    await run(program);
-  });
-
   it("linearizes admission against retirement and waits through rollback", async () => {
     const program = Effect.scoped(
       Effect.gen(function* () {
@@ -108,7 +86,7 @@ describe("ResourceUseGate", () => {
           .pipe(Effect.fork);
         yield* Effect.yieldNow();
         const acquireFiber = yield* gate
-          .acquire("racing-demand")
+          .acquire("racing-use")
           .pipe(Effect.fork);
         yield* Effect.yieldNow();
         expect((yield* gate.snapshot).phase).toBe("retirement-claimed");
@@ -124,7 +102,7 @@ describe("ResourceUseGate", () => {
     await run(program);
   });
 
-  it("rejects demand after a committed retirement", async () => {
+  it("rejects use after a committed retirement", async () => {
     const program = Effect.scoped(
       Effect.gen(function* () {
         const gate = yield* makeResourceUseGate({
@@ -190,7 +168,7 @@ describe("ResourceUseGate", () => {
     await run(program);
   });
 
-  it("gives demand arriving before the deadline a full post-release interval", async () => {
+  it("gives use arriving before the deadline a full post-release interval", async () => {
     const program = Effect.scoped(
       Effect.gen(function* () {
         const gate = yield* makeResourceUseGate({
@@ -200,7 +178,7 @@ describe("ResourceUseGate", () => {
           retire: () => Effect.succeed(true),
         });
         yield* TestClock.adjust("999 millis");
-        const release = yield* gate.acquire("last-moment-demand");
+        const release = yield* gate.acquire("last-moment-use");
         yield* TestClock.adjust("1 hour");
         expect((yield* gate.snapshot).phase).toBe("open");
         yield* release;
@@ -249,13 +227,7 @@ describe("ResourceUseGate", () => {
 
         yield* gate.closeAdmission;
         expect((yield* gate.snapshot).leaseCount).toBe(1);
-        expect(yield* Effect.either(gate.acquire("late-demand"))).toMatchObject({
-          _tag: "Left",
-          left: { _tag: "ResourceRetired" },
-        });
-        expect(
-          yield* Effect.either(gate.joinIfBusy("late-continuation")),
-        ).toMatchObject({
+        expect(yield* Effect.either(gate.acquire("late-use"))).toMatchObject({
           _tag: "Left",
           left: { _tag: "ResourceRetired" },
         });

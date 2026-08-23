@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest"
 import { Effect, Fiber, Layer, Option, Queue, Scope, Stream } from "effect"
 import type { AgentIntrospection, CodingAgentSession } from "@magnitudedev/agent"
 import { DirectoryPathSchema, type DisplayViewShape } from "@magnitudedev/acn-protocol"
-import { AcnActivityTrackerLive } from "../activity-tracker"
 import { AcnServiceLifecycleLive } from "../service-lifecycle"
 import { AgentRuntime, type AgentRuntimeApi } from "../agent-runtime"
 import type { RuntimeEntry } from "../session-types"
@@ -87,6 +86,7 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
 
       const runtime: AgentRuntimeApi = {
         withSession: (_sessionId, _label, use) => use(entry, 1),
+        withSessionWork: (_sessionId, _label, use) => use(entry, 1),
         withSessionRequest: (_request, _label, use) => use(entry, 1),
         tryWithResident: (sessionId, _label, use) =>
           sessionId === entry.id ? use(entry, 1).pipe(Effect.map(Option.some)) : Effect.succeed(Option.none()),
@@ -103,6 +103,7 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
             updatedAt: entry.updatedAt,
             residentSince: 1,
             workStatus: { _tag: "Working", workerCount: 0 },
+            continuingWorkOwned: true,
             gate: {
               resource: `session:${entry.id}`,
               generation: 1,
@@ -122,11 +123,10 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
       }
 
       const runtimeLayer = Layer.succeed(AgentRuntime, runtime)
-      const withActivity = Layer.provideMerge(
-        AcnActivityTrackerLive,
+      const withDisplay = Layer.provideMerge(
+        AcnDisplayViewIntrospectorLive,
         Layer.merge(runtimeLayer, AcnServiceLifecycleLive()),
       )
-      const withDisplay = Layer.provideMerge(AcnDisplayViewIntrospectorLive, withActivity)
       return Layer.provideMerge(AcnIntrospectorLive, withDisplay)
     }),
   )

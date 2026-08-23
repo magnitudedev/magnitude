@@ -59,10 +59,6 @@ import {
   SharedProviderClientLive,
 } from "./shared-client"
 import { ActiveSessionStatusesLive } from "./active-session-statuses"
-import {
-  AcnActivityTrackerLive,
-  AcnRpcDemandLive,
-} from "./activity-tracker"
 import { DisplayViewStreamsLive } from "./display-view-streams"
 import {
   AcnDisplayViewIntrospectorLive,
@@ -346,13 +342,9 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     SessionRuntimeOptionsStoreLive
   ).pipe(Layer.provideMerge(domainCore))
 
-  const withActivity = Layer.provideMerge(
-    AcnActivityTrackerLive,
-    storageServices
-  )
   const withSubscriptions = Layer.provideMerge(
     AcnSubscriptionsLive,
-    withActivity
+    storageServices
   )
   // The change registry serves `StreamChanges`; storage change streams are
   // forwarded into it here, versioned snapshots publish their own pokes.
@@ -458,8 +450,7 @@ const addLocalInferenceServices = <A, E, R>(
 }
 
 const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
-  const withDemand = Layer.provideMerge(AcnRpcDemandLive, services)
-  const withClientLeases = Layer.provideMerge(ClientLeaseManagerLive, withDemand)
+  const withClientLeases = Layer.provideMerge(ClientLeaseManagerLive, services)
   const withMentionSearcher = Layer.provideMerge(FileMentionSearcherLive, withClientLeases)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withMentionSearcher)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
@@ -481,10 +472,10 @@ const AcnBaseServicesLayer = (dataDir: string) =>
   addCommonAcnServices(makeAcnServicesBase(false, dataDir))
 
 const AcnDebugServicesLayer = (dataDir: string) => {
-  const withActivity = makeAcnServicesBase(true, dataDir)
+  const services = makeAcnServicesBase(true, dataDir)
   const withDisplayIntrospection = Layer.provideMerge(
     AcnDisplayViewIntrospectorLive,
-    withActivity
+    services
   )
   return addCommonAcnServices(
     Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection)
@@ -674,7 +665,6 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       lifecycle.awaitStopping.pipe(Effect.map(() => Option.none())),
     )
     if (Option.isNone(started)) {
-      yield* boundedShutdownStep(lifecycle.awaitActivityDrain)
       yield* closeApplicationScope
       return
     }
@@ -684,7 +674,6 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       reason: request.reason,
       detail: Option.getOrNull(request.safeDetail),
     }))
-    yield* boundedShutdownStep(lifecycle.awaitActivityDrain)
     yield* boundedShutdownStep(subscriptions.terminate)
     yield* closeApplicationScope
     yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))

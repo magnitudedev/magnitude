@@ -16,8 +16,6 @@ import { LocalProviderOfferings } from "./local-provider-offerings"
 import { AcnChangesLive } from "./changes"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderClient } from "@magnitudedev/sdk"
-import { AcnActivityTrackerLive } from "./activity-tracker"
-import { AcnServiceLifecycleLive } from "./service-lifecycle"
 
 const providerA = ProviderIdSchema.make("provider-a")
 const providerB = ProviderIdSchema.make("provider-b")
@@ -113,9 +111,6 @@ describe("provider model catalog", () => {
           resolve: () => Effect.die("unused"),
         })),
         AcnChangesLive,
-        AcnActivityTrackerLive.pipe(
-          Layer.provide(AcnServiceLifecycleLive("30 minutes")),
-        ),
       )
       return yield* Effect.gen(function* () {
         const catalog = yield* ProviderModelCatalog

@@ -155,7 +155,7 @@ identity. The instance manager compares the client's target only with exact live
 adopts equal or newer revisions and replaces lower revisions. A historical or dead revision has no
 authority, and losing the selected endpoint never regresses the client's effective identity.
 
-Selection is a true single-flight operation. Bootstrap, retry, lease, and application demand share
+Selection is a true single-flight operation. Bootstrap, retry, lease, and application calls share
 one scoped owner and one exact outcome while selection is active; a semaphore that merely queues
 new operations is insufficient. The owner calls `AcnInstanceManager.ensure`, projects progress into
 client presentation, and atomically publishes only terminal `AcnInstance<AcnReady>` values. Every

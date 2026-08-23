@@ -143,6 +143,10 @@ describe("SessionCommands", () => {
             Ref.update(withSessionCalls, (count) => count + 1).pipe(
               Effect.zipRight(use({ ...entry, id: sessionId }, 1)),
             ),
+          withSessionWork: (sessionId, _label, use) =>
+            Ref.update(withSessionCalls, (count) => count + 1).pipe(
+              Effect.zipRight(use({ ...entry, id: sessionId }, 1)),
+            ),
           withSessionRequest: () => Effect.die("unused"),
           tryWithResident: () => Effect.succeed(Option.none()),
           tryWithBusyResident: () => Effect.succeed(Option.none()),
@@ -186,6 +190,7 @@ describe("SessionCommands", () => {
         )
         const runtime: AgentRuntimeApi = {
           withSession: (_sessionId, _label, use) => use(entry, 1),
+          withSessionWork: (_sessionId, _label, use) => use(entry, 1),
           withSessionRequest: () => Effect.die("unused"),
           tryWithResident: () => Effect.succeed(Option.none()),
           tryWithBusyResident: () => Effect.succeed(Option.none()),
@@ -234,6 +239,7 @@ describe("SessionCommands", () => {
         )
         const runtime: AgentRuntimeApi = {
           withSession: (_sessionId, _label, use) => use(entry, 1),
+          withSessionWork: (_sessionId, _label, use) => use(entry, 1),
           withSessionRequest: () => Effect.die("unused"),
           tryWithResident: () => Effect.succeed(Option.none()),
           tryWithBusyResident: () => Effect.succeed(Option.none()),

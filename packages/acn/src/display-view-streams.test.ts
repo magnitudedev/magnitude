@@ -136,6 +136,7 @@ const makeSetup = Effect.gen(function* () {
           Effect.ensuring(Ref.set(busy, false)),
         )
       }),
+    withSessionWork: () => Effect.die("unused"),
     withSessionRequest: () => Effect.die("unused"),
     tryWithResident: (_sessionId, _label, use) =>
       Effect.gen(function* () {

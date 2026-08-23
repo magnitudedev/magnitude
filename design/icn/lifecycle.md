@@ -308,7 +308,7 @@ before readiness or during `Ready` is still unexpected.
 
 ### Shutdown
 
-ACN first closes root demand admission and finalizes ICN request producers and observers. Explicit
+ACN first closes RPC dispatch and finalizes ICN request producers and observers. Explicit
 shutdown and scope finalization use the same cached child terminalization installed as the one
 process-scope finalizer. ACN ownership remains held until that operation finishes.
 
@@ -455,9 +455,9 @@ stdout/stderr is bounded, line-framed, level-mapped where possible, and correlat
 instance ID. A diagnostic tail is retained for failures without becoming an unbounded in-memory
 log store.
 
-Health, inventory, and hardware observation are not ACN demand. ACN/session leases
-cover accepted user operations and inference; ICN backend leases cover native admission and response
-streams. These are composed resource gates, not shared activity timestamps.
+Health, inventory, and hardware observation do not affect ACN process presence. Session-generation
+ownership covers continuing agent work; ICN backend leases cover native admission and response
+streams. These are local resource lifetimes, not process-global activity or demand.
 
 ## Conformance criteria
 

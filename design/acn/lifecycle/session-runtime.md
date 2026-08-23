@@ -27,13 +27,18 @@ Startup is single-flight per session. Work enters through a generation-scoped ga
 closes admission before publication, and cleanup from an old generation cannot affect its
 replacement.
 
-A resident runtime unloads after two minutes without session work. Commands, agent execution,
-display materialization (opening or reopening a display subscription), and preload count as work.
-Holding an open display subscription does not. The final claim starts that generation's idle timer.
+A resident runtime unloads after two minutes without session use. Commands, preload, and display
+materialization (opening or reopening a display subscription) are bounded uses. Holding an open
+display subscription does not retain the runtime.
 
 Agent work has one authoritative status covering accepted messages awaiting resolution, turns,
-queued triggers, workers, compaction, and owned detached processes. Runtime retention and UI
-consume that status instead of reconstructing work independently.
+queued triggers, workers, compaction, and owned detached processes. Each runtime generation owns
+at most one continuing-work claim for that aggregate status. Message and goal admission establish
+the claim before committing work; a later `Working` transition confirms it, and the corresponding
+`Quiescent` transition releases it and starts a fresh idle interval. Rehydration of an already
+working session establishes the same claim before publishing the resident generation. Runtime
+ownership and UI consume the aggregate status instead of reconstructing work independently; there
+are no per-message, per-worker, display, or process-global work claims.
 
 Resolving a session under the runtime admission lock never waits for that session's retirement, so
 one wedged generation cannot block unrelated sessions. Work arriving behind abnormal retirement
@@ -90,6 +95,8 @@ snapshot.
 - Durable session state remains authoritative across unload, restart, and ACN replacement.
 - Observation alone cannot retain a runtime.
 - Every accepted work item belongs to exactly one live runtime generation.
+- Every resident generation has at most one continuing-work claim, owned before work commit and
+  released only after aggregate quiescence.
 - Admission and retirement cannot cross, and old cleanup cannot affect a replacement.
 - Draft cancellation cannot strand preloading or claiming.
 - Deletion accepts no work after its commit point.

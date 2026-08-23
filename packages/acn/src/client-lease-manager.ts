@@ -13,7 +13,6 @@ import { AcnServiceLifecycle } from "./service-lifecycle"
 
 interface ClientLeaseManagerState {
   readonly leaseSet: ClientLeaseSet
-  readonly releaseRetention: Option.Option<Effect.Effect<void>>
   readonly changed: Deferred.Deferred<void>
 }
 
@@ -45,7 +44,6 @@ export const makeClientLeaseManager = (
     const initialChanged = yield* Deferred.make<void>()
     const state = yield* Ref.make<ClientLeaseManagerState>({
       leaseSet: emptyClientLeaseSet(),
-      releaseRetention: Option.none(),
       changed: initialChanged,
     })
     const mutationLock = yield* Effect.makeSemaphore(1)
@@ -89,36 +87,31 @@ export const makeClientLeaseManager = (
     const commit = (
       previous: ClientLeaseManagerState,
       leaseSet: ClientLeaseSet,
-      releaseRetention: Option.Option<Effect.Effect<void>>
     ) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
           const changed = yield* Deferred.make<void>()
-          yield* Ref.set(state, { leaseSet, releaseRetention, changed })
+          yield* Ref.set(state, { leaseSet, changed })
           yield* Deferred.succeed(previous.changed, undefined)
         })
       )
 
     const renew: ClientLeaseManager["renew"] = (clientId) =>
       mutationLock.withPermits(1)(
-        Effect.uninterruptibleMask((restore) =>
+        Effect.uninterruptible(
           Effect.gen(function* () {
             const previous = yield* Ref.get(state)
             const nowNanos = yield* Clock.currentTimeNanos
             const transition = renewClientLease(previous.leaseSet, clientId, nowNanos, timeoutNanos)
 
             if (!transition.connectionChanged) {
-              yield* commit(previous, transition.state, previous.releaseRetention)
+              yield* commit(previous, transition.state)
               return asResult(transition.state)
             }
 
-            const releaseRetention = yield* restore(lifecycle.acquireIdleRetention("client-leases")).pipe(
-              Effect.catchTag("ResourceRetired", () => Effect.interrupt)
-            )
-            yield* completePolicyUpdate(true).pipe(
-              Effect.onExit((exit) => (exit._tag === "Failure" ? releaseRetention : Effect.void))
-            )
-            yield* commit(previous, transition.state, Option.some(releaseRetention))
+            if (!(yield* lifecycle.setClientPresence(true))) return yield* Effect.interrupt
+            yield* completePolicyUpdate(true)
+            yield* commit(previous, transition.state)
             return asResult(transition.state)
           })
         )
@@ -133,15 +126,13 @@ export const makeClientLeaseManager = (
             if (!transition.removed) return asResult(previous.leaseSet)
 
             if (!transition.connectionChanged) {
-              yield* commit(previous, transition.state, previous.releaseRetention)
+              yield* commit(previous, transition.state)
               return asResult(transition.state)
             }
 
             yield* completePolicyUpdate(false)
-            yield* commit(previous, transition.state, Option.none())
-            if (Option.isSome(previous.releaseRetention)) {
-              yield* previous.releaseRetention.value
-            }
+            yield* commit(previous, transition.state)
+            yield* lifecycle.setClientPresence(false)
             return asResult(transition.state)
           })
         )

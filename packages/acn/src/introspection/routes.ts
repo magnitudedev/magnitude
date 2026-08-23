@@ -89,7 +89,7 @@ const AcnIntrospectionRoutesLive = Layer.mergeAll(
   HttpLayerRouter.add("GET", "/dev/sessions", Effect.gen(function* () {
     const introspector = yield* AcnIntrospector
     const overview = yield* introspector.currentOverview
-    return yield* json({ sessions: overview.sessions, activity: overview.activity, timestamp: overview.timestamp })
+    return yield* json({ sessions: overview.sessions, timestamp: overview.timestamp })
   })),
   HttpLayerRouter.add("GET", "/dev/sessions/:sessionId", currentSessionResponse),
   HttpLayerRouter.add("GET", "/dev/sessions/:sessionId/stream", sessionChangesResponse),
@@ -119,7 +119,6 @@ export const installAcnIntrospectionRoutes = (
     yield* router.add("GET", "/dev/sessions", introspector.currentOverview.pipe(
       Effect.flatMap((overview) => json({
         sessions: overview.sessions,
-        activity: overview.activity,
         timestamp: overview.timestamp,
       })),
     ))

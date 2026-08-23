@@ -2,7 +2,6 @@ import { Context, Effect, Layer, Option, Stream } from "effect"
 import { SessionNotFound, SessionOperationFailed, type SessionError } from "@magnitudedev/acn-protocol"
 import type { AgentIntrospection } from "@magnitudedev/agent"
 import { AgentRuntime } from "../agent-runtime"
-import { AcnActivityTracker } from "../activity-tracker"
 import { formatUnknownCause } from "../session-errors"
 import { AcnDisplayViewIntrospector } from "./display-views"
 import type {
@@ -39,6 +38,7 @@ const runtimeEntryToSession = (entry: {
   readonly residentSince: number
   readonly gate: AcnIntrospectionSession["gate"]
   readonly retirement: AcnIntrospectionSession["retirement"]
+  readonly continuingWorkOwned: boolean
 }): AcnIntrospectionSession => ({
   sessionId: entry.sessionId,
   title: entry.title,
@@ -50,6 +50,7 @@ const runtimeEntryToSession = (entry: {
   residentSince: entry.residentSince,
   gate: entry.gate,
   retirement: entry.retirement,
+  continuingWorkOwned: entry.continuingWorkOwned,
 })
 
 const introspectionFailure = (sessionId: string, cause: unknown) =>
@@ -61,12 +62,11 @@ const introspectionFailure = (sessionId: string, cause: unknown) =>
 export const AcnIntrospectorLive: Layer.Layer<
   AcnIntrospector,
   never,
-  AgentRuntime | AcnActivityTracker
+  AgentRuntime
 > = Layer.effect(
   AcnIntrospector,
   Effect.gen(function* () {
     const runtime = yield* AgentRuntime
-    const activity = yield* AcnActivityTracker
     const displayViewIntrospector = yield* Effect.serviceOption(AcnDisplayViewIntrospector)
 
     const currentDisplayViews = (sessionId: string) =>
@@ -87,10 +87,9 @@ export const AcnIntrospectorLive: Layer.Layer<
     ) =>
       Effect.gen(function* () {
         return {
-          schemaVersion: 1,
+          schemaVersion: 2,
           timestamp: Date.now(),
           session,
-          activity: yield* activity.current,
           displayViews: yield* currentDisplayViews(session.sessionId),
           introspection,
         } satisfies AcnSessionIntrospection
@@ -99,10 +98,9 @@ export const AcnIntrospectorLive: Layer.Layer<
     const currentOverview = Effect.gen(function* () {
       const entries = yield* runtime.residentSessions
       return {
-        schemaVersion: 1,
+        schemaVersion: 2,
         timestamp: Date.now(),
         sessions: entries.map(runtimeEntryToSession),
-        activity: yield* activity.current,
       } satisfies AcnIntrospectionOverview
     })
 

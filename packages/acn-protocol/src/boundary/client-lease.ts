@@ -9,14 +9,14 @@ const ClientLeaseMutationPayload = Schema.Struct({ clientId: ClientIdSchema })
 
 /** Lease renewal; executed by the transport's JIT runtime, never by client code. */
 const RenewClientLease = Mutation.make("RenewClientLease", {
-  policy: { recovery: "ReplaySafe", demand: false },
+  policy: { recovery: "ReplaySafe" },
   payload: ClientLeaseMutationPayload,
   success: ClientLeaseMutationResultSchema,
 })
 
 /** Graceful lease release; executed by the transport's JIT runtime on close. */
 const ReleaseClientLease = Mutation.make("ReleaseClientLease", {
-  policy: { recovery: "ReplaySafe", demand: false },
+  policy: { recovery: "ReplaySafe" },
   payload: ClientLeaseMutationPayload,
   success: ClientLeaseMutationResultSchema,
 })

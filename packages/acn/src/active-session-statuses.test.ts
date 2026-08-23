@@ -22,6 +22,7 @@ const resident = (
   updatedAt: 2,
   residentSince: 1,
   workStatus,
+  continuingWorkOwned: workStatus._tag === "Working",
   gate: {
     resource: `session:${sessionId}`,
     generation: 1,
@@ -52,6 +53,7 @@ const makeSetup = Effect.gen(function* () {
   const changed = yield* PubSub.unbounded<void>()
   const runtime: AgentRuntimeApi = {
     withSession: () => Effect.die("unused"),
+    withSessionWork: () => Effect.die("unused"),
     withSessionRequest: () => Effect.die("unused"),
     tryWithResident: () => Effect.die("unused"),
     tryWithBusyResident: () => Effect.die("unused"),

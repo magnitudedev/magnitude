@@ -42,16 +42,18 @@ connected count. One supervisor sleeps to the nearest monotonic deadline and is 
 revision changes. Exact renewal generations fence stale expiry work; no heartbeat creates its own
 timer fiber.
 
-The first lease acquires one ACN retention capability and publishes connected model residency. The
-final release or expiry publishes disconnected residency, commits the empty set, and releases that
-exact retention capability. These transitions are serialized. The bounded policy operation runs in
+The first lease directly marks client presence in the ACN lifecycle and publishes connected model
+residency. The final release or expiry publishes disconnected residency, commits the empty set,
+and directly marks client absence. These transitions are serialized. Presence is marked before the
+first connected-policy operation so ACN cannot retire during it; final absence is marked only after
+the disconnected policy and empty-set commit. The bounded policy operation runs in
 an explicitly interruptible child fiber so its timeout remains effective; the serialized mutation
 joins that child uninterruptibly before the matching state commit. Caller cancellation therefore
 cannot split policy acknowledgement from its commit. Definite policy failure fails closed by
 stopping ACN rather than committing mismatched state.
 
-Connected clients retain ACN independently of work demand. With no connected client and no work,
-ACN begins a fresh 30-minute idle interval.
+Connected clients are the sole authority retaining ACN. With no connected client, ACN begins a
+fresh 30-minute idle interval regardless of RPC, session, inference, or subscription activity.
 
 ## ICN authority
 
@@ -86,7 +88,8 @@ count or deadline.
   the runtime's endpoint-selection and recovery authority.
 - Graceful close stops renewal and uses a non-recovering protocol bound to the selected exact ACN;
   abrupt scope finalization closes the runtime, stops renewal, and relies on lease expiry.
-- Heartbeat and release RPCs are lifecycle-neutral and do not count as work demand.
+- Heartbeat and release RPC duration is lifecycle-neutral; only their committed client-presence
+  transition affects process idleness.
 - Lease expiry uses monotonic time and exact renewal generations.
 - First/final transitions alone change ICN residency policy.
 - Every disconnected transition gives an idle resident model a fresh 10-minute interval.
