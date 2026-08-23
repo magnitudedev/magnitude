@@ -29,13 +29,7 @@ import {
   type SlashCommandDefinition,
   getDraftSessionOwnerId,
 } from '@magnitudedev/client-common'
-import {
-  Agent,
-  DirectoryPathSchema,
-  Sessions,
-  Skills,
-  type SessionPageCursor,
-} from '@magnitudedev/sdk'
+import { DirectoryPathSchema, type SessionPageCursor } from '@magnitudedev/sdk'
 import { setLastSessionId } from '../state/last-session'
 import { useTerminalTitle } from './use-terminal-title'
 
@@ -70,7 +64,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const latestSessionAtom = useMemo(
     () =>
       sessionStart._tag === 'latest' && Result.isSuccess(runtimeResult)
-        ? Atom.make((get) => get(client.query(Sessions.ListSessions, {
+        ? Atom.make((get) => get(client.Sessions.ListSessions({
             cwd: Option.some(DirectoryPathSchema.make(process.cwd())),
             query: Option.none<string>(),
             cursor: Option.none<SessionPageCursor>(),
@@ -117,7 +111,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   const skillsAtom = useMemo(
     () =>
       selectedCwd && Result.isSuccess(runtimeResult)
-        ? Atom.make((get) => get(client.query(Skills.ListSkills, { cwd: selectedCwd })).result)
+        ? Atom.make((get) => get(client.Skills.ListSkills({ cwd: selectedCwd })).result)
         : idleAtom,
     [client, selectedCwd, runtimeResult],
   )
@@ -150,12 +144,9 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   useAtomMount(skillRegistrationAtom)
 
   // ── 3. One-shot --prompt / --goal — true mutations needing return value
-  const startGoalAtom = useMemo(() => client.mutation(Agent.StartGoal), [client])
-  const sendMessageAtom = useMemo(() => client.mutation(Agent.SendMessage), [client])
-  const createSessionAtom = useMemo(() => client.mutation(Sessions.CreateSession), [client])
-  const startGoalMutation = useAtomSet(startGoalAtom, { mode: 'promise' })
-  const sendMessageMutation = useAtomSet(sendMessageAtom, { mode: 'promise' })
-  const createSessionMutation = useAtomSet(createSessionAtom, { mode: 'promise' })
+  const startGoalMutation = useAtomSet(client.Agent.StartGoal, { mode: 'promise' })
+  const sendMessageMutation = useAtomSet(client.Agent.SendMessage, { mode: 'promise' })
+  const createSessionMutation = useAtomSet(client.Sessions.CreateSession, { mode: 'promise' })
 
   const initialWorkAtom = useMemo(
     () =>

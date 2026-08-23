@@ -3,7 +3,7 @@ import { Effect, Option, Stream } from "effect"
 import { Subscription, type Client } from "@magnitudedev/effect-query"
 import {
   forkIdToKey,
-  Display,
+  type AcnBoundary,
   type DisplayTimeline,
   type DisplayViewShape,
   type StreamDisplayViewFailure,
@@ -72,7 +72,7 @@ export interface DisplayViewControllerSnapshot {
 }
 
 /** The part of the connection client the controller materializes the display subscription with. */
-export type DisplayViewClient = Pick<Client.Client<AcnClientRequirements, never>, "subscription" | "runtime">
+export type DisplayViewClient = Pick<Client.GroupClient<typeof AcnBoundary, AcnClientRequirements, never>, "Display" | "runtime">
 
 export interface DisplayViewControllerOptions {
   readonly client: DisplayViewClient
@@ -83,7 +83,7 @@ export interface DisplayViewControllerOptions {
 
 type Listener = () => void
 
-type DisplaySubscription = ReturnType<DisplayViewClient["subscription"]> extends infer S
+type DisplaySubscription = ReturnType<DisplayViewClient["Display"]["StreamDisplayView"]> extends infer S
   ? S extends Subscription.SubscriptionAtom<infer I, infer E, infer Err, infer R>
     ? Subscription.SubscriptionAtom<I, E, Err, R>
     : never
@@ -330,7 +330,7 @@ export class DisplayViewControllerCore {
     }
     this.closeView()
 
-    const subscription = this.client.subscription(Display.StreamDisplayView, { sessionId, shape })
+    const subscription = this.client.Display.StreamDisplayView({ sessionId, shape })
     const events = this.client.runtime.atom(
       Subscription.events(subscription).pipe(
         Stream.runForEach((event) => this.acceptEvent(sessionId, shape, event)),

@@ -378,10 +378,15 @@ the core `Group.make`, and the root `AcnBoundary` group is the sole complete pro
 The ACN RPC adapter derives its RPC projection from that group; it does not provide another
 operation-definition or grouping mechanism. Queries declare freshness, while mutations declare
 their scope, recovery policy, and synchronization postcondition on the same values. One
-connection-scoped Effect Query client (the `AgentClient`) provides RPC-backed operation
-implementations and materializes definitions
-into query, mutation, and subscription atoms. Components consume those atoms; they do not construct
-runtimes or wrap them in parallel request atoms or writable status state.
+connection-scoped Effect Query client (the `AgentClient`) is made **for** `AcnBoundary`
+(`Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary), …)`): it provides RPC-backed operation
+implementations and carries every member of the group, materialized, at its name — a query member
+is `(input) => QueryAtom` (`client.Sessions.GetSession(input)`), a mutation member is its
+`MutationAtom` (`client.Agent.SendMessage`), a subscription member is `(input) => SubscriptionAtom`
+(`client.Display.StreamDisplayView(input)`). Members are the canonical atoms: equal inputs return
+the same atom, and a member is identical to what the generic materializer returns for the same
+definition. Components consume those atoms; they do not pass definitions to a materializer,
+construct runtimes, or wrap them in parallel request atoms or writable status state.
 
 Mutation states are retained per invocation and keyed by the mutation definition and, when
 concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports

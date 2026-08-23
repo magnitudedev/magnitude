@@ -7,7 +7,7 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../../components/button'
-import { Configuration, type CloudUsageResponse, type UsagePeriod } from '@magnitudedev/sdk'
+import type { CloudUsageResponse, UsagePeriod } from '@magnitudedev/sdk'
 import { Atom, Result, useAtomValue } from '@effect-atom/atom-react'
 import { authSourceAtom } from '../../state/cli-atoms'
 import { hasCloudUsageAuth } from './usage-auth'
@@ -197,7 +197,7 @@ export const UsageOverlay = memo(function UsageOverlay({ isVisible, onClose }: U
   const usageAtom = useMemo(
     () => isVisible && runtimeReady && cloudConfigured
       ? Atom.make((get): Result.Result<CloudUsageResponse, unknown> =>
-          get(client.query(Configuration.GetCloudUsage, { period, days: DAILY_DAYS, tz })).result)
+          get(client.Configuration.GetCloudUsage({ period, days: DAILY_DAYS, tz })).result)
       : Atom.make<Result.Result<CloudUsageResponse, unknown>>(() => Result.initial()),
     [client, cloudConfigured, isVisible, period, runtimeReady, tz],
   )

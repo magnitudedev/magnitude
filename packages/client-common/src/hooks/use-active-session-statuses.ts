@@ -5,10 +5,9 @@
 import { useMemo } from "react"
 import { Atom, Result, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import {
-  Sessions,
-  type ActiveSessionStatus,
-  type ActiveSessionStatuses,
+import type {
+  ActiveSessionStatus,
+  ActiveSessionStatuses,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
@@ -28,7 +27,7 @@ const toStatusById = (snapshot: ActiveSessionStatuses): ActiveSessionStatusById 
 export function useActiveSessionStatuses(): ActiveSessionStatusById {
   const client = useAgentClient()
   const statuses = useMemo(() => Atom.make((get) =>
-    Option.match(Result.value(get(client.query(Sessions.StreamActiveSessionStatuses, {})).result), {
+    Option.match(Result.value(get(client.Sessions.StreamActiveSessionStatuses({})).result), {
       onNone: () => EMPTY,
       onSome: toStatusById,
     })), [client])

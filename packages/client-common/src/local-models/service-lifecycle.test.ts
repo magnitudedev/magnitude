@@ -11,7 +11,7 @@ import {
   useLocalModelsSelector,
   type AgentClient,
 } from "../index"
-import { type Change, type LocalModelsState } from "@magnitudedev/sdk"
+import { AcnBoundary, type Change, type LocalModelsState } from "@magnitudedev/sdk"
 import { Queue, Stream } from "effect"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
@@ -44,7 +44,8 @@ const makeFakeAgentClient = (
     request,
     (tag) => tag === "StreamChanges" ? Stream.fromQueue(changes) : Stream.never,
   )
-  const client: AgentClient = EffectQueryClient.make<AcnClientRequirements, never, ClientServices, never>(
+  const client: AgentClient = EffectQueryClient.make<typeof AcnBoundary, AcnClientRequirements, never, ClientServices, never>(
+    AcnBoundary,
     implementations,
     (effectQuery) => clientServicesLayer(effectQuery),
   )

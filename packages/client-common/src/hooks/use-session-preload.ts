@@ -1,7 +1,6 @@
 import { Option, Effect } from "effect"
 import { useMemo } from "react"
 import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { Sessions } from "@magnitudedev/sdk"
 import {
   selectedCwdAtom,
   sessionCreateOptionsAtom,
@@ -18,10 +17,8 @@ export function useSessionPreload(enabled = true): void {
   const sessionCreateOptions = useAtomValue(sessionCreateOptionsAtom)
   const runtimeResult = useAtomValue(client.runtime)
   const runtimeReady = Result.isSuccess(runtimeResult)
-  const preloadMutationAtom = useMemo(() => client.mutation(Sessions.PreloadSession), [client])
-  const releaseMutationAtom = useMemo(() => client.mutation(Sessions.ReleaseSessionPreload), [client])
-  const preloadSession = useAtomSet(preloadMutationAtom, { mode: "promise" })
-  const releaseSessionPreload = useAtomSet(releaseMutationAtom, { mode: "promise" })
+  const preloadSession = useAtomSet(client.Sessions.PreloadSession, { mode: "promise" })
+  const releaseSessionPreload = useAtomSet(client.Sessions.ReleaseSessionPreload, { mode: "promise" })
 
   const preloadAtom = useMemo(
     () =>

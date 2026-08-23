@@ -4,7 +4,6 @@ import { Context, Effect, Layer, Option } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
   Configuration,
-  LocalInference,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   authoritativeSlotSelection,
@@ -48,12 +47,12 @@ const makeModelSlots = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const query = effectQuery.query(Configuration.GetModelSlots, {})
-  const assign = effectQuery.mutation(Configuration.AssignSlot)
-  const clear = effectQuery.mutation(Configuration.ClearSlot)
-  const load = effectQuery.mutation(LocalInference.LoadModel)
-  const stop = effectQuery.mutation(LocalInference.StopModel)
-  const favorite = effectQuery.mutation(Configuration.SetModelFavorite)
+  const query = effectQuery.Configuration.GetModelSlots({})
+  const assign = effectQuery.Configuration.AssignSlot
+  const clear = effectQuery.Configuration.ClearSlot
+  const load = effectQuery.LocalInference.LoadModel
+  const stop = effectQuery.LocalInference.StopModel
+  const favorite = effectQuery.Configuration.SetModelFavorite
   const assignResult = Atom.make((get) => get(assign))
   const clearResult = Atom.make((get) => get(clear))
   const favoriteResult = Atom.make((get) => get(favorite))

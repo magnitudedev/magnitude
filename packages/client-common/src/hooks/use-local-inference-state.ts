@@ -3,7 +3,6 @@ import { Effect, Option, type Equivalence } from "effect"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { QueryClient } from "@magnitudedev/effect-query"
 import {
-  Configuration,
   LocalInference,
   ProviderIdSchema,
   type LocalModelsState,
@@ -21,7 +20,7 @@ import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
 export const useLocalInferenceHardware = () => {
   const client = useAgentClient()
   const hardware = useMemo(() => Atom.make((get) =>
-    Result.map(get(client.query(LocalInference.GetLocalInferenceHardware, {})).result, ({ state }) => state)), [client])
+    Result.map(get(client.LocalInference.GetLocalInferenceHardware({})).result, ({ state }) => state)), [client])
   return useAtomValue(hardware)
 }
 export type LocalInferenceHardwareResult = ReturnType<typeof useLocalInferenceHardware>
@@ -74,7 +73,7 @@ export const useModelSlots = () => {
 export const useProviderModelCatalog = () => {
   const client = useAgentClient()
   const catalog = useMemo(() => Atom.make((get) =>
-    Result.map(get(client.query(Configuration.GetProviderModelCatalog, {})).result, ({ state }) => state)), [client])
+    Result.map(get(client.Configuration.GetProviderModelCatalog({})).result, ({ state }) => state)), [client])
   return useAtomValue(catalog)
 }
 
@@ -91,8 +90,8 @@ export function usePreviewModelLoad(slotId: SlotId) {
   const preview = useMemo(() => {
     let dependencies: readonly [number, number] | null = null
     return Atom.make((get) => {
-      const hardware = get(client.query(LocalInference.GetLocalInferenceHardware, {}))
-      const slots = get(client.query(Configuration.GetModelSlots, {}))
+      const hardware = get(client.LocalInference.GetLocalInferenceHardware({}))
+      const slots = get(client.Configuration.GetModelSlots({}))
       const next: readonly [number, number] = [
         Option.getOrElse(hardware.dataUpdatedAt, () => 0),
         Option.getOrElse(slots.dataUpdatedAt, () => 0),
@@ -101,7 +100,7 @@ export function usePreviewModelLoad(slotId: SlotId) {
         queueMicrotask(() => runRefresh())
       }
       dependencies = next
-      return get(client.query(LocalInference.PreviewModelLoad, { slotId })).result
+      return get(client.LocalInference.PreviewModelLoad({ slotId })).result
     })
   }, [client, slotId, runRefresh])
   return useAtomValue(preview)

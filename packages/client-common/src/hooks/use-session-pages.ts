@@ -66,7 +66,7 @@ export function useSessionPages(params?: UseSessionPagesParams): UseSessionPages
 
   const pageSet = useMemo(() => {
     const page = (cursor: Option.Option<SessionPageCursor>, limit: number) =>
-      Atom.make((get) => get(client.query(Sessions.ListSessions, payload(cursor, limit))).result)
+      Atom.make((get) => get(client.Sessions.ListSessions(payload(cursor, limit))).result)
     const continuations = new Map<string, ReturnType<typeof page>>()
     return makePageSet<SessionMetadata, SessionPageCursor>({
       firstPage: page(Option.none(), pageSize),

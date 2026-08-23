@@ -9,16 +9,14 @@
 import { Registry } from "@effect-atom/atom-react"
 import { Effect, Layer, Runtime, Stream } from "effect"
 import { Key, QueryClient, Subscription } from "@magnitudedev/effect-query"
-import { Changes } from "@magnitudedev/sdk"
 import { ClientEffectQuery } from "./client-effect-query"
-
 
 export const ChangesLive = Layer.scopedDiscard(Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
   const runtime = yield* Effect.runtime()
-  const changes = effectQuery.subscription(Changes.StreamChanges, {})
+  const changes = effectQuery.Changes.StreamChanges({})
   const runSync = Runtime.runSync(runtime)
 
   // A reconnection (any attempt after the first) may have missed pokes: reread everything.

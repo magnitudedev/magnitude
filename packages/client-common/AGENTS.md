@@ -67,10 +67,17 @@ root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
 
 Every client↔ACN interaction is a core Effect Query `Query`, `Mutation`, `Subscription`, or
 stream-folded `Query`, composed with `Group.make` in `packages/acn-protocol`.
-`createAgentClient(protocolLayer)` installs the RPC-derived implementation layer for the root
-`AcnBoundary`; `useAgentClient()` returns the connection's Effect Query client. Nothing in client
-code declares or inspects RPCs, transports, or framing: there is no raw RPC client, parallel
-request cache, reactivity-key registry, or per-domain invalidation wiring.
+`createAgentClient(protocolLayer)` makes the connection's Effect Query client **for** the root
+`AcnBoundary` (`Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary), …)`); `useAgentClient()`
+returns it. Every boundary operation is a member of that client at its group name, already
+materialized: a query member is `(input) => QueryAtom` (`client.Sessions.GetSession({ sessionId })`),
+a mutation member is its `MutationAtom` (`client.Agent.SendMessage`), a subscription member is
+`(input) => SubscriptionAtom` (`client.Changes.StreamChanges({})`). Members are the canonical atoms —
+equal inputs return the same atom — so they are never wrapped in `useMemo`. Domain services see the
+same members through `ClientEffectQuery`. Client code never passes a definition to
+`client.query`/`client.mutation`/`client.subscription`, and never declares or inspects RPCs,
+transports, or framing: there is no raw RPC client, parallel request cache, reactivity-key
+registry, or per-domain invalidation wiring.
 
 - A definition carries its cache identity (the payload), freshness, and — for mutations — its
   `scope` and `synchronize` postcondition. Client code never re-declares them.
@@ -84,8 +91,8 @@ request cache, reactivity-key registry, or per-domain invalidation wiring.
 
 ### Queries
 
-- Read server state with `useAtomValue(…)` over `client.query(Definition, input)` (its value is the
-  query state; render from `.result`) or over a service's read-only atom.
+- Read server state with `useAtomValue(…)` over the query member (`client.Sessions.GetSession(input)`;
+  its value is the query state; render from `.result`) or over a service's read-only atom.
 - Render loading, success, and failure directly from the `Result`.
 - Derive transformed views with pure functions, `useMemo`, or derived atoms. Do not copy query results into writable state.
 - A query must be observational. Reading or mounting it must not cause installation, downloads, process startup, or other product mutations.
@@ -93,7 +100,7 @@ request cache, reactivity-key registry, or per-domain invalidation wiring.
 
 ### Mutations
 
-- Trigger a mutation from the user event that causes it with `useAtomSet(client.mutation(Definition))`; the argument is the payload.
+- Trigger a mutation from the user event that causes it with `useAtomSet(client.Sessions.CreateSession)` (the mutation member is the atom); the argument is the payload.
 - If the UI displays mutation pending/failure state, read the mutation atom's `Result` with `useAtomValue`. Do not wrap the call with `busy`/`error` `useState` or `try/finally` bookkeeping.
 - Prefer value mode. Use `{ mode: "promise" }` only when the event handler genuinely needs the returned success value for immediate one-shot control flow. A promise is not a state store and must not be used to mirror loading, errors, progress, or query data.
 - For long-running work, the mutation should acknowledge or return an operation ID. Progress and terminal state belong to a query, not to the mutation promise.

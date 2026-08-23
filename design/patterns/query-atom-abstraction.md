@@ -11,9 +11,12 @@ applies_to:
 ## Purpose
 
 Effect Query is the client-common mechanism for observing and changing backend-owned state: every
-client↔ACN interaction is a boundary-group query, mutation, or subscription materialized through the
-connection's Effect Query client. A feature exposes the product capability built with the mechanism
-rather than propagating mechanism-level representations.
+client↔ACN interaction is a boundary-group query, mutation, or subscription, reached as a member of
+the connection's Effect Query client (`client.Sessions.GetSession(input)`, `client.Agent.SendMessage`,
+`client.Changes.StreamChanges({})`). The client is made for `AcnBoundary`, so each member is already
+the canonical atom (or, for keyed queries and subscriptions, the function from input to it). A
+feature exposes the product capability built with the mechanism rather than propagating
+mechanism-level representations.
 
 ```text
 backend authority
@@ -55,15 +58,16 @@ the DI document defines how the services at that boundary are acquired and compo
 ## Ownership
 
 ```text
-core operation definitions (Query / Mutation / Subscription)
+core operation definitions (Query / Mutation / Subscription), grouped in AcnBoundary
               |
               v
-   connection Effect Query client (AgentClient)
+   connection Effect Query client (AgentClient = Client.make(AcnBoundary, …))
+   members: client.<Group>.<Operation>
               |
    +----------+-----------------------------+
    |                                        |
    v                                        v
-domain service (when warranted)       hook materializing a definition directly
+domain service (when warranted)       hook using a member directly
    |                                        |
    +------------- semantic API -------------+
 ```
@@ -165,14 +169,15 @@ When a domain has a client service (the client-di criteria: connection-lifetime 
 resource such as a keyed watch, reusable operations with dependencies, or a stateful use case), its
 definitions are consumed only by that service; UI and composed services see the service's semantic
 surface. When no service is warranted (sessions, projects, provider auth, usage, skills), a hook
-materializes the definition directly through the connection client; that hook is the domain's
+uses the member directly (`client.Sessions.ListSessions(payload)`); that hook is the domain's
 terminal adapter and still returns values and callbacks, not atoms or clients.
 
 ### ACN-backed client service
 
 One service instance exists per client connection and owns materialization of a backend domain. It:
 
-- materializes the domain's boundary operations with that connection's Effect Query client;
+- uses the domain's members of that connection's Effect Query client (`ClientEffectQuery`, the
+  materialized `AcnBoundary`);
 - exposes one read-only Atom containing the domain query Result;
 - exposes domain operations as functions returning Effects;
 - exposes semantic derived state or status selectors when presentation needs mutation intent; and

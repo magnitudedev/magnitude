@@ -3,6 +3,7 @@ import { Cause, Effect, Layer, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
+  AcnBoundary,
   AssessmentEnvironmentIdSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
@@ -563,7 +564,8 @@ const makeHarness = (options: HarnessOptions) => {
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
   }))
-  const effectQuery = EffectQueryClient.make<AcnClientRequirements, never, ClientServices, never>(
+  const effectQuery = EffectQueryClient.make<typeof AcnBoundary, AcnClientRequirements, never, ClientServices, never>(
+    AcnBoundary,
     fakeAcnImplementationsLayer(rpc),
     (client) => clientServicesLayer(client, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,

@@ -11,8 +11,8 @@ const makeOnboardingPersistence = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const query = effectQuery.query(Onboarding.GetOnboardingState, {})
-  const complete = effectQuery.mutation(Onboarding.CompleteOnboarding)
+  const query = effectQuery.Onboarding.GetOnboardingState({})
+  const complete = effectQuery.Onboarding.CompleteOnboarding
 
   return {
     state: Atom.make((get) => Result.map(get(query).result, (snapshot) => snapshot.state)),

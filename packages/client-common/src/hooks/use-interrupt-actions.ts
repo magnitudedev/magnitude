@@ -5,11 +5,8 @@
  * mutation dispatchers. Both apps use this identically.
  */
 import { useAtomSet } from "@effect-atom/atom-react"
-import { useMemo } from "react"
-import { Agent } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { useSelectedSessionId } from "../display-view-controller/hooks"
-
 
 export interface UseInterruptActionsResult {
   /** Interrupt a specific fork, or the root agent if forkId is null */
@@ -21,8 +18,7 @@ export interface UseInterruptActionsResult {
 export function useInterruptActions(): UseInterruptActionsResult {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptAtom = useMemo(() => client.mutation(Agent.Interrupt), [client])
-  const interruptMutation = useAtomSet(interruptAtom)
+  const interruptMutation = useAtomSet(client.Agent.Interrupt)
 
   function interrupt(forkId?: string | null): void {
     if (!selectedSessionId) return
