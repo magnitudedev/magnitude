@@ -128,6 +128,21 @@ const makeMeta = (sessionId: string, cwd: DirectoryPath): StoredSessionMeta => {
 const residentCount = (runtime: AgentRuntimeApi) =>
   runtime.residentSessions.pipe(Effect.map((sessions) => sessions.length))
 
+const awaitContinuingWorkOwnership = (
+  runtime: AgentRuntimeApi,
+  owned: boolean,
+): Effect.Effect<void> => Effect.suspend(() =>
+  runtime.residentSessions.pipe(
+    Effect.flatMap((sessions) =>
+      sessions[0]?.continuingWorkOwned === owned
+        ? Effect.void
+        : Effect.yieldNow().pipe(
+            Effect.zipRight(awaitContinuingWorkOwnership(runtime, owned)),
+          ),
+    ),
+  ),
+)
+
 interface TestSetup {
   readonly cwd: DirectoryPath
   readonly layer: Layer.Layer<AgentRuntime>
@@ -258,7 +273,7 @@ describe("AgentRuntime", () => {
     await Effect.runPromise(program)
   })
 
-  it("holds continuing session work and starts a fresh idle interval at quiescence", async () => {
+  it("owns work before a delayed Working transition and starts a fresh idle interval at quiescence", async () => {
     const program = Effect.gen(function* () {
       const status = yield* Ref.make<SessionWorkStatus>({
         _tag: "Quiescent",
@@ -273,28 +288,30 @@ describe("AgentRuntime", () => {
           ...idleSession.state,
           work: {
             get: () => Ref.get(status),
-            subscribe: Stream.fromPubSub(changes),
+            subscribe: Stream.concat(
+              Stream.fromEffect(Ref.get(status)),
+              Stream.fromPubSub(changes),
+            ),
           },
         },
       }
       const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(session) },
+        storedSessionIds: ["continuing"],
       })
 
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        yield* runtime.withSessionRequest(setup.request("continuing"), "start-work", () =>
-          Ref.set(status, working).pipe(
-            Effect.zipRight(PubSub.publish(changes, working)),
-          ),
-        )
-        yield* Effect.yieldNow()
+        yield* runtime.withSessionWork("continuing", "start-work", () => Effect.void)
+        yield* Ref.set(status, working)
+        yield* PubSub.publish(changes, working)
+        yield* awaitContinuingWorkOwnership(runtime, true)
         yield* TestClock.adjust("1 hour")
         expect(yield* residentCount(runtime)).toBe(1)
 
         yield* Ref.set(status, quiescent)
         yield* PubSub.publish(changes, quiescent)
-        yield* Effect.yieldNow()
+        yield* awaitContinuingWorkOwnership(runtime, false)
         yield* TestClock.adjust("1999 millis")
         expect(yield* residentCount(runtime)).toBe(1)
         yield* TestClock.adjust("1 millis")
@@ -384,12 +401,7 @@ describe("AgentRuntime", () => {
         beginStopping: (request) =>
           Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
         awaitStopping: Effect.never,
-        awaitActivityDrain: Effect.never,
-        acquireActivity: () => Effect.die("unused"),
-        acquireIdleRetention: () => Effect.die("unused"),
-        joinActivityIfBusy: () => Effect.die("unused"),
-        withActivity: (_label, effect) => effect,
-        activity: Effect.die("unused"),
+        setClientPresence: () => Effect.die("unused"),
       }
       const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(idleSession) },
@@ -427,7 +439,7 @@ describe("AgentRuntime", () => {
       })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
-        yield* runtime.withSessionRequest(setup.request("passive"), "demand", () => Effect.void)
+        yield* runtime.withSessionRequest(setup.request("passive"), "initial-use", () => Effect.void)
         yield* TestClock.adjust("1 second")
         const observed = yield* runtime.tryWithBusyResident(
           "passive",

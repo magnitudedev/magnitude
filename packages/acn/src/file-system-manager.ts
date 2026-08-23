@@ -139,7 +139,7 @@ export interface FileSystemManager {
   >
   /**
    * Native watcher with a per-subscription 500ms polling fallback — a
-   * client-demanded stream, not an ambient poller.
+   * client-observed stream, not an ambient poller.
    */
   readonly watchHostFile: (path: AbsolutePath) => Stream.Stream<FileWatchEvent>
   readonly listHostSubdirectories: (parent: AbsolutePath) => Effect.Effect<SubdirectoryListing>

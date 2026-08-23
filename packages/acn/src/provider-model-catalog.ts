@@ -25,7 +25,6 @@ import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { AcnChanges } from "./changes"
 import { makeMirroredState } from "./mirrored-state"
 import { LocalProviderOfferings } from "./local-provider-offerings"
-import { AcnActivityTracker } from "./activity-tracker"
 import { makeServiceOperationCoordinator } from "./service-operation-coordinator"
 
 class ProviderContractViolation extends Data.TaggedError("ProviderContractViolation")<{
@@ -184,7 +183,7 @@ const sameRefreshTarget = (
 export const ProviderModelCatalogLive: Layer.Layer<
   ProviderModelCatalog,
   never,
-  ProviderClient | LocalProviderOfferings | AcnChanges | AcnActivityTracker
+  ProviderClient | LocalProviderOfferings | AcnChanges
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
   const localOfferings = yield* LocalProviderOfferings
@@ -334,7 +333,6 @@ export const ProviderModelCatalogLive: Layer.Layer<
   ) => refreshOperations.admit(Effect.succeed({
     key: providerId,
     whenIdle: Effect.succeed(Option.some({
-      activityLabel: "provider-model-catalog:refresh",
       commit: beginRefresh,
       operation: refreshNow(true, providerId),
       terminalize: (exit: Exit.Exit<void, never>) =>

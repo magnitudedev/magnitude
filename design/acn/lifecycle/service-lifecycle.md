@@ -3,8 +3,6 @@ applies_to:
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
   - packages/acn/src/ownership-monitor.ts
-  - packages/acn/src/activity-tracker.ts
-  - packages/acn/src/resource-use-gate.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
   - packages/acn-protocol/src/schemas/acn-health.ts
@@ -43,12 +41,12 @@ policy, ownership loss, the ACN's own terminal failure, or process signals.
 
 ## Readiness and admission
 
-Health, lifecycle observation, application RPC dispatch, root activity admission, and shutdown read
+Health, lifecycle observation, application RPC dispatch, client presence, and shutdown read
 one lifecycle value. The control server exists throughout startup. Application RPC rejects until
 the complete application and private ICN exist.
 
-`Ready` installs the RPC application and opens work admission atomically. `Stopping` closes RPC and
-activity admission before becoming observable. The first stop reason wins; both transitions are
+`Ready` installs the RPC application atomically. `Stopping` closes RPC dispatch before becoming
+observable. The first stop reason wins; both transitions are
 monotonic and idempotent.
 
 External JIT ensurance treats observable `Starting` health as live regardless of whether optional
@@ -57,16 +55,16 @@ ceiling and separately bounds loss of observable health. ACN independently owns 
 absolute application-startup ceiling that never restarts. Expiry commits
 `Stopping(startup-failed)`.
 
-## Activity and idleness
+## Client presence and idleness
 
-ACN stops after thirty minutes without work or connected-client retention. The first idle period begins only after readiness. A
-finite RPC retains demand for its whole handler; shared work continuing after a request retains its
-own scoped demand according to [operation ownership](../../architecture/operation-ownership.md).
+ACN stops after thirty minutes with no connected client. The first idle period begins only after
+readiness. The first client-presence transition cancels it; the final absence transition starts a
+fresh full interval. Revision-fenced timers cannot retire a newer presence state.
 
-Health, subscriptions, status/file watches, mirror refetch, display streams, ICN observation,
-telemetry, and introspection are non-demand. Explicit renewable client leases retain ACN without
-turning observation into demand. The final demand and client-retention release starts the idle timer. Demand
-admission and retirement commit are serialized so work cannot enter a service being destroyed.
+RPCs, subscriptions, session work, inference, status/file watches, display streams, ICN
+observation, telemetry, and introspection do not participate in process idleness. They remain
+bounded by their own caller, operation, session, model, and application scopes. Client leases are
+the only process-presence authority.
 
 ## Shutdown
 
@@ -74,7 +72,6 @@ Every stop cause uses one process-owned, single-flight shutdown:
 
 ```text
 commit Stopping and close admission
-  -> bounded activity drain
   -> terminate subscriptions and transports
   -> close application and session scopes
   -> terminate and reap private ICN
@@ -95,12 +92,12 @@ belongs to manager-side owner and exact-process revalidation, not a required end
 
 ## Guarantees
 
-- One lifecycle value governs health, readiness, work admission, idleness, and shutdown.
+- One lifecycle value governs health, readiness, RPC dispatch, client-presence idleness, and shutdown.
 - No application or ICN work starts before atomic exact-owner admission.
 - Losing owner acquisition cannot initialize expensive resources.
 - No application work is admitted outside the exact admitted `Ready` ACN.
 - A confirmed missing or changed owner row stops the admitted ACN, and any store failure fails
   closed rather than leaving an unfenced service alive.
-- Observation cannot retain ACN, and operation duration cannot replace it.
+- Only connected-client presence retains ACN; operation duration and observation do not.
 - The stopping transition is single-flight; cooperative teardown and external exact-process-group escalation
   are independently bounded.

@@ -60,7 +60,7 @@ export const SessionCommandsLive: Layer.Layer<
         })
       }
 
-      yield* runtime.withSession(input.sessionId, "send-user-message", (entry) =>
+      yield* runtime.withSessionWork(input.sessionId, "send-user-message", (entry) =>
         Effect.gen(function* () {
           const materialized = yield* materializeMessageUploads({
             scratchpadPath: entry.scratchpadPath,
@@ -97,7 +97,7 @@ export const SessionCommandsLive: Layer.Layer<
               mode: "text",
               synthetic: false,
               taskMode: input.taskMode,
-            } satisfies AppEvent)
+            } satisfies AppEvent).pipe(Effect.uninterruptible)
           })
 
           yield* admitMessage.pipe(
@@ -122,13 +122,13 @@ export const SessionCommandsLive: Layer.Layer<
           reason: "Goal objective cannot be empty",
         })
       }
-      yield* runtime.withSession(input.sessionId, "start-goal", (entry) =>
+      yield* runtime.withSessionWork(input.sessionId, "start-goal", (entry) =>
         entry.session.send({
           type: "goal_started",
           forkId: null,
           goalId: createId(),
           objective,
-        } satisfies AppEvent),
+        } satisfies AppEvent).pipe(Effect.uninterruptible),
       )
     })
 

@@ -7,10 +7,6 @@ import {
   Scope,
   type Fiber,
 } from "effect"
-import {
-  AcnActivityTracker,
-} from "./activity-tracker"
-import type { ResourceRetired } from "./resource-use-gate"
 
 export type ServiceOperationAdmission<E> =
   | { readonly _tag: "Satisfied" }
@@ -18,7 +14,6 @@ export type ServiceOperationAdmission<E> =
   | { readonly _tag: "Conflicting"; readonly outcome: Effect.Effect<Exit.Exit<void, E>> }
 
 export interface ServiceOperationDefinition<E> {
-  readonly activityLabel: string
   /** Infallible, bounded publication of the domain's nonterminal state. */
   readonly commit: Effect.Effect<void>
   readonly operation: Effect.Effect<void, E>
@@ -44,13 +39,13 @@ export interface ServiceOperationSupersession<K, E, AdmissionError>
 export interface ServiceOperationCoordinator<K, E> {
   readonly admit: <AdmissionError>(
     request: Effect.Effect<ServiceOperationRequest<K, E, AdmissionError>, AdmissionError>,
-  ) => Effect.Effect<ServiceOperationAdmission<E>, AdmissionError | ResourceRetired>
+  ) => Effect.Effect<ServiceOperationAdmission<E>, AdmissionError>
   readonly supersede: <AdmissionError>(
     request: Effect.Effect<
       ServiceOperationSupersession<K, E, AdmissionError>,
       AdmissionError
     >,
-  ) => Effect.Effect<ServiceOperationAdmission<E>, AdmissionError | ResourceRetired>
+  ) => Effect.Effect<ServiceOperationAdmission<E>, AdmissionError>
 }
 
 interface ActiveOperation<K, E> {
@@ -63,9 +58,8 @@ export const makeServiceOperationCoordinator = <K, E>(
 ): Effect.Effect<
   ServiceOperationCoordinator<K, E>,
   never,
-  AcnActivityTracker | Scope.Scope
+  Scope.Scope
 > => Effect.gen(function* () {
-  const activity = yield* AcnActivityTracker
   const scope = yield* Scope.Scope
   const admissionLock = yield* Effect.makeSemaphore(1)
   const active = yield* Ref.make<Option.Option<ActiveOperation<K, E>>>(Option.none())
@@ -91,7 +85,6 @@ export const makeServiceOperationCoordinator = <K, E>(
   const launch = (
     current: ActiveOperation<K, E>,
     definition: ServiceOperationDefinition<E>,
-    releaseActivity: Effect.Effect<void>,
   ): Effect.Effect<Fiber.RuntimeFiber<void, never>> =>
     Effect.forkIn(
       Effect.exit(definition.operation).pipe(
@@ -106,7 +99,6 @@ export const makeServiceOperationCoordinator = <K, E>(
                 )),
             ),
           )),
-        Effect.ensuring(releaseActivity),
       ),
       scope,
     )
@@ -114,10 +106,9 @@ export const makeServiceOperationCoordinator = <K, E>(
   const start = (
     key: K,
     definition: ServiceOperationDefinition<E>,
-  ): Effect.Effect<ServiceOperationAdmission<E>, ResourceRetired> =>
+  ): Effect.Effect<ServiceOperationAdmission<E>> =>
     Effect.uninterruptible(Effect.gen(function* () {
       const outcome = yield* Deferred.make<Exit.Exit<void, E>>()
-      const releaseActivity = yield* activity.acquire(definition.activityLabel)
       const current = { key, outcome } satisfies ActiveOperation<K, E>
       yield* Ref.set(active, Option.some(current))
       const committed = yield* Effect.exit(definition.commit)
@@ -125,11 +116,10 @@ export const makeServiceOperationCoordinator = <K, E>(
         const operationExit: Exit.Exit<void, E> = Exit.failCause(committed.cause)
         const terminalized = yield* Effect.exit(definition.terminalize(operationExit))
         yield* completeUnlocked(current, operationExit)
-        yield* releaseActivity
         if (Exit.isFailure(terminalized)) return yield* Effect.failCause(terminalized.cause)
         return yield* Effect.failCause(committed.cause)
       }
-      yield* launch(current, definition, releaseActivity)
+      yield* launch(current, definition)
       return {
         _tag: "Current" as const,
         outcome: Deferred.await(outcome),
