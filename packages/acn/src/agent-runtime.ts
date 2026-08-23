@@ -1,4 +1,5 @@
 import {
+  Cause,
   Context,
   Deferred,
   Duration,
@@ -25,11 +26,10 @@ import { AcnServiceLifecycle } from "./service-lifecycle"
 import { AgentFactory } from "./agent-factory"
 import { FileSystemManager } from "./file-system-manager"
 import {
-  makeResourceUseGate,
-  ResourceRetired,
-  type ResourceUseGate,
-  type ResourceUseGateSnapshot,
-} from "./resource-use-gate"
+  makeSessionRuntimeState,
+  type SessionRuntimeRetired,
+  type SessionRuntimeState,
+} from "./session-runtime-state"
 import {
   SessionRuntimeOptionsStore,
   normalizeSessionRuntimeOptions,
@@ -44,7 +44,7 @@ export interface RuntimeStartRequest {
   readonly visibility: StoredSessionMeta["visibility"]
 }
 
-export interface ResidentSessionSnapshot {
+export interface SessionRuntimeSnapshot {
   readonly sessionId: string
   readonly generation: number
   readonly title: string
@@ -52,11 +52,19 @@ export interface ResidentSessionSnapshot {
   readonly scratchpadPath: string
   readonly createdAt: number
   readonly updatedAt: number
-  readonly residentSince: number
+  readonly loadedAt: number
   readonly workStatus: SessionWorkStatus
-  readonly continuingWorkOwned: boolean
-  readonly gate: ResourceUseGateSnapshot
+  readonly phase: "open" | "retirement-claimed" | "retired"
+  readonly scopedUseCount: number
+  readonly scopedUseLabels: ReadonlyArray<string>
+  readonly idleSince: number | null
+  readonly revision: number
   readonly retirement: SessionRetirementSnapshot | null
+}
+
+export interface SessionRuntime {
+  readonly entry: RuntimeEntry
+  readonly generation: number
 }
 
 export type SessionRetirementStage =
@@ -78,32 +86,19 @@ export interface SessionRetirementObserver {
 }
 
 export interface AgentRuntimeApi {
-  readonly withSession: <A, E, R>(
+  readonly acquireSession: (
     sessionId: string,
     label: string,
-    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E | SessionError, R>
-  readonly withSessionRequest: <A, E, R>(
+  ) => Effect.Effect<SessionRuntime, SessionError, Scope.Scope>
+  readonly acquireSessionRequest: (
     request: RuntimeStartRequest,
     label: string,
-    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E | SessionError, R>
-  readonly withSessionWork: <A, E, R>(
+  ) => Effect.Effect<SessionRuntime, SessionError, Scope.Scope>
+  readonly tryAcquireActiveSession: (
     sessionId: string,
     label: string,
-    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E | SessionError, R>
-  readonly tryWithResident: <A, E, R>(
-    sessionId: string,
-    label: string,
-    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-  ) => Effect.Effect<Option.Option<A>, E | SessionError, R>
-  readonly tryWithBusyResident: <A, E, R>(
-    sessionId: string,
-    label: string,
-    use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-  ) => Effect.Effect<Option.Option<A>, E | SessionError, R>
-  readonly residentSessions: Effect.Effect<ReadonlyArray<ResidentSessionSnapshot>>
+  ) => Effect.Effect<Option.Option<SessionRuntime>, SessionError, Scope.Scope>
+  readonly sessionRuntimes: Effect.Effect<ReadonlyArray<SessionRuntimeSnapshot>>
   readonly dispose: (sessionId: string) => Effect.Effect<void>
   readonly deleteSession: <R>(
     sessionId: string,
@@ -117,21 +112,15 @@ export interface AgentRuntimeApi {
 
 export class AgentRuntime extends Context.Tag("AgentRuntime")<AgentRuntime, AgentRuntimeApi>() {}
 
-interface ResidentGeneration {
+interface SessionRuntimeInternal {
   readonly generation: number
   readonly entry: RuntimeEntry
-  readonly gate: ResourceUseGate
+  readonly state: SessionRuntimeState
   readonly scope: Scope.CloseableScope
-  readonly residentSince: number
-  readonly workStatus: Ref.Ref<SessionWorkStatus>
-  readonly reconcileWork: Effect.Effect<void>
-  readonly withWorkAdmission: <A, E, R>(
-    use: Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E | ResourceRetired, R>
-  readonly continuingWorkOwned: Effect.Effect<boolean>
+  readonly loadedAt: number
 }
 
-type StartDeferred = Deferred.Deferred<ResidentGeneration, SessionError>
+type StartDeferred = Deferred.Deferred<SessionRuntimeInternal, SessionError>
 
 type StartClaim =
   | { readonly _tag: "owner"; readonly deferred: StartDeferred }
@@ -165,7 +154,7 @@ export const makeAgentRuntimeLive = (
       const runtimeOptions = yield* SessionRuntimeOptionsStore
       const lifecycle = yield* Effect.serviceOption(AcnServiceLifecycle)
       const managerScope = yield* Effect.scope
-      const entries = yield* Ref.make(new Map<string, ResidentGeneration>())
+      const entries = yield* Ref.make(new Map<string, SessionRuntimeInternal>())
       const starts = yield* Ref.make(new Map<string, StartDeferred>())
       const deletions = yield* Ref.make(new Map<string, DeleteDeferred>())
       const admissionLock = yield* Effect.makeSemaphore(1)
@@ -194,8 +183,8 @@ export const makeAgentRuntimeLive = (
 
       const removeExact = (sessionId: string, generation: number) =>
         Ref.modify(entries, (current) => {
-          const resident = current.get(sessionId)
-          if (!resident || resident.generation !== generation) {
+          const runtime = current.get(sessionId)
+          if (!runtime || runtime.generation !== generation) {
             return [false, current] as const
           }
           const next = new Map(current)
@@ -206,189 +195,11 @@ export const makeAgentRuntimeLive = (
       let retireGeneration = (_sessionId: string, _generation: number): Effect.Effect<boolean> =>
         Effect.succeed(true)
 
-      const makeWorkBridge = (
-        sessionId: string,
-        generation: number,
-        entry: RuntimeEntry,
-        gate: ResourceUseGate,
-        generationScope: Scope.CloseableScope,
-      ) =>
-        Effect.gen(function* () {
-          const workStatus = yield* Ref.make<SessionWorkStatus>({
-            _tag: "Quiescent",
-            workerCount: 0,
-          })
-          interface ContinuingWorkOwnership {
-            readonly release: Effect.Effect<void>
-            readonly phase: "AwaitingWorking" | "Working"
-            readonly admitting: boolean
-          }
-          const ownership = yield* Ref.make<ContinuingWorkOwnership | null>(null)
-          const setOwnership = (value: ContinuingWorkOwnership | null) =>
-            Ref.set(ownership, value)
-          const serialize = yield* Effect.makeSemaphore(1)
-          const admission = yield* Effect.makeSemaphore(1)
-
-          const acquireOwnership = gate.acquire(
-            `continuing-work:${sessionId}:${generation}`,
-          )
-
-          const releaseOwnership = (current: ContinuingWorkOwnership) =>
-            setOwnership(null).pipe(
-              Effect.zipRight(current.release),
-              Effect.zipRight(publishChange),
-            )
-
-          const recordStatus = (next: SessionWorkStatus) => Effect.gen(function* () {
-            const previous = yield* Ref.get(workStatus)
-            yield* Ref.set(workStatus, next)
-            if (
-              previous._tag !== next._tag ||
-              previous.workerCount !== next.workerCount
-            ) {
-              yield* publishChange
-            }
-            return next
-          })
-
-          const readStatus = entry.session.state.work.get().pipe(
-            Effect.flatMap(recordStatus),
-          )
-
-          const restoreInitialOwnership = serialize.withPermits(1)(
-            Effect.gen(function* () {
-              const next = yield* readStatus
-              if (next._tag === "Quiescent") return
-              const release = yield* acquireOwnership
-              yield* setOwnership({
-                release,
-                phase: "Working",
-                admitting: false,
-              })
-              yield* publishChange
-            }),
-          )
-
-          const reconcileStatus = (nextStatus: SessionWorkStatus) => serialize.withPermits(1)(
-            Effect.gen(function* () {
-              const next = yield* recordStatus(nextStatus)
-              const current = yield* Ref.get(ownership)
-              if (next._tag === "Working") {
-                if (current === null) {
-                  return yield* Effect.dieMessage(
-                    `Session ${sessionId} generation ${generation} has work without an owner`,
-                  )
-                }
-                if (current.phase !== "Working") {
-                  yield* setOwnership({ ...current, phase: "Working" })
-                }
-                return
-              }
-              if (
-                current !== null &&
-                current.phase === "Working" &&
-                !current.admitting
-              ) {
-                yield* releaseOwnership(current)
-              }
-            }),
-          )
-
-          const reconcileWork = entry.session.state.work.get().pipe(
-            Effect.flatMap(reconcileStatus),
-          )
-
-          const withWorkAdmission = <A, E, R>(
-            use: Effect.Effect<A, E, R>,
-          ): Effect.Effect<A, E | ResourceRetired, R> =>
-            admission.withPermits(1)(
-              Effect.uninterruptibleMask((restore) =>
-                Effect.gen(function* () {
-                  yield* serialize.withPermits(1)(
-                    Effect.gen(function* () {
-                      const current = yield* Ref.get(ownership)
-                      if (current === null) {
-                        const release = yield* acquireOwnership
-                        yield* setOwnership({
-                          release,
-                          phase: "AwaitingWorking",
-                          admitting: true,
-                        })
-                        yield* publishChange
-                      } else {
-                        yield* setOwnership({
-                          ...current,
-                          phase: "AwaitingWorking",
-                          admitting: true,
-                        })
-                      }
-                    }),
-                  )
-
-                  const result = yield* restore(use).pipe(Effect.exit)
-                  yield* serialize.withPermits(1)(
-                    Effect.gen(function* () {
-                      const next = yield* readStatus
-                      const current = yield* Ref.get(ownership)
-                      if (current === null) return
-                      if (next._tag === "Working") {
-                        yield* setOwnership({
-                          ...current,
-                          phase: "Working",
-                          admitting: false,
-                        })
-                        return
-                      }
-                      if (Exit.isFailure(result) || current.phase === "Working") {
-                        yield* releaseOwnership(current)
-                        return
-                      }
-                      yield* setOwnership({ ...current, admitting: false })
-                    }),
-                  )
-                  if (Exit.isSuccess(result)) return result.value
-                  return yield* Effect.failCause(result.cause)
-                }),
-              ),
-            )
-
-          yield* restoreInitialOwnership.pipe(Effect.orDie)
-          yield* Effect.forkIn(
-            entry.session.state.work.subscribe.pipe(
-              Stream.runForEach(reconcileStatus),
-              Effect.ensuring(
-                Ref.getAndSet(ownership, null).pipe(
-                  Effect.flatMap((current) => current?.release ?? Effect.void),
-                ),
-              ),
-            ),
-            generationScope,
-          )
-          // Let the scoped subscriber acquire its upstream subscription before
-          // this generation is published to callers that can commit work.
-          yield* Effect.yieldNow()
-          return {
-            workStatus,
-            reconcileWork,
-            withWorkAdmission,
-            continuingWorkOwned: Ref.get(ownership).pipe(
-              Effect.map((current) => current !== null),
-            ),
-          }
-        })
-
-      const startResidentAttempt = Effect.fn("acn.agent-runtime.start-attempt")(function* (
+      const startRuntimeAttempt = Effect.fn("acn.agent-runtime.start-attempt")(function* (
         request: RuntimeStartRequest,
       ) {
         const generation = yield* nextGeneration(request.sessionId)
         const generationScope = yield* Scope.fork(managerScope, ExecutionStrategy.sequential)
-        const gate = yield* makeResourceUseGate({
-          resource: `session:${request.sessionId}`,
-          generation,
-          idleTimeout: options.idleTimeout ?? "2 minutes",
-          retire: () => retireGeneration(request.sessionId, generation),
-        }).pipe(Effect.provideService(Scope.Scope, managerScope))
-        const releaseStartup = yield* gate.acquire("session-start").pipe(Effect.orDie)
 
         return yield* Effect.gen(function* () {
           // A request's cwd is immutable session identity: validate the host
@@ -404,54 +215,85 @@ export const makeAgentRuntimeLive = (
             options: request.options,
             visibility: request.visibility,
           })
-          const residentSince = Date.now()
+          const loadedAt = Date.now()
           const storedMeta = yield* readStoredMeta(request.sessionId)
           const createdAt = storedMeta
-            ? Date.parse(storedMeta.created) || residentSince
-            : residentSince
+            ? Date.parse(storedMeta.created) || loadedAt
+            : loadedAt
           const scratchpadPath = storage.sessions.paths.sessionScratchpad(request.sessionId)
           const entry: RuntimeEntry = {
             id: request.sessionId,
             createdAt,
-            updatedAt: residentSince,
+            updatedAt: loadedAt,
             title: storedMeta?.chatName ?? DEFAULT_CHAT_NAME,
             cwd: request.cwd,
             scratchpadPath,
             session,
             scope: generationScope,
           }
-          const bridge = yield* makeWorkBridge(
-            request.sessionId,
+          const state = yield* makeSessionRuntimeState({
+            sessionId: request.sessionId,
             generation,
-            entry,
-            gate,
+            idleTimeout: options.idleTimeout ?? "2 minutes",
+            readWorkStatus: entry.session.state.work.get(),
+            retire: () => retireGeneration(request.sessionId, generation),
+          }).pipe(Effect.provideService(Scope.Scope, managerScope))
+
+          const firstStatus = yield* Deferred.make<void>()
+          yield* Effect.forkIn(
+            entry.session.state.work.subscribe.pipe(
+              Stream.runForEach((status) =>
+                state.updateWorkStatus(status).pipe(
+                  Effect.zipRight(Deferred.succeed(firstStatus, undefined)),
+                  Effect.zipRight(publishChange),
+                ),
+              ),
+              Effect.catchAllCause((cause) =>
+                Cause.isInterruptedOnly(cause)
+                  ? Effect.void
+                  : Effect.logError("Session work-status observation failed").pipe(
+                    Effect.annotateLogs({
+                      sessionId: request.sessionId,
+                      generation,
+                      cause: String(cause),
+                    }),
+                    Effect.zipRight(Option.match(lifecycle, {
+                      onNone: () => Effect.void,
+                      onSome: (serviceLifecycle) => serviceLifecycle.beginStopping({
+                        reason: "fatal",
+                        detail: `session ${request.sessionId} generation ${generation} work-status observation failed`,
+                      }).pipe(Effect.asVoid),
+                    })),
+                  ),
+              ),
+            ),
             generationScope,
           )
-          const resident: ResidentGeneration = {
+          yield* Deferred.await(firstStatus)
+          const runtime: SessionRuntimeInternal = {
             generation,
             entry,
-            gate,
+            state,
             scope: generationScope,
-            residentSince,
-            ...bridge,
+            loadedAt,
           }
-          yield* Ref.update(entries, (current) => new Map(current).set(request.sessionId, resident))
+          yield* Ref.update(entries, (current) => new Map(current).set(request.sessionId, runtime))
           yield* publishChange
-          return { resident, releaseStartup }
+          return runtime
         }).pipe(
           Effect.onExit((exit) =>
             Exit.isSuccess(exit)
               ? Effect.void
-              : releaseStartup.pipe(Effect.zipRight(Scope.close(generationScope, Exit.void))),
+              : Scope.close(generationScope, Exit.void),
           ),
         )
       })
 
-      const startResident = startResidentAttempt
+      const startRuntime = startRuntimeAttempt
 
       const claimStart = (sessionId: string) =>
         Effect.gen(function* () {
-          const deferred = yield* Deferred.make<ResidentGeneration, SessionError>()
+          const deferred = yield* Deferred.make<SessionRuntimeInternal, SessionError>()
           return yield* Ref.modify(
             starts,
             (current): readonly [StartClaim, Map<string, StartDeferred>] => {
@@ -483,14 +325,16 @@ export const makeAgentRuntimeLive = (
         },
       )
 
-      /** Resolve a generation and acquire the caller lease atomically. */
-      const acquireResident = (
+      const publicRuntime = (runtime: SessionRuntimeInternal): SessionRuntime => ({
+        entry: runtime.entry,
+        generation: runtime.generation,
+      })
+
+      /** Resolve a generation and acquire exact scoped access atomically. */
+      const acquireRuntime = (
         request: RuntimeStartRequest,
         label: string,
-      ): Effect.Effect<
-        readonly [ResidentGeneration, Effect.Effect<void>],
-        SessionError | ResourceRetired
-      > =>
+      ): Effect.Effect<SessionRuntime, SessionError | SessionRuntimeRetired, Scope.Scope> =>
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
             const deleting = () =>
@@ -505,14 +349,14 @@ export const makeAgentRuntimeLive = (
                     return yield* deleting()
                   }
                   const existing = (yield* Ref.get(entries)).get(request.sessionId)
-                  if (existing) return { _tag: "resident" as const, resident: existing }
+                  if (existing) return { _tag: "runtime" as const, runtime: existing }
                   return { _tag: "start" as const, claim: yield* claimStart(request.sessionId) }
                 }),
               ),
             )
-            if (resolved._tag === "resident") {
-              const release = yield* restore(
-                resolved.resident.gate.acquire(label).pipe(
+            if (resolved._tag === "runtime") {
+              yield* restore(
+                resolved.runtime.state.acquire(label).pipe(
                   Effect.timeoutFail({
                     duration: options.retirementAdmissionTimeout ?? "10 seconds",
                     onTimeout: () =>
@@ -524,17 +368,17 @@ export const makeAgentRuntimeLive = (
                   }),
                 ),
               )
-              return [resolved.resident, release] as const
+              return publicRuntime(resolved.runtime)
             }
 
             const claim = resolved.claim
             if (claim._tag === "joiner") {
-              const resident = yield* restore(Deferred.await(claim.deferred))
+              const runtime = yield* restore(Deferred.await(claim.deferred))
               if ((yield* Ref.get(deletions)).has(request.sessionId)) {
                 return yield* deleting()
               }
-              const release = yield* restore(
-                resident.gate.acquire(label).pipe(
+              yield* restore(
+                runtime.state.acquire(label).pipe(
                   Effect.timeoutFail({
                     duration: options.retirementAdmissionTimeout ?? "10 seconds",
                     onTimeout: () =>
@@ -546,122 +390,63 @@ export const makeAgentRuntimeLive = (
                   }),
                 ),
               )
-              return [resident, release] as const
+              return publicRuntime(runtime)
             }
 
-            const result = yield* restore(startResident(request)).pipe(Effect.exit)
+            const result = yield* restore(startRuntime(request)).pipe(Effect.exit)
             if (Exit.isFailure(result)) {
               yield* Deferred.failCause(claim.deferred, result.cause)
               yield* clearStart(request.sessionId, claim.deferred)
               return yield* Effect.failCause(result.cause)
             }
 
-            const { resident, releaseStartup } = result.value
-            const release = yield* resident.gate.acquire(label).pipe(Effect.orDie)
-            yield* Deferred.succeed(claim.deferred, resident)
+            const runtime = result.value
+            yield* Deferred.succeed(claim.deferred, runtime)
             yield* clearStart(request.sessionId, claim.deferred)
-            yield* releaseStartup
-            return [resident, release] as const
+            yield* runtime.state.acquire(label)
+            return publicRuntime(runtime)
           }),
         )
 
-      const useResident = <A, E, R>(
-        resident: ResidentGeneration,
-        label: string,
-        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-      ): Effect.Effect<A, E | ResourceRetired, R> =>
-        resident.gate.withUse(
-          label,
-          use(resident.entry, resident.generation).pipe(Effect.ensuring(resident.reconcileWork)),
-        )
-
-      const withRequest = <A, E, R>(
+      const acquireSessionRequest = (
         request: RuntimeStartRequest,
         label: string,
-        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-      ): Effect.Effect<A, E | SessionError, R> =>
+      ): Effect.Effect<SessionRuntime, SessionError, Scope.Scope> =>
         Effect.suspend(() =>
-          acquireResident(request, label).pipe(
-            Effect.flatMap(([resident, release]) =>
-              use(resident.entry, resident.generation).pipe(
-                Effect.ensuring(resident.reconcileWork),
-                Effect.ensuring(release),
-              ),
-            ),
-            Effect.catchTag("ResourceRetired", () => withRequest(request, label, use)),
+          acquireRuntime(request, label).pipe(
+            Effect.catchTag("SessionRuntimeRetired", () =>
+              acquireSessionRequest(request, label)),
           ),
         )
 
-      const withSession = <A, E, R>(
+      const acquireSession = (
         sessionId: string,
         label: string,
-        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-      ): Effect.Effect<A, E | SessionError, R> =>
+      ): Effect.Effect<SessionRuntime, SessionError, Scope.Scope> =>
         requestForStoredSession(sessionId).pipe(
-          Effect.flatMap((request) => withRequest(request, label, use)),
+          Effect.flatMap((request) => acquireSessionRequest(request, label)),
         )
 
-      const withSessionWork = <A, E, R>(
+      const tryAcquireActiveSession = (
         sessionId: string,
         label: string,
-        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-      ): Effect.Effect<A, E | SessionError, R> =>
-        requestForStoredSession(sessionId).pipe(
-          Effect.flatMap((request) =>
-            Effect.suspend(() =>
-              acquireResident(request, label).pipe(
-                Effect.flatMap(([resident, release]) =>
-                  resident.withWorkAdmission(
-                    use(resident.entry, resident.generation),
-                  ).pipe(Effect.ensuring(release)),
-                ),
-                Effect.catchTag("ResourceRetired", () =>
-                  withSessionWork(sessionId, label, use),
-                ),
-              ),
-            ),
-          ),
-        )
-
-      const tryWithResident = <A, E, R>(
-        sessionId: string,
-        label: string,
-        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-      ): Effect.Effect<Option.Option<A>, E | SessionError, R> =>
+      ): Effect.Effect<Option.Option<SessionRuntime>, SessionError, Scope.Scope> =>
         Effect.suspend(() =>
           Effect.gen(function* () {
-            const resident = (yield* Ref.get(entries)).get(sessionId)
-            if (!resident) return Option.none<A>()
-            return yield* useResident(resident, label, use).pipe(
-              Effect.map(Option.some),
-              Effect.catchTag("ResourceRetired", () => tryWithResident(sessionId, label, use)),
-            )
-          }),
-        )
-
-      const tryWithBusyResident = <A, E, R>(
-        sessionId: string,
-        label: string,
-        use: (entry: RuntimeEntry, generation: number) => Effect.Effect<A, E, R>,
-      ): Effect.Effect<Option.Option<A>, E | SessionError, R> =>
-        Effect.suspend(() =>
-          Effect.gen(function* () {
-            const resident = (yield* Ref.get(entries)).get(sessionId)
-            if (!resident) return Option.none<A>()
-            return yield* resident.gate
-              .withBusyUse(label, use(resident.entry, resident.generation))
-              .pipe(
-                Effect.catchTag("ResourceRetired", () =>
-                  tryWithBusyResident(sessionId, label, use),
-                ),
+            const runtime = (yield* Ref.get(entries)).get(sessionId)
+            if (!runtime) return Option.none<SessionRuntime>()
+            return yield* runtime.state.acquireIfActive(label).pipe(
+              Effect.map(Option.map(() => publicRuntime(runtime))),
+              Effect.catchTag("SessionRuntimeRetired", () =>
+                tryAcquireActiveSession(sessionId, label)),
               )
           }),
         )
 
       retireGeneration = (sessionId, generation) => {
         const retire = Effect.gen(function* () {
-          const resident = (yield* Ref.get(entries)).get(sessionId)
-          if (!resident || resident.generation !== generation) return true
+          const runtime = (yield* Ref.get(entries)).get(sessionId)
+          if (!runtime || runtime.generation !== generation) return true
 
           const startedAt = Date.now()
           const setRetirementStage = (stage: SessionRetirementStage) =>
@@ -701,7 +486,7 @@ export const makeAgentRuntimeLive = (
 
           stageStartedAt = Date.now()
           yield* setRetirementStage("closing-runtime")
-          const closeExit = yield* Scope.close(resident.scope, Exit.void).pipe(Effect.exit)
+          const closeExit = yield* Scope.close(runtime.scope, Exit.void).pipe(Effect.exit)
           if (Exit.isFailure(closeExit)) {
             yield* Effect.logError("Session runtime scope failed to close").pipe(
               Effect.annotateLogs({
@@ -734,7 +519,7 @@ export const makeAgentRuntimeLive = (
           yield* logStage("removing-generation", stageStartedAt)
           if (removed) {
             yield* publishChange
-            yield* Effect.logInfo("Evicted idle session").pipe(
+            yield* Effect.logInfo("Unloaded idle session runtime").pipe(
               Effect.annotateLogs({ sessionId, generation }),
             )
           }
@@ -767,9 +552,9 @@ export const makeAgentRuntimeLive = (
       }
 
       const dispose = Effect.fn("acn.agent-runtime.dispose")(function* (sessionId: string) {
-        const resident = (yield* Ref.get(entries)).get(sessionId)
-        if (!resident) return
-        yield* resident.gate.retireNow("explicit-dispose")
+        const runtime = (yield* Ref.get(entries)).get(sessionId)
+        if (!runtime) return
+        yield* runtime.state.retireNow("explicit-dispose")
       })
 
       const deleteSession: AgentRuntimeApi["deleteSession"] = (sessionId, removeDurableState) =>
@@ -780,12 +565,12 @@ export const makeAgentRuntimeLive = (
               Ref.modify(
                 deletions,
                 (current): readonly [DeleteClaim, Map<string, DeleteDeferred>] => {
-                const existing = current.get(sessionId)
+                  const existing = current.get(sessionId)
                   if (existing) return [{ _tag: "joiner", deferred: existing }, current]
-                return [
+                  return [
                     { _tag: "owner", deferred: candidate },
-                  new Map(current).set(sessionId, candidate),
-                ] as const
+                    new Map(current).set(sessionId, candidate),
+                  ] as const
                 },
               ),
             )
@@ -810,27 +595,29 @@ export const makeAgentRuntimeLive = (
           }),
         )
       return {
-        withSession,
-        withSessionRequest: withRequest,
-        withSessionWork,
-        tryWithResident,
-        tryWithBusyResident,
-        residentSessions: Effect.gen(function* () {
-          const result: ResidentSessionSnapshot[] = []
-          for (const resident of (yield* Ref.get(entries)).values()) {
+        acquireSession,
+        acquireSessionRequest,
+        tryAcquireActiveSession,
+        sessionRuntimes: Effect.gen(function* () {
+          const result: SessionRuntimeSnapshot[] = []
+          for (const runtime of (yield* Ref.get(entries)).values()) {
+            const state = yield* runtime.state.snapshot
             result.push({
-              sessionId: resident.entry.id,
-              generation: resident.generation,
-              title: resident.entry.title,
-              cwd: resident.entry.cwd,
-              scratchpadPath: resident.entry.scratchpadPath,
-              createdAt: resident.entry.createdAt,
-              updatedAt: resident.entry.updatedAt,
-              residentSince: resident.residentSince,
-              workStatus: yield* Ref.get(resident.workStatus),
-              continuingWorkOwned: yield* resident.continuingWorkOwned,
-              gate: yield* resident.gate.snapshot,
-              retirement: (yield* Ref.get(retirements)).get(resident.entry.id) ?? null,
+              sessionId: runtime.entry.id,
+              generation: runtime.generation,
+              title: runtime.entry.title,
+              cwd: runtime.entry.cwd,
+              scratchpadPath: runtime.entry.scratchpadPath,
+              createdAt: runtime.entry.createdAt,
+              updatedAt: runtime.entry.updatedAt,
+              loadedAt: runtime.loadedAt,
+              workStatus: state.workStatus,
+              phase: state.phase,
+              scopedUseCount: state.scopedUseCount,
+              scopedUseLabels: state.scopedUseLabels,
+              idleSince: state.idleSince,
+              revision: state.revision,
+              retirement: (yield* Ref.get(retirements)).get(runtime.entry.id) ?? null,
             })
           }
           return result

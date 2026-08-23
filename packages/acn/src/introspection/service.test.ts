@@ -85,14 +85,12 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
       } satisfies RuntimeEntry
 
       const runtime: AgentRuntimeApi = {
-        withSession: (_sessionId, _label, use) => use(entry, 1),
-        withSessionWork: (_sessionId, _label, use) => use(entry, 1),
-        withSessionRequest: (_request, _label, use) => use(entry, 1),
-        tryWithResident: (sessionId, _label, use) =>
-          sessionId === entry.id ? use(entry, 1).pipe(Effect.map(Option.some)) : Effect.succeed(Option.none()),
-        tryWithBusyResident: (sessionId, _label, use) =>
-          sessionId === entry.id ? use(entry, 1).pipe(Effect.map(Option.some)) : Effect.succeed(Option.none()),
-        residentSessions: Effect.succeed([
+        acquireSession: () => Effect.succeed({ entry, generation: 1 }),
+        acquireSessionRequest: () => Effect.succeed({ entry, generation: 1 }),
+        tryAcquireActiveSession: (sessionId) => Effect.succeed(
+          sessionId === entry.id ? Option.some({ entry, generation: 1 }) : Option.none(),
+        ),
+        sessionRuntimes: Effect.succeed([
           {
             sessionId: entry.id,
             generation: 1,
@@ -101,18 +99,13 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
             scratchpadPath: entry.scratchpadPath,
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
-            residentSince: 1,
+            loadedAt: 1,
             workStatus: { _tag: "Working", workerCount: 0 },
-            continuingWorkOwned: true,
-            gate: {
-              resource: `session:${entry.id}`,
-              generation: 1,
-              phase: "open",
-              leaseCount: 0,
-              leaseLabels: [],
-              idleSince: null,
-              revision: 0,
-            },
+            phase: "open",
+            scopedUseCount: 0,
+            scopedUseLabels: [],
+            idleSince: null,
+            revision: 0,
             retirement: null,
           },
         ]),

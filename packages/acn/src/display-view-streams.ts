@@ -129,7 +129,7 @@ export const DisplayViewStreamsLive: Layer.Layer<DisplayViewStreams, never, Agen
         registration.serialize.withPermits(1)(detachUnlocked(registration, generation))
 
       /**
-       * Attaches the registration to the resident runtime generation (or
+       * Attaches the registration to the loaded runtime generation (or
        * refreshes an existing attachment): sets the agent view's shape, takes
        * a complete snapshot, publishes it, and returns it.
        */
@@ -210,13 +210,14 @@ export const DisplayViewStreamsLive: Layer.Layer<DisplayViewStreams, never, Agen
         registration.serialize.withPermits(1)(attachUnlocked(registration, entry, generation))
 
       const attachIfBusy = (registration: Registration) =>
-        runtime
-          .tryWithBusyResident(
+        Effect.scoped(Effect.gen(function* () {
+          const acquired = yield* runtime.tryAcquireActiveSession(
             registration.sessionId,
             `display-attach:${registration.viewId}`,
-            (entry, generation) => attach(registration, entry, generation),
           )
-          .pipe(Effect.asVoid)
+          if (Option.isNone(acquired)) return
+          yield* attach(registration, acquired.value.entry, acquired.value.generation)
+        }))
 
       const attachBusyRegistrations = Effect.gen(function* () {
         for (const registration of (yield* Ref.get(registrations)).values()) {
@@ -250,13 +251,13 @@ export const DisplayViewStreamsLive: Layer.Layer<DisplayViewStreams, never, Agen
           Effect.gen(function* () {
             const key = keyFor(registration.sessionId, registration.viewId)
             if ((yield* Ref.get(registrations)).get(key) !== registration) return
-            yield* runtime.withSession(
+            const acquired = yield* runtime.acquireSession(
               registration.sessionId,
               `display-materialize:${registration.viewId}`,
-              (entry, generation) => attachUnlocked(registration, entry, generation),
             )
+            yield* attachUnlocked(registration, acquired.entry, acquired.generation)
           }),
-        )
+        ).pipe(Effect.scoped)
 
       const stream = (
         sessionId: string,
@@ -289,11 +290,15 @@ export const DisplayViewStreamsLive: Layer.Layer<DisplayViewStreams, never, Agen
                   if ((yield* Ref.get(registrations)).get(keyFor(sessionId, viewId)) !== registration) {
                     return
                   }
-                  yield* runtime.tryWithBusyResident(
-                    sessionId,
-                    `display-close:${viewId}`,
-                    (entry) => entry.session.displayView.close(viewId),
-                  )
+                  yield* Effect.scoped(Effect.gen(function* () {
+                    const acquired = yield* runtime.tryAcquireActiveSession(
+                      sessionId,
+                      `display-close:${viewId}`,
+                    )
+                    if (Option.isSome(acquired)) {
+                      yield* acquired.value.entry.session.displayView.close(viewId)
+                    }
+                  }))
                   yield* detachUnlocked(registration)
                   yield* Ref.update(registrations, (all) => {
                     if (all.get(keyFor(sessionId, viewId)) !== registration) return all

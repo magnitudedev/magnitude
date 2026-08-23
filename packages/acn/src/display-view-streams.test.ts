@@ -126,32 +126,23 @@ const makeSetup = Effect.gen(function* () {
   yield* Ref.set(entry, yield* makeEntry("generation-1"))
 
   const runtime: AgentRuntimeApi = {
-    withSession: (_sessionId, _label, use) =>
+    acquireSession: () =>
       Effect.gen(function* () {
         yield* Ref.update(withSessionCalls, (count) => count + 1)
         const current = yield* Ref.get(entry)
         if (!current) return yield* Effect.die("missing fake resident")
         yield* Ref.set(busy, true)
-        return yield* use(current, yield* Ref.get(generation)).pipe(
-          Effect.ensuring(Ref.set(busy, false)),
-        )
+        yield* Effect.addFinalizer(() => Ref.set(busy, false))
+        return { entry: current, generation: yield* Ref.get(generation) }
       }),
-    withSessionWork: () => Effect.die("unused"),
-    withSessionRequest: () => Effect.die("unused"),
-    tryWithResident: (_sessionId, _label, use) =>
-      Effect.gen(function* () {
-        const current = yield* Ref.get(entry)
-        return current
-          ? Option.some(yield* use(current, yield* Ref.get(generation)))
-          : Option.none()
-      }),
-    tryWithBusyResident: (_sessionId, _label, use) =>
+    acquireSessionRequest: () => Effect.die("unused"),
+    tryAcquireActiveSession: () =>
       Effect.gen(function* () {
         const current = yield* Ref.get(entry)
         if (!current || !(yield* Ref.get(busy))) return Option.none()
-        return Option.some(yield* use(current, yield* Ref.get(generation)))
+        return Option.some({ entry: current, generation: yield* Ref.get(generation) })
       }),
-    residentSessions: Effect.succeed([]),
+    sessionRuntimes: Effect.succeed([]),
     dispose: () => Effect.void,
     deleteSession: (_sessionId, remove) => remove,
     registerRetirementObserver: (observer) =>

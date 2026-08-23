@@ -139,18 +139,13 @@ describe("SessionCommands", () => {
         )
 
         const runtime: AgentRuntimeApi = {
-          withSession: (sessionId, _label, use) =>
+          acquireSession: (sessionId) =>
             Ref.update(withSessionCalls, (count) => count + 1).pipe(
-              Effect.zipRight(use({ ...entry, id: sessionId }, 1)),
+              Effect.as({ entry: { ...entry, id: sessionId }, generation: 1 }),
             ),
-          withSessionWork: (sessionId, _label, use) =>
-            Ref.update(withSessionCalls, (count) => count + 1).pipe(
-              Effect.zipRight(use({ ...entry, id: sessionId }, 1)),
-            ),
-          withSessionRequest: () => Effect.die("unused"),
-          tryWithResident: () => Effect.succeed(Option.none()),
-          tryWithBusyResident: () => Effect.succeed(Option.none()),
-          residentSessions: Effect.succeed([]),
+          acquireSessionRequest: () => Effect.die("unused"),
+          tryAcquireActiveSession: () => Effect.succeed(Option.none()),
+          sessionRuntimes: Effect.succeed([]),
           dispose: () => Effect.void,
           deleteSession: (_sessionId, remove) => remove,
           registerRetirementObserver: () => Effect.succeed(Effect.void),
@@ -189,12 +184,10 @@ describe("SessionCommands", () => {
           root,
         )
         const runtime: AgentRuntimeApi = {
-          withSession: (_sessionId, _label, use) => use(entry, 1),
-          withSessionWork: (_sessionId, _label, use) => use(entry, 1),
-          withSessionRequest: () => Effect.die("unused"),
-          tryWithResident: () => Effect.succeed(Option.none()),
-          tryWithBusyResident: () => Effect.succeed(Option.none()),
-          residentSessions: Effect.succeed([]),
+          acquireSession: () => Effect.succeed({ entry, generation: 1 }),
+          acquireSessionRequest: () => Effect.die("unused"),
+          tryAcquireActiveSession: () => Effect.succeed(Option.none()),
+          sessionRuntimes: Effect.succeed([]),
           dispose: () => Effect.void,
           deleteSession: (_sessionId, remove) => remove,
           registerRetirementObserver: () => Effect.succeed(Effect.void),
@@ -238,12 +231,10 @@ describe("SessionCommands", () => {
           root,
         )
         const runtime: AgentRuntimeApi = {
-          withSession: (_sessionId, _label, use) => use(entry, 1),
-          withSessionWork: (_sessionId, _label, use) => use(entry, 1),
-          withSessionRequest: () => Effect.die("unused"),
-          tryWithResident: () => Effect.succeed(Option.none()),
-          tryWithBusyResident: () => Effect.succeed(Option.none()),
-          residentSessions: Effect.succeed([]),
+          acquireSession: () => Effect.succeed({ entry, generation: 1 }),
+          acquireSessionRequest: () => Effect.die("unused"),
+          tryAcquireActiveSession: () => Effect.succeed(Option.none()),
+          sessionRuntimes: Effect.succeed([]),
           dispose: () => Effect.void,
           deleteSession: (_sessionId, remove) => remove,
           registerRetirementObserver: () => Effect.succeed(Effect.void),

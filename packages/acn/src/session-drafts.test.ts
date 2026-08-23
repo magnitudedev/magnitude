@@ -92,10 +92,9 @@ const makeSetup = Effect.gen(function* () {
     } satisfies RuntimeEntry
   })
 
-  const withSessionRequest: AgentRuntimeApi["withSessionRequest"] = (
+  const acquireSessionRequest: AgentRuntimeApi["acquireSessionRequest"] = (
     request,
     _label,
-    use,
   ) =>
     serialize.withPermits(1)(
       Effect.gen(function* () {
@@ -113,23 +112,23 @@ const makeSetup = Effect.gen(function* () {
             makeMeta(request.sessionId, request.cwd, request.visibility),
           ).pipe(Effect.orDie)
         }
-        return yield* use(entry, 1)
+        return { entry, generation: 1 }
       }),
     )
 
   const runtime: AgentRuntimeApi = {
-    withSession: (sessionId, _label, use) =>
+    acquireSession: (sessionId) =>
       Ref.get(live).pipe(
         Effect.flatMap((all) => {
           const entry = all.get(sessionId)
-          return entry ? use(entry, 1) : Effect.die("missing fake session")
+          return entry
+            ? Effect.succeed({ entry, generation: 1 })
+            : Effect.die("missing fake session")
         }),
       ),
-    withSessionWork: () => Effect.die("unused"),
-    withSessionRequest,
-    tryWithResident: () => Effect.succeed(Option.none()),
-    tryWithBusyResident: () => Effect.succeed(Option.none()),
-    residentSessions: Effect.succeed([]),
+    acquireSessionRequest,
+    tryAcquireActiveSession: () => Effect.succeed(Option.none()),
+    sessionRuntimes: Effect.succeed([]),
     dispose: (sessionId) =>
       Ref.update(live, (all) => {
         const next = new Map(all)

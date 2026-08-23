@@ -60,8 +60,12 @@ export const SessionCommandsLive: Layer.Layer<
         })
       }
 
-      yield* runtime.withSessionWork(input.sessionId, "send-user-message", (entry) =>
+      yield* Effect.scoped(
         Effect.gen(function* () {
+          const { entry } = yield* runtime.acquireSession(
+            input.sessionId,
+            "send-user-message",
+          )
           const materialized = yield* materializeMessageUploads({
             scratchpadPath: entry.scratchpadPath,
             uploads: input.uploads,
@@ -122,32 +126,38 @@ export const SessionCommandsLive: Layer.Layer<
           reason: "Goal objective cannot be empty",
         })
       }
-      yield* runtime.withSessionWork(input.sessionId, "start-goal", (entry) =>
-        entry.session.send({
+      yield* Effect.scoped(Effect.gen(function* () {
+        const { entry } = yield* runtime.acquireSession(input.sessionId, "start-goal")
+        yield* entry.session.send({
           type: "goal_started",
           forkId: null,
           goalId: createId(),
           objective,
-        } satisfies AppEvent).pipe(Effect.uninterruptible),
-      )
+        } satisfies AppEvent).pipe(Effect.uninterruptible)
+      }))
     })
 
     return {
       sendUserMessage,
       startGoal,
       getRuntimeExecutionContext: (sessionId) =>
-        runtime.withSession(sessionId, "execution-context", (entry) =>
-          Effect.succeed({
+        Effect.scoped(Effect.gen(function* () {
+          const { entry } = yield* runtime.acquireSession(sessionId, "execution-context")
+          return {
             cwd: entry.cwd,
             projectRoot: entry.cwd,
             scratchpadPath: entry.scratchpadPath,
-          }),
-        ),
+          }
+        })),
       sendUserEvent: (sessionId, event) =>
-        runtime.withSession(sessionId, "send-user-event", (entry) => entry.session.send(event)),
+        Effect.scoped(Effect.gen(function* () {
+          const { entry } = yield* runtime.acquireSession(sessionId, "send-user-event")
+          yield* entry.session.send(event)
+        })),
       interrupt: (sessionId, target) =>
-        runtime.withSession(sessionId, "interrupt", (entry) =>
+        Effect.scoped(
           Effect.gen(function* () {
+            const { entry } = yield* runtime.acquireSession(sessionId, "interrupt")
             if (target._tag === "fork") {
               yield* entry.session.send({
                 type: "interrupt",
