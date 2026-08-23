@@ -14,14 +14,9 @@ import { Client, Key, Query, QueryClient, Subscription } from "./index.js"
 
 const sleep = (millis: number) => Effect.runPromise(Effect.sleep(`${millis} millis`))
 
+/** The QueryClient owned by this Client's runtime in this registry. */
 const queryClientFor = (client: Client.Client<never, never>, registry: Registry.Registry) =>
-  Effect.runSync(
-    QueryClient.QueryClient.pipe(
-      Effect.provide(QueryClient.makeLayer(client.query as QueryClient.Service["resolve"]).pipe(
-        Layer.provide(Layer.succeed(Registry.AtomRegistry, registry))
-      ))
-    )
-  )
+  Effect.runPromise(Registry.getResult(registry, client.runtime.atom(QueryClient.QueryClient)))
 
 describe("Key", () => {
   it("canonicalizes structurally equal values to one string", () => {
@@ -154,7 +149,7 @@ describe("Subscription", () => {
   it("is reconnected through the QueryClient by filter", async () => {
     const registry = Registry.make()
     const client = Client.make(Layer.empty)
-    const queryClient = queryClientFor(client, registry)
+    const queryClient = await queryClientFor(client, registry)
     let opened = 0
     const ticks = Subscription.make("ClientReconnect", {
       key: (_: void) => "client-reconnect",
@@ -229,7 +224,7 @@ describe("Query.fromStream", () => {
   it("reopens the stream on invalidation", async () => {
     const registry = Registry.make()
     const client = Client.make(Layer.empty)
-    const queryClient = queryClientFor(client, registry)
+    const queryClient = await queryClientFor(client, registry)
     let opened = 0
     const snapshots = Query.fromStream("Snapshots", {
       key: (_: void) => "snapshots",
@@ -256,7 +251,7 @@ describe("QueryClient", () => {
   it("invalidates by definition name", async () => {
     const registry = Registry.make()
     const client = Client.make(Layer.empty)
-    const queryClient = queryClientFor(client, registry)
+    const queryClient = await queryClientFor(client, registry)
     let fetches = 0
     const users = Query.make("NamedUsers", {
       key: ({ id }: { readonly id: string }) => Data.struct({ id }),

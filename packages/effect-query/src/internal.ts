@@ -2,13 +2,24 @@ import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
 import * as Cause from "effect/Cause"
+import * as Chunk from "effect/Chunk"
+import * as Clock from "effect/Clock"
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
+import * as Fiber from "effect/Fiber"
+import * as HashMap from "effect/HashMap"
+import * as HashSet from "effect/HashSet"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
+import * as Ref from "effect/Ref"
+import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
+import * as SynchronizedRef from "effect/SynchronizedRef"
 import {
   type AnyMutationState,
+  type MutationDefinition,
   type MutationState,
   type MutationStateId,
   type MutationScope,
@@ -22,10 +33,18 @@ import {
   type SubscriptionEntryState,
   type SubscriptionFilter
 } from "./Model.js"
+import type { Service as QueryClientService } from "./QueryClient.js"
 
 export const QueryEntryTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/QueryEntry")
 export const MutationInternalTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/MutationInternal")
 export const SubscriptionEntryTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/SubscriptionEntry")
+export const QueryCacheTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/QueryCache")
+
+/** The connection's query client. Declared here so materialized atoms can reach their owning cache. */
+export class QueryClient extends Context.Tag("@magnitudedev/effect-query/QueryClient")<
+  QueryClient,
+  QueryClientService
+>() {}
 
 export interface ErasedSubscriptionEntry {
   readonly stateAtom: Atom.Atom<SubscriptionEntryState>
@@ -63,14 +82,13 @@ export interface ErasedQueryEntry {
   ) => void
   readonly cancel: (registry: AtomRegistry.Registry) => void
   readonly invalidate: (registry: AtomRegistry.Registry) => void
-  readonly remove: (registry: AtomRegistry.Registry) => void
 }
 
 export interface QueryEntry<Data> extends ErasedQueryEntry {
   readonly setData: (
     registry: AtomRegistry.Registry,
     update: (current: Option.Option<Data>) => Data
-  ) => void
+  ) => Effect.Effect<void>
   readonly hasData: (registry: AtomRegistry.Registry) => boolean
   readonly getData: (registry: AtomRegistry.Registry) => Option.Option<Data>
 }
@@ -82,16 +100,11 @@ export interface QueryEntryCarrier<Data> {
 export const queryEntry = <Data>(carrier: QueryEntryCarrier<Data>): QueryEntry<Data> =>
   carrier[QueryEntryTypeId]
 
-export interface MutationInvocation<Output, Error> {
-  readonly id: MutationStateId
-  readonly await: Effect.Effect<Output, Error>
-}
-
 export interface MutationController<Input, Output, Error> {
-  readonly invoke: (
-    registry: AtomRegistry.Registry,
-    input: Input
-  ) => MutationInvocation<Output, Error>
+  /** Submit one invocation and return its id; the invocation runs in the owning cache's scope. */
+  readonly submit: (registry: AtomRegistry.Registry, input: Input) => MutationStateId
+  /** Resolve when the invocation's history entry is terminal, or fail if the runtime never built. */
+  readonly await: (registry: AtomRegistry.Registry, id: MutationStateId) => Effect.Effect<Output, Error>
 }
 
 export interface MutationControllerCarrier<Input, Output, Error> {
@@ -103,109 +116,220 @@ export const mutationController = <Input, Output, Error>(
 ): MutationController<Input, Output, Error> =>
   carrier[MutationInternalTypeId]
 
-export interface ClientCore {
-  readonly registry: AtomRegistry.Registry
-  readonly entries: Set<ErasedQueryEntry>
-  readonly definitions: Map<string, QueryDefinition>
-  readonly subscriptions: Set<ErasedSubscriptionEntry>
-  readonly subscriptionDefinitions: Map<string, SubscriptionDefinition>
-  readonly removed: Set<ErasedQueryEntry>
-  readonly mutationStates: Array<AnyMutationState>
-  readonly mutationScopes: Map<MutationScope, Effect.Semaphore>
-  readonly revision: Atom.Writable<number>
+/**
+ * The QueryClient's caches: retained query and subscription entries, mutation
+ * history, in-flight invocations, scope semaphores, and the client event bus.
+ * Built in the QueryClient layer's scope; every operation is a pure in-memory
+ * Effect that never touches the atom graph.
+ */
+export interface QueryCache {
+  readonly queries: SubscriptionRef.SubscriptionRef<HashSet.HashSet<ErasedQueryEntry>>
+  readonly subscriptions: SubscriptionRef.SubscriptionRef<HashSet.HashSet<ErasedSubscriptionEntry>>
+  readonly mutations: SubscriptionRef.SubscriptionRef<Chunk.Chunk<AnyMutationState>>
   readonly events: Stream.Stream<QueryClientEvent>
-  readonly emit: (event: QueryClientEvent) => void
-  readonly touch: () => void
+  readonly emit: (event: QueryClientEvent) => Effect.Effect<void>
+  readonly registerQuery: (entry: ErasedQueryEntry) => Effect.Effect<void>
+  readonly unregisterQuery: (entry: ErasedQueryEntry) => Effect.Effect<void>
+  /** Tombstone the entry and drop it from the cache; it stays out until restored. */
+  readonly removeQuery: (entry: ErasedQueryEntry) => Effect.Effect<void>
+  /** Clear the tombstone and re-add the entry. */
+  readonly restoreQuery: (entry: ErasedQueryEntry) => Effect.Effect<void>
+  /** Resolves once the entry has been removed. */
+  readonly awaitRemoval: (entry: ErasedQueryEntry) => Effect.Effect<void>
+  readonly registerSubscription: (entry: ErasedSubscriptionEntry) => Effect.Effect<void>
+  readonly unregisterSubscription: (entry: ErasedSubscriptionEntry) => Effect.Effect<void>
+  readonly addMutation: (state: AnyMutationState) => Effect.Effect<void>
+  readonly settleMutation: (
+    id: MutationStateId,
+    result: AtomResult.Result<unknown, unknown>
+  ) => Effect.Effect<void>
+  readonly forgetMutation: (id: MutationStateId) => Effect.Effect<void>
+  /** Resolves with the invocation's terminal state. */
+  readonly awaitMutation: (id: MutationStateId) => Effect.Effect<AnyMutationState>
+  /** Run one invocation as a fiber of the cache scope. */
+  readonly runInvocation: (
+    id: MutationStateId,
+    mutation: MutationDefinition,
+    effect: Effect.Effect<unknown, unknown>
+  ) => Effect.Effect<void>
+  readonly interruptInvocations: (mutation: MutationDefinition) => Effect.Effect<void>
+  readonly scopeSemaphore: (scope: MutationScope) => Effect.Effect<Effect.Semaphore>
 }
 
-const clients = new WeakMap<AtomRegistry.Registry, ClientCore>()
+const isTerminal = (result: AtomResult.Result<unknown, unknown>): boolean =>
+  result._tag !== "Initial" && !result.waiting
 
-export const getClientCore = (registry: AtomRegistry.Registry): ClientCore => {
-  const existing = clients.get(registry)
-  if (existing !== undefined) return existing
+interface Invocation {
+  readonly mutation: MutationDefinition
+  readonly fiber: Fiber.RuntimeFiber<unknown, unknown>
+}
 
-  const pubsub = Effect.runSync(PubSub.unbounded<QueryClientEvent>())
-  const revision = Atom.keepAlive(Atom.make(0))
-  // Entries register while an atom is being evaluated (possibly during a React
-  // render); the registry-wide revision therefore advances after the current
-  // evaluation, coalescing concurrent touches into one write.
-  let touchPending = false
-  const core: ClientCore = {
-    registry,
-    entries: new Set(),
-    definitions: new Map(),
-    subscriptions: new Set(),
-    subscriptionDefinitions: new Map(),
-    removed: new Set(),
-    mutationStates: [],
-    mutationScopes: new Map(),
-    revision,
-    events: Stream.fromPubSub(pubsub),
-    emit: (event) => {
-      Effect.runSync(PubSub.publish(pubsub, event))
-    },
-    touch: () => {
-      if (touchPending) return
-      touchPending = true
-      queueMicrotask(() => {
-        touchPending = false
-        // Nothing observes the revision until something read it; a disposed
-        // registry has no nodes at all.
-        if (registry.getNodes().has(revision)) registry.update(revision, (value) => value + 1)
+export const makeQueryCache: Effect.Effect<QueryCache, never, Scope.Scope> = Effect.gen(function*() {
+  const scope = yield* Effect.scope
+  const queries = yield* SubscriptionRef.make(HashSet.empty<ErasedQueryEntry>())
+  const subscriptions = yield* SubscriptionRef.make(HashSet.empty<ErasedSubscriptionEntry>())
+  const mutations = yield* SubscriptionRef.make(Chunk.empty<AnyMutationState>())
+  const tombstones = yield* SubscriptionRef.make(HashSet.empty<ErasedQueryEntry>())
+  const queryDefinitions = yield* Ref.make(HashMap.empty<string, QueryDefinition>())
+  const subscriptionDefinitions = yield* Ref.make(HashMap.empty<string, SubscriptionDefinition>())
+  const invocations = yield* Ref.make(HashMap.empty<MutationStateId, Invocation>())
+  const scopes = yield* SynchronizedRef.make(HashMap.empty<MutationScope, Effect.Semaphore>())
+  const pubsub = yield* Effect.acquireRelease(PubSub.unbounded<QueryClientEvent>(), PubSub.shutdown)
+
+  const emit = (event: QueryClientEvent): Effect.Effect<void> => PubSub.publish(pubsub, event).pipe(Effect.asVoid)
+
+  const registerQuery = (entry: ErasedQueryEntry): Effect.Effect<void> => Effect.gen(function*() {
+    if (HashSet.has(yield* SubscriptionRef.get(tombstones), entry)) return
+    const conflicting = HashMap.get(yield* Ref.get(queryDefinitions), entry.name)
+    if (Option.isSome(conflicting) && conflicting.value !== entry.definition) {
+      return yield* Effect.die(new Error(`Duplicate query definition name: ${entry.name}`))
+    }
+    yield* Ref.update(queryDefinitions, HashMap.set(entry.name, entry.definition))
+    const added = yield* SubscriptionRef.modify(queries, (current) =>
+      HashSet.has(current, entry) ? [false, current] : [true, HashSet.add(current, entry)])
+    if (added) yield* emit({ _tag: "QueryCreated", name: entry.name, keyHash: entry.keyHash })
+  })
+
+  const unregisterQuery = (entry: ErasedQueryEntry): Effect.Effect<void> => Effect.gen(function*() {
+    const remaining = yield* SubscriptionRef.modify(queries, (current) => {
+      if (!HashSet.has(current, entry)) return [Option.none<HashSet.HashSet<ErasedQueryEntry>>(), current]
+      const next = HashSet.remove(current, entry)
+      return [Option.some(next), next]
+    })
+    if (Option.isNone(remaining)) return
+    if (!HashSet.some(remaining.value, (candidate) => candidate.definition === entry.definition)) {
+      yield* Ref.update(queryDefinitions, HashMap.remove(entry.name))
+    }
+    yield* emit({ _tag: "QueryRemoved", name: entry.name, keyHash: entry.keyHash })
+  })
+
+  const removeQuery = (entry: ErasedQueryEntry): Effect.Effect<void> =>
+    SubscriptionRef.update(tombstones, HashSet.add(entry)).pipe(
+      Effect.zipRight(SubscriptionRef.update(queries, HashSet.remove(entry)))
+    )
+
+  const restoreQuery = (entry: ErasedQueryEntry): Effect.Effect<void> =>
+    SubscriptionRef.update(tombstones, HashSet.remove(entry)).pipe(Effect.zipRight(registerQuery(entry)))
+
+  const awaitRemoval = (entry: ErasedQueryEntry): Effect.Effect<void> =>
+    tombstones.changes.pipe(
+      Stream.filter((current) => HashSet.has(current, entry)),
+      Stream.runHead,
+      Effect.asVoid
+    )
+
+  const registerSubscription = (entry: ErasedSubscriptionEntry): Effect.Effect<void> => Effect.gen(function*() {
+    const conflicting = HashMap.get(yield* Ref.get(subscriptionDefinitions), entry.name)
+    if (Option.isSome(conflicting) && conflicting.value !== entry.definition) {
+      return yield* Effect.die(new Error(`Duplicate subscription definition name: ${entry.name}`))
+    }
+    yield* Ref.update(subscriptionDefinitions, HashMap.set(entry.name, entry.definition))
+    yield* SubscriptionRef.update(subscriptions, HashSet.add(entry))
+  })
+
+  const unregisterSubscription = (entry: ErasedSubscriptionEntry): Effect.Effect<void> => Effect.gen(function*() {
+    const remaining = yield* SubscriptionRef.modify(subscriptions, (current) => {
+      const next = HashSet.remove(current, entry)
+      return [next, next]
+    })
+    if (!HashSet.some(remaining, (candidate) => candidate.definition === entry.definition)) {
+      yield* Ref.update(subscriptionDefinitions, HashMap.remove(entry.name))
+    }
+  })
+
+  const addMutation = (state: AnyMutationState): Effect.Effect<void> =>
+    SubscriptionRef.update(mutations, Chunk.append(state))
+
+  const settleMutation = (
+    id: MutationStateId,
+    result: AtomResult.Result<unknown, unknown>
+  ): Effect.Effect<void> => Effect.gen(function*() {
+    const now = yield* Clock.currentTimeMillis
+    const terminal = isTerminal(result)
+    const previous = yield* SubscriptionRef.modify(mutations, (current) => {
+      const index = Chunk.findFirstIndex(current, (state) => state.id === id)
+      if (Option.isNone(index)) return [Option.none<AnyMutationState>(), current]
+      const state = Chunk.unsafeGet(current, index.value)
+      const next: AnyMutationState = {
+        ...state,
+        result,
+        settledAt: terminal ? Option.some(now) : Option.none()
+      }
+      return [Option.some(state), Chunk.replace(current, index.value, next)]
+    })
+    if (Option.isSome(previous) && terminal) {
+      yield* emit({
+        _tag: "MutationSettled",
+        name: previous.value.mutation.name,
+        id,
+        success: result._tag === "Success"
       })
     }
-  }
-  clients.set(registry, core)
-  return core
-}
+  })
 
-export const registerEntry = (registry: AtomRegistry.Registry, entry: ErasedQueryEntry): (() => void) => {
-  const core = getClientCore(registry)
-  if (core.removed.has(entry)) return () => {}
-  const conflicting = core.definitions.get(entry.name)
-  if (conflicting !== undefined && conflicting !== entry.definition) {
-    throw new Error(`Duplicate query definition name: ${entry.name}`)
-  }
-  core.definitions.set(entry.name, entry.definition)
-  if (!core.entries.has(entry)) {
-    core.entries.add(entry)
-    core.emit({ _tag: "QueryCreated", name: entry.name, keyHash: entry.keyHash })
-    core.touch()
-  }
-  return () => {
-    queueMicrotask(() => {
-      if (registry.getNodes().has(entry.stateAtom) || !core.entries.delete(entry)) return
-      if (![...core.entries].some((candidate) => candidate.definition === entry.definition)) {
-        core.definitions.delete(entry.name)
-      }
-      core.emit({ _tag: "QueryRemoved", name: entry.name, keyHash: entry.keyHash })
-    })
-  }
-}
+  const forgetMutation = (id: MutationStateId): Effect.Effect<void> =>
+    SubscriptionRef.update(mutations, Chunk.filter((state) => state.id !== id))
 
-export const registerSubscriptionEntry = (
-  registry: AtomRegistry.Registry,
-  entry: ErasedSubscriptionEntry
-): (() => void) => {
-  const core = getClientCore(registry)
-  const conflicting = core.subscriptionDefinitions.get(entry.name)
-  if (conflicting !== undefined && conflicting !== entry.definition) {
-    throw new Error(`Duplicate subscription definition name: ${entry.name}`)
+  const awaitMutation = (id: MutationStateId): Effect.Effect<AnyMutationState> =>
+    mutations.changes.pipe(
+      Stream.filterMap(Chunk.findFirst((state) => state.id === id && isTerminal(state.result))),
+      Stream.runHead,
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.dieMessage(`Mutation ${id}: history closed before the invocation settled`),
+        onSome: Effect.succeed
+      }))
+    )
+
+  const runInvocation = (
+    id: MutationStateId,
+    mutation: MutationDefinition,
+    effect: Effect.Effect<unknown, unknown>
+  ): Effect.Effect<void> => Effect.gen(function*() {
+    const fiber = yield* Effect.forkIn(
+      effect.pipe(Effect.ensuring(Ref.update(invocations, HashMap.remove(id)))),
+      scope
+    )
+    yield* Ref.update(invocations, HashMap.set(id, { mutation, fiber }))
+  })
+
+  const interruptInvocations = (mutation: MutationDefinition): Effect.Effect<void> =>
+    Ref.get(invocations).pipe(
+      Effect.flatMap((current) => Effect.forEach(
+        HashMap.values(current),
+        (invocation) => invocation.mutation === mutation ? Fiber.interruptFork(invocation.fiber) : Effect.void,
+        { discard: true }
+      ))
+    )
+
+  const scopeSemaphore = (key: MutationScope): Effect.Effect<Effect.Semaphore> =>
+    SynchronizedRef.modifyEffect(scopes, (current) => Option.match(HashMap.get(current, key), {
+      onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+      onNone: () => Effect.map(Effect.makeSemaphore(1), (semaphore) =>
+        [semaphore, HashMap.set(current, key, semaphore)] as const)
+    }))
+
+  return {
+    queries,
+    subscriptions,
+    mutations,
+    events: Stream.fromPubSub(pubsub),
+    emit,
+    registerQuery,
+    unregisterQuery,
+    removeQuery,
+    restoreQuery,
+    awaitRemoval,
+    registerSubscription,
+    unregisterSubscription,
+    addMutation,
+    settleMutation,
+    forgetMutation,
+    awaitMutation,
+    runInvocation,
+    interruptInvocations,
+    scopeSemaphore
   }
-  core.subscriptionDefinitions.set(entry.name, entry.definition)
-  if (!core.subscriptions.has(entry)) {
-    core.subscriptions.add(entry)
-    core.touch()
-  }
-  return () => {
-    queueMicrotask(() => {
-      if (registry.getNodes().has(entry.stateAtom) || !core.subscriptions.delete(entry)) return
-      if (![...core.subscriptions].some((candidate) => candidate.definition === entry.definition)) {
-        core.subscriptionDefinitions.delete(entry.name)
-      }
-    })
-  }
-}
+})
 
 export const subscriptionMatches = (
   entry: ErasedSubscriptionEntry,
@@ -255,38 +379,6 @@ export const mutationMatches = (state: AnyMutationState, filter: MutationFilter 
   if (filter.scope !== undefined && !Option.contains(state.scope, filter.scope)) return false
   if (filter.status !== undefined && filter.status !== mutationStatus(state)) return false
   return filter.predicate?.(state) ?? true
-}
-
-export const addMutationState = <Input, Output, Error>(
-  core: ClientCore,
-  state: MutationState<Input, Output, Error>
-): void => {
-  core.mutationStates.push(state)
-  core.touch()
-}
-
-export const settleMutationState = <Output, Error>(
-  core: ClientCore,
-  id: MutationStateId,
-  result: AtomResult.Result<Output, Error>
-): void => {
-  const index = core.mutationStates.findIndex((state) => state.id === id)
-  if (index < 0) return
-  const previous = core.mutationStates[index]
-  core.mutationStates[index] = {
-    ...previous,
-    result,
-    settledAt: result.waiting || result._tag === "Initial" ? Option.none() : Option.some(Date.now())
-  }
-  if (!result.waiting && result._tag !== "Initial") {
-    core.emit({
-      _tag: "MutationSettled",
-      name: previous.mutation.name,
-      id,
-      success: result._tag === "Success"
-    })
-  }
-  core.touch()
 }
 
 export type {

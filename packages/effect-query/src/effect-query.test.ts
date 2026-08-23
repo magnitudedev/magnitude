@@ -16,17 +16,14 @@ import * as Schedule from "effect/Schedule"
 import { describe, expect, expectTypeOf, it } from "vitest"
 import { Client, Mutation, Query, QueryClient } from "./index.js"
 
-const clientFor = (registry: Registry.Registry): QueryClient.Service => Effect.runSync(
-  QueryClient.QueryClient.pipe(
-    Effect.provide(
-      QueryClient.makeLayer(() => {
-        throw new Error("not used by low-level service tests")
-      }).pipe(
-        Layer.provide(Layer.succeed(Registry.AtomRegistry, registry))
-      )
-    )
-  )
-)
+/** The QueryClient owned by this Client's runtime in this registry. */
+const clientFor = (
+  registry: Registry.Registry,
+  effectQuery: Client.Client<never, never>
+): Promise<QueryClient.Service> =>
+  Effect.runPromise(Registry.getResult(registry, effectQuery.runtime.atom(QueryClient.QueryClient)))
+
+const provideClient = (client: QueryClient.Service) => Effect.provideService(QueryClient.QueryClient, client)
 
 describe("Client", () => {
   it("acquires additional services once and releases them with the Atom registry", async () => {
@@ -96,8 +93,8 @@ describe("Query", () => {
 
   it("uses one canonical atom and shares its in-flight fetch", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const users = Query.make("User", {
       key: ({ id }: { readonly id: string }) => Data.struct({ id }),
@@ -123,8 +120,8 @@ describe("Query", () => {
 
   it("retains the complete query entry across observer-free remounts", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("Remounted", {
       key: () => Data.struct({ singleton: true }),
@@ -150,8 +147,8 @@ describe("Query", () => {
 
   it("returns retained fresh data from fetch without executing again", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("FreshFetch", {
       key: () => Data.struct({ singleton: true }),
@@ -169,8 +166,8 @@ describe("Query", () => {
 
   it("does not prefetch retained fresh data again", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("FreshPrefetch", {
       key: () => Data.struct({ singleton: true }),
@@ -188,8 +185,8 @@ describe("Query", () => {
 
   it("does not execute again when switching between selector observers", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("SelectorSwitch", {
       key: () => Data.struct({ singleton: true }),
@@ -242,8 +239,8 @@ describe("Query", () => {
 
   it("collects the complete query entry when gcTime expires", async () => {
     const registry = Registry.make({ timeoutResolution: 1 })
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("Expired", {
       key: () => Data.struct({ singleton: true }),
@@ -302,8 +299,8 @@ describe("Query", () => {
 
   it("retains successful data during background refetch failure", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let succeeds = true
     const query = Query.make("Retained", {
       key: () => Data.struct({ singleton: true }),
@@ -324,8 +321,8 @@ describe("Query", () => {
 
   it("uses the definition retry schedule without widening errors", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("Retry", {
       key: () => Data.struct({ singleton: true }),
@@ -340,8 +337,8 @@ describe("Query", () => {
 
   it("select derives state without creating another query entry", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const query = Query.make("Selectable", {
       key: () => Data.struct({ singleton: true }),
       effect: () => Effect.succeed({ title: "hello", ignored: true })
@@ -370,8 +367,8 @@ describe("Query", () => {
 
   it("lets authoritative fetches replace data written through setData", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let server = 1
     const query = Query.make("SetData", {
       key: () => Data.struct({ singleton: true }),
@@ -390,8 +387,8 @@ describe("Query", () => {
 
   it("supersedes a fetch invalidated while it is in flight", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const first = Effect.runSync(Deferred.make<number>())
     const second = Effect.runSync(Deferred.make<number>())
     let calls = 0
@@ -414,10 +411,10 @@ describe("Query", () => {
     registry.dispose()
   })
 
-  it("coalesces repeated invalidations while a replacement fetch is active", async () => {
+  it("coalesces repeated invalidations during a replacement fetch into one trailing refetch", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const first = Effect.runSync(Deferred.make<number>())
     const replacement = Effect.runSync(Deferred.make<number>())
     let calls = 0
@@ -434,19 +431,26 @@ describe("Query", () => {
       Array.from({ length: 25 }, () => client.invalidate(query.match())),
       { concurrency: "unbounded" }
     ))
+    // The first invalidation replaces the active fetch; the other 24 coalesce.
+    expect(calls).toBe(2)
     await Effect.runPromise(Deferred.succeed(first, 1))
     await Effect.runPromise(Deferred.succeed(replacement, 2))
 
     expect(await Effect.runPromise(Fiber.join(waiter))).toBe(2)
-    expect(calls).toBe(2)
-    expect(AtomResult.value(registry.get(atom).result)).toEqual(Option.some(2))
+    // Invalidations that arrived during the replacement cause exactly one trailing refetch,
+    // after which the entry is fresh again.
+    await Effect.runPromise(Effect.sleep("1 millis"))
+    expect(calls).toBe(3)
+    const state = registry.get(atom)
+    expect(AtomResult.value(state.result)).toEqual(Option.some(2))
+    expect(state.isStale).toBe(false)
     registry.dispose()
   })
 
   it("awaits the replacement when fetching an invalidated active query", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const first = Effect.runSync(Deferred.make<number>())
     const replacement = Effect.runSync(Deferred.make<number>())
     let calls = 0
@@ -476,8 +480,8 @@ describe("Query", () => {
 
   it("fetches an unobserved query once after invalidation", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("UnobservedRefetch", {
       key: () => Data.struct({ singleton: true }),
@@ -493,8 +497,8 @@ describe("Query", () => {
 
   it("does not materialize an unobserved query when a notification invalidates its key", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const query = Query.make("RemoteNotification", {
       key: (id: string) => Data.tuple(id),
@@ -514,8 +518,8 @@ describe("Query", () => {
 
   it("exposes reactive aggregate fetch state", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const pending = Effect.runSync(Deferred.make<number>())
     const query = Query.make("Fetching", {
       key: () => Data.struct({ singleton: true }),
@@ -535,8 +539,8 @@ describe("Query", () => {
 
   it("cancellation restores retained data and pauses the entry", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const pending = Effect.runSync(Deferred.make<number>())
     let calls = 0
     const query = Query.make("Cancellation", {
@@ -576,8 +580,8 @@ describe("Query", () => {
 
   it("lets Atom registry collection remove the client index entry", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const query = Query.make("Collected", {
       key: () => Data.struct({ singleton: true }),
       effect: () => Effect.succeed(1),
@@ -595,8 +599,8 @@ describe("Query", () => {
 describe("Mutation", () => {
   it("indexes mutation states and distinguishes synchronization failure", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const mutation = Mutation.make("Rename", {
       effect: (name: string) => Effect.succeed(name.toUpperCase()),
       synchronize: () => Effect.fail("not-visible" as const)
@@ -627,13 +631,14 @@ describe("Mutation", () => {
   it("keeps mutation state pending until synchronization completes", async () => {
     const registry = Registry.make()
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const synchronized = Effect.runSync(Deferred.make<void>())
     const mutation = Mutation.make("SynchronizedMutation", {
       effect: (input: string) => Effect.succeed(input.toUpperCase()),
       synchronize: () => Deferred.await(synchronized),
     })
     const mutationAtom = effectQuery.mutation(mutation)
-    const mutatingState = Mutation.isMutating({ mutation })
+    const mutatingState = Effect.runSync(Mutation.isMutating({ mutation }).pipe(provideClient(client)))
     const fiber = Effect.runFork(Mutation.execute(mutationAtom, "ready").pipe(
       Effect.provideService(Registry.AtomRegistry, registry),
     ))
@@ -743,6 +748,7 @@ describe("Mutation", () => {
   it("selects typed mutation states by semantic scope and pending status", async () => {
     const registry = Registry.make()
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     const first = Effect.runSync(Deferred.make<string>())
     const second = Effect.runSync(Deferred.make<string>())
     const mutation = Mutation.make("ScopedSelectors", {
@@ -752,14 +758,16 @@ describe("Mutation", () => {
     })
     const mutationAtom = effectQuery.mutation(mutation)
     const firstScope = Mutation.MutationScope("item:first")
-    const firstMutationStates = Mutation.state({
+    const firstMutationStates = Effect.runSync(Mutation.state({
       filters: { mutation, scope: firstScope },
-    })
-    const firstInputsState = Mutation.state({
+    }).pipe(provideClient(client)))
+    const firstInputsState = Effect.runSync(Mutation.state({
       filters: { mutation, scope: firstScope },
       select: ({ input }) => input.id,
-    })
-    const firstMutatingState = Mutation.isMutating({ mutation, scope: firstScope })
+    }).pipe(provideClient(client)))
+    const firstMutatingState = Effect.runSync(
+      Mutation.isMutating({ mutation, scope: firstScope }).pipe(provideClient(client))
+    )
 
     const firstInput: Mutation.Input<typeof mutation> = { id: "first" }
     const secondInput: Mutation.Input<typeof mutation> = { id: "second" }
@@ -778,7 +786,7 @@ describe("Mutation", () => {
     Effect.runSync(Deferred.succeed(first, "FIRST"))
     await Effect.runPromise(Fiber.join(firstFiber))
     expect(registry.get(firstMutatingState)).toBe(0)
-    expect(registry.get(Mutation.isMutating({ mutation }))).toBe(1)
+    expect(registry.get(Effect.runSync(Mutation.isMutating({ mutation }).pipe(provideClient(client))))).toBe(1)
 
     Effect.runSync(Deferred.succeed(second, "SECOND"))
     await Effect.runPromise(Fiber.join(secondFiber))
@@ -812,8 +820,8 @@ describe("Mutation", () => {
 
   it("retries commands and collects settled mutation states", async () => {
     const registry = Registry.make()
-    const client = clientFor(registry)
     const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
     let calls = 0
     const mutation = Mutation.make("RetryingMutation", {
       effect: () => ++calls === 1 ? Effect.fail("transient" as const) : Effect.succeed("done"),

@@ -1,5 +1,6 @@
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
+import * as AtomResult from "@effect-atom/atom/Result"
 import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Cause from "effect/Cause"
 import * as EffectData from "effect/Data"
@@ -13,7 +14,8 @@ import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import {
-  registerSubscriptionEntry,
+  QueryCacheTypeId,
+  QueryClient,
   SubscriptionEntryTypeId,
   subscriptionEntry,
   type SubscriptionEntry,
@@ -117,11 +119,6 @@ interface Control {
   readonly closed: boolean
 }
 
-/** A real asynchronous boundary: continues in a microtask, after the registry finished evaluating. */
-const afterEvaluation: Effect.Effect<void> = Effect.async<void>((resume) => {
-  queueMicrotask(() => resume(Effect.void))
-})
-
 export function make<Input, Event, Error, Requirements>(
   name: string,
   options: Options<Input, Event, Error, Requirements>
@@ -183,7 +180,7 @@ export function make(
 }
 
 export const makeAtomFamily = <Provided, RuntimeError, Input, Event, Error, Required extends Provided | Reactivity.Reactivity>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  runtime: Atom.AtomRuntime<Provided | QueryClient, RuntimeError>,
   definition: Subscription<Input, Event, Error, Required>
 ): ((input: Input) => SubscriptionAtom<Input, Event, Error | RuntimeError, Required>) => {
   const { name } = definition
@@ -209,67 +206,94 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Event, Error, Requ
       failure: Option.none(),
       attempt: 0
     }
-    const state = retain(Atom.make<PublicState>(initialState))
     const control = retain(Atom.make<Control>({ generation: 0, closed: false }))
     const pubsub = Effect.runSync(PubSub.unbounded<Event>())
 
+    /**
+     * The subscription's lifecycle as a stream of public states: connecting,
+     * active per event, reconnecting per failure (driven by the reconnect
+     * schedule), failed when that schedule is exhausted or the source dies,
+     * completed when the source ends, idle when closed. Elements are applied to
+     * the graph by the atom runtime; nothing here writes atoms.
+     */
     const runner = retain(runtime.atom((get) => {
       const { closed } = get(control)
-      const registry = get.registry
-      const update = (f: (current: PublicState) => PublicState) => Effect.sync(() => {
-        if (!registry.getNodes().has(state)) return
-        registry.update(state, f)
-      })
-      // Atom state is never written while this atom is being evaluated: every
-      // update below runs after `afterEvaluation`, outside the registry's
-      // synchronous evaluation (a yield alone is drained synchronously).
-      if (closed) return afterEvaluation.pipe(Effect.zipRight(update((current) => ({ ...current, status: "idle" }))))
-      const attempt = Effect.suspend(() =>
-        update((current) => ({
-          ...current,
-          status: current.attempt === 0 ? "connecting" : "reconnecting",
-          attempt: current.attempt + 1
-        })).pipe(
-          Effect.zipRight(options.stream(canonicalInput).pipe(
-            Stream.runForEach((event) => PubSub.publish(pubsub, event).pipe(
-              Effect.zipRight(update((current) => ({
-                ...current,
-                status: "active",
-                latest: Option.some(event),
-                failure: Option.none()
-              })))
-            ))
-          ))
+      if (closed) return Stream.succeed<PublicState>(initialState)
+      const attempt = (
+        driver: Schedule.ScheduleDriver<unknown, Error, never>,
+        index: number,
+        latest: Option.Option<Event>
+      ): Stream.Stream<PublicState, never, Required> => {
+        let seen = latest
+        const opening: PublicState = {
+          status: index === 0 ? "connecting" : "reconnecting",
+          latest,
+          failure: Option.none(),
+          attempt: index + 1
+        }
+        const events: Stream.Stream<PublicState, Error, Required> = options.stream(canonicalInput).pipe(
+          Stream.mapEffect((event) => Effect.map(PubSub.publish(pubsub, event), (): PublicState => {
+            seen = Option.some(event)
+            return { status: "active", latest: seen, failure: Option.none(), attempt: index + 1 }
+          }))
         )
-      )
-      return afterEvaluation.pipe(
-        Effect.zipRight(attempt),
-        Effect.tapErrorCause((cause) => update((current) => ({
-          ...current,
-          status: "reconnecting",
-          failure: Option.some(cause)
-        }))),
-        Effect.retry(reconnect),
-        Effect.matchCauseEffect({
-          onFailure: (cause) => Cause.isInterruptedOnly(cause)
-            ? Effect.void
-            : update((current) => ({ ...current, status: "failed", failure: Option.some(cause) })),
-          onSuccess: () => update((current) => ({ ...current, status: "completed" }))
-        })
-      )
+        const completed = Stream.unwrap(Effect.sync(() => Stream.succeed<PublicState>({
+          status: "completed",
+          latest: seen,
+          failure: Option.none(),
+          attempt: index + 1
+        })))
+        return Stream.concat(Stream.succeed(opening), Stream.concat(events, completed)).pipe(
+          Stream.catchAllCause((cause): Stream.Stream<PublicState, never, Required> => {
+            if (Cause.isInterruptedOnly(cause)) return Stream.empty
+            const failed = Stream.succeed<PublicState>({
+              status: "failed",
+              latest: seen,
+              failure: Option.some(cause),
+              attempt: index + 1
+            })
+            return Option.match(Cause.failureOption(cause), {
+              onNone: () => failed,
+              onSome: (error) => Stream.concat(
+                Stream.succeed<PublicState>({
+                  status: "reconnecting",
+                  latest: seen,
+                  failure: Option.some(cause),
+                  attempt: index + 1
+                }),
+                Stream.unwrap(driver.next(error).pipe(
+                  Effect.map(() => attempt(driver, index + 1, seen)),
+                  Effect.catchAll(() => Effect.succeed(failed))
+                ))
+              )
+            })
+          })
+        )
+      }
+      return Stream.unwrap(Effect.map(Schedule.driver(reconnect), (driver) => attempt(driver, 0, Option.none())))
     }))
 
     let entry!: SubscriptionEntry<Event>
+    // Cache membership lasts exactly as long as this node (see Query.ts).
+    const registration = Atom.setIdleTTL(
+      runtime.atom(Effect.gen(function*() {
+        const cache = (yield* QueryClient)[QueryCacheTypeId]
+        yield* Effect.acquireRelease(cache.registerSubscription(entry), () => cache.unregisterSubscription(entry))
+      })),
+      0
+    )
     let atom = Atom.writable<PublicState, Atom.Reset | Atom.Interrupt>(
       (get) => {
-        const unregister = registerSubscriptionEntry(get.registry, entry)
-        get.addFinalizer(unregister)
-        const current = get(state)
+        const registered = get(registration)
+        if (registered._tag === "Failure") throw Cause.squash(registered.cause)
         const run = get(runner)
-        if (run._tag === "Failure" && !run.waiting) {
-          return EffectData.struct<PublicState>({ ...current, status: "failed", failure: Option.some(run.cause) })
+        const previous: PublicState = Option.getOrElse(get.self<PublicState>(), () => initialState)
+        if (run._tag === "Failure" && !run.waiting && !Cause.isInterruptedOnly(run.cause)) {
+          const failed: PublicState = { ...previous, status: "failed", failure: Option.some(run.cause) }
+          return EffectData.struct(failed)
         }
-        return EffectData.struct(current)
+        const state: PublicState = Option.getOrElse(AtomResult.value(run), () => previous)
+        return EffectData.struct(state)
       },
       (ctx, value) => {
         const current = ctx.get(control)
