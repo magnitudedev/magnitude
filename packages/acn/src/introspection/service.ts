@@ -27,32 +27,6 @@ export class AcnIntrospector extends Context.Tag("AcnIntrospector")<
   AcnIntrospectorApi
 >() {}
 
-const runtimeEntryToSession = (entry: {
-  readonly sessionId: string
-  readonly title: string
-  readonly cwd: string
-  readonly scratchpadPath: string
-  readonly createdAt: number
-  readonly updatedAt: number
-  readonly generation: number
-  readonly residentSince: number
-  readonly gate: AcnIntrospectionSession["gate"]
-  readonly retirement: AcnIntrospectionSession["retirement"]
-  readonly continuingWorkOwned: boolean
-}): AcnIntrospectionSession => ({
-  sessionId: entry.sessionId,
-  title: entry.title,
-  cwd: entry.cwd,
-  scratchpadPath: entry.scratchpadPath,
-  createdAt: entry.createdAt,
-  updatedAt: entry.updatedAt,
-  generation: entry.generation,
-  residentSince: entry.residentSince,
-  gate: entry.gate,
-  retirement: entry.retirement,
-  continuingWorkOwned: entry.continuingWorkOwned,
-})
-
 const introspectionFailure = (sessionId: string, cause: unknown) =>
   new SessionOperationFailed({
     operation: "AcnIntrospector.currentSession",
@@ -87,7 +61,7 @@ export const AcnIntrospectorLive: Layer.Layer<
     ) =>
       Effect.gen(function* () {
         return {
-          schemaVersion: 2,
+          schemaVersion: 3,
           timestamp: Date.now(),
           session,
           displayViews: yield* currentDisplayViews(session.sessionId),
@@ -96,11 +70,11 @@ export const AcnIntrospectorLive: Layer.Layer<
       })
 
     const currentOverview = Effect.gen(function* () {
-      const entries = yield* runtime.residentSessions
+      const entries = yield* runtime.sessionRuntimes
       return {
-        schemaVersion: 2,
+        schemaVersion: 3,
         timestamp: Date.now(),
-        sessions: entries.map(runtimeEntryToSession),
+        sessions: entries,
       } satisfies AcnIntrospectionOverview
     })
 
@@ -108,26 +82,27 @@ export const AcnIntrospectorLive: Layer.Layer<
       sessionId: string,
       forkId: string | null,
     ) {
-      const resident = (yield* runtime.residentSessions).find(
+      const runtimeSnapshot = (yield* runtime.sessionRuntimes).find(
         (candidate) => candidate.sessionId === sessionId,
       )
-      if (!resident) return yield* new SessionNotFound({ sessionId })
+      if (!runtimeSnapshot) return yield* new SessionNotFound({ sessionId })
 
       // Introspection is ambient. It may join an already-busy generation to
       // obtain a fresh agent snapshot, but it never creates or prolongs one.
-      const sampled = yield* runtime.tryWithBusyResident(
-        sessionId,
-        "introspection-sample",
-        (entry) =>
-          entry.session.subscribeIntrospection(forkId).pipe(
-            Stream.take(1),
-            Stream.runHead,
-            Effect.map((value) => Option.getOrNull(value)),
-            Effect.mapError((cause) => introspectionFailure(sessionId, cause)),
-          ),
-      )
+      const sampled = yield* Effect.scoped(Effect.gen(function* () {
+        const acquired = yield* runtime.tryAcquireActiveSession(
+          sessionId,
+          "introspection-sample",
+        )
+        if (Option.isNone(acquired)) return Option.none<AgentIntrospection>()
+        return yield* acquired.value.entry.session.subscribeIntrospection(forkId).pipe(
+          Stream.take(1),
+          Stream.runHead,
+          Effect.mapError((cause) => introspectionFailure(sessionId, cause)),
+        )
+      }))
       return yield* currentSessionPayload(
-        runtimeEntryToSession(resident),
+        runtimeSnapshot,
         Option.getOrNull(sampled),
       )
     })

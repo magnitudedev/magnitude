@@ -18,33 +18,37 @@ A session runtime is an ACN-owned disposable execution environment over durable 
 is neither session identity nor history and can unload and reconstruct without changing either.
 
 ```text
-Absent -> Starting -> Resident -> Retiring -> Absent
+Absent -> Starting -> Loaded -> Retiring -> Absent
 ```
 
-## Admission and residency
+## Admission and lifetime
 
-Startup is single-flight per session. Work enters through a generation-scoped gate: retirement
-closes admission before publication, and cleanup from an old generation cannot affect its
-replacement.
+Startup is single-flight per session. There are two semantic entities: the durable `Session` and
+its currently loaded, disposable `SessionRuntime`. A runtime's generation is only an exact-instance
+fence; cleanup from an old generation cannot affect its replacement.
 
-A resident runtime unloads after two minutes without session use. Commands, preload, and display
-materialization (opening or reopening a display subscription) are bounded uses. Holding an open
-display subscription does not retain the runtime.
+Callers acquire a `SessionRuntime` in an Effect scope. Commands, preload, and display
+materialization (opening or reopening a display subscription) are bounded scoped uses. Holding an
+open display subscription does not retain the runtime. Scope finalization releases the use for
+every Effect exit, without callback wrappers or caller-selected work classifications.
 
 Agent work has one authoritative status covering accepted messages awaiting resolution, turns,
 queued triggers, workers, compaction, and owned detached processes. Each runtime generation owns
-at most one continuing-work claim for that aggregate status. Message and goal admission establish
-the claim before committing work; a later `Working` transition confirms it, and the corresponding
-`Quiescent` transition releases it and starts a fresh idle interval. Rehydration of an already
-working session establishes the same claim before publishing the resident generation. Runtime
-ownership and UI consume the aggregate status instead of reconstructing work independently; there
-are no per-message, per-worker, display, or process-global work claims.
+no additional work claim. The runtime stays loaded while its scoped-use count is nonzero or this
+aggregate status is `Working`. It becomes idle only when the scoped-use count is zero and the status
+is `Quiescent`, then unloads after two minutes if neither fact changes.
+
+ACN subscribes to the current-first aggregate work status before publishing a newly loaded runtime.
+Status changes update the runtime's private lifetime state directly. Before final release and
+retirement, ACN rereads the authoritative status so a delayed notification cannot unload working
+state. There are no per-message, per-worker, display, continuing-work, demand, or process-global
+claims.
 
 Resolving a session under the runtime admission lock never waits for that session's retirement, so
-one wedged generation cannot block unrelated sessions. Work arriving behind abnormal retirement
-fails after a bounded wait and before accepting a session event, allowing the client to restore
-unsent input. Persistent retirement failure requests controlled ACN replacement; the old gate is
-never reopened into a partially closed generation.
+one wedged runtime cannot block unrelated sessions. Work arriving behind abnormal retirement fails
+after a bounded wait and before accepting a session event, allowing the client to restore unsent
+input. Persistent retirement failure requests controlled ACN replacement; a partially closed
+runtime is never reopened.
 
 ## Drafts, creation, and deletion
 
@@ -94,9 +98,9 @@ snapshot.
 
 - Durable session state remains authoritative across unload, restart, and ACN replacement.
 - Observation alone cannot retain a runtime.
-- Every accepted work item belongs to exactly one live runtime generation.
-- Every resident generation has at most one continuing-work claim, owned before work commit and
-  released only after aggregate quiescence.
+- Every accepted work item belongs to exactly one live `SessionRuntime`.
+- A `SessionRuntime` remains loaded exactly while it has a scoped user or aggregate work is
+  `Working`, followed by its configured idle interval.
 - Admission and retirement cannot cross, and old cleanup cannot affect a replacement.
 - Draft cancellation cannot strand preloading or claiming.
 - Deletion accepts no work after its commit point.

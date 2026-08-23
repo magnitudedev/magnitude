@@ -376,6 +376,25 @@ const releaseLoadAsReady = (
 })
 
 describe("ModelSlotController load admission", () => {
+  it("does not start current-slot work for a stale request identity", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const harness = yield* makeHarness()
+      yield* Effect.gen(function* () {
+        const controller = yield* ModelSlotController
+
+        yield* Effect.flip(controller.acquireLocalModel(
+          PRIMARY_SLOT_ID,
+          ProviderModelIdSchema.make("stale-model"),
+        ))
+
+        expect((yield* controller.snapshot).state.slots.primary).toMatchObject({
+          _tag: "ConfiguredLocal",
+          residency: { _tag: "Unloaded" },
+        })
+      }).pipe(Effect.provide(harness.layer))
+    })))
+  })
+
   it("clears a persisted selection that has no authoritative offering", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const harness = yield* makeHarness({ initialOfferings: [] })

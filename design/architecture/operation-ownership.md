@@ -51,9 +51,10 @@ Every owner handles its complete Effect `Exit`: success, typed failure, defect, 
 owner shutdown. Terminal product state is committed before ownership and continuing lifetime are
 released. Public nonterminal state without a live owner is invalid.
 
-Continuing lifetime is local to the authority whose state remains nonterminal. For example, one
-resident session generation owns one claim for its aggregate `Working` status; it does not retain
-the ACN process, and it is not duplicated per message, worker, detached process, or observer.
+Continuing lifetime is local to the authority whose state remains nonterminal. A session's
+aggregate `Working` status is already authoritative agent state: its loaded `SessionRuntime`
+observes that status directly instead of manufacturing a second continuing-work claim. This does
+not retain the ACN process and is not duplicated per message, worker, detached process, or observer.
 
 Owned work is a child of the responsible service scope, never an unscoped daemon fiber. Service
 teardown may interrupt it because teardown destroys the authority whose state it governs, but the

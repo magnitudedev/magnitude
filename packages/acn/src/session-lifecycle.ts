@@ -83,8 +83,8 @@ export const SessionLifecycleLive: Layer.Layer<
       const storage = yield* MagnitudeStorage
       const inspector = yield* SessionInspector
 
-      const residentSnapshot = (sessionId: string) =>
-        runtime.residentSessions.pipe(
+      const runtimeSnapshot = (sessionId: string) =>
+        runtime.sessionRuntimes.pipe(
           Effect.map((sessions) => sessions.find((session) => session.sessionId === sessionId)),
         )
 
@@ -188,7 +188,7 @@ export const SessionLifecycleLive: Layer.Layer<
           // then claim → sendUserMessage → promote.
           // Outcome-aware: distinguish message-sent-but-promote-failed from total failure.
           if (sessionId) {
-            const live = yield* residentSnapshot(sessionId)
+            const live = yield* runtimeSnapshot(sessionId)
             if (live) {
               return yield* new SessionAlreadyExists({ sessionId })
             }
@@ -319,7 +319,7 @@ export const SessionLifecycleLive: Layer.Layer<
 
         getSessionExecutionContext: Effect.fn("acn.session-lifecycle.get-session-execution-context")(
           function* (sessionId) {
-            const live = yield* residentSnapshot(sessionId)
+            const live = yield* runtimeSnapshot(sessionId)
             if (live) {
               return { cwd: live.cwd, projectRoot: live.cwd, scratchpadPath: live.scratchpadPath }
             }

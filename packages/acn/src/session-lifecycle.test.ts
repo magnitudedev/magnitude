@@ -30,12 +30,10 @@ describe("SessionLifecycle initial messages", () => {
       const root = yield* Effect.promise(() => mkdtemp(join(tmpdir(), "magnitude-lifecycle-")))
       const sent = yield* Ref.make<SendUserMessageInput[]>([])
       const runtime: AgentRuntimeApi = {
-        withSession: () => Effect.die("unused"),
-        withSessionWork: () => Effect.die("unused"),
-        withSessionRequest: () => Effect.die("unused"),
-        tryWithResident: () => Effect.succeed(Option.none()),
-        tryWithBusyResident: () => Effect.succeed(Option.none()),
-        residentSessions: Effect.succeed([]),
+        acquireSession: () => Effect.die("unused"),
+        acquireSessionRequest: () => Effect.die("unused"),
+        tryAcquireActiveSession: () => Effect.succeed(Option.none()),
+        sessionRuntimes: Effect.succeed([]),
         dispose: () => Effect.void,
         deleteSession: (_sessionId, remove) => remove,
         registerRetirementObserver: () => Effect.succeed(Effect.void),

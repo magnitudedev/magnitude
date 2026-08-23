@@ -5,14 +5,14 @@ import {
   SessionNotFound,
   type SessionMetadata,
 } from "@magnitudedev/acn-protocol"
-import { AgentRuntime, type AgentRuntimeApi, type ResidentSessionSnapshot } from "./agent-runtime"
+import { AgentRuntime, type AgentRuntimeApi, type SessionRuntimeSnapshot } from "./agent-runtime"
 import { ActiveSessionStatusesLive, ActiveSessionStatusesService } from "./active-session-statuses"
 import { SessionInspector } from "./session-inspector"
 
 const resident = (
   sessionId: string,
-  workStatus: ResidentSessionSnapshot["workStatus"],
-): ResidentSessionSnapshot => ({
+  workStatus: SessionRuntimeSnapshot["workStatus"],
+): SessionRuntimeSnapshot => ({
   sessionId,
   generation: 1,
   title: "Session",
@@ -20,18 +20,13 @@ const resident = (
   scratchpadPath: `/tmp/${sessionId}/scratchpad`,
   createdAt: 1,
   updatedAt: 2,
-  residentSince: 1,
+  loadedAt: 1,
   workStatus,
-  continuingWorkOwned: workStatus._tag === "Working",
-  gate: {
-    resource: `session:${sessionId}`,
-    generation: 1,
-    phase: "open",
-    leaseCount: 0,
-    leaseLabels: [],
-    idleSince: 1,
-    revision: 0,
-  },
+  phase: "open",
+  scopedUseCount: 0,
+  scopedUseLabels: [],
+  idleSince: 1,
+  revision: 0,
   retirement: null,
 })
 
@@ -48,16 +43,14 @@ const protocolMeta = (sessionId: string, updatedAt: number): SessionMetadata => 
 })
 
 const makeSetup = Effect.gen(function* () {
-  const residents = yield* Ref.make<ReadonlyArray<ResidentSessionSnapshot>>([])
+  const residents = yield* Ref.make<ReadonlyArray<SessionRuntimeSnapshot>>([])
   const metas = yield* Ref.make(new Map<string, SessionMetadata>())
   const changed = yield* PubSub.unbounded<void>()
   const runtime: AgentRuntimeApi = {
-    withSession: () => Effect.die("unused"),
-    withSessionWork: () => Effect.die("unused"),
-    withSessionRequest: () => Effect.die("unused"),
-    tryWithResident: () => Effect.die("unused"),
-    tryWithBusyResident: () => Effect.die("unused"),
-    residentSessions: Ref.get(residents),
+    acquireSession: () => Effect.die("unused"),
+    acquireSessionRequest: () => Effect.die("unused"),
+    tryAcquireActiveSession: () => Effect.die("unused"),
+    sessionRuntimes: Ref.get(residents),
     dispose: () => Effect.void,
     deleteSession: (_sessionId, remove) => remove,
     registerRetirementObserver: () => Effect.succeed(Effect.void),

@@ -38,13 +38,13 @@ export const ActiveSessionStatusesLive: Layer.Layer<
 
     const snapshot: Effect.Effect<ActiveSessionStatuses> = Effect.gen(function* () {
       const statuses = yield* Effect.forEach(
-        yield* runtime.residentSessions,
-        (resident) =>
-          inspector.get(resident.sessionId).pipe(
+        yield* runtime.sessionRuntimes,
+        (runtime) =>
+          inspector.get(runtime.sessionId).pipe(
             Effect.map((meta): ActiveSessionStatus | null => ({
-              sessionId: resident.sessionId,
-              workStatus: resident.workStatus._tag === "Working" ? "working" : "idle",
-              activeWorkerCount: resident.workStatus.workerCount,
+              sessionId: runtime.sessionId,
+              workStatus: runtime.workStatus._tag === "Working" ? "working" : "idle",
+              activeWorkerCount: runtime.workStatus.workerCount,
               lastMessageAt: meta.updatedAt,
             })),
             Effect.catchTags({

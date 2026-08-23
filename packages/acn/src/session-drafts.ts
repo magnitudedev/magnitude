@@ -204,7 +204,9 @@ export const SessionDraftsLive: Layer.Layer<
       if (meta && meta.visibility !== "draft") {
         return yield* new SessionAlreadyExists({ sessionId: entry.sessionId })
       }
-      yield* runtime.withSessionRequest(startRequest(entry), "draft-initialize", () => Effect.void)
+      yield* Effect.scoped(
+        runtime.acquireSessionRequest(startRequest(entry), "draft-initialize"),
+      )
     })
 
     const markReady = (entry: DraftEntry) =>
