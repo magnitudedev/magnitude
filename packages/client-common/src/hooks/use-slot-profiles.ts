@@ -3,7 +3,6 @@ import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   isRoleId,
-  Configuration,
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   ROLE_TO_SLOT,
@@ -57,10 +56,9 @@ export function useSlotProfiles() {
     (service) => get(service.state),
   )), [slotService])
   const slots = useAtomValue(slotState)
-  const catalogAtom = useMemo(() => Atom.make((get) => get(client.query(Configuration.GetProviderModelCatalog, {})).result), [client])
+  const catalogAtom = useMemo(() => Atom.make((get) => get(client.Configuration.GetProviderModelCatalog({})).result), [client])
   const catalog = useAtomValue(catalogAtom)
-  const refreshAtom = useMemo(() => client.mutation(Configuration.RefreshModelCatalog), [client])
-  const refresh = useAtomSet(refreshAtom)
+  const refresh = useAtomSet(client.Configuration.RefreshModelCatalog)
   const retry = useCallback(() => refresh({ providerId: Option.none() }), [refresh])
 
   const profiles = Option.flatMap(Result.value(slots), ({ state: slotState }) =>

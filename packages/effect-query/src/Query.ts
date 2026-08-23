@@ -744,6 +744,9 @@ export const when = <Input, Data, Error, Requirements>(
 ): Atom.Atom<Option.Option<State<Data, Error>>> =>
   Atom.readable((get) => Option.map(query, (atom) => get(atom)))
 
+export const isQuery = (value: unknown): value is Any =>
+  typeof value === "object" && value !== null && QueryDefinitionTypeId in value
+
 export const isQueryAtom = (value: unknown): value is QueryAtom.Any =>
   typeof value === "object" && value !== null && QueryEntryTypeId in value
 

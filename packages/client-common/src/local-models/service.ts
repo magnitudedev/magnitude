@@ -109,11 +109,11 @@ const makeLocalModels = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const query = effectQuery.query(LocalInference.GetLocalModels, {})
-  const install = effectQuery.mutation(LocalInference.ReconcileCatalogModel)
-  const cancelDownload = effectQuery.mutation(LocalInference.CancelModelDownload)
-  const dismissDownloadFailure = effectQuery.mutation(LocalInference.DismissModelDownloadFailure)
-  const deleteModel = effectQuery.mutation(LocalInference.DeleteLocalModel)
+  const query = effectQuery.LocalInference.GetLocalModels({})
+  const install = effectQuery.LocalInference.ReconcileCatalogModel
+  const cancelDownload = effectQuery.LocalInference.CancelModelDownload
+  const dismissDownloadFailure = effectQuery.LocalInference.DismissModelDownloadFailure
+  const deleteModel = effectQuery.LocalInference.DeleteLocalModel
   const installationInvocations = yield* Mutation.state({
     filters: { mutation: LocalInference.ReconcileCatalogModel },
     select: ({ input, result }): ReconciliationInvocationState => ({

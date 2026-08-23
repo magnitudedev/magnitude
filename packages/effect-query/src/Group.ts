@@ -31,6 +31,8 @@ export type Any = Group<Record<string, unknown>, CoreOperation.Any>
 export type Operation<Value> = Value extends Group<Record<string, unknown>, infer ContainedOperation>
   ? ContainedOperation
   : never
+/** The exact member record of a group: operations and nested groups by name. */
+export type Members<Value> = Value extends { readonly [MembersTypeId]?: infer MemberRecord } ? MemberRecord : never
 
 export const isGroup = (value: unknown): value is Any =>
   typeof value === "object" && value !== null && TypeId in value

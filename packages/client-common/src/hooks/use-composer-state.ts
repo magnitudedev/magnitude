@@ -37,13 +37,10 @@ import {
   presentPendingUserMessage,
   useDisplaySpeculator,
 } from "../sync/index"
-import {
-  Agent,
-  Sessions,
-  Shell,
-  type DisplayAttachment,
-  type RawMessageUpload,
-  type RawMentionOccurrence,
+import type {
+  DisplayAttachment,
+  RawMessageUpload,
+  RawMentionOccurrence,
 } from "@magnitudedev/sdk"
 import { canonicalExtensionForImageMediaType } from "@magnitudedev/sdk"
 import { isRpcOutcomeUnknown } from "@magnitudedev/sdk"
@@ -134,14 +131,10 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
   })), [selectedSessionId])
   useAtomMount(selectedSessionSyncAtom)
 
-  const sendAtom = useMemo(() => client.mutation(Agent.SendMessage), [client])
-  const createSessionAtom = useMemo(() => client.mutation(Sessions.CreateSession), [client])
-  const interruptAtom = useMemo(() => client.mutation(Agent.Interrupt), [client])
-  const runBashAtom = useMemo(() => client.mutation(Shell.RunBash), [client])
-  const sendMutation = useAtomSet(sendAtom, { mode: "promise" })
-  const createSession = useAtomSet(createSessionAtom, { mode: "promise" })
-  const interruptMutation = useAtomSet(interruptAtom)
-  const runBashMutation = useAtomSet(runBashAtom, { mode: "promise" })
+  const sendMutation = useAtomSet(client.Agent.SendMessage, { mode: "promise" })
+  const createSession = useAtomSet(client.Sessions.CreateSession, { mode: "promise" })
+  const interruptMutation = useAtomSet(client.Agent.Interrupt)
+  const runBashMutation = useAtomSet(client.Shell.RunBash, { mode: "promise" })
   const mentionClient: MentionSearchClient = useMentionSearchClient()
 
   const handleSend = useCallback((

@@ -83,7 +83,7 @@ const makeProjectFiles = Effect.gen(function* () {
   const watch = memoized(
     (projectId: ProjectId) => projectId,
     (projectId: ProjectId) => Atom.make((get): void => {
-      const subscription = effectQuery.subscription(ProjectFilesBoundary.WatchProjectFiles, { projectId })
+      const subscription = effectQuery.ProjectFiles.WatchProjectFiles({ projectId })
       let attempt = 0
       get.subscribe(subscription, (state) => {
         if (state.attempt === attempt) return
@@ -103,7 +103,7 @@ const makeProjectFiles = Effect.gen(function* () {
     (input: ProjectDirectoryInput) => Key.canonical(input),
     (input: ProjectDirectoryInput): Atom.Atom<DirectoryState> => Atom.make((get) => {
       get(watch(input.projectId))
-      return get(effectQuery.query(ProjectFilesBoundary.ListProjectDirectory, input))
+      return get(effectQuery.ProjectFiles.ListProjectDirectory(input))
     }),
   )
 
@@ -111,7 +111,7 @@ const makeProjectFiles = Effect.gen(function* () {
     (input: ProjectPathInput) => Key.canonical(input),
     (input: ProjectPathInput): Atom.Atom<FileState> => Atom.make((get) => {
       get(watch(input.projectId))
-      return get(effectQuery.query(ProjectFilesBoundary.ReadProjectFile, input))
+      return get(effectQuery.ProjectFiles.ReadProjectFile(input))
     }),
   )
 
@@ -208,7 +208,7 @@ export function useProjectFileSave(options: {
   readonly onSuccess?: (snapshot: ProjectFileTextSnapshot) => void
 } = {}) {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.mutation(ProjectFilesBoundary.WriteProjectFile), [client])
+  const mutation = client.ProjectFiles.WriteProjectFile
   const result = useAtomValue(mutation)
   const execute = useAtomSet(mutation, { mode: "promise" })
   const save = useCallback(async (input: ProjectFileWriteInput) => {
@@ -226,7 +226,7 @@ export function useProjectFileDelete(options: {
   readonly onSuccess?: () => void
 } = {}) {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.mutation(ProjectFilesBoundary.DeleteProjectFile), [client])
+  const mutation = client.ProjectFiles.DeleteProjectFile
   const result = useAtomValue(mutation)
   const execute = useAtomSet(mutation, { mode: "promise" })
   const remove = useCallback(async (input: ProjectFileDeleteInput) => {
@@ -244,7 +244,7 @@ export function useProjectEntryMove(options: {
   readonly onSuccess?: (move: ProjectEntryMove) => void
 } = {}) {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.mutation(ProjectFilesBoundary.MoveProjectEntry), [client])
+  const mutation = client.ProjectFiles.MoveProjectEntry
   const result = useAtomValue(mutation)
   const execute = useAtomSet(mutation, { mode: "promise" })
   const move = useCallback(async (input: ProjectEntryMoveInput) => {

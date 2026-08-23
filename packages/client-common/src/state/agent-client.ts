@@ -1,10 +1,11 @@
 /**
- * The connection's Effect Query client over the ACN boundary.
+ * The connection's Effect Query client for the ACN boundary.
  *
- * Every client↔ACN interaction is a declared query, mutation, or subscription
- * materialized through this client. RPC-backed implementations are derived
- * once per connection; domain services
- * and the change drain are installed as Layers in the same runtime.
+ * The client is made for `AcnBoundary`: every domain group's operations are
+ * materialized at their names (`client.Sessions.GetSession(input)`,
+ * `client.Agent.SendMessage`, `client.Changes.StreamChanges({})`). RPC-backed
+ * implementations are derived once per connection; domain services and the
+ * change drain are installed as Layers in the same runtime.
  */
 import type { RpcClient } from "@effect/rpc"
 import { Layer } from "effect"
@@ -22,13 +23,14 @@ const acnImplementationsLayer = (
 
 export type AcnClientRequirements = Layer.Layer.Success<ReturnType<typeof acnImplementationsLayer>>
 
-export type AgentClient = Client.Client<AcnClientRequirements | ClientServices, never>
+export type AgentClient = Client.GroupClient<typeof AcnBoundary, AcnClientRequirements | ClientServices, never>
 
 export function createAgentClient(
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
   options: ClientServicesOptions = {},
 ): AgentClient {
-  return Client.make<AcnClientRequirements, never, ClientServices, never>(
+  return Client.make<typeof AcnBoundary, AcnClientRequirements, never, ClientServices, never>(
+    AcnBoundary,
     acnImplementationsLayer(protocolLayer),
     (client) => clientServicesLayer(client, options),
   )

@@ -7,9 +7,8 @@
 import { useMemo } from "react"
 import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import { Configuration, ProviderIdSchema } from "@magnitudedev/sdk"
+import { ProviderIdSchema } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-
 
 export interface ApiKeyState {
   readonly status: "none" | "loading" | "config"
@@ -53,12 +52,12 @@ export function useSettingsState(): UseSettingsStateResult {
   const client = useAgentClient()
 
   const queryAtom = useMemo(
-    () => Atom.make((get) => get(client.query(Configuration.GetProviderAuth, { providerId: MAGNITUDE_PROVIDER_ID })).result),
+    () => Atom.make((get) => get(client.Configuration.GetProviderAuth({ providerId: MAGNITUDE_PROVIDER_ID })).result),
     [client],
   )
   const result = useAtomValue(queryAtom)
 
-  const updateProviderAuthAtom = useMemo(() => client.mutation(Configuration.UpdateProviderAuth), [client])
+  const updateProviderAuthAtom = client.Configuration.UpdateProviderAuth
   const updateProviderAuthResult = useAtomValue(updateProviderAuthAtom)
   const updateProviderAuth = useAtomSet(updateProviderAuthAtom)
 

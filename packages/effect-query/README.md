@@ -150,21 +150,32 @@ export const AcnBoundary = Group.make({ Sessions, Changes })
 
 Servers implement the derived group through `AcnRpc.toLayer(AcnBoundary, handlers)` and serve it
 with `AcnRpc.makeRpcServer(AcnBoundary)`. Clients install RPC-backed implementations with
-`AcnRpc.layer(AcnBoundary)` and use the core `Client` unchanged:
+`AcnRpc.layer(AcnBoundary)` and make the `Client` **for the group**. The client then carries every
+member of the group, materialized, at its name:
 
 ```ts
-const effectQuery = Client.make(AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)))
-const session = effectQuery.query(Sessions.GetSession, { sessionId: "session-1" })
-const remove = effectQuery.mutation(Sessions.DeleteSession)
-const changes = effectQuery.subscription(Changes.StreamChanges, {})
+const effectQuery = Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)))
+const session = effectQuery.Sessions.GetSession({ sessionId: "session-1" })   // Query.QueryAtom
+const remove = effectQuery.Sessions.DeleteSession                             // Mutation.MutationAtom
+const changes = effectQuery.Changes.StreamChanges({})                         // Subscription.SubscriptionAtom
 ```
+
+A query member is `(input) => QueryAtom`, a mutation member is its `MutationAtom`, a subscription
+member is `(input) => SubscriptionAtom`, and a nested group is its materialized members. Each is
+exactly what the materializer returns for the same definition — the same canonical atom:
+`effectQuery.Sessions.GetSession(input) === effectQuery.query(Sessions.GetSession, input)`. The
+materializers (`query`, `mutation`, `subscription`) remain for definitions outside the group. The
+type is `Client.GroupClient<typeof AcnBoundary, Provided, RuntimeError>`; the members alone are
+`Client.Materialized<typeof AcnBoundary, Provided, RuntimeError>`.
+
+`Client.make(group, …)` checks at construction that every operation of the group can be
+materialized by the client — the constraint the materializers impose per call — and that no
+top-level member is named `runtime`, `query`, `mutation`, or `subscription`.
 
 Cache identity defaults to the canonical structural form of the constructed payload
 (`Key.canonical`); payload, success, and domain-error types come from the operation declaration,
 while implementation failures such as RPC client errors come from the installed implementation
-layer. Kinds are
-structural: `effectQuery.query(DeleteSession, …)` does not compile because a mutation is not a
-query. Declarative `Query.fromStream` defines a query folded over a derived stream RPC.
+layer. Declarative `Query.fromStream` defines a query folded over a derived stream RPC.
 
 ## HTTP API-backed definitions
 
@@ -245,41 +256,40 @@ A remote atom is ordinary composition, not another cache primitive:
 snapshot RPC → Query atom ← invalidate ← watch Stream
 ```
 
-Install the remote watch as scoped Effect infrastructure. Notifications carry identity and
-announce that authoritative state may have changed, while the query remains the only owner of
+The watch is a `Subscription` member of the boundary, drained once per connection as scoped Effect
+infrastructure installed through `Client.make`'s `additional` Layer. Notifications carry identity
+and announce that authoritative state may have changed, while the query remains the only owner of
 snapshot data:
 
 ```ts
 import * as Stream from "effect/Stream"
 
-const synchronizeModels = Effect.gen(function*() {
-  const client = yield* AcnRpc
-
-  yield* client("WatchModelChanges", {}).pipe(
+const synchronizeModels = (client: Client.Materialized<typeof AcnBoundary, AcnClientRequirements, never>) =>
+  Subscription.events(client.Models.WatchModelChanges({})).pipe(
     Stream.runForEach((change) =>
-      QueryClient.invalidate(modelQuery.match({ modelId: change.modelId }))
+      QueryClient.invalidate(Models.GetModel.match({ modelId: change.modelId }))
     )
   )
-})
 
-const ModelSynchronizationLive = Layer.scopedDiscard(synchronizeModels)
+const effectQuery = Client.make(
+  AcnBoundary,
+  AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)),
+  (client) => Layer.scopedDiscard(Effect.forkScoped(synchronizeModels(client)))
+)
 ```
 
-Mutation synchronization uses the same cache primitives. Fetch the exact query when the command
-must remain pending until the authoritative snapshot has been read:
+Mutation synchronization uses the same cache primitives and is declared on the mutation itself.
+Fetch the exact query when the command must remain pending until the authoritative snapshot has
+been read:
 
 ```ts
-const renameModel = Mutation.make("RenameModel", {
-  effect: (payload: {
-    readonly modelId: string
-    readonly name: string
-  }) => Effect.flatMap(AcnRpc, (client) =>
-    client("RenameModel", payload)),
-
+const RenameModel = Mutation.make("RenameModel", {
+  payload: { modelId: Schema.String, name: Schema.String },
+  success: Schema.Struct({}),
   synchronize: (_receipt, payload) => QueryClient.invalidate(
-    modelQuery.match({ modelId: payload.modelId })
+    GetModel.match({ modelId: payload.modelId })
   ).pipe(
-    Effect.zipRight(QueryClient.fetch(modelQuery, { modelId: payload.modelId })),
+    Effect.zipRight(QueryClient.fetch(GetModel, { modelId: payload.modelId })),
     Effect.asVoid
   )
 })
@@ -288,7 +298,7 @@ const renameModel = Mutation.make("RenameModel", {
 The resulting “remote atom” is therefore a `Query` plus an optional scoped notification Stream.
 RPC and HTTP transports supply Effects and Streams but do not need query-specific adapters. If an
 API requires a stronger consistency guarantee than “refetch the authoritative snapshot,” that
-guarantee belongs in the query's RPC Effect rather than in the generic cache.
+guarantee belongs in the operation's implementation rather than in the generic cache.
 
 ## Observation and selection
 
@@ -321,8 +331,8 @@ import {
 import { createRoot } from "react-dom/client"
 
 function Session({ sessionId }: { readonly sessionId: string }) {
-  const state = useAtomValue(effectQuery.query(sessionQuery, { sessionId }))
-  const remove = useAtomSet(effectQuery.mutation(deleteSession), { mode: "promise" })
+  const state = useAtomValue(effectQuery.Sessions.GetSession({ sessionId }))
+  const remove = useAtomSet(effectQuery.Sessions.DeleteSession, { mode: "promise" })
 
   if (Result.isInitial(state.result)) return <p>Loading…</p>
   if (Result.isFailure(state.result)) return <p>Unable to load session.</p>

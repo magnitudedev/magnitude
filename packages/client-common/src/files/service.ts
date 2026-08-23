@@ -51,7 +51,7 @@ const makeFiles = Effect.gen(function* () {
   const watch = memoized(
     (input: FileInput) => Key.canonical(input),
     (input: FileInput) => Atom.make((get): void => {
-      const subscription = effectQuery.subscription(FilesBoundary.WatchFile, input)
+      const subscription = effectQuery.Files.WatchFile(input)
       let attempt = 0
       get.subscribe(subscription, (state) => {
         if (state.attempt === attempt) return
@@ -72,7 +72,7 @@ const makeFiles = Effect.gen(function* () {
     (input: FileInput): Atom.Atom<Query.State<ResolvePathResult, Query.Error<typeof FilesBoundary.ResolvePath> | RpcClientError>> =>
       Atom.make((get) => {
         get(watch(input))
-        return get(effectQuery.query(FilesBoundary.ResolvePath, { ...input, checkExists: true }))
+        return get(effectQuery.Files.ResolvePath({ ...input, checkExists: true }))
       }),
   )
 
@@ -81,7 +81,7 @@ const makeFiles = Effect.gen(function* () {
     (input: FileInput & { readonly format: ReadFileFormat }): Atom.Atom<Query.State<ReadFileResult, Query.Error<typeof FilesBoundary.ReadFile> | RpcClientError>> =>
       Atom.make((get) => {
         get(watch({ cwd: input.cwd, path: input.path }))
-        return get(effectQuery.query(FilesBoundary.ReadFile, input))
+        return get(effectQuery.Files.ReadFile(input))
       }),
   )
 

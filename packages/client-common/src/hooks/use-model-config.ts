@@ -2,7 +2,6 @@ import { useMemo } from "react"
 import { Atom, useAtomValue, useAtomSet, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
-  Configuration,
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
@@ -19,7 +18,7 @@ import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
 
 export function useModelConfig() {
   const client = useAgentClient()
-  const catalogAtom = useMemo(() => Atom.make((get) => get(client.query(Configuration.GetProviderModelCatalog, {})).result), [client])
+  const catalogAtom = useMemo(() => Atom.make((get) => get(client.Configuration.GetProviderModelCatalog({})).result), [client])
   const catalog = useAtomValue(catalogAtom)
   const slotService = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const slotState = useMemo(() => Atom.make((get) => Result.flatMap(
@@ -32,7 +31,7 @@ export function useModelConfig() {
   )), [slotService])
   const slotMutations = useModelSlotMutations()
   const slots = useAtomValue(slotState)
-  const refreshAtom = useMemo(() => client.mutation(Configuration.RefreshModelCatalog), [client])
+  const refreshAtom = client.Configuration.RefreshModelCatalog
   const catalogRefresh = useAtomValue(refreshAtom)
   const selections = Result.value(useAtomValue(slotSelections))
   const refresh = useAtomSet(refreshAtom)

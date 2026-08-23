@@ -5,9 +5,8 @@
  */
 import { useMemo, useState } from "react"
 import { Atom, useAtomValue, Result } from "@effect-atom/atom-react"
-import { Configuration, type CloudUsageResponse, type UsagePeriod } from "@magnitudedev/sdk"
+import type { CloudUsageResponse, UsagePeriod } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
-
 
 export interface UseUsageStateResult {
   /** Whether the query is loading */
@@ -27,7 +26,7 @@ export function useUsageState(): UseUsageStateResult {
   const [period, setPeriod] = useState<UsagePeriod>("24h")
 
   const usageAtom = useMemo(
-    () => Atom.make((get) => get(client.query(Configuration.GetCloudUsage, { period })).result),
+    () => Atom.make((get) => get(client.Configuration.GetCloudUsage({ period })).result),
     [client, period],
   )
   const result = useAtomValue(usageAtom)

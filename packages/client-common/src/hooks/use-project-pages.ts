@@ -7,10 +7,9 @@ import { useCallback, useMemo } from "react"
 import { Option } from "effect"
 import { Atom, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Key } from "@magnitudedev/effect-query"
-import { Projects, type Project, type ProjectPageCursor } from "@magnitudedev/sdk"
+import type { Project, ProjectPageCursor } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { appendRequestedPage, makePageSet, type RequestedPage } from "../data/paginated-query"
-
 
 const DEFAULT_PROJECT_PAGE_SIZE = 20
 
@@ -35,7 +34,7 @@ export function useProjectPages(params?: UseProjectPagesParams): UseProjectPages
 
   const pageSet = useMemo(() => {
     const page = (cursor: Option.Option<ProjectPageCursor>, limit: number) =>
-      Atom.make((get) => get(client.query(Projects.ListProjects, { includeRemoved, cursor, limit })).result)
+      Atom.make((get) => get(client.Projects.ListProjects({ includeRemoved, cursor, limit })).result)
     const continuations = new Map<string, ReturnType<typeof page>>()
     return makePageSet<Project, ProjectPageCursor>({
       firstPage: page(Option.none(), pageSize),

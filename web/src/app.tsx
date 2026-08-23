@@ -4,8 +4,8 @@
  * Wraps the component tree in DisplayViewControllerProvider.
  * Wires the display view controller, session list, composer, and panels.
  *
- * Cold RPCs use useAgentClient().query() / .mutation() (effect-atom).
- * StreamDisplayView uses the display view store (spec §6.1).
+ * Boundary operations are members of useAgentClient() (client.Sessions.GetSession(input),
+ * client.Agent.Interrupt); StreamDisplayView is consumed by the display view controller.
  * Local UI state uses plain atoms (spec §6.3).
  */
 import {
@@ -101,16 +101,13 @@ import {
   type SlotProfiles,
 } from "@magnitudedev/client-common"
 import {
-  Agent,
   isRoleId,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
-  Projects,
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
-  Sessions,
 } from "@magnitudedev/sdk"
 import type {
   AcnLifecycleState,
@@ -190,14 +187,11 @@ function SessionsSidebarContainer(props?: {
     []
   )
   useAtomMount(focusSearchAtom)
-  const archiveSessionAtom = useMemo(() => client.mutation(Sessions.ArchiveSession), [client])
-  const setSessionPinnedAtom = useMemo(() => client.mutation(Sessions.SetSessionPinned), [client])
-  const revealProjectAtom = useMemo(() => client.mutation(Projects.RevealProjectSource), [client])
-  const archiveSession = useAtomSet(archiveSessionAtom, {
+  const archiveSession = useAtomSet(client.Sessions.ArchiveSession, {
     mode: "promise",
   })
-  const setSessionPinned = useAtomSet(setSessionPinnedAtom, { mode: "promise" })
-  const revealProject = useAtomSet(revealProjectAtom, { mode: "promise" })
+  const setSessionPinned = useAtomSet(client.Sessions.SetSessionPinned, { mode: "promise" })
+  const revealProject = useAtomSet(client.Projects.RevealProjectSource, { mode: "promise" })
   const handleCompose = () => {
     setSettingsTab(null)
     startNewSession()
@@ -619,7 +613,7 @@ function ChatTitleBar({
   const selectedSessionAtom = useMemo(
     () =>
       selectedSessionId
-        ? Atom.make((get) => get(client.query(Sessions.GetSession, { sessionId: selectedSessionId })).result)
+        ? Atom.make((get) => get(client.Sessions.GetSession({ sessionId: selectedSessionId })).result)
         : Atom.make(() => null),
     [client, selectedSessionId]
   )
@@ -783,7 +777,7 @@ function ChatTitleBar({
 function useInterruptAllListener(): void {
   const client = useAgentClient()
   const selectedSessionId = useSelectedSessionId()
-  const interruptMutation = useAtomSet(client.mutation(Agent.Interrupt))
+  const interruptMutation = useAtomSet(client.Agent.Interrupt)
   const interruptAtom = useMemo(
     () =>
       Atom.make(

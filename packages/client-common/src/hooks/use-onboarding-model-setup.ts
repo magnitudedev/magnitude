@@ -6,16 +6,15 @@ import {
   useAtomValue,
 } from "@effect-atom/atom-react"
 import { Effect } from "effect"
-import { LocalInference, type ModelServingConfigurationId } from "@magnitudedev/sdk"
+import type { ModelServingConfigurationId } from "@magnitudedev/sdk"
 import { OnboardingModelSetup } from "../local-models/setup"
 import { onboardingModelSetupViewAtom } from "../local-models/setup-view"
 import { useAgentClient } from "../state/agent-client-context"
 
-
 export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
   const hardwareAtom = useMemo(() => Atom.make((get) =>
-    Result.map(get(client.query(LocalInference.GetLocalInferenceHardware, {})).result, ({ state }) => state)), [client])
+    Result.map(get(client.LocalInference.GetLocalInferenceHardware({})).result, ({ state }) => state)), [client])
   const view = useMemo(() => onboardingModelSetupViewAtom(client), [client])
   const retryAction = useMemo(() => client.runtime.fn(
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.retry),

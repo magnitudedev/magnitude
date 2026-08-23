@@ -1,9 +1,9 @@
-import { useMemo, useState, type ReactNode } from "react"
+import { useState, type ReactNode } from "react"
 import { useAtomSet, useAtomValue, Result } from "@effect-atom/atom-react"
 import { Cause, Option } from "effect"
 import { FolderOpen } from "@phosphor-icons/react"
 import { useAgentClient, usePlatform } from "@magnitudedev/client-common"
-import { Projects, type Project } from "@magnitudedev/sdk"
+import type { Project } from "@magnitudedev/sdk"
 import {
   Dialog,
   DialogContent,
@@ -47,8 +47,8 @@ export function ProjectFormDialog({
   const [name, setName] = useState(project?.name ?? "")
   const [nameWasEdited, setNameWasEdited] = useState(project !== undefined)
   const [sourcePickerFailed, setSourcePickerFailed] = useState(false)
-  const createMutation = useMemo(() => client.mutation(Projects.CreateProject), [client])
-  const editMutation = useMemo(() => client.mutation(Projects.EditProject), [client])
+  const createMutation = client.Projects.CreateProject
+  const editMutation = client.Projects.EditProject
   const createState = useAtomValue(createMutation)
   const editState = useAtomValue(editMutation)
   const create = useAtomSet(createMutation, { mode: "promise" })
@@ -227,7 +227,7 @@ export function RemoveProjectDialog({
   readonly onRemoved: () => void
 }): ReactNode {
   const client = useAgentClient()
-  const mutation = useMemo(() => client.mutation(Projects.RemoveProject), [client])
+  const mutation = client.Projects.RemoveProject
   const state = useAtomValue(mutation)
   const remove = useAtomSet(mutation, { mode: "promise" })
   const pending = Result.isWaiting(state)

@@ -178,3 +178,84 @@ describe("effect-query/rpc", () => {
       .toEqualTypeOf<"GetUser" | "Rename" | "Changes" | "Counter">()
   })
 })
+
+describe("effect-query/rpc group client", () => {
+  const Reads = Group.make({ GetUser, Counter })
+  const Writes = Group.make({ Rename })
+  const Boundary = Group.make({ Reads, Writes, Changes })
+
+  it("materializes every member at its name with the materializer's exact type", () => {
+    const client = Client.make(Boundary, implementationLayer)
+    expectTypeOf(client.Reads.GetUser).parameter(0).toEqualTypeOf<{ readonly id: string }>()
+    expectTypeOf(client.Reads.GetUser({ id: "1" })).toEqualTypeOf(client.query(GetUser, { id: "1" }))
+    expectTypeOf(client.Reads.Counter({ start: 1 })).toEqualTypeOf(client.query(Counter, { start: 1 }))
+    expectTypeOf(client.Writes.Rename).toEqualTypeOf(client.mutation(Rename))
+    expectTypeOf(client.Changes({})).toEqualTypeOf(client.subscription(Changes, {}))
+    const typeOnly = () => {
+      // @ts-expect-error wrong payload
+      client.Reads.GetUser({ id: 1 })
+      // @ts-expect-error a mutation member is the atom, not a function
+      client.Writes.Rename()
+      // @ts-expect-error a member named like a materializer does not compile
+      Client.make(Group.make({ query: GetUser }), implementationLayer)
+      // @ts-expect-error an operation requiring an unprovided service does not compile
+      Client.make(Boundary, Layer.empty)
+    }
+    expectTypeOf(typeOnly).toBeFunction()
+  })
+
+  it("returns the canonical atom through members and materializers alike", () => {
+    const client = Client.make(Boundary, implementationLayer)
+    expect(client.Reads.GetUser({ id: "1" })).toBe(client.query(GetUser, { id: "1" }))
+    expect(client.Reads.Counter({ start: 1 })).toBe(client.query(Counter, { start: 1 }))
+    expect(client.Writes.Rename).toBe(client.mutation(Rename))
+    expect(client.Writes.Rename).toBe(client.Writes.Rename)
+    expect(client.Changes({})).toBe(client.subscription(Changes, {}))
+    expect(Object.isFrozen(client.Reads)).toBe(true)
+  })
+
+  it("rejects a member named like a client property at runtime", () => {
+    const Colliding = Group.make({ mutation: GetUser })
+    expect(() => Client.make(Colliding as never, implementationLayer)).toThrow("collides with a client property")
+  })
+
+  it("executes through members", async () => {
+    const registry = Registry.make()
+    const client = Client.make(Boundary, implementationLayer)
+    const user = client.Reads.GetUser({ id: "1" })
+    const unmount = registry.mount(user)
+    await sleep(10)
+    expect(Option.isSome(AtomResult.value(registry.get(user).result))).toBe(true)
+    const renamed = await Effect.runPromise(
+      Mutation.execute(client.Writes.Rename, { id: "1", name: "Linus" }).pipe(
+        Effect.provideService(Registry.AtomRegistry, registry),
+      ),
+    )
+    expect(renamed).toEqual({ id: "1", name: "Linus" })
+    await sleep(10)
+    expect(AtomResult.value(registry.get(user).result)).toEqual(Option.some({ id: "1", name: "Linus" }))
+    const events = await Effect.runPromise(
+      Subscription.events(client.Changes({})).pipe(
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.provideService(Registry.AtomRegistry, registry),
+      ),
+    )
+    expect(Array.from(events)).toEqual([{ query: "GetUser" }, { query: "Other" }])
+    unmount()
+    registry.dispose()
+  })
+
+  it("hands the group client to the additional Layer", async () => {
+    class Seen extends Effect.Tag("Seen")<Seen, { readonly rename: unknown }>() {}
+    const client = Client.make<typeof Boundary, Operation.Implementations<RpcClientError.RpcClientError>, never, Seen>(
+      Boundary,
+      implementationLayer,
+      (client) => Layer.effect(Seen, Effect.sync(() => ({ rename: client.Writes.Rename }))),
+    )
+    const registry = Registry.make()
+    const seen = await Effect.runPromise(Registry.getResult(registry, client.runtime.atom(Seen)))
+    expect(seen.rename).toBe(client.mutation(Rename))
+    registry.dispose()
+  })
+})
