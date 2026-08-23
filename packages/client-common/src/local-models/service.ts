@@ -114,7 +114,7 @@ const makeLocalModels = Effect.gen(function* () {
   const cancelDownload = effectQuery.mutation(LocalInference.CancelModelDownload)
   const dismissDownloadFailure = effectQuery.mutation(LocalInference.DismissModelDownloadFailure)
   const deleteModel = effectQuery.mutation(LocalInference.DeleteLocalModel)
-  const installationInvocations = Mutation.state({
+  const installationInvocations = yield* Mutation.state({
     filters: { mutation: LocalInference.ReconcileCatalogModel },
     select: ({ input, result }): ReconciliationInvocationState => ({
       identity: input,
@@ -122,7 +122,7 @@ const makeLocalModels = Effect.gen(function* () {
       failed: Result.isFailure(result),
     }),
   })
-  const deletionInvocations = Mutation.state({
+  const deletionInvocations = yield* Mutation.state({
     filters: { mutation: LocalInference.DeleteLocalModel },
     select: ({ input, result }): DeletionInvocationState => ({
       configurationId: input.configurationId,

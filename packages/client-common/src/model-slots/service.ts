@@ -57,7 +57,7 @@ const makeModelSlots = Effect.gen(function* () {
   const assignResult = Atom.make((get) => get(assign))
   const clearResult = Atom.make((get) => get(clear))
   const favoriteResult = Atom.make((get) => get(favorite))
-  const assignments = Mutation.state({
+  const assignments = yield* Mutation.state({
     filters: { mutation: Configuration.AssignSlot },
     select: ({ input, result }): PendingAssignment => ({
       slotId: input.slotId,

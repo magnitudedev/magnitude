@@ -1,22 +1,24 @@
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as Cause from "effect/Cause"
-import * as Context from "effect/Context"
+import * as Chunk from "effect/Chunk"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
-import * as Exit from "effect/Exit"
-import * as FiberId from "effect/FiberId"
+import * as HashSet from "effect/HashSet"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import type * as Stream from "effect/Stream"
+import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import type { Query, QueryAtom, State as QueryState } from "./Query.js"
 import {
   type ErasedQueryEntry,
-  getClientCore,
+  makeQueryCache,
   mutationMatches,
+  QueryCacheTypeId,
+  QueryClient,
+  type QueryCache,
   queryEntry,
   queryMatches,
-  registerEntry,
   subscriptionMatches,
   type QueryClientEvent,
   type QueryFilter,
@@ -25,6 +27,7 @@ import {
 import type { AnyMutationState, MutationFilter, SubscriptionFilter } from "./Model.js"
 
 export type { QueryClientEvent, QueryFilter, QueryMetadata, SubscriptionFilter }
+export { QueryClient }
 
 export interface QueryBatchFailure {
   readonly name: string
@@ -37,6 +40,8 @@ export class QueryBatchError extends Data.TaggedError("QueryBatchError")<{
 }> {}
 
 export interface Service {
+  /** The client's caches; package-internal. */
+  readonly [QueryCacheTypeId]: QueryCache
   readonly resolve: <Input, Data, Error, Requirements>(
     query: Query<Input, Data, Error, Requirements>,
     input: Input
@@ -72,169 +77,159 @@ export interface Service {
   readonly events: Stream.Stream<QueryClientEvent>
 }
 
-export class QueryClient extends Context.Tag("@magnitudedev/effect-query/QueryClient")<QueryClient, Service>() {}
+const isSettled = <Data, Error>(state: QueryState<Data, Error>): boolean =>
+  state.result._tag !== "Initial" && !state.result.waiting
 
-function awaitQuery<Input, Data, Error, Requirements>(
+/** Resolve with the query's next settled result, or interrupt if the entry is removed first. */
+const awaitQuery = <Input, Data, Error, Requirements>(
   registry: AtomRegistry.Registry,
+  cache: QueryCache,
   query: QueryAtom<Input, Data, Error, Requirements>
-): Effect.Effect<Data, Error> {
-  return Effect.async((resume) => {
-    const core = getClientCore(registry)
-    let unsubscribe: (() => void) | undefined
-    let completed = false
-    const inspect = (state: QueryState<Data, Error>) => {
-      if (completed) return
-      if (core.removed.has(queryEntry(query))) {
-        completed = true
-        resume(Exit.interrupt(FiberId.none))
-        unsubscribe?.()
-        return
-      }
-      if (state.result._tag === "Failure" && !state.result.waiting) {
-        completed = true
-        resume(Exit.failCause(state.result.cause))
-        unsubscribe?.()
-        return
-      }
-      if (state.result._tag === "Success" && !state.result.waiting) {
-        completed = true
-        resume(Exit.succeed(state.result.value))
-        unsubscribe?.()
-      }
-    }
-    inspect(registry.get(query))
-    if (!completed) unsubscribe = registry.subscribe(query, inspect)
-    return Effect.sync(() => unsubscribe?.())
-  })
+): Effect.Effect<Data, Error> => {
+  const settled = AtomRegistry.toStream(registry, query).pipe(
+    Stream.filter(isSettled),
+    Stream.runHead,
+    Effect.flatMap(Option.match({
+      onNone: () => Effect.dieMessage(`Query ${query.definition.name}: observation ended before it settled`),
+      onSome: Effect.succeed
+    }))
+  )
+  const removed = cache.awaitRemoval(queryEntry(query)).pipe(Effect.zipRight(Effect.interrupt))
+  return Effect.raceFirst(settled, removed).pipe(
+    Effect.flatMap((state) => state.result._tag === "Success"
+      ? Effect.succeed(state.result.value)
+      : state.result._tag === "Failure"
+        ? Effect.failCause(state.result.cause)
+        : Effect.interrupt)
+  )
 }
 
+/** Resolve once the entry's fetch is idle again, failing with the entry's failure cause if any. */
 const awaitErased = (
   registry: AtomRegistry.Registry,
   entry: ErasedQueryEntry
-): Effect.Effect<void, unknown> => Effect.async((resume) => {
-  let unsubscribe: (() => void) | undefined
-  let completed = false
-  const inspect = (state: ReturnType<ErasedQueryEntry["state"]>) => {
-    if (completed || state.fetchStatus !== "idle") return
-    completed = true
-    const failure = entry.failureCause(registry)
-    resume(Option.isSome(failure) ? Exit.failCause(failure.value) : Exit.void)
-    unsubscribe?.()
-  }
-  inspect(entry.state(registry))
-  if (!completed) unsubscribe = registry.subscribe(entry.stateAtom, inspect)
-  return Effect.sync(() => unsubscribe?.())
-})
+): Effect.Effect<void, unknown> =>
+  AtomRegistry.toStream(registry, entry.stateAtom).pipe(
+    Stream.filter((state) => state.fetchStatus === "idle"),
+    Stream.runHead,
+    Effect.flatMap(() => Option.match(entry.failureCause(registry), {
+      onNone: () => Effect.void,
+      onSome: Effect.failCause
+    }))
+  )
 
 const makeService = (
   registry: AtomRegistry.Registry,
+  cache: QueryCache,
   resolve: Service["resolve"]
 ): Service => {
-  const core = getClientCore(registry)
-  const entries = (filter?: QueryFilter) => [...core.entries].filter((entry) => queryMatches(registry, entry, filter))
+  const queriesAtom = Atom.subscriptionRef(cache.queries)
+  const mutationsAtom = Atom.subscriptionRef(cache.mutations)
+
+  const entries = (filter?: QueryFilter): Effect.Effect<ReadonlyArray<ErasedQueryEntry>> =>
+    Effect.map(SubscriptionRef.get(cache.queries), (current) =>
+      [...current].filter((entry) => queryMatches(registry, entry, filter)))
+
+  /** Make the entry current in the cache (restoring it if removed) and materialize its atoms. */
   const entryFor = <Input, Data, Error, Requirements>(
     query: QueryAtom<Input, Data, Error, Requirements>
-  ): readonly [ReturnType<typeof queryEntry<Data>>, boolean] => {
+  ): Effect.Effect<readonly [ReturnType<typeof queryEntry<Data>>, boolean]> => Effect.gen(function*() {
     const entry = queryEntry(query)
-    const existed = core.entries.has(entry)
+    const existed = HashSet.has(yield* SubscriptionRef.get(cache.queries), entry)
+    yield* cache.restoreQuery(entry)
     registry.get(query)
-    if (!core.entries.has(entry)) {
-      core.removed.delete(entry)
-      registerEntry(registry, entry)
-    }
-    return [entry, existed]
-  }
+    return [entry, existed] as const
+  })
+
   const fetchQuery = <Input, Data, Error, Requirements>(
     query: QueryAtom<Input, Data, Error, Requirements>
-  ): Effect.Effect<Data, Error> => Effect.suspend(() => {
-    const [entry, existed] = entryFor(query)
+  ): Effect.Effect<Data, Error> => Effect.gen(function*() {
+    const [entry, existed] = yield* entryFor(query)
     const state = entry.state(registry)
     if (existed && state.fetchStatus !== "paused" && entry.hasData(registry) && !state.isStale) {
-      return Effect.succeed(Option.getOrThrow(entry.getData(registry)))
+      return Option.getOrThrow(entry.getData(registry))
     }
     if ((existed || state.fetchStatus === "paused") && state.fetchStatus !== "fetching") entry.start(registry)
-    return awaitQuery(registry, query)
+    return yield* awaitQuery(registry, cache, query)
   })
 
   return {
+    [QueryCacheTypeId]: cache,
     resolve,
     fetch: fetchQuery,
-    ensure: (query) => Effect.suspend(() => {
-      const [entry] = entryFor(query)
+    ensure: (query) => Effect.gen(function*() {
+      const [entry] = yield* entryFor(query)
       if (entry.hasData(registry)) {
         if (entry.state(registry).isStale && entry.state(registry).fetchStatus !== "fetching") entry.start(registry)
-        return Effect.succeed(Option.getOrThrow(entry.getData(registry)))
+        return Option.getOrThrow(entry.getData(registry))
       }
       if (entry.state(registry).fetchStatus !== "fetching") entry.start(registry)
-      return awaitQuery(registry, query)
+      return yield* awaitQuery(registry, cache, query)
     }),
     prefetch: (query) => Effect.ignore(fetchQuery(query)),
-    invalidate: (filter, options) => Effect.sync(() => {
-      for (const entry of entries(filter)) {
+    invalidate: (filter, options) => Effect.gen(function*() {
+      for (const entry of yield* entries(filter)) {
         entry.invalidate(registry)
-        core.emit({ _tag: "QueryInvalidated", name: entry.name, keyHash: entry.keyHash })
+        yield* cache.emit({ _tag: "QueryInvalidated", name: entry.name, keyHash: entry.keyHash })
         if (options?.refetch !== false) entry.start(registry, { cancelRefetch: true })
       }
-      core.touch()
     }),
     refetch: (filter) => Effect.gen(function*() {
       const failures: Array<QueryBatchFailure> = []
-      for (const entry of entries(filter)) {
+      for (const entry of yield* entries(filter)) {
         entry.start(registry, { cancelRefetch: true })
         const state = yield* Effect.exit(awaitErased(registry, entry))
         if (state._tag === "Failure") failures.push({ name: entry.name, keyHash: entry.keyHash, cause: state.cause })
       }
       if (failures.length > 0) return yield* new QueryBatchError({ failures })
     }),
-    cancel: (filter) => Effect.sync(() => {
-      for (const entry of entries(filter)) entry.cancel(registry)
-      core.touch()
+    cancel: (filter) => Effect.gen(function*() {
+      for (const entry of yield* entries(filter)) entry.cancel(registry)
     }),
-    remove: (filter) => Effect.sync(() => {
-      for (const entry of entries(filter)) entry.remove(registry)
-      core.touch()
+    remove: (filter) => Effect.gen(function*() {
+      for (const entry of yield* entries(filter)) {
+        yield* cache.removeQuery(entry)
+        entry.cancel(registry)
+      }
     }),
-    getState: (query) => Effect.sync(() => {
-      const entry = queryEntry(query)
-      return core.entries.has(entry)
+    getState: (query) => Effect.map(SubscriptionRef.get(cache.queries), (current) =>
+      HashSet.has(current, queryEntry(query))
         ? Option.some(registry.get(query))
-        : Option.none()
-    }),
-    setData: (query, update) => Effect.sync(() => {
-      const [entry] = entryFor(query)
-      entry.setData(registry, update)
-      core.touch()
+        : Option.none()),
+    setData: (query, update) => Effect.gen(function*() {
+      const [entry] = yield* entryFor(query)
+      yield* entry.setData(registry, update)
     }),
     isFetching: (filter) => Atom.readable((get) => {
-      get(core.revision)
-      const matching = entries(filter)
+      const matching = [...get(queriesAtom)].filter((entry) => queryMatches(registry, entry, filter))
       for (const entry of matching) get(entry.stateAtom)
       return matching.filter((entry) => entry.state(registry).fetchStatus === "fetching").length
     }),
-    isMutating: (filter) => Atom.readable((get) => {
-      get(core.revision)
-      return core.mutationStates.filter((state) => mutationMatches(state, filter)).filter((state) =>
-        state.result.waiting || state.result._tag === "Initial"
-      ).length
-    }),
-    mutationState: (filter) => Atom.readable((get) => {
-      get(core.revision)
-      return core.mutationStates.filter((state) => mutationMatches(state, filter))
-    }),
-    reconnect: (filter) => Effect.sync(() => {
-      for (const entry of core.subscriptions) {
+    isMutating: (filter) => Atom.readable((get) =>
+      Chunk.toReadonlyArray(get(mutationsAtom))
+        .filter((state) => mutationMatches(state, filter))
+        .filter((state) => state.result.waiting || state.result._tag === "Initial")
+        .length),
+    mutationState: (filter) => Atom.readable((get) =>
+      Chunk.toReadonlyArray(get(mutationsAtom)).filter((state) => mutationMatches(state, filter))),
+    reconnect: (filter) => Effect.gen(function*() {
+      for (const entry of yield* SubscriptionRef.get(cache.subscriptions)) {
         if (subscriptionMatches(entry, filter)) entry.reconnect(registry)
       }
     }),
-    events: core.events
+    events: cache.events
   }
 }
 
-/** Internal layer constructor used by a connection-scoped Client. */
+/** Internal layer constructor used by a connection-scoped Client. Owns the client's caches. */
 export const makeLayer = (
   resolve: Service["resolve"]
 ): Layer.Layer<QueryClient, never, AtomRegistry.AtomRegistry> =>
-  Layer.effect(QueryClient, Effect.map(AtomRegistry.AtomRegistry, (registry) => makeService(registry, resolve)))
+  Layer.scoped(QueryClient, Effect.gen(function*() {
+    const registry = yield* AtomRegistry.AtomRegistry
+    const cache = yield* makeQueryCache
+    return makeService(registry, cache, resolve)
+  }))
 
 export const fetch = <Input, Data, Error, Requirements>(
   query: Query<Input, Data, Error, Requirements>,

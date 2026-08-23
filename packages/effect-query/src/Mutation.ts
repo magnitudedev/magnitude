@@ -2,20 +2,21 @@ import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
 import type * as Reactivity from "@effect/experimental/Reactivity"
+import * as Chunk from "effect/Chunk"
+import * as Clock from "effect/Clock"
+import * as Context from "effect/Context"
 import * as Data from "effect/Data"
-import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import {
-  addMutationState,
-  getClientCore,
   MutationInternalTypeId,
   mutationMatches,
   mutationController,
-  settleMutationState,
+  QueryCacheTypeId,
+  QueryClient,
   type MutationController,
   type MutationControllerCarrier
 } from "./internal.js"
@@ -105,26 +106,39 @@ export interface StateOptions<M extends AnyMutation = AnyMutation, Selected = St
   readonly select?: (state: State<M>) => Selected
 }
 
-/** Reactive mutation-cache selection, equivalent to TanStack Query's useMutationState. */
-export const state = <M extends AnyMutation = AnyMutation, Selected = State<M>>(
+/**
+ * Reactive mutation-history selection over the contextual QueryClient's cache,
+ * equivalent to TanStack Query's useMutationState.
+ */
+export function state<M extends AnyMutation, Selected>(
+  options: { readonly filters?: Filters<M>; readonly select: (state: State<M>) => Selected },
+): Effect.Effect<Atom.Atom<ReadonlyArray<Selected>>, never, QueryClient>
+export function state<M extends AnyMutation = AnyMutation>(
+  options?: { readonly filters?: Filters<M> },
+): Effect.Effect<Atom.Atom<ReadonlyArray<State<M>>>, never, QueryClient>
+export function state<M extends AnyMutation, Selected>(
   options: StateOptions<M, Selected> = {},
-): Atom.Atom<ReadonlyArray<Selected>> => Atom.readable((get) => {
-  const core = getClientCore(get.registry)
-  get(core.revision)
-  const states = core.mutationStates.filter((state) =>
-    mutationMatches(state, mutationFilter(options.filters))) as unknown as ReadonlyArray<State<M>>
-  return options.select === undefined
-    ? states as unknown as ReadonlyArray<Selected>
-    : states.map(options.select)
-})
+): Effect.Effect<Atom.Atom<ReadonlyArray<State<M> | Selected>>, never, QueryClient> {
+  const filter = mutationFilter(options.filters)
+  const select = options.select
+  return Effect.map(QueryClient, (client) => {
+    const history = Atom.subscriptionRef(client[QueryCacheTypeId].mutations)
+    return Atom.readable((get) => {
+      const matching = Chunk.toReadonlyArray(get(history))
+        .filter((entry): entry is State<M> => mutationMatches(entry, filter))
+      return select === undefined ? matching : matching.map(select)
+    })
+  })
+}
 
-/** Number of matching pending mutation states, equivalent to TanStack Query's useIsMutating. */
+/** Number of matching pending mutations, equivalent to TanStack Query's useIsMutating. */
 export const isMutating = <M extends AnyMutation = AnyMutation>(
   filters?: Filters<M>,
-): Atom.Atom<number> => state({
-  filters: { ...filters, status: "pending" },
-  select: () => 1,
-}).pipe(Atom.map((matches) => matches.length))
+): Effect.Effect<Atom.Atom<number>, never, QueryClient> =>
+  Effect.map(
+    state({ filters: { ...filters, status: "pending" } }),
+    (matches) => Atom.map(matches, (states) => states.length)
+  )
 
 export interface Options<Input, Output, CommandError, CommandRequirements, SynchronizationError, SynchronizationRequirements> {
   readonly effect: (input: Input) => Effect.Effect<Output, CommandError, CommandRequirements>
@@ -155,16 +169,6 @@ export type DeclarationOptions<
   readonly scope?: (input: Input) => MutationScope
   readonly retry?: Schedule.Schedule<unknown, CommandError, never>
   readonly gcTime?: Duration.DurationInput
-}
-
-interface Invocation<Input, Output, Error> {
-  readonly id: MutationStateId
-  readonly input: Input
-  readonly registry: AtomRegistry.Registry
-  readonly deferred: Deferred.Deferred<Output, Error>
-  readonly cancellation: Deferred.Deferred<void>
-  result: AtomResult.Result<Output, Error>
-  started: boolean
 }
 
 let nextMutationStateId = 0
@@ -241,6 +245,10 @@ export function make(
     : definition
 }
 
+type Command<Input> =
+  | { readonly _tag: "Submit"; readonly id: MutationStateId; readonly input: Input }
+  | { readonly _tag: "Interrupt" }
+
 export const makeAtom = <
   Provided,
   RuntimeError,
@@ -250,7 +258,7 @@ export const makeAtom = <
   Required extends Provided | Reactivity.Reactivity,
   SynchronizationError,
 >(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  runtime: Atom.AtomRuntime<Provided | QueryClient, RuntimeError>,
   definition: Mutation<
     Input,
     Output,
@@ -275,146 +283,138 @@ export const makeAtom = <
     Required
   >
   type PublicError = CommandError | RuntimeError | MutationSynchronizationError<Output, SynchronizationError>
-  type CurrentInvocation = Invocation<Input, Output, PublicError>
-  const registryAtom = Atom.readable((get) => get.registry)
-  const activeByRegistry = new WeakMap<AtomRegistry.Registry, Map<MutationStateId, CurrentInvocation>>()
-  const activeFor = (registry: AtomRegistry.Registry): Map<MutationStateId, CurrentInvocation> => {
-    const existing = activeByRegistry.get(registry)
-    if (existing !== undefined) return existing
-    const active = new Map<MutationStateId, CurrentInvocation>()
-    activeByRegistry.set(registry, active)
-    return active
-  }
-  const gcTime = Duration.toMillis(Duration.decode(options.gcTime ?? Duration.minutes(5)))
-  const completeInvocation = (
-    core: ReturnType<typeof getClientCore>,
-    invocation: CurrentInvocation,
-    result: AtomResult.Result<Output, PublicError>
-  ) => {
-    invocation.result = result
-    settleMutationState(core, invocation.id, result)
-    if (gcTime === Number.POSITIVE_INFINITY) return
-    const timer = setTimeout(() => {
-      const index = core.mutationStates.findIndex((state) => state.id === invocation.id)
-      if (index >= 0) core.mutationStates.splice(index, 1)
-      if (core.registry.getNodes().has(core.revision)) core.touch()
-    }, gcTime)
-    timer.unref()
-  }
-  let mutation!: MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
+  type PublicResult = AtomResult.Result<Output, PublicError>
+  const gcTime = options.gcTime ?? Duration.minutes(5)
 
-  const run = runtime.fn<CurrentInvocation>()((invocation) => {
-    if (invocation.started) {
-      return Deferred.await(invocation.deferred)
-    }
-    invocation.started = true
-    const core = getClientCore(invocation.registry)
-    const command = options.retry === undefined
-      ? Effect.suspend(() => options.effect(invocation.input))
-      : Effect.retry(Effect.suspend(() => options.effect(invocation.input)), options.retry)
-    let operation = command.pipe(
-        Effect.flatMap((output) => options.synchronize === undefined
-          ? Effect.succeed(output)
-          : options.synchronize(output, invocation.input).pipe(
-            Effect.mapError((error) => new MutationSynchronizationError({ output, error })),
-            Effect.as(output)
-          ))
-      )
+  /**
+   * The invocation this atom presents. Atom state is per registry by
+   * construction; kept alive so the presented invocation survives the atom
+   * being unobserved, as it did with a per-registry map.
+   */
+  const latestId = Atom.keepAlive(Atom.make(Option.none<MutationStateId>()))
 
-    const scope = options.scope?.(invocation.input)
-    if (scope !== undefined) {
-      let semaphore = core.mutationScopes.get(scope)
-      if (semaphore === undefined) {
-        semaphore = Effect.unsafeMakeSemaphore(1)
-        core.mutationScopes.set(scope, semaphore)
-      }
+  /**
+   * Submission and interruption run as Effects in the client's context. A
+   * submitted command becomes a fiber of the cache scope, so it outlives this
+   * evaluation, is serialized by its semantic scope, and is interrupted by
+   * `Atom.Interrupt` or by disposing the registry.
+   */
+  const run = runtime.fn<Command<Input>>()((command) => Effect.gen(function*() {
+    const cache = (yield* QueryClient)[QueryCacheTypeId]
+    if (command._tag === "Interrupt") return yield* cache.interruptInvocations(definition)
+    const { id, input } = command
+    const scope = Option.fromNullable(options.scope?.(input))
+    yield* cache.addMutation({
+      id,
+      mutation: definition,
+      input,
+      result: AtomResult.initial(true),
+      scope,
+      submittedAt: yield* Clock.currentTimeMillis,
+      settledAt: Option.none()
+    })
+    yield* cache.emit({ _tag: "MutationStarted", name, id })
+    const command$ = options.retry === undefined
+      ? Effect.suspend(() => options.effect(input))
+      : Effect.retry(Effect.suspend(() => options.effect(input)), options.retry)
+    let operation: Effect.Effect<Output, PublicError, Required> = command$.pipe(
+      Effect.flatMap((output) => options.synchronize === undefined
+        ? Effect.succeed(output)
+        : options.synchronize(output, input).pipe(
+          Effect.mapError((error) => new MutationSynchronizationError({ output, error })),
+          Effect.as(output)
+        ))
+    )
+    if (Option.isSome(scope)) {
+      const semaphore = yield* cache.scopeSemaphore(scope.value)
       operation = semaphore.withPermits(1)(operation)
     }
-
-    return Effect.raceFirst(
-      operation,
-      Deferred.await(invocation.cancellation).pipe(Effect.zipRight(Effect.interrupt))
-    ).pipe(
-      Effect.onExit((exit) => Deferred.done(invocation.deferred, exit).pipe(
-        Effect.zipRight(Effect.sync(() => {
-          activeFor(invocation.registry).delete(invocation.id)
-          completeInvocation(
-            core,
-            invocation,
-            AtomResult.fromExit(exit)
-          )
-        }))
-      ))
+    const context = yield* Effect.context<Required>()
+    yield* cache.runInvocation(
+      id,
+      definition,
+      operation.pipe(
+        Effect.provide(context),
+        Effect.onExit((exit) => cache.settleMutation(id, AtomResult.fromExit(exit)))
+      )
     )
-  }, { concurrent: true })
+  }))
 
-  const latest = new WeakMap<AtomRegistry.Registry, CurrentInvocation>()
-  const writable = Atom.writable(
+  /**
+   * The history entry of one invocation: `None` while the runtime is still
+   * building, otherwise whether the entry is present. A fresh node reads the
+   * current history synchronously and follows changes thereafter, so the entry
+   * is visible in the same evaluation that submitted it; absence means the
+   * history has forgotten it.
+   */
+  const historyEntry = Atom.family((id: MutationStateId) =>
+    runtime.subscriptionRef(Effect.map(QueryClient, (client) => client[QueryCacheTypeId].mutations)).pipe(
+      Atom.map((history) => history._tag === "Success"
+        ? Option.some(Chunk.findFirst(history.value, (entry) => entry.id === id))
+        : Option.none<Option.Option<AnyMutationState>>())
+    ))
+
+  /**
+   * History retention for one invocation: the entry stays in the cache while
+   * this node is observed and `gcTime` after it loses its last observer.
+   */
+  const retention = Atom.family((id: MutationStateId) => Atom.setIdleTTL(
+    runtime.atom(Effect.gen(function*() {
+      const cache = (yield* QueryClient)[QueryCacheTypeId]
+      yield* Effect.acquireRelease(Effect.void, () => cache.forgetMutation(id))
+    })),
+    gcTime
+  ))
+
+  const writable = Atom.writable<PublicResult, Input | Atom.Reset | Atom.Interrupt>(
     (get) => {
-      const core = getClientCore(get.registry)
-      get(core.revision)
-      const result = run.read(get)
-      const invocation = latest.get(get.registry)
-      if (invocation !== undefined && (invocation.result._tag === "Initial" || invocation.result.waiting)
-        && result._tag === "Failure" && !result.waiting) {
-        activeFor(get.registry).delete(invocation.id)
-        Effect.runSync(Deferred.failCause(invocation.deferred, result.cause))
-        completeInvocation(getClientCore(get.registry), invocation, result)
-      }
-      return invocation === undefined
-        ? result
-        : invocation.result
+      const runResult = get(run)
+      const fallback = (): PublicResult => runResult._tag === "Failure"
+        ? AtomResult.failure(runResult.cause)
+        : AtomResult.initial()
+      const latest = get(latestId)
+      if (Option.isNone(latest)) return fallback()
+      get(retention(latest.value))
+      const history = get(historyEntry(latest.value))
+      if (Option.isNone(history)) return runResult._tag === "Failure" ? fallback() : AtomResult.initial(true)
+      return Option.match(history.value, {
+        onNone: fallback,
+        onSome: (entry) => entry.result as PublicResult
+      })
     },
     (ctx, value: Input | Atom.Reset | Atom.Interrupt) => {
       if (value === Atom.Reset) {
-        latest.delete(ctx.get(registryAtom))
-        run.write(ctx, Atom.Reset)
+        ctx.set(latestId, Option.none())
+        ctx.set(run, Atom.Reset)
         return
       }
       if (value === Atom.Interrupt) {
-        for (const invocation of activeFor(ctx.get(registryAtom)).values()) {
-          Effect.runSync(Deferred.succeed(invocation.cancellation, undefined))
-        }
-        run.write(ctx, Atom.Interrupt)
+        ctx.set(run, { _tag: "Interrupt" })
         return
       }
-      const registry = ctx.get(registryAtom)
-      const core = getClientCore(registry)
-      const id = MutationStateId(`${name}:${Date.now()}:${nextMutationStateId++}`)
-      const state: MutationState<Input, Output, PublicError> = {
-        id,
-        mutation: definition,
-        input: value,
-        result: AtomResult.initial(true),
-        scope: Option.fromNullable(options.scope?.(value)),
-        submittedAt: Date.now(),
-        settledAt: Option.none()
-      }
-      addMutationState(core, state)
-      core.emit({ _tag: "MutationStarted", name, id })
-      const invocation: CurrentInvocation = {
-        id,
-        input: value,
-        registry,
-        deferred: Effect.runSync(Deferred.make<Output, PublicError>()),
-        cancellation: Effect.runSync(Deferred.make<void>()),
-        result: AtomResult.initial(true),
-        started: false
-      }
-      latest.set(registry, invocation)
-      activeFor(registry).set(id, invocation)
-      run.write(ctx, invocation)
+      const id = MutationStateId(`${name}:${nextMutationStateId++}`)
+      ctx.set(latestId, Option.some(id))
+      ctx.set(run, { _tag: "Submit", id, input: value })
     }
   )
 
+  let mutation!: MutationAtom<Input, Output, CommandError | RuntimeError, Required, SynchronizationError>
   const internal: MutationController<Input, Output, PublicError> = {
-    invoke: (registry, input) => {
-      registry.get(mutation)
+    submit: (registry, input) => {
       registry.set(mutation, input)
-      const invocation = latest.get(registry)
-      if (invocation === undefined) throw new Error(`Mutation ${name} did not create invocation state`)
-      return { id: invocation.id, await: Deferred.await(invocation.deferred) }
-    }
+      return Option.getOrThrow(registry.get(latestId))
+    },
+    await: (registry, id) => Effect.gen(function*() {
+      const built = yield* AtomRegistry.getResult(registry, runtime)
+      const cache = Context.get(built.context, QueryClient)[QueryCacheTypeId]
+      const settled = yield* cache.awaitMutation(id)
+      const result = settled.result as PublicResult
+      return result._tag === "Success"
+        ? result.value
+        : result._tag === "Failure"
+          ? yield* Effect.failCause(result.cause)
+          : yield* Effect.dieMessage(`Mutation ${id} settled without a result`)
+    })
   }
   mutation = Object.assign(writable, {
     [MutationInternalTypeId]: internal,
@@ -435,9 +435,7 @@ export const execute = <Input, Output, CommandError, Requirements, Synchronizati
   const controller = mutationController(mutation)
   return yield* Effect.acquireUseRelease(
     Effect.sync(() => registry.mount(mutation)),
-    () => {
-      return controller.invoke(registry, input).await
-    },
+    () => controller.await(registry, controller.submit(registry, input)),
     (unmount) => Effect.sync(unmount)
   )
 })

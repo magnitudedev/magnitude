@@ -3,23 +3,24 @@ import * as AtomRegistry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
 import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Cause from "effect/Cause"
-import * as Deferred from "effect/Deferred"
+import * as Clock from "effect/Clock"
 import * as Duration from "effect/Duration"
 import * as EffectData from "effect/Data"
 import * as Effect from "effect/Effect"
 import type * as Equivalence from "effect/Equivalence"
 import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
+import * as FiberId from "effect/FiberId"
 import * as Hash from "effect/Hash"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import {
-  getClientCore,
+  QueryCacheTypeId,
+  QueryClient,
   QueryEntryTypeId,
-  registerEntry,
+  type QueryCache,
   type QueryEntry,
   type QueryEntryCarrier,
   type QueryFilter
@@ -161,42 +162,55 @@ interface InternalOptions<Input, Data, Error, Requirements> {
   readonly source: Source<Input, Data, Error, Requirements>
 }
 
-interface StreamFailure<Error> {
-  readonly cause: Cause.Cause<Error>
-  readonly request: number
+/** Position of one fetch attempt: a generation is started explicitly, attempts within it are trailing refetches. */
+interface Sequence {
+  readonly generation: number
+  readonly attempt: number
 }
 
-interface Control<Data, Error> {
+const after = (a: Sequence, b: Sequence): boolean =>
+  a.generation > b.generation || (a.generation === b.generation && a.attempt > b.attempt)
+
+const sameSequence = (a: Sequence, b: Sequence): boolean =>
+  a.generation === b.generation && a.attempt === b.attempt
+
+/** Elements of the fetch stream; the atom graph derives everything else from the latest one. */
+type FetchEvent<Data, Error> =
+  | { readonly _tag: "Started"; readonly sequence: Sequence }
+  | {
+    readonly _tag: "Settled"
+    readonly sequence: Sequence
+    readonly data: Data
+    readonly invalidation: number
+    readonly updatedAt: number
+  }
+  | { readonly _tag: "Failed"; readonly sequence: Sequence; readonly cause: Cause.Cause<Error> }
+
+interface Override<Data> {
+  readonly data: Data
+  readonly updatedAt: number
+  readonly sequence: Sequence
   readonly invalidation: number
-  readonly acceptedInvalidation: number
-  readonly override: Option.Option<Data>
-  readonly overrideUpdatedAt: Option.Option<number>
-  readonly overrideRequest: number
-  readonly failureCount: number
-  readonly cancelled: boolean
-  readonly refetchRequest: Option.Option<number>
-  /** Terminal stream failure after data was produced (fold source only). */
-  readonly streamFailure: Option.Option<StreamFailure<Error>>
 }
 
-interface FetchedValue<Data> {
+interface Control<Data> {
+  readonly invalidation: number
+  readonly cancelled: boolean
+  /** Generation started as a replacement while a fetch was active; later cancel-refetch starts coalesce into it. */
+  readonly replacement: Option.Option<number>
+  readonly override: Option.Option<Override<Data>>
+}
+
+interface Accepted<Data> {
+  readonly sequence: Sequence
   readonly data: Data
   readonly invalidation: number
-  readonly request: number
+  readonly updatedAt: number
 }
 
-const resultTimestamp = <A, E>(result: AtomResult.Result<A, E>): Option.Option<number> => {
-  if (result._tag === "Success") return Option.some(result.timestamp)
-  if (result._tag === "Failure") return Option.map(result.previousSuccess, (success) => success.timestamp)
-  return Option.none()
-}
-
-const normalizeInterrupted = <A, E>(result: AtomResult.Result<A, E>): AtomResult.Result<A, E> => {
-  if (!AtomResult.isInterrupted(result)) return result
-  return Option.match(result.previousSuccess, {
-    onNone: () => AtomResult.initial(),
-    onSome: (success) => AtomResult.success(success.value, success)
-  })
+interface Failures<Error> {
+  readonly count: number
+  readonly latest: Option.Option<{ readonly sequence: Sequence; readonly cause: Cause.Cause<Error> }>
 }
 
 const validatedKey = (name: string, key: QueryKey): QueryKey => {
@@ -344,7 +358,7 @@ export function fromStream(
 }
 
 export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Required extends Provided | Reactivity.Reactivity>(
-  runtime: Atom.AtomRuntime<Provided, RuntimeError>,
+  runtime: Atom.AtomRuntime<Provided | QueryClient, RuntimeError>,
   definition: Query<Input, Data, Error, Required>
 ): ((input: Input) => QueryAtom<Input, Data, Error | RuntimeError, Required>) => {
   const { name } = definition
@@ -353,137 +367,187 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
   const gcTime = options.gcTime ?? Duration.minutes(5)
   const keyFor = (input: Input): QueryKey => validatedKey(name, options.key(input))
   const source = options.source
+  type Event = FetchEvent<Data, Error>
 
   const family = Atom.family((identity: QueryKey) => {
     let canonicalInput!: Input
     let hasCanonicalInput = false
+    const keyHash = Hash.hash(identity)
     const retain = <A extends Atom.Atom<any>>(atom: A): A => Atom.setIdleTTL(atom, gcTime)
-    const control = retain(Atom.make<Control<Data, Error>>({
+    const control = retain(Atom.make<Control<Data>>({
       invalidation: 0,
-      acceptedInvalidation: -1,
-      override: Option.none(),
-      overrideUpdatedAt: Option.none(),
-      overrideRequest: -1,
-      failureCount: 0,
       cancelled: false,
-      refetchRequest: Option.none(),
-      streamFailure: Option.none()
+      replacement: Option.none(),
+      override: Option.none()
     }))
-    const request = retain(Atom.make(0))
+    /** Explicitly started fetch generation; bumping it reopens the fetch stream. */
+    const generation = retain(Atom.make(0))
 
+    const cacheOf = Effect.map(QueryClient, (client): QueryCache => client[QueryCacheTypeId])
+
+    /**
+     * One fetch attempt of the request/response source, followed by a trailing
+     * attempt whenever the entry was invalidated while this one was in flight.
+     */
     const loadEffect = (
-      input: Input,
-      invalidation: number,
-      requestId: number,
+      registry: AtomRegistry.Registry,
       effect: (input: Input) => Effect.Effect<Data, Error, Required>,
-      retry: Schedule.Schedule<unknown, Error, never> | undefined
-    ): Effect.Effect<FetchedValue<Data>, Error, Required> => {
-      let run = Effect.suspend(() => effect(input))
-      if (retry !== undefined) run = Effect.retry(run, retry)
-      return Effect.map(run, (data): FetchedValue<Data> => ({ data, invalidation, request: requestId }))
+      retry: Schedule.Schedule<unknown, Error, never> | undefined,
+      sequence: Sequence,
+      capturedInvalidation: number
+    ): Stream.Stream<Event, never, Required | QueryClient> => {
+      const started: Event = { _tag: "Started", sequence }
+      const run = retry === undefined
+        ? Effect.suspend(() => effect(canonicalInput))
+        : Effect.retry(Effect.suspend(() => effect(canonicalInput)), retry)
+      const outcome = Stream.unwrap(Effect.gen(function*() {
+        const cache = yield* cacheOf
+        yield* cache.emit({ _tag: "FetchStarted", name, keyHash })
+        const exit = yield* Effect.exit(run)
+        yield* cache.emit({ _tag: "FetchSettled", name, keyHash, success: Exit.isSuccess(exit) })
+        const event: Event = Exit.isSuccess(exit)
+          ? {
+            _tag: "Settled",
+            sequence,
+            data: exit.value,
+            invalidation: capturedInvalidation,
+            updatedAt: yield* Clock.currentTimeMillis
+          }
+          : { _tag: "Failed", sequence, cause: exit.cause }
+        const current = registry.get(control)
+        const trailing = !current.cancelled && current.invalidation > capturedInvalidation
+          ? loadEffect(
+            registry,
+            effect,
+            retry,
+            { generation: sequence.generation, attempt: sequence.attempt + 1 },
+            current.invalidation
+          )
+          : Stream.empty
+        return Stream.concat(Stream.make(event), trailing)
+      }))
+      return Stream.concat(Stream.make(started), outcome)
     }
 
     /**
-     * Fold source: the first stream element resolves the fetch; later elements
-     * are applied as data overrides while the stream stays open in the atom's
-     * scope. A terminal failure after data was produced is surfaced as a
-     * failure carrying the previous success.
+     * Fold source: the first element settles the fetch and every later element
+     * settles it again with reduced data while the stream stays open. A terminal
+     * failure after data was produced is a `Failed` event whose previous success
+     * is retained by the derivation below.
      */
     const loadFold = (
-      input: Input,
-      invalidation: number,
-      requestId: number,
       registry: AtomRegistry.Registry,
       fold: (input: Input) => Stream.Stream<(previous: Option.Option<Data>) => Data, Error, Required>,
-      reconnect: Schedule.Schedule<unknown, Error, never> | undefined
-    ): Effect.Effect<FetchedValue<Data>, Error, Required | Scope.Scope> => Effect.gen(function*() {
-      // Leave the registry's synchronous evaluation before any element can write
-      // atom state (a yield alone is drained synchronously by the registry).
-      yield* Effect.async<void>((resume) => {
-        queueMicrotask(() => resume(Effect.void))
-      })
-      const first = yield* Deferred.make<FetchedValue<Data>, Error>()
-      let current = Option.none<Data>()
-      let stream = fold(input)
-      if (reconnect !== undefined) stream = Stream.retry(stream, reconnect)
-      const isCurrentRequest = () => registry.getNodes().has(control) && registry.get(request) === requestId
-      yield* stream.pipe(
-        Stream.runForEach((step) => Effect.sync(() => {
-          const next = step(current)
-          const isFirst = Option.isNone(current)
-          current = Option.some(next)
-          if (isFirst) {
-            Deferred.unsafeDone(first, Exit.succeed({ data: next, invalidation, request: requestId }))
-            return
+      reconnect: Schedule.Schedule<unknown, Error, never> | undefined,
+      sequence: Sequence,
+      capturedInvalidation: number
+    ): Stream.Stream<Event, never, Required | QueryClient> => {
+      const started: Event = { _tag: "Started", sequence }
+      const outcome = Stream.unwrap(Effect.gen(function*() {
+        const cache = yield* cacheOf
+        yield* cache.emit({ _tag: "FetchStarted", name, keyHash })
+        let produced = false
+        let stream = fold(canonicalInput)
+        if (reconnect !== undefined) stream = Stream.retry(stream, reconnect)
+        const settled: Stream.Stream<Event, never, Required> = stream.pipe(
+          Stream.mapAccum(Option.none<Data>(), (previous, step) => {
+            const next = step(previous)
+            return [Option.some(next), next]
+          }),
+          Stream.mapEffect((data) => Effect.map(Clock.currentTimeMillis, (updatedAt): Event => {
+            produced = true
+            return { _tag: "Settled", sequence, data, invalidation: capturedInvalidation, updatedAt }
+          })),
+          Stream.catchAllCause((cause): Stream.Stream<Event> => {
+            if (Cause.isInterruptedOnly(cause)) return Stream.empty
+            const failed: Event = { _tag: "Failed", sequence, cause }
+            return Stream.succeed(failed)
+          })
+        )
+        const closing = Stream.unwrap(Effect.gen(function*() {
+          yield* cache.emit({ _tag: "FetchSettled", name, keyHash, success: produced })
+          if (!produced) {
+            const failed: Event = {
+              _tag: "Failed",
+              sequence,
+              cause: Cause.die(new Error(`Query ${name}: stream completed before producing data`))
+            }
+            return Stream.make(failed)
           }
-          if (!isCurrentRequest()) return
-          registry.update(control, (state) => ({
-            ...state,
-            override: Option.some(next),
-            overrideUpdatedAt: Option.some(Date.now()),
-            overrideRequest: requestId,
-            acceptedInvalidation: state.invalidation
-          }))
-        })),
-        Effect.onExit((exit) => Effect.sync(() => {
-          if (Option.isNone(current)) {
-            Deferred.unsafeDone(
-              first,
-              Exit.isFailure(exit)
-                ? Exit.failCause(exit.cause)
-                : Exit.die(new Error(`Query ${name}: stream completed before producing data`))
+          const current = registry.get(control)
+          return !current.cancelled && current.invalidation > capturedInvalidation
+            ? loadFold(
+              registry,
+              fold,
+              reconnect,
+              { generation: sequence.generation, attempt: sequence.attempt + 1 },
+              current.invalidation
             )
-            return
-          }
-          if (Exit.isSuccess(exit) || Cause.isInterruptedOnly(exit.cause) || !isCurrentRequest()) return
-          registry.update(control, (state) => ({
-            ...state,
-            streamFailure: Option.some({ cause: exit.cause, request: requestId })
-          }))
-        })),
-        Effect.forkScoped
-      )
-      return yield* Deferred.await(first)
-    })
+            : Stream.empty
+        }))
+        return Stream.concat(settled, closing)
+      }))
+      return Stream.concat(Stream.make(started), outcome)
+    }
 
+    /**
+     * The fetch stream of the current generation. Elements are applied to the
+     * graph by the atom runtime; nothing in the stream writes atoms. A cancelled
+     * generation is an interrupted result so retained data stays visible.
+     */
     const fetched = retain(runtime.atom((get) => {
-      const requestId = get(request)
+      const currentGeneration = get(generation)
       const captured = get.once(control)
       const registry = get.registry
-      const core = getClientCore(registry)
-      if (captured.cancelled) return Effect.interrupt
-      core.emit({ _tag: "FetchStarted", name, keyHash: Hash.hash(identity) })
-      core.touch()
-      const load = source._tag === "Effect"
-        ? loadEffect(canonicalInput, captured.invalidation, requestId, source.effect, source.retry)
-        : loadFold(canonicalInput, captured.invalidation, requestId, registry, source.fold, source.reconnect)
-      return load.pipe(
-        Effect.onExit((exit) => Effect.sync(() => {
-          core.emit({
-            _tag: "FetchSettled",
-            name,
-            keyHash: Hash.hash(identity),
-            success: exit._tag === "Success"
-          })
-          core.touch()
-          queueMicrotask(() => {
-            if (!registry.getNodes().has(control)) return
-            if (registry.get(request) !== requestId) return
-            let refetch = false
-            registry.update(control, (current) => {
-              refetch = !current.cancelled && current.invalidation > captured.invalidation
-              return {
-                ...current,
-                failureCount: exit._tag === "Success" ? 0 : current.failureCount + 1,
-                refetchRequest: refetch
-                  ? Option.some(requestId + 1)
-                  : Option.none()
-              }
-            })
-            if (refetch) registry.update(request, (value) => value + 1)
-          })
-        }))
+      if (captured.cancelled) return Stream.failCause(Cause.interrupt(FiberId.none))
+      const sequence: Sequence = { generation: currentGeneration, attempt: 0 }
+      return source._tag === "Effect"
+        ? loadEffect(registry, source.effect, source.retry, sequence, captured.invalidation)
+        : loadFold(registry, source.fold, source.reconnect, sequence, captured.invalidation)
+    }))
+
+    const latestEvent = (get: Atom.Context): Option.Option<Event> => AtomResult.value(get(fetched))
+
+    /** The most recent settled data; remembered across later attempts and generations. */
+    const accepted = retain(Atom.readable<Option.Option<Accepted<Data>>>((get) => {
+      const previous = Option.flatten(get.self<Option.Option<Accepted<Data>>>())
+      const event = latestEvent(get)
+      if (Option.isSome(event) && event.value._tag === "Settled") {
+        const { sequence, data, invalidation, updatedAt } = event.value
+        return Option.some({ sequence, data, invalidation, updatedAt })
+      }
+      return previous
+    }))
+
+    /** Consecutive failed attempts, and the latest failure; reset by a settled attempt. */
+    const failures = retain(Atom.readable<Failures<Error | RuntimeError>>((get) => {
+      const previous = Option.getOrElse(
+        get.self<Failures<Error | RuntimeError>>(),
+        (): Failures<Error | RuntimeError> => ({ count: 0, latest: Option.none() })
       )
+      const result = get(fetched)
+      if (result._tag === "Failure" && !Cause.isInterruptedOnly(result.cause)) {
+        // The runtime failed to build, or the stream itself failed.
+        return {
+          count: previous.count + 1,
+          latest: Option.some({ sequence: { generation: -1, attempt: previous.count }, cause: result.cause })
+        }
+      }
+      const event = AtomResult.value(result)
+      if (Option.isNone(event)) return previous
+      switch (event.value._tag) {
+        case "Settled":
+          return { count: 0, latest: Option.none() }
+        case "Failed": {
+          const counted = Option.exists(previous.latest, (latest) => sameSequence(latest.sequence, event.value.sequence))
+          return {
+            count: counted ? previous.count : previous.count + 1,
+            latest: Option.some({ sequence: event.value.sequence, cause: event.value.cause })
+          }
+        }
+        case "Started":
+          return previous
+      }
     }))
 
     const scheduler = options.refresh === undefined ? undefined : runtime.atom((get) => {
@@ -501,36 +565,56 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
     })
 
     let entry!: QueryEntry<Data>
+    // Membership in the client's cache lasts exactly as long as this node: the
+    // registration node depends only on the runtime, so it is evaluated once and
+    // released when it loses its last child (the state atom below).
+    const registration = Atom.setIdleTTL(
+      runtime.atom(Effect.gen(function*() {
+        const cache = yield* cacheOf
+        yield* Effect.acquireRelease(cache.registerQuery(entry), () => cache.unregisterQuery(entry))
+      })),
+      0
+    )
     let atom = Atom.readable<State<Data, Error | RuntimeError>>((get) => {
-      const unregister = registerEntry(get.registry, entry)
-      get.addFinalizer(unregister)
+      const registered = get(registration)
+      if (registered._tag === "Failure") throw Cause.squash(registered.cause)
       if (scheduler !== undefined) get(scheduler)
       const current = get(control)
-      const currentRequest = get(request)
-      const fetchedResult = normalizeInterrupted(get(fetched))
-      const accepted = AtomResult.value(fetchedResult)
-      const hasOverride = Option.isSome(current.override)
-        && (Option.isNone(accepted) || current.overrideRequest >= accepted.value.request)
-      let result: AtomResult.Result<Data, Error | RuntimeError> = AtomResult.map(fetchedResult, (value) => value.data)
-      if (hasOverride && Option.isSome(current.override)) {
-        result = AtomResult.success(current.override.value, {
-          timestamp: Option.getOrElse(current.overrideUpdatedAt, () => Date.now()),
-          waiting: result.waiting
+      const fetchedResult = get(fetched)
+      const acceptedValue = get(accepted)
+      const failed = get(failures)
+      // A fetch is in flight from `Started` until that attempt settles or fails;
+      // a fold source stays open after its first element without "fetching".
+      const fetching = Option.match(AtomResult.value(fetchedResult), {
+        onNone: () => fetchedResult.waiting,
+        onSome: (event) => event._tag === "Started"
+      })
+
+      const supersededBy = (sequence: Sequence): boolean =>
+        Option.exists(acceptedValue, (value) => after(value.sequence, sequence))
+      const override = Option.filter(current.override, (value) => !supersededBy(value.sequence))
+      const failure = Option.filter(failed.latest, (value) => !supersededBy(value.sequence))
+      const previousSuccess = Option.map(acceptedValue, (value) =>
+        AtomResult.success(value.data, { timestamp: value.updatedAt }))
+      const result: AtomResult.Result<Data, Error | RuntimeError> = Option.match(override, {
+        onSome: (value) => AtomResult.success(value.data, { timestamp: value.updatedAt, waiting: fetching }),
+        onNone: () => Option.match(failure, {
+          onSome: (value) => AtomResult.failure<Data, Error | RuntimeError>(value.cause, { previousSuccess, waiting: fetching }),
+          onNone: () => Option.match(previousSuccess, {
+            onNone: () => AtomResult.initial<Data, Error | RuntimeError>(fetching),
+            onSome: (success) => AtomResult.success(success.value, { timestamp: success.timestamp, waiting: fetching })
+          })
         })
-      }
-      if (
-        result._tag === "Success"
-        && Option.isSome(current.streamFailure)
-        && current.streamFailure.value.request === currentRequest
-      ) {
-        result = AtomResult.failure(current.streamFailure.value.cause, { previousSuccess: Option.some(result) })
-      }
-      const updatedAt = hasOverride && Option.isSome(current.overrideUpdatedAt)
-        ? current.overrideUpdatedAt
-        : resultTimestamp(result)
-      const acceptedInvalidation = hasOverride
-        ? current.acceptedInvalidation
-        : Option.match(accepted, { onNone: () => -1, onSome: (value) => value.invalidation })
+      })
+
+      const updatedAt = Option.match(override, {
+        onSome: (value) => Option.some(value.updatedAt),
+        onNone: () => Option.map(acceptedValue, (value) => value.updatedAt)
+      })
+      const acceptedInvalidation = Option.match(override, {
+        onSome: (value) => value.invalidation,
+        onNone: () => Option.match(acceptedValue, { onNone: () => -1, onSome: (value) => value.invalidation })
+      })
       const ageFresh = staleTime === Number.POSITIVE_INFINITY
         || Option.exists(updatedAt, (timestamp) => Date.now() - timestamp < staleTime)
       const isStale = acceptedInvalidation < current.invalidation || !ageFresh
@@ -540,10 +624,10 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
       }
       return EffectData.struct({
         result,
-        fetchStatus: current.cancelled ? "paused" : result.waiting ? "fetching" : "idle",
+        fetchStatus: current.cancelled ? "paused" : fetching ? "fetching" : "idle",
         isStale,
         dataUpdatedAt: updatedAt,
-        failureCount: current.failureCount
+        failureCount: failed.count
       })
     }, (refresh) => refresh(fetched))
     atom = retain(atom)
@@ -553,7 +637,7 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
       definition,
       name,
       key: identity,
-      keyHash: Hash.hash(identity),
+      keyHash,
       state: (registry) => {
         const state = registry.get(atom)
         return { fetchStatus: state.fetchStatus, isStale: state.isStale }
@@ -564,51 +648,50 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
       },
       start: (registry, options) => {
         const status = entry.state(registry).fetchStatus
-        const nextRequest = registry.get(request) + 1
+        const currentGeneration = registry.get(generation)
         let shouldStart = status !== "fetching"
         registry.update(control, (current) => {
-          if (status === "fetching" && options?.cancelRefetch === true && Option.isNone(current.refetchRequest)) {
+          if (
+            status === "fetching"
+            && options?.cancelRefetch === true
+            && !Option.contains(current.replacement, currentGeneration)
+          ) {
             shouldStart = true
           }
           return {
             ...current,
             cancelled: false,
-            refetchRequest: shouldStart && status === "fetching"
-              ? Option.some(nextRequest)
-              : current.refetchRequest
+            replacement: shouldStart && status === "fetching"
+              ? Option.some(currentGeneration + 1)
+              : current.replacement
           }
         })
-        if (shouldStart) registry.update(request, () => nextRequest)
+        if (shouldStart) registry.update(generation, () => currentGeneration + 1)
       },
       cancel: (registry) => {
-        registry.update(control, (current) => ({
-          ...current,
-          cancelled: true,
-          refetchRequest: Option.none()
-        }))
-        registry.update(request, (value) => value + 1)
+        registry.update(control, (current) => ({ ...current, cancelled: true }))
+        registry.update(generation, (value) => value + 1)
       },
       invalidate: (registry) => {
         registry.update(control, (current) => ({ ...current, invalidation: current.invalidation + 1 }))
       },
-      remove: (registry) => {
-        const core = getClientCore(registry)
-        core.removed.add(entry)
-        core.entries.delete(entry)
-        entry.cancel(registry)
-        core.touch()
-      },
-      setData: (registry, update) => {
-        const currentState = registry.get(atom)
-        const currentData = AtomResult.value(currentState.result)
+      setData: (registry, update) => Effect.gen(function*() {
+        const updatedAt = yield* Clock.currentTimeMillis
+        const currentData = AtomResult.value(registry.get(atom).result)
+        const sequence = Option.match(AtomResult.value(registry.get(fetched)), {
+          onNone: (): Sequence => ({ generation: registry.get(generation), attempt: 0 }),
+          onSome: (event) => event.sequence
+        })
         registry.update(control, (current) => ({
           ...current,
-          override: Option.some(update(currentData)),
-          overrideUpdatedAt: Option.some(Date.now()),
-          overrideRequest: registry.get(request),
-          acceptedInvalidation: current.invalidation
+          override: Option.some({
+            data: update(currentData),
+            updatedAt,
+            sequence,
+            invalidation: current.invalidation
+          })
         }))
-      },
+      }),
       hasData: (registry) => Option.isSome(AtomResult.value(registry.get(atom).result)),
       getData: (registry) => AtomResult.value(registry.get(atom).result)
     }

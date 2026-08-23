@@ -30,8 +30,8 @@ and Effect services remain native to this package.
 | `mutate` / `mutateAsync` | Write the mutation atom / `Mutation.execute` | Atom writes support reactive use; `execute` composes directly in Effect workflows. |
 | Mutation key | Exact mutation-definition identity | The definition is the typed identity, avoiding a parallel string-key contract. |
 | `MutationState` | `Mutation.State<M>` | Preserves the exact mutation input, output, and error types. |
-| `useMutationState` | `Mutation.state({ filters, select })` | Returns a derived `Atom` containing matching mutation states. |
-| `useIsMutating` | `Mutation.isMutating(filters)` | Returns an `Atom<number>`. |
+| `useMutationState` | `Mutation.state({ filters, select })` | An Effect requiring the contextual `QueryClient` that yields a derived `Atom` of matching mutation states. |
+| `useIsMutating` | `Mutation.isMutating(filters)` | An Effect requiring the contextual `QueryClient` that yields an `Atom<number>`. |
 | Mutation cache retention (`gcTime`) | Mutation `gcTime` | Each invocation's `Mutation.State` remains selectable until collection. |
 | `experimental_streamedQuery` | `Query.fromStream(name, { key, stream, reduce })` | The first element resolves the query; later elements are reduced into the data; refetch reopens the stream. |
 | — (tRPC `useSubscription`) | `Subscription.make(name, { key, stream, reconnect })` | A keyed, shared, reconnecting stream with `status`/`latest`; consumers drain `Subscription.events(atom)`. |
@@ -374,24 +374,30 @@ Invocations with the same scope are serialized. A synchronization failure is rep
 output and the exact visibility error. Reactive aggregate state is available through
 `QueryClient.isFetching`, `QueryClient.isMutating`, and `QueryClient.mutationState`.
 
-The atom equivalents of TanStack Query's `useMutationState` and `useIsMutating` preserve the
-mutation's input, output, and error types and support exact semantic scope selection:
+The equivalents of TanStack Query's `useMutationState` and `useIsMutating` preserve the
+mutation's input, output, and error types and support exact semantic scope selection. Like the
+hooks, they read the contextual client's history: each is an Effect requiring `QueryClient` that
+yields the derived atom.
 
 ```ts
 const userScope = Mutation.MutationScope("user:1")
-const mutationStatesAtom = Mutation.state({
-  filters: { mutation: renameUser, scope: userScope },
+const selectors = Effect.gen(function*() {
+  const mutationStatesAtom = yield* Mutation.state({
+    filters: { mutation: renameUser, scope: userScope },
+  })
+  const namesAtom = yield* Mutation.state({
+    filters: { mutation: renameUser, status: "success" },
+    select: ({ input }) => input.name,
+  })
+  const isMutatingAtom = yield* Mutation.isMutating({ mutation: renameUser, scope: userScope })
+  return { mutationStatesAtom, namesAtom, isMutatingAtom }
 })
-const namesAtom = Mutation.state({
-  filters: { mutation: renameUser, status: "success" },
-  select: ({ input }) => input.name,
-})
-const isMutatingAtom = Mutation.isMutating({ mutation: renameUser, scope: userScope })
 ```
 
 Derive the latest invocation state with `mutationStates.at(-1)` and a pending boolean with
 `isMutating > 0`; these are consumer views rather than cache APIs. Resource lifecycle continues to
-come from its query.
+come from its query. A history entry is retained while the mutation atom that produced it is
+observed and for `gcTime` after its last observer leaves, as with query entries.
 
 ### Optimistic presentation from mutation state
 
@@ -402,7 +408,8 @@ provisional intent, while the query result is confirmed state.
 
 ```tsx
 const userScope = Mutation.MutationScope("user:1")
-const pendingNamesAtom = Mutation.state({
+// Inside the domain service's Effect, where QueryClient is in context:
+const pendingNamesAtom = yield* Mutation.state({
   filters: {
     mutation: renameUser,
     scope: userScope,
