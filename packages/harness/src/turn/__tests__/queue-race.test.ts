@@ -5,7 +5,7 @@ import { createHarness } from '../harness'
 import { defineHarnessTool } from '../../tool/tool'
 import { defineToolkit } from '../../tool/toolkit'
 import type { BoundModel, ProviderToolCallId, ToolCallId, ResponseStreamEvent, StreamingFieldParser } from '@magnitudedev/ai'
-import { createStreamingFieldParser, ModelStreamTerminal, Prompt, createToolCallId } from '@magnitudedev/ai'
+import { createStreamingFieldParser, ModelRequestTerminal, Prompt, createToolCallId } from '@magnitudedev/ai'
 
 // ── Test tool that always errors ─────────────────────────────────────
 
@@ -58,7 +58,7 @@ describe('queue race', () => {
         { _tag: 'tool_call_ready', toolCallId: callId, providerToolCallId },
         {
           _tag: 'stream_end',
-          terminal: ModelStreamTerminal.StreamCompleted({
+          terminal: ModelRequestTerminal.StreamCompleted({
             call: { provider: 'test', model: 'test', method: 'POST', url: 'http://test' },
             response: { status: 200, headers: [], requestId: null },
             finishReason: 'tool_calls',
@@ -69,7 +69,6 @@ describe('queue race', () => {
       ]
 
       const model = createMockModel(streamEvents, parsers)
-
       const harness = createHarness({
         model,
         toolkit,
@@ -99,5 +98,43 @@ describe('queue race', () => {
 
       // The outcome must be ToolExecutionError, not Completed
       expect(turnEnd.outcome._tag).toBe('ToolExecutionError')
+    }))
+
+  it('preserves generic preparation and maps provider stop without caller interruption', () =>
+    Effect.gen(function* () {
+      type Preparation = { readonly detail: 'loading' }
+      const model: BoundModel<any, never, Preparation> = {
+        stream: () => Effect.gen(function* () {
+          const terminalEvent: ResponseStreamEvent = {
+            _tag: 'stream_end',
+            terminal: ModelRequestTerminal.ModelInstanceStopped(),
+          }
+          return {
+            events: Stream.make(
+              { _tag: 'preparation_update' as const, preparation: { detail: 'loading' as const }, requestId: 'request-1' },
+              terminalEvent,
+            ),
+            parsers: new Map(),
+            logprobs: [],
+            requestId: 'request-1',
+          }
+        }),
+      }
+      const harness = createHarness({
+        model,
+        toolkit,
+      })
+      const turn = yield* harness.runTurn(Prompt.from({
+        messages: [{ _tag: 'UserMessage', parts: [{ _tag: 'TextPart', text: 'run' }] }],
+      }))
+      const events = Array.from(yield* Stream.runCollect(turn.events))
+      const turnEnd = events.find((event) => event._tag === 'TurnEnd')
+
+      const canonicalTags: readonly string[] = events.map((event) => event._tag)
+      expect(canonicalTags).not.toContain('preparation_update')
+      expect(turnEnd).toMatchObject({
+        _tag: 'TurnEnd',
+        outcome: { _tag: 'ModelInstanceStopped' },
+      })
     }))
 })

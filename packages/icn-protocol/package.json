@@ -10,6 +10,7 @@
     "./api": "./src/generated/api.ts",
     "./client": "./src/generated/client.ts",
     "./operations": "./src/generated/operations.ts",
+    "./model-request": "./src/model-request.ts",
     "./schemas": "./src/generated/schemas.ts"
   },
   "scripts": {

@@ -57,7 +57,10 @@ not observe attempts or retry timing.
 
 Only transient upstream connection failures are automatically retried. Authentication failures,
 invalid requests, context-window rejection, unavailable model selection, safety termination, and
-correctness defects terminate the retry loop immediately with their normal turn result.
+correctness defects terminate the retry loop immediately with their normal turn result. Stopped
+model preparation is also terminal: retrying it would negate the explicit instance stop by
+immediately admitting replacement residency. Stopped model execution is terminal for the same
+reason.
 
 The policy permits five retries after the initial attempt. For zero-based retry index `n`:
 
@@ -149,5 +152,7 @@ their own execution and durability boundaries.
 - Failed-attempt output is absent from the committed turn and the next attempt's prompt.
 - Tool execution prevents any later automatic restart of the turn.
 - Interruption during an attempt or backoff produces cancellation and no later retry.
+- Stopped model preparation produces its distinct cancellation result and no later retry.
+- Stopped model execution produces its distinct cancellation result and no later retry.
 - Replay and hydration contain no retry effects or retry state.
 - Event-core contains no retry scheduling path and no `wake` event or trigger.

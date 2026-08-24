@@ -1,4 +1,4 @@
-import type { ModelRequestProgress } from '@magnitudedev/ai'
+import type { IcnModelPreparation } from '@magnitudedev/sdk'
 import { Ambient } from '@magnitudedev/event-core'
 
 interface ModelRequestTurn {
@@ -9,8 +9,14 @@ interface ModelRequestTurn {
 
 export interface ModelRequestActivityObservation {
   readonly turn: ModelRequestTurn
-  readonly progress: ModelRequestProgress
+  readonly activity: ModelRequestActivity
 }
+
+export type ModelRequestActivity =
+  | { readonly _tag: 'Starting'; readonly requestId: string | null }
+  | { readonly _tag: 'Preparing'; readonly preparation: IcnModelPreparation; readonly requestId: string | null }
+  | { readonly _tag: 'Streaming'; readonly requestId: string | null }
+  | { readonly _tag: 'Ended'; readonly requestId: string | null }
 
 export const ModelRequestActivityAmbient =
   Ambient.define<ModelRequestActivityObservation | null>({

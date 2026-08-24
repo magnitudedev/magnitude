@@ -77,4 +77,37 @@ describe('harness adapter generation boundary', () => {
     })
     expect(outcomeWillChainContinue(adapter.getResult().result)).toBe(true)
   })
+
+  it('maps a stopped model instance to non-retrying model cancellation', async () => {
+    const adapter = createHarnessAdapter({
+      forkId: null,
+      turnId: 'turn-1',
+      chainId: 'chain-1',
+      roleId: 'leader',
+      defaultProseDest: { kind: 'user' },
+      publish: () => Effect.void,
+      identicalResponseTracker: null,
+      retryCount: 0,
+      maxRetries: 3,
+      resolveToolKey: () => undefined,
+    })
+    await Effect.runPromise(adapter.processEvent({
+      _tag: 'TurnEnd',
+      outcome: {
+        _tag: 'ModelInstanceStopped',
+        requestId: 'request-1',
+      },
+      usage: null,
+    }))
+
+    expect(adapter.getResult()).toMatchObject({
+      result: {
+        _tag: 'Cancelled',
+        reason: { _tag: 'ModelInstanceStopped' },
+        requestId: 'request-1',
+      },
+      commitPolicy: { _tag: 'discardPartialAssistant' },
+    })
+  })
+
 })

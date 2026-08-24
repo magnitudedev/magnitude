@@ -12,6 +12,7 @@ import type {
   ModelPropertyDiscoveryRequest,
   ModelDiscoveryOperationId,
   ModelPropertyDiscoveryError,
+  StreamStartFailure,
 } from "@magnitudedev/ai"
 import type { MagnitudeProviderInstance } from "./magnitude/provider"
 import { inspectProviderCatalogs, makeAggregatedCatalog, type ProviderCatalogOutcome } from "./catalog-aggregator"
@@ -31,8 +32,8 @@ export interface ProviderInfo {
   readonly hint?: string
 }
 
-export interface DiscoverableProviderInstance {
-  readonly provider: Pick<Provider, "id" | "displayName" | "bindModel" | "catalog" | "discoverModelProperties">
+export interface DiscoverableProviderInstance<TPreparation = never> {
+  readonly provider: Pick<Provider<ProviderModel, TPreparation>, "id" | "displayName" | "bindModel" | "catalog" | "discoverModelProperties">
   readonly authStatus?: AuthStatus
   readonly kind: ProviderInfo["kind"]
   readonly checkStatus: Effect.Effect<{
@@ -42,7 +43,7 @@ export interface DiscoverableProviderInstance {
   }, never, HttpClient.HttpClient>
 }
 
-export interface ProviderRegistryService {
+export interface ProviderRegistryService<TPreparation = never> {
   readonly listProviderIds: Effect.Effect<readonly ProviderId[]>
   readonly listProviders: Effect.Effect<readonly ProviderInfo[], never, HttpClient.HttpClient>
   readonly aggregatedCatalog: ModelCatalog<ProviderModel>
@@ -58,7 +59,7 @@ export interface ProviderRegistryService {
     providerId: ProviderId,
     providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
-  ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
+  ) => Effect.Effect<BoundModel<BaseCallOptions, StreamStartFailure, TPreparation>, never, never>
   readonly discoverModelProperties: (
     providerId: ProviderId,
     request: ModelPropertyDiscoveryRequest,
@@ -74,11 +75,11 @@ export class ProviderRegistry extends Context.Tag("ProviderRegistry")<
  * Create a registry from configured provider instances.
  * Only non-null instances are activated.
  */
-export function makeProviderRegistry(config: {
-  readonly magnitude: MagnitudeProviderInstance | null
-  readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
-}): ProviderRegistryService {
-  const providers = new Map<ProviderId, Pick<Provider, "id" | "bindModel" | "catalog" | "discoverModelProperties">>()
+export function makeProviderRegistry<TPreparation = never>(config: {
+  readonly magnitude: MagnitudeProviderInstance<TPreparation> | null
+  readonly discoverableProviders?: readonly DiscoverableProviderInstance<TPreparation>[]
+}): ProviderRegistryService<TPreparation> {
+  const providers = new Map<ProviderId, Pick<Provider<ProviderModel, TPreparation>, "id" | "bindModel" | "catalog" | "discoverModelProperties">>()
   const providerInfos: ProviderInfo[] = []
 
   if (config.magnitude) {

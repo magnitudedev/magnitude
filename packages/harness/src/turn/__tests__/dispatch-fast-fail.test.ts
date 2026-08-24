@@ -6,7 +6,7 @@ import { defineHarnessTool } from '../../tool/tool'
 import { defineToolkit } from '../../tool/toolkit'
 import type { HarnessEvent } from '../../events'
 import type { ProviderToolCallId, ToolCallId, StreamingFieldParser } from '@magnitudedev/ai'
-import { createStreamingFieldParser, ModelStreamTerminal, StreamProviderCorrectnessViolation } from '@magnitudedev/ai'
+import { createStreamingFieldParser, ModelRequestTerminal, StreamProviderCorrectnessViolation } from '@magnitudedev/ai'
 
 // ── Test tools ────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ function toolCallEvents(id: string, name: string): StreamEvent[] {
 function streamEndCompleted(finishReason: string = 'tool_calls'): StreamEvent {
   return {
     _tag: 'stream_end',
-    terminal: ModelStreamTerminal.StreamCompleted({
+    terminal: ModelRequestTerminal.StreamCompleted({
       call: { provider: 'test', model: 'test', method: 'POST', url: 'http://test' },
       response: { status: 200, headers: [], requestId: null },
       finishReason: finishReason as any,
@@ -70,7 +70,7 @@ function streamEndValidationFailure(
 ): StreamEvent {
   return {
     _tag: 'stream_end',
-    terminal: ModelStreamTerminal.StreamFailed({
+    terminal: ModelRequestTerminal.StreamFailed({
       cause: new StreamProviderCorrectnessViolation({
         call: { provider: 'test', model: 'test', method: 'POST', url: 'http://test' },
         response: { status: 200, headers: [], requestId: null },

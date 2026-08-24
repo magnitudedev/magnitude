@@ -19,6 +19,7 @@ import {
   ModelDiscoveryOperationIdSchema,
   type ModelFamilyId,
   type ProviderModelId,
+  type StreamStartFailure,
 } from "@magnitudedev/ai"
 import { isEnvFlagOn } from "@magnitudedev/utils"
 import type { MagnitudeModelInfo, MagnitudeAdditionalOptions } from "./contract"
@@ -78,18 +79,18 @@ export interface FetchUsageOptions {
  * The Magnitude provider — implements Provider<MagnitudeModelInfo, MagnitudeCallOptions>
  * & WebSearchExtension & UsageExtension.
  */
-export interface MagnitudeProvider extends Provider<MagnitudeModelInfo> {
+export interface MagnitudeProvider<TPreparation = never> extends Provider<MagnitudeModelInfo, TPreparation> {
   readonly webSearch: WebSearchExtension<WebSearchResult, WebSearchError, HttpClient.HttpClient>["webSearch"]
   readonly usage: UsageExtension<CloudUsageResponse, MagnitudeClientError, HttpClient.HttpClient>["usage"]
 }
 
-export interface MagnitudeProviderInstance {
-  readonly provider: MagnitudeProvider
+export interface MagnitudeProviderInstance<TPreparation = never> {
+  readonly provider: MagnitudeProvider<TPreparation>
   readonly catalog: ModelCatalog<MagnitudeModelInfo>
   readonly authentication: MagnitudeAuthentication
 }
 
-export function createMagnitudeProvider(config?: MagnitudeClientConfig): MagnitudeProviderInstance {
+export function createMagnitudeProvider<TPreparation = never>(config?: MagnitudeClientConfig): MagnitudeProviderInstance<TPreparation> {
   const useLocal = isEnvFlagOn(process.env.MAGNITUDE_USE_LOCAL)
   const endpoint = config?.endpoint ?? (useLocal ? LOCAL_ENDPOINT : DEFAULT_ENDPOINT)
   const sessionId = config?.sessionId ?? null
@@ -129,7 +130,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
   const bindModel = (
     id: ProviderModelId,
     options?: ProviderModelBindOptions,
-  ): Effect.Effect<BoundModel<BaseCallOptions>, never, never> =>
+  ): Effect.Effect<BoundModel<BaseCallOptions, StreamStartFailure, TPreparation>, never, never> =>
     Effect.gen(function* () {
       // Build magnitude-specific options from bind options
       const nonEmpty = (value: string | null | undefined) => Option.fromNullable(value).pipe(
@@ -270,7 +271,7 @@ export function createMagnitudeProvider(config?: MagnitudeClientConfig): Magnitu
       return body as CloudUsageResponse
     })
 
-  const provider: MagnitudeProvider = {
+  const provider: MagnitudeProvider<TPreparation> = {
     id: PROVIDER_ID,
     displayName: "Magnitude",
     catalog,

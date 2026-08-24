@@ -5,6 +5,7 @@ import type { ModelCatalog } from "./catalog"
 import type { ImagePlaceholderConfig } from "../model/capabilities"
 import type { BaseCallOptions, ToolChoice } from "./call-options"
 import type { ModelDiscoveryOperationId, ModelPropertyDiscoveryError, ModelPropertyDiscoveryRequest } from "./discoverable-property"
+import type { StreamStartFailure } from "../errors/failure"
 
 /**
  * The base provider interface — defines what a provider is.
@@ -16,6 +17,7 @@ import type { ModelDiscoveryOperationId, ModelPropertyDiscoveryError, ModelPrope
  */
 export interface Provider<
   TModel extends ProviderModel = ProviderModel,
+  TPreparation = never,
 > {
   readonly id: ProviderId
   readonly displayName: string
@@ -34,7 +36,7 @@ export interface Provider<
   readonly bindModel: (
     providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
-  ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
+  ) => Effect.Effect<BoundModel<BaseCallOptions, StreamStartFailure, TPreparation>, never, never>
 
   /**
    * Classify a model into a known model family.
@@ -107,21 +109,4 @@ export interface UsageExtension<TResponse = UsageResponse, TError = unknown, R =
 export interface RequestAttribution {
   readonly key: string
   readonly requestStarted: Effect.Effect<void, never, never>
-  readonly requestProgress?: (
-    progress: ModelRequestProgress,
-  ) => Effect.Effect<void, never, never>
 }
-
-export type ModelRequestProgress =
-  | { readonly phase: "model_loading"; readonly requestId: string; readonly fraction: number }
-  | { readonly phase: "queued"; readonly requestId: string }
-  | { readonly phase: "preparing"; readonly requestId: string | null }
-  | {
-      readonly phase: "prefill"
-      readonly requestId: string
-      readonly completedTokens: number
-      readonly totalTokens: number
-      readonly cachedTokens: number
-    }
-  | { readonly phase: "generating"; readonly requestId: string }
-  | { readonly phase: "cleared"; readonly requestId: string | null }

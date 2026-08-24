@@ -50,6 +50,13 @@ Caller cancellation after admission detaches that waiter. It does not cancel sha
 stop the admitted Instance. Explicit exact-instance stop, idle policy, memory pressure, worker
 failure, replacement, or ICN teardown control physical lifetime.
 
+An explicit Stop during Loading transitions the exact occurrence through Stopping to
+`Stopped(UserStop)`. Every inference waiter joined to that occurrence receives the same canonical
+non-retryable `model_instance_stopped` result. A Ready occurrence has active inference leases;
+explicit Stop closes admission, terminates active execution, and reports the canonical
+non-retryable `model_instance_stopped` result to every affected stream. Graceful replacement and
+idle release, rather than explicit Stop, drain active leases.
+
 ## Inference acquisition
 
 Chat Completions, Responses, and explicit Instance admission use one residency coordinator.
@@ -86,3 +93,7 @@ Effect Query layer.
 - Stop and replacement cannot race past accepted inference demand or active leases.
 - ACN never stores or projects Instance residency inside Slot state.
 - Agent and external inference requests follow the same ICN acquisition path.
+- Loading-instance Stop terminalizes every joined preparation waiter without admitting a
+  replacement.
+- Ready-instance explicit Stop interrupts active semantic output as `ModelInstanceStopped`.
+- Graceful replacement and idle release drain active inference leases.

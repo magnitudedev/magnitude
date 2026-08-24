@@ -6,7 +6,7 @@ import { ConfigAmbient, getSlotConfig, getSlotConfigForRole, type SlotConfig } f
 import { makeAgentBoundModel, type AgentBoundModel } from './agent-model'
 import { TurnContextTag } from '../engine/turn-context'
 import { ModelRequestActivityAmbient } from './model-request-activity'
-import type { ModelRequestProgress } from '@magnitudedev/ai'
+import type { ModelRequestActivity } from './model-request-activity'
 import { MAX_TOOL_CALLS_PER_TURN } from '../constants'
 
 export type { AgentBoundModel } from './agent-model'
@@ -76,22 +76,19 @@ export const AgentModelResolverLive = (
             providerModelId,
             slotId,
           )
-          const reportProgress = (progress: ModelRequestProgress) =>
+          const reportActivity = (activity: ModelRequestActivity) =>
             Effect.gen(function* () {
               const turn = yield* Effect.serviceOption(TurnContextTag)
               if (Option.isSome(turn)) {
                 yield* ambient.update(ModelRequestActivityAmbient, {
                   turn: turn.value,
-                  progress,
+                  activity,
                 })
               }
             })
           const rawModel = yield* client.resolveModel(providerId, providerModelId, {
             defaults,
-            requestAttribution: {
-              ...requestAttribution,
-              requestProgress: reportProgress,
-            },
+            requestAttribution,
             reasoningEffortFallback: (requested, fallback) => applyReasoningEffortFallback({
               slotId,
               providerId,
@@ -107,6 +104,7 @@ export const AgentModelResolverLive = (
 
           return makeAgentBoundModel({
             rawModel,
+            reportActivity,
             modelSource: { slotId: slotConfig.slotId },
             modelId: slotConfig.providerModelId,
             modelDisplayName: slotConfig.modelDisplayName,

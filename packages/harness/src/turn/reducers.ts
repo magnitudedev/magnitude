@@ -112,6 +112,7 @@ export const TurnOutcomeSchema = Schema.Union(
     toolName: Schema.String,
   }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("StreamFailed", { message: Schema.String, terminal: StreamFailedTerminalSchema }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
+  Schema.extend(Schema.TaggedStruct("ModelInstanceStopped", {}), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("EngineDefect", { message: Schema.String }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("Interrupted", {}), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),
   Schema.extend(Schema.TaggedStruct("ThoughtLimitExceeded", { limit: Schema.Number }), Schema.Struct({ requestId: Schema.NullOr(Schema.String) })),

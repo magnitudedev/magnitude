@@ -185,12 +185,15 @@ describe('display view runtime', () => {
       yield* Queue.take(queue)
       yield* ambient.update(ModelRequestActivityAmbient, {
         turn: { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
-        progress: {
-          phase: 'prefill',
+        activity: {
+          _tag: 'Preparing',
+          preparation: {
+            phase: 'prefill',
+            completed_tokens: 14_020,
+            total_tokens: 14_300,
+            cached_tokens: 13_200,
+          },
           requestId: 'request-1',
-          completedTokens: 14_020,
-          totalTokens: 14_300,
-          cachedTokens: 13_200,
         },
       })
       let active = yield* Queue.take(queue)
@@ -201,7 +204,10 @@ describe('display view runtime', () => {
 
       yield* ambient.update(ModelRequestActivityAmbient, {
         turn: { turnId: 'turn-1', chainId: 'chain-1', forkId: null },
-        progress: { phase: 'generating', requestId: 'request-1' },
+        activity: {
+          _tag: 'Streaming',
+          requestId: 'request-1',
+        },
       })
       let cleared = yield* Queue.take(queue)
       while (cleared.state.actors.root?.status._tag !== 'Working'

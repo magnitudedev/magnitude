@@ -255,45 +255,45 @@ export type UsageMissingReason =
 // Model Stream Terminal (§9)
 // ---------------------------------------------------------------------------
 
-export type ModelStreamTerminal = Data.TaggedEnum<{
-  StreamCompleted: {
-    readonly call: ProviderCall
-    readonly response: AcceptedHttpResponse
-    readonly finishReason: FinishReason
-    readonly progress: StreamProgress
-    readonly usage: UsageAtTermination
-  }
-  StreamFailed: {
-    readonly cause: StreamFailure
-    readonly usage: UsageAtTermination
-  }
-}>
+export type ModelRequestTerminal =
+  | {
+      readonly _tag: "StreamCompleted"
+      readonly call: ProviderCall
+      readonly response: AcceptedHttpResponse
+      readonly finishReason: FinishReason
+      readonly progress: StreamProgress
+      readonly usage: UsageAtTermination
+    }
+  | {
+      readonly _tag: "StreamFailed"
+      readonly cause: StreamFailure
+      readonly usage: UsageAtTermination
+    }
+  | {
+      readonly _tag: "ModelInstanceStopped"
+    }
 
-const makeModelStreamTerminal = Data.taggedEnum<ModelStreamTerminal>()
+export type ModelInstanceStoppedTerminal = Extract<
+  ModelRequestTerminal,
+  { readonly _tag: "ModelInstanceStopped" }
+>
 
-type ModelStreamTerminalTag = ModelStreamTerminal["_tag"]
-type ModelStreamTerminalArgs<Tag extends ModelStreamTerminalTag> =
-  Omit<Extract<ModelStreamTerminal, { readonly _tag: Tag }>, "_tag">
-
-function makeTerminal<Tag extends ModelStreamTerminalTag>(
-  tag: Tag,
-): (args: ModelStreamTerminalArgs<Tag>) => Extract<ModelStreamTerminal, { readonly _tag: Tag }> {
-  return (args) => ({ _tag: tag, ...args }) as Extract<ModelStreamTerminal, { readonly _tag: Tag }>
-}
-
-export const ModelStreamTerminal = {
-  StreamCompleted: makeTerminal("StreamCompleted"),
-  StreamFailed: makeTerminal("StreamFailed"),
-
-  hadPartialOutput: (terminal: ModelStreamTerminal): boolean => {
-    const progress = makeModelStreamTerminal.$match({
-      StreamCompleted: (t) => t.progress,
-      StreamFailed: (t) => t.cause.progress,
-    })(terminal)
-    return progress.modelEventsEmitted > 0
-  },
-  $is: makeModelStreamTerminal.$is,
-  $match: makeModelStreamTerminal.$match,
+export const ModelRequestTerminal = {
+  StreamCompleted: (
+    args: Omit<Extract<ModelRequestTerminal, { readonly _tag: "StreamCompleted" }>, "_tag">,
+  ): Extract<ModelRequestTerminal, { readonly _tag: "StreamCompleted" }> => ({
+    _tag: "StreamCompleted",
+    ...args,
+  }),
+  StreamFailed: (
+    args: Omit<Extract<ModelRequestTerminal, { readonly _tag: "StreamFailed" }>, "_tag">,
+  ): Extract<ModelRequestTerminal, { readonly _tag: "StreamFailed" }> => ({
+    _tag: "StreamFailed",
+    ...args,
+  }),
+  ModelInstanceStopped: (): ModelInstanceStoppedTerminal => ({
+    _tag: "ModelInstanceStopped",
+  }),
 }
 
 export interface StreamFailureContext {

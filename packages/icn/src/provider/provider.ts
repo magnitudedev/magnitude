@@ -10,9 +10,11 @@ import type {
   Provider,
   ProviderModelBindOptions,
   ProviderModelId,
+  StreamStartFailure,
 } from "@magnitudedev/ai"
 import { ProviderIdSchema } from "@magnitudedev/ai"
 import type { LocalModelInfo } from "./contract"
+import type { IcnModelPreparation } from "./contract"
 
 export const PROVIDER_ID = ProviderIdSchema.make("local")
 
@@ -25,7 +27,7 @@ export interface LocalProviderSource {
   readonly bindModel: (
     providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
-  ) => Effect.Effect<BoundModel<BaseCallOptions>, never>
+  ) => Effect.Effect<BoundModel<BaseCallOptions, StreamStartFailure, IcnModelPreparation>, never>
   readonly status: Effect.Effect<{
     readonly status: "ok" | "loading" | "not_found" | "error"
     readonly message?: string
@@ -34,7 +36,7 @@ export interface LocalProviderSource {
 }
 
 export interface LocalProviderInstance {
-  readonly provider: Provider<LocalModelInfo>
+  readonly provider: Provider<LocalModelInfo, IcnModelPreparation>
   readonly checkStatus: LocalProviderSource["status"]
 }
 

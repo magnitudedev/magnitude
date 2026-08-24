@@ -45,16 +45,16 @@ export function reduceModelRequestActivity(
   current: ModelRequestActivityState,
   observation: ModelRequestActivityObservation,
 ): ModelRequestActivityState {
-  const { turn, progress } = observation
+  const { turn, activity } = observation
   const key = forkIdToKey(turn.forkId)
 
-  if (progress.phase === 'generating') {
+  if (activity._tag === 'Ended') {
     const active = current.requests.get(key)
     if (!active) return current
     if (
-      progress.requestId !== null
+      activity.requestId !== null
       && active.requestId !== null
-      && active.requestId !== progress.requestId
+      && active.requestId !== activity.requestId
     ) {
       return current
     }
@@ -63,31 +63,35 @@ export function reduceModelRequestActivity(
     return { requests }
   }
 
-  if (progress.phase === 'cleared') {
+  if (activity._tag === 'Streaming') {
     const active = current.requests.get(key)
     if (!active) return current
     if (
-      progress.requestId !== null
+      activity.requestId !== null
       && active.requestId !== null
-      && active.requestId !== progress.requestId
+      && active.requestId !== activity.requestId
     ) {
       return current
     }
     const requests = new Map(current.requests)
     requests.delete(key)
-    return { ...current, requests }
+    return { requests }
   }
 
+  if (activity._tag === 'Starting') return current
+
+  const preparation = activity.preparation
+
   const nextActivity: ActiveModelRequest = {
-    requestId: progress.requestId,
+    requestId: activity.requestId,
     turnId: turn.turnId,
     chainId: turn.chainId,
     forkId: turn.forkId,
-    phase: progress.phase,
+    phase: preparation.phase,
     completedTokens:
-      progress.phase === 'prefill' ? progress.completedTokens : null,
-    totalTokens: progress.phase === 'prefill' ? progress.totalTokens : null,
-    cachedTokens: progress.phase === 'prefill' ? progress.cachedTokens : null,
+      preparation.phase === 'prefill' ? preparation.completed_tokens : null,
+    totalTokens: preparation.phase === 'prefill' ? preparation.total_tokens : null,
+    cachedTokens: preparation.phase === 'prefill' ? preparation.cached_tokens : null,
   }
   const requests = new Map(current.requests)
   requests.set(key, nextActivity)

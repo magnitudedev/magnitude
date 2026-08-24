@@ -101,27 +101,22 @@ model IDs and does not create, reassess, or rewrite offerings.
 
 ICN owns one `ModelInstanceController` and currently permits at most one Ready local instance.
 
-ACN's `ModelSlotController` is the product intent authority. A manual load and local request
-preparation use the same canonical slot and instance observation:
-
-1. resolve the selected configuration through its current provider offering;
-2. require all bundle packages to be installed;
-3. create a fresh `ModelInstanceId` and submit the exact configuration to ICN;
-4. bind the slot after native admission and observe that exact instance to Ready; and
-5. start chat with that exact instance ID and configuration.
+ACN's `ModelSlotController` remains only the product-intent authority. Inference addresses the
+canonical model ID. ICN resolves its current configuration, joins or admits a physical instance,
+waits for readiness, and acquires the inference lease. Explicit warm-load uses the same residency
+coordinator without creating another loading path.
 
 The submitted configuration fixes per-request context capacity. ICN independently resolves the
 resident parallel allocation and reports it as load execution evidence; ACN does not persist or
 select that allocation.
 
 Loading another configuration replaces the singleton residency through the same serialized
-transition. ACN creates a branded model-instance identity before loading and ICN preserves it
-through loading and residency. One Stop operation addresses only that exact identity, whether it is
-still loading or already resident, and waits for partial cleanup or active generation leases to
-drain. A delayed Stop cannot affect a newer instance of the same configuration.
-
-ICN chat never loads, configures, or selects a model. A chat request for a configuration that is
-not resident fails without mutating runtime state.
+transition. ICN creates and preserves a branded model-instance identity through loading and
+residency. One Stop operation addresses only that exact identity. Stopping during Loading ends that
+occurrence and every joined preparation waiter with the canonical non-retryable
+`model_instance_stopped` condition. Stopping a Ready instance terminates active generation and
+returns `model_instance_stopped` to those streams. Graceful replacement and idle
+release retain lease draining. A delayed Stop cannot affect a newer instance of the same model.
 
 ## Concurrency and lifetime
 
@@ -137,32 +132,35 @@ The ICN `ModelInstanceController` is the sole native mutation and lease authorit
 - Unexpected resident-worker loss is observed with the exact instance ID and becomes a typed
   blocked slot state; it is not inferred from generic provider unavailability.
 
-ACN rechecks the attributed slot and exact instance after preparation. Progress and terminal state
-come from `ModelInstancesSnapshot`; the load response stream is never the lifecycle authority.
+Progress and terminal instance state come from `ModelInstancesSnapshot`; an individual inference
+response is never the instance-lifecycle authority.
 
 ## Prompt and request boundary
 
 The provider follows the shared [native Chat Completions contract](../ai/native-chat-completions.md).
-It uses the shared request builder and encoder before adding the bound model-instance identity. The
-generated ICN client then validates the local extension and transports it. ICN validates structural
-inputs before accepting a stream and validates tokenizer-dependent constraints under the resident
-lease.
-
-Local-model preparation is a scoped agent-request phase injected by ACN. It resolves and observes
-the exact Ready instance, then installs an Effect fiber-local instance binding for the provider
-request. The local provider refuses to encode a request without that binding. ICN atomically
-acquires the exact `ModelInstanceLease`; no ACN residency-admission bridge exists.
+It uses the shared request builder and encoder with the canonical model ID. The generated ICN
+client validates and transports the request. ICN validates structural inputs before admission and
+tokenizer-dependent constraints under the acquired resident lease. No instance identity or serving
+configuration crosses the chat boundary.
 
 Context admission uses the resident configuration's context length. Catalog metadata, compaction,
 load planning, and request admission must agree on that exact configuration.
 
 ICN lifecycle control chunks are process-local request observations, not assistant output. The
-local provider removes them before the provider-neutral response codec and forwards queue, prefill,
-and generation-start state through optional request attribution. ACN's preceding preparation phase
-uses that same progress sink, so the display sees one continuous request lifecycle. A failed or
-canceled start clears preparation progress; after acceptance, ending, failing, or canceling the
-response stream clears provider-owned progress. Providers that do not support granular observation
-remain valid and expose no synthetic progress.
+local provider removes them before the provider-neutral response codec and emits queue, prefill,
+model-loading, and generation-start activity in the same ordered generic model-event stream.
+ICN defines the concrete preparation payload; the provider-neutral AI contract does not. The
+harness owns Starting and terminal cleanup and supplies a Streaming fallback on the first semantic
+response event, so the display sees one continuous lifecycle without provider-specific cleanup
+events. Providers that do not support preparation observation remain valid and expose no synthetic
+preparation progress.
+
+If the backing instance is explicitly stopped during preparation, ICN emits the exact
+non-retryable `model_instance_stopped` error. Explicit Stop after readiness terminates active
+worker requests with the same condition. The local adapter maps that exact condition directly to
+`ModelInstanceStopped` while adapting the known ICN error envelope, before generic stream-failure
+construction. Downstream layers never recover this meaning by inspecting a failure cause.
+Caller-side stream cancellation remains Effect interruption.
 
 ICN also publishes one final cumulative timing snapshot for every accepted generation. The local
 provider translates its generated-token count, decode duration, native decode rate, and time to
@@ -190,7 +188,8 @@ reports the selected method, effective parameters, and whether drafting actually
 - Configuration no longer fits or is incompatible: the provider catalog entry is disabled and load
   fails with the typed ICN result.
 - ICN unavailable or malformed response: ACN preserves the dependency/transport failure.
-- Nonresident chat: ICN rejects it without a load side effect.
+- Explicit Stop: every affected request terminates as `ModelInstanceStopped`
+  and does not retry or immediately reload the model.
 
 ## Acceptance criteria
 
@@ -204,9 +203,9 @@ reports the selected method, effective parameters, and whether drafting actually
 - Every assessed local provider catalog entry exposes ICN's complete per-domain memory accounting
   for that exact serving configuration.
 - Provider binding does not load a model.
-- Local preparation is not represented as a provider response or provider failure.
-- Preparation admission remains held until ICN accepts the request's generation lease.
-- Chat cannot mutate residency.
+- Local preparation is represented only by generic model-stream activity with ICN-owned detail.
+- Inference admission remains held until ICN atomically acquires the request's generation lease.
+- Chat, Responses, and explicit warm-load share one residency coordinator.
 - Slot selection and recency refer only to stable provider model IDs.
 - Speculative method and embedded/separate draft composition are identical during assessment, load,
   and inference.

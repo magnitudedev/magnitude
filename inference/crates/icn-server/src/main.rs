@@ -282,6 +282,23 @@ impl InstanceRuntime {
         }
     }
 
+    async fn begin_interrupting_mutation(&self) -> InstanceMutationGuard {
+        loop {
+            let available = self.mutation_available.notified();
+            if self
+                .mutating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return InstanceMutationGuard {
+                    mutating: Arc::clone(&self.mutating),
+                    mutation_available: Arc::clone(&self.mutation_available),
+                };
+            }
+            available.await;
+        }
+    }
+
     fn install(&self, instance_id: ModelInstanceId, backend: Arc<dyn CompletionBackend>) -> u64 {
         let mut state = self.inner.write().expect("instance runtime lock poisoned");
         state.generation = state.generation.saturating_add(1);
@@ -3655,6 +3672,19 @@ impl ModelTransitionFailure {
     }
 }
 
+fn stopped_instance_preparation_error(reason: &ModelReleaseReason) -> InventoryError {
+    if *reason == ModelReleaseReason::UserStop {
+        return InventoryError::ModelOperation {
+            code: "model_instance_stopped".to_owned(),
+            message: "model instance was stopped".to_owned(),
+            retryable: false,
+        };
+    }
+    InventoryError::NotReady(format!(
+        "model instance stopped during request preparation: {reason:?}"
+    ))
+}
+
 impl From<InventoryError> for ModelTransitionFailure {
     fn from(error: InventoryError) -> Self {
         match error {
@@ -4891,17 +4921,48 @@ impl NativeModelInstanceController {
         Ok(true)
     }
 
-    async fn stop_ready_instance(
+    async fn interrupt_ready_instance(
         &self,
-        ready_instance: &ReadyInstanceRecord,
-        reason: ModelReleaseReason,
+        expected: &ReadyInstanceRecord,
     ) -> Result<bool, InventoryError> {
+        let backend_mutation = expected.runtime.begin_interrupting_mutation().await;
+        let current = self.instances.ready_instance().await;
+        let Some(resident) = current.filter(|resident| {
+            resident.generation == expected.generation
+                && resident.instance_id == expected.instance_id
+        }) else {
+            return Ok(false);
+        };
+
         self.instances
-            .wait_for_inference_demands(&ready_instance.instance_id)
+            .publish_lifecycle(
+                resident.instance_id.clone(),
+                ModelInstanceLifecycle::Stopping {
+                    reason: ModelReleaseReason::UserStop,
+                    allocation: ModelStoppingAllocation::Resident {
+                        allocation: resident.allocation.clone(),
+                    },
+                },
+            )
             .await;
-        let backend_mutation = ready_instance.runtime.begin_mutation().await;
-        self.stop_ready_instance_under_mutation(ready_instance, reason, backend_mutation)
-            .await
+        if let Some(owned) = self.instances.take_worker(&resident.instance_id).await {
+            owned.worker.stop_all_executions();
+        }
+        resident.runtime.clear();
+        if let Ok(mut slot) = self.native_executor.write() {
+            *slot = None;
+        }
+        self.instances.clear_ready(&resident.instance_id).await;
+        self.instances
+            .publish_lifecycle(
+                resident.instance_id,
+                ModelInstanceLifecycle::Stopped {
+                    reason: ModelReleaseReason::UserStop,
+                },
+            )
+            .await;
+        drop(backend_mutation);
+        Ok(true)
     }
 
     async fn run_admitted_transition(
@@ -5017,19 +5078,15 @@ impl NativeModelInstanceController {
                             "model was replaced before its inference lease was acquired".to_owned(),
                         ));
                     };
-                    if let Some(observer) = progress {
-                        observer(1.0);
+                    if let Some(lease) = resident.runtime.acquire(instance_id) {
+                        if let Some(observer) = progress {
+                            observer(1.0);
+                        }
+                        return Ok(lease.with_model_alias(model_id.to_owned()));
                     }
-                    return resident
-                        .runtime
-                        .acquire(instance_id)
-                        .map(|lease| lease.with_model_alias(model_id.to_owned()))
-                        .ok_or_else(|| {
-                            InventoryError::NotReady(
-                                "model was replaced before its inference lease was acquired"
-                                    .to_owned(),
-                            )
-                        });
+                    // A serialized mutation closed admission after the Ready snapshot. Observe
+                    // that exact instance's next lifecycle state rather than fabricating a
+                    // retryable NotReady result that could immediately undo an explicit Stop.
                 }
                 ModelInstanceLifecycle::Failed { failure } => {
                     let (code, message, retryable) = match failure {
@@ -5051,10 +5108,8 @@ impl NativeModelInstanceController {
                         retryable,
                     });
                 }
-                ModelInstanceLifecycle::Stopped { .. } => {
-                    return Err(InventoryError::NotReady(
-                        "model load was stopped".to_owned(),
-                    ));
+                ModelInstanceLifecycle::Stopped { reason } => {
+                    return Err(stopped_instance_preparation_error(&reason));
                 }
                 ModelInstanceLifecycle::Stopping { .. } => {}
             }
@@ -5321,8 +5376,7 @@ impl ModelInstanceController for NativeModelInstanceController {
                 .await
                 .filter(|resident| resident.instance_id == instance_id);
             if let Some(resident) = resident {
-                self.stop_ready_instance(&resident, ModelReleaseReason::UserStop)
-                    .await?;
+                self.interrupt_ready_instance(&resident).await?;
             }
             Ok(())
         })
@@ -6355,6 +6409,46 @@ mod tests {
                 parallel_sequences: 1,
             }
         );
+    }
+
+    #[test]
+    fn explicit_stop_is_a_canonical_non_retryable_preparation_result() {
+        match stopped_instance_preparation_error(&ModelReleaseReason::UserStop) {
+            InventoryError::ModelOperation {
+                code,
+                message,
+                retryable,
+            } => {
+                assert_eq!(code, "model_instance_stopped");
+                assert_eq!(message, "model instance was stopped");
+                assert!(!retryable);
+            }
+            error => panic!("unexpected stopped-instance result: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupting_mutation_closes_admission_without_waiting_for_active_lease() {
+        let runtime = InstanceRuntime::empty();
+        let instance_id = ModelInstanceId("instance-stop-test".to_owned());
+        runtime.install(
+            instance_id.clone(),
+            Arc::new(FakeBackend::new("test-model", "")),
+        );
+        let lease = runtime.acquire(&instance_id).expect("initial lease");
+
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.begin_interrupting_mutation(),
+        )
+        .await
+        .expect("explicit stop must not drain active leases");
+        assert!(runtime.acquire(&instance_id).is_none());
+
+        runtime.clear();
+        drop(guard);
+        drop(lease);
+        assert!(runtime.acquire(&instance_id).is_none());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import type { JsonValue } from "@magnitudedev/utils/schema"
-import type { GenerationPerformance, ProviderToolCallId, ResponseUsage, ToolCallId, ValidationIssue, ModelStreamTerminal } from "@magnitudedev/ai"
+import type { GenerationPerformance, ProviderToolCallId, ResponseUsage, ToolCallId, ValidationIssue, ModelRequestTerminal } from "@magnitudedev/ai"
 
 // ── Tool Error ───────────────────────────────────────────────────────
 
@@ -52,10 +52,10 @@ export type SafetyStopReason =
 // ── Turn Outcome ─────────────────────────────────────────────────────
 
 interface TurnOutcomeBase {
-  readonly _tag: "Completed" | "ToolCallLimitExceeded" | "OutputTruncated" | "ContentFiltered" | "SafetyStop" | "ToolInputValidationFailure" | "ToolExecutionError" | "GateRejected" | "StreamFailed" | "EngineDefect" | "Interrupted" | "ThoughtLimitExceeded"
+  readonly _tag: "Completed" | "ToolCallLimitExceeded" | "OutputTruncated" | "ContentFiltered" | "SafetyStop" | "ToolInputValidationFailure" | "ToolExecutionError" | "GateRejected" | "StreamFailed" | "ModelInstanceStopped" | "EngineDefect" | "Interrupted" | "ThoughtLimitExceeded"
 }
 
-export type StreamFailedTerminal = Extract<ModelStreamTerminal, { readonly _tag: "StreamFailed" }>
+export type StreamFailedTerminal = Extract<ModelRequestTerminal, { readonly _tag: "StreamFailed" }>
 
 type WithRequestId<T> = T & { readonly requestId: string | null }
 
@@ -69,6 +69,7 @@ type TurnOutcomeConcrete<TInput> = WithRequestId<
   | { readonly _tag: "ToolExecutionError"; readonly toolCallId: ToolCallId; readonly providerToolCallId: ProviderToolCallId; readonly toolName: string; readonly toolKey: string; readonly error: ToolError }
   | { readonly _tag: "GateRejected"; readonly toolCallId: ToolCallId; readonly providerToolCallId: ProviderToolCallId; readonly toolName: string }
   | { readonly _tag: "StreamFailed"; readonly message: string; readonly terminal: StreamFailedTerminal }
+  | { readonly _tag: "ModelInstanceStopped" }
   | { readonly _tag: "EngineDefect"; readonly message: string }
   | { readonly _tag: "Interrupted" }
   | { readonly _tag: "ThoughtLimitExceeded"; readonly limit: number }
@@ -84,6 +85,7 @@ type TurnOutcomeErased = WithRequestId<
   | { readonly _tag: "ToolExecutionError"; readonly toolCallId: ToolCallId; readonly providerToolCallId: ProviderToolCallId; readonly toolName: string; readonly toolKey: string; readonly error: ToolError }
   | { readonly _tag: "GateRejected"; readonly toolCallId: ToolCallId; readonly providerToolCallId: ProviderToolCallId; readonly toolName: string }
   | { readonly _tag: "StreamFailed"; readonly message: string; readonly terminal: StreamFailedTerminal }
+  | { readonly _tag: "ModelInstanceStopped" }
   | { readonly _tag: "EngineDefect"; readonly message: string }
   | { readonly _tag: "Interrupted" }
   | { readonly _tag: "ThoughtLimitExceeded"; readonly limit: number }

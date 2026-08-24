@@ -397,13 +397,20 @@ Replacing a model must not claim the new model is ready until its backend is usa
 the model instance in an explicitly reported state and must not make requests route to a
 half-loaded backend. One Stop endpoint accepts only the exact model-instance identity. During
 loading it cancels and cleans partial resources; after readiness it closes mutation admission,
-waits for protected inference leases, and releases native resources. Stop is idempotent for an
+terminates active worker requests, and releases native resources. Stop is idempotent for an
 ended identity and cannot affect a newer occurrence of the same configuration. Chat requests bind
 to the active native generation they began with and cannot silently continue on a replacement.
 
+Every request joined to a Loading occurrence observes exact-instance Stop as the canonical
+non-retryable `model_instance_stopped` condition. Once semantic streaming begins, explicit Stop
+closes admission, terminates active worker requests with the same condition, and then releases the
+instance. The provider adapter presents either occurrence as `ModelInstanceStopped`. Replacement
+and idle release retain graceful lease drain.
+
 Every inference request holds an exact model-instance lease through stream end or cancellation.
 Explicit load, replacement, and Stop share controller mutation authority. Stop and replacement
-close new inference admission and wait for existing leases to drain. Memory-pressure
+close new inference admission. Replacement waits for existing leases to drain; explicit Stop
+terminates those requests. Memory-pressure
 eviction is deliberately different: persistent ICN observes whole-system available memory every
 100 milliseconds while a worker exists, and every second while idle. It immediately terminates
 the inference worker when availability reaches the configured system reserve. After eviction,
@@ -492,6 +499,8 @@ The lifecycle conforms when:
   process exit;
 - replacement, load, and Stop serialize through native mutation authority and cannot
   invalidate an admitted inference lease;
+- stopping a Loading instance ends every joined preparation waiter without retry or automatic
+  replacement, while stopping a Ready instance terminates active execution streams;
 - product model-download, activation, deletion, hardware, and assessment operations reach ICN only through
   the generated client, with no alternate model-repository or host-inspection path in ACN;
 - interrupting a consumer stream closes its response without terminating ICN;
