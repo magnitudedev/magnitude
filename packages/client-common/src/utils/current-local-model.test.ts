@@ -2,7 +2,6 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelInstanceIdSchema,
-  ModelServingConfigurationIdSchema,
   ModelSlotConfiguredLocal,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
@@ -56,7 +55,6 @@ describe("current local model derivation", () => {
       residency: {
         _tag: "Ready",
         instanceId: ModelInstanceIdSchema.make("instance"),
-        configurationId: ModelServingConfigurationIdSchema.make("configuration"),
         allocation,
       },
       actions: ["Stop"],

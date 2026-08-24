@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{DownloadFailure, DownloadStage, InventoryError, ResolvedModel};
@@ -21,7 +22,6 @@ string_id!(ModelPackageId);
 string_id!(ModelDownloadId);
 string_id!(ModelAssessmentRequestId);
 string_id!(ServableModelBundleKey);
-string_id!(ModelServingConfigurationId);
 string_id!(ModelAssessmentId);
 string_id!(AssessmentEnvironmentId);
 string_id!(CatalogModelId);
@@ -262,7 +262,8 @@ pub enum ModelInstanceLifecycle {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelInstance {
     pub id: ModelInstanceId,
-    pub configuration_id: ModelServingConfigurationId,
+    /// Canonical callable model identity (for example `model:format:variant`).
+    pub model_id: String,
     pub lifecycle: ModelInstanceLifecycle,
 }
 
@@ -271,6 +272,8 @@ pub struct ModelInstance {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelInstancesSnapshot {
     pub revision: u64,
+    /// Instances in lifecycle-update order, oldest first. The final matching
+    /// instance is therefore the current attempt for a model.
     pub instances: Vec<ModelInstance>,
 }
 
@@ -514,7 +517,6 @@ pub struct ServingProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelServingConfiguration {
-    pub id: ModelServingConfigurationId,
     pub bundle: ServableModelBundle,
     pub profile: ServingProfile,
 }
@@ -639,7 +641,9 @@ pub enum CatalogModelLocalState {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogModel {
+pub struct InferenceModel {
+    /// Canonical callable identity used unchanged by native and standard inference APIs.
+    pub id: String,
     pub model_id: CatalogModelId,
     pub variant_id: CatalogVariantId,
     pub desired_configuration: ModelServingConfiguration,
@@ -664,15 +668,14 @@ pub struct CatalogModel {
 pub struct ModelsResponse {
     pub revision: u64,
     pub reconciliation_complete: bool,
-    pub catalog_models: Vec<CatalogModel>,
-    pub uncatalogued_packages: Vec<InstalledModelPackage>,
+    pub models: Vec<InferenceModel>,
     pub diagnostics: Vec<CatalogDiagnostic>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReconcileCatalogModelRequest {
+pub struct InstallCatalogModelRequest {
     pub model_id: CatalogModelId,
     pub variant_id: CatalogVariantId,
 }
@@ -680,7 +683,7 @@ pub struct ReconcileCatalogModelRequest {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ReconcileCatalogModelResponse {
+pub enum InstallModelResponse {
     Current,
     #[serde(rename_all = "camelCase")]
     DownloadAdmitted {
@@ -919,35 +922,11 @@ pub struct ModelDownloadsResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LoadModelRequest {
-    pub instance_id: ModelInstanceId,
-    pub configuration: ModelServingConfiguration,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PreviewModelLoadRequest {
-    pub configuration: ModelServingConfiguration,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelLoadPlan {
     pub context_window_tokens: u32,
     pub parallel_sequences: u32,
     pub physical_context_tokens: u32,
     pub required_system_memory_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LoadModelReady {
-    pub instance_id: ModelInstanceId,
-    pub configuration_id: ModelServingConfigurationId,
-    pub allocation: ModelInstanceAllocation,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -959,29 +938,6 @@ pub enum ModelLoadStage {
     Unloading,
     Loading,
     Verifying,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelLoadEvent {
-    #[serde(rename_all = "camelCase")]
-    Progress {
-        stage: ModelLoadStage,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fraction: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        plan: Option<ModelLoadPlan>,
-    },
-    Ready {
-        ready: LoadModelReady,
-    },
-    Stopped {
-        instance_id: ModelInstanceId,
-    },
-    Failed {
-        failure: ModelInstanceFailure,
-    },
 }
 
 #[derive(Clone)]
@@ -1050,10 +1006,10 @@ pub trait RecommendableModelCatalogProvider: Send + Sync + 'static {
 
 pub trait CatalogModels: Send + Sync + 'static {
     fn list(&self) -> BoxFuture<'_, Result<ModelsResponse, InventoryError>>;
-    fn reconcile(
+    fn install(
         &self,
-        request: ReconcileCatalogModelRequest,
-    ) -> BoxFuture<'_, Result<ReconcileCatalogModelResponse, InventoryError>>;
+        request: InstallCatalogModelRequest,
+    ) -> BoxFuture<'_, Result<InstallModelResponse, InventoryError>>;
 }
 
 pub trait CatalogPackageRemover: Send + Sync + 'static {
@@ -1081,4 +1037,10 @@ pub trait ModelDownloads: Send + Sync + 'static {
         &self,
         id: &ModelDownloadId,
     ) -> BoxFuture<'_, Result<ModelDownload, InventoryError>>;
+    fn watch(&self) -> BoxStream<'static, ModelDownloadsInvalidation>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelDownloadsInvalidation {
+    pub revision: u64,
 }

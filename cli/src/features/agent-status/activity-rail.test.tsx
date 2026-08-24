@@ -5,7 +5,6 @@ import { Option } from 'effect'
 import {
   ModelSlotConfiguredLocal,
   ModelInstanceIdSchema,
-  ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -50,7 +49,6 @@ const selection = {
   reasoningEffort: ReasoningEffortSchema.make('none'),
 }
 const instanceId = ModelInstanceIdSchema.make('test-instance')
-const configurationId = ModelServingConfigurationIdSchema.make('test-configuration')
 
 const localActivity = (lifecycle: {
   readonly _tag: 'Requested'
@@ -73,7 +71,7 @@ const localActivity = (lifecycle: {
   },
   availability: { _tag: 'Available' },
   residency: lifecycle._tag === 'Loading'
-    ? { ...lifecycle, instanceId, configurationId }
+    ? { ...lifecycle, instanceId }
     : lifecycle,
   actions: lifecycle._tag === 'Loading' || lifecycle._tag === 'Requested' ? ['Stop'] : [],
 })

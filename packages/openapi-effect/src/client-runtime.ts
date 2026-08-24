@@ -234,7 +234,9 @@ const requestFor = <A extends RequestOperationDescriptor>(
       });
     }
 
-    const url = new URL(pathname, connection.baseUrl);
+    const baseUrl = new URL(connection.baseUrl);
+    if (!baseUrl.pathname.endsWith("/")) baseUrl.pathname += "/";
+    const url = new URL(pathname.replace(/^\/+/, ""), baseUrl);
     if (operation.queryParameters !== undefined) {
       const encoded = record(
         yield* encode(
@@ -321,7 +323,7 @@ const remoteFailure = <A extends RequestOperationDescriptor>(
       new GeneratedClientInvalidResponseError({
         operationId: operation.operationId,
         status: response.status,
-        message: `Undeclared HTTP response status ${response.status}`,
+        message: `Undeclared HTTP response status ${response.status} for ${operation.operationId} (${response.request.url})`,
         cause: Option.none(),
       })
     );

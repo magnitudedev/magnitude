@@ -10,13 +10,13 @@ import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
   IcnProcess,
-  makeIcnCatalog,
   makeIcnModels,
   makeIcnClient,
   makeIcnDownloads,
   makeIcnProcess,
   makeIcnHardware,
   makeIcnInstalledModels,
+  makeIcnEvents,
   IcnInstancesLive,
   IcnStorageConfig,
   IcnPreparationReporter,
@@ -212,12 +212,12 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const process = makeProcess(dataDir).pipe(Layer.provide(preparation));
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
-  const withHardware = Layer.provideMerge(makeIcnHardware(), withClient);
+  const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);
+  const withHardware = Layer.provideMerge(makeIcnHardware(), withEvents);
   const withModels = Layer.provideMerge(makeIcnModels(), withHardware);
-  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withModels);
   const withInstalled = Layer.provideMerge(
     makeIcnInstalledModels(),
-    withCatalog
+    withModels
   );
   const withInstances = Layer.provideMerge(IcnInstancesLive, withInstalled);
   const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstances);

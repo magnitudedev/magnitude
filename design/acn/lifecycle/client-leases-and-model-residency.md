@@ -42,18 +42,16 @@ connected count. One supervisor sleeps to the nearest monotonic deadline and is 
 revision changes. Exact renewal generations fence stale expiry work; no heartbeat creates its own
 timer fiber.
 
-The first lease directly marks client presence in the ACN lifecycle and publishes connected model
-residency. The final release or expiry publishes disconnected residency, commits the empty set,
-and directly marks client absence. These transitions are serialized. Presence is marked before the
-first connected-policy operation so ACN cannot retire during it; final absence is marked only after
-the disconnected policy and empty-set commit. The bounded policy operation runs in
+The first lease publishes connected model-residency policy. The final release or expiry publishes
+disconnected policy and commits the empty set. These transitions are serialized. The bounded policy operation runs in
 an explicitly interruptible child fiber so its timeout remains effective; the serialized mutation
 joins that child uninterruptibly before the matching state commit. Caller cancellation therefore
 cannot split policy acknowledgement from its commit. Definite policy failure fails closed by
 stopping ACN rather than committing mismatched state.
 
-Connected clients are the sole authority retaining ACN. With no connected client, ACN begins a
-fresh 30-minute idle interval regardless of RPC, session, inference, or subscription activity.
+Client absence never retires ACN. The per-user service owns ACN process lifetime; explicit service
+stop or fatal failure ends it. JIT clients coordinate with that same authority rather than creating
+a second lifecycle.
 
 ## ICN authority
 
@@ -65,7 +63,9 @@ API:
 
 A newer policy starts a fresh idle interval for a resident generation with no inference leases.
 Exact retries are idempotent. Older generations and equal generations with different content are
-rejected. Idle release revalidates the exact model generation, policy generation, zero inference
+rejected. Before each ACN transition, ACN reads the authoritative ICN policy, advances that
+generation, writes the desired timeout, and rereads to verify acknowledgement. It therefore remains
+correct if another management-API consumer advanced the policy generation. Idle release revalidates the exact model generation, policy generation, zero inference
 leases, and the complete interval under the model controller's mutation authority.
 
 If ACN cannot establish a first/final-client policy after bounded retries, it fails closed instead
@@ -73,13 +73,9 @@ of committing a client count paired with an unproved model timeout.
 
 ## Client presentation
 
-Graceful CLI exit reads the authoritative model-slot snapshot before releasing its own lease. It
-uses the returned post-release client count to report either the fresh 10-minute idle boundary or
-the number of other connected clients. `AcnJitRuntime.close` owns that observation and release;
-client surfaces do not receive its private lease client or raw lease handle. Only local `Loading`
-and `Ready` instances produce a model notice. Distinct instances are all named and duplicate slot
-projections are deduplicated. Unknown observation uses bounded fallback copy and never invents a
-count or deadline.
+Graceful close releases the lease and returns the post-release connected count. It does not read
+Slot residency because Slots contain no runtime state and foreground exit does not own service or
+model lifetime. Unknown close observation may show bounded generic service guidance.
 
 ## Conformance
 
@@ -88,10 +84,9 @@ count or deadline.
   the runtime's endpoint-selection and recovery authority.
 - Graceful close stops renewal and uses a non-recovering protocol bound to the selected exact ACN;
   abrupt scope finalization closes the runtime, stops renewal, and relies on lease expiry.
-- Heartbeat and release RPC duration is lifecycle-neutral; only their committed client-presence
-  transition affects process idleness.
+- Heartbeat and release RPC duration is process-lifecycle neutral.
 - Lease expiry uses monotonic time and exact renewal generations.
 - First/final transitions alone change ICN residency policy.
 - Every disconnected transition gives an idle resident model a fresh 10-minute interval.
 - A stale timer or policy message cannot release a newer model or extend its residency.
-- CLI notices are derived only from the slot snapshot and post-release count.
+- Foreground client exit never stops the per-user service or infers residency from Slots.

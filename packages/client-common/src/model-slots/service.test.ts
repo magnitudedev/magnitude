@@ -4,7 +4,6 @@ import {
   ModelSlotUnassigned,
   ModelSlotConfiguredLocal,
   ModelInstanceIdSchema,
-  ModelServingConfigurationIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -79,7 +78,6 @@ describe("model-slot mutation synchronization", () => {
         residency: {
           _tag: "Loading",
           instanceId: ModelInstanceIdSchema.make("instance"),
-          configurationId: ModelServingConfigurationIdSchema.make("configuration"),
           stage: "queued",
           progress: Option.none(),
           plannedAllocation: Option.none(),

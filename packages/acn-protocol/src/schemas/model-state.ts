@@ -140,10 +140,6 @@ export const formatModelDisplayName = (
   onSome: (label) => `${displayName} (${label})`,
 })
 
-export const ModelServingConfigurationIdSchema =
-  NonEmptyString.pipe(Schema.brand("ModelServingConfigurationId"))
-export type ModelServingConfigurationId = typeof ModelServingConfigurationIdSchema.Type
-
 export const ModelLoadPlanSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
   parallelSequences: PositiveSafeInteger,
@@ -435,7 +431,6 @@ export const ServingProfileSchema = Schema.Struct({
 export type ServingProfile = typeof ServingProfileSchema.Type
 
 export const ModelServingConfigurationSchema = Schema.Struct({
-  id: ModelServingConfigurationIdSchema,
   bundle: ServableModelBundleSchema,
   profile: ServingProfileSchema,
 })
@@ -515,7 +510,6 @@ export type GenerationPerformanceSamples = typeof GenerationPerformanceSamplesSc
 
 export const FitsModelAssessmentSchema = Schema.TaggedStruct("Fits", {
   profile: ServingProfileSchema,
-  configurationId: ModelServingConfigurationIdSchema,
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   memory: Schema.Array(MemoryAssessmentSchema),
@@ -789,6 +783,7 @@ export const LocalModelServingStateSchema = Schema.Union(
 export type LocalModelServingState = typeof LocalModelServingStateSchema.Type
 
 export const LocalModelSchema = Schema.Struct({
+  modelId: ProviderModelIdSchema,
   bundle: ServableModelBundleSchema,
   presentation: LocalModelPresentationSchema,
   downloadBytes: NonNegativeSafeInteger,
@@ -845,6 +840,29 @@ export const LocalModelRecommendationProgressStepSchema = Schema.Struct({
 })
 export type LocalModelRecommendationProgressStep =
   typeof LocalModelRecommendationProgressStepSchema.Type
+
+export const ModelRecommendationSchema = Schema.Struct({
+  modelId: ProviderModelIdSchema,
+  id: RecommendationIdSchema,
+  intent: Schema.Literal("balanced", "smartest", "fastest", "lightweight"),
+  explanation: Schema.String,
+})
+export type ModelRecommendation = typeof ModelRecommendationSchema.Type
+
+export const ModelRecommendationsStateSchema = Schema.Union(
+  Schema.TaggedStruct("Loading", {
+    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+  }),
+  Schema.TaggedStruct("Ready", {
+    recommendations: Schema.Array(ModelRecommendationSchema),
+    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+  }),
+  Schema.TaggedStruct("Failed", {
+    failure: ModelFailureSchema,
+    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+  }),
+)
+export type ModelRecommendationsState = typeof ModelRecommendationsStateSchema.Type
 
 export const LocalModelDiscoveryStateSchema = Schema.Union(
   Schema.TaggedStruct("Loading", {
@@ -999,6 +1017,20 @@ export const SlotSelectionSchema = Schema.Struct({
 })
 export type SlotSelection = typeof SlotSelectionSchema.Type
 
+/** Durable Magnitude model intent. Runtime availability and residency are ICN projections. */
+export const ModelSlotSelectionsStateSchema = Schema.Struct({
+  slots: Schema.Struct({
+    primary: Schema.optionalWith(SlotSelectionSchema, { as: "Option", exact: true }),
+    secondary: Schema.optionalWith(SlotSelectionSchema, { as: "Option", exact: true }),
+  }),
+  recentModels: Schema.Struct({
+    primary: Schema.Array(ProviderModelIdentitySchema),
+    secondary: Schema.Array(ProviderModelIdentitySchema),
+  }),
+  favoriteModels: Schema.Array(ProviderModelIdentitySchema),
+})
+export type ModelSlotSelectionsState = typeof ModelSlotSelectionsStateSchema.Type
+
 export class ModelSlotUnassigned extends Schema.TaggedClass<ModelSlotUnassigned>()("Unassigned", {
   slotId: SlotIdSchema,
 }) {}
@@ -1028,7 +1060,6 @@ export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 
 const ModelResidencyIdentityFields = {
   instanceId: ModelInstanceIdSchema,
-  configurationId: ModelServingConfigurationIdSchema,
 } as const
 
 export const ModelResidencySchema = Schema.Union(
@@ -1143,18 +1174,18 @@ export const ModelSlotsStateSchema = Schema.Struct({
     const local = [state.slots.primary, state.slots.secondary].filter(
       (slot): slot is ModelSlotConfiguredLocal => slot._tag === "ConfiguredLocal",
     )
-    const instanceIdsByConfiguration = new Map<string, Set<ModelInstanceId>>()
+    const instanceIdsByModel = new Map<string, Set<ModelInstanceId>>()
     for (const slot of local) {
       const residency = slot.residency
       if (residency._tag !== "Loading"
         && residency._tag !== "Ready"
         && residency._tag !== "Stopping") continue
-      const ids = instanceIdsByConfiguration.get(residency.configurationId)
+      const ids = instanceIdsByModel.get(slot.selection.providerModelId)
         ?? new Set<ModelInstanceId>()
       ids.add(residency.instanceId)
-      instanceIdsByConfiguration.set(residency.configurationId, ids)
+      instanceIdsByModel.set(slot.selection.providerModelId, ids)
     }
-    return [...instanceIdsByConfiguration.values()].every((ids) => ids.size === 1)
+    return [...instanceIdsByModel.values()].every((ids) => ids.size === 1)
   }, {
     message: () => "matching local slots must share one canonical model instance",
   }),

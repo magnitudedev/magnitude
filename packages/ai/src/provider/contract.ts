@@ -113,6 +113,7 @@ export interface RequestAttribution {
 }
 
 export type ModelRequestProgress =
+  | { readonly phase: "model_loading"; readonly requestId: string; readonly fraction: number }
   | { readonly phase: "queued"; readonly requestId: string }
   | { readonly phase: "preparing"; readonly requestId: string | null }
   | {

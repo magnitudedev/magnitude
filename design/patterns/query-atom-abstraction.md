@@ -212,10 +212,10 @@ using the exact admitted identity. No step infers causality from the latest muta
 resource discovered later, or timing.
 
 ```text
-choose exact configuration
+choose canonical catalog model
           |
           v
-install(configurationId) -> admission(providerModelId, modelDownloadId)
+install(modelId) -> admission(providerModelId, modelDownloadId)
           |                              |
           | await exact download         +---- cancellation addresses exact modelDownloadId
           v
@@ -242,7 +242,7 @@ bridges, or watch atoms. It does not require a component to mount synchronizatio
 ### UI
 
 The UI chooses when a user action occurs and renders state. It may consume semantic command status
-such as `isInstalling(configurationId)` or the outcome of `assign`, but it does not inspect a
+such as `isInstalling(modelId)` or the outcome of `assign`, but it does not inspect a
 mutation registry, select the latest invocation, execute dependent operations, or synchronize
 backend state.
 

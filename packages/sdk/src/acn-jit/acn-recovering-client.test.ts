@@ -175,7 +175,7 @@ describe("AcnJitRuntime", () => {
     })))
 
     expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(1)
-    expect(tags.filter((tag) => tag === "GetModelSlots")).toHaveLength(1)
+    expect(tags.filter((tag) => tag === "GetModelSlots")).toHaveLength(0)
     expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
   })
 
@@ -366,7 +366,7 @@ describe("AcnJitRuntime", () => {
     })))
   })
 
-  it("releases one lease when close observation fails and never ensures again", async () => {
+  it("releases one lease without a slot observation and never ensures again", async () => {
     const tags: string[] = []
     let ensures = 0
     const manager = AcnInstanceManager.of({
@@ -387,8 +387,8 @@ describe("AcnJitRuntime", () => {
         )),
       )
       yield* runtime.startup.retry
-      expect(Option.isNone(yield* runtime.close)).toBe(true)
-      expect(Option.isNone(yield* runtime.close)).toBe(true)
+      expect(Option.isSome(yield* runtime.close)).toBe(true)
+      expect(Option.isSome(yield* runtime.close)).toBe(true)
       expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
       expect(Exit.isFailure(yield* Effect.exit(runtime.startup.retry))).toBe(true)
       expect(ensures).toBe(1)

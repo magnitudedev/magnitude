@@ -21,7 +21,7 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 | Concern | Owner |
 |---|---|
 | Native compatibility, memory, placement, performance | ICN |
-| Serving-configuration construction, canonical identity, validation | ICN |
+| Native serving-configuration resolution and validation | ICN |
 | Profile set, orchestration, recommendation policy | ACN |
 | Rendering | Clients |
 
@@ -37,38 +37,26 @@ sequenceDiagram
     participant Resolver
     participant Recommender
 
-    alt Catalog configuration
-        Catalog->>ACN: Reviewed configuration (bundle, profile, canonical ID)
-        ACN->>ACN: Preserve reviewed profile
-    else Standard configuration
-        Inventory->>ACN: Inspected standalone bundle without catalog configuration
-        ACN->>ACN: Choose standard profile
-    end
+    Catalog->>ACN: Reviewed model identity and configuration (bundle, profile)
+    ACN->>ACN: Preserve reviewed profile
 
     ACN->>ICN: Assess exact bundle at profile with sampling policy
-    ICN->>ICN: Construct canonical configuration from bundle and profile
+    ICN->>ICN: Resolve and validate bundle and profile
     ICN->>ICN: Assess compatibility, memory, and performance
     ICN-->>ACN: Request-correlated terminal result
 
-    alt Catalog configuration
-        ACN->>ACN: Attach evidence to submitted catalog configuration
-    else Standard configuration
-        ACN->>ACN: Accept ICN-constructed configuration
-    end
+    ACN->>ACN: Attach evidence to submitted catalog model
 
     ACN->>Resolver: Publish configuration and assessment
-    Resolver->>Resolver: Select catalog, otherwise standard
+    Resolver->>Resolver: Resolve catalog model configuration
     ACN->>Recommender: Evaluate Fits catalog configuration
 ```
 
-ACN always supplies the serving profile used for assessment. For catalog input it preserves the
-reviewed profile; standard input requires ACN to choose one by policy. ICN
-always constructs and canonically identifies the exact serving configuration for the supplied
-bundle and profile. Each ACN request carries one or more unique profiles. The response is correlated
-first by exact request identity and then by exact profile identity within that request. For catalog
-intent, ACN attaches the returned evidence to the submitted catalog configuration. For standard
-intent, ACN accepts the ICN-constructed configuration. ACN never compares copied configuration
-records to correlate a result.
+ACN supplies the reviewed serving profile for each catalog model. ICN resolves and validates the
+exact bundle and profile. Each ACN request carries one or more unique profiles. The response is
+correlated first by exact request identity and then by exact profile identity within that request.
+ACN attaches returned evidence to the canonical catalog model ID. A serving configuration is a
+value, not a separately addressable entity.
 
 The rejection proof compares exact, content-deduplicated tensor storage with aggregate stable
 physical capacity. Uncertain bundles proceed. File/download size is not rejection evidence.
@@ -85,19 +73,15 @@ Every executor request carries one bundle and one or more unique profiles so ICN
 opening across their assessment. Missing, duplicate, or unrequested profile outcomes violate the
 assessment operation contract; they fail the operation rather than becoming a model compatibility
 or capacity state.
-One ACN local-model assessor owns demand for each catalog model's desired configuration, its
-installed effective configuration when different, and standard profile decisions made only for
-inspected uncatalogued packages. Desired catalog assessment supports recommendation and acquisition;
-effective catalog assessment supports current serving. ACN supplies the chosen bundle and profile for standard demand;
-ICN constructs and identifies the corresponding serving configuration as part of assessment.
+One ACN local-model assessor owns demand for each catalog model's desired configuration and its
+installed effective configuration when different. Desired catalog assessment supports recommendation
+and acquisition; effective catalog assessment supports current serving.
 Recommendation, provider-offering, and local-model projections consume its state and
 never invoke assessment independently. Recommendation policy consumes only release-catalog
-candidates. Each release-catalog configuration uses its reviewed catalog profile. ACN chooses the
-standard profile bounded by the package maximum for an inspected standalone package only when no
-catalog configuration exists for that bundle. ICN, not ACN, constructs and canonically identifies the
-resulting configuration. Package installation origin does not affect this decision. An installed
-catalog target is never reclassified as a standard model merely because its desired bundle differs;
-it remains the effective configuration of the same `CatalogIdentity`.
+candidates. Each release-catalog configuration uses its reviewed catalog profile. Installed
+artifacts that are not attributed to a catalog model remain package inventory; they do not become
+callable models with fabricated identities. An installed catalog target remains the effective
+configuration of the same canonical catalog model when its desired bundle changes.
 
 ICN persists every completed exact profile result, including `DoesNotFit`, and performs
 single-flight native work. Repeated reads consume current results and do not trigger native
@@ -127,7 +111,7 @@ coalesce -> read snapshots -> compute semantic assessment keys
                                       publish only while current
 ```
 
-One semantic assessment key contains the complete serving configuration, resolved immutable
+One private semantic assessment key contains the complete serving configuration, resolved immutable
 assessment material, stable topology and capacity identity, native build and enabled backends,
 calibration identity, assessment method and policy, and requested performance-depth policy.
 
@@ -138,7 +122,7 @@ assessment by itself.
 
 Reconciliation is serialized and invalidations are coalesced. It assesses only new or changed keys,
 preserves terminal results for unchanged keys, and removes state only when catalog and
-installed-package demand no longer includes the configuration. Completion rechecks the semantic key before publication;
+catalog demand no longer includes the configuration. Completion rechecks the semantic key before publication;
 a result for a superseded key is discarded and reconciliation continues without overwriting newer
 state.
 
@@ -163,7 +147,7 @@ independently of assessment and offering publication.
 
 ## Assessment lifecycle
 
-ACN owns one shared per-configuration assessment coordinator. While admitted work for the current
+ACN owns one shared assessment coordinator per structural bundle-and-profile value. While admitted work for the current
 semantic key is running, its internal state is `Assessing`. Completion publishes `Failed`, `Fits`,
 `DoesNotFit`, or `Incompatible` for that key. Serialized reconciliation plus key validation makes
 stale completion unrepresentable. Unchanged configurations retain their terminal state while
@@ -204,8 +188,8 @@ Cached assessment never authorizes loading.
 
 - Every release-catalog choice publishes one reviewed configuration whose profile does not exceed
   its exact bundle maximum.
-- For every inspected independently servable package without a catalog configuration, ACN applies
-  the canonical standard-profile rule and ICN constructs and assesses its exact configuration.
+- Installed packages without catalog attribution remain artifact inventory and are not assigned a
+  callable model identity.
 - A package already participating in a catalog bundle is assessed only through that
   bundle. Separate speculative companions are never submitted again as standalone targets.
 - All missing profiles for one bundle are submitted together.
@@ -218,7 +202,7 @@ Cached assessment never authorizes loading.
 - Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
 - Recommendation-policy inputs remain private; client-visible recommendation annotations preserve
-  the local model's serving-configuration identity.
+  the canonical catalog model ID.
 - Loading never treats cached assessment as admission authority.
 - ACN startup and service publication never wait for model assessment.
 - Onboarding keeps installed and downloadable model groups at a stable layout height while making

@@ -1,4 +1,35 @@
 export { protocolLayer } from "./protocol"
+export {
+  Inference,
+  MagnitudeBoundary,
+  makeInferenceImplementations,
+  inferenceImplementationsLayer,
+  invalidateAllInferenceQueries,
+  invalidateInferenceTopic,
+  inferenceClientErrorMessage,
+  magnitudeImplementationsLayer,
+  type InferenceClientError,
+  type MagnitudeImplementationError,
+} from "./inference"
+export {
+  MAGNITUDE_SERVICE_ORIGIN,
+  MAGNITUDE_INFERENCE_BASE_URL,
+} from "./inference-endpoint"
+export {
+  makeInferenceClient,
+  type InferenceClient,
+  type InferenceEffectQueryClient,
+} from "./inference-client"
+
+export {
+  projectInferenceAllocation,
+  projectInferenceLoadPlan,
+  projectInferenceResidency,
+} from "./inference-projection"
+export type {
+  ModelsResponse as InferenceModelsResponse,
+  ModelInstancesSnapshot as InferenceInstancesSnapshot,
+} from "@magnitudedev/icn-protocol/schemas"
 
 export {
   AcnInstanceManager,

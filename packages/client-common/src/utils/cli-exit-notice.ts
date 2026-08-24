@@ -1,71 +1,10 @@
 import { Option } from "effect"
-import type {
-  AcnClientCloseResult,
-  ModelSlotConfiguredLocal,
-  ModelSlotsState,
-} from "@magnitudedev/sdk"
-import { formatModelDisplayName } from "./model-presentation"
+import type { AcnClientCloseResult } from "@magnitudedev/sdk"
 
 export const CLI_EXIT_OBSERVATION_FALLBACK =
   "Magnitude may still have background processes running.\n" +
-  "Run `magnitude stop` to stop the current daemon and release any loaded model now."
+  "Run `magnitude server stop` to stop the background service."
 
-const activeLocalSlots = (state: ModelSlotsState): ReadonlyArray<ModelSlotConfiguredLocal> =>
-  [state.slots.primary, state.slots.secondary].filter(
-    (slot): slot is ModelSlotConfiguredLocal =>
-      slot._tag === "ConfiguredLocal" &&
-      (slot.residency._tag === "Ready" || slot.residency._tag === "Loading")
-  )
-
+/** A healthy close needs no residency warning; the background service owns lifetime. */
 export const deriveCliExitNotice = (observation: AcnClientCloseResult): Option.Option<string> =>
-  Option.match(observation, {
-    onNone: () => Option.some(CLI_EXIT_OBSERVATION_FALLBACK),
-    onSome: ({ modelSlots, connectedClientCount }) => {
-      const byInstance = new Map<string, ModelSlotConfiguredLocal>()
-      for (const slot of activeLocalSlots(modelSlots)) {
-        const residency = slot.residency
-        if (residency._tag !== "Ready" && residency._tag !== "Loading") continue
-        byInstance.set(residency.instanceId, byInstance.get(residency.instanceId) ?? slot)
-      }
-      if (byInstance.size === 0) return Option.none()
-      if (byInstance.size > 1) {
-        const descriptions = [...byInstance.values()].map((slot) => {
-          const activity = slot.residency._tag === "Loading" ? "loading" : "running"
-          return `${formatModelDisplayName(
-            slot.descriptor.displayName,
-            slot.descriptor.variantLabel,
-          )} (${activity})`
-        })
-        const names = descriptions.length === 2
-          ? descriptions.join(" and ")
-          : `${descriptions.slice(0, -1).join(", ")}, and ${descriptions.at(-1)}`
-        const firstSentence = connectedClientCount === 0
-          ? `${names} are still active and will stop automatically after 10 minutes when idle.`
-          : `${names} are still active. ${connectedClientCount} other ${
-              connectedClientCount === 1 ? "client is" : "clients are"
-            } connected.`
-        return Option.some(
-          `${firstSentence}\nRun \`magnitude stop\` to stop the current daemon and release the models now.`
-        )
-      }
-
-      const slot = byInstance.values().next().value!
-      const activity = slot.residency._tag === "Loading" ? "loading" : "running"
-      const name = formatModelDisplayName(
-        slot.descriptor.displayName,
-        slot.descriptor.variantLabel,
-      )
-      const firstSentence =
-        connectedClientCount === 0
-          ? activity === "loading"
-            ? `${name} is still loading. When idle, it will stop automatically after 10 minutes.`
-            : `${name} is still running and will stop automatically after 10 minutes.`
-          : `${name} is still ${activity}. ${connectedClientCount} other ${
-              connectedClientCount === 1 ? "client is" : "clients are"
-            } connected.`
-
-      return Option.some(
-        `${firstSentence}\nRun \`magnitude stop\` to stop the current daemon and release the model now.`
-      )
-    },
-  })
+  Option.isSome(observation) ? Option.none() : Option.some(CLI_EXIT_OBSERVATION_FALLBACK)

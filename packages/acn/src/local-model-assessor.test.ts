@@ -5,7 +5,6 @@ import {
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelReleaseDateSchema,
-  ModelServingConfigurationIdSchema,
   type ModelPackageEntry,
 } from "@magnitudedev/acn-protocol"
 import { IcnHardware, IcnModels } from "@magnitudedev/icn"
@@ -68,18 +67,14 @@ describe("LocalModelAssessor", () => {
         state: { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] },
       }
       const configuration = {
-        id: ModelServingConfigurationIdSchema.make("configuration-test"),
         bundle: { _tag: "Standalone" as const, package: modelPackage },
         profile: { contextLength: 32_768 },
       }
-      const siblingConfiguration = {
-        ...configuration,
-        id: ModelServingConfigurationIdSchema.make("configuration-sibling"),
-      }
-      const catalogModel = (id: string, configuration: typeof siblingConfiguration) => ({
+      const catalogModel = (id: string, desiredConfiguration: typeof configuration) => ({
+        id: `${id}:gguf:q4`,
         modelId: id,
         variantId: "gguf:q4",
-        desiredConfiguration: configuration,
+        desiredConfiguration,
         localState: { _tag: "NotInstalled" as const },
         displayName: "Test",
         variantLabel: "Q4",
@@ -103,18 +98,15 @@ describe("LocalModelAssessor", () => {
             state: {
               revision: 1,
               reconciliationComplete: true,
-              catalogModels: [
+              models: [
                 catalogModel("recommendable-test", configuration),
-                catalogModel("recommendable-sibling", siblingConfiguration),
               ] as never,
-              uncataloguedPackages: [],
               diagnostics: [],
             },
           }),
           changes: Stream.never,
           initialized: Effect.succeed(true),
           refresh: Effect.void,
-          reconcileCatalogModel: () => Effect.dieMessage("unused"),
         })),
         Layer.succeed(IcnHardware, IcnHardware.of({
           get: Effect.succeed({
@@ -136,10 +128,6 @@ describe("LocalModelAssessor", () => {
           snapshot: Effect.succeed(packageSnapshot),
           changes: Stream.fromPubSub(packageChanges),
           installedPackageIds: Effect.succeed(new Set([packageId])),
-          admitBundle: () => Effect.dieMessage("unused"),
-          cancelDownload: () => Effect.dieMessage("unused"),
-          acknowledgeFailure: () => Effect.dieMessage("unused"),
-          removeBundlePackages: () => Effect.dieMessage("unused"),
         })),
         Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({
           assess: (requests) => Effect.sync(() => {
@@ -150,10 +138,7 @@ describe("LocalModelAssessor", () => {
                   environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
                   assessments: [{
                     _tag: "Incompatible",
-                    configuration: {
-                      ...configuration,
-                      id: ModelServingConfigurationIdSchema.make("native-generated-configuration"),
-                    },
+                    configuration,
                     failure: {
                       code: "unsupported_architecture",
                       message: "Unsupported architecture",
@@ -175,9 +160,9 @@ describe("LocalModelAssessor", () => {
         yield* Effect.sleep("100 millis")
         expect(assessmentCalls).toBe(1)
         const initialState = yield* assessor.state
-        expect([...initialState.keys()]).toEqual([configuration.id, siblingConfiguration.id])
-        expect(initialState.get(configuration.id)?.configuration).toEqual(configuration)
-        expect(initialState.get(configuration.id)?.assessment).toEqual({
+        expect(initialState).toHaveLength(1)
+        expect(initialState[0]?.configuration).toEqual(configuration)
+        expect(initialState[0]?.assessment).toEqual({
           _tag: "Incompatible",
           environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
           failure: {
@@ -186,21 +171,12 @@ describe("LocalModelAssessor", () => {
             retryable: false,
           },
         })
-        expect(initialState.get(siblingConfiguration.id)?.assessment).toEqual({
-          _tag: "Failed",
-          failure: {
-            code: "invalid_model_bundle",
-            message: "terminal test result",
-            retryable: false,
-          },
-        })
-
         yield* PubSub.publish(packageChanges, packageSnapshot)
         yield* PubSub.publish(packageChanges, packageSnapshot)
         yield* Effect.sleep("100 millis")
 
         expect(assessmentCalls).toBe(1)
-        expect((yield* assessor.state).get(configuration.id)?.assessment._tag)
+        expect((yield* assessor.state)[0]?.assessment._tag)
           .toBe("Incompatible")
       }).pipe(Effect.provide(testLayer))
     })))

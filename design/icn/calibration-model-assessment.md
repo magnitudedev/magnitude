@@ -110,8 +110,8 @@ Every requested profile produces one result:
 
 | Result | Meaning |
 |---|---|
-| `Fits` | Configuration identity, memory accounting, and ordered performance samples |
-| `DoesNotFit` | Configuration identity, memory accounting, limiting resource, and deficit |
+| `Fits` | Exact configuration value, memory accounting, and ordered performance samples |
+| `DoesNotFit` | Exact configuration value, memory accounting, limiting resource, and deficit |
 | `Incompatible` | The artifact/runtime combination cannot execute |
 
 Malformed or unresolved input produces target-level `InvalidTarget`. An operational failure while
@@ -122,9 +122,7 @@ fails the endpoint.
 
 ## Profiles
 
-ACN submits the exact profile contained in each issued catalog configuration. For an installed
-standalone package without a catalog configuration, ACN submits the profile produced by its
-canonical standard-profile rule. Catalog generation rejects a reviewed profile above its artifact
+ACN submits the exact profile contained in each issued catalog configuration. Catalog generation rejects a reviewed profile above its artifact
 maximum; a pair is bounded by the lower component maximum. Profiles below 4,096 tokens are not
 submitted. ICN does not search a context range or choose a profile.
 
@@ -251,8 +249,7 @@ configurations, and completion publishes only if that key remains current.
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-bundle job returns one result per requested profile.
 - Every profile result carries the exact ICN-constructed serving configuration it assessed.
-- ACN standard demand supplies bundle and profile policy without constructing or predicting
-  configuration identity.
+- Serving configurations cross the boundary as exact values without a separate configuration ID.
 - Every `Fits` result contains ordered performance samples ending at the profile context.
 - Multiple performance depths for one profile require only one native context graph.
 - Warm exact-cache reads invoke no native planner.

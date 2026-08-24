@@ -5,19 +5,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use futures_util::future::BoxFuture;
 use icn_contracts::InventoryError;
 use icn_contracts::models::{
-    CatalogModel, CatalogModelEffectiveConfiguration, CatalogModelInstallation,
-    CatalogModelLocalState, CatalogModelUpdateState, CatalogModels, CatalogPackageRemover,
-    CatalogPackageRole, InstalledCatalogAttribution, InstalledModelPackage, ModelDownloads,
-    ModelFailure, ModelPackageId, ModelServingConfiguration, RecommendableModel,
-    RecommendableModelCatalog, ReconcileCatalogModelRequest, ReconcileCatalogModelResponse,
-    ServableModelBundle, StartModelDownloadRequest,
+    CatalogModelEffectiveConfiguration, CatalogModelInstallation, CatalogModelLocalState,
+    CatalogModelUpdateState, CatalogModels, CatalogPackageRemover, InferenceModel,
+    InstallCatalogModelRequest, InstallModelResponse, InstalledCatalogAttribution,
+    InstalledModelPackage, ModelDownloads, ModelFailure, ModelPackageId, ModelServingConfiguration,
+    RecommendableModel, RecommendableModelCatalog, ServableModelBundle, StartModelDownloadRequest,
 };
 
 use crate::ManagedModelDownloads;
 use crate::inventory::{
     InstalledPackagesObserver, ManagedModelStore, catalog_packages, catalog_target,
 };
-use crate::package_service::{servable_model_bundle_key_for_bundle, serving_configuration_id};
 
 #[derive(Clone)]
 pub struct ManagedCatalogModels {
@@ -74,41 +72,15 @@ impl ManagedCatalogModels {
             .iter()
             .map(|model| catalog_model(model, &present, &affiliations))
             .collect::<Vec<_>>();
-        let dependency_ids = self
-            .catalog
-            .models
-            .iter()
-            .flat_map(catalog_packages)
-            .filter_map(|(package, role)| {
-                (role == CatalogPackageRole::Dependency).then_some(package.id.clone())
-            })
-            .chain(affiliations.iter().filter_map(|affiliation| {
-                (affiliation.role == CatalogPackageRole::Dependency)
-                    .then_some(affiliation.package_id.clone())
-            }))
-            .collect::<BTreeSet<_>>();
-        let uncatalogued_packages = installed
-            .packages
-            .into_iter()
-            .filter(|entry| {
-                !dependency_ids.contains(&entry.package.id)
-                    && !matches!(
-                        entry.catalog_attribution,
-                        InstalledCatalogAttribution::Attributed { .. }
-                    )
-            })
-            .collect();
-
         Ok(icn_contracts::models::ModelsResponse {
             revision: installed.revision,
             reconciliation_complete: installed.reconciliation_complete,
-            catalog_models,
-            uncatalogued_packages,
+            models: catalog_models,
             diagnostics: self.catalog.diagnostics.clone(),
         })
     }
 
-    async fn cleanup(&self, model: &CatalogModel) -> Result<(), InventoryError> {
+    async fn cleanup(&self, model: &InferenceModel) -> Result<(), InventoryError> {
         for package_id in superseded_packages_ready_for_removal(model) {
             self.remover
                 .remove_catalog_package(package_id.clone())
@@ -135,7 +107,7 @@ impl ManagedCatalogModels {
             let observed = self.maintenance_generation.load(Ordering::Acquire);
             match self.snapshot() {
                 Ok(snapshot) => {
-                    for model in &snapshot.catalog_models {
+                    for model in &snapshot.models {
                         if let Err(error) = self.cleanup(model).await {
                             tracing::warn!(
                                 model_id = %model.model_id.0,
@@ -165,7 +137,7 @@ impl ManagedCatalogModels {
     }
 }
 
-fn superseded_packages_ready_for_removal(model: &CatalogModel) -> &[ModelPackageId] {
+fn superseded_packages_ready_for_removal(model: &InferenceModel) -> &[ModelPackageId] {
     let CatalogModelLocalState::Installed {
         update_state:
             CatalogModelUpdateState::Available {
@@ -194,7 +166,7 @@ fn catalog_model(
     definition: &RecommendableModel,
     present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
     affiliations: &[icn_contracts::models::CatalogPackageAffiliation],
-) -> CatalogModel {
+) -> InferenceModel {
     let desired_ids = catalog_packages(definition)
         .map(|(package, _)| package.id.clone())
         .collect::<BTreeSet<_>>();
@@ -265,10 +237,6 @@ fn catalog_model(
                     let profile = definition.configuration.profile.clone();
                     CatalogModelEffectiveConfiguration::Runnable {
                         configuration: ModelServingConfiguration {
-                            id: serving_configuration_id(
-                                &servable_model_bundle_key_for_bundle(&bundle),
-                                &profile,
-                            ),
                             bundle,
                             profile,
                         },
@@ -302,7 +270,8 @@ fn catalog_model(
         }
     };
 
-    CatalogModel {
+    InferenceModel {
+        id: format!("{}:{}", definition.model_id.0, definition.variant_id.0),
         model_id: definition.model_id.clone(),
         variant_id: definition.variant_id.clone(),
         desired_configuration: definition.configuration.clone(),
@@ -327,15 +296,15 @@ impl CatalogModels for ManagedCatalogModels {
         Box::pin(async { self.snapshot() })
     }
 
-    fn reconcile(
+    fn install(
         &self,
-        request: ReconcileCatalogModelRequest,
-    ) -> BoxFuture<'_, Result<ReconcileCatalogModelResponse, InventoryError>> {
+        request: InstallCatalogModelRequest,
+    ) -> BoxFuture<'_, Result<InstallModelResponse, InventoryError>> {
         Box::pin(async move {
             self.inventory.ensure_installed_model_inventory().await?;
             let model = self
                 .snapshot()?
-                .catalog_models
+                .models
                 .into_iter()
                 .find(|model| {
                     model.model_id == request.model_id && model.variant_id == request.variant_id
@@ -369,13 +338,13 @@ impl CatalogModels for ManagedCatalogModels {
                     })
                     .await?;
                 if let Some(download) = response.download {
-                    return Ok(ReconcileCatalogModelResponse::DownloadAdmitted {
+                    return Ok(InstallModelResponse::DownloadAdmitted {
                         download_id: download.id,
                     });
                 }
             }
             self.cleanup(&model).await?;
-            Ok(ReconcileCatalogModelResponse::Current)
+            Ok(InstallModelResponse::Current)
         })
     }
 }
@@ -386,10 +355,10 @@ mod tests {
     use std::path::PathBuf;
 
     use icn_contracts::models::{
-        CatalogModelId, CatalogPackageAffiliation, CatalogVariantId, ModelCapabilities,
-        ModelPackage, ModelPackageInspection, ModelPackageInstallationOrigin,
+        CatalogModelId, CatalogPackageAffiliation, CatalogPackageRole, CatalogVariantId,
+        ModelCapabilities, ModelPackage, ModelPackageInspection, ModelPackageInstallationOrigin,
         ModelPackageProperties, ModelPackageSource, ModelReasoningCapabilities, ModelReleaseDate,
-        ModelServingConfigurationId, ServingProfile,
+        ServingProfile,
     };
 
     fn package(id: &str) -> ModelPackage {
@@ -417,7 +386,6 @@ mod tests {
             model_id: CatalogModelId("catalog".to_owned()),
             variant_id: CatalogVariantId("gguf:q4".to_owned()),
             configuration: ModelServingConfiguration {
-                id: ModelServingConfigurationId("desired".to_owned()),
                 bundle: ServableModelBundle::Standalone { package: desired },
                 profile: ServingProfile {
                     context_length: 4_096,

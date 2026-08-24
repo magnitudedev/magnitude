@@ -21,18 +21,17 @@ import {
 } from "@magnitudedev/acn-protocol"
 import type {
   ModelDownload as NativeModelDownload,
-  CatalogModel as NativeCatalogModel,
+  InferenceModel as NativeInferenceModel,
   ServableModelBundle as NativeServableModelBundle,
   ModelPackageInspection as NativeModelPackageInspection,
   ModelPackage as NativeModelPackage,
   ModelServingConfiguration as NativeModelServingConfiguration,
   ModelBundleInput,
-  RecommendableModel as NativeRecommendableModel,
   ServingProfile as NativeServingProfile,
 } from "@magnitudedev/icn-protocol/schemas"
 
 export const catalogIdentityFromIcn = (
-  model: Pick<NativeCatalogModel, "modelId" | "variantId">,
+  model: Pick<NativeInferenceModel, "modelId" | "variantId">,
 ): Effect.Effect<CatalogIdentity, ParseResult.ParseError> =>
   Schema.decodeUnknown(CatalogIdentitySchema)({
     modelId: model.modelId,
@@ -40,15 +39,17 @@ export const catalogIdentityFromIcn = (
   })
 
 export const catalogModelDefinitionFromIcn = (
-  model: NativeCatalogModel,
+  model: NativeInferenceModel,
 ): Effect.Effect<RecommendableModel, ParseResult.ParseError> =>
-  recommendableModelFromIcn({
-    ...model,
-    configuration: model.desiredConfiguration,
-  })
+  modelServingConfigurationFromIcn(model.desiredConfiguration).pipe(
+    Effect.flatMap((configuration) => Schema.validate(RecommendableModelSchema)({
+      ...model,
+      configuration,
+    })),
+  )
 
 export const catalogModelEffectiveConfigurationFromIcn = (
-  model: NativeCatalogModel,
+  model: NativeInferenceModel,
 ): Effect.Effect<Option.Option<ModelServingConfiguration>, ParseResult.ParseError> =>
   model.localState._tag === "Installed"
     && model.localState.installation.effectiveConfiguration._tag === "Runnable"
@@ -127,7 +128,6 @@ export const modelServingConfigurationToIcn = (
 ): Effect.Effect<NativeModelServingConfiguration, ParseResult.ParseError> =>
   servableModelBundleToIcn(configuration.bundle).pipe(
     Effect.map((bundle) => ({
-      id: configuration.id,
       bundle,
       profile: servingProfileToIcn(configuration.profile),
     })),
@@ -137,19 +137,9 @@ export const modelServingConfigurationFromIcn = (
   configuration: NativeModelServingConfiguration,
 ): Effect.Effect<ModelServingConfiguration, ParseResult.ParseError> =>
   Schema.validate(ModelServingConfigurationSchema)({
-    ...configuration,
+    profile: configuration.profile,
     bundle: normalizeBundleFromIcn(configuration.bundle),
   })
-
-export const recommendableModelFromIcn = (
-  model: NativeRecommendableModel,
-): Effect.Effect<RecommendableModel, ParseResult.ParseError> =>
-  modelServingConfigurationFromIcn(model.configuration).pipe(
-    Effect.flatMap((configuration) => Schema.validate(RecommendableModelSchema)({
-      ...model,
-      configuration,
-    })),
-  )
 
 export const modelDownloadFromIcn = (
   download: NativeModelDownload,

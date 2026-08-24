@@ -13,7 +13,6 @@ import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
 import { ProviderClientRegistry } from "./shared-client"
 import { ModelSlotController } from "./model-slot-controller"
-import { makeModelRequestPreparation } from "./model-request-preparation"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {
@@ -72,7 +71,6 @@ export const AgentFactoryLive = (options: {
             sessionContext: prepared.sessionContext,
             sessionId: input.sessionId,
             providerClient: prepared.providerClient,
-            prepareModelRequest: makeModelRequestPreparation(modelSlots),
             modelConfiguration: modelSlots.agentModelConfiguration,
             modelConfigurationChanges: modelSlots.agentModelConfigurationChanges,
             toolAvailability: providerClients.toolAvailability,

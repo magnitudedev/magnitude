@@ -137,7 +137,7 @@ system-domain allocation once, capped by ICN's normalized allocation capacity.
 
 ICN owns and publishes the assessment and abort thresholds. ACN owns the recommended-headroom
 formula and publishes derived application guidance; clients consume that guidance rather than
-reconstructing it. A resident worker failure is published with its configuration identity and
+reconstructing it. A resident worker failure is published with its exact instance ID and
 becomes a typed slot residency-loss state.
 
 An assigned model remains configured while it is loading, unloaded, or blocked. Loadability is

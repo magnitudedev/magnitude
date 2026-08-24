@@ -6,6 +6,7 @@ import {
   type IcnObservedSnapshot,
   type IcnObservedState,
 } from "../observed-state.js"
+import { IcnEvents, refreshOnIcnEvents } from "../events/index.js"
 
 type HardwareReadError = Effect.Effect.Error<ReturnType<IcnClientService["system"]["getHardware"]>>
 
@@ -28,18 +29,31 @@ export interface IcnHardwareOptions {
 
 export const makeIcnHardware = (
   options: IcnHardwareOptions = {},
-): Layer.Layer<IcnHardware, HardwareReadError, IcnClient> =>
+): Layer.Layer<IcnHardware, HardwareReadError, IcnClient | IcnEvents> =>
   Layer.scoped(
     IcnHardware,
     Effect.gen(function* () {
       const client = yield* IcnClient
+      const events = yield* IcnEvents
+      const invalidations = yield* events.subscribe
       const read = client.system.getHardware({})
       const initial = yield* read
       const observed = yield* makeIcnObservedState(
         initial,
         read,
         Schema.equivalence(HardwareSnapshotSchema),
+        { initiallyInitialized: true },
       )
+
+      // Instance transitions alter the allocatable-memory view immediately.
+      // Polling remains necessary for memory consumed by unrelated processes.
+      yield* refreshOnIcnEvents(
+        invalidations,
+        new Set(["hardware"]),
+        observed.refresh,
+        "ICN hardware snapshot",
+        options.refreshInterval ?? "2 seconds",
+      ).pipe(Effect.forkScoped)
 
       yield* observed.refresh.pipe(
         Effect.tapError((error) => Effect.logWarning("Unable to refresh ICN hardware snapshot").pipe(

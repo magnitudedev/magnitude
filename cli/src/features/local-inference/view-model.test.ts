@@ -8,7 +8,7 @@ import {
   localModelBundleKey,
   localModelMaximumContextLength,
   performanceRange,
-  selectionConfigurationId,
+  selectionModelId,
   selectionMetadata,
   selectionProviderModelId,
 } from "./view-model"
@@ -37,8 +37,7 @@ describe("unified local inference projection", () => {
     const view = makeView({ models: [model] })
     const [selection] = buildLocalInferenceSelections(view.models, view.slots)
     expect(selection?.model).toBe(model)
-    expect(Option.getOrThrow(selectionConfigurationId(selection!)))
-      .toBe(model.servingState._tag === "Assessed" ? model.servingState.configuration.id : undefined)
+    expect(selectionModelId(selection!)).toBe(model.modelId)
     expect(Option.getOrThrow(selectionProviderModelId(selection!))).toBeDefined()
   })
 

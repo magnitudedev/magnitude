@@ -10,27 +10,7 @@
     "version": "0.1.0"
   },
   "paths": {
-    "/health": {
-      "get": {
-        "tags": [
-          "system"
-        ],
-        "operationId": "health",
-        "responses": {
-          "200": {
-            "description": "ICN is running",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/apply-template": {
+    "/api/v1/chat/templates/apply": {
       "post": {
         "tags": [
           "chat"
@@ -67,6 +47,36 @@
               }
             }
           },
+          "404": {
+            "description": "Model is not installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model cannot currently be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Template preparation failed",
             "content": {
@@ -80,12 +90,1381 @@
         }
       }
     },
+    "/api/v1/downloads": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "listModelDownloads",
+        "responses": {
+          "200": {
+            "description": "Retained model downloads and internal package attempts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDownloadsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model downloads unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/downloads/{download_id}": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelDownload",
+        "parameters": [
+          {
+            "name": "download_id",
+            "in": "path",
+            "description": "Model download ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact model download",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDownload"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model download not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model downloads unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/downloads/{download_id}/acknowledge-failure": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "acknowledgeModelDownloadFailure",
+        "parameters": [
+          {
+            "name": "download_id",
+            "in": "path",
+            "description": "Failed model download ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Acknowledged failed model download",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDownload"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model download has not failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model download not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model download acknowledgement failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/downloads/{download_id}/cancel": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "cancelModelDownload",
+        "parameters": [
+          {
+            "name": "download_id",
+            "in": "path",
+            "description": "Model download ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled or terminal model download",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDownload"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model download cannot be cancelled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model download not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model download cancellation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "watchInferenceEvents",
+        "parameters": [
+          {
+            "name": "topics",
+            "in": "query",
+            "description": "Comma-separated inference resource topics",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Multiplexed native inference-resource invalidations",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid resource topic filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/InferenceResourceInvalidation"
+            }
+          },
+          "framing": "sse",
+          "reconnect": {
+            "type": "none"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "long-lived"
+          },
+          "version": 1
+        }
+      }
+    },
+    "/api/v1/hardware": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "getHardware",
+        "responses": {
+          "200": {
+            "description": "Hardware visible to the pinned ICN process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HardwareSnapshot"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Hardware discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/instances": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelInstances",
+        "responses": {
+          "200": {
+            "description": "Authoritative native model instances",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInstancesSnapshot"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "ensureModelInstance",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnsureModelInstanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Current ready instance for the model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInstance"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid model identity or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model is not installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model cannot currently be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/instances/{instance_id}": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelInstance",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Model instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact model instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInstance"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model instance not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/instances/{instance_id}/stop": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "stopModelInstance",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Model instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The exact model instance is stopped"
+          },
+          "400": {
+            "description": "Invalid instance identity or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model instance not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model instance cannot currently be stopped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model instance stop failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "listModels",
+        "responses": {
+          "200": {
+            "description": "Catalog models joined with current local artifact state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models/assess": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "assessModels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssessModelsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Exact target and profile assessments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssessModelsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid assessment request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Assessment target not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model assessment could not be completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Assessment target failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Assessment operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models/install": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "installModel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Model installation admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallModelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid canonical model identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model installation cannot currently be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Downloaded model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog model reconciliation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models/uninstall": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "uninstallModel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Model packages safely removed or retained because they are shared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UninstallModelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid model identity or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model is active or package deletion is unsafe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model reconciliation or package removal failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models/{model_id}": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModel",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact Model projection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InferenceModel"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models/{model_id}/load-plan": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "previewModelLoad",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Plan ICN would select from current admission evidence",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelLoadPlan"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Configuration cannot be resolved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model is not installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model cannot currently be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Load preview failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/models/{model_id}/properties": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelProperties",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Loaded model and active template properties",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PropsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid model identity or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model is not installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model cannot currently be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Properties unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/packages": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "listInstalledModels",
+        "responses": {
+          "200": {
+            "description": "Verified model packages installed on this machine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledModelPackagesResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Installed package discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/packages/{package_id}": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getInstalledModelPackage",
+        "parameters": [
+          {
+            "name": "package_id",
+            "in": "path",
+            "description": "Model package ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact installed model package",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledModelPackage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Installed model package not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Installed package discovery failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "removeInstalledModel",
+        "parameters": [
+          {
+            "name": "package_id",
+            "in": "path",
+            "description": "Canonical model package identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Installed package removal result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoveInstalledModelPackageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid package identity or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Installed package not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Package deletion is currently unsafe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed package failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Installed package removal failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/residency-policy": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelResidencyPolicy",
+        "responses": {
+          "200": {
+            "description": "Current model residency policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelResidencyPolicyResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "setModelResidencyPolicy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetModelResidencyPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The model residency policy is established"
+          },
+          "400": {
+            "description": "The policy is invalid or conflicts with its generation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Runtime control unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/hugging-face/resolve": {
+      "post": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "resolveHuggingFaceRepository",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Immutable snapshot of the requested live Hugging Face repository",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HuggingFaceRepositorySnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid repository request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Hugging Face resolution failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/hugging-face/search": {
+      "post": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "searchHuggingFaceModels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceModelSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Live Hugging Face GGUF model search",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HuggingFaceModelSearchResults"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid search request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Hugging Face search failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "ICN is running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "tags": [
           "chat"
         ],
         "operationId": "createChatCompletion",
+        "parameters": [
+          {
+            "name": "Magnitude-Include-Progress",
+            "in": "header",
+            "description": "Include Magnitude loading and inference progress events",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -178,149 +1557,19 @@
         }
       }
     },
-    "/v1/hardware": {
-      "get": {
-        "tags": [
-          "system"
-        ],
-        "operationId": "getHardware",
-        "responses": {
-          "200": {
-            "description": "Hardware visible to the pinned ICN process",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HardwareSnapshot"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Hardware discovery failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/hugging-face/models/resolve": {
-      "post": {
-        "tags": [
-          "hugging-face"
-        ],
-        "operationId": "resolveHuggingFaceRepository",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/HuggingFaceRepositoryRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Immutable snapshot of the requested live Hugging Face repository",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HuggingFaceRepositorySnapshot"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid repository request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Hugging Face resolution failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/hugging-face/models/search": {
-      "post": {
-        "tags": [
-          "hugging-face"
-        ],
-        "operationId": "searchHuggingFaceModels",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/HuggingFaceModelSearchRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Live Hugging Face GGUF model search",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HuggingFaceModelSearchResults"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid search request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Hugging Face search failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/models": {
       "get": {
         "tags": [
-          "models"
+          "inference"
         ],
-        "operationId": "listModels",
+        "operationId": "listServableModels",
         "responses": {
           "200": {
-            "description": "Catalog models joined with current local artifact state",
+            "description": "Installed models available for inference",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelsResponse"
+                  "$ref": "#/components/schemas/OpenAiModelsResponse"
                 }
               }
             }
@@ -338,416 +1587,28 @@
         }
       }
     },
-    "/v1/models/assess": {
+    "/v1/responses": {
       "post": {
         "tags": [
-          "models"
+          "inference"
         ],
-        "operationId": "assessModels",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AssessModelsRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Exact target and profile assessments",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AssessModelsResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Model assessment could not be completed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Assessment operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/catalog": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getRecommendableModelCatalog",
-        "responses": {
-          "200": {
-            "description": "Resolved recommendable model catalog",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RecommendableModelCatalog"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Catalog publication failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/catalog/reconcile": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "reconcileCatalogModel",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReconcileCatalogModelRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Catalog model reconciliation admission",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReconcileCatalogModelResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Catalog model not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Catalog model reconciliation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/downloads": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "listModelDownloads",
-        "responses": {
-          "200": {
-            "description": "Retained model downloads and internal package attempts",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelDownloadsResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model downloads unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "startModelDownload",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/StartModelDownloadRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Authoritative model-download admission",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StartModelDownloadResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Download could not start",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/downloads/{download_id}/acknowledge-failure": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "acknowledgeModelDownloadFailure",
+        "operationId": "createResponse",
         "parameters": [
           {
-            "name": "download_id",
-            "in": "path",
-            "description": "Failed model download ID",
-            "required": true,
+            "name": "Magnitude-Include-Progress",
+            "in": "header",
+            "description": "Include Magnitude loading and inference progress events",
+            "required": false,
             "schema": {
-              "type": "string"
+              "type": "boolean"
             }
           }
         ],
-        "responses": {
-          "200": {
-            "description": "Acknowledged failed model download",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelDownload"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Model download has not failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Model download not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/downloads/{download_id}/cancel": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "cancelModelDownload",
-        "parameters": [
-          {
-            "name": "download_id",
-            "in": "path",
-            "description": "Model download ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Cancelled or terminal model download",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelDownload"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Model download not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/installed": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "listInstalledModels",
-        "responses": {
-          "200": {
-            "description": "Verified model packages installed on this machine",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstalledModelPackagesResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Installed package discovery failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/installed/{package_id}": {
-      "delete": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "removeInstalledModel",
-        "parameters": [
-          {
-            "name": "package_id",
-            "in": "path",
-            "description": "Canonical model package identity",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Installed package removal result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RemoveInstalledModelPackageResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Installed package not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Installed package removal failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/instances": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getModelInstances",
-        "responses": {
-          "200": {
-            "description": "Authoritative native model instances",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelInstancesSnapshot"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Runtime control unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "loadModelInstance",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LoadModelRequest"
+                "$ref": "#/components/schemas/ResponseCreateRequest"
               }
             }
           },
@@ -755,7 +1616,7 @@
         },
         "responses": {
           "200": {
-            "description": "Exact model configuration load progress",
+            "description": "OpenAI-compatible Responses event stream",
             "content": {
               "text/event-stream": {
                 "schema": {
@@ -764,8 +1625,48 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid Responses request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested model is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Runtime target failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
-            "description": "Runtime control unavailable",
+            "description": "Inference failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -779,7 +1680,7 @@
           "data": {
             "encoding": "json",
             "schema": {
-              "$ref": "#/components/schemas/ModelLoadEvent"
+              "$ref": "#/components/schemas/ResponseStreamEvent"
             }
           },
           "framing": "sse",
@@ -791,220 +1692,6 @@
             "type": "eof"
           },
           "version": 1
-        }
-      }
-    },
-    "/v1/models/instances/watch": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "watchModelInstances",
-        "responses": {
-          "200": {
-            "description": "Coalescing native model-instance invalidations",
-            "content": {
-              "text/event-stream": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Runtime control unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "x-magnitude-stream": {
-          "data": {
-            "encoding": "json",
-            "schema": {
-              "$ref": "#/components/schemas/ModelInstancesInvalidation"
-            }
-          },
-          "framing": "sse",
-          "reconnect": {
-            "type": "last-event-id"
-          },
-          "responseStatus": 200,
-          "termination": {
-            "type": "long-lived"
-          },
-          "version": 1
-        }
-      }
-    },
-    "/v1/models/instances/{instance_id}/stop": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "stopModelInstance",
-        "parameters": [
-          {
-            "name": "instance_id",
-            "in": "path",
-            "description": "Model instance ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "The exact model instance is stopped"
-          },
-          "500": {
-            "description": "Model instance stop failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/load/preview": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "previewModelLoad",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PreviewModelLoadRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Plan ICN would select from current admission evidence",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelLoadPlan"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Configuration cannot be resolved",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Model cannot currently be admitted",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Load preview failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/residency-policy": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "setModelResidencyPolicy",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SetModelResidencyPolicyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "The model residency policy is established"
-          },
-          "400": {
-            "description": "The policy is invalid or conflicts with its generation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Runtime control unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/props": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getModelProperties",
-        "responses": {
-          "200": {
-            "description": "Loaded model and active template properties",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PropsResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Properties unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
         }
       }
     }
@@ -1102,13 +1789,9 @@
       "ApplyTemplateRequest": {
         "type": "object",
         "required": [
-          "model_instance_id",
           "messages"
         ],
         "properties": {
-          "model_instance_id": {
-            "type": "string"
-          },
           "model": {
             "type": "string"
           },
@@ -1398,84 +2081,6 @@
         },
         "additionalProperties": false
       },
-      "CatalogModel": {
-        "type": "object",
-        "required": [
-          "modelId",
-          "variantId",
-          "desiredConfiguration",
-          "displayName",
-          "variantLabel",
-          "description",
-          "releaseDate",
-          "license",
-          "capabilities",
-          "parameterization",
-          "qualityScore",
-          "qualityScoreProvenance",
-          "fidelityRank",
-          "quantizationAware",
-          "qualityEvidence",
-          "localState"
-        ],
-        "properties": {
-          "modelId": {
-            "$ref": "#/components/schemas/CatalogModelId"
-          },
-          "variantId": {
-            "$ref": "#/components/schemas/CatalogVariantId"
-          },
-          "desiredConfiguration": {
-            "$ref": "#/components/schemas/ModelServingConfiguration"
-          },
-          "displayName": {
-            "type": "string"
-          },
-          "variantLabel": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          },
-          "releaseDate": {
-            "$ref": "#/components/schemas/ModelReleaseDate"
-          },
-          "license": {
-            "type": "string"
-          },
-          "capabilities": {
-            "$ref": "#/components/schemas/ModelCapabilities"
-          },
-          "parameterization": {
-            "$ref": "#/components/schemas/ModelParameterization"
-          },
-          "qualityScore": {
-            "type": "number",
-            "format": "double"
-          },
-          "qualityScoreProvenance": {
-            "type": "string"
-          },
-          "fidelityRank": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "quantizationAware": {
-            "type": "boolean"
-          },
-          "qualityEvidence": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "localState": {
-            "$ref": "#/components/schemas/CatalogModelLocalState"
-          }
-        },
-        "additionalProperties": false
-      },
       "CatalogModelEffectiveConfiguration": {
         "oneOf": [
           {
@@ -1677,13 +2282,18 @@
           {
             "type": "object",
             "required": [
-              "_tag"
+              "fraction",
+              "phase"
             ],
             "properties": {
-              "_tag": {
+              "fraction": {
+                "type": "number",
+                "format": "float"
+              },
+              "phase": {
                 "type": "string",
                 "enum": [
-                  "Queued"
+                  "model_loading"
                 ]
               }
             }
@@ -1691,13 +2301,13 @@
           {
             "type": "object",
             "required": [
-              "_tag"
+              "phase"
             ],
             "properties": {
-              "_tag": {
+              "phase": {
                 "type": "string",
                 "enum": [
-                  "Preparing"
+                  "queued"
                 ]
               }
             }
@@ -1705,31 +2315,13 @@
           {
             "type": "object",
             "required": [
-              "completedTokens",
-              "totalTokens",
-              "cachedTokens",
-              "_tag"
+              "phase"
             ],
             "properties": {
-              "completedTokens": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalTokens": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "cachedTokens": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
+              "phase": {
                 "type": "string",
                 "enum": [
-                  "Prefill"
+                  "preparing"
                 ]
               }
             }
@@ -1737,13 +2329,45 @@
           {
             "type": "object",
             "required": [
-              "_tag"
+              "completed_tokens",
+              "total_tokens",
+              "cached_tokens",
+              "phase"
             ],
             "properties": {
-              "_tag": {
+              "completed_tokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "total_tokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "cached_tokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "phase": {
                 "type": "string",
                 "enum": [
-                  "Generating"
+                  "prefill"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "phase"
+            ],
+            "properties": {
+              "phase": {
+                "type": "string",
+                "enum": [
+                  "generating"
                 ]
               }
             }
@@ -1753,14 +2377,10 @@
       "ChatCompletionRequest": {
         "type": "object",
         "required": [
-          "model_instance_id",
           "messages",
           "stream"
         ],
         "properties": {
-          "model_instance_id": {
-            "type": "string"
-          },
           "model": {
             "type": "string"
           },
@@ -2414,6 +3034,18 @@
           "verifying",
           "publishing"
         ]
+      },
+      "EnsureModelInstanceRequest": {
+        "type": "object",
+        "required": [
+          "modelId"
+        ],
+        "properties": {
+          "modelId": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "ErrorResponse": {
         "type": "object",
@@ -3478,6 +4110,153 @@
         },
         "additionalProperties": false
       },
+      "InferenceModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "modelId",
+          "variantId",
+          "desiredConfiguration",
+          "displayName",
+          "variantLabel",
+          "description",
+          "releaseDate",
+          "license",
+          "capabilities",
+          "parameterization",
+          "qualityScore",
+          "qualityScoreProvenance",
+          "fidelityRank",
+          "quantizationAware",
+          "qualityEvidence",
+          "localState"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Canonical callable identity used unchanged by native and standard inference APIs."
+          },
+          "modelId": {
+            "$ref": "#/components/schemas/CatalogModelId"
+          },
+          "variantId": {
+            "$ref": "#/components/schemas/CatalogVariantId"
+          },
+          "desiredConfiguration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "releaseDate": {
+            "$ref": "#/components/schemas/ModelReleaseDate"
+          },
+          "license": {
+            "type": "string"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "parameterization": {
+            "$ref": "#/components/schemas/ModelParameterization"
+          },
+          "qualityScore": {
+            "type": "number",
+            "format": "double"
+          },
+          "qualityScoreProvenance": {
+            "type": "string"
+          },
+          "fidelityRank": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "quantizationAware": {
+            "type": "boolean"
+          },
+          "qualityEvidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "localState": {
+            "$ref": "#/components/schemas/CatalogModelLocalState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "InferenceResourceInvalidation": {
+        "type": "object",
+        "required": [
+          "topic",
+          "revision"
+        ],
+        "properties": {
+          "topic": {
+            "$ref": "#/components/schemas/InferenceResourceTopic"
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "InferenceResourceTopic": {
+        "type": "string",
+        "enum": [
+          "hardware",
+          "models",
+          "packages",
+          "downloads",
+          "instances",
+          "residency-policy"
+        ]
+      },
+      "InstallModelResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Current"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "downloadId",
+              "_tag"
+            ],
+            "properties": {
+              "downloadId": {
+                "$ref": "#/components/schemas/ModelDownloadId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DownloadAdmitted"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "InstalledCatalogAttribution": {
         "oneOf": [
           {
@@ -3604,42 +4383,6 @@
           },
           "strict": {
             "type": "boolean"
-          }
-        },
-        "additionalProperties": false
-      },
-      "LoadModelReady": {
-        "type": "object",
-        "required": [
-          "instanceId",
-          "configurationId",
-          "allocation"
-        ],
-        "properties": {
-          "instanceId": {
-            "$ref": "#/components/schemas/ModelInstanceId"
-          },
-          "configurationId": {
-            "$ref": "#/components/schemas/ModelServingConfigurationId"
-          },
-          "allocation": {
-            "$ref": "#/components/schemas/ModelInstanceAllocation"
-          }
-        },
-        "additionalProperties": false
-      },
-      "LoadModelRequest": {
-        "type": "object",
-        "required": [
-          "instanceId",
-          "configuration"
-        ],
-        "properties": {
-          "instanceId": {
-            "$ref": "#/components/schemas/ModelInstanceId"
-          },
-          "configuration": {
-            "$ref": "#/components/schemas/ModelServingConfiguration"
           }
         },
         "additionalProperties": false
@@ -4294,19 +5037,32 @@
           "auxiliary"
         ]
       },
+      "ModelIdentityRequest": {
+        "type": "object",
+        "required": [
+          "modelId"
+        ],
+        "properties": {
+          "modelId": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "ModelInstance": {
         "type": "object",
         "required": [
           "id",
-          "configurationId",
+          "modelId",
           "lifecycle"
         ],
         "properties": {
           "id": {
             "$ref": "#/components/schemas/ModelInstanceId"
           },
-          "configurationId": {
-            "$ref": "#/components/schemas/ModelServingConfigurationId"
+          "modelId": {
+            "type": "string",
+            "description": "Canonical callable model identity (for example `model:format:variant`)."
           },
           "lifecycle": {
             "$ref": "#/components/schemas/ModelInstanceLifecycle"
@@ -4613,103 +5369,11 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ModelInstance"
-            }
+            },
+            "description": "Instances in lifecycle-update order, oldest first. The final matching\ninstance is therefore the current attempt for a model."
           }
         },
         "additionalProperties": false
-      },
-      "ModelLoadEvent": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "stage",
-              "_tag"
-            ],
-            "properties": {
-              "stage": {
-                "$ref": "#/components/schemas/ModelLoadStage"
-              },
-              "fraction": {
-                "type": [
-                  "number",
-                  "null"
-                ],
-                "format": "float"
-              },
-              "plan": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/ModelLoadPlan"
-                  }
-                ]
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Progress"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "ready",
-              "_tag"
-            ],
-            "properties": {
-              "ready": {
-                "$ref": "#/components/schemas/LoadModelReady"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Ready"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "instance_id",
-              "_tag"
-            ],
-            "properties": {
-              "instance_id": {
-                "$ref": "#/components/schemas/ModelInstanceId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Stopped"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelInstanceFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          }
-        ]
       },
       "ModelLoadPlan": {
         "type": "object",
@@ -5085,17 +5749,33 @@
           "memory_pressure"
         ]
       },
+      "ModelResidencyPolicyResponse": {
+        "type": "object",
+        "required": [
+          "generation",
+          "idleTimeoutSeconds"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "idleTimeoutSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "ModelServingConfiguration": {
         "type": "object",
         "required": [
-          "id",
           "bundle",
           "profile"
         ],
         "properties": {
-          "id": {
-            "$ref": "#/components/schemas/ModelServingConfigurationId"
-          },
           "bundle": {
             "$ref": "#/components/schemas/ServableModelBundle"
           },
@@ -5104,9 +5784,6 @@
           }
         },
         "additionalProperties": false
-      },
-      "ModelServingConfigurationId": {
-        "type": "string"
       },
       "ModelStoppingAllocation": {
         "oneOf": [
@@ -5152,8 +5829,7 @@
         "required": [
           "revision",
           "reconciliationComplete",
-          "catalogModels",
-          "uncataloguedPackages",
+          "models",
           "diagnostics"
         ],
         "properties": {
@@ -5165,16 +5841,10 @@
           "reconciliationComplete": {
             "type": "boolean"
           },
-          "catalogModels": {
+          "models": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/CatalogModel"
-            }
-          },
-          "uncataloguedPackages": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/InstalledModelPackage"
+              "$ref": "#/components/schemas/InferenceModel"
             }
           },
           "diagnostics": {
@@ -5201,6 +5871,49 @@
           }
         },
         "additionalProperties": false
+      },
+      "OpenAiModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "owned_by"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "owned_by": {
+            "type": "string"
+          }
+        }
+      },
+      "OpenAiModelsResponse": {
+        "type": "object",
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "object": {
+            "type": "string"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OpenAiModel"
+            }
+          }
+        }
       },
       "PerformanceConfidence": {
         "type": "string",
@@ -5239,18 +5952,6 @@
           },
           "confidence": {
             "$ref": "#/components/schemas/PerformanceConfidence"
-          }
-        },
-        "additionalProperties": false
-      },
-      "PreviewModelLoadRequest": {
-        "type": "object",
-        "required": [
-          "configuration"
-        ],
-        "properties": {
-          "configuration": {
-            "$ref": "#/components/schemas/ModelServingConfiguration"
           }
         },
         "additionalProperties": false
@@ -5357,153 +6058,6 @@
         },
         "additionalProperties": false
       },
-      "RecommendableModel": {
-        "type": "object",
-        "required": [
-          "modelId",
-          "variantId",
-          "configuration",
-          "displayName",
-          "variantLabel",
-          "description",
-          "releaseDate",
-          "license",
-          "capabilities",
-          "parameterization",
-          "qualityScore",
-          "qualityScoreProvenance",
-          "fidelityRank",
-          "quantizationAware",
-          "qualityEvidence"
-        ],
-        "properties": {
-          "modelId": {
-            "$ref": "#/components/schemas/CatalogModelId"
-          },
-          "variantId": {
-            "$ref": "#/components/schemas/CatalogVariantId"
-          },
-          "configuration": {
-            "$ref": "#/components/schemas/ModelServingConfiguration"
-          },
-          "displayName": {
-            "type": "string"
-          },
-          "variantLabel": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          },
-          "releaseDate": {
-            "$ref": "#/components/schemas/ModelReleaseDate"
-          },
-          "license": {
-            "type": "string"
-          },
-          "capabilities": {
-            "$ref": "#/components/schemas/ModelCapabilities"
-          },
-          "parameterization": {
-            "$ref": "#/components/schemas/ModelParameterization"
-          },
-          "qualityScore": {
-            "type": "number",
-            "format": "double"
-          },
-          "qualityScoreProvenance": {
-            "type": "string"
-          },
-          "fidelityRank": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "quantizationAware": {
-            "type": "boolean"
-          },
-          "qualityEvidence": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
-      "RecommendableModelCatalog": {
-        "type": "object",
-        "required": [
-          "models",
-          "diagnostics"
-        ],
-        "properties": {
-          "models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RecommendableModel"
-            }
-          },
-          "diagnostics": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CatalogDiagnostic"
-            }
-          }
-        }
-      },
-      "ReconcileCatalogModelRequest": {
-        "type": "object",
-        "required": [
-          "modelId",
-          "variantId"
-        ],
-        "properties": {
-          "modelId": {
-            "$ref": "#/components/schemas/CatalogModelId"
-          },
-          "variantId": {
-            "$ref": "#/components/schemas/CatalogVariantId"
-          }
-        },
-        "additionalProperties": false
-      },
-      "ReconcileCatalogModelResponse": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Current"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "downloadId",
-              "_tag"
-            ],
-            "properties": {
-              "downloadId": {
-                "$ref": "#/components/schemas/ModelDownloadId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DownloadAdmitted"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "RemoveInstalledModelPackageResponse": {
         "type": "object",
         "required": [
@@ -5515,6 +6069,55 @@
             "$ref": "#/components/schemas/ModelPackageId"
           },
           "removed": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ResponseCreateRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "input"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "input": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "temperature": {
+            "type": "number",
+            "format": "float"
+          },
+          "top_p": {
+            "type": "number",
+            "format": "float"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Value"
+            }
+          },
+          "tool_choice": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "reasoning": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "stream": {
             "type": "boolean"
           }
         }
@@ -5586,6 +6189,26 @@
             }
           }
         ]
+      },
+      "ResponseStreamEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "sequence_number"
+        ],
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "sequence_number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": {
+          "$ref": "#/components/schemas/Value"
+        }
       },
       "ServableModelBundle": {
         "oneOf": [
@@ -5797,25 +6420,6 @@
           "tensor"
         ]
       },
-      "StartModelDownloadRequest": {
-        "type": "object",
-        "required": [
-          "bundle"
-        ],
-        "properties": {
-          "bundle": {
-            "$ref": "#/components/schemas/ServableModelBundle"
-          }
-        }
-      },
-      "StartModelDownloadResponse": {
-        "type": "object",
-        "properties": {
-          "download": {
-            "$ref": "#/components/schemas/ModelDownload"
-          }
-        }
-      },
       "StopRequest": {
         "oneOf": [
           {
@@ -5985,6 +6589,32 @@
             "$ref": "#/components/schemas/AllowedToolsChoiceRequest"
           }
         ]
+      },
+      "UninstallModelResponse": {
+        "type": "object",
+        "required": [
+          "modelId",
+          "removedPackageIds",
+          "retainedPackageIds"
+        ],
+        "properties": {
+          "modelId": {
+            "type": "string"
+          },
+          "removedPackageIds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelPackageId"
+            }
+          },
+          "retainedPackageIds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelPackageId"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "Usage": {
         "type": "object",

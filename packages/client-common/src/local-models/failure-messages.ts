@@ -23,7 +23,13 @@ export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): stri
 export const onboardingModelSetupFailureMessage = (
   failure: OnboardingModelSetupFailure,
 ): string => {
-  if (!("_tag" in failure)) return failure.message
+  if (typeof failure !== "object" || failure === null) {
+    return "The onboarding model setup could not be completed."
+  }
+  if (!("_tag" in failure)) {
+    const message = "message" in failure ? failure.message : undefined
+    return typeof message === "string" ? message : "The onboarding model setup could not be completed."
+  }
   switch (failure._tag) {
     case "OnboardingModelChoiceRejected":
       return "That model is no longer available for setup."
@@ -35,7 +41,7 @@ export const onboardingModelSetupFailureMessage = (
     case "NetworkUnavailable":
     case "CorruptDownload":
     case "LocalStorageFailure":
-    case "Internal": return modelDownloadFailureMessage(failure)
+    case "Internal": return modelDownloadFailureMessage(failure as ModelDownloadFailure)
     default: {
       const message = "message" in failure ? failure.message : undefined
       return typeof message === "string" && message.length > 0

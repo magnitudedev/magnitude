@@ -12,7 +12,6 @@ import {
   LOCAL_PROVIDER_ID,
   makeModel,
   makeView,
-  TEST_CONFIGURATION_ID,
   TEST_MEMORY_DOMAIN_ID,
   TEST_MODEL_ID,
   TEST_REASONING_EFFORT,
@@ -46,7 +45,6 @@ const localSlot = (
 const loadingResidency = (progress: number) => ({
   _tag: "Loading" as const,
   instanceId,
-  configurationId: TEST_CONFIGURATION_ID,
   stage: "loading" as const,
   progress: Option.some(progress),
   plannedAllocation: Option.none(),

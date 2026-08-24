@@ -118,7 +118,7 @@ const makeLayer = (queue: Queue.Queue<AgentIntrospection>) =>
       const runtimeLayer = Layer.succeed(AgentRuntime, runtime)
       const withDisplay = Layer.provideMerge(
         AcnDisplayViewIntrospectorLive,
-        Layer.merge(runtimeLayer, AcnServiceLifecycleLive()),
+        Layer.merge(runtimeLayer, AcnServiceLifecycleLive),
       )
       return Layer.provideMerge(AcnIntrospectorLive, withDisplay)
     }),

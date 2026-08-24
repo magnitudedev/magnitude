@@ -19,7 +19,6 @@ import {
   modelSlotResidentAllocation,
   getDisplayWidth,
   getAnimationTimeSnapshot,
-  localModelConfigurationId,
   localModelProviderModelId,
   localModelCapabilities,
   localModelSpeculativeMethodLabel,
@@ -47,7 +46,6 @@ import {
   type ProviderCatalogEntry,
   type ProviderModelDisabledReason,
   type ProviderModelId,
-  type ModelServingConfigurationId,
   type ProviderModelCatalogEntry,
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
@@ -151,14 +149,14 @@ export const resolveRootNavigationDirection = (
   return null
 }
 
-const catalogCandidateRowId = (configurationId: string): string =>
-  `catalog-candidate:${configurationId}`
+const catalogCandidateRowId = (modelId: string): string =>
+  `catalog-candidate:${modelId}`
 
 export const scrollCatalogCandidateIntoView = (
   scrollbox: Pick<ScrollBoxRenderable, "scrollChildIntoView"> | null,
-  configurationId: string,
+  modelId: string,
 ): void => {
-  scrollbox?.scrollChildIntoView(catalogCandidateRowId(configurationId))
+  scrollbox?.scrollChildIntoView(catalogCandidateRowId(modelId))
 }
 
 const formatContextWindow = (tokens: number): string =>
@@ -426,8 +424,8 @@ export type ModelsMenuSelectionAction =
       readonly reasoningEffort: Option.Option<ReasoningEffort>
     }
   | {
-      readonly _tag: "InstallConfiguration"
-      readonly configurationId: ModelServingConfigurationId
+      readonly _tag: "InstallModel"
+      readonly modelId: ProviderModelId
       readonly reasoningEffort: Option.Option<ReasoningEffort>
     }
 
@@ -456,8 +454,8 @@ export const modelsMenuSelectionAction = (
   }
   if (model.servingState.availabilityState._tag !== "Installable") return Option.none()
   return Option.some({
-    _tag: "InstallConfiguration",
-    configurationId: model.servingState.configuration.id,
+    _tag: "InstallModel",
+    modelId: model.modelId,
     reasoningEffort,
   })
 }
@@ -836,9 +834,9 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   const detailIsLocal = detail !== null && detail._tag !== "Provider"
   const detailIsSelected = detail !== null && isSelected(detail)
   const detailLocalModel = detail === null ? undefined : modelsMenuLocalModel(detail)
-  const detailCatalogConfigurationId = detailLocalModel?.servingState._tag === "Assessed"
+  const detailCatalogModelId = detailLocalModel?.servingState._tag === "Assessed"
     && detailLocalModel.catalogMembershipState._tag === "InCatalog"
-    ? detailLocalModel.servingState.configuration.id
+    ? detailLocalModel.modelId
     : undefined
   const detailActions = useMemo(() => {
     if (!detail) return [] as readonly ("select" | "load" | "stop" | "catalog")[]
@@ -855,9 +853,9 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
       && primarySlot
       && primarySlot._tag === "ConfiguredLocal"
       && primarySlot.actions.includes("Stop")) actions.push("stop")
-    if (detailCatalogConfigurationId) actions.push("catalog")
+    if (detailCatalogModelId) actions.push("catalog")
     return actions
-  }, [detail, detailCatalogConfigurationId, detailIsLocal, detailIsSelected, primarySlot])
+  }, [detail, detailCatalogModelId, detailIsLocal, detailIsSelected, primarySlot])
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
@@ -913,7 +911,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
     }
     const createAction = action.value
     modelActions.installAndAssign(
-      createAction.configurationId,
+      createAction.modelId,
       PRIMARY_SLOT_ID,
       Option.getOrElse(
         createAction.reasoningEffort,
@@ -941,8 +939,8 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
     else if (action === "stop" && primarySlot?._tag === "ConfiguredLocal") {
       void slotActions.stop(PRIMARY_SLOT_ID)
     }
-    else if (detailCatalogConfigurationId) openCatalogDetail(detailCatalogConfigurationId)
-  }, [choose, detail, detailCatalogConfigurationId, openCatalogDetail, primarySlot, slotActions])
+    else if (detailCatalogModelId) openCatalogDetail(detailCatalogModelId)
+  }, [choose, detail, detailCatalogModelId, openCatalogDetail, primarySlot, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
@@ -1349,7 +1347,7 @@ export type CatalogInspectorActionId =
 type CatalogPrimarySlot = ModelSlotsState["slots"]["primary"]
 
 interface CatalogActionHoverTarget {
-  readonly configurationId: string
+  readonly modelId: string
   readonly action: CatalogInspectorActionId
 }
 
@@ -1639,33 +1637,29 @@ const CatalogMenu = memo(function CatalogMenu({
     return (leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1)
       || left.presentation.displayName.localeCompare(right.presentation.displayName)
       || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
-      || Option.getOrElse(localModelConfigurationId(left), () => "")
-        .localeCompare(Option.getOrElse(localModelConfigurationId(right), () => ""))
+      || left.modelId.localeCompare(right.modelId)
   })
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
   const [actionHoverTarget, setActionHoverTarget] = useState<CatalogActionHoverTarget | null>(null)
-  const configurationIdFor = (model: LocalModel) => Option.getOrUndefined(
-    localModelConfigurationId(model),
-  )
+  const modelIdFor = (model: LocalModel) => model.modelId
   const reconciliationStateFor = (model: LocalModel): CatalogModelReconciliationState => {
-    const configurationId = configurationIdFor(model)
-    if (configurationId === undefined) return { _tag: "Idle" }
+    const modelId = modelIdFor(model)
     return catalogModels.find(({ model: candidate }) =>
-      configurationIdFor(candidate) === configurationId)?.reconciliationState ?? { _tag: "Idle" }
+      modelIdFor(candidate) === modelId)?.reconciliationState ?? { _tag: "Idle" }
   }
   const cursorIndex = Math.max(0, candidates.findIndex((model) =>
-    configurationIdFor(model) === cursorId))
+    modelIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
-  const detail = candidates.find((model) => configurationIdFor(model) === detailId) ?? null
+  const detail = candidates.find((model) => modelIdFor(model) === detailId) ?? null
   const inspected = detail ?? cursor ?? null
-  const inspectedConfigurationId = inspected === null ? undefined : configurationIdFor(inspected)
-  const confirmingUninstall = inspectedConfigurationId !== undefined
-    && pendingDeleteId === inspectedConfigurationId
-  const hoveredInspectorAction = inspectedConfigurationId !== undefined
-    && actionHoverTarget?.configurationId === inspectedConfigurationId
+  const inspectedModelId = inspected === null ? undefined : modelIdFor(inspected)
+  const confirmingUninstall = inspectedModelId !== undefined
+    && pendingDeleteId === inspectedModelId
+  const hoveredInspectorAction = inspectedModelId !== undefined
+    && actionHoverTarget?.modelId === inspectedModelId
     ? actionHoverTarget.action
     : null
   const selectedModel = Option.flatMap(config.selections, ({ primary }) => primary)
@@ -1690,13 +1684,13 @@ const CatalogMenu = memo(function CatalogMenu({
   const inspectorActionCursor = useBoundedCursor(inspectorActions.length)
   const moveCursorTo = useCallback((index: number) => {
     const model = candidates[index]
-    const configurationId = model && configurationIdFor(model)
-    if (!model || configurationId === undefined) return
+    const modelId = model && modelIdFor(model)
+    if (!model || modelId === undefined) return
     setActionHoverTarget(null)
     const fromAxes = cursor === undefined ? Option.none() : localModelRadarAxes(cursor)
     const toAxes = localModelRadarAxes(model)
     if (Option.isSome(fromAxes) && Option.isSome(toAxes)
-      && configurationIdFor(cursor!) !== configurationId) {
+      && modelIdFor(cursor!) !== modelId) {
       const now = getAnimationTimeSnapshot()
       setRadarTransition(retargetPentagonRadar(
         pentagonRadarValues(fromAxes.value),
@@ -1707,19 +1701,18 @@ const CatalogMenu = memo(function CatalogMenu({
     } else {
       setRadarTransition(null)
     }
-    setCursorId(configurationId)
-    scrollCatalogCandidateIntoView(catalogScrollRef.current, configurationId)
+    setCursorId(modelId)
+    scrollCatalogCandidateIntoView(catalogScrollRef.current, modelId)
   }, [candidates, cursor, radarTransition])
 
   const primaryAction = useCallback((model: LocalModel) => {
-    const configurationId = configurationIdFor(model)
-    if (configurationId === undefined
-      || model.acquisitionState._tag === "Downloading"
+    const modelId = modelIdFor(model)
+    if (model.acquisitionState._tag === "Downloading"
       || (model.acquisitionState._tag === "Installed"
         && model.upgradeState._tag !== "Available"
         && model.upgradeState._tag !== "Failed")
       || reconciliationStateFor(model)._tag === "Starting") return
-    modelActions.install(configurationId)
+    modelActions.install(modelId)
   }, [modelActions, catalogModels])
 
   const selectCandidate = useCallback((model: LocalModel) => {
@@ -1771,8 +1764,7 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "uninstall" && inspected.acquisitionState._tag === "Installed") {
-      const configurationId = configurationIdFor(inspected)
-      if (configurationId !== undefined) setPendingDeleteId(configurationId)
+      setPendingDeleteId(modelIdFor(inspected))
     }
   }, [inspected, inspectedReconciliationState, inspectedSlot, modelActions, primaryAction, selectCandidate, slotActions])
 
@@ -1780,10 +1772,9 @@ const CatalogMenu = memo(function CatalogMenu({
     if (key.defaultPrevented) return
     if (confirmingUninstall && pendingDeleteId !== null) {
       if (key.name === "return" || key.name === "enter") {
-        const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
-        const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
-        if (model?.acquisitionState._tag === "Installed" && configurationId !== undefined) {
-          modelActions.delete(configurationId)
+        const model = candidates.find((candidate) => modelIdFor(candidate) === pendingDeleteId)
+        if (model?.acquisitionState._tag === "Installed") {
+          modelActions.delete(model.modelId)
         }
         setPendingDeleteId(null)
         key.preventDefault()
@@ -1823,10 +1814,9 @@ const CatalogMenu = memo(function CatalogMenu({
     if (pendingDeleteId !== null) {
       const confirmsDelete = key.name === "return" || key.name === "enter"
       if (confirmsDelete) {
-        const model = candidates.find((candidate) => configurationIdFor(candidate) === pendingDeleteId)
-        const configurationId = model && Option.getOrUndefined(localModelConfigurationId(model))
-        if (model?.acquisitionState._tag === "Installed" && configurationId !== undefined) {
-          modelActions.delete(configurationId)
+        const model = candidates.find((candidate) => modelIdFor(candidate) === pendingDeleteId)
+        if (model?.acquisitionState._tag === "Installed") {
+          modelActions.delete(model.modelId)
         }
         setPendingDeleteId(null)
         key.preventDefault()
@@ -1848,7 +1838,7 @@ const CatalogMenu = memo(function CatalogMenu({
       key.preventDefault()
       setRadarTransition(null)
       inspectorActionCursor.reset()
-      setDetailId(configurationIdFor(cursor) ?? null)
+      setDetailId(modelIdFor(cursor))
       setRootSwitchingEnabled(false)
     } else if (key.name === "d" && cursor) {
       key.preventDefault()
@@ -1865,7 +1855,7 @@ const CatalogMenu = memo(function CatalogMenu({
         modelActions.cancel(cursor.upgradeState.downloadId)
         key.preventDefault()
       } else if (cursor.acquisitionState._tag === "Installed") {
-        setPendingDeleteId(configurationIdFor(cursor) ?? null)
+        setPendingDeleteId(modelIdFor(cursor))
         key.preventDefault()
       }
     }
@@ -1884,7 +1874,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const inspectorView = inspected === null ? null : (
     <>
       <CatalogInspector
-        key={inspectedConfigurationId}
+        key={inspectedModelId}
         model={inspected}
         reconciliationState={inspectedReconciliationState}
         selected={inspectedSelected}
@@ -1897,9 +1887,9 @@ const CatalogMenu = memo(function CatalogMenu({
         confirmingUninstall={confirmingUninstall}
         onAction={runInspectorAction}
         onActionHover={(action) => {
-          setActionHoverTarget(action === null || inspectedConfigurationId === undefined
+          setActionHoverTarget(action === null || inspectedModelId === undefined
             ? null
-            : { configurationId: inspectedConfigurationId, action })
+            : { modelId: inspectedModelId, action })
         }}
       />
       {Result.isFailure(slotActions.assignResult) && (
@@ -1969,39 +1959,38 @@ const CatalogMenu = memo(function CatalogMenu({
           No compatible recommended models are currently available.
         </text>
       ) : candidates.map((candidate, index) => {
-        const configurationId = configurationIdFor(candidate)
-        if (configurationId === undefined) return null
+        const modelId = modelIdFor(candidate)
         const highlighted = index === cursorIndex
         return (
           <CatalogCandidateRow
-            key={configurationId}
+            key={modelId}
             model={candidate}
             memoryBytes={memoryBytesFor(candidate)}
             highlighted={highlighted}
             focused={highlighted && detail === null}
             selected={catalogModelIsSelected(candidate, selectedModel)}
-            pendingDelete={pendingDeleteId === configurationId}
+            pendingDelete={pendingDeleteId === modelId}
             reconciliationState={reconciliationStateFor(candidate)}
             index={index}
             layout={layout}
-            rowId={catalogCandidateRowId(configurationId)}
+            rowId={catalogCandidateRowId(modelId)}
             onClick={() => {
               setPendingDeleteId(null)
               moveCursorTo(index)
               setRadarTransition(null)
               inspectorActionCursor.reset()
-              setDetailId(configurationId)
+              setDetailId(modelId)
               setRootSwitchingEnabled(false)
             }}
             onMouseOver={() => {
-              if (detail !== null && detailId === configurationId) return
+              if (detail !== null && detailId === modelId) return
               if (detail !== null) {
                 setDetailId(null)
                 setRootSwitchingEnabled(true)
                 inspectorActionCursor.reset()
               }
               moveCursorTo(index)
-              if (pendingDeleteId !== configurationId) setPendingDeleteId(null)
+              if (pendingDeleteId !== modelId) setPendingDeleteId(null)
             }}
           />
         )

@@ -3,7 +3,7 @@ import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
-import { Chunk, Context, Data, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
+import { Context, Data, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { createWriteStream } from "node:fs"
@@ -122,87 +122,17 @@ const provisionIcnModel = (
     }
 
     const client = yield* makeIcnApiClient({ baseUrl: new URL(target.endpoint) })
-    const readInventory: Effect.Effect<
-      Awaited<ReturnType<typeof client.models.listInstalledModels> extends Effect.Effect<infer A, any, any> ? A : never>,
-      TargetError
-    > = Effect.suspend(() => client.models.listInstalledModels({}).pipe(
-      Effect.mapError((error) => targetError(target.id, "discover-model", error)),
-      Effect.flatMap((snapshot) => snapshot.reconciliationComplete
-        ? Effect.succeed(snapshot)
-        : Effect.sleep("250 millis").pipe(Effect.zipRight(readInventory))),
-    ))
-    const snapshot = yield* readInventory.pipe(
-      Effect.timeoutFail({
-        duration: "10 minutes",
-        onTimeout: () => new TargetError({
-          targetId: target.id,
-          operation: "discover-model",
-          message: "ICN model inventory did not finish reconciliation",
-        }),
-      }),
-    )
-    const installed = snapshot.packages.find(({ package: modelPackage }) =>
-      modelPackage.files.some(({ sha256 }) => sha256 === load.artifactSha256))
-    if (!installed) {
-      return yield* new TargetError({
-        targetId: target.id,
-        operation: "discover-model",
-        message: `ICN has no installed package containing artifact ${load.artifactSha256}`,
-      })
-    }
-
-    const assessment = yield* client.models.assessModels({
-      payload: {
-        requests: [{
-          requestId: `benchmark-${target.id}`,
-          bundle: {
-            _tag: "Standalone",
-            package: { _tag: "Installed", packageId: installed.package.id },
-          },
-          profiles: [{
-            profile: { contextLength: load.contextLimit },
-            performanceContextTokens: [load.contextLimit],
-          }],
-        }],
-      },
-    }).pipe(Effect.mapError((error) => targetError(target.id, "assess-model", error)))
-    const result = assessment.results[0]
-    const fit = result?._tag === "Assessed"
-      ? result.profiles.find((profile) => profile._tag === "Fits")
-      : undefined
-    if (!fit || fit._tag !== "Fits") {
-      return yield* new TargetError({
-        targetId: target.id,
-        operation: "assess-model",
-        message: `ICN did not assess the requested serving profile as fitting: ${result?._tag ?? "missing result"}`,
-      })
-    }
-
-    const response = yield* client.models.loadModelInstance({
-      payload: { instanceId: load.instanceId, configuration: fit.configuration },
+    const instance = yield* client.models.ensureModelInstance({
+      payload: { modelId: target.servedModel },
     }).pipe(Effect.mapError((error) => targetError(target.id, "load-model", error)))
-    const events = yield* response.events.pipe(
-      Stream.runCollect,
-      Effect.mapError((error) => targetError(target.id, "load-model", error)),
-    )
-    const failed = Chunk.findFirst(events, (event) => event._tag === "Failed")
-    if (Option.isSome(failed) && failed.value._tag === "Failed") {
+    if (instance.lifecycle._tag !== "Ready") {
       return yield* new TargetError({
         targetId: target.id,
         operation: "load-model",
-        message: failed.value.failure.message,
+        message: `ICN returned a non-ready instance: ${instance.lifecycle._tag}`,
       })
     }
-    const ready = Chunk.findFirst(events, (event) => event._tag === "Ready")
-    if (Option.isNone(ready) || ready.value._tag !== "Ready") {
-      return yield* new TargetError({
-        targetId: target.id,
-        operation: "load-model",
-        message: "ICN load stream completed without a Ready event",
-      })
-    }
-
-    const allocation = ready.value.ready.allocation
+    const allocation = instance.lifecycle.allocation
     if (allocation.parallelSequences !== target.parallelSequences) {
       return yield* new TargetError({
         targetId: target.id,
@@ -212,11 +142,11 @@ const provisionIcnModel = (
     }
 
     yield* Effect.addFinalizer(() =>
-      client.models.stopModelInstance({ path: { instance_id: load.instanceId } }).pipe(Effect.ignore),
+      client.models.stopModelInstance({ path: { instance_id: instance.id } }).pipe(Effect.ignore),
     )
     return {
-      servedModel: fit.configuration.id,
-      instanceId: load.instanceId,
+      servedModel: target.servedModel,
+      instanceId: instance.id,
       parallelSequences: allocation.parallelSequences,
     }
   })
@@ -298,7 +228,6 @@ const acquireTarget = (
     const sessionTarget: ManagedTarget = {
       ...target,
       servedModel: provisioned.servedModel,
-      requestBody: { model_instance_id: provisioned.instanceId },
       parallelSequences: provisioned.parallelSequences,
     }
     return {
@@ -306,7 +235,6 @@ const acquireTarget = (
       endpoint: {
         ...baseEndpoint,
         servedModel: provisioned.servedModel,
-        requestBody: { model_instance_id: provisioned.instanceId },
       },
       rootPid: Option.some(Number(processHandle.pid)),
       diagnostic: Ref.get(output),

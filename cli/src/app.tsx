@@ -37,7 +37,6 @@ import {
   useModelSlots,
   useModelSlotActions,
   useAcnLifecycle,
-  localModelConfigurationId,
   formatLocalModelDisplayName,
   onboardingModelSetupFailureMessage,
   type OnboardingModelSetupState,
@@ -207,18 +206,17 @@ function OnboardingGate(
   const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary);
   const onboardingSetupOpen = onboardingSetup.view.value._tag === "Open";
   const modelsConfigured = Option.exists(primary, isModelSlotConfigured);
-  const modelsReadyForInitialWork = Option.exists(primary, (slot) => {
+  const modelsAvailableForInitialWork = Option.exists(primary, (slot) => {
     if (slot._tag === "Unassigned" || slot.availability._tag !== "Available")
       return false;
-    if (slot._tag === "ConfiguredRemote") return true;
-    return slot.residency._tag === "Ready";
+    return true;
   });
 
   return (
     <CliAppContent
       {...props}
       modelsConfigured={modelsConfigured}
-      modelsReadyForInitialWork={modelsReadyForInitialWork}
+      modelsAvailableForInitialWork={modelsAvailableForInitialWork}
       onboardingSetupOpen={onboardingSetupOpen}
       onboardingSetup={onboardingSetup}
     />
@@ -228,7 +226,7 @@ function OnboardingGate(
 function CliAppContent(
   props: CliAppProps & {
     readonly modelsConfigured: boolean;
-    readonly modelsReadyForInitialWork: boolean;
+    readonly modelsAvailableForInitialWork: boolean;
     readonly onboardingSetupOpen: boolean;
     readonly onboardingSetup: ReturnType<typeof useOnboardingModelSetup>;
   }
@@ -239,7 +237,7 @@ function CliAppContent(
     initialPrompt: props.initialPrompt,
     goal: props.goal,
     modelsConfigured:
-      props.modelsReadyForInitialWork && !props.onboardingSetupOpen,
+      props.modelsAvailableForInitialWork && !props.onboardingSetupOpen,
   });
 
   const theme = useTheme();
@@ -424,7 +422,7 @@ function CliAppContent(
             model: operation.model,
             phase: operation.phase,
             failure: operation.failure,
-            onRetry: () => setupOnboardingModel(operation.configurationId),
+            onRetry: () => setupOnboardingModel(operation.modelId),
             onChooseAnother: cancelOnboardingModelSetup,
           }, operation.phase === "Loading"
             ? `Loading ${formatLocalModelDisplayName(operation.model)}…`
@@ -439,7 +437,7 @@ function CliAppContent(
             model: operation.model,
             phase: "Ready",
             failure: null,
-            onRetry: () => setupOnboardingModel(operation.configurationId),
+            onRetry: () => setupOnboardingModel(operation.modelId),
             onChooseAnother: cancelOnboardingModelSetup,
           }, `Finishing setup for ${formatLocalModelDisplayName(operation.model)}…`);
         }

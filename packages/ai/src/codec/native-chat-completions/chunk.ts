@@ -9,6 +9,7 @@ export interface ChatCompletionProviderError {
   readonly type: Option.Option<string>
   readonly code: Option.Option<string>
   readonly param: Option.Option<string>
+  readonly retryable: Option.Option<boolean>
 }
 
 export interface ChatCompletionToolCallDelta {
@@ -106,6 +107,7 @@ export const normalizeChatCompletionsChunk = (
         type: error.type,
         code: error.code,
         param: error.param,
+        retryable: error.retryable,
       })),
     ),
     rawInput: chunk.raw_input,

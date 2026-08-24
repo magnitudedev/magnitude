@@ -5,7 +5,6 @@ applies_to:
   - inference/crates/icn-models/**
   - inference/crates/icn-contracts/src/inventory.rs
   - inference/crates/icn-contracts/src/models.rs
-  - packages/icn/src/catalog/**
   - packages/icn/src/installed/**
   - packages/icn/src/downloads/**
   - packages/acn/src/local-model-**
@@ -21,8 +20,8 @@ download, and deletion behavior. Terms follow [Model-management terminology](./t
 
 ICN owns the recommendable catalog, exact packages and sources, the managed model store, filesystem
 inventory, and process-local download coordination. ACN observes those authorities and produces
-product projections. Clients initiate mutations through ACN and do not infer command authorization
-or completion from cached projections.
+product projections. Clients initiate native mutations through ACN's transparent inference proxy
+and do not infer command authorization or completion from cached projections.
 
 Catalog membership, artifact presence, download activity, inspection, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
@@ -179,7 +178,8 @@ curated presentation, including its reviewed variant label, across target, repos
 changes. A non-catalog row derives its variant label from inspected target-package quantization.
 Artifact format and inspection evidence are not copied into parallel product-presentation fields.
 
-Catalog reconciliation addresses a `CatalogIdentity`. ICN compares desired package IDs with current
+Model installation addresses the existing canonical model ID; ICN resolves its internal
+`CatalogIdentity`, compares desired package IDs with current
 filesystem presence and exact package affiliations, acquires missing desired packages, and removes
 affiliated superseded packages after the desired bundle is complete. It does not materialize or
 persist configuration state. The response carries the deterministic local provider-model identity
@@ -218,23 +218,18 @@ Operations that publish, replace, or remove files in the same managed repository
 may share in-flight hashing and inspection. Package download sharing and cancellation exist only
 within the owning ICN process.
 
-Startup derives inventory from current files and configurations from catalog plus serving policy.
+Startup derives inventory from current files and callable models from catalog.
 There is no model-state recovery epoch. Later filesystem or catalog observations reconcile through
 the same continuous derivation.
-
-The standard-profile construction rule is canonical for a package identity. A release must not
-reinterpret an existing package identity as a different standard configuration. A new standard
-profile requires a distinct explicit configuration authority rather than changing resolution of an
-already issued provider-model identity.
 
 ## Conformance
 
 - The same valid filesystem produces the same package inventory independent of upgrade history.
 - Removing every derived cache changes cost only, never package presence or user intent.
-- Catalog and standard configurations are not copied into durable model state.
+- Catalog configurations are not copied into durable model state.
 - Issued catalog configurations remain resolvable after deprecation.
 - Every catalog variant publishes the valid ISO calendar date inherited from its model declaration.
-- Standard configuration identity remains stable for a given package identity.
+- Installed packages without catalog attribution remain inventory and do not become callable models.
 - Installed inventory is derived without network access or hardware assessment.
 - Partial, unsafe, invalid, or digest-mismatched content is not installed.
 - Complete packages from multiple repository revisions may coexist until exact catalog affiliation

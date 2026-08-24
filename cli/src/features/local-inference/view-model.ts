@@ -1,7 +1,6 @@
 import { Option } from "effect"
 import {
   installedLocalModels,
-  localModelConfigurationId,
   localModelProviderModelId,
   formatLocalModelDisplayName,
   localModelBundleKey,
@@ -13,8 +12,7 @@ import {
 } from "@magnitudedev/client-common"
 export {
   installedLocalModels,
-  findLocalModelByConfigurationId,
-  localModelConfigurationId,
+  findLocalModelById,
   localModelProviderModelId,
   localModelBundleKey,
   modelDownloadFailureMessage,
@@ -26,7 +24,6 @@ import {
   type LocalModelsState,
   type LocalModelRecommendationProgressStep,
   type ModelAssessmentId,
-  type ModelServingConfigurationId,
   type ModelSlotsState,
   type ProviderModelId,
   type ReasoningEffort,
@@ -65,9 +62,9 @@ export const selectedInferenceIndex = (
   return index >= 0 ? index : 0
 }
 
-export const selectionConfigurationId = (
+export const selectionModelId = (
   selection: LocalInferenceSelection,
-): Option.Option<ModelServingConfigurationId> => localModelConfigurationId(selection.model)
+): ProviderModelId => selection.model.modelId
 
 export const selectionProviderModelId = (
   selection: LocalInferenceSelection,

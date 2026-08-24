@@ -8,7 +8,7 @@ import * as Schemas from "./schemas.js"
 
 export const acknowledgeModelDownloadFailure = HttpApiEndpoint.post(
   "acknowledgeModelDownloadFailure",
-  "/v1/models/downloads/:download_id/acknowledge-failure",
+  "/api/v1/downloads/:download_id/acknowledge-failure",
 )
   .setPath(S.Struct({ download_id: S.String }))
   .addSuccess(
@@ -23,8 +23,12 @@ export const acknowledgeModelDownloadFailure = HttpApiEndpoint.post(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
   )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
 
-export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/v1/apply-template")
+export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/api/v1/chat/templates/apply")
   .setPayload(
     S.suspend(
       (): S.Schema<Schemas.ApplyTemplateRequest, Schemas.ApplyTemplateRequestEncoded> => Schemas.ApplyTemplateRequest,
@@ -43,10 +47,22 @@ export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/v1/
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
   )
 
-export const assessModels = HttpApiEndpoint.post("assessModels", "/v1/models/assess")
+export const assessModels = HttpApiEndpoint.post("assessModels", "/api/v1/models/assess")
   .setPayload(
     S.suspend(
       (): S.Schema<Schemas.AssessModelsRequest, Schemas.AssessModelsRequestEncoded> => Schemas.AssessModelsRequest,
@@ -60,17 +76,26 @@ export const assessModels = HttpApiEndpoint.post("assessModels", "/v1/models/ass
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
   )
 
-export const cancelModelDownload = HttpApiEndpoint.post(
-  "cancelModelDownload",
-  "/v1/models/downloads/:download_id/cancel",
-)
+export const cancelModelDownload = HttpApiEndpoint.post("cancelModelDownload", "/api/v1/downloads/:download_id/cancel")
   .setPath(S.Struct({ download_id: S.String }))
   .addSuccess(
     S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
@@ -78,10 +103,50 @@ export const cancelModelDownload = HttpApiEndpoint.post(
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
   )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
 
-export const getHardware = HttpApiEndpoint.get("getHardware", "/v1/hardware")
+export const ensureModelInstance = HttpApiEndpoint.post("ensureModelInstance", "/api/v1/instances")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.EnsureModelInstanceRequest, Schemas.EnsureModelInstanceRequestEncoded> =>
+        Schemas.EnsureModelInstanceRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.ModelInstance, Schemas.ModelInstanceEncoded> => Schemas.ModelInstance),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const getHardware = HttpApiEndpoint.get("getHardware", "/api/v1/hardware")
   .addSuccess(
     S.suspend((): S.Schema<Schemas.HardwareSnapshot, Schemas.HardwareSnapshotEncoded> => Schemas.HardwareSnapshot),
     { status: 200 },
@@ -91,7 +156,70 @@ export const getHardware = HttpApiEndpoint.get("getHardware", "/v1/hardware")
     { status: 500 },
   )
 
-export const getModelInstances = HttpApiEndpoint.get("getModelInstances", "/v1/models/instances")
+export const getInstalledModelPackage = HttpApiEndpoint.get("getInstalledModelPackage", "/api/v1/packages/:package_id")
+  .setPath(S.Struct({ package_id: S.String }))
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.InstalledModelPackage, Schemas.InstalledModelPackageEncoded> =>
+        Schemas.InstalledModelPackage,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const getModel = HttpApiEndpoint.get("getModel", "/api/v1/models/:model_id")
+  .setPath(S.Struct({ model_id: S.String }))
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.InferenceModel, Schemas.InferenceModelEncoded> => Schemas.InferenceModel),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const getModelDownload = HttpApiEndpoint.get("getModelDownload", "/api/v1/downloads/:download_id")
+  .setPath(S.Struct({ download_id: S.String }))
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const getModelInstance = HttpApiEndpoint.get("getModelInstance", "/api/v1/instances/:instance_id")
+  .setPath(S.Struct({ instance_id: S.String }))
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.ModelInstance, Schemas.ModelInstanceEncoded> => Schemas.ModelInstance),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const getModelInstances = HttpApiEndpoint.get("getModelInstances", "/api/v1/instances")
   .addSuccess(
     S.suspend(
       (): S.Schema<Schemas.ModelInstancesSnapshot, Schemas.ModelInstancesSnapshotEncoded> =>
@@ -104,21 +232,38 @@ export const getModelInstances = HttpApiEndpoint.get("getModelInstances", "/v1/m
     { status: 500 },
   )
 
-export const getModelProperties = HttpApiEndpoint.get("getModelProperties", "/v1/props")
+export const getModelProperties = HttpApiEndpoint.post("getModelProperties", "/api/v1/models/:model_id/properties")
+  .setPath(S.Struct({ model_id: S.String }))
   .addSuccess(
     S.suspend((): S.Schema<Schemas.PropsResponse, Schemas.PropsResponseEncoded> => Schemas.PropsResponse),
     { status: 200 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
   )
 
-export const getRecommendableModelCatalog = HttpApiEndpoint.get("getRecommendableModelCatalog", "/v1/models/catalog")
+export const getModelResidencyPolicy = HttpApiEndpoint.get("getModelResidencyPolicy", "/api/v1/residency-policy")
   .addSuccess(
     S.suspend(
-      (): S.Schema<Schemas.RecommendableModelCatalog, Schemas.RecommendableModelCatalogEncoded> =>
-        Schemas.RecommendableModelCatalog,
+      (): S.Schema<Schemas.ModelResidencyPolicyResponse, Schemas.ModelResidencyPolicyResponseEncoded> =>
+        Schemas.ModelResidencyPolicyResponse,
     ),
     { status: 200 },
   )
@@ -132,7 +277,40 @@ export const health = HttpApiEndpoint.get("health", "/health").addSuccess(
   { status: 200 },
 )
 
-export const listInstalledModels = HttpApiEndpoint.get("listInstalledModels", "/v1/models/installed")
+export const installModel = HttpApiEndpoint.post("installModel", "/api/v1/models/install")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.ModelIdentityRequest, Schemas.ModelIdentityRequestEncoded> => Schemas.ModelIdentityRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.InstallModelResponse, Schemas.InstallModelResponseEncoded> => Schemas.InstallModelResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const listInstalledModels = HttpApiEndpoint.get("listInstalledModels", "/api/v1/packages")
   .addSuccess(
     S.suspend(
       (): S.Schema<Schemas.InstalledModelPackagesResponse, Schemas.InstalledModelPackagesResponseEncoded> =>
@@ -145,7 +323,7 @@ export const listInstalledModels = HttpApiEndpoint.get("listInstalledModels", "/
     { status: 500 },
   )
 
-export const listModelDownloads = HttpApiEndpoint.get("listModelDownloads", "/v1/models/downloads")
+export const listModelDownloads = HttpApiEndpoint.get("listModelDownloads", "/api/v1/downloads")
   .addSuccess(
     S.suspend(
       (): S.Schema<Schemas.ModelDownloadsResponse, Schemas.ModelDownloadsResponseEncoded> =>
@@ -158,7 +336,7 @@ export const listModelDownloads = HttpApiEndpoint.get("listModelDownloads", "/v1
     { status: 500 },
   )
 
-export const listModels = HttpApiEndpoint.get("listModels", "/v1/models")
+export const listModels = HttpApiEndpoint.get("listModels", "/api/v1/models")
   .addSuccess(
     S.suspend((): S.Schema<Schemas.ModelsResponse, Schemas.ModelsResponseEncoded> => Schemas.ModelsResponse),
     { status: 200 },
@@ -168,13 +346,20 @@ export const listModels = HttpApiEndpoint.get("listModels", "/v1/models")
     { status: 500 },
   )
 
-export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/v1/models/load/preview")
-  .setPayload(
+export const listServableModels = HttpApiEndpoint.get("listServableModels", "/v1/models")
+  .addSuccess(
     S.suspend(
-      (): S.Schema<Schemas.PreviewModelLoadRequest, Schemas.PreviewModelLoadRequestEncoded> =>
-        Schemas.PreviewModelLoadRequest,
+      (): S.Schema<Schemas.OpenAiModelsResponse, Schemas.OpenAiModelsResponseEncoded> => Schemas.OpenAiModelsResponse,
     ),
+    { status: 200 },
   )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
+export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/api/v1/models/:model_id/load-plan")
+  .setPath(S.Struct({ model_id: S.String }))
   .addSuccess(
     S.suspend((): S.Schema<Schemas.ModelLoadPlan, Schemas.ModelLoadPlanEncoded> => Schemas.ModelLoadPlan),
     { status: 200 },
@@ -185,37 +370,22 @@ export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/v1/mo
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 409 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
-export const reconcileCatalogModel = HttpApiEndpoint.post("reconcileCatalogModel", "/v1/models/catalog/reconcile")
-  .setPayload(
-    S.suspend(
-      (): S.Schema<Schemas.ReconcileCatalogModelRequest, Schemas.ReconcileCatalogModelRequestEncoded> =>
-        Schemas.ReconcileCatalogModelRequest,
-    ),
-  )
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.ReconcileCatalogModelResponse, Schemas.ReconcileCatalogModelResponseEncoded> =>
-        Schemas.ReconcileCatalogModelResponse,
-    ),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
   )
 
-export const removeInstalledModel = HttpApiEndpoint.del("removeInstalledModel", "/v1/models/installed/:package_id")
+export const removeInstalledModel = HttpApiEndpoint.del("removeInstalledModel", "/api/v1/packages/:package_id")
   .setPath(S.Struct({ package_id: S.String }))
   .addSuccess(
     S.suspend(
@@ -226,7 +396,19 @@ export const removeInstalledModel = HttpApiEndpoint.del("removeInstalledModel", 
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -235,7 +417,7 @@ export const removeInstalledModel = HttpApiEndpoint.del("removeInstalledModel", 
 
 export const resolveHuggingFaceRepository = HttpApiEndpoint.post(
   "resolveHuggingFaceRepository",
-  "/v1/hugging-face/models/resolve",
+  "/api/v1/sources/hugging-face/resolve",
 )
   .setPayload(
     S.suspend(
@@ -259,7 +441,10 @@ export const resolveHuggingFaceRepository = HttpApiEndpoint.post(
     { status: 500 },
   )
 
-export const searchHuggingFaceModels = HttpApiEndpoint.post("searchHuggingFaceModels", "/v1/hugging-face/models/search")
+export const searchHuggingFaceModels = HttpApiEndpoint.post(
+  "searchHuggingFaceModels",
+  "/api/v1/sources/hugging-face/search",
+)
   .setPayload(
     S.suspend(
       (): S.Schema<Schemas.HuggingFaceModelSearchRequest, Schemas.HuggingFaceModelSearchRequestEncoded> =>
@@ -282,7 +467,7 @@ export const searchHuggingFaceModels = HttpApiEndpoint.post("searchHuggingFaceMo
     { status: 500 },
   )
 
-export const setModelResidencyPolicy = HttpApiEndpoint.post("setModelResidencyPolicy", "/v1/models/residency-policy")
+export const setModelResidencyPolicy = HttpApiEndpoint.put("setModelResidencyPolicy", "/api/v1/residency-policy")
   .setPayload(
     S.suspend(
       (): S.Schema<Schemas.SetModelResidencyPolicyRequest, Schemas.SetModelResidencyPolicyRequestEncoded> =>
@@ -299,28 +484,55 @@ export const setModelResidencyPolicy = HttpApiEndpoint.post("setModelResidencyPo
     { status: 500 },
   )
 
-export const startModelDownload = HttpApiEndpoint.post("startModelDownload", "/v1/models/downloads")
-  .setPayload(
-    S.suspend(
-      (): S.Schema<Schemas.StartModelDownloadRequest, Schemas.StartModelDownloadRequestEncoded> =>
-        Schemas.StartModelDownloadRequest,
-    ),
+export const stopModelInstance = HttpApiEndpoint.post("stopModelInstance", "/api/v1/instances/:instance_id/stop")
+  .setPath(S.Struct({ instance_id: S.String }))
+  .addSuccess(S.Void, { status: 204 })
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
   )
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.StartModelDownloadResponse, Schemas.StartModelDownloadResponseEncoded> =>
-        Schemas.StartModelDownloadResponse,
-    ),
-    { status: 200 },
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
   )
 
-export const stopModelInstance = HttpApiEndpoint.post("stopModelInstance", "/v1/models/instances/:instance_id/stop")
-  .setPath(S.Struct({ instance_id: S.String }))
-  .addSuccess(S.Void, { status: 204 })
+export const uninstallModel = HttpApiEndpoint.post("uninstallModel", "/api/v1/models/uninstall")
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.ModelIdentityRequest, Schemas.ModelIdentityRequestEncoded> => Schemas.ModelIdentityRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.UninstallModelResponse, Schemas.UninstallModelResponseEncoded> =>
+        Schemas.UninstallModelResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
@@ -332,23 +544,35 @@ export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
   .add(resolveHuggingFaceRepository)
   .add(searchHuggingFaceModels)
 
+export const InferenceGroup = HttpApiGroup.make("inference").add(listServableModels)
+
 export const ModelsGroup = HttpApiGroup.make("models")
   .add(acknowledgeModelDownloadFailure)
   .add(assessModels)
   .add(cancelModelDownload)
+  .add(ensureModelInstance)
+  .add(getInstalledModelPackage)
+  .add(getModel)
+  .add(getModelDownload)
+  .add(getModelInstance)
   .add(getModelInstances)
   .add(getModelProperties)
-  .add(getRecommendableModelCatalog)
+  .add(getModelResidencyPolicy)
+  .add(installModel)
   .add(listInstalledModels)
   .add(listModelDownloads)
   .add(listModels)
   .add(previewModelLoad)
-  .add(reconcileCatalogModel)
   .add(removeInstalledModel)
   .add(setModelResidencyPolicy)
-  .add(startModelDownload)
   .add(stopModelInstance)
+  .add(uninstallModel)
 
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
-export const IcnApi = HttpApi.make("IcnApi").add(ChatGroup).add(HuggingFaceGroup).add(ModelsGroup).add(SystemGroup)
+export const IcnApi = HttpApi.make("IcnApi")
+  .add(ChatGroup)
+  .add(HuggingFaceGroup)
+  .add(InferenceGroup)
+  .add(ModelsGroup)
+  .add(SystemGroup)

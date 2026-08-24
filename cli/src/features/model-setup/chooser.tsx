@@ -9,7 +9,6 @@ import {
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
   formatMemorySize,
-  localModelConfigurationId,
   type LocalModelOption,
   type LocalInferenceHardwareResult,
 } from "@magnitudedev/client-common"
@@ -18,7 +17,6 @@ import type {
   LocalModelMemory,
   LocalModelRecommendationProgressStep,
   ModelInstanceFailure,
-  ModelServingConfigurationId,
   ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -38,7 +36,7 @@ import {
   localInferenceProgressLines,
   selectedInferenceIndex,
   selectionContextLabel,
-  selectionConfigurationId,
+  selectionModelId,
   selectionProviderModelId,
   type LocalInferenceSelection,
 } from "../local-inference/view-model"
@@ -372,7 +370,7 @@ export function OnboardingModelChooser({
   readonly width: number
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
-  readonly onSelect: (configurationId: ModelServingConfigurationId) => void
+  readonly onSelect: (modelId: ProviderModelId) => void
   readonly onExit: () => void
   readonly exitKind: "Skip" | "Close"
 }): ReactNode {
@@ -393,8 +391,7 @@ export function OnboardingModelChooser({
     ? Option.none<string>()
     : Option.fromNullable(selections.find((selection) =>
       operation._tag === "Downloading" || operation._tag === "Configuring"
-      ? Option.exists(localModelConfigurationId(operation.model), (configurationId) =>
-          Option.contains(selectionConfigurationId(selection), configurationId))
+      ? operation.model.modelId === selection.model.modelId
       : Option.contains(selectionProviderModelId(selection), operation.providerModelId))?.id)
   const selectedIndex = operation !== null && Option.isNone(activeSelectionId)
     ? -1
@@ -435,8 +432,7 @@ export function OnboardingModelChooser({
     ? Math.max(listRows, detailPanelRows)
     : listRows + detailPanelRows
   const choose = useCallback((selection: LocalInferenceSelection) => {
-    const configurationId = selectionConfigurationId(selection)
-    if (Option.isSome(configurationId)) onSelect(configurationId.value)
+    onSelect(selectionModelId(selection))
   }, [onSelect])
 
   const moveSelectionTo = useCallback((index: number) => {

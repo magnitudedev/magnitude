@@ -94,11 +94,13 @@ function providerErrorEnvelopeFromBody(body: string): ProviderErrorEnvelope | nu
   const type = error.type
   const code = error.code
   const param = error.param
+  const retryable = error.retryable
   return {
     message,
     type: typeof type === "string" ? type : null,
     code: typeof code === "string" ? code : null,
     param: typeof param === "string" ? param : null,
+    retryable: typeof retryable === "boolean" ? retryable : null,
   }
 }
 
@@ -375,6 +377,7 @@ function providerErrorText(error: ProviderErrorEnvelope): string {
 function providerErrorRetryable(error: ProviderErrorEnvelope, status: number): boolean {
   const text = providerErrorText(error)
   if (status === 429 || status >= 500) return !hasPattern(text, CONTEXT_LIMIT_PATTERNS)
+  if (error.retryable !== null) return error.retryable
   return hasPattern(text, TRANSIENT_PROVIDER_PATTERNS)
 }
 

@@ -20,12 +20,14 @@ export const makeIcnObservedState = <A, E>(
   initial: A,
   read: Effect.Effect<A, E>,
   equivalent: Equivalence.Equivalence<A>,
+  options: { readonly initiallyInitialized?: boolean } = {},
 ): Effect.Effect<IcnMutableObservedState<A, E>> =>
   Effect.gen(function* () {
+    const initiallyInitialized = options.initiallyInitialized === true
     const current = yield* SubscriptionRef.make({
-      initialized: false,
+      initialized: initiallyInitialized,
       snapshot: {
-        revision: 0,
+        revision: initiallyInitialized ? 1 : 0,
         state: initial,
       },
     })

@@ -22,14 +22,14 @@ separate model-management or appearance interface.
 
 ## Authority and boundaries
 
-`LocalModelsState` is the server-owned product projection for inventory, catalog membership,
-acquisition, update, serving configuration, assessment, availability, and recommendations. Clients
-must not join older parallel package, candidate, and offering collections to reconstruct that
-product state. `ModelSlotsState` owns durable selection, availability, residency, canonical actions,
-favorites, and resident allocation. Hardware and onboarding completion likewise remain server
-owned.
+`LocalModelsState` is ACN's read-only Magnitude product projection for assessment presentation,
+provider availability, recommendations, updates, and product warnings. Native ICN Models,
+Packages, Downloads, Instances, and Hardware remain independently authoritative. `ModelSlotsState`
+owns durable selection, favorites, and recency, but no physical residency. Client-common joins these
+Queries by canonical model ID for presentation without copying them into a writable mirror.
 
-Web consumes those domains through the connection-scoped `LocalModels`, `ModelSlots`, and
+Web consumes those domains through one connection-scoped Effect Query runtime containing ACN RPC
+and authored inference HTTP operations, plus the composed `LocalModels`, `ModelSlots`, and
 `OnboardingModelSetup` client-common services. React hooks are adapters to those services. DOM
 components may derive labels and layout, but do not construct services, cache server snapshots, or
 infer compatibility, availability, readiness, progress, or command completion.
@@ -98,18 +98,18 @@ CLI and web share the pure five-axis local-model comparison profile: intelligenc
 speculation, memory efficiency, and accuracy. Each client owns its renderer, so terminal cells and
 browser SVG remain separate presentations of the same model evidence.
 
-Install and update use the model serving configuration ID. Cancellation and failure dismissal use
-the exact server-issued download ID. Selection assigns the projected local provider-model identity
-to a slot. Load and stop address the slot; the daemon owns the physical instance identity. Long
+Install and update use the canonical model ID. Cancellation and failure dismissal use
+the exact ICN-issued Download ID. Selection assigns that same model ID to a slot. Warm load uses the
+model ID and exact stop uses the ICN Instance ID; neither operation is routed through Slot state. Long
 running state is always rendered from refreshed service queries, while mutation state represents
 only local invocation admission.
 
 Chat submission requires a selected local model. When no model is selected, the composer routes the
 user to Models in Settings instead of discarding the attempt. A selected model does not need to be
-resident before submission: request preparation acquires it through the authoritative slot
-lifecycle, whose `Requested` and `Loading` states provide loading status while the message waits.
-The client must not preempt that lifecycle by treating a selected unloaded, loading, stopping, or
-failed model as though no model were selected. If model-slot state is temporarily unavailable, the
+resident before submission: the inference request automatically acquires it through ICN's residency
+coordinator. Native Instance events and opt-in request progress provide loading status while the
+message waits. The client must not treat a selected unloaded, loading, stopping, or failed model as
+though no model were selected. If model-slot state is temporarily unavailable, the
 client likewise must not infer that selection is absent.
 While acquisition is requested or loading, the work-status surface gives model loading priority
 over the generic waiting detail and renders `Loading model`, a spinner, and authoritative progress

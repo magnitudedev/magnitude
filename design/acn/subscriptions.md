@@ -11,6 +11,7 @@ applies_to:
   - packages/sdk/src/acn-jit/acn-subscription-protocol.ts
   - packages/sdk/src/jit-rpc/recovering-stream-protocol.ts
   - packages/client-common/src/state/changes.ts
+  - packages/sdk/src/inference.ts
 ---
 
 # ACN subscriptions
@@ -58,6 +59,12 @@ Multiplexing neither combines state nor creates a cross-domain authority.
 The client drains `StreamChanges` once per connection and invalidates the named query; every
 (re)connection after the first invalidates everything, since pokes may have been missed. Nothing
 else is derived from pokes and no domain code interprets them.
+
+Native inference uses ICN's `/api/v1/events` SSE stream rather than ACN RPC framing. The authored
+Inference Effect Query layer drains that one multiplexed stream and invalidates Hardware, Models,
+Packages, Downloads, Instances, and residency-policy Queries. Both drains feed the same
+connection-scoped query cache and use the same reconnect-then-reread rule; they do not combine the
+underlying authorities or introduce another frontend state system.
 
 ## Keyed subscriptions
 

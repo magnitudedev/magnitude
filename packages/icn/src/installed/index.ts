@@ -1,10 +1,15 @@
-import { Context, Duration, Effect, Layer, Stream } from "effect"
-import type { InstalledModelPackagesResponse } from "@magnitudedev/icn-protocol/schemas"
-import { IcnModels, type IcnModelsService } from "../models/index.js"
-import type { IcnObservedSnapshot, IcnObservedState } from "../observed-state.js"
+import { Context, Duration, Effect, Layer, Schema } from "effect"
+import { InstalledModelPackagesResponse } from "@magnitudedev/icn-protocol/schemas"
+import { IcnClient, type IcnClientService } from "../client.js"
+import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
+import { IcnEvents, refreshOnIcnEvents } from "../events/index.js"
+
+type InstalledPackagesReadError = Effect.Effect.Error<
+  ReturnType<IcnClientService["models"]["listInstalledModels"]>
+>
 
 export interface IcnInstalledModelsService
-  extends IcnObservedState<InstalledModelPackagesResponse, unknown> {}
+  extends IcnObservedState<InstalledModelPackagesResponse, InstalledPackagesReadError> {}
 
 export class IcnInstalledModels extends Context.Tag("@magnitudedev/icn/IcnInstalledModels")<
   IcnInstalledModels,
@@ -12,41 +17,45 @@ export class IcnInstalledModels extends Context.Tag("@magnitudedev/icn/IcnInstal
 >() {}
 
 export interface IcnInstalledModelsOptions {
-  readonly refreshInterval?: Duration.DurationInput
-}
-
-const installedSnapshot = (
-  snapshot: Effect.Effect.Success<IcnModelsService["get"]>,
-): IcnObservedSnapshot<InstalledModelPackagesResponse> => {
-  const byId = new Map(snapshot.state.uncataloguedPackages.map((entry) => [entry.package.id, entry]))
-  for (const model of snapshot.state.catalogModels) {
-    if (model.localState._tag !== "Installed") continue
-    for (const present of model.localState.installation.packages) {
-      byId.set(present.package.id, present)
-    }
-  }
-  return {
-    revision: snapshot.revision,
-    state: {
-      revision: snapshot.state.revision,
-      reconciliationComplete: snapshot.state.reconciliationComplete,
-      packages: [...byId.values()],
-    },
-  }
+  readonly retryInterval?: Duration.DurationInput
 }
 
 export const makeIcnInstalledModels = (
-  _options: IcnInstalledModelsOptions = {},
-): Layer.Layer<IcnInstalledModels, never, IcnModels> =>
-  Layer.effect(
+  options: IcnInstalledModelsOptions = {},
+): Layer.Layer<IcnInstalledModels, InstalledPackagesReadError, IcnClient | IcnEvents> =>
+  Layer.scoped(
     IcnInstalledModels,
     Effect.gen(function* () {
-      const models = yield* IcnModels
-      return IcnInstalledModels.of({
-        get: models.get.pipe(Effect.map(installedSnapshot)),
-        changes: models.changes.pipe(Stream.map(installedSnapshot)),
-        initialized: models.initialized,
-        refresh: models.refresh,
-      })
+      const client = yield* IcnClient
+      const events = yield* IcnEvents
+      const invalidations = yield* events.subscribe
+      const read = client.models.listInstalledModels({})
+      const initial = yield* read
+      const observed = yield* makeIcnObservedState(
+        initial,
+        read,
+        Schema.equivalence(InstalledModelPackagesResponse),
+        { initiallyInitialized: true },
+      )
+      if (!initial.reconciliationComplete) {
+        yield* Effect.iterate(false, {
+          while: (complete) => !complete,
+          body: () => Effect.sleep(options.retryInterval ?? "1 second").pipe(
+            Effect.zipRight(observed.refresh),
+            Effect.zipRight(observed.get),
+            Effect.map(({ state }) => state.reconciliationComplete),
+          ),
+        }).pipe(Effect.forkScoped)
+      }
+      yield* refreshOnIcnEvents(
+        invalidations,
+        new Set(["packages"]),
+        observed.refresh,
+        "installed model packages",
+        options.retryInterval ?? "1 second",
+      ).pipe(
+        Effect.forkScoped,
+      )
+      return IcnInstalledModels.of(observed)
     }),
   )

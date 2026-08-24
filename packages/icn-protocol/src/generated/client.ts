@@ -24,6 +24,10 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         ),
         searchHuggingFaceModels: makeHttpOperation(http, options, Operations.searchHuggingFaceModelsOperation),
       },
+      inference: {
+        listServableModels: makeHttpOperation(http, options, Operations.listServableModelsOperation),
+        createResponse: makeStreamOperation(http, options, Operations.createResponseOperation),
+      },
       models: {
         acknowledgeModelDownloadFailure: makeHttpOperation(
           http,
@@ -32,28 +36,28 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         ),
         assessModels: makeHttpOperation(http, options, Operations.assessModelsOperation),
         cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
+        ensureModelInstance: makeHttpOperation(http, options, Operations.ensureModelInstanceOperation),
+        getInstalledModelPackage: makeHttpOperation(http, options, Operations.getInstalledModelPackageOperation),
+        getModel: makeHttpOperation(http, options, Operations.getModelOperation),
+        getModelDownload: makeHttpOperation(http, options, Operations.getModelDownloadOperation),
+        getModelInstance: makeHttpOperation(http, options, Operations.getModelInstanceOperation),
         getModelInstances: makeHttpOperation(http, options, Operations.getModelInstancesOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),
-        getRecommendableModelCatalog: makeHttpOperation(
-          http,
-          options,
-          Operations.getRecommendableModelCatalogOperation,
-        ),
+        getModelResidencyPolicy: makeHttpOperation(http, options, Operations.getModelResidencyPolicyOperation),
+        installModel: makeHttpOperation(http, options, Operations.installModelOperation),
         listInstalledModels: makeHttpOperation(http, options, Operations.listInstalledModelsOperation),
         listModelDownloads: makeHttpOperation(http, options, Operations.listModelDownloadsOperation),
         listModels: makeHttpOperation(http, options, Operations.listModelsOperation),
         previewModelLoad: makeHttpOperation(http, options, Operations.previewModelLoadOperation),
-        reconcileCatalogModel: makeHttpOperation(http, options, Operations.reconcileCatalogModelOperation),
         removeInstalledModel: makeHttpOperation(http, options, Operations.removeInstalledModelOperation),
         setModelResidencyPolicy: makeHttpOperation(http, options, Operations.setModelResidencyPolicyOperation),
-        startModelDownload: makeHttpOperation(http, options, Operations.startModelDownloadOperation),
         stopModelInstance: makeHttpOperation(http, options, Operations.stopModelInstanceOperation),
-        loadModelInstance: makeStreamOperation(http, options, Operations.loadModelInstanceOperation),
-        watchModelInstances: makeStreamOperation(http, options, Operations.watchModelInstancesOperation),
+        uninstallModel: makeHttpOperation(http, options, Operations.uninstallModelOperation),
       },
       system: {
         getHardware: makeHttpOperation(http, options, Operations.getHardwareOperation),
         health: makeHttpOperation(http, options, Operations.healthOperation),
+        watchInferenceEvents: makeStreamOperation(http, options, Operations.watchInferenceEventsOperation),
       },
     }
   })

@@ -3,6 +3,33 @@ import { Effect, Fiber, Ref, Stream } from "effect"
 import { makeIcnObservedState } from "./observed-state"
 
 describe("ICN observed state", () => {
+  it("marks an authoritative initial read as initialized without rereading it", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const reads = yield* Ref.make(0)
+      const observed = yield* makeIcnObservedState(
+        { value: 1 },
+        Ref.update(reads, (count) => count + 1).pipe(Effect.as({ value: 1 })),
+        (left, right) => left.value === right.value,
+        { initiallyInitialized: true },
+      )
+      const initial = yield* observed.get
+      yield* observed.refresh
+      return {
+        initialized: yield* observed.initialized,
+        initial,
+        current: yield* observed.get,
+        reads: yield* Ref.get(reads),
+      }
+    }))
+
+    expect(result).toEqual({
+      initialized: true,
+      initial: { revision: 1, state: { value: 1 } },
+      current: { revision: 1, state: { value: 1 } },
+      reads: 1,
+    })
+  })
+
   it("publishes initial readiness before structurally changed reads", async () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const source = yield* Ref.make({ value: 1 })

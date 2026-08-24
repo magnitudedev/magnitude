@@ -1,39 +1,35 @@
 import { describe, expect, it } from 'vitest'
-import { StreamStartOperationalFailure } from '@magnitudedev/ai'
+import { StreamProviderError, StreamStartOperationalFailure } from '@magnitudedev/ai'
 import {
   agentModelStartRetryability,
   finalizeAgentModelStartFailure,
+  finalizeModelAttemptFailure,
 } from '../src/errors'
-import {
-  ModelRequestPreparationCancelled,
-  ModelRequestPreparationFailed,
-} from '../src/model/model-request-preparation'
 
 describe('agent model start failures', () => {
-  it('classifies preparation failure as model-not-ready without automatic retry', () => {
-    const failure = new ModelRequestPreparationFailed({
-      code: 'low_memory',
-      message: 'Model stopped · Low memory - close memory-intensive apps and try again',
-      retryable: true,
+  it('presents streamed local admission failures as model-not-ready without automatic retry', () => {
+    const failure = new StreamProviderError({
+      call: { provider: 'local', model: 'model', method: 'POST', url: 'http://127.0.0.1/inference/v1/chat/completions' },
+      response: { status: 200, headers: [], requestId: null },
+      providerError: {
+        message: 'Not enough memory to load model',
+        type: 'model_error',
+        code: 'low_memory',
+        param: null,
+        retryable: true,
+      },
+      payload: { text: '', encodedBytes: 0, truncated: false },
+      progress: { dataPayloadsDecoded: 1, modelEventsEmitted: 0 },
     })
 
-    const decision = finalizeAgentModelStartFailure({
-      failure,
-      retryCount: 0,
-      maxRetries: 3,
-    })
+    const decision = finalizeModelAttemptFailure({ failure, retryCount: 0, maxRetries: 3 })
 
     expect(decision.outcome).toEqual({
       _tag: 'ModelNotReady',
-      failure: {
-        code: 'low_memory',
-        message: failure.message,
-        retryable: true,
-      },
+      failure: { code: 'low_memory', message: 'Not enough memory to load model', retryable: true },
       requestId: null,
     })
     expect(decision.retry).toEqual({ _tag: 'none' })
-    expect(agentModelStartRetryability(failure)._tag).toBe('UpstreamNotRetryable')
   })
 
   it('retains existing provider connection retry behavior', () => {
@@ -63,26 +59,5 @@ describe('agent model start failures', () => {
     expect(decision.outcome._tag).toBe('ConnectionFailure')
     expect(decision.retry._tag).toBe('retry')
     expect(agentModelStartRetryability(failure)._tag).toBe('UpstreamRetryable')
-  })
-
-  it('finalizes an explicit model stop as silent cancellation', () => {
-    const decision = finalizeAgentModelStartFailure({
-      failure: new ModelRequestPreparationCancelled({
-        reason: 'user_stop',
-      }),
-      retryCount: 0,
-      maxRetries: 3,
-    })
-
-    expect(decision.outcome).toEqual({
-      _tag: 'Cancelled',
-      reason: {
-        _tag: 'ModelStopped',
-        reason: 'user_stop',
-      },
-      requestId: null,
-    })
-    expect(decision.presentation.surface).toBe('silent')
-    expect(decision.retry).toEqual({ _tag: 'none' })
   })
 })

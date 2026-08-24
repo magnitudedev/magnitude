@@ -10,7 +10,6 @@ import {
   SECONDARY_SLOT_ID,
   ProviderModelCatalogEntrySchema,
   type ProviderModelCatalogEntry,
-  type ModelServingConfigurationId,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
@@ -21,12 +20,11 @@ import {
 } from "./local-model-configuration-resolver"
 import { makeObservedState } from "./mirrored-state"
 import { resolveBundlePresentation } from "./local-model-presentation"
-export { localProviderModelId, localCatalogProviderModelId } from "./local-provider-model-id"
-import { localCatalogProviderModelId, localProviderModelId } from "./local-provider-model-id"
+export { localCatalogProviderModelId } from "./local-provider-model-id"
+import { localCatalogProviderModelId } from "./local-provider-model-id"
 
 export type ProviderOfferingPackageEvidence = readonly {
   readonly providerModelId: LocalProviderOffering["providerModelId"]
-  readonly configurationId: LocalProviderOffering["configuration"]["id"]
   readonly packages: readonly {
     readonly packageId: ModelPackageEntry["package"]["id"]
     readonly installed: boolean
@@ -41,7 +39,6 @@ export const providerOfferingPackageEvidence = (
   .sort((left, right) => left.providerModelId.localeCompare(right.providerModelId))
   .map((offering) => ({
     providerModelId: offering.providerModelId,
-    configurationId: offering.configuration.id,
     packages: servableModelBundlePackageIds(offering.configuration.bundle).map((packageId) => {
       const entry = entries.get(packageId)
       return {
@@ -58,7 +55,6 @@ export const sameProviderOfferingPackageEvidence = (
 ): boolean => left.length === right.length && left.every((offering, index) => {
   const other = right[index]
   return offering.providerModelId === other?.providerModelId
-    && offering.configurationId === other.configurationId
     && offering.packages.length === other.packages.length
     && offering.packages.every((modelPackage, packageIndex) => {
       const otherPackage = other.packages[packageIndex]
@@ -133,13 +129,11 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   const readyOfferingsFrom = (
     resolved: readonly ResolvedLocalModelConfiguration[],
   ) => resolved.flatMap((resolution) => resolution.targetInspection._tag === "Inspected"
+    && Option.isSome(resolution.catalogModel)
     ? [{
       resolution,
       offering: {
-        providerModelId: Option.match(resolution.catalogModel, {
-          onNone: () => localProviderModelId(resolution.servingConfiguration.id),
-          onSome: localCatalogProviderModelId,
-        }),
+        providerModelId: localCatalogProviderModelId(resolution.catalogModel.value),
         configuration: resolution.servingConfiguration,
         capabilities: resolution.targetInspection.capabilities,
       } satisfies LocalProviderOffering,
@@ -243,8 +237,12 @@ export const LocalProviderOfferingsLive: Layer.Layer<
       "Unable to project local provider offerings",
     ).pipe(Effect.annotateLogs({ cause: String(cause) }))),
   )
-  yield* Stream.make(undefined).pipe(
-    Stream.concat(changes.pipe(Stream.debounce("25 millis"))),
+  // Downstream catalog construction reads this state immediately. Publish the
+  // initial projection before exposing the service so that initialization
+  // cannot race the changes subscription.
+  yield* project
+  yield* changes.pipe(
+    Stream.debounce("25 millis"),
     Stream.runForEach(() => project),
     Effect.forkScoped,
   )

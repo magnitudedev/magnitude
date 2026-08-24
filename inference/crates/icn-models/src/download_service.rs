@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
 use getrandom::fill;
 use icn_contracts::models::{
-    ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads, ModelDownloadsResponse,
-    ModelPackage, ModelPackageId, ModelPackageSource, ServableModelBundle,
+    ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads, ModelDownloadsInvalidation,
+    ModelDownloadsResponse, ModelPackage, ModelPackageId, ModelPackageSource, ServableModelBundle,
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use icn_contracts::{DownloadFailure, DownloadStage, InventoryError, ModelDownloadEvent};
@@ -55,6 +57,8 @@ pub struct ManagedModelDownloads {
     records: Arc<RwLock<BTreeMap<DownloadAttemptId, AttemptRecord>>>,
     downloads: Arc<RwLock<BTreeMap<ModelDownloadId, DownloadRecord>>>,
     starts: Arc<tokio::sync::Mutex<()>>,
+    revision: Arc<AtomicU64>,
+    changes: tokio::sync::broadcast::Sender<ModelDownloadsInvalidation>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,12 +80,23 @@ struct DownloadRecord {
 
 impl ManagedModelDownloads {
     pub async fn open(manager: Arc<ManagedModelStore>) -> Result<Self, InventoryError> {
+        let (changes, _) = tokio::sync::broadcast::channel(64);
         Ok(Self {
             manager,
             records: Arc::new(RwLock::new(BTreeMap::new())),
             downloads: Arc::new(RwLock::new(BTreeMap::new())),
             starts: Arc::new(tokio::sync::Mutex::new(())),
+            revision: Arc::new(AtomicU64::new(0)),
+            changes,
         })
+    }
+
+    fn invalidate(&self) {
+        let revision = self
+            .revision
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let _ = self.changes.send(ModelDownloadsInvalidation { revision });
     }
 
     fn update(&self, id: &DownloadAttemptId, attempt: DownloadAttempt) {
@@ -90,6 +105,8 @@ impl ManagedModelDownloads {
         };
         if let Some(record) = records.get_mut(id) {
             record.attempt = attempt;
+            drop(records);
+            self.invalidate();
         }
     }
 
@@ -552,6 +569,9 @@ impl ModelDownloads for ManagedModelDownloads {
                 downloads.insert(id.clone(), record);
                 Some(projected)
             };
+            if download.is_some() {
+                self.invalidate();
+            }
             Ok(StartModelDownloadResponse { download })
         })
     }
@@ -655,7 +675,10 @@ impl ModelDownloads for ManagedModelDownloads {
             let attempts = self.records.read().map_err(|_| {
                 InventoryError::Internal("download registry lock poisoned".to_owned())
             })?;
-            Ok(model_download(&record, &attempts))
+            let download = model_download(&record, &attempts);
+            drop(attempts);
+            self.invalidate();
+            Ok(download)
         })
     }
 
@@ -688,13 +711,39 @@ impl ModelDownloads for ManagedModelDownloads {
                 .get_mut(&id)
                 .expect("failed model download must remain retained")
                 .failure_acknowledged = true;
-            Ok(model_download(
+            let download = model_download(
                 downloads
                     .get(&id)
                     .expect("acknowledged model download must remain retained"),
                 &attempts,
-            ))
+            );
+            drop(downloads);
+            drop(attempts);
+            self.invalidate();
+            Ok(download)
         })
+    }
+
+    fn watch(&self) -> BoxStream<'static, ModelDownloadsInvalidation> {
+        let receiver = self.changes.subscribe();
+        let revision = Arc::clone(&self.revision);
+        let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => return Some((event, receiver)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Box::pin(
+            futures_util::stream::once(async move {
+                ModelDownloadsInvalidation {
+                    revision: revision.load(Ordering::Acquire),
+                }
+            })
+            .chain(changes),
+        )
     }
 }
 

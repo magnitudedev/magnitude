@@ -2,14 +2,13 @@
 applies_to:
   - packages/acn-protocol/src/schemas/mirrored-state.ts
   - packages/acn-protocol/src/boundary/configuration.ts
-  - packages/acn-protocol/src/boundary/local-inference.ts
+  - packages/sdk/src/inference.ts
   - packages/acn-protocol/src/boundary/onboarding.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/acn/src/mirrored-state.ts
   - packages/acn/src/provider-model-catalog.ts
   - packages/acn/src/local-models.ts
   - packages/acn/src/model-slot-controller.ts
-  - packages/acn/src/local-inference-hardware.ts
   - packages/acn/src/onboarding/**
   - packages/client-common/src/hooks/use-local-inference-state.ts
 ---
@@ -36,13 +35,14 @@ Reconnection invalidates every consumed query.
 ## Ownership
 
 ACN owns the public product mirrors: `GetProviderModelCatalog`, `GetLocalModels`, `GetModelSlots`,
-`GetLocalInferenceHardware`, and `GetOnboardingState`. `LocalModels` groups by servable-bundle
-identity and publishes acquisition, serving, recommendation, provider availability, and advisory
+and `GetOnboardingState`. `LocalModels` groups by canonical model identity and publishes
+acquisition, serving, recommendation, provider availability, and advisory
 memory facets on the same row. Every catalog bundle and independently servable installed package
 contributes the same `LocalModel` shape. Raw package and package-attempt state, model-download
-records, recommendation-policy, provider-offering, and memory-observation working state remain
-private ACN observations. Private ICN types, native paths, and native field names do not cross the
-protocol boundary. The complete local-model projection is defined by
+records, recommendation-policy, and provider-offering working state remain private ACN
+observations. Hardware, Models, Packages, Downloads, and Instances are native ICN Queries consumed
+through the same connection-scoped Effect Query cache; ACN does not mirror them. The complete
+Magnitude-specific local-model projection is defined by
 [Local-model product projection](../model-management/local-model-product-projection.md).
 A backend may bind directly only when it owns the exact public schema and versioned replay.
 
@@ -53,6 +53,9 @@ publishes the new snapshot.
 The connection's Effect Query client drains `StreamChanges` once and invalidates the named query;
 no domain code owns invalidation. Query atoms remain distinct by query name, and a domain has one
 canonical client query cache.
+
+The same client drains ICN's multiplexed `/api/v1/events` stream and invalidates native inference
+Queries. This is a second observation transport inside the same cache, not a second cache or mirror.
 
 Clients retain each query's waiting, failure, and success Result independently. Screens may derive
 presentation from successful domain values; they do not combine domain Results into an aggregate

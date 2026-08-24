@@ -8,45 +8,28 @@ import {
   type Equivalence,
 } from "effect"
 import {
-  LocalModelMutationFailed,
   InstalledCatalogAttributionSchema,
-  ModelDownloadIdSchema,
-  ModelPackageIdSchema,
   ModelPackagesStateSchema,
   servableModelBundlePackages,
-  type ModelDownloadId,
-  type LocalInferenceError,
   type ModelPackage,
   type ModelPackageEntry,
   type ModelPackageId,
   type ModelPackageInstallationOrigin,
   type ModelPackagesState,
-  type ServableModelBundle,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
 import {
-  IcnCatalog,
-  IcnClient,
   IcnDownloads,
   IcnInstalledModels,
+  IcnModels,
 } from "@magnitudedev/icn"
 import { makeObservedState } from "./mirrored-state"
 import {
   modelDownloadFromIcn,
   modelPackageFromIcn,
-  servableModelBundleToIcn,
   packageInspectionFromIcn,
-  recommendableModelFromIcn,
+  catalogModelDefinitionFromIcn,
 } from "./local-model-icn-adapter"
-
-export const localModelPackageMutationFailure = <Failure>(operation: string, error: Failure) =>
-  error instanceof LocalModelMutationFailed
-    ? error
-    : new LocalModelMutationFailed({
-        code: operation,
-        message: error instanceof Error ? error.message : String(error),
-        retryable: true,
-      })
 
 const packagesInCatalog = (
   catalog: readonly RecommendableModel[],
@@ -92,23 +75,7 @@ export interface LocalModelPackagesApi {
   readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly changes: Stream.Stream<{ readonly revision: number; readonly state: ModelPackagesState }>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
-  readonly admitBundle: (
-    bundle: ServableModelBundle,
-  ) => Effect.Effect<BundleInstallationAdmission, LocalInferenceError>
-  readonly cancelDownload: (downloadId: ModelDownloadId) => Effect.Effect<void, LocalInferenceError>
-  readonly acknowledgeFailure: (downloadId: ModelDownloadId) => Effect.Effect<void, LocalInferenceError>
-  readonly removeBundlePackages: (
-    bundle: ServableModelBundle,
-    retainedPackageIds?: ReadonlySet<string>,
-  ) => Effect.Effect<void, LocalInferenceError>
 }
-
-export type BundleInstallationAdmission =
-  | { readonly _tag: "AlreadyInstalled" }
-  | {
-      readonly _tag: "DownloadAdmitted"
-      readonly downloadId: ModelDownloadId
-    }
 
 export class LocalModelPackages extends Context.Tag("LocalModelPackages")<
   LocalModelPackages,
@@ -118,12 +85,11 @@ export class LocalModelPackages extends Context.Tag("LocalModelPackages")<
 export const LocalModelPackagesLive: Layer.Layer<
   LocalModelPackages,
   never,
-  IcnCatalog | IcnClient | IcnDownloads | IcnInstalledModels
+  IcnModels | IcnDownloads | IcnInstalledModels
 > = Layer.scoped(LocalModelPackages, Effect.gen(function* () {
-  const catalog = yield* IcnCatalog
+  const models = yield* IcnModels
   const installed = yield* IcnInstalledModels
   const downloads = yield* IcnDownloads
-  const client = yield* IcnClient
   const mirror = yield* makeObservedState<ModelPackagesState>({
     inventory: { _tag: "Initializing" },
     entries: [],
@@ -136,8 +102,8 @@ export const LocalModelPackagesLive: Layer.Layer<
 
   const project = projectionLock.withPermits(1)(Effect.gen(function* () {
     const catalogModels = yield* Effect.forEach(
-      (yield* catalog.get).state.models,
-      recommendableModelFromIcn,
+      (yield* models.get).state.models,
+      catalogModelDefinitionFromIcn,
     )
     const downloadsState = (yield* downloads.get).state
     const newlyCompleted = downloadsState.downloads.filter(({ id, state }) =>
@@ -226,7 +192,7 @@ export const LocalModelPackagesLive: Layer.Layer<
 
   yield* project
   yield* Stream.mergeAll([
-    catalog.changes.pipe(Stream.map(() => undefined)),
+    models.changes.pipe(Stream.map(() => undefined)),
     installed.changes.pipe(Stream.map(() => undefined)),
     downloads.changes.pipe(Stream.map(() => undefined)),
   ], { concurrency: "unbounded" }).pipe(
@@ -240,59 +206,5 @@ export const LocalModelPackagesLive: Layer.Layer<
     changes: mirror.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
-    admitBundle: (bundle) => Effect.gen(function* () {
-      const nativeBundle = yield* servableModelBundleToIcn(bundle)
-      const response = yield* client.models.startModelDownload({
-        payload: { bundle: nativeBundle },
-      })
-      yield* downloads.observeAdmission(response)
-      yield* project
-      return Option.match(response.download, {
-        onNone: () => ({ _tag: "AlreadyInstalled" } as const),
-        onSome: ({ id }) => ({
-          _tag: "DownloadAdmitted" as const,
-          downloadId: ModelDownloadIdSchema.make(id),
-        }),
-      }) satisfies BundleInstallationAdmission
-    }).pipe(Effect.mapError((error) =>
-      localModelPackageMutationFailure("start_model_download_failed", error))),
-    cancelDownload: (downloadId) => Effect.gen(function* () {
-      const cancelled = yield* client.models.cancelModelDownload({
-        path: { download_id: downloadId },
-      }).pipe(Effect.mapError((error) =>
-        localModelPackageMutationFailure("cancel_model_download_failed", error)))
-      yield* downloads.observeDownload(cancelled)
-      yield* project
-    }),
-    acknowledgeFailure: (downloadId) => Effect.gen(function* () {
-      const acknowledged = yield* client.models.acknowledgeModelDownloadFailure({
-        path: { download_id: downloadId },
-      }).pipe(Effect.mapError((error) => localModelPackageMutationFailure(
-        "acknowledge_model_download_failure_failed",
-        error,
-      )))
-      yield* downloads.observeDownload(acknowledged)
-      yield* project
-    }),
-    removeBundlePackages: (bundle, retainedPackageIds = new Set()) => Effect.gen(function* () {
-      const installedIds = yield* installed.get.pipe(Effect.map(({ state }) =>
-        new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id))))
-      yield* Effect.forEach(
-        servableModelBundlePackages(bundle).filter((modelPackage) =>
-          installedIds.has(modelPackage.id) && !retainedPackageIds.has(modelPackage.id)),
-        (modelPackage) => client.models.removeInstalledModel({
-          path: { package_id: modelPackage.id },
-        }).pipe(
-          Effect.mapError((error) =>
-            localModelPackageMutationFailure("remove_installed_model_failed", error)),
-        ),
-        { concurrency: 1, discard: true },
-      )
-      yield* installed.refresh.pipe(
-        Effect.mapError((error) =>
-          localModelPackageMutationFailure("refresh_installed_models_failed", error)),
-      )
-      yield* project
-    }),
   })
 }))

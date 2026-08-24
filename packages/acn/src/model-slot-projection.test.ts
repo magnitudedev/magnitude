@@ -2,7 +2,6 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelInstanceIdSchema,
-  ModelServingConfigurationIdSchema,
   modelSlotActions,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
@@ -15,94 +14,16 @@ import {
 } from "@magnitudedev/sdk"
 import {
   localModelSlotAvailability,
-  projectModelResidency,
   selectableModelCapabilities,
 } from "./model-slot-projection"
-import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 
 describe("model slot projection", () => {
-  it("preserves exact instance and configuration identity from ICN", () => {
-    const instance = {
-      id: "instance",
-      configurationId: "configuration",
-      lifecycle: {
-        _tag: "Loading",
-        stage: "loading",
-        progress: Option.some(0.5),
-        plannedAllocation: Option.none(),
-      },
-    } as unknown as Generated.ModelInstance
-    const projected = projectModelResidency(instance)
-    expect(projected._tag).toBe("Loading")
-    if (projected._tag !== "Loading") return
-    expect(projected.instanceId).toBe(ModelInstanceIdSchema.make("instance"))
-    expect(projected.configurationId).toBe(
-      ModelServingConfigurationIdSchema.make("configuration"),
-    )
-    expect(projected).toMatchObject({
-      progress: Option.some(0.5),
-    })
-  })
-
-  it("preserves structured low-memory failure facts", () => {
-    const projected = projectModelResidency({
-      id: "instance",
-      configurationId: "configuration",
-      lifecycle: {
-        _tag: "Failed",
-        failure: {
-          _tag: "LowMemory",
-          code: "low_memory",
-          message: "not enough memory",
-          retryable: true,
-          requiredSystemMemoryBytes: 24,
-          allocationHeadroomBytes: 20,
-          systemReserveBytes: 2,
-          loadBoundaryBytes: 26,
-          minimumAdditionalAvailableBytes: 7,
-          parallelSequences: 1,
-        },
-      },
-    } as Generated.ModelInstance)
-
-    expect(projected).toEqual({
-      _tag: "Failed",
-      failure: {
-        _tag: "LowMemory",
-        code: "low_memory",
-        message: "not enough memory",
-        retryable: true,
-        requiredSystemMemoryBytes: 24,
-        allocationHeadroomBytes: 20,
-        systemReserveBytes: 2,
-        loadBoundaryBytes: 26,
-        minimumAdditionalAvailableBytes: 7,
-        parallelSequences: 1,
-      },
-    })
-  })
-
-  it("projects terminal instance history into current residency", () => {
-    const stopped = (reason: "user_stop" | "memory_pressure") => projectModelResidency({
-      id: "instance",
-      configurationId: "configuration",
-      lifecycle: { _tag: "Stopped", reason },
-    } as Generated.ModelInstance)
-
-    expect(stopped("user_stop")).toEqual({ _tag: "Unloaded" })
-    expect(stopped("memory_pressure")).toMatchObject({
-      _tag: "Failed",
-      failure: { code: "low_memory", retryable: true },
-    })
-  })
-
   it("derives every model action from canonical residency", () => {
     const available = { _tag: "Available" as const }
     expect(modelSlotActions(available, { _tag: "Unloaded" })).toEqual(["Load"])
     expect(modelSlotActions(available, {
       _tag: "Loading",
       instanceId: ModelInstanceIdSchema.make("instance"),
-      configurationId: ModelServingConfigurationIdSchema.make("configuration"),
       stage: "loading",
       progress: Option.none(),
       plannedAllocation: Option.none(),

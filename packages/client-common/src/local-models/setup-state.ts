@@ -6,7 +6,6 @@ import type {
   LocalModelsState,
   ModelDownloadFailure,
   ModelInstanceFailure,
-  ModelServingConfigurationId,
   ModelSlotsState,
   ProviderModelId,
   SlotSelection,
@@ -19,7 +18,7 @@ import type {
 } from "../model-slots/service"
 import { localModelOptions, type LocalModelOption } from "./options"
 import type { LocalModelsCancelError, LocalModelsInstallError } from "./service"
-import { findLocalModelByConfigurationId } from "./projection"
+import { findLocalModelById } from "./projection"
 
 export class OnboardingModelSetupAlreadyActive extends Data.TaggedError(
   "OnboardingModelSetupAlreadyActive",
@@ -40,14 +39,14 @@ export class OnboardingModelSetupCancellationUnavailable extends Data.TaggedErro
 export class OnboardingModelChoiceRejected extends Data.TaggedError(
   "OnboardingModelChoiceRejected",
 )<{
-  readonly configurationId: ModelServingConfigurationId
+  readonly modelId: ProviderModelId
   readonly reason: "missing" | "unresolved" | "ineligible"
 }> {}
 
 export class OnboardingModelResourceChanged extends Data.TaggedError(
   "OnboardingModelResourceChanged",
 )<{
-  readonly configurationId: ModelServingConfigurationId
+  readonly modelId: ProviderModelId
   readonly resource: "installation" | "instance"
 }> {}
 
@@ -78,7 +77,7 @@ export type OnboardingModelSetupOperation =
   | {
       readonly _tag: "Loading"
       readonly model: LocalModel
-      readonly configurationId: ModelServingConfigurationId
+      readonly modelId: ProviderModelId
       readonly providerModelId: ProviderModelId
       readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
       readonly failure: ModelInstanceFailure | null
@@ -86,7 +85,7 @@ export type OnboardingModelSetupOperation =
   | {
       readonly _tag: "Completing"
       readonly model: LocalModel
-      readonly configurationId: ModelServingConfigurationId
+      readonly modelId: ProviderModelId
       readonly providerModelId: ProviderModelId
     }
 
@@ -119,13 +118,13 @@ export type OnboardingModelSetupExecution =
   | {
       readonly _tag: "Preparing" | "Installing" | "Configuring"
       readonly option: LocalModelOption
-      readonly configurationId: ModelServingConfigurationId
+      readonly modelId: ProviderModelId
       readonly cancelling: boolean
     }
   | {
       readonly _tag: "Loading"
       readonly option: LocalModelOption
-      readonly configurationId: ModelServingConfigurationId
+      readonly modelId: ProviderModelId
       readonly providerModelId: ProviderModelId
       readonly selection: SlotSelection
       readonly cancelling: boolean
@@ -133,7 +132,7 @@ export type OnboardingModelSetupExecution =
   | {
       readonly _tag: "Completing"
       readonly option: LocalModelOption
-      readonly configurationId: ModelServingConfigurationId
+      readonly modelId: ProviderModelId
       readonly providerModelId: ProviderModelId
     }
 
@@ -194,9 +193,9 @@ export const projectOnboardingModelSetupContent = (
   const current = execution.value
   const options = localModelOptions(models, slots)
   const currentModel = Option.getOrElse(
-    findLocalModelByConfigurationId(
+    findLocalModelById(
       models.models,
-      current.configurationId,
+      current.modelId,
     ),
     () => current.option.model,
   )
@@ -208,7 +207,7 @@ export const projectOnboardingModelSetupContent = (
       operation: Option.some({
         _tag: "Completing",
         model: currentModel,
-        configurationId: current.configurationId,
+        modelId: current.modelId,
         providerModelId: current.providerModelId,
       }),
     }
@@ -228,10 +227,6 @@ export const projectOnboardingModelSetupContent = (
   const slot = slots.slots.primary
   const residency = slot._tag === "ConfiguredLocal"
     && sameSelection(slot.selection, current.selection)
-    && (slot.residency._tag !== "Loading"
-      && slot.residency._tag !== "Ready"
-      && slot.residency._tag !== "Stopping"
-      || slot.residency.configurationId === current.configurationId)
     ? Option.some(slot.residency)
     : Option.none()
   const failure = Option.getOrNull(Option.flatMap(
@@ -259,7 +254,7 @@ export const projectOnboardingModelSetupContent = (
     operation: Option.some({
       _tag: "Loading",
       model: currentModel,
-      configurationId: current.configurationId,
+      modelId: current.modelId,
       providerModelId: current.providerModelId,
       phase,
       failure,

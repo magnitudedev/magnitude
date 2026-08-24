@@ -2,136 +2,82 @@
 applies_to:
   - inference/crates/icn-contracts/src/**
   - inference/crates/icn-models/**
-  - packages/icn/src/catalog/**
-  - packages/icn/src/installed/**
-  - packages/icn/src/downloads/**
+  - packages/icn/src/**
+  - packages/sdk/src/inference*
   - packages/acn/src/local-model-**
   - packages/acn/src/local-provider-**
   - packages/acn/src/model-slot-**
-  - packages/acn-protocol/src/boundary/local-inference.ts
   - packages/acn-protocol/src/schemas/model-state.ts
 ---
 
 # Model-management terminology
 
-This document defines canonical local-model vocabulary. An unqualified `model` is presentation
-language, not an identity-bearing domain type.
-
-## Package and serving terms
+## Authoritative resources
 
 | Term | Meaning |
 |---|---|
-| **Model file** | One immutable content-identified file with a role such as weights, shard, projector, draft, or MTP. |
-| **Model package** | One immutable set of exact files, roles, relationships, inspected properties, and one source. |
-| **Installed package** | The current observation that every required valid file for one package is present in a configured artifact root. |
-| **Servable model bundle** | The complete structure that can be served: one standalone package or one method-identified speculative bundle with an embedded or separate draft. |
-| **Serving profile** | Serving intent for a bundle, currently its context length. |
-| **Model serving configuration** | One exact bundle plus one serving profile, constructed and canonically identified by ICN. |
-| **Model download** | One process-local admitted acquisition occurrence for an exact bundle. Its identity is stable only for the owning ICN process lifetime. |
-| **Download attempt** | One process-local attempt to acquire one exact package, private to ICN coordination. |
+| **Model** | A callable model addressed everywhere by its existing canonical model ID, such as `gemma-4-26b-a4b-it-qat:gguf:q4`. It projects release declaration, capabilities, serving configuration, and current installation state. |
+| **Model package** | One immutable content-identified set of files, roles, relationships, inspection, and source evidence. |
+| **Installed package** | The current observation that every required valid file for a Package is present. It is a state, not another resource. |
+| **Download** | One process-local admitted acquisition occurrence created by Model installation. |
+| **Instance** | One physical loaded occurrence of a Model, identified by an ICN-created Instance ID. |
+| **Hardware** | ICN's singleton current topology, capacity, and calibration profile. |
+| **Slot** | ACN-owned durable provider-qualified model selection, reasoning preference, favorites, and recency for a product role. It contains no Instance identity or residency state. |
 
-Installed is not an entity, lifecycle record, or durable state transition. Package and bundle
-presence are recomputed from current valid files. Historical acquisition state never contributes
-presence.
+Catalog is a source of Model declarations, not a parallel collection. A local product view is a
+read-only ACN projection adding Magnitude assessment, provider, recommendation, update, and warning
+semantics to native facts. It is not an inference authority.
 
-The bundle is structural data, not an independently identified entity:
-
-```text
-ServableModelBundle
-  +-- Standalone(package)
-  +-- SpeculativeDecoding(target, method, Embedded | Separate(draft))
-```
-
-Two bundles are equal when their tag, target package, speculative method, draft-source variant, and
-separate draft package are equal. ICN alone constructs configuration identity from exact bundle and
-profile. Private bundle or cache keys are not serialized product identities.
-
-## Assessment terms
+## Derived values
 
 | Term | Meaning |
 |---|---|
-| **Hardware calibration** | Recomputable model-free performance evidence for one native hardware/backend environment. |
-| **Model assessment** | Recomputable compatibility, capacity, memory, and performance evidence for one exact serving configuration. |
-| **Semantic assessment key** | The configuration, immutable package evidence, stable hardware environment, native build, and assessment policy that determine reuse. |
-| **Standard profile rule** | ACN's canonical, stable rule for an inspected standalone package without a catalog configuration. |
-| **Resolved execution plan** | Load-time native allocation evidence; it is not serving intent or durable identity. |
+| **Servable model bundle** | Structural set of one standalone Package or a method-identified speculative target and draft relationship. It has no public resource lifecycle. |
+| **Serving profile** | Serving intent for a bundle, currently context length. |
+| **Model serving configuration** | The exact bundle and profile ICN currently resolves for a Model. Callers do not construct or persist it. |
+| **Model assessment** | Recomputable compatibility, capacity, memory, and performance evidence for a Model configuration and Hardware. |
+| **Load plan** | Advisory allocation evidence computed from a Model, current Hardware, and resident Instances. |
+| **Provider offering** | ACN's provider-facing metadata for a callable Model, keyed by the same canonical model ID. |
 
-Assessment predicts whether a configuration normally fits. Load admission decides whether it may
-run now. Cached assessment never authorizes loading.
+Assessment predicts whether a Model normally fits. ICN admission decides whether it may run now.
+Cached assessment never authorizes loading.
 
-## Catalog, offering, and runtime terms
-
-| Term | Meaning |
-|---|---|
-| **Catalog identity** | Structured pair of branded `CatalogModelId` and branded format-qualified `CatalogVariantId`, independent of exact target package and drafter. |
-| **Recommendable model** | One active catalog configuration plus presentation, capabilities, license, and ranking data. |
-| **Deprecated catalog entry** | An issued configuration excluded from recommendation and first-time discovery while remaining resolvable by identity. |
-| **Local model** | One client-facing product row: stable catalog product or exact non-catalog target, with acquisition, upgrade, and serving state. |
-| **Provider offering** | A provider-facing projection of one currently resolved serving configuration. |
-| **Slot selection** | The user's durable provider-qualified choice and reasoning effort for one product role. |
-| **Model slot** | Durable role intent joined with current availability, actions, and one current residency state. |
-| **Model residency** | Current slot runtime state: unloaded, requested, loading, ready, stopping, or failed. |
-| **Model instance** | One physical admitted occurrence of a serving configuration in ICN. |
-
-Catalog membership contributes configuration and metadata. It implies no package presence,
-selection, or residency. A provider offering is derived from catalog configuration, the canonical
-standard-profile rule, current artifacts, and assessment. It is not persisted.
-
-## Durability boundary
-
-Magnitude model state stores slot selections, provider-qualified recency, and favorites. Onboarding
-state stores its own completion fact. Model files are authoritative artifacts. Catalog
-configurations are release data. Package inventory, serving configurations, offerings, assessments,
-download occurrences, presentation, and instances are derived or process-local and are not copied
-into model state.
-
-`ManagedModelStore` is the exclusive mutation boundary for Magnitude-owned model artifacts. It
-observes installed packages from files, reconciles exact desired packages additively, and removes
-only exact addressed packages. Catalog and client layers never manipulate its filesystem layout.
-
-A slot persists only `(ProviderId, ProviderModelId, reasoningEffort)`. For the local provider,
-`ProviderModelId` is derived from `CatalogIdentity` at the local provider boundary for a catalog product and represents canonical configuration
-identity for a standard product. The catalog resolves stable products to their effective exact
-configuration. Standard configurations are reconstructed
-from inspected packages and the canonical standard-profile rule. That rule does not reinterpret an
-existing package identity across releases. While provider authority is unavailable, a selection is
-retained without guessing. Once authoritative resolution proves the identity absent, ACN clears the
-selection; it never substitutes silently.
-
-## Product projection
-
-Every active catalog product and every independently servable installed non-catalog package is
-represented. `CatalogIdentity` coalesces catalog, artifact, acquisition, assessment, recommendation,
-and provider facts across exact bundle changes. A catalog product retains one attributed runnable
-configuration until its desired exact catalog bundle is complete. Non-catalog resolution uses the
-ICN-issued standard configuration for an inspected standalone package.
-
-## Identity map
+## Identity and durability
 
 | Identity | Identifies | Lifetime and owner |
 |---|---|---|
-| `CatalogIdentity` | One stable catalog model and format-qualified quality track | Stable, catalog-authored structured pair |
-| `ModelPackageId` | One immutable package | Stable, ICN |
-| `ModelServingConfigurationId` | One exact bundle/profile combination | Stable, ICN-issued catalog or policy result |
-| `ModelDownloadId` | One exact-bundle acquisition occurrence | ICN process lifetime |
-| `DownloadAttemptId` | One package acquisition attempt | ICN process lifetime, private |
-| `ModelInstanceId` | One physical loaded occurrence | ICN controller lifetime |
-| `(ProviderId, ProviderModelId)` | One provider offering identity | Provider boundary; selection may retain it |
+| Canonical model ID | One callable Model across native APIs, `/v1/models`, inference requests, providers, Slots, and harness configuration | Stable release meaning, ICN |
+| `ModelPackageId` | One immutable Package | Content-stable, ICN |
+| `ModelDownloadId` | One acquisition occurrence | ICN process lifetime |
+| `ModelInstanceId` | One loaded occurrence | ICN controller lifetime |
+| `(ProviderId, ProviderModelId)` | One provider offering; for `local`, `ProviderModelId` is the canonical model ID | Provider boundary; Slot selection may retain it |
 | `SlotId` | One product role assignment | Durable, ACN |
 
-Display names, paths, repositories, filenames, recommendation membership, cache keys, and array
-positions are never operational identities.
+Magnitude persists Slot selection, recency, favorites, and onboarding completion. Model files are
+authoritative artifacts; catalog declarations are release data. Package inventory, configurations,
+offerings, assessments, Downloads, and Instances are derived or process-local and are not copied
+into durable model state.
 
-## Canonical relationship
+`ManagedModelStore` is the exclusive mutation boundary for Magnitude-owned artifacts. Model install
+and uninstall address a canonical model ID; ICN resolves exact Packages, preserves shared or active
+Packages, and never asks clients to reproduce bundle accounting.
+
+## Runtime relationship
 
 ```text
-catalog or inspected package + serving policy
-                    -> ModelServingConfiguration
-                    -> assessment
-                    -> provider offering
-                    -> slot selection -> model instance
+release declaration + current Packages
+              -> Model -> serving configuration -> assessment / load plan
+                    |
+                    +-> install -> Download
+                    +-> explicit warm load --------+
+                    +-> inference request ----------+-> residency coordinator -> Instance -> lease
 
-current files -> installed packages ----+
-catalog + acquisition + assessment -----+-> LocalModel[]
-recommendations + offerings + memory ---+
+ACN Slot selection by canonical model ID
+  + native Model and Instance Queries
+  -> first-party residency presentation
 ```
+
+Equivalent explicit and inference demand joins one admitted load. ICN creates Instance identity,
+serializes incompatible replacement, and protects active inference with exact request leases.
+Display names, paths, repositories, filenames, cache keys, and array positions are never operational
+identities.
