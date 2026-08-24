@@ -71,6 +71,11 @@ export interface Adapter<FiniteMiddleware extends RpcMiddleware.TagClassAny = ne
     never,
     RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Context<GroupRpcs<Value, FiniteMiddleware>>
   >
+  readonly makeImplementations: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
+    Operation.ImplementationService<RpcClientError>,
+    never,
+    RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Scope.Scope
+  >
   readonly makeRpcClient: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
     RpcClient.RpcClient<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
     never,
@@ -166,6 +171,11 @@ export const make = <FiniteMiddleware extends RpcMiddleware.TagClassAny = never>
         Effect.map(RpcClient.make(project(group).group, { flatten: true }), (client) => implementations(group, client as never)),
       ) as never
     },
+    makeImplementations: (group) =>
+      Effect.map(
+        RpcClient.make(project(group).group, { flatten: true }),
+        (client) => implementations(group, client as never),
+      ),
     makeRpcClient: (group) => RpcClient.make(project(group).group),
     toLayer: (group, handlers) => project(group).group.toLayer(handlers as never) as never,
     makeRpcServer: (group) => RpcServer.make(project(group).group) as never,

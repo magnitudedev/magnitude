@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, FiberRef, Layer, Match, Option, Ref, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Match, Option, Ref, Schema, Stream } from "effect"
 import {
   ModelCatalogError,
   ModelDiscoveryOperationIdSchema,
@@ -42,7 +42,6 @@ import {
   type GeneratedClientError,
 } from "@magnitudedev/openapi-effect/client-runtime"
 import type { LocalProviderSource } from "./provider.js"
-import { CurrentModelInstance } from "./contract.js"
 
 const icnRequestOptions = {
   maxTokens: NativeChatCompletions.options.maxTokens,
@@ -125,6 +124,7 @@ const generatedBodyFailure = (
       type: remote.body.error.type,
       code: remote.body.error.code,
       param: null,
+      retryable: remote.body.error.retryable,
     },
     payload: payloadSample(JSON.stringify(remote.body)),
     progress: { dataPayloadsDecoded: 0, modelEventsEmitted: 0 },
@@ -192,54 +192,38 @@ const bindIcnModel = (
     const maxTokens = Option.fromNullable(requestOptions?.maxTokens ?? defaults?.maxTokens)
     const toolChoice = Option.fromNullable(requestOptions?.toolChoice ?? defaults?.toolChoice)
     const reasoningEffort = Option.fromNullable(requestOptions?.reasoningEffort ?? defaults?.reasoningEffort)
-    return FiberRef.get(CurrentModelInstance).pipe(
-      Effect.flatMap((binding) => Option.match(binding, {
-        onNone: () => Effect.fail(new StreamStartClientCorrectnessViolation({
-          call,
-          component: "request_builder",
-          message: "No exact model instance was bound to the local request",
-          evidence: {
-            _tag: "UnexpectedDefectCaught",
-            cause: {
-              _tag: "ErrorCause",
-              name: "MissingModelInstanceBinding",
-              message: "ModelSlotController must bind a Ready instance before provider start",
-            },
-          },
-        })),
-        onSome: (target) => NativeChatCompletions.buildRequest(
-          {
-            call,
-            modelId: providerModelId,
-            options: icnRequestOptions,
-          },
-          prompt,
-          tools,
-          {
-            ...Option.match(maxTokens, { onNone: () => ({}), onSome: (value) => ({ maxTokens: value }) }),
-            ...Option.match(toolChoice, { onNone: () => ({}), onSome: (value) => ({ toolChoice: value }) }),
-            ...Option.match(reasoningEffort, { onNone: () => ({}), onSome: (value) => ({ reasoningEffort: value }) }),
-          },
-        ).pipe(Effect.flatMap((nativeRequest) => encodeChatCompletionsRequest(nativeRequest).pipe(
-          Effect.flatMap((request) => Schema.decodeUnknown(Generated.ChatCompletionRequest)({
-            ...request,
-            model_instance_id: target.instanceId,
-          })),
-          Effect.mapError((cause) => new StreamStartClientCorrectnessViolation({
-            call,
-            component: "request_builder",
-            message: "Unable to encode the ICN chat request",
-            evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
-          })),
-        ))),
+    const requestProgress = bindOptions?.requestAttribution?.requestProgress
+    return NativeChatCompletions.buildRequest(
+      {
+        call,
+        modelId: providerModelId,
+        options: icnRequestOptions,
+      },
+      prompt,
+      tools,
+      {
+        ...Option.match(maxTokens, { onNone: () => ({}), onSome: (value) => ({ maxTokens: value }) }),
+        ...Option.match(toolChoice, { onNone: () => ({}), onSome: (value) => ({ toolChoice: value }) }),
+        ...Option.match(reasoningEffort, { onNone: () => ({}), onSome: (value) => ({ reasoningEffort: value }) }),
+      },
+    ).pipe(
+      Effect.flatMap((nativeRequest) => encodeChatCompletionsRequest(nativeRequest)),
+      Effect.flatMap(Schema.decodeUnknown(Generated.ChatCompletionRequest)),
+      Effect.mapError((cause) => new StreamStartClientCorrectnessViolation({
+        call,
+        component: "request_builder",
+        message: "Unable to encode the ICN chat request",
+        evidence: { _tag: "RequestBodyEncodingFailed", cause: toCauseInfo(cause) },
       })),
       Effect.tap(() => bindOptions?.requestAttribution?.requestStarted ?? Effect.void),
       Effect.flatMap((payload) =>
-        client.chat.createChatCompletion({ payload }).pipe(
+        client.chat.createChatCompletion({
+          payload,
+          headers: { "Magnitude-Include-Progress": Option.some(true) },
+        }).pipe(
           Effect.mapError((cause) => generatedStartFailure(call, cause)),
           Effect.flatMap(({ status, headers, events }) => Effect.gen(function* () {
               const response = acceptedHttpResponse(status, headers)
-              const requestProgress = bindOptions?.requestAttribution?.requestProgress
               const performance = yield* Ref.make(Option.none<GenerationPerformance>())
               let progressRequestId: string | null = null
               let semanticStarted = false
@@ -249,19 +233,25 @@ const bindIcnModel = (
               ): Effect.Effect<void> => {
                 if (!requestProgress) return Effect.void
                 progressRequestId = requestId
-                const update: ModelRequestProgress = Match.value(progress).pipe(
-                  Match.tag("Queued", () => ({ phase: "queued" as const, requestId })),
-                  Match.tag("Preparing", () => ({ phase: "preparing" as const, requestId })),
-                  Match.tag("Prefill", (prefill) => ({
-                    phase: "prefill" as const,
-                    requestId,
-                    completedTokens: prefill.completedTokens,
-                    totalTokens: prefill.totalTokens,
-                    cachedTokens: prefill.cachedTokens,
-                  })),
-                  Match.tag("Generating", () => ({ phase: "generating" as const, requestId })),
-                  Match.exhaustive,
-                )
+                const update: ModelRequestProgress = (() => {
+                  switch (progress.phase) {
+                    case "model_loading": return {
+                      phase: "model_loading",
+                      requestId,
+                      fraction: progress.fraction,
+                    }
+                    case "queued": return { phase: "queued", requestId }
+                    case "preparing": return { phase: "preparing", requestId }
+                    case "prefill": return {
+                      phase: "prefill",
+                      requestId,
+                      completedTokens: progress.completed_tokens,
+                      totalTokens: progress.total_tokens,
+                      cachedTokens: progress.cached_tokens,
+                    }
+                    case "generating": return { phase: "generating", requestId }
+                  }
+                })()
                 return requestProgress(update)
               }
               const sourceEvents = events.pipe(
@@ -276,7 +266,7 @@ const bindIcnModel = (
                 })),
                 Stream.tap((chunk) => Option.match(chunk.progress, {
                   onSome: (progress) => {
-                    if (progress._tag === "Generating") semanticStarted = true
+                    if (progress.phase === "generating") semanticStarted = true
                     return reportProgress(chunk.id, progress)
                   },
                   onNone: () => {
@@ -339,6 +329,10 @@ const bindIcnModel = (
                 requestId: response.requestId,
               }
           })),
+          Effect.tapError(() => requestProgress?.({
+            phase: "cleared",
+            requestId: null,
+          }) ?? Effect.void),
         )),
     )
   },

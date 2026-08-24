@@ -2,6 +2,7 @@ import { Option } from "effect"
 import {
   RecommendationIdSchema,
   type FitsModelAssessment,
+  type ModelRecommendation,
   type RecommendableModel,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
@@ -58,8 +59,7 @@ export interface RecommendationCandidate {
 
 export interface RecommendationSelection {
   readonly id: ReturnType<typeof RecommendationIdSchema.make>
-  readonly configurationId: FitsModelAssessment["configurationId"]
-  readonly recommendableModelId: string
+  readonly modelId: ModelRecommendation["modelId"]
   readonly displayName: string
   readonly intent: "balanced" | "smartest" | "fastest" | "lightweight"
   readonly explanation: string
@@ -78,9 +78,7 @@ const stableCompare = (
   left: RecommendationCandidate,
   right: RecommendationCandidate,
 ): number =>
-  String(left.assessment.configurationId).localeCompare(
-    String(right.assessment.configurationId),
-  )
+  localCatalogProviderModelId(left.model).localeCompare(localCatalogProviderModelId(right.model))
 
 const clamp = (value: number): number => Math.max(0, Math.min(1, value))
 
@@ -140,11 +138,11 @@ export const assembleRecommendationCatalogCandidates = (
   input: readonly RecommendationCandidate[],
   recommendations: readonly RecommendationSelection[],
 ): readonly RecommendationCandidate[] => {
-  const candidatesByConfiguration = new Map(
-    input.map((candidate) => [candidate.assessment.configurationId, candidate]),
+  const candidatesByModel = new Map(
+    input.map((candidate) => [localCatalogProviderModelId(candidate.model), candidate]),
   )
   const selected = recommendations.flatMap((recommendation) => {
-    const candidate = candidatesByConfiguration.get(recommendation.configurationId)
+    const candidate = candidatesByModel.get(recommendation.modelId)
     return candidate ? [candidate] : []
   }).filter((candidate, index, candidates) => candidates.findIndex(({ artifactId }) =>
     artifactId === candidate.artifactId) === index)
@@ -259,9 +257,8 @@ const toRecommendation = (
   intent: RecommendationSelection["intent"],
   balanced: RecommendationCandidate,
 ): RecommendationSelection => ({
-  id: RecommendationIdSchema.make(`${candidate.assessment.configurationId}:${intent}`),
-  configurationId: candidate.assessment.configurationId,
-  recommendableModelId: localCatalogProviderModelId(candidate.model),
+  id: RecommendationIdSchema.make(`${localCatalogProviderModelId(candidate.model)}:${intent}`),
+  modelId: localCatalogProviderModelId(candidate.model),
   displayName: candidate.model.displayName,
   intent,
   explanation: intent === "balanced" ? describeBalanced(candidate)
@@ -279,13 +276,13 @@ export const selectRecommendationPortfolio = (
     compareForIntent(left, right, "balanced")).at(0)
   if (!balanced) return []
 
-  const selectedConfigurationIds = new Set<string>()
+  const selectedModelIds = new Set<string>()
   return recommendationIntents.flatMap((intent): readonly RecommendationSelection[] => {
     const candidate = [...input]
       .sort((left, right) => compareForIntent(left, right, intent))
-      .find(({ assessment }) => !selectedConfigurationIds.has(assessment.configurationId))
+      .find(({ model }) => !selectedModelIds.has(localCatalogProviderModelId(model)))
     if (!candidate) return []
-    selectedConfigurationIds.add(candidate.assessment.configurationId)
+    selectedModelIds.add(localCatalogProviderModelId(candidate.model))
     return [toRecommendation(candidate, intent, balanced)]
   })
 }

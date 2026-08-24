@@ -70,6 +70,25 @@ export const make = <const Members extends Record<string, unknown>>(
   }) as never
 }
 
+/** Extend a root group while preserving its existing top-level member shape. */
+export const extend = <
+  Base extends Any,
+  const Added extends Record<string, unknown>,
+>(
+  base: Base,
+  added: Added & ValidMembers<Added>,
+): Group<Members<Base> & Added, Operation<Base> | Extract<OperationOfMembers<Added>, CoreOperation.Any>> => {
+  for (const name of Object.keys(added)) {
+    if (Object.prototype.hasOwnProperty.call(base, name)) {
+      throw new TypeError(`Cannot extend Group with duplicate member ${name}`)
+    }
+  }
+  return make({
+    ...Object.fromEntries(Object.entries(base)),
+    ...added,
+  } as never) as never
+}
+
 export const operations = <Value extends Any>(group: Value): ReadonlyArray<Operation<Value>> =>
   group[OperationListTypeId] as ReadonlyArray<Operation<Value>>
 

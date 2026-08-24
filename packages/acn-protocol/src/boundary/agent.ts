@@ -2,6 +2,7 @@ import { Schema } from "effect"
 import { Group, Mutation } from "@magnitudedev/effect-query"
 import { SessionError } from "../errors"
 import { RawMessageUploads, RawMentionOccurrence } from "../schemas/attachments"
+import { turnAdmissionScope } from "./configuration"
 
 const SendMessage = Mutation.make("SendMessage", {
   policy: { recovery: "AtMostOnce" },
@@ -16,6 +17,7 @@ const SendMessage = Mutation.make("SendMessage", {
   }),
   success: Schema.Struct({}),
   error: SessionError,
+  scope: () => turnAdmissionScope,
 })
 
 const StartGoal = Mutation.make("StartGoal", {
@@ -26,6 +28,7 @@ const StartGoal = Mutation.make("StartGoal", {
   }),
   success: Schema.Struct({}),
   error: SessionError,
+  scope: () => turnAdmissionScope,
 })
 
 export const InterruptTarget = Schema.Union(

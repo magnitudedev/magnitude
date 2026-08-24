@@ -19,19 +19,18 @@ or runtime residency.
 
 ## Provider offerings
 
-The local provider adapter projects each currently resolved model serving configuration as one
-offering containing a stable local provider model ID and that exact configuration. Both the
-configuration and offering are derived rather than persisted.
+The local provider adapter projects each callable catalog model as one offering containing its
+canonical model ID and current exact serving configuration. The configuration and offering are
+derived rather than persisted.
 
-ACN resolves configurations and capabilities from issued catalog entries or installed package
-inspection plus the canonical standard-profile rule. Catalog capabilities describe an uninstalled
+ACN resolves configurations and capabilities from issued catalog entries. Catalog capabilities describe an uninstalled
 offering. Once the effective target package has a completed inspection, that inspection is
 authoritative because it describes the artifact inference will actually execute. When neither
 source can establish capabilities, the offering remains disabled with conservative metadata rather
 than claiming support.
 
-Within the separate `local` provider namespace, the provider model ID is exactly the serving
-configuration ID. ACN never prefixes or hashes package or profile data to create another identity.
+Within the separate `local` provider namespace, the provider model ID is exactly the canonical
+catalog model ID. Serving configurations have no separate public identity.
 
 An offering exists independently of current installation, assessment, slot selection, or residency.
 ACN's local-offering projection combines the resolved configuration with installed-package and assessment
@@ -69,7 +68,7 @@ Product visibility and grouping belong to
 [Local-model product projection](../model-management/local-model-product-projection.md). The provider
 adapter contributes one offering facet for each resolved configuration; it does not decide whether
 a product row exists. Bundle identity is its tagged structure and ordered package identities.
-Provider model IDs continue to distinguish exact configurations.
+Provider model IDs distinguish callable models, not derived configurations.
 
 ## Selection and resolution
 
@@ -90,8 +89,8 @@ requested effort and otherwise selects the provider model's default. Stored sele
 normalized through the same operation when the catalog becomes available. The client and agent do
 not independently repair reasoning effort.
 
-The local provider resolver maps the selected provider model ID to the exact current catalog or
-standard configuration. Provider binding is cheap and has no runtime side effect. Temporary
+The local provider resolver maps the selected canonical model ID to its exact current catalog
+configuration. Provider binding is cheap and has no runtime side effect. Temporary
 authority failure preserves the selection as unavailable. A complete authoritative projection
 that lacks the identity clears the selection; neither case chooses another configuration.
 
@@ -135,7 +134,7 @@ The ICN `ModelInstanceController` is the sole native mutation and lease authorit
 - Replacement closes new admission and waits for existing generation leases.
 - A completion holds one generation lease until its body completes, fails, or is canceled.
 - A failed mutation does not poison later attempts.
-- Unexpected resident-worker loss is observed with the configuration identity and becomes a typed
+- Unexpected resident-worker loss is observed with the exact instance ID and becomes a typed
   blocked slot state; it is not inferred from generic provider unavailability.
 
 ACN rechecks the attributed slot and exact instance after preparation. Progress and terminal state

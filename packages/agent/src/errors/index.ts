@@ -27,7 +27,5 @@ export {
   formatAgentModelStartFailure,
   presentAgentModelStartFailure,
   type AgentModelStartFinalizerDecision,
-  type ModelRequestPreparationCancellationSnapshot,
-  type ModelRequestPreparationFailureSnapshot,
 } from './model-start'
 export type { AgentModelStartFailure } from '../model/model-request-preparation'

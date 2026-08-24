@@ -4,6 +4,7 @@ import {
   StreamFailure,
   ModelStreamTerminal,
   ProviderRejection,
+  type ProviderErrorEnvelope,
 } from "./failure"
 
 // ---------------------------------------------------------------------------
@@ -187,12 +188,7 @@ function retryabilityForStreamFailure(
 }
 
 function providerErrorRetryable(
-  error: {
-    readonly message: string
-    readonly type: string | null
-    readonly code: string | null
-    readonly param: string | null
-  },
+  error: ProviderErrorEnvelope,
   status: number,
   retryAfterMs: number | null,
 ): UpstreamRetryability {
@@ -227,6 +223,11 @@ function providerErrorRetryable(
   }
   if (status >= 500) {
     return UpstreamRetryability.UpstreamRetryable({ retryAfter: RetryAfter.NoRetryAfter() })
+  }
+  if (error.retryable !== null) {
+    return error.retryable
+      ? UpstreamRetryability.UpstreamRetryable({ retryAfter: RetryAfter.NoRetryAfter() })
+      : UpstreamRetryability.UpstreamNotRetryable({ reason: "provider_error_not_retryable" })
   }
   if (status >= 400 && status < 500) {
     return UpstreamRetryability.UpstreamNotRetryable({ reason: "invalid_request" })

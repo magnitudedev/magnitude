@@ -1,12 +1,12 @@
 import { useCallback, useMemo } from "react"
 import { Effect, Option, type Equivalence } from "effect"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { QueryClient } from "@magnitudedev/effect-query"
 import {
-  LocalInference,
+  Inference,
   ProviderIdSchema,
+  projectInferenceHardware,
   type LocalModelsState,
-  type ModelServingConfigurationId,
+  type ProviderModelId,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
@@ -20,7 +20,10 @@ import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
 export const useLocalInferenceHardware = () => {
   const client = useAgentClient()
   const hardware = useMemo(() => Atom.make((get) =>
-    Result.map(get(client.LocalInference.GetLocalInferenceHardware({})).result, ({ state }) => state)), [client])
+    Result.map(
+      get(client.Inference.GetInferenceHardware({})).result,
+      (state) => Effect.runSync(projectInferenceHardware(state)),
+    )), [client])
   return useAtomValue(hardware)
 }
 export type LocalInferenceHardwareResult = ReturnType<typeof useLocalInferenceHardware>
@@ -83,26 +86,21 @@ export const useProviderModelCatalog = () => {
  */
 export function usePreviewModelLoad(slotId: SlotId) {
   const client = useAgentClient()
-  const refresh = useMemo(() => client.runtime.fn<void>()(
-    () => QueryClient.invalidate(LocalInference.PreviewModelLoad.match({ slotId })),
-  ), [client, slotId])
-  const runRefresh = useAtomSet(refresh)
+  const modelSlots = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const preview = useMemo(() => {
-    let dependencies: readonly [number, number] | null = null
     return Atom.make((get) => {
-      const hardware = get(client.LocalInference.GetLocalInferenceHardware({}))
-      const slots = get(client.Configuration.GetModelSlots({}))
-      const next: readonly [number, number] = [
-        Option.getOrElse(hardware.dataUpdatedAt, () => 0),
-        Option.getOrElse(slots.dataUpdatedAt, () => 0),
-      ]
-      if (dependencies !== null && (dependencies[0] !== next[0] || dependencies[1] !== next[1])) {
-        queueMicrotask(() => runRefresh())
-      }
-      dependencies = next
-      return get(client.LocalInference.PreviewModelLoad({ slotId })).result
+      get(client.Inference.GetInferenceHardware({}))
+      return Result.flatMap(get(modelSlots), (service) =>
+        Result.flatMap(get(service.state), ({ state }) => {
+          const slot = slotId === "primary" ? state.slots.primary : state.slots.secondary
+          return slot._tag === "ConfiguredLocal"
+            ? get(client.Inference.PreviewInferenceModelLoad({
+                modelId: slot.selection.providerModelId,
+              })).result
+            : Result.initial()
+        }))
     })
-  }, [client, slotId, runRefresh])
+  }, [client, modelSlots, slotId])
   return useAtomValue(preview)
 }
 
@@ -110,12 +108,12 @@ export function useLocalModelActions() {
   const client = useAgentClient()
   const mutations = useLocalModelMutations()
   const installAndAssignAction = useMemo(() => Atom.keepAlive(client.runtime.fn<{
-    readonly configurationId: ModelServingConfigurationId
+    readonly modelId: ProviderModelId
     readonly slotId: SlotId
     readonly reasoningEffort: SlotSelection["reasoningEffort"]
-  }>()(({ configurationId, slotId, reasoningEffort }) => Effect.flatMap(
+  }>()(({ modelId, slotId, reasoningEffort }) => Effect.flatMap(
     LocalModels,
-    (models) => models.install(configurationId),
+    (models) => models.install(modelId),
   ).pipe(
     Effect.flatMap(({ providerModelId }) => Effect.flatMap(
       ModelSlots,
@@ -131,11 +129,11 @@ export function useLocalModelActions() {
   return {
     ...mutations,
     installAndAssign: useCallback((
-      configurationId: ModelServingConfigurationId,
+      modelId: ProviderModelId,
       slotId: SlotId,
       reasoningEffort: SlotSelection["reasoningEffort"],
     ) => {
-      installAndAssign({ configurationId, slotId, reasoningEffort })
+      installAndAssign({ modelId, slotId, reasoningEffort })
     }, [installAndAssign]),
   }
 }

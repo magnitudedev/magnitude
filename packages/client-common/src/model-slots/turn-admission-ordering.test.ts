@@ -3,12 +3,12 @@ import { Deferred, Effect, Fiber, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client, Mutation } from "@magnitudedev/effect-query"
 import {
-  AcnBoundary,
+  MagnitudeBoundary,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-  type ModelSlotsState,
+  type ModelSlotSelectionsState,
 } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
@@ -22,25 +22,12 @@ const selection = {
 
 const modelSlots = {
   slots: {
-    primary: {
-      _tag: "ConfiguredLocal",
-      slotId: PRIMARY_SLOT_ID,
-      selection,
-      descriptor: {
-        providerId: selection.providerId,
-        providerModelId: selection.providerModelId,
-        displayName: "New model",
-        variantLabel: Option.none(),
-      },
-      availability: { _tag: "Available" },
-      residency: { _tag: "Unloaded" },
-      actions: ["Load"],
-    },
-    secondary: { _tag: "Unassigned", slotId: "secondary" },
+    primary: Option.some(selection),
+    secondary: Option.none(),
   },
   recentModels: { primary: [], secondary: [] },
   favoriteModels: [],
-} as unknown as ModelSlotsState
+} satisfies ModelSlotSelectionsState
 
 const reproduceOvertake = (submit: (client: ReturnType<typeof makeClient>) =>
   Effect.Effect<unknown, unknown, Registry.AtomRegistry>) =>
@@ -97,8 +84,8 @@ const reproduceOvertake = (submit: (client: ReturnType<typeof makeClient>) =>
   }))
 
 const makeClient = (implementation: ReturnType<typeof fakeAcnImplementationsLayer>) =>
-  Client.make<typeof AcnBoundary, AcnClientRequirements, never, ClientServices, never>(
-    AcnBoundary,
+  Client.make<typeof MagnitudeBoundary, AcnClientRequirements, never, ClientServices, never>(
+    MagnitudeBoundary,
     implementation,
     clientServicesLayer,
   )

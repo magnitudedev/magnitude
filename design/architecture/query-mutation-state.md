@@ -263,7 +263,7 @@ Admission publishes the nonterminal state and establishes its owner before retur
 admit occurrence -> retain exact ID -> observe / stop / replace same occurrence
 ```
 
-- Configuration identity does not substitute for occurrence identity.
+- Canonical model identity does not substitute for instance occurrence identity.
 - “Latest” does not substitute for the admitted occurrence.
 - A delayed command cannot affect a replacement.
 - The state owner decides completion once.
@@ -371,16 +371,18 @@ local interaction  -> presentation atom
 - Shared atoms choose disposable or keep-alive lifetime intentionally.
 - CLI, web, and desktop share state behavior through client-common.
 
-Effect Query is the client cache and command-state authority for every client↔ACN interaction.
+Effect Query is the client cache and command-state authority for every first-party client
+interaction with ACN RPC and native inference HTTP.
 Each interaction is defined once with the core Effect Query primitives: `Query.make`,
 `Query.fromStream`, `Mutation.make`, or `Subscription.make`. Domain definitions compose through
-the core `Group.make`, and the root `AcnBoundary` group is the sole complete protocol witness.
-The ACN RPC adapter derives its RPC projection from that group; it does not provide another
+the core `Group.make`. The root client boundary composes `AcnBoundary` with the authored
+`Inference` group. The ACN RPC adapter derives only the RPC projection; generated ICN OpenAPI
+operations implement the inference group without becoming RPCs. Neither transport provides another
 operation-definition or grouping mechanism. Queries declare freshness, while mutations declare
 their scope, recovery policy, and synchronization postcondition on the same values. One
-connection-scoped Effect Query client (the `AgentClient`) is made **for** `AcnBoundary`
-(`Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary), …)`): it provides RPC-backed operation
-implementations and carries every member of the group, materialized, at its name — a query member
+connection-scoped Effect Query client (the `AgentClient`) is made for the composed boundary with a
+merged RPC and inference implementation Layer. It carries every member of the group, materialized,
+at its name — a query member
 is `(input) => QueryAtom` (`client.Sessions.GetSession(input)`), a mutation member is its
 `MutationAtom` (`client.Agent.SendMessage`), a subscription member is `(input) => SubscriptionAtom`
 (`client.Display.StreamDisplayView(input)`). Members are the canonical atoms: equal inputs return
@@ -402,29 +404,31 @@ publication to finish; progress, physical completion, and serving readiness rema
 query state consumed by the dependent Effect.
 
 There is one canonical query cache and one mutation-state registry per connection; a second cache,
-request system, or command-state mechanism for ACN data is prohibited. Definers know the `Acn`
-boundary, not the transport; callers know the three primitives, not the transport.
+request system, or command-state mechanism is prohibited. Definers know their semantic boundary,
+not the transport; callers know the three primitives, not the transport.
 
 ### AgentClient and RPC
 
 ```text
 component
-   +-- domain-group query member ----> Effect Query client ----> ACN transport
-   +-- domain-group mutation member -> Effect Query client ----> ACN transport
-                                                ^
-                                                +-- StreamChanges poke invalidates the named query
+   +-- ACN domain member ------> Effect Query client ----> ACN RPC
+   +-- inference member -------> Effect Query client ----> generated ICN HTTP client
+                                           ^                         ^
+                                           |                         +-- ICN events invalidate native query
+                                           +-- StreamChanges invalidates RPC query
 ```
 
-- The ACN transport service executes Rpcs; it owns no query or mutation state. Its
+- The ACN transport service executes RPCs; the generated ICN client executes native HTTP. Neither
+  owns query or mutation state. The ACN transport's
   implementation (the JIT runtime, recovering HTTP protocol, subscription framing) is the only
   place that knows Effect RPC.
 - One Effect Query client per connection owns the Atom runtime, query cache, mutation history, and
   the domain service Layers.
 - Definitions are transport-neutral values requiring a generic operation implementation through
   Effect DI. The connection installs the RPC-backed implementation layer.
-- Freshness is owned by the connection: one `StreamChanges` subscription carries pokes that name a
-  query, and the Effect Query client invalidates by name. ACN-owned snapshots are boundary queries
-  with infinite freshness.
+- Freshness is owned by the connection: `StreamChanges` invalidates ACN Queries and one multiplexed
+  ICN event stream invalidates native inference Queries in the same cache. Reconnect rereads every
+  covered authoritative snapshot.
 - A keyed subscription that keeps queries fresh (`WatchFile`, `WatchProjectFiles`) is a dependency
   of the query atoms it serves, owned by that domain's client service: open while observed, closed
   when unobserved. Components and hooks mount no watches and own no stream fibers.
@@ -482,20 +486,19 @@ ICN --observe/remove--> exact native workers
 ### Local inference
 
 ```text
-ACN ModelSlot                         ICN ModelInstance
-durable product intent --command--> physical admitted occurrence
-         ^                                      |
-         +---------- projected query -----------+
+ACN ModelSlot                         ICN Model / Instance
+durable product selection             physical availability / occurrence
+         |                                      |
+         +---------- client-side join ----------+
 
 hardware query ----> fit/load advice ----> fresh validation at mutation admission
 ```
 
 - Slot selection, model residency, hardware topology, downloads, and catalog state remain
   independent authorities.
-- ACN authors `Requested` residency and otherwise projects current ICN instance truth into the
-  slot's single residency lifecycle.
-- Client load and stop address a slot; ACN resolves physical commands to the retained exact
-  instance identity.
+- ACN stores no requested or observed physical residency in a Slot.
+- Explicit warm load addresses a canonical model ID; exact stop addresses an ICN Instance ID.
+- Chat Completions and Responses acquire residency automatically through that same ICN coordinator.
 - Client mutation pending and response progress never substitute for authoritative residency.
 - Loading repeats current hardware and package validation at ICN admission.
 

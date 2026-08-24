@@ -63,6 +63,8 @@ export interface ProviderErrorEnvelope {
   readonly type: string | null
   readonly code: string | null
   readonly param: string | null
+  /** Provider-authored retry hint when the wire protocol exposes one. */
+  readonly retryable: boolean | null
 }
 
 export type RetryPolicy = {

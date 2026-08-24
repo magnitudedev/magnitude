@@ -27,6 +27,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@effect-atom/atom": "^0.5.3",
     "effect": "^3.21.2",
     "@effect/platform": "^0.96.0",
     "@effect/opentelemetry": "^0.63.0",
@@ -34,6 +35,9 @@
     "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/providers": "workspace:*",
     "@magnitudedev/acn-protocol": "workspace:*",
+    "@magnitudedev/effect-query": "workspace:*",
+    "@magnitudedev/icn-protocol": "workspace:*",
+    "@magnitudedev/openapi-effect": "workspace:*",
     "@magnitudedev/release": "workspace:*",
     "@magnitudedev/storage": "workspace:*",
 

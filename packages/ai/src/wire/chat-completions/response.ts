@@ -89,6 +89,7 @@ export const chatCompletionsStreamChunkFields = <A, I, R>(
       type: Schema.optionalWith(Schema.String, { as: "Option", exact: true, nullable: true }),
       code: Schema.optionalWith(Schema.String, { as: "Option", exact: true, nullable: true }),
       param: Schema.optionalWith(Schema.String, { as: "Option", exact: true, nullable: true }),
+      retryable: Schema.optionalWith(Schema.Boolean, { as: "Option", exact: true, nullable: true }),
     }),
     { as: "Option", exact: true, nullable: true },
   ),

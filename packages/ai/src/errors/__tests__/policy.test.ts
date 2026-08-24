@@ -110,7 +110,7 @@ function makeStreamProviderError(
   return new StreamProviderError({
     call,
     response: acceptedResponse(),
-    providerError: { message, type: "test", code, param: null },
+    providerError: { message, type: "test", code, param: null, retryable: null },
     payload: payloadSample('{"error":"boom"}'),
     progress,
   })

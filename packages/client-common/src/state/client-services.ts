@@ -33,15 +33,20 @@ export const clientServicesLayer = (
   options: ClientServicesOptions = {},
 ) => {
   const infrastructure = Layer.succeed(ClientEffectQuery, effectQuery)
+  // Establish both invalidation drains before any domain service performs its
+  // first Query. This closes the read-before-watch startup race while retaining
+  // one connection-scoped Effect Query runtime.
+  const observedInfrastructure = ChangesLive.pipe(
+    Layer.provideMerge(infrastructure),
+  )
   const domains = Layer.mergeAll(
-    ChangesLive,
     FilesLive,
     LocalModelsLive,
     ModelSlotsLive,
     OnboardingPersistenceLive,
     ProjectFilesLive,
   ).pipe(
-    Layer.provideMerge(infrastructure),
+    Layer.provideMerge(observedInfrastructure),
   )
 
   return OnboardingModelSetupLive.pipe(

@@ -5,7 +5,6 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   ModelFileIdSchema,
   ModelPackageIdSchema,
-  ModelServingConfigurationIdSchema,
   ModelAssessmentIdSchema,
   ModelReleaseDateSchema,
   ModelVariantLabelSchema,
@@ -54,7 +53,6 @@ const candidate = (input: {
   const capacityBytes = (input.capacityGiB ?? 64) * GIB
   const packageId = ModelPackageIdSchema.make(`package_${input.id}`)
   const profile = { contextLength: context }
-  const configurationId = ModelServingConfigurationIdSchema.make(`${input.id}:ctx${context}`)
   const comparisonContext = Math.min(50_000, context)
   const performanceContexts = [...new Set([
     ...[25_000, 50_000, 75_000].filter((sample) => sample <= context),
@@ -65,7 +63,6 @@ const candidate = (input: {
       modelId: CatalogModelIdSchema.make(catalogModelId),
       variantId: CatalogVariantIdSchema.make(`gguf:${qualityTrack}`),
       configuration: {
-        id: configurationId,
         bundle: {
           _tag: "Standalone",
           package: {
@@ -123,7 +120,6 @@ const candidate = (input: {
     assessment: {
       _tag: "Fits",
       profile,
-      configurationId,
       assessmentId: ModelAssessmentIdSchema.make(`assessment_${input.id}_${context}`),
       environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
       memory: [{
@@ -325,8 +321,8 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "q6", checkpoint: "same", artifact: "same:q6", score: 50, fidelity: 60, expected: 40, runtimeGiB: 25 }),
       candidate({ id: "q8", checkpoint: "same", artifact: "same:q8", score: 50, fidelity: 80, expected: 33, runtimeGiB: 32 }),
     ])
-    expect(recommendations.map(({ recommendableModelId, intent }) =>
-      [recommendableModelId, intent])).toEqual([
+    expect(recommendations.map(({ modelId, intent }) =>
+      [modelId, intent])).toEqual([
       ["same:gguf:q6", "balanced"],
       ["same:gguf:q8", "smartest"],
     ])
@@ -351,7 +347,7 @@ describe("local model multicriteria recommendation policy", () => {
       candidate({ id: "only", score: 50, expected: 30 }),
     ])
     expect(recommendations.map(({ intent }) => intent)).toEqual(["balanced"])
-    expect(new Set(recommendations.map(({ configurationId }) => configurationId)).size).toBe(1)
+    expect(new Set(recommendations.map(({ modelId }) => modelId)).size).toBe(1)
   })
 
   it("treats dense and MoE candidates only through their estimated vectors", () => {

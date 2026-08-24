@@ -56,9 +56,9 @@ override the weighted result.
 ## Portfolio
 
 Selection is ordered and greedy: Balanced chooses first, followed by Smartest, Fastest, and
-Lightweight. Each intent chooses its highest-utility configuration that has not already been chosen
-by an earlier intent. A configuration appears at most once. An intent is omitted only when no
-unselected candidate remains. Stable configuration identity is the only tie-breaker. Identical
+Lightweight. Each intent chooses its highest-utility canonical model that has not already been chosen
+by an earlier intent. A model appears at most once. An intent is omitted only when no
+unselected candidate remains. Canonical model ID is the only tie-breaker. Identical
 inputs always produce identical results.
 
 ## Conformance

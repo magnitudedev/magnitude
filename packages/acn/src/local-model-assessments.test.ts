@@ -12,7 +12,6 @@ import {
 import {
   AssessmentEnvironmentIdSchema,
   ModelPackageSchema,
-  ModelServingConfigurationIdSchema,
   ServableModelBundleSchema,
   type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
@@ -146,11 +145,10 @@ describe("localModelAssessmentResultFromIcn", () => {
   const environmentId = AssessmentEnvironmentIdSchema.make("environment-test")
   const assessmentBundle = standaloneBundle(100_000)
   const nativeConfiguration = (
-    id: string,
     contextLength: number,
   ): NativeModelServingConfiguration => Schema.validateSync(
     NativeModelServingConfigurationSchema,
-  )({ id, bundle: assessmentBundle, profile: { contextLength } })
+  )({ bundle: assessmentBundle, profile: { contextLength } })
 
   it("preserves a request-local operational failure", () => {
     const failure = {
@@ -173,7 +171,7 @@ describe("localModelAssessmentResultFromIcn", () => {
       requestId: "assessment-0",
       profiles: [{
         _tag: "DoesNotFit",
-        configuration: nativeConfiguration("configuration-0", 50_000),
+        configuration: nativeConfiguration(50_000),
         assessmentId: "assessment-result-0",
         memory: [],
         totalRequiredBytes: 0,
@@ -181,7 +179,7 @@ describe("localModelAssessmentResultFromIcn", () => {
         deficitBytes: 1024,
       }, {
         _tag: "Incompatible",
-        configuration: nativeConfiguration("configuration-1", 100_000),
+        configuration: nativeConfiguration(100_000),
         failure: {
           code: "unsupported_architecture",
           message: "Unsupported architecture",
@@ -196,7 +194,6 @@ describe("localModelAssessmentResultFromIcn", () => {
       assessments: [{
         _tag: "DoesNotFit",
         configuration: {
-          id: "configuration-0",
           bundle: assessmentBundle,
           profile: { contextLength: 50_000 },
         },
@@ -208,7 +205,6 @@ describe("localModelAssessmentResultFromIcn", () => {
       }, {
         _tag: "Incompatible",
         configuration: {
-          id: "configuration-1",
           bundle: assessmentBundle,
           profile: { contextLength: 100_000 },
         },
@@ -225,7 +221,6 @@ describe("localModelAssessmentResultFromIcn", () => {
     const assessment = (contextLength: number): LocalModelAssessment => ({
       _tag: "Incompatible",
       configuration: {
-        id: ModelServingConfigurationIdSchema.make(`configuration-${contextLength}`),
         bundle: assessmentBundle,
         profile: { contextLength },
       },
@@ -244,7 +239,6 @@ describe("localModelAssessmentResultFromIcn", () => {
     const assessment = (contextLength: number): LocalModelAssessment => ({
       _tag: "Incompatible",
       configuration: {
-        id: ModelServingConfigurationIdSchema.make(`configuration-${contextLength}`),
         bundle: assessmentBundle,
         profile: { contextLength },
       },

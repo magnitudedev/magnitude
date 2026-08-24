@@ -65,8 +65,12 @@ no transport attempt occurs.
 Generic HTTP transport receives only the final encoded JSON request. Traces retain that exact
 protocol-specific encoded type and value.
 
-ICN runs the shared native builder, encodes the native request, adds only ICN-owned addressing, and
-then validates the result through the generated ICN request contract. The inference benchmark is a
+ICN runs the shared native builder, encodes the native request with the canonical model ID, and
+then validates the result through the generated ICN request contract. The request contains no
+Instance ID or serving configuration: ICN resolves the Model and automatically acquires residency
+before execution. First-party callers may request Magnitude progress chunks with
+`Magnitude-Include-Progress: true`; the provider adapter consumes those chunks before ordinary
+provider-neutral response decoding. The inference benchmark is a
 direct wire client: it may add benchmark-owned JSON extensions, but validates and canonicalizes the
 complete request through the native request Schema before fetch.
 

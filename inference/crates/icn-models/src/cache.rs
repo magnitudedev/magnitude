@@ -324,13 +324,11 @@ mod tests {
     use icn_contracts::models::{
         MemoryAssessment, ModelAssessmentId, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
         ModelPackageId, ModelPackageProperties, ModelPackageSource, ModelServingConfiguration,
-        ModelServingConfigurationId, PerformanceConfidence, PerformanceEvidence,
-        ServableModelBundle, ServingProfile,
+        PerformanceConfidence, PerformanceEvidence, ServableModelBundle, ServingProfile,
     };
 
-    fn configuration(id: &str, context_length: u32) -> ModelServingConfiguration {
+    fn configuration(_id: &str, context_length: u32) -> ModelServingConfiguration {
         ModelServingConfiguration {
-            id: ModelServingConfigurationId(id.to_owned()),
             bundle: ServableModelBundle::Standalone {
                 package: ModelPackage {
                     id: ModelPackageId("package_test".to_owned()),

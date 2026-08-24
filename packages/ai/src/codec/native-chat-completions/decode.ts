@@ -215,6 +215,7 @@ function processChunk(
         type: Option.getOrNull(error.type),
         code: Option.getOrNull(error.code),
         param: Option.getOrNull(error.param),
+        retryable: Option.getOrNull(error.retryable),
       },
       payload: payloadSample(JSON.stringify({ error })),
       progress,

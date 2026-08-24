@@ -31,8 +31,7 @@ pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ManagedModelStore};
 pub use package_service::{
     canonical_package_id, servable_model_bundle_key, servable_model_bundle_key_for_bundle,
-    serving_configuration_id, serving_configuration_identity_is_valid,
-    speculative_servable_model_bundle_key,
+    serving_configuration_fingerprint, speculative_servable_model_bundle_key,
 };
 pub use planner_stub::{
     PlannerStubComponent, PlannerStubContext, PlannerStubError, compact_planner_stub,

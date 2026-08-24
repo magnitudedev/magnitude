@@ -121,6 +121,21 @@ function requestIdFromFailure(failure: AgentModelAttemptFailure): string | null 
 }
 
 function providerSpecificOutcome(failure: AgentModelAttemptFailure, requestId: string | null): TurnOutcome | null {
+  if (
+    failure._tag === 'StreamProviderError'
+    && failure.call.provider === 'local'
+    && failure.providerError.type === 'model_error'
+  ) {
+    return {
+      _tag: 'ModelNotReady',
+      failure: {
+        code: failure.providerError.code ?? 'model_not_ready',
+        message: failure.providerError.message,
+        retryable: failure.providerError.retryable ?? false,
+      },
+      requestId,
+    }
+  }
   if (failure._tag !== 'StreamStartProviderRejection') return null
 
   switch (failure.rejection._tag) {

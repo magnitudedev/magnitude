@@ -6,7 +6,6 @@ import {
   ReasoningEffortSchema,
   type CatalogModelReconciliationAdmission,
   type LocalModelsState,
-  type ModelServingConfigurationId,
   type ModelSlotsState,
   type ProviderModelId,
   type ReasoningEffort,
@@ -14,7 +13,6 @@ import {
 } from "@magnitudedev/sdk"
 import { OnboardingPersistence } from "../onboarding/persistence"
 import { ModelSlots, sameSlotSelection } from "../model-slots/service"
-import { localModelConfigurationId } from "./projection"
 import { localModelOptions, type LocalModelOption } from "./options"
 import { LocalModels } from "./service"
 import {
@@ -34,7 +32,7 @@ import {
 export * from "./setup-state"
 
 interface PreparedModel {
-  readonly configurationId: ModelServingConfigurationId
+  readonly modelId: ProviderModelId
   readonly reasoningEffort: ReasoningEffort
   readonly option: LocalModelOption
 }
@@ -94,21 +92,20 @@ export const OnboardingModelSetupConfig = Context.GenericTag<OnboardingModelSetu
 )
 
 const resolveChoice = (
-  configurationId: ModelServingConfigurationId,
+  modelId: ProviderModelId,
   models: LocalModelsState,
   slots: ModelSlotsState,
 ): Effect.Effect<ResolvedChoice, OnboardingModelChoiceRejected> => {
-  const option = localModelOptions(models, slots).find((candidate) =>
-    Option.contains(localModelConfigurationId(candidate.model), configurationId))
+  const option = localModelOptions(models, slots).find((candidate) => candidate.model.modelId === modelId)
   if (option === undefined) {
-    return Effect.fail(new OnboardingModelChoiceRejected({ configurationId, reason: "missing" }))
+    return Effect.fail(new OnboardingModelChoiceRejected({ modelId, reason: "missing" }))
   }
   const serving = option.model.servingState
   if (serving._tag !== "Assessed") {
-    return Effect.fail(new OnboardingModelChoiceRejected({ configurationId, reason: "unresolved" }))
+    return Effect.fail(new OnboardingModelChoiceRejected({ modelId, reason: "unresolved" }))
   }
   if (serving.assessment._tag !== "Fits") {
-    return Effect.fail(new OnboardingModelChoiceRejected({ configurationId, reason: "ineligible" }))
+    return Effect.fail(new OnboardingModelChoiceRejected({ modelId, reason: "ineligible" }))
   }
   const primary = slots.slots.primary
   const providerModelId = serving.availabilityState._tag === "Selectable"
@@ -121,7 +118,7 @@ const resolveChoice = (
         serving.capabilities.reasoning.defaultEffort,
         () => ReasoningEffortSchema.make("none"),
       )
-  const prepared = { configurationId, reasoningEffort, option }
+  const prepared = { modelId, reasoningEffort, option }
   const installed = option.model.acquisitionState._tag === "Installed"
       && Option.isSome(providerModelId)
     ? Option.some({ ...prepared, providerModelId: providerModelId.value })
@@ -136,7 +133,6 @@ const resolveChoice = (
       return Option.none()
     }
     return primary.residency._tag === "Ready"
-      && primary.residency.configurationId === configurationId
       ? Option.some({ ...exact, selection })
       : Option.none()
   })
@@ -257,11 +253,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     admission: CatalogModelReconciliationAdmission,
   ) => {
     const project = (current: LocalModelsState): TerminalFact<InstalledModel> => {
-      const model = current.models.find((candidate) =>
-        Option.contains(localModelConfigurationId(candidate), prepared.configurationId))
+      const model = current.models.find((candidate) => candidate.modelId === prepared.modelId)
       if (model === undefined) {
         return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-          configurationId: prepared.configurationId,
+          modelId: prepared.modelId,
           resource: "installation",
         }) }
       }
@@ -280,7 +275,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           return providerModelId === undefined
             ? { _tag: "Waiting" }
             : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-                configurationId: prepared.configurationId,
+                modelId: prepared.modelId,
                 resource: "installation",
               }) }
         }
@@ -296,7 +291,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         || acquisition._tag === "NotInstalled"
         || acquisition.downloadId !== admission.downloadId) {
         return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-          configurationId: prepared.configurationId,
+          modelId: prepared.modelId,
           resource: "installation",
         }) }
       }
@@ -304,7 +299,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       return acquisition._tag === "Failed"
         ? { _tag: "Failed", failure: acquisition.failure }
         : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-            configurationId: prepared.configurationId,
+            modelId: prepared.modelId,
             resource: "installation",
           }) }
     }
@@ -325,13 +320,13 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           ? Effect.fail(new OnboardingModelSelectionCancelled())
           : Effect.succeed(installed)),
       ),
-      onNone: () => localModels.install(resolved.prepared.configurationId).pipe(
+      onNone: () => localModels.install(resolved.prepared.modelId).pipe(
         Effect.flatMap((admission) => {
           const publish = admission._tag === "DownloadAdmitted"
             ? setExecution(invocation, {
                 _tag: "Installing",
                 option: resolved.prepared.option,
-                configurationId: resolved.prepared.configurationId,
+                modelId: resolved.prepared.modelId,
                 cancelling: false,
               })
             : Effect.void
@@ -368,7 +363,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     return setExecution(invocation, {
       _tag: "Configuring",
       option: installed.option,
-      configurationId: installed.configurationId,
+      modelId: installed.modelId,
       cancelling: false,
     }).pipe(
       Effect.zipRight(slots.assign(PRIMARY_SLOT_ID, selection)),
@@ -384,7 +379,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         const slot = state.slots.primary
         if (slot._tag !== "ConfiguredLocal" || !sameSlotSelection(slot.selection, assigned.selection)) {
           return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-            configurationId: assigned.configurationId,
+            modelId: assigned.modelId,
             resource: "instance",
           }) }
         }
@@ -392,16 +387,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           case "Requested":
           case "Loading":
           case "Stopping": return { _tag: "Waiting" }
-          case "Ready":
-            return slot.residency.configurationId === assigned.configurationId
-              ? { _tag: "Ready", value: assigned }
-              : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-                  configurationId: assigned.configurationId,
-                  resource: "instance",
-                }) }
+          case "Ready": return { _tag: "Ready", value: assigned }
           case "Failed": return { _tag: "Failed", failure: slot.residency.failure }
           case "Unloaded": return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-            configurationId: assigned.configurationId,
+            modelId: assigned.modelId,
             resource: "instance",
           }) }
         }
@@ -416,7 +405,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     setExecution(invocation, {
       _tag: "Loading",
       option: assigned.option,
-      configurationId: assigned.configurationId,
+      modelId: assigned.modelId,
       providerModelId: assigned.providerModelId,
       selection: assigned.selection,
       cancelling: false,
@@ -424,7 +413,6 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       Effect.zipRight(Effect.raceFirst(
         slots.load(PRIMARY_SLOT_ID).pipe(Effect.zipRight(awaitReady(assigned))),
         Deferred.await(invocation.cancellation).pipe(
-          Effect.zipRight(slots.stop(PRIMARY_SLOT_ID)),
           Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())),
         ),
       )),
@@ -472,7 +460,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       execution: {
         _tag: "Completing",
         option: selected.option,
-        configurationId: selected.configurationId,
+        modelId: selected.modelId,
         providerModelId: selected.providerModelId,
       },
     })
@@ -516,7 +504,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     registry.set(lifecycle, { ...current, retainedOpen: true })
   }))
 
-  const select = (configurationId: ModelServingConfigurationId) =>
+  const select = (modelId: ProviderModelId) =>
     admissionLock.withPermits(1)(Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
       const current = registry.get(lifecycle)
       if (current._tag !== "Resting") return yield* new OnboardingModelSetupAlreadyActive()
@@ -526,7 +514,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       }
       const models = yield* restore(Registry.getResult(registry, localModels.state))
       const slotResponse = yield* restore(Registry.getResult(registry, slots.state))
-      const resolved = yield* resolveChoice(configurationId, models, slotResponse.state)
+      const resolved = yield* resolveChoice(modelId, models, slotResponse.state)
       const invocation: SelectionInvocation = {
         cancellation: yield* Deferred.make<void>(),
         done: yield* Deferred.make<void, OnboardingModelSetupFailure>(),
@@ -537,7 +525,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         execution: {
           _tag: "Preparing",
           option: resolved.prepared.option,
-          configurationId,
+          modelId,
           cancelling: false,
         },
       })

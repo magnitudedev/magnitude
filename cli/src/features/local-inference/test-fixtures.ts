@@ -6,7 +6,6 @@ import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelPackageIdSchema,
-  ModelServingConfigurationIdSchema,
   ModelInstanceIdSchema,
   ModelAssessmentIdSchema,
   ModelSlotConfiguredLocal,
@@ -36,7 +35,6 @@ export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
 export const TEST_MODEL_ID = ProviderModelIdSchema.make("configuration_test")
 export const TEST_PACKAGE_ID = ModelPackageIdSchema.make("package_test")
-export const TEST_CONFIGURATION_ID = ModelServingConfigurationIdSchema.make("configuration_test")
 export const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
 export const TEST_REASONING_EFFORT = ReasoningEffortSchema.make("none")
 
@@ -132,6 +130,7 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
     }))
   if (firstInstalledPackage === undefined) throw new Error("Test model bundle must contain a package")
   return {
+    modelId: overrides.modelId ?? TEST_MODEL_ID,
     bundle,
     presentation: {
       displayName: "Qwen Test",
@@ -151,7 +150,6 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
       _tag: "Assessed",
       capabilities,
       configuration: {
-        id: TEST_CONFIGURATION_ID,
         bundle,
         profile: { contextLength },
       },
@@ -182,12 +180,13 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
 
 export const makeCatalogOnlyModel = (
   overrides: Partial<LocalModel> = {},
-  configurationId = TEST_CONFIGURATION_ID,
+  modelId = TEST_MODEL_ID,
 ): LocalModel => {
   const model = makeModel()
   if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
   return {
     ...model,
+    modelId,
     catalogMembershipState: {
       _tag: "InCatalog",
       catalogData: {
@@ -206,7 +205,6 @@ export const makeCatalogOnlyModel = (
     upgradeState: { _tag: "NotApplicable" },
     servingState: {
       ...model.servingState,
-      configuration: { ...model.servingState.configuration, id: configurationId },
       availabilityState: { _tag: "Installable" },
     },
     presentation: { ...model.presentation, license: Option.some("Apache-2.0") },
@@ -246,19 +244,19 @@ export const withDoesNotFitAssessment = (model: LocalModel): LocalModel => {
 }
 
 export const makeConfiguredModel = (
-  configurationId: ReturnType<typeof ModelServingConfigurationIdSchema.make>,
+  modelId: ReturnType<typeof ProviderModelIdSchema.make>,
   overrides: Partial<LocalModel> = {},
 ): LocalModel => {
   const model = makeModel()
   if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
   return {
     ...model,
+    modelId,
     servingState: {
       ...model.servingState,
-      configuration: { ...model.servingState.configuration, id: configurationId },
       availabilityState: {
         _tag: "Selectable",
-        providerModelId: ProviderModelIdSchema.make(configurationId),
+        providerModelId: modelId,
       },
     },
     ...overrides,
@@ -365,7 +363,6 @@ export const makeView = (options: {
               residency: {
                 _tag: "Ready",
                 instanceId: ModelInstanceIdSchema.make("test-instance"),
-                configurationId: TEST_CONFIGURATION_ID,
                 allocation: options.allocation ?? {
                   contextWindowTokens: 32_768,
                   parallelSequences: 1,

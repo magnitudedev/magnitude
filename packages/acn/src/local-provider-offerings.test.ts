@@ -4,7 +4,6 @@ import {
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
   ModelPackageIdSchema,
-  ModelServingConfigurationIdSchema,
   ModelReleaseDateSchema,
   ModelVariantLabelSchema,
   type LocalProviderOffering,
@@ -13,7 +12,7 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { LocalModelPackages } from "./local-model-packages"
-import { LocalModelConfigurationResolver, localModelTargetIdentity } from "./local-model-configuration-resolver"
+import { LocalModelConfigurationResolver } from "./local-model-configuration-resolver"
 import {
   LocalProviderOfferings,
   LocalProviderOfferingsLive,
@@ -22,12 +21,11 @@ import {
 } from "./local-provider-offerings"
 
 describe("local provider offering projection", () => {
-  it("tracks package facts without changing exact configuration identity", () => {
+  it("tracks package facts under the canonical model identity", () => {
     const packageId = ModelPackageIdSchema.make("package-a")
     const offering = {
-      providerModelId: ProviderModelIdSchema.make("configuration-a"),
+      providerModelId: ProviderModelIdSchema.make("catalog-a:gguf:q4"),
       configuration: {
-        id: ModelServingConfigurationIdSchema.make("configuration-a"),
         bundle: { _tag: "Standalone", package: { id: packageId } },
         profile: { contextLength: 32_768 },
       },
@@ -43,8 +41,7 @@ describe("local provider offering projection", () => {
       new Map([[packageId, entry]]),
     )
     expect(evidence[0]).toMatchObject({
-      providerModelId: "configuration-a",
-      configurationId: "configuration-a",
+      providerModelId: "catalog-a:gguf:q4",
       packages: [{ packageId: "package-a", installed: true, inspection: "Pending" }],
     })
     expect(sameProviderOfferingPackageEvidence(evidence, evidence)).toBe(true)
@@ -52,7 +49,6 @@ describe("local provider offering projection", () => {
 
   it("uses the capabilities selected by the configuration resolver", async () => {
     const packageId = ModelPackageIdSchema.make("package-a")
-    const configurationId = ModelServingConfigurationIdSchema.make("configuration-a")
     const modelPackage = {
       id: packageId,
       source: { _tag: "Local" as const, path: "/models/a.gguf" },
@@ -69,7 +65,6 @@ describe("local provider offering projection", () => {
       },
     }
     const configuration = {
-      id: configurationId,
       bundle: { _tag: "Standalone" as const, package: modelPackage },
       profile: { contextLength: 32_768 },
     }
@@ -126,7 +121,7 @@ describe("local provider offering projection", () => {
     const dependencies = Layer.mergeAll(
       Layer.succeed(LocalModelConfigurationResolver, LocalModelConfigurationResolver.of({
         get: Effect.succeed(new Map([[
-          localModelTargetIdentity(configuration.bundle),
+          ProviderModelIdSchema.make("catalog-a:gguf:q4") as never,
           {
             servingConfiguration: configuration,
             assessment: { _tag: "Assessing" },
@@ -136,12 +131,6 @@ describe("local provider offering projection", () => {
         ]])),
         changes: Stream.never,
         settled: Effect.succeed(true),
-        resolve: () => Effect.succeed(Option.some({
-          servingConfiguration: configuration,
-          assessment: { _tag: "Assessing" },
-          catalogModel: Option.some(catalogModel),
-          targetInspection: { _tag: "Inspected", capabilities: inspectedCapabilities },
-        })),
       })),
       Layer.succeed(LocalModelPackages, LocalModelPackages.of({
         initialized: Effect.succeed(true),
@@ -151,16 +140,15 @@ describe("local provider offering projection", () => {
         }),
         changes: Stream.never,
         installedPackageIds: Effect.succeed(new Set([packageId])),
-        admitBundle: () => Effect.dieMessage("unused"),
-        cancelDownload: () => Effect.dieMessage("unused"),
-        acknowledgeFailure: () => Effect.dieMessage("unused"),
-        removeBundlePackages: () => Effect.dieMessage("unused"),
       })),
     )
 
-    const offerings = await Effect.runPromise(Effect.gen(function* () {
+    const { offerings, catalog } = await Effect.runPromise(Effect.gen(function* () {
       const service = yield* LocalProviderOfferings
-      return yield* service.list
+      return {
+        offerings: yield* service.list,
+        catalog: yield* service.catalog,
+      }
     }).pipe(
       Effect.provide(LocalProviderOfferingsLive.pipe(Layer.provide(dependencies))),
       Effect.scoped,
@@ -168,12 +156,12 @@ describe("local provider offering projection", () => {
 
     expect(offerings).toHaveLength(1)
     expect(offerings[0]?.capabilities).toEqual(inspectedCapabilities)
+    expect(catalog.map((entry) => entry.providerModelId)).toEqual(["catalog-a:gguf:q4"])
   })
 
   it("does not delay layer readiness while the initial assessment is stalled", async () => {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const packageId = ModelPackageIdSchema.make("package-a")
-      const configurationId = ModelServingConfigurationIdSchema.make("configuration-a")
       const modelPackage = {
         id: packageId,
         source: { _tag: "Local" as const, path: "/models/a.gguf" },
@@ -190,7 +178,6 @@ describe("local provider offering projection", () => {
         },
       }
       const configuration = {
-        id: configurationId,
         bundle: { _tag: "Standalone" as const, package: modelPackage },
         profile: { contextLength: 32_768 },
       }
@@ -212,7 +199,7 @@ describe("local provider offering projection", () => {
       const dependencies = Layer.mergeAll(
         Layer.succeed(LocalModelConfigurationResolver, LocalModelConfigurationResolver.of({
           get: Effect.succeed(new Map([[
-            localModelTargetIdentity(configuration.bundle),
+            ProviderModelIdSchema.make("catalog-a:gguf:q4") as never,
             {
               servingConfiguration: configuration,
               assessment: { _tag: "Assessing" },
@@ -222,12 +209,6 @@ describe("local provider offering projection", () => {
           ]])),
           changes: Stream.never,
           settled: Effect.succeed(true),
-          resolve: () => Effect.succeed(Option.some({
-            servingConfiguration: configuration,
-            assessment: { _tag: "Assessing" },
-            catalogModel: Option.none(),
-            targetInspection: { _tag: "Inspected", capabilities },
-          })),
         })),
         Layer.succeed(LocalModelPackages, LocalModelPackages.of({
           initialized: Effect.succeed(true),
@@ -237,10 +218,6 @@ describe("local provider offering projection", () => {
           }),
           changes: Stream.never,
           installedPackageIds: Effect.succeed(new Set([packageId])),
-          admitBundle: () => Effect.dieMessage("unused"),
-          cancelDownload: () => Effect.dieMessage("unused"),
-          acknowledgeFailure: () => Effect.dieMessage("unused"),
-          removeBundlePackages: () => Effect.dieMessage("unused"),
         })),
       )
       yield* Layer.build(LocalProviderOfferingsLive.pipe(Layer.provide(dependencies)))

@@ -7,7 +7,6 @@ import { Connection } from "./connection"
 import { Display } from "./display"
 import { Files } from "./files"
 import { Git } from "./git"
-import { LocalInference } from "./local-inference"
 import { Onboarding } from "./onboarding"
 import { ProjectFiles } from "./project-files"
 import { Projects } from "./projects"
@@ -28,7 +27,6 @@ export const AcnBoundary = Group.make({
   Skills,
   Shell,
   Display,
-  LocalInference,
   Onboarding,
   ClientLease,
   Changes,

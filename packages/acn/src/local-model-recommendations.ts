@@ -12,20 +12,23 @@ import { createHash } from "node:crypto"
 import {
   LocalModelMutationFailed,
   ModelFailureSchema,
+  ModelServingConfigurationSchema,
   LocalModelRecommendationProgressStepSchema,
   servableModelBundlePackages,
+  servableModelBundleTargetPackageId,
   type LocalModelRecommendationProgressStep,
   type LocalModelRecommendationProgressStepId,
   type ServableModelBundle,
   type ModelFailure,
+  type ModelRecommendationsState,
   type ModelServingConfiguration,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalog, IcnHardware } from "@magnitudedev/icn"
+import { IcnHardware, IcnModels } from "@magnitudedev/icn"
 import { makeObservedState } from "./mirrored-state"
 import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
-import { recommendableModelFromIcn } from "./local-model-icn-adapter"
+import { catalogModelDefinitionFromIcn } from "./local-model-icn-adapter"
 import {
   assembleRecommendationCatalogCandidates,
   selectRecommendationPortfolio,
@@ -78,6 +81,10 @@ export interface LocalModelRecommendationsApi {
   readonly changes: Stream.Stream<{
     readonly revision: number
     readonly state: RecommendationState
+  }>
+  readonly publicSnapshot: Effect.Effect<{
+    readonly revision: number
+    readonly state: ModelRecommendationsState
   }>
 }
 
@@ -139,12 +146,12 @@ const updateProgress = (
 export const makeLocalModelRecommendationsLive = (): Layer.Layer<
   LocalModelRecommendations,
   never,
-  IcnCatalog | IcnHardware | LocalModelAssessor | LocalModelPackages
+  IcnModels | IcnHardware | LocalModelAssessor | LocalModelPackages
 > =>
   Layer.scoped(
     LocalModelRecommendations,
     Effect.gen(function* () {
-      const catalog = yield* IcnCatalog
+      const models = yield* IcnModels
       const hardware = yield* IcnHardware
       const assessments = yield* LocalModelAssessor
       const packages = yield* LocalModelPackages
@@ -165,10 +172,9 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
         right: readonly RecommendationSelection[],
       ): boolean => left.length === right.length && left.every((entry, index) => {
         const other = right[index]
-        return other !== undefined
+          return other !== undefined
           && entry.id === other.id
-          && entry.configurationId === other.configurationId
-          && entry.recommendableModelId === other.recommendableModelId
+          && entry.modelId === other.modelId
           && entry.displayName === other.displayName
           && entry.intent === other.intent
           && entry.explanation === other.explanation
@@ -306,11 +312,11 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               }
             )
 
-            if (!(yield* catalog.ready)) return
-            const catalogState = (yield* catalog.get).state
+            if (!(yield* models.initialized)) return
+            const modelsState = (yield* models.get).state
             const catalogModels = yield* Effect.forEach(
-              catalogState.models,
-              recommendableModelFromIcn
+              modelsState.models,
+              catalogModelDefinitionFromIcn
             )
             const assessmentConfigurations = catalogModels
             const inputState = yield* Schema.encode(
@@ -410,15 +416,19 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             })
             yield* publishProgress(progress)
             const coordinated = yield* assessments.state
+            const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
+            const assessmentFor = (configuration: ModelServingConfiguration) =>
+              coordinated.find((entry) =>
+                sameConfiguration(entry.configuration, configuration))?.assessment
             const failedAssessment = assessableConfigurations.flatMap(({ configuration }) => {
-              const assessment = coordinated.get(configuration.id)?.assessment
+              const assessment = assessmentFor(configuration)
               return assessment?._tag === "Failed" ? [assessment.failure] : []
             })[0]
             if (failedAssessment !== undefined) {
               return yield* new LocalModelMutationFailed(failedAssessment)
             }
             const completed = assessableConfigurations.filter(({ configuration }) => {
-              const assessment = coordinated.get(configuration.id)?.assessment
+              const assessment = assessmentFor(configuration)
               return assessment !== undefined
                 && assessment._tag !== "Assessing"
             })
@@ -429,10 +439,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             })
             yield* publishProgress(progress)
             if (completed.length !== assessableConfigurations.length) return
-            const results = new Map(assessableConfigurations.flatMap(({ configuration }) => {
-              const assessment = coordinated.get(configuration.id)?.assessment
-              return assessment === undefined ? [] : [[configuration.id, assessment] as const]
-            }))
             progress = yield* completeStep(
               progress,
               "assessment",
@@ -442,14 +448,14 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             )
             const evaluated = catalogModels.flatMap(
               (model): readonly RecommendationCandidate[] => {
-                const result = results.get(model.configuration.id)
+                const result = assessmentFor(model.configuration)
                 if (result?._tag !== "Fits") return []
                 const profile = result.assessment.profile
                 return [{
                         model,
                         profile,
                         assessment: result.assessment,
-                        artifactId: model.configuration.id,
+                        artifactId: servableModelBundleTargetPackageId(model.configuration.bundle),
                         catalogModelId: model.modelId,
                         capabilityScore: model.qualityScore,
                         fidelityRank: model.fidelityRank,
@@ -559,7 +565,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
 
       yield* generate.pipe(Effect.forkScoped)
       yield* Stream.mergeAll([
-        catalog.changes.pipe(Stream.map(() => undefined)),
+        models.changes.pipe(Stream.map(() => undefined)),
         hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
         packages.changes.pipe(Stream.map(() => undefined)),
         assessments.changes.pipe(Stream.map(() => undefined)),
@@ -571,6 +577,22 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       return LocalModelRecommendations.of({
         snapshot: mirror.get,
         changes: mirror.changes,
+        publicSnapshot: mirror.get.pipe(Effect.map(({ revision, state }) => {
+          if (state._tag !== "Ready") return { revision, state }
+          return {
+            revision,
+            state: {
+              _tag: "Ready" as const,
+              progress: state.progress,
+              recommendations: state.recommendations.map((recommendation) => ({
+                  modelId: recommendation.modelId,
+                  id: recommendation.id,
+                  intent: recommendation.intent,
+                  explanation: recommendation.explanation,
+                })),
+            },
+          }
+        })),
       })
     })
   )

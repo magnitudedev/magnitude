@@ -10,10 +10,11 @@ import {
 } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
 import type {
-  ModelInstancesInvalidation,
+  InferenceResourceInvalidation,
   ModelInstancesSnapshot,
 } from "@magnitudedev/icn-protocol/schemas"
 import { IcnInstances, makeIcnInstances } from "./index.js"
+import { makeIcnEvents } from "../events/index.js"
 
 class TestFailure extends Data.TaggedError("TestFailure")<{
   readonly message: string
@@ -23,7 +24,7 @@ const instances = (revision: number): ModelInstancesSnapshot => ({
   revision,
   instances: [{
     id: "instance-test",
-    configurationId: "configuration-test",
+    modelId: "model-test",
     lifecycle: {
       _tag: "Ready",
       allocation: {
@@ -36,7 +37,7 @@ const instances = (revision: number): ModelInstancesSnapshot => ({
   }],
 })
 
-const response = (events: Stream.Stream<ModelInstancesInvalidation, TestFailure>) => ({
+const response = (events: Stream.Stream<InferenceResourceInvalidation, TestFailure>) => ({
   status: 200,
   headers: {},
   events,
@@ -45,19 +46,21 @@ const response = (events: Stream.Stream<ModelInstancesInvalidation, TestFailure>
 describe("ICN model-instance observation", () => {
   it("retries a failed snapshot refresh without abandoning the invalidation", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const invalidations = yield* PubSub.unbounded<ModelInstancesInvalidation>()
+      const invalidations = yield* PubSub.unbounded<InferenceResourceInvalidation>()
       const reads = yield* Ref.make(0)
       const watching = yield* Deferred.make<void>()
       const refreshed = yield* Deferred.make<void>()
       const client = {
-        models: {
-          watchModelInstances: () =>
+        system: {
+          watchInferenceEvents: () =>
             Effect.succeed(response(
               Stream.fromEffect(Deferred.succeed(watching, undefined)).pipe(
                 Stream.drain,
                 Stream.concat(Stream.fromPubSub(invalidations)),
               ),
             )),
+        },
+        models: {
           getModelInstances: () => Ref.getAndUpdate(reads, (count) => count + 1).pipe(
             Effect.flatMap((call) => {
               if (call === 0) return Effect.succeed(instances(0))
@@ -77,13 +80,18 @@ describe("ICN model-instance observation", () => {
       const snapshot = yield* Effect.gen(function* () {
         const observed = yield* IcnInstances
         yield* Deferred.await(watching)
-        yield* PubSub.publish(invalidations, { revision: 1 })
+        yield* PubSub.publish(invalidations, { topic: "instances" as const, revision: 1 })
         yield* Deferred.await(refreshed)
         return yield* observed.get
       }).pipe(
-        Effect.provide(makeIcnInstances({ retryInterval: "1 millis" }).pipe(
-          Layer.provide(Layer.succeed(IcnClient, client)),
-        )),
+        Effect.provide((() => {
+          const clientLayer = Layer.succeed(IcnClient, client)
+          const withEvents = Layer.provideMerge(
+            makeIcnEvents({ retryInterval: "1 millis" }),
+            clientLayer,
+          )
+          return Layer.provide(makeIcnInstances({ retryInterval: "1 millis" }), withEvents)
+        })()),
       )
 
       expect(snapshot).toEqual(instances(1))
@@ -97,8 +105,8 @@ describe("ICN model-instance observation", () => {
       const reads = yield* Ref.make(0)
       const refreshed = yield* Deferred.make<void>()
       const client = {
-        models: {
-          watchModelInstances: () => Ref.getAndUpdate(watchCalls, (count) => count + 1).pipe(
+        system: {
+          watchInferenceEvents: () => Ref.getAndUpdate(watchCalls, (count) => count + 1).pipe(
             Effect.flatMap((call) => {
               if (call === 1) {
                 return Effect.fail(new TestFailure({
@@ -112,6 +120,8 @@ describe("ICN model-instance observation", () => {
               ))
             }),
           ),
+        },
+        models: {
           getModelInstances: () => Ref.getAndUpdate(reads, (count) => count + 1).pipe(
             Effect.flatMap((call) => call === 0
               ? Effect.succeed(instances(0))
@@ -127,9 +137,14 @@ describe("ICN model-instance observation", () => {
         yield* Deferred.await(refreshed)
         return yield* observed.get
       }).pipe(
-        Effect.provide(makeIcnInstances({ retryInterval: "1 millis" }).pipe(
-          Layer.provide(Layer.succeed(IcnClient, client)),
-        )),
+        Effect.provide((() => {
+          const clientLayer = Layer.succeed(IcnClient, client)
+          const withEvents = Layer.provideMerge(
+            makeIcnEvents({ retryInterval: "1 millis" }),
+            clientLayer,
+          )
+          return Layer.provide(makeIcnInstances({ retryInterval: "1 millis" }), withEvents)
+        })()),
       )
 
       expect(snapshot).toEqual(instances(1))

@@ -1,16 +1,19 @@
 /**
- * The connection's Effect Query client for the ACN boundary.
+ * The connection's Effect Query client for the composed Magnitude boundary.
  *
- * The client is made for `AcnBoundary`: every domain group's operations are
- * materialized at their names (`client.Sessions.GetSession(input)`,
- * `client.Agent.SendMessage`, `client.Changes.StreamChanges({})`). RPC-backed
- * implementations are derived once per connection; domain services and the
- * change drain are installed as Layers in the same runtime.
+ * ACN application operations use RPC while inference operations use the stable
+ * HTTP proxy. Every domain group's operations are materialized at its name;
+ * both transports share one runtime, QueryClient, registry, and change drains.
  */
 import type { RpcClient } from "@effect/rpc"
 import { Layer } from "effect"
+import { FetchHttpClient } from "@effect/platform"
 import { Client } from "@magnitudedev/effect-query"
-import { AcnBoundary, AcnRpc } from "@magnitudedev/sdk"
+import {
+  MagnitudeBoundary,
+  type MagnitudeImplementationError,
+  magnitudeImplementationsLayer,
+} from "@magnitudedev/sdk"
 import {
   clientServicesLayer,
   type ClientServices,
@@ -19,18 +22,30 @@ import {
 
 const acnImplementationsLayer = (
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
-) => AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer))
+) => magnitudeImplementationsLayer(protocolLayer).pipe(
+  Layer.provide(FetchHttpClient.layer),
+)
 
 export type AcnClientRequirements = Layer.Layer.Success<ReturnType<typeof acnImplementationsLayer>>
 
-export type AgentClient = Client.GroupClient<typeof AcnBoundary, AcnClientRequirements | ClientServices, never>
+export type AgentClient = Client.GroupClient<
+  typeof MagnitudeBoundary,
+  AcnClientRequirements | ClientServices,
+  MagnitudeImplementationError
+>
 
 export function createAgentClient(
   protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>,
   options: ClientServicesOptions = {},
 ): AgentClient {
-  return Client.make<typeof AcnBoundary, AcnClientRequirements, never, ClientServices, never>(
-    AcnBoundary,
+  return Client.make<
+    typeof MagnitudeBoundary,
+    AcnClientRequirements,
+    MagnitudeImplementationError,
+    ClientServices,
+    never
+  >(
+    MagnitudeBoundary,
     acnImplementationsLayer(protocolLayer),
     (client) => clientServicesLayer(client, options),
   )

@@ -11,7 +11,6 @@ import {
   type AcnTarget,
   type ClientId,
   type ClientLeaseMutationResult,
-  type ModelSlotsState,
 } from "@magnitudedev/acn-protocol"
 import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
 import {
@@ -58,7 +57,6 @@ const CLIENT_LEASE_RENEWAL_INTERVAL = Duration.seconds(15)
 const CLIENT_LEASE_ESTABLISH_TIMEOUT = Duration.seconds(5)
 const CLIENT_LEASE_ESTABLISH_RETRY_DELAY = Duration.millis(250)
 const CLIENT_LEASE_RELEASE_TIMEOUT = Duration.seconds(2)
-const CLIENT_CLOSE_OBSERVATION_TIMEOUT = Duration.seconds(2)
 
 type ReleaseClientLeaseThrough = (client: ClientLeaseRpcClient) => Effect.Effect<
   ClientLeaseMutationResult,
@@ -129,7 +127,6 @@ export interface AcnStartup {
 }
 
 export interface AcnClientCloseReport {
-  readonly modelSlots: ModelSlotsState
   readonly connectedClientCount: number
 }
 export type AcnClientCloseResult = Option.Option<AcnClientCloseReport>
@@ -377,18 +374,8 @@ export const makeAcnJitRuntime = (): Effect.Effect<
         }
         const result = yield* Effect.scoped(Effect.gen(function* () {
           const closeClient = yield* makeAcnRpcClient()
-          const modelSlots = yield* closeClient.GetModelSlots({}).pipe(
-            Effect.map((result) => result.state),
-            Effect.timeout(CLIENT_CLOSE_OBSERVATION_TIMEOUT),
-            resultOption,
-          )
           const release = yield* resultOption(owner.releaseThrough(closeClient))
-          return Option.all({ modelSlots, release }).pipe(
-            Option.map(({ modelSlots, release }) => ({
-              modelSlots,
-              connectedClientCount: release.connectedClientCount,
-            })),
-          )
+          return Option.map(release, ({ connectedClientCount }) => ({ connectedClientCount }))
         }).pipe(
           Effect.provide(jitRecoveringProtocolLayer({
             endpoint: Effect.succeed(selected.value),

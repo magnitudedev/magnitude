@@ -21,20 +21,13 @@ data contracts crossing those boundaries.
 ## Layer model
 
 ```text
-operating systems, drivers, and native runtimes
-                         |
-                         v
-              ICN inference truth
-                         |
-                         v
-              ACN application truth
-                         |
-                         v
-          SDK and client-common transport
-                         |
-                         v
-                 client presentation
+clients -> one Effect Query runtime -> ACN application RPC
+                                  \-> ACN /inference proxy -> ICN inference API
 ```
+
+Application RPC uses the current owner-record endpoint. The inference proxy is exposed on ACN's
+stable public listener at `127.0.0.1:10100`; these are two listeners of one admitted ACN process,
+not two services or authorities.
 
 Each boundary is an abstraction boundary. A lower layer exposes the smallest stable semantic
 contract its caller actually needs; it does not expose implementation-specific inputs merely
@@ -44,14 +37,9 @@ Each semantic decision has one owner. A higher layer may project an owned result
 contract, but it must not independently recreate the decision or redefine the lower-layer domain
 shape.
 
-For model presentation, ICN publishes reviewed variant facts with each recommendable configuration.
-ACN owns the unified local presentation projection and carries one variant label independently from
-the base display name. Catalog products use the reviewed catalog label; standalone products use
-the inspected target-package quantization as their fallback label. Exact artifact format and
-inspection evidence do not become parallel product-presentation fields. The ACN protocol exports
-the canonical `Name (Variant)` composition so agent attribution and clients cannot diverge;
-client-common exposes it to clients. Individual clients own width-aware layout and truncation. No
-boundary parses a display string or infers a label from fidelity rank.
+ICN publishes model, package, download, instance, and hardware resources. ACN publishes only
+Magnitude application resources. The shared client may compose these independently owned resources
+for presentation, but it does not copy that composition into a second writable authority.
 
 ## ICN
 
@@ -123,12 +111,20 @@ ACN owns Magnitude application semantics:
 - application interpretations of ICN facts;
 - correlations across inference, configuration, storage, and session state;
 - durable user intent and application operation lifecycles;
-- disposable product projections consumed by clients; and
+- Magnitude-specific provider and recommendation projections; and
 - the complete client-facing application contract.
 
-When a client needs a conclusion that combines multiple backend facts, ACN performs the join once
-and publishes the result. Clients do not independently join raw hardware, assessment, and instance
-mirrors to reconstruct application state.
+ACN does not proxy individual inference DTOs through RPC. It owns one transparent streaming prefix
+proxy and injects the private ICN authorization. The public OpenAPI document is ICN's document with
+the proxy base path.
+
+ACN's Magnitude-specific projections observe their private ICN through one shared multiplexed
+resource-event connection. Each projection subscribes before reading its authoritative snapshot;
+on invalidation or reconnect it rereads that snapshot. Hardware consumers additionally poll because
+memory used by unrelated operating-system processes has no ICN mutation event. Individual ACN
+projections must not open separate ICN event streams or invent other per-resource polling loops.
+The event endpoint emits one current invalidation per selected topic when a connection opens, so
+first-party query drains also converge if their initial read races stream establishment.
 
 ACN may define advisory policy, such as how much system headroom Magnitude recommends leaving for
 other applications. Such policy may produce warnings, ranking inputs, or explanations, but it
@@ -139,34 +135,23 @@ ACN does not:
 - duplicate native planning or inference safety calculations;
 - treat a copied ICN observation as authority over an ICN resource;
 - ask ICN to evaluate a Magnitude-specific warning or screen state; or
-- expose raw ICN wire types directly to clients.
+- reinterpret ICN resource types as ACN application resources.
 
-### Application projections
-
-Derived product state belongs to ACN when it combines backend facts or applies Magnitude policy.
-It is represented as an ACN protocol schema and, when reactive, as a mirrored state with one
-semantic lifecycle.
-
-Stable and volatile evidence may share one atomic product row when clients need their relationship.
-Their semantic substructures still retain independent invalidation rules: changes in live hardware
-pressure update current headroom without changing stable model assessment or recommendation
-identity. A separate mirror is justified only for a separately consumable domain authority, not
-merely because one nested value changes more frequently.
-
-Derived application state is advisory unless its owning operation is also the authoritative
-mutation owner. Advisory state never becomes an authorization token for a later mutation.
+Slots retain durable selection only. Recommendations remain ACN application policy keyed by the
+same canonical model ID. ACN never mirrors Instance residency into Slots. Its read-only Local
+Models projection is permitted because it gives native facts Magnitude-specific assessment,
+provider, recommendation, and warning semantics; it owns no inference transition and is not a
+copy of the native Models contract.
 
 ## Protocol and SDK boundaries
 
 The ICN contract contains normalized inference-domain schemas and operations. Platform-specific
 mechanics remain beneath it.
 
-The ACN protocol contains complete Magnitude application schemas and operations. It may project
-ICN facts into application shapes, but private ICN types and application-irrelevant native details
-do not leak through it.
-
-The SDK provides typed transport, daemon lifecycle, and access to the ACN protocol. It does not
-own product policy or create a parallel domain model.
+The ACN protocol contains Magnitude application schemas and RPC operations. ICN Rust routes and
+schemas generate the canonical inference OpenAPI contract. The SDK derives one low-level
+TypeScript inference client from that generated contract and authors an Effect Query group over it.
+Adding an inference operation requires no ACN RPC handler or proxy generation.
 
 At each real serialized boundary, a concept has one canonical shape. A projection into a new
 domain is justified only when the receiving layer gives the data different semantics. Copying a
@@ -180,29 +165,27 @@ does not introduce a second domain contract.
 
 Client-common owns shared client infrastructure:
 
-- the connection's Effect Query client over the ACN contract (queries, mutations, subscriptions);
+- one connection-scoped Effect Query client combining ACN RPC and inference HTTP operations;
 - reactive query, mutation, invalidation, and subscription behavior;
 - reusable hooks and identity-safe selectors;
 - shared interaction infrastructure; and
 - reusable presentation primitives that are genuinely common across clients and contain no
   backend policy, such as memory, storage, and transfer byte-unit formatting.
 
-Client-common imports application contracts through the SDK. It does not redefine ACN or ICN
-domain unions, calculate backend policy, or become a second application backend in the client
-process.
+Client-common imports both contracts through the SDK. It consumes ACN Local Models for product
+semantics, ACN Slots for durable selection, and native Models and Instances for authoritative
+installation and residency operations. Its final rendered view is a pure reactive join with no
+writable copy and no inference admission decision.
 
-Every client↔ACN interaction is a contract query, mutation, or subscription (defined in the ACN
-protocol through the Effect Query RPC adapter) materialized by the connection's Effect Query client
-that client-common creates. ACN change pokes are notification only; the connection drains them into
-`QueryClient` and the Query rereads the ACN snapshot. Effect Query mutation states describe exact
-client command invocations and do not duplicate ACN installation or ICN download lifecycle state.
-There is no second client cache, request mechanism, or invalidation channel.
+ACN change pokes invalidate ACN Queries. ICN's multiplexed resource event stream invalidates native
+Queries. Both are notification only; Query state is refreshed from its owning authority. Effect
+Query mutation states describe exact invocations and never duplicate Download or Instance state.
 
 Client-common must not:
 
 - define parallel memory-assessment, fit, guidance, or loadability shapes;
 - calculate assessment, admission, reserve, recommendation, or warning policy;
-- join independent backend mirrors to manufacture a new product fact;
+- join independent facts to recreate backend policy or authority;
 - parse diagnostic prose into structured state; or
 - retain copied backend facts as an independent authority.
 
@@ -279,12 +262,10 @@ ICN assessment and abort reserves
 ICN Fits / DoesNotFit and actual load rejection
         |
         v
-ACN recommended-headroom policy
-ACN high-use and current-shortfall guidance
-ACN atomic LocalModel projection
+ACN Local Models product projection
         |
         v
-client-common mirrored-state access
+client-common joins Slots and native Instance state
         |
         v
 CLI wording and layout
@@ -302,7 +283,7 @@ not the platform mechanism that happened to bind it.
 - An ICN operation named after onboarding, a menu, or a Magnitude warning.
 - An ACN request asking ICN whether Magnitude should display a warning.
 - A client-common union parallel to an ACN protocol union.
-- A client joining assessment, hardware, and instance state to reconstruct product guidance.
+- A client joining assessment, hardware, and instance state to recreate admission policy.
 - A client parsing error prose to recover required bytes, reserve, or shortfall.
 - The same policy formula implemented in ICN, ACN, and a client under one meaning.
 - Platform-specific fields crossing ICN when callers need only a normalized semantic result.
@@ -317,9 +298,9 @@ not the platform mechanism that happened to bind it.
   all callers as domain facts.
 - ICN contracts contain no Magnitude recommendation, warning, or presentation policy.
 - ACN application policy cannot alter ICN truth except through an explicit ICN mutation.
-- ACN publishes client-ready domain state for conclusions that require backend joins.
+- Each authority publishes complete owned resources; client-common may join identities for display.
 - Client-common contains no duplicated backend domain schemas or policy calculations.
-- Clients can render complete states without parsing diagnostic prose or joining raw backend facts.
+- Clients can render complete states without parsing diagnostic prose or recreating backend policy.
 - Advisory observations are identified as advisory, and authoritative operations revalidate.
 - Derived state changes only when its semantic inputs change and retains the identities needed to
   reject stale joins.

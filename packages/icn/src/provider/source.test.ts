@@ -13,7 +13,6 @@ import { IcnClient } from "../client.js"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
 import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { IcnProvider, IcnProviderModelResolver, makeIcnProvider } from "./source.js"
-import { CurrentModelInstance } from "./contract.js"
 
 const TEST_BASE_URL = "http://icn.test"
 
@@ -106,10 +105,6 @@ describe("ICN local provider", () => {
     })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
-        instanceId: "instance-test",
-        configurationId: "configuration-test",
-      }))
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId)
       yield* bound.stream(Prompt.from({
@@ -152,10 +147,6 @@ describe("ICN local provider", () => {
     })
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
-        instanceId: "instance-test",
-        configurationId: "configuration-test",
-      }))
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId)
       yield* bound.stream(PromptBuilder.empty().user("hello").build(), [tool])
@@ -176,8 +167,8 @@ describe("ICN local provider", () => {
       model: modelId,
     }
     const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
-      { ...chunk, choices: [], progress: { _tag: "Queued" } },
-      { ...chunk, choices: [], progress: { _tag: "Generating" } },
+      { ...chunk, choices: [], progress: { phase: "queued" } },
+      { ...chunk, choices: [], progress: { phase: "generating" } },
       {
         ...chunk,
         choices: [{
@@ -224,10 +215,6 @@ describe("ICN local provider", () => {
     const progress: ModelRequestProgress[] = []
 
     const output = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      yield* Effect.locallyScoped(CurrentModelInstance, Option.some({
-        instanceId: "instance-test",
-        configurationId: "configuration-test",
-      }))
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId, {
         requestAttribution: {
@@ -261,5 +248,78 @@ describe("ICN local provider", () => {
       { phase: "generating", requestId: "request-1" },
       { phase: "cleared", requestId: "request-1" },
     ])
+  })
+
+  it("clears request activity when the inference request fails before streaming", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    const http = HttpClient.make((request) => Effect.succeed(jsonResponse(
+      request,
+      JSON.stringify({
+        error: {
+          code: "model_unavailable",
+          message: "model unavailable",
+          retryable: true,
+          type: "server_error",
+        },
+      }),
+      500,
+    )))
+    const lifecycle: string[] = []
+
+    const result = await Effect.runPromiseExit(Effect.gen(function* () {
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId, {
+        requestAttribution: {
+          key: "test",
+          requestStarted: Effect.sync(() => lifecycle.push("started")),
+          requestProgress: (update) => Effect.sync(() => {
+            lifecycle.push(update.phase)
+          }),
+        },
+      })
+      return yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+    }).pipe(Effect.provide(makeTestLayer(http, modelId))))
+
+    expect(Exit.isFailure(result)).toBe(true)
+    expect(lifecycle).toEqual(["started", "cleared"])
+  })
+
+  it("preserves ICN retry hints on in-stream model admission failures", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [{
+      id: "request-1",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: modelId,
+      choices: [],
+      error: {
+        code: "low_memory",
+        message: "Not enough memory to load model",
+        retryable: true,
+        type: "model_error",
+      },
+    }])))
+
+    const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+      return Array.from(yield* Stream.runCollect(result.events))
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    expect(events.at(-1)).toMatchObject({
+      _tag: "stream_end",
+      terminal: {
+        _tag: "StreamFailed",
+        cause: {
+          _tag: "StreamProviderError",
+          providerError: {
+            code: "low_memory",
+            retryable: true,
+            type: "model_error",
+          },
+        },
+      },
+    })
   })
 })

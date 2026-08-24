@@ -2,16 +2,13 @@ import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelMutationFailed,
   ModelServingConfigurationSchema,
-  servableModelBundlePackageIds,
   servableModelBundleTargetPackageId,
   type LocalInferenceError,
   type CatalogIdentity,
-  type ModelPackage,
   type ModelPackageEntry,
   type ModelPackageId,
   type ModelPackageInspection,
   type ModelServingConfiguration,
-  type ModelServingConfigurationId,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
 import { IcnModels } from "@magnitudedev/icn"
@@ -52,31 +49,11 @@ export interface LocalModelConfigurationResolverApi {
    * only meaningful when this is true.
    */
   readonly settled: Effect.Effect<boolean>
-  readonly resolve: (
-    configurationId: ModelServingConfigurationId,
-  ) => Effect.Effect<Option.Option<ResolvedLocalModelConfiguration>, LocalInferenceError>
 }
 
 export class LocalModelConfigurationResolver extends Context.Tag(
   "LocalModelConfigurationResolver",
 )<LocalModelConfigurationResolver, LocalModelConfigurationResolverApi>() {}
-
-export const localModelTargetIdentity = (
-  bundle: ModelServingConfiguration["bundle"],
-): LocalModelTargetIdentity => LocalModelTargetIdentitySchema.make(
-  servableModelBundleTargetPackageId(bundle),
-)
-
-export const configuredModelPackageIds = (
-  configurations: Iterable<ModelServingConfiguration>,
-): ReadonlySet<string> => new Set([...configurations].flatMap(({ bundle }) =>
-  servableModelBundlePackageIds(bundle)))
-
-export const isStandalonePackageCandidate = (
-  modelPackage: ModelPackage,
-  configuredPackageIds: ReadonlySet<string>,
-): boolean => !configuredPackageIds.has(modelPackage.id)
-  && modelPackage.files.some(({ role }) => role === "weights")
 
 const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 
@@ -86,22 +63,10 @@ export const resolveLocalModelConfigurations = (input: {
     readonly identity: CatalogIdentity
     readonly configuration: ModelServingConfiguration
   }[]
-  readonly assessed: ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>
+  readonly assessed: readonly CoordinatedLocalModelAssessment[]
   readonly packageEntries: ReadonlyMap<ModelPackageId, ModelPackageEntry>
 }): ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration> => {
   const configurations = new Map<LocalModelTargetIdentity, ModelServingConfiguration>()
-  for (const { configuration, origin } of input.assessed.values()) {
-    if (origin === "Standard" && servableModelBundlePackageIds(configuration.bundle).every(
-      (packageId) => input.packageEntries.get(packageId)?.localState._tag === "Installed",
-    )) {
-      const attribution = input.packageEntries.get(
-        servableModelBundleTargetPackageId(configuration.bundle),
-      )?.catalogAttribution
-      if (attribution?._tag !== "Attributed") {
-        configurations.set(localModelTargetIdentity(configuration.bundle), configuration)
-      }
-    }
-  }
   const catalogByIdentity = new Map(input.catalog.map((model) => [
     LocalModelTargetIdentitySchema.make(localCatalogProviderModelId(model)),
     model,
@@ -117,7 +82,8 @@ export const resolveLocalModelConfigurations = (input: {
     )
   }
   return new Map([...configurations].map(([identity, servingConfiguration]) => {
-    const assessed = input.assessed.get(servingConfiguration.id)
+    const assessed = input.assessed.find((entry) =>
+      sameConfiguration(entry.configuration, servingConfiguration))
     const assessment: CoordinatedLocalModelAssessment["assessment"] = assessed !== undefined
       && sameConfiguration(assessed.configuration, servingConfiguration)
       ? assessed.assessment
@@ -158,7 +124,7 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
 
   const get = Effect.gen(function* () {
     const nativeCatalogModels = (yield* models.initialized)
-      ? (yield* models.get).state.catalogModels
+      ? (yield* models.get).state.models
       : []
     const catalogModels = yield* Effect.forEach(
       nativeCatalogModels,
@@ -204,8 +170,5 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
     settled: Effect.gen(function* () {
       return (yield* models.initialized) && (yield* assessor.settled)
     }),
-    resolve: (configurationId) => get.pipe(Effect.map((resolved) =>
-      Option.fromNullable([...resolved.values()].find(({ servingConfiguration }) =>
-        servingConfiguration.id === configurationId)))),
   })
 }))

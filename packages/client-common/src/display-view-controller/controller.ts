@@ -9,7 +9,6 @@ import {
   type StreamDisplayViewFailure,
   type StreamEvent,
 } from "@magnitudedev/sdk"
-import type { AcnClientRequirements } from "../state/agent-client"
 import {
   applyStreamEvent,
   ceilToPageMultiple,
@@ -72,7 +71,7 @@ export interface DisplayViewControllerSnapshot {
 }
 
 /** The part of the connection client the controller materializes the display subscription with. */
-export type DisplayViewClient = Pick<Client.GroupClient<typeof AcnBoundary, AcnClientRequirements, never>, "Display" | "runtime">
+export type DisplayViewClient = Pick<Client.GroupClient<typeof AcnBoundary, any, any>, "Display" | "runtime">
 
 export interface DisplayViewControllerOptions {
   readonly client: DisplayViewClient

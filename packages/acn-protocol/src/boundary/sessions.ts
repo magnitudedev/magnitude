@@ -23,6 +23,7 @@ import {
   SessionNotArchived,
   SessionNotFound,
 } from "../errors"
+import { turnAdmissionScope } from "./configuration"
 
 /** Session pages are fresh until the ACN publishes a session change on `StreamChanges`. */
 const ListSessions = Query.make("ListSessions", {
@@ -58,6 +59,7 @@ const CreateSession = Mutation.make("CreateSession", {
   }),
   success: CreateSessionResult,
   error: SessionError,
+  scope: () => turnAdmissionScope,
 })
 
 const PreloadSession = Mutation.make("PreloadSession", {

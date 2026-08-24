@@ -1,9 +1,6 @@
-import { Duration, Effect, Option, TestClock, TestContext } from "effect"
+import { Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
-
-const run = <A, E>(effect: Effect.Effect<A, E, never>) =>
-  Effect.runPromise(Effect.provide(effect, TestContext.TestContext))
 
 describe("AcnServiceLifecycle", () => {
   it("keeps readiness, RPC availability, and stopping coherent", async () => {
@@ -30,37 +27,15 @@ describe("AcnServiceLifecycle", () => {
     })))
   })
 
-  it("starts the first full idle interval at readiness when no client is present", async () => {
-    await run(Effect.scoped(Effect.gen(function* () {
-      const lifecycle = yield* makeAcnServiceLifecycle("30 minutes")
+  it("does not tie process lifetime to RPC client presence", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const lifecycle = yield* makeAcnServiceLifecycle()
       yield* lifecycle.becomeReady(Effect.die("unused RPC"))
-      yield* Effect.yieldNow()
-      yield* TestClock.adjust(Duration.minutes(30).pipe(Duration.subtract(Duration.millis(1))))
-      expect((yield* lifecycle.state)._tag).toBe("Ready")
-      yield* TestClock.adjust(Duration.millis(1))
-      expect((yield* lifecycle.awaitStopping).reason).toBe("idle")
-    })))
-  })
-
-  it("fences stale idle timers and starts a fresh interval on final client departure", async () => {
-    await run(Effect.scoped(Effect.gen(function* () {
-      const lifecycle = yield* makeAcnServiceLifecycle("30 minutes")
-      yield* lifecycle.becomeReady(Effect.die("unused RPC"))
-      yield* Effect.yieldNow()
-      yield* TestClock.adjust(Duration.minutes(29))
       expect(yield* lifecycle.setClientPresence(true)).toBe(true)
-      yield* Effect.yieldNow()
-      yield* TestClock.adjust(Duration.minutes(2))
       expect((yield* lifecycle.state)._tag).toBe("Ready")
-
       expect(yield* lifecycle.setClientPresence(false)).toBe(true)
-      yield* Effect.yieldNow()
-      yield* Effect.yieldNow()
-      yield* TestClock.adjust(Duration.minutes(30).pipe(Duration.subtract(Duration.millis(1))))
       expect((yield* lifecycle.state)._tag).toBe("Ready")
-      yield* TestClock.adjust(Duration.millis(1))
-      yield* Effect.yieldNow()
-      expect(yield* lifecycle.state).toMatchObject({ _tag: "Stopping", reason: "idle" })
+      expect(yield* lifecycle.beginStopping({ reason: "administrative" })).toBe(true)
       expect(yield* lifecycle.setClientPresence(true)).toBe(false)
     })))
   })

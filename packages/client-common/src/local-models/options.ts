@@ -9,7 +9,6 @@ import { servableModelBundlePackages } from "@magnitudedev/sdk"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import {
   installedLocalModels,
-  localModelConfigurationId,
   localModelProviderModelId,
 } from "./projection"
 
@@ -69,10 +68,7 @@ export const localModelOptions = (
     ? [slot.selection.providerModelId]
     : []))
   const installed = installedLocalModels(models).map((model): LocalModelOption => ({
-    id: `installed:${Option.getOrElse(
-      localModelConfigurationId(model),
-      () => localModelBundleKey(model),
-    )}`,
+    id: `installed:${model.modelId}`,
     kind: Option.exists(localModelProviderModelId(model), (providerModelId) =>
       runningProviderModelIds.has(providerModelId)) ? "running" : "stored",
     model,
@@ -91,7 +87,7 @@ export const localModelOptions = (
     if (recommendations.length === 0 && !acquisitionActive) return []
     return [{
       id: recommendations.length === 0
-        ? `acquisition:${model.servingState.configuration.id}`
+        ? `acquisition:${model.modelId}`
         : `recommendation:${recommendations[0]!.id}`,
       kind: "recommendation",
       model,

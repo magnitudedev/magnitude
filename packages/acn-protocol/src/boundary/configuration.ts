@@ -1,4 +1,4 @@
-import { Data, Effect, Schema } from "effect"
+import { Data, Effect, Option, Schema } from "effect"
 import { Group, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
 import {
@@ -17,10 +17,12 @@ import {
   SlotIdSchema,
   ProviderModelIdentitySchema,
   ProviderModelCatalogStateSchema,
-  ModelSlotsStateSchema,
+  ModelSlotSelectionsStateSchema,
+  ModelRecommendationsStateSchema,
+  LocalModelsStateSchema,
   type SlotId,
 } from "../schemas/model-state"
-import { slotAssignmentIsVisible } from "../schemas/model-slot-visibility"
+import { sameSlotSelection } from "../schemas/model-slot-visibility"
 
 const GetProviderAuth = Query.make("GetProviderAuth", {
   payload: Schema.Struct({
@@ -94,7 +96,24 @@ const RefreshModelCatalog = Mutation.make("RefreshModelCatalog", {
  */
 const GetModelSlots = Query.make("GetModelSlots", {
   payload: Schema.Struct({}),
-  success: MirroredSnapshotSchema(ModelSlotsStateSchema),
+  success: MirroredSnapshotSchema(ModelSlotSelectionsStateSchema),
+  error: Schema.Never,
+  staleTime: Infinity,
+  gcTime: Infinity,
+})
+
+const GetLocalModelRecommendations = Query.make("GetLocalModelRecommendations", {
+  payload: Schema.Struct({}),
+  success: MirroredSnapshotSchema(ModelRecommendationsStateSchema),
+  error: Schema.Never,
+  staleTime: Infinity,
+  gcTime: Infinity,
+})
+
+/** Magnitude's read-only product projection over native inference facts and provider policy. */
+const GetLocalModels = Query.make("GetLocalModels", {
+  payload: Schema.Struct({}),
+  success: MirroredSnapshotSchema(LocalModelsStateSchema),
   error: Schema.Never,
   staleTime: Infinity,
   gcTime: Infinity,
@@ -114,7 +133,15 @@ export const synchronizeModelSlots = QueryClient.invalidate(GetModelSlots.match(
 )
 
 const slotSelectionScope = (slotId: SlotId): Mutation.MutationScope =>
-  Mutation.MutationScope(`model-slot-selection:${slotId}`)
+  slotId === "primary"
+    ? turnAdmissionScope
+    : Mutation.MutationScope(`model-slot-selection:${slotId}`)
+
+/**
+ * Primary-model selection and work admission share one serialization boundary:
+ * a turn must never observe the selection before its mutation has synchronized.
+ */
+export const turnAdmissionScope = Mutation.MutationScope("turn-admission")
 
 const AssignSlot = Mutation.make("AssignSlot", {
   policy: { recovery: "ReplaySafe" },
@@ -127,7 +154,10 @@ const AssignSlot = Mutation.make("AssignSlot", {
   scope: ({ slotId }) => slotSelectionScope(slotId),
   synchronize: (_, { slotId, selection }) => synchronizeModelSlots.pipe(
     Effect.filterOrFail(
-      ({ state }) => slotAssignmentIsVisible(state, slotId, selection),
+      ({ state }) => Option.exists(
+        state.slots[slotId === "primary" ? "primary" : "secondary"],
+        (current) => sameSlotSelection(current, selection),
+      ),
       () => new ModelSlotSynchronizationFailed({
         operation: "assign",
         message: "The assigned model selection was absent from ModelSlots.",
@@ -166,6 +196,8 @@ export const Configuration = Group.make({
   GetProviderModelCatalog,
   RefreshModelCatalog,
   GetModelSlots,
+  GetLocalModelRecommendations,
+  GetLocalModels,
   AssignSlot,
   ClearSlot,
   SetModelFavorite,

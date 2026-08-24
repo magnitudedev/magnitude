@@ -17,7 +17,7 @@ const ActiveModelRequestSchema = Schema.Struct({
   turnId: Schema.String,
   chainId: Schema.String,
   forkId: Schema.NullOr(Schema.String),
-  phase: Schema.Literal('queued', 'preparing', 'prefill'),
+  phase: Schema.Literal('model_loading', 'queued', 'preparing', 'prefill'),
   completedTokens: Schema.NullOr(Schema.Number),
   totalTokens: Schema.NullOr(Schema.Number),
   cachedTokens: Schema.NullOr(Schema.Number),

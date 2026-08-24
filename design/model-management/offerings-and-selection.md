@@ -6,7 +6,8 @@ applies_to:
   - packages/acn/src/model-slot-**
   - packages/acn/src/local-model-**
   - packages/acn/src/boundary/**
-  - packages/acn-protocol/src/boundary/local-inference.ts
+  - packages/sdk/src/inference.ts
+  - packages/icn-protocol/src/generated/**
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
   - packages/client-common/src/hooks/use-onboarding-model-setup.ts
@@ -24,39 +25,40 @@ applies_to:
 Generic provider and agent code sees `(ProviderId, ProviderModelId)` and a bound model. It does not
 see catalog packages, downloads, assessments, or reconciliation state.
 
-The local provider projects each effective `ModelServingConfiguration` as one offering. For a
-catalog product, it converts the structured `CatalogIdentity` to a provider-model ID at this
-boundary. For a non-catalog model, the provider-model ID is its ICN-issued configuration ID.
-Provider offerings and configurations are derived and are not persisted.
+The local provider projects each callable ICN Model as one offering. Its provider-model ID is the
+Model's existing canonical model ID (for example `gemma-4-26b-a4b-it-qat:gguf:q4`) everywhere:
+native Models, standard inference, slot selection, and provider invocation. ACN creates no alias or
+configuration identity. Provider offerings and configurations are derived and are not persisted.
 
 An offering is selectable only when its effective configuration is runnable, installed, currently
 assessed as fitting, and published by the provider. Update availability does not disable the old
 effective offering.
 
-## Catalog reconciliation
+## Model installation
 
-Catalog acquisition and update use one idempotent mutation:
+Acquisition and update use one idempotent native inference mutation:
 
 ```text
-ReconcileCatalogModel(CatalogIdentity)
-  -> Current(providerModelId)
-   | DownloadAdmitted(providerModelId, ModelDownloadId)
+POST /api/v1/models/install { modelId }
+  -> Current(modelId)
+   | DownloadAdmitted(modelId, downloadId)
 ```
 
-ICN compares the current filesystem and package affiliations with the current desired catalog
+ICN compares the current filesystem and package affiliations with the desired Model
 bundle. It acquires missing desired packages, waits until the desired bundle is complete, and then
 removes only affiliated superseded packages. Removal passes through runtime ownership checks; a
-package used by a live instance is retained and reconciliation remains available for retry.
+package used by a live instance is retained and installation remains available for retry.
 
 The old effective target remains runnable throughout acquisition. Failed or cancelled acquisition
-does not remove it. Reconciliation writes artifacts and non-derivable package affiliations only; it
+does not remove it. Installation writes artifacts and non-derivable package affiliations only; it
 does not persist configurations, manifests, versions, or product state.
 
 ## Slot selection
 
 A slot persists only provider, provider-model identity, and normalized reasoning effort. Assignment
-validates a current offering. Loading resolves the selection again and submits its exact current
-configuration to ICN.
+validates a current offering. Slots express durable selection, not physical residency. Explicit
+warm loading and inference both send the selected canonical model ID to ICN; ICN resolves the
+current configuration and owns admission, replacement, and request leases.
 
 Temporary unavailability preserves a selection. Local offerings expose whether ICN's model
 inventory has completed its initial authoritative observation; an empty local list before that
@@ -67,8 +69,8 @@ representable published state.
 ## Conformance
 
 - Catalog identity is structured and branded outside the provider boundary.
-- Reconciliation is the sole catalog install/update mutation.
-- Reconciliation is idempotent and exact-package based.
+- Native Model installation is the sole install/update mutation.
+- Model installation is idempotent and exact-package based.
 - A runnable prior target remains available during update.
 - Superseded cleanup never deletes an unaffiliated or live package.
 - Startup ordering cannot clear a local selection before local offerings are authoritative.

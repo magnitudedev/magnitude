@@ -1,32 +1,22 @@
-import { createHash } from "node:crypto"
 import { Cause, Context, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelConfigurationAssessmentSchema,
   ModelServingConfigurationSchema,
-  ServableModelBundleSchema,
-  ServingProfileSchema,
   servableModelBundlePackageIds,
   type ModelPackageId,
   type LocalModelConfigurationAssessment,
   type ModelServingConfiguration,
-  type ModelServingConfigurationId,
   type ServableModelBundle,
-  type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 import { IcnHardware, IcnModels } from "@magnitudedev/icn"
 import {
   LocalModelAssessments,
-  localModelAssessmentProfiles,
   type LocalModelAssessmentResult,
 } from "./local-model-assessments"
 import {
   catalogModelDefinitionFromIcn,
   catalogModelEffectiveConfigurationFromIcn,
 } from "./local-model-icn-adapter"
-import {
-  configuredModelPackageIds,
-  isStandalonePackageCandidate,
-} from "./local-model-configuration-resolver"
 import { LocalModelPackages } from "./local-model-packages"
 import { makeObservedState } from "./mirrored-state"
 
@@ -39,13 +29,12 @@ type CoordinatedLocalModelAssessmentState =
 
 export interface CoordinatedLocalModelAssessment {
   readonly configuration: ModelServingConfiguration
-  readonly origin: "Authored" | "Standard"
   readonly assessment: CoordinatedLocalModelAssessmentState
 }
 
 export interface LocalModelAssessorApi {
-  readonly state: Effect.Effect<ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>>
-  readonly changes: Stream.Stream<ReadonlyMap<ModelServingConfigurationId, CoordinatedLocalModelAssessment>>
+  readonly state: Effect.Effect<readonly CoordinatedLocalModelAssessment[]>
+  readonly changes: Stream.Stream<readonly CoordinatedLocalModelAssessment[]>
   readonly settled: Effect.Effect<boolean>
 }
 
@@ -56,13 +45,7 @@ export class LocalModelAssessor extends Context.Tag(
 type AssessmentDemandKey = string
 
 type DesiredAssessment = {
-  readonly _tag: "Authored"
   readonly configuration: ModelServingConfiguration
-  readonly semanticKey: string
-} | {
-  readonly _tag: "Standard"
-  readonly bundle: ServableModelBundle
-  readonly profile: ServingProfile
   readonly semanticKey: string
 }
 
@@ -80,9 +63,8 @@ const publishedEquivalent = (
   right: ReadonlyMap<AssessmentDemandKey, CoordinatedLocalModelAssessment>,
 ): boolean => left.size === right.size && [...left].every(([id, value]) => {
   const other = right.get(id)
-  return other !== undefined
+    return other !== undefined
     && configurationEquivalent(value.configuration, other.configuration)
-    && value.origin === other.origin
     && assessmentEquivalent(value.assessment, other.assessment)
 })
 
@@ -92,7 +74,7 @@ const sameDesired = (
 ): boolean => left.size === right.size
   && [...left].every(([id, value]) => {
     const other = right.get(id)
-    return other?.semanticKey === value.semanticKey && other._tag === value._tag
+    return other?.semanticKey === value.semanticKey
   })
 
 const sameCompleted = (
@@ -126,16 +108,9 @@ const assessmentCauseFailure = (cause: Cause.Cause<unknown>) => Option.match(
   },
 )
 
-const standardDemandKey = (
-  bundle: ServableModelBundle,
-  profile: ServingProfile,
-): AssessmentDemandKey => bundle._tag === "Standalone"
-  ? `Standard\0Standalone\0${bundle.package.id}\0${profile.contextLength}`
-  : `Standard\0${bundleDemandKey(bundle)}\0${profile.contextLength}`
-
 const authoredDemandKey = (
   configuration: ModelServingConfiguration,
-): AssessmentDemandKey => `Authored\0${configuration.id}`
+): AssessmentDemandKey => `Authored\0${bundleDemandKey(configuration.bundle)}\0${configuration.profile.contextLength}`
 
 const bundleDemandKey = (bundle: ServableModelBundle): string =>
   bundle._tag === "Standalone"
@@ -150,7 +125,7 @@ const completedAssessment = (
 ): { readonly configuration: ModelServingConfiguration; readonly assessment: LocalModelConfigurationAssessment }
   | undefined => {
   if (result._tag === "InvalidBundle") {
-    return request._tag === "Authored" ? {
+    return {
       configuration: request.configuration,
       assessment: {
         _tag: "Failed",
@@ -160,30 +135,25 @@ const completedAssessment = (
           retryable: false,
         },
       },
-    } : undefined
+    }
   }
   if (result._tag === "Failed") {
-    return request._tag === "Authored" ? {
+    return {
       configuration: request.configuration,
       assessment: { _tag: "Failed", failure: result.failure },
-    } : undefined
+    }
   }
   const resultForConfiguration = result.assessments[0]!
-  const configuration = request._tag === "Authored"
-    ? request.configuration
-    : resultForConfiguration.configuration
+  const configuration = request.configuration
   if (resultForConfiguration._tag === "Fits") {
     return {
       configuration,
       assessment: {
         _tag: "Fits",
-        assessment: request._tag === "Authored"
-          ? {
-              ...resultForConfiguration.assessment,
-              profile: request.configuration.profile,
-              configurationId: request.configuration.id,
-            }
-          : resultForConfiguration.assessment,
+        assessment: {
+          ...resultForConfiguration.assessment,
+          profile: request.configuration.profile,
+        },
       },
     }
   }
@@ -232,7 +202,7 @@ export const LocalModelAssessorLive: Layer.Layer<
 
   const readDesired = Effect.gen(function* () {
     const catalogModels = (yield* models.initialized)
-      ? (yield* models.get).state.catalogModels
+      ? (yield* models.get).state.models
       : []
     const desiredCatalogConfigurations = yield* Effect.forEach(
       catalogModels,
@@ -250,8 +220,6 @@ export const LocalModelAssessorLive: Layer.Layer<
     const packageState = (yield* packages.snapshot).state
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     const hardwareState = (yield* hardware.get).state
-    const configuredPackages = configuredModelPackageIds(catalogConfigurations)
-
     const hardwareEvidence = {
       nativeBuild: hardwareState.native_build,
       topology: hardwareState.topology_fingerprint,
@@ -275,34 +243,9 @@ export const LocalModelAssessorLive: Layer.Layer<
         material: packageEvidence,
       })
       desired.set(authoredDemandKey(configuration), {
-        _tag: "Authored",
         configuration,
-        semanticKey: createHash("sha256").update(semanticInput).digest("hex"),
+        semanticKey: semanticInput,
       })
-    }
-    for (const entry of packageState.entries) {
-      if (entry.localState._tag !== "Installed" || entry.inspection._tag !== "Inspected") continue
-      if (!isStandalonePackageCandidate(entry.package, configuredPackages)) continue
-      const bundle: ServableModelBundle = { _tag: "Standalone", package: entry.package }
-      for (const profile of localModelAssessmentProfiles(bundle)) {
-        const packageEvidence = [{
-          packageId: entry.package.id,
-          installed: true,
-          inspection: "Inspected",
-        }]
-        const semanticInput = yield* Schema.encode(Schema.parseJson(Schema.Unknown))({
-          bundle: yield* Schema.encode(ServableModelBundleSchema)(bundle),
-          profile: yield* Schema.encode(ServingProfileSchema)(profile),
-          hardware: hardwareEvidence,
-          material: packageEvidence,
-        })
-        desired.set(standardDemandKey(bundle, profile), {
-          _tag: "Standard",
-          bundle,
-          profile,
-          semanticKey: createHash("sha256").update(semanticInput).digest("hex"),
-        })
-      }
     }
     return desired
   })
@@ -324,32 +267,26 @@ export const LocalModelAssessorLive: Layer.Layer<
     )
     for (const [demandKey, entry] of published) {
       const next = desired.get(demandKey)
-      if (next?._tag === "Authored") {
+      if (next !== undefined) {
         published.set(demandKey, {
           ...entry,
           configuration: next.configuration,
-          origin: "Authored",
         })
       }
     }
     for (const [demandKey, request] of pending) {
-      if (request._tag === "Authored") {
-        published.set(demandKey, {
-          configuration: request.configuration,
-          origin: "Authored",
-          assessment: { _tag: "Assessing" },
-        })
-      } else {
-        published.delete(demandKey)
-      }
+      published.set(demandKey, {
+        configuration: request.configuration,
+        assessment: { _tag: "Assessing" },
+      })
     }
     yield* publish({ ...current, desired, published })
     if (pending.length === 0) return
 
     const outcome = yield* Effect.exit(assessments.assess(
       pending.map(([, request]) => ({
-        bundle: request._tag === "Authored" ? request.configuration.bundle : request.bundle,
-        profiles: [request._tag === "Authored" ? request.configuration.profile : request.profile],
+        bundle: request.configuration.bundle,
+        profiles: [request.configuration.profile],
       })),
       () => Effect.void,
     ))
@@ -362,14 +299,11 @@ export const LocalModelAssessorLive: Layer.Layer<
       for (const [demandKey, request] of pending) {
         const latestRequest = latestDesired.get(demandKey)
         if (latestRequest?.semanticKey !== request.semanticKey) continue
-        if (latestRequest._tag === "Authored") {
-          nextPublished.set(demandKey, {
-            configuration: latestRequest.configuration,
-            origin: "Authored",
-            assessment: { _tag: "Failed", failure },
-          })
-          completedKeys.set(demandKey, request.semanticKey)
-        }
+        nextPublished.set(demandKey, {
+          configuration: latestRequest.configuration,
+          assessment: { _tag: "Failed", failure },
+        })
+        completedKeys.set(demandKey, request.semanticKey)
       }
     } else {
       pending.forEach(([demandKey, request], index) => {
@@ -377,7 +311,7 @@ export const LocalModelAssessorLive: Layer.Layer<
         if (latestRequest?.semanticKey !== request.semanticKey) return
         const result = outcome.value[index]
         const completed = result === undefined
-          ? latestRequest._tag === "Authored" ? {
+          ? {
               configuration: latestRequest.configuration,
               assessment: {
                 _tag: "Failed",
@@ -387,12 +321,11 @@ export const LocalModelAssessorLive: Layer.Layer<
                   retryable: true,
                 },
               } as const,
-            } : undefined
+            }
           : completedAssessment(result, latestRequest)
         if (completed === undefined) return
         nextPublished.set(demandKey, {
           configuration: completed.configuration,
-          origin: latestRequest._tag === "Authored" ? "Authored" : "Standard",
           assessment: completed.assessment,
         })
         completedKeys.set(demandKey, request.semanticKey)
@@ -421,9 +354,7 @@ export const LocalModelAssessorLive: Layer.Layer<
     Effect.forkScoped,
   )
 
-  const publicState = (published: AssessorState["published"]) => new Map(
-    [...published.values()].map((entry) => [entry.configuration.id, entry]),
-  )
+  const publicState = (published: AssessorState["published"]) => [...published.values()]
 
   return LocalModelAssessor.of({
     state: observed.get.pipe(Effect.map(({ state }) => publicState(state.published))),

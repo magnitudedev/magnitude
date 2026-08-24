@@ -57,8 +57,8 @@ Initial onboarding uncertainty remains unavailable and is never interpreted as c
 ```text
 Resting + incomplete ------------------------------> Open chooser (Skip)
 Resting + complete + open -------------------------> Open chooser (Close)
-Open chooser + select -> Prepare -> Install -> Assign -> Load -> [Complete onboarding] -> Closed
-Open operation + cancel -> exact lower cleanup -------------------------------> Open chooser
+Open chooser + select -> Prepare -> Install -> Assign -> Ensure resident -> [Complete onboarding] -> Closed
+Open operation + cancel -> detach observation --------------------------------> Open chooser
 Open operation + failure -------------------------------------------> Open chooser with notice
 Open + Close --------------------------------------------------------> Closed
 Open + Skip -> Complete onboarding ---------------------------------> Closed
@@ -73,11 +73,11 @@ is explicitly restored to normal interruption so cancellation races and scope sh
 
 The worker passes exact predecessor outputs through one Effect program:
 
-1. resolve the exact displayed serving configuration;
-2. reconcile that configuration and retain the exact download admission when needed;
-3. assign the exact returned provider model and captured reasoning effort to the primary slot;
-4. invoke load for that captured selection;
-5. accept readiness only for the same selection and configuration; and
+1. retain the exact displayed canonical model ID;
+2. install that Model and retain the exact native Download admission when needed;
+3. assign that exact model ID and captured reasoning effort to the primary slot;
+4. admit native residency for that model ID through the shared ICN coordinator;
+5. accept readiness only for the exact returned Instance and model ID; and
 6. complete onboarding only when it was incomplete at admission.
 
 A stable snapshot of the submitted option is retained only as historical presentation evidence.
@@ -85,19 +85,16 @@ Canonical queries may replace it for display, but all decisions use exact identi
 authoritative observations. Discovery refresh or removal therefore cannot make an active operation
 unrenderable or redirect it.
 
-Model-instance identity remains private to ACN's slot controller. Setup addresses the selected slot
-and verifies its exact selection and configuration; it does not introduce a parallel instance API.
-Selection replacement fails the invocation instead of satisfying or redirecting it.
-
-Model-slot mutation scopes express independent command concurrency. Selection changes serialize
-with selection changes, loads with loads, and stops with stops. Stop and selection replacement must
-be able to reach ACN while a load request is pending because ACN owns cancellation and supersession.
+Instance identity is native ICN state. Setup uses the returned identity only to observe the admitted
+occurrence; it never persists it in the Slot. Slot selection and native residency remain independent
+authorities and are joined by canonical model ID for presentation.
 
 ## Cancellation, failure, and retry
 
-Cancellation is cooperative and identity-safe. It cancels only the exact admitted download or asks
-the authoritative slot owner to stop the captured slot load. The operation remains visible as
-cancelling until cleanup and terminalization finish. Completing onboarding cannot be cancelled.
+Cancellation is cooperative and identity-safe. Before installation admission it interrupts the
+request; after a Download is admitted it cancels only that exact Download where shared-work rules
+permit. After residency admission it detaches this setup waiter and does not stop the shared
+Instance. Completing onboarding cannot be cancelled.
 
 Every terminal update is fenced by invocation identity, so late work cannot overwrite a newer flow.
 Expected lower failures remain typed and become one retained chooser notice. Defects are re-raised
@@ -147,7 +144,7 @@ orthogonal server observation, not setup lifecycle state.
 - Discovery refresh, failure, or removal cannot mask an active operation.
 - Exact download admission governs observation and cancellation.
 - Readiness must match the captured selection and configuration.
-- Stop and selection replacement are not queued behind a pending load.
+- Cancellation after residency admission never stops shared residency work.
 - Closed and Closing views do not observe unrelated model or slot queries.
 - Query retry targets the failed participating owner.
 - UI code renders one setup view and never inspects mutation history to derive lifecycle.

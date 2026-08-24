@@ -6,8 +6,8 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -21,15 +21,13 @@ use icn_contracts::bootstrap_protocol::{
     VulkanEligibility,
 };
 use icn_contracts::models::{
-    AssessModelsRequest, AssessModelsResponse, CatalogModels, InstalledModelPackages,
-    InstalledModelPackagesResponse, LoadModelRequest, ModelAssessor, ModelDownload,
+    AssessModelsRequest, AssessModelsResponse, CatalogModelLocalState, CatalogModels,
+    InferenceModel, InstallCatalogModelRequest, InstallModelResponse, InstalledModelPackage,
+    InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessor, ModelDownload,
     ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance,
     ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadEvent, ModelLoadPlan, ModelPackageId,
-    ModelServingConfigurationId, ModelsResponse, PreviewModelLoadRequest,
-    RecommendableModelCatalog, RecommendableModelCatalogProvider, ReconcileCatalogModelRequest,
-    ReconcileCatalogModelResponse, RemoveInstalledModelPackageResponse, StartModelDownloadRequest,
-    StartModelDownloadResponse,
+    ModelInstancesSnapshot, ModelLoadPlan, ModelPackageId, ModelsResponse,
+    RemoveInstalledModelPackageResponse,
 };
 use icn_contracts::{
     AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
@@ -75,7 +73,6 @@ const fn default_true() -> bool {
 pub struct AppState {
     catalog_models: Option<Arc<dyn CatalogModels>>,
     installed_packages: Option<Arc<dyn InstalledModelPackages>>,
-    recommendable_catalog: Option<Arc<dyn RecommendableModelCatalogProvider>>,
     model_assessor: Option<Arc<dyn ModelAssessor>>,
     model_downloads: Option<Arc<dyn ModelDownloads>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
@@ -84,6 +81,89 @@ pub struct AppState {
     identity: ServerIdentity,
     authorization: Option<Arc<str>>,
     next_id: Arc<AtomicU64>,
+    resource_revision: Arc<AtomicU64>,
+    resource_changes: tokio::sync::broadcast::Sender<InferenceResourceInvalidation>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OpenAiModel {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OpenAiModelsResponse {
+    pub object: &'static str,
+    pub data: Vec<OpenAiModel>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelIdentityRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UninstallModelResponse {
+    pub model_id: String,
+    pub removed_package_ids: Vec<ModelPackageId>,
+    pub retained_package_ids: Vec<ModelPackageId>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnsureModelInstanceRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum InferenceResourceTopic {
+    Hardware,
+    Models,
+    Packages,
+    Downloads,
+    Instances,
+    ResidencyPolicy,
+}
+
+impl InferenceResourceTopic {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hardware => "hardware",
+            Self::Models => "models",
+            Self::Packages => "packages",
+            Self::Downloads => "downloads",
+            Self::Instances => "instances",
+            Self::ResidencyPolicy => "residency-policy",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "hardware" => Some(Self::Hardware),
+            "models" => Some(Self::Models),
+            "packages" => Some(Self::Packages),
+            "downloads" => Some(Self::Downloads),
+            "instances" => Some(Self::Instances),
+            "residency-policy" => Some(Self::ResidencyPolicy),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InferenceResourceInvalidation {
+    pub topic: InferenceResourceTopic,
+    pub revision: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InferenceEventQuery {
+    topics: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,23 +186,22 @@ impl Default for ServerIdentity {
 pub struct ModelInstanceLease {
     backend: Arc<dyn CompletionBackend>,
     instance_id: ModelInstanceId,
-    configuration_id: ModelServingConfigurationId,
     model_aliases: Arc<BTreeSet<String>>,
     release: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+pub type ModelLoadingObserver = Arc<dyn Fn(f32) + Send + Sync>;
 
 impl ModelInstanceLease {
     pub fn new(
         backend: Arc<dyn CompletionBackend>,
         instance_id: ModelInstanceId,
-        configuration_id: ModelServingConfigurationId,
         model_aliases: Arc<BTreeSet<String>>,
         release: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         Self {
             backend,
             instance_id,
-            configuration_id,
             model_aliases,
             release: Some(Arc::new(release)),
         }
@@ -136,12 +215,14 @@ impl ModelInstanceLease {
         &self.instance_id
     }
 
-    pub fn configuration_id(&self) -> &ModelServingConfigurationId {
-        &self.configuration_id
-    }
-
     pub fn model_id(&self) -> &str {
         self.backend.model_id()
+    }
+
+    #[must_use]
+    pub fn with_model_alias(mut self, alias: String) -> Self {
+        self.model_aliases = Arc::new(BTreeSet::from([alias]));
+        self
     }
 
     fn accepts_model(&self, requested: &str) -> bool {
@@ -164,10 +245,10 @@ impl AppState {
 
     /// Construct API state from a backend shared with another server-owned service.
     pub fn from_shared_backend(backend: Arc<dyn CompletionBackend>) -> Self {
+        let (resource_changes, _) = tokio::sync::broadcast::channel(64);
         Self {
             catalog_models: None,
             installed_packages: None,
-            recommendable_catalog: None,
             model_assessor: None,
             model_downloads: None,
             hardware: None,
@@ -176,14 +257,16 @@ impl AppState {
             identity: ServerIdentity::default(),
             authorization: None,
             next_id: Arc::new(AtomicU64::new(1)),
+            resource_revision: Arc::new(AtomicU64::new(0)),
+            resource_changes,
         }
     }
 
     pub fn model_free() -> Self {
+        let (resource_changes, _) = tokio::sync::broadcast::channel(64);
         Self {
             catalog_models: None,
             installed_packages: None,
-            recommendable_catalog: None,
             model_assessor: None,
             model_downloads: None,
             hardware: None,
@@ -192,6 +275,8 @@ impl AppState {
             identity: ServerIdentity::default(),
             authorization: None,
             next_id: Arc::new(AtomicU64::new(1)),
+            resource_revision: Arc::new(AtomicU64::new(0)),
+            resource_changes,
         }
     }
 
@@ -215,14 +300,6 @@ impl AppState {
 
     pub fn with_catalog_models(mut self, catalog_models: Arc<dyn CatalogModels>) -> Self {
         self.catalog_models = Some(catalog_models);
-        self
-    }
-
-    pub fn with_recommendable_catalog(
-        mut self,
-        recommendable_catalog: Arc<dyn RecommendableModelCatalogProvider>,
-    ) -> Self {
-        self.recommendable_catalog = Some(recommendable_catalog);
         self
     }
 
@@ -260,62 +337,75 @@ impl AppState {
         self.authorization = Some(capability.into());
         self
     }
+
+    fn invalidate_resources(&self, topics: impl IntoIterator<Item = InferenceResourceTopic>) {
+        for topic in topics {
+            let revision = self
+                .resource_revision
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            let _ = self
+                .resource_changes
+                .send(InferenceResourceInvalidation { topic, revision });
+        }
+    }
 }
 
 pub fn app(state: AppState) -> Router {
     let mut protected = Router::new()
-        .route("/v1/hardware", get(hardware))
-        .route("/v1/models", get(models))
+        .route("/api/v1/hardware", get(hardware))
+        .route("/api/v1/models", get(models))
+        .route("/api/v1/models/{model_id}", get(model))
+        .route("/api/v1/models/install", post(install_model))
+        .route("/api/v1/models/uninstall", post(uninstall_model))
+        .route("/api/v1/packages", get(installed_models))
         .route(
-            "/v1/models/catalog/reconcile",
-            post(reconcile_catalog_model),
+            "/api/v1/packages/{package_id}",
+            get(installed_model).delete(remove_installed_model),
         )
-        .route("/v1/models/installed", get(installed_models))
+        .route("/api/v1/models/assess", post(assess_models))
+        .route("/api/v1/downloads", get(model_downloads))
+        .route("/api/v1/downloads/{download_id}", get(model_download))
         .route(
-            "/v1/models/installed/{package_id}",
-            axum::routing::delete(remove_installed_model),
-        )
-        .route("/v1/models/catalog", get(recommendable_model_catalog))
-        .route("/v1/models/assess", post(assess_models))
-        .route(
-            "/v1/models/downloads",
-            get(model_downloads).post(start_model_download),
-        )
-        .route("/v1/models/load/preview", post(preview_model_load))
-        .route(
-            "/v1/models/instances",
-            get(model_instances).post(load_model_instance),
-        )
-        .route("/v1/models/instances/watch", get(watch_model_instances))
-        .route(
-            "/v1/models/residency-policy",
-            post(set_model_residency_policy),
+            "/api/v1/models/{model_id}/load-plan",
+            post(preview_model_load),
         )
         .route(
-            "/v1/models/instances/{instance_id}/stop",
+            "/api/v1/instances",
+            get(model_instances).post(ensure_model_instance),
+        )
+        .route("/api/v1/instances/{instance_id}", get(model_instance))
+        .route("/api/v1/events", get(watch_inference_events))
+        .route(
+            "/api/v1/residency-policy",
+            get(model_residency_policy).put(set_model_residency_policy),
+        )
+        .route(
+            "/api/v1/instances/{instance_id}/stop",
             post(stop_model_instance),
         )
         .route(
-            "/v1/models/downloads/{download_id}/cancel",
+            "/api/v1/downloads/{download_id}/cancel",
             post(cancel_model_download),
         )
         .route(
-            "/v1/models/downloads/{download_id}/acknowledge-failure",
+            "/api/v1/downloads/{download_id}/acknowledge-failure",
             post(acknowledge_model_download_failure),
         )
         .route(
-            "/v1/hugging-face/models/search",
+            "/api/v1/sources/hugging-face/search",
             post(search_hugging_face_models),
         )
         .route(
-            "/v1/hugging-face/models/resolve",
+            "/api/v1/sources/hugging-face/resolve",
             post(resolve_hugging_face_repository),
         )
-        .route("/props", get(props))
-        .route("/v1/props", get(props))
-        .route("/apply-template", post(apply_template))
-        .route("/v1/apply-template", post(apply_template))
+        .route("/api/v1/models/{model_id}/properties", post(props))
+        .route("/api/v1/chat/templates/apply", post(apply_template))
+        .route("/v1/models", get(standard_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
+        .route("/openapi.json", get(serve_openapi))
         .with_state(state.clone());
     if let Some(capability) = state.authorization.clone() {
         protected = protected.route_layer(middleware::from_fn_with_state(capability, authorize));
@@ -348,6 +438,12 @@ async fn authorize(State(capability): State<Arc<str>>, request: Request, next: N
     }
 }
 
+async fn serve_openapi() -> Result<Json<OpenApiDocument>, ApiError> {
+    openapi()
+        .map(Json)
+        .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HealthResponse {
@@ -366,7 +462,21 @@ pub struct SetModelResidencyPolicyRequest {
     pub idle_timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelResidencyPolicyResponse {
+    pub generation: u64,
+    pub idle_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ModelResidencyPolicyInvalidation {
+    pub revision: u64,
+}
+
 pub trait ModelInstanceController: Send + Sync + 'static {
+    fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError>;
+    fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation>;
     fn set_residency_policy(
         &self,
         generation: u64,
@@ -374,9 +484,12 @@ pub trait ModelInstanceController: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), InventoryError>>;
     fn preview_load(
         &self,
-        request: PreviewModelLoadRequest,
+        model_id: String,
     ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>>;
-    fn load_instance(&self, request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent>;
+    fn ensure_resident(
+        &self,
+        model_id: String,
+    ) -> BoxFuture<'_, Result<ModelInstance, InventoryError>>;
     fn stop_instance(
         &self,
         instance_id: ModelInstanceId,
@@ -390,7 +503,11 @@ pub trait ModelInstanceController: Send + Sync + 'static {
     fn lease(
         &self,
         instance_id: ModelInstanceId,
-        configuration_id: ModelServingConfigurationId,
+    ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>>;
+    fn acquire_for_inference(
+        &self,
+        model_id: String,
+        progress: Option<ModelLoadingObserver>,
     ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>>;
     fn add_alias(&self, _alias: String) {}
 }
@@ -409,13 +526,22 @@ impl StaticModelInstanceController {
             aliases: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
-
-    fn configuration_id(&self) -> ModelServingConfigurationId {
-        ModelServingConfigurationId(self.backend.model_id().to_owned())
-    }
 }
 
 impl ModelInstanceController for StaticModelInstanceController {
+    fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError> {
+        Ok(ModelResidencyPolicyResponse {
+            generation: 0,
+            idle_timeout_seconds: 600,
+        })
+    }
+
+    fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation> {
+        Box::pin(futures_util::stream::once(async {
+            ModelResidencyPolicyInvalidation { revision: 0 }
+        }))
+    }
+
     fn set_residency_policy(
         &self,
         _generation: u64,
@@ -426,7 +552,7 @@ impl ModelInstanceController for StaticModelInstanceController {
 
     fn preview_load(
         &self,
-        _request: PreviewModelLoadRequest,
+        _model_id: String,
     ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
         Box::pin(async {
             Err(InventoryError::Unsupported(
@@ -435,8 +561,19 @@ impl ModelInstanceController for StaticModelInstanceController {
         })
     }
 
-    fn load_instance(&self, _request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
-        Box::pin(futures_util::stream::empty())
+    fn ensure_resident(
+        &self,
+        model_id: String,
+    ) -> BoxFuture<'_, Result<ModelInstance, InventoryError>> {
+        Box::pin(async move {
+            let lease = self.acquire_for_inference(model_id, None).await?;
+            self.instances()
+                .await
+                .instances
+                .into_iter()
+                .find(|instance| instance.id == lease.instance_id)
+                .ok_or_else(|| InventoryError::NotReady("model instance is not ready".to_owned()))
+        })
     }
 
     fn stop_instance(
@@ -451,13 +588,13 @@ impl ModelInstanceController for StaticModelInstanceController {
     }
 
     fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot> {
-        let configuration_id = self.configuration_id();
+        let model_id = self.backend.model_id().to_owned();
         Box::pin(async move {
             ModelInstancesSnapshot {
                 revision: 0,
                 instances: vec![ModelInstance {
                     id: ModelInstanceId(Self::INSTANCE_ID.to_owned()),
-                    configuration_id,
+                    model_id,
                     lifecycle: ModelInstanceLifecycle::Ready {
                         allocation: ModelInstanceAllocation {
                             context_window_tokens: 1,
@@ -490,9 +627,7 @@ impl ModelInstanceController for StaticModelInstanceController {
     fn lease(
         &self,
         instance_id: ModelInstanceId,
-        configuration_id: ModelServingConfigurationId,
     ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
-        let expected_configuration = self.configuration_id();
         let backend = Arc::clone(&self.backend);
         let aliases = self
             .aliases
@@ -500,7 +635,7 @@ impl ModelInstanceController for StaticModelInstanceController {
             .map(|aliases| Arc::new(aliases.clone()))
             .unwrap_or_else(|_| Arc::new(BTreeSet::new()));
         Box::pin(async move {
-            if instance_id.0 != Self::INSTANCE_ID || configuration_id != expected_configuration {
+            if instance_id.0 != Self::INSTANCE_ID {
                 return Err(InventoryError::NotReady(
                     "the requested model instance is not ready".to_owned(),
                 ));
@@ -508,10 +643,32 @@ impl ModelInstanceController for StaticModelInstanceController {
             Ok(ModelInstanceLease::new(
                 backend,
                 instance_id,
-                configuration_id,
                 aliases,
                 || {},
             ))
+        })
+    }
+
+    fn acquire_for_inference(
+        &self,
+        model_id: String,
+        _progress: Option<ModelLoadingObserver>,
+    ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
+        let instance_id = ModelInstanceId(Self::INSTANCE_ID.to_owned());
+        let accepted = model_id == self.backend.model_id()
+            || self
+                .aliases
+                .read()
+                .is_ok_and(|aliases| aliases.contains(&model_id));
+        Box::pin(async move {
+            if !accepted {
+                return Err(InventoryError::NotReady(
+                    "requested model instance is not ready".to_owned(),
+                ));
+            }
+            self.lease(instance_id)
+                .await
+                .map(|lease| lease.with_model_alias(model_id))
         })
     }
 
@@ -652,7 +809,6 @@ pub struct TemplateCapabilitiesResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyTemplateRequest {
-    pub model_instance_id: String,
     #[schema(nullable = false)]
     pub model: Option<String>,
     pub messages: Vec<ChatMessageRequest>,
@@ -700,7 +856,6 @@ pub enum GrammarTriggerResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
-    pub model_instance_id: String,
     #[schema(nullable = false)]
     pub model: Option<String>,
     pub messages: Vec<ChatMessageRequest>,
@@ -742,6 +897,38 @@ pub struct ChatCompletionRequest {
     #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     #[schema(default = false)]
     pub timings_per_token: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResponseCreateRequest {
+    pub model: String,
+    pub input: JsonValue,
+    #[schema(nullable = false)]
+    pub instructions: Option<String>,
+    #[schema(nullable = false)]
+    pub max_output_tokens: Option<u32>,
+    #[schema(nullable = false)]
+    pub temperature: Option<f32>,
+    #[schema(nullable = false)]
+    pub top_p: Option<f32>,
+    #[schema(nullable = false)]
+    pub tools: Option<Vec<JsonValue>>,
+    #[schema(nullable = false)]
+    pub tool_choice: Option<JsonValue>,
+    #[schema(nullable = false)]
+    pub parallel_tool_calls: Option<bool>,
+    #[schema(nullable = false)]
+    pub reasoning: Option<JsonValue>,
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponseStreamEvent {
+    pub r#type: String,
+    pub sequence_number: u64,
+    #[serde(flatten)]
+    pub data: BTreeMap<String, JsonValue>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -955,11 +1142,13 @@ pub struct ChatCompletionChunk {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
+#[serde(tag = "phase", rename_all = "snake_case")]
 pub enum ChatCompletionProgress {
+    ModelLoading {
+        fraction: f32,
+    },
     Queued,
     Preparing,
-    #[serde(rename_all = "camelCase")]
     Prefill {
         completed_tokens: u64,
         total_tokens: u64,
@@ -1110,20 +1299,6 @@ impl ApiError {
         }
     }
 
-    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            body: ErrorResponse {
-                error: ApiErrorBody {
-                    message: message.into(),
-                    r#type: "invalid_request_error",
-                    code: code.to_owned(),
-                    retryable: false,
-                },
-            },
-        }
-    }
-
     fn from_inference(error: InferenceError) -> Self {
         match error {
             InferenceError::InvalidConfig(message) => Self::invalid(message),
@@ -1233,7 +1408,25 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-#[utoipa::path(post, path = "/v1/models/residency-policy", operation_id = "setModelResidencyPolicy", tag = "models",
+#[utoipa::path(get, path = "/api/v1/residency-policy", operation_id = "getModelResidencyPolicy", tag = "models",
+    responses(
+        (status = 200, description = "Current model residency policy", body = ModelResidencyPolicyResponse),
+        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
+    )
+)]
+async fn model_residency_policy(
+    State(state): State<AppState>,
+) -> Result<Json<ModelResidencyPolicyResponse>, ApiError> {
+    state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?
+        .residency_policy()
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(put, path = "/api/v1/residency-policy", operation_id = "setModelResidencyPolicy", tag = "models",
     request_body(content = SetModelResidencyPolicyRequest, content_type = "application/json"),
     responses(
         (status = 204, description = "The model residency policy is established"),
@@ -1265,69 +1458,67 @@ async fn set_model_residency_policy(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/instances", operation_id = "loadModelInstance", tag = "models",
-    request_body(content = LoadModelRequest, content_type = "application/json"),
+#[utoipa::path(post, path = "/api/v1/instances", operation_id = "ensureModelInstance", tag = "models",
+    request_body(content = EnsureModelInstanceRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Exact model configuration load progress", body = String, content_type = "text/event-stream"),
+        (status = 200, description = "Current ready instance for the model", body = ModelInstance),
+        (status = 400, description = "Invalid model identity or request", body = ErrorResponse),
+        (status = 404, description = "Model is not installed", body = ErrorResponse),
+        (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
+        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
         (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.model_instance.load", skip_all, err(Debug))]
-async fn load_model_instance(
+#[tracing::instrument(name = "icn.model_instance.ensure", skip_all, err(Debug))]
+async fn ensure_model_instance(
     State(state): State<AppState>,
-    Json(request): Json<LoadModelRequest>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    Json(request): Json<EnsureModelInstanceRequest>,
+) -> Result<Json<ModelInstance>, ApiError> {
     let controller = state
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let events = controller.load_instance(request);
-    let framed = tokio_stream::StreamExt::map(events, |event| {
-        let data = serde_json::to_string(&event).unwrap_or_else(|error| {
-            serde_json::json!({
-                "_tag": "Failed",
-                "failure": {
-                    "code": "serialization_failed",
-                    "message": error.to_string(),
-                    "retryable": false
-                }
-            })
-            .to_string()
-        });
-        Ok(Event::default().data(data))
-    });
-    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
+    controller
+        .ensure_resident(request.model_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/load/preview", operation_id = "previewModelLoad", tag = "models",
-    request_body(content = PreviewModelLoadRequest, content_type = "application/json"),
+#[utoipa::path(post, path = "/api/v1/models/{model_id}/load-plan", operation_id = "previewModelLoad", tag = "models",
+    params(("model_id" = String, Path, description = "Canonical model ID")),
     responses(
         (status = 200, description = "Plan ICN would select from current admission evidence", body = ModelLoadPlan),
         (status = 400, description = "Configuration cannot be resolved", body = ErrorResponse),
+        (status = 404, description = "Model is not installed", body = ErrorResponse),
         (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
+        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
         (status = 500, description = "Load preview failed", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(name = "icn.model_load.preview", skip_all, err(Debug))]
 async fn preview_model_load(
     State(state): State<AppState>,
-    Json(request): Json<PreviewModelLoadRequest>,
+    Path(model_id): Path<String>,
 ) -> Result<Json<ModelLoadPlan>, ApiError> {
     let controller = state
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     controller
-        .preview_load(request)
+        .preview_load(model_id)
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/instances/{instance_id}/stop", operation_id = "stopModelInstance", tag = "models",
+#[utoipa::path(post, path = "/api/v1/instances/{instance_id}/stop", operation_id = "stopModelInstance", tag = "models",
     params(("instance_id" = String, Path, description = "Model instance ID")),
     responses(
         (status = 204, description = "The exact model instance is stopped"),
+        (status = 400, description = "Invalid instance identity or request", body = ErrorResponse),
+        (status = 404, description = "Model instance not found", body = ErrorResponse),
+        (status = 409, description = "Model instance cannot currently be stopped", body = ErrorResponse),
         (status = 500, description = "Model instance stop failed", body = ErrorResponse)
     )
 )]
@@ -1347,7 +1538,7 @@ async fn stop_model_instance(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models/instances", operation_id = "getModelInstances", tag = "models",
+#[utoipa::path(get, path = "/api/v1/instances", operation_id = "getModelInstances", tag = "models",
     responses(
         (status = 200, description = "Authoritative native model instances", body = ModelInstancesSnapshot),
         (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
@@ -1363,29 +1554,142 @@ async fn model_instances(
     Ok(Json(controller.instances().await))
 }
 
-#[utoipa::path(get, path = "/v1/models/instances/watch", operation_id = "watchModelInstances", tag = "models",
+#[utoipa::path(get, path = "/api/v1/instances/{instance_id}", operation_id = "getModelInstance", tag = "models",
+    params(("instance_id" = String, Path, description = "Model instance ID")),
     responses(
-        (status = 200, description = "Coalescing native model-instance invalidations", body = String, content_type = "text/event-stream"),
+        (status = 200, description = "Exact model instance", body = ModelInstance),
+        (status = 404, description = "Model instance not found", body = ErrorResponse),
         (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
     )
 )]
-async fn watch_model_instances(
+async fn model_instance(
     State(state): State<AppState>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    Path(instance_id): Path<String>,
+) -> Result<Json<ModelInstance>, ApiError> {
     let controller = state
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let events = controller.watch_instances();
-    let framed = tokio_stream::StreamExt::map(events, |event| {
-        Ok(Event::default()
-            .id(event.revision.to_string())
-            .data(serde_json::to_string(&event).expect("instance invalidation is serializable")))
+    controller
+        .instances()
+        .await
+        .instances
+        .into_iter()
+        .find(|instance| instance.id.0 == instance_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(instance_id)))
+}
+
+#[utoipa::path(get, path = "/api/v1/events", operation_id = "watchInferenceEvents", tag = "system",
+    params(("topics" = Option<String>, Query, description = "Comma-separated inference resource topics")),
+    responses(
+        (status = 200, description = "Multiplexed native inference-resource invalidations", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid resource topic filter", body = ErrorResponse),
+        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
+    )
+)]
+async fn watch_inference_events(
+    State(state): State<AppState>,
+    Query(query): Query<InferenceEventQuery>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let selected = match query.topics {
+        None => None,
+        Some(topics) => {
+            let values = topics
+                .split(',')
+                .map(str::trim)
+                .filter(|topic| !topic.is_empty())
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            if values.is_empty() {
+                return Err(ApiError::invalid("topics must name at least one resource"));
+            }
+            for topic in &values {
+                if InferenceResourceTopic::parse(topic).is_none() {
+                    return Err(ApiError::invalid(format!(
+                        "unknown inference resource topic: {topic}"
+                    )));
+                }
+            }
+            Some(values)
+        }
+    };
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    let instance_events =
+        futures_util::StreamExt::flat_map(controller.watch_instances(), |event| {
+            futures_util::stream::iter(
+                [
+                    InferenceResourceTopic::Instances,
+                    InferenceResourceTopic::Hardware,
+                ]
+                .map(|topic| InferenceResourceInvalidation {
+                    topic,
+                    revision: event.revision,
+                }),
+            )
+        });
+    let download_events = futures_util::StreamExt::flat_map(downloads.watch(), |event| {
+        futures_util::stream::iter(
+            [
+                InferenceResourceTopic::Downloads,
+                InferenceResourceTopic::Models,
+                InferenceResourceTopic::Packages,
+            ]
+            .map(|topic| InferenceResourceInvalidation {
+                topic,
+                revision: event.revision,
+            }),
+        )
+    });
+    let policy_events =
+        futures_util::StreamExt::map(controller.watch_residency_policy(), |event| {
+            InferenceResourceInvalidation {
+                topic: InferenceResourceTopic::ResidencyPolicy,
+                revision: event.revision,
+            }
+        });
+    let direct_events = futures_util::stream::unfold(
+        state.resource_changes.subscribe(),
+        |mut receiver| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => return Some((event, receiver)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+    let events = futures_util::stream::select(
+        futures_util::stream::select(
+            futures_util::stream::select(instance_events, download_events),
+            policy_events,
+        ),
+        direct_events,
+    );
+    let events = futures_util::StreamExt::filter(events, move |event| {
+        std::future::ready(
+            selected
+                .as_ref()
+                .is_none_or(|topics| topics.contains(event.topic.as_str())),
+        )
+    });
+    let framed = tokio_stream::StreamExt::map(events, |invalidation| {
+        Ok(Event::default().event("invalidation").data(
+            serde_json::to_string(&invalidation).expect("inference invalidation is serializable"),
+        ))
     });
     Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
 }
 
-#[utoipa::path(get, path = "/v1/hardware", operation_id = "getHardware", tag = "system", responses(
+#[utoipa::path(get, path = "/api/v1/hardware", operation_id = "getHardware", tag = "system", responses(
     (status = 200, description = "Hardware visible to the pinned ICN process", body = HardwareSnapshot),
     (status = 500, description = "Hardware discovery failed", body = ErrorResponse)
 ))]
@@ -1402,7 +1706,7 @@ async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/hugging-face/models/search", operation_id = "searchHuggingFaceModels", tag = "hugging-face",
+#[utoipa::path(post, path = "/api/v1/sources/hugging-face/search", operation_id = "searchHuggingFaceModels", tag = "hugging-face",
     request_body(content = HuggingFaceModelSearchRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Live Hugging Face GGUF model search", body = HuggingFaceModelSearchResults),
@@ -1426,7 +1730,7 @@ async fn search_hugging_face_models(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/hugging-face/models/resolve", operation_id = "resolveHuggingFaceRepository", tag = "hugging-face",
+#[utoipa::path(post, path = "/api/v1/sources/hugging-face/resolve", operation_id = "resolveHuggingFaceRepository", tag = "hugging-face",
     request_body(content = HuggingFaceRepositoryRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Immutable snapshot of the requested live Hugging Face repository", body = HuggingFaceRepositorySnapshot),
@@ -1450,7 +1754,7 @@ async fn resolve_hugging_face_repository(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models/installed", operation_id = "listInstalledModels", tag = "models",
+#[utoipa::path(get, path = "/api/v1/packages", operation_id = "listInstalledModels", tag = "models",
     responses(
         (status = 200, description = "Verified model packages installed on this machine", body = InstalledModelPackagesResponse),
         (status = 500, description = "Installed package discovery failed", body = ErrorResponse)
@@ -1471,7 +1775,34 @@ async fn installed_models(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/models", operation_id = "listModels", tag = "models",
+#[utoipa::path(get, path = "/api/v1/packages/{package_id}", operation_id = "getInstalledModelPackage", tag = "models",
+    params(("package_id" = String, Path, description = "Model package ID")),
+    responses(
+        (status = 200, description = "Exact installed model package", body = InstalledModelPackage),
+        (status = 404, description = "Installed model package not found", body = ErrorResponse),
+        (status = 500, description = "Installed package discovery failed", body = ErrorResponse)
+    )
+)]
+async fn installed_model(
+    State(state): State<AppState>,
+    Path(package_id): Path<String>,
+) -> Result<Json<InstalledModelPackage>, ApiError> {
+    let installed = state
+        .installed_packages
+        .as_ref()
+        .ok_or_else(|| ApiError::server("installed model packages are not configured"))?;
+    installed
+        .list_installed()
+        .await
+        .map_err(ApiError::from_inventory)?
+        .packages
+        .into_iter()
+        .find(|package| package.package.id.0 == package_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(package_id)))
+}
+
+#[utoipa::path(get, path = "/api/v1/models", operation_id = "listModels", tag = "models",
     responses(
         (status = 200, description = "Catalog models joined with current local artifact state", body = ModelsResponse),
         (status = 500, description = "Model discovery failed", body = ErrorResponse)
@@ -1490,35 +1821,215 @@ async fn models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, A
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/catalog/reconcile", operation_id = "reconcileCatalogModel", tag = "models",
-    request_body(content = ReconcileCatalogModelRequest, content_type = "application/json"),
+#[utoipa::path(get, path = "/api/v1/models/{model_id}", operation_id = "getModel", tag = "models",
+    params(("model_id" = String, Path, description = "Canonical model ID")),
     responses(
-        (status = 200, description = "Catalog model reconciliation admission", body = ReconcileCatalogModelResponse),
-        (status = 404, description = "Catalog model not found", body = ErrorResponse),
-        (status = 500, description = "Catalog model reconciliation failed", body = ErrorResponse)
+        (status = 200, description = "Exact Model projection", body = InferenceModel),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 500, description = "Model discovery failed", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.models.catalog.reconcile", skip_all, err(Debug))]
-async fn reconcile_catalog_model(
+async fn model(
     State(state): State<AppState>,
-    Json(request): Json<ReconcileCatalogModelRequest>,
-) -> Result<Json<ReconcileCatalogModelResponse>, ApiError> {
+    Path(model_id): Path<String>,
+) -> Result<Json<InferenceModel>, ApiError> {
     let models = state
         .catalog_models
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
     models
-        .reconcile(request)
+        .list()
         .await
+        .map_err(ApiError::from_inventory)?
+        .models
+        .into_iter()
+        .find(|model| model.id == model_id)
         .map(Json)
-        .map_err(ApiError::from_inventory)
+        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(model_id)))
 }
 
-#[utoipa::path(delete, path = "/v1/models/installed/{package_id}", operation_id = "removeInstalledModel", tag = "models",
+#[utoipa::path(get, path = "/v1/models", operation_id = "listServableModels", tag = "inference",
+    responses(
+        (status = 200, description = "Installed models available for inference", body = OpenAiModelsResponse),
+        (status = 500, description = "Model discovery failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.inference.models.list", skip_all, err(Debug))]
+async fn standard_models(
+    State(state): State<AppState>,
+) -> Result<Json<OpenAiModelsResponse>, ApiError> {
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .list()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    let data = models
+        .models
+        .into_iter()
+        .filter(|model| matches!(model.local_state, CatalogModelLocalState::Installed { .. }))
+        .map(|model| OpenAiModel {
+            id: model.id,
+            object: "model",
+            created: 0,
+            owned_by: "magnitude",
+        })
+        .collect();
+    Ok(Json(OpenAiModelsResponse {
+        object: "list",
+        data,
+    }))
+}
+
+#[utoipa::path(post, path = "/api/v1/models/install", operation_id = "installModel", tag = "models",
+    request_body(content = ModelIdentityRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Model installation admission", body = InstallModelResponse),
+        (status = 400, description = "Invalid canonical model identity", body = ErrorResponse),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 409, description = "Model installation cannot currently be admitted", body = ErrorResponse),
+        (status = 422, description = "Downloaded model failed integrity validation", body = ErrorResponse),
+        (status = 500, description = "Catalog model reconciliation failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.models.install", skip_all, err(Debug))]
+async fn install_model(
+    State(state): State<AppState>,
+    Json(request): Json<ModelIdentityRequest>,
+) -> Result<Json<InstallModelResponse>, ApiError> {
+    let Some((model_id, variant_id)) = request.model_id.split_once(':') else {
+        return Err(ApiError::invalid(
+            "modelId must be a canonical model and variant ID",
+        ));
+    };
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
+    let response = models
+        .install(InstallCatalogModelRequest {
+            model_id: icn_contracts::models::CatalogModelId(model_id.to_owned()),
+            variant_id: icn_contracts::models::CatalogVariantId(variant_id.to_owned()),
+        })
+        .await
+        .map_err(ApiError::from_inventory)?;
+    if matches!(response, InstallModelResponse::Current) {
+        state.invalidate_resources([
+            InferenceResourceTopic::Models,
+            InferenceResourceTopic::Packages,
+        ]);
+    }
+    Ok(Json(response))
+}
+
+#[utoipa::path(post, path = "/api/v1/models/uninstall", operation_id = "uninstallModel", tag = "models",
+    request_body(content = ModelIdentityRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Model packages safely removed or retained because they are shared", body = UninstallModelResponse),
+        (status = 400, description = "Invalid model identity or request", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 409, description = "Model is active or package deletion is unsafe", body = ErrorResponse),
+        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
+        (status = 500, description = "Model reconciliation or package removal failed", body = ErrorResponse)
+    )
+)]
+async fn uninstall_model(
+    State(state): State<AppState>,
+    Json(request): Json<ModelIdentityRequest>,
+) -> Result<Json<UninstallModelResponse>, ApiError> {
+    let models = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .list()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    let target = models
+        .models
+        .iter()
+        .find(|model| model.id == request.model_id)
+        .ok_or_else(|| {
+            ApiError::from_inventory(InventoryError::NotFound(request.model_id.clone()))
+        })?;
+    let target_packages = match &target.local_state {
+        CatalogModelLocalState::NotInstalled => Vec::new(),
+        CatalogModelLocalState::Installed { installation, .. } => installation
+            .packages
+            .iter()
+            .map(|package| package.package.id.clone())
+            .collect::<Vec<_>>(),
+    };
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    if controller
+        .instances()
+        .await
+        .instances
+        .iter()
+        .any(|instance| {
+            instance.model_id == request.model_id
+                && !matches!(
+                    instance.lifecycle,
+                    ModelInstanceLifecycle::Stopped { .. } | ModelInstanceLifecycle::Failed { .. }
+                )
+        })
+    {
+        return Err(ApiError::from_inventory(InventoryError::Loaded(
+            request.model_id,
+        )));
+    }
+    let shared = models
+        .models
+        .iter()
+        .filter(|model| model.id != request.model_id)
+        .filter_map(|model| match &model.local_state {
+            CatalogModelLocalState::NotInstalled => None,
+            CatalogModelLocalState::Installed { installation, .. } => Some(installation),
+        })
+        .flat_map(|installation| {
+            installation
+                .packages
+                .iter()
+                .map(|package| package.package.id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut removed_package_ids = Vec::new();
+    let mut retained_package_ids = Vec::new();
+    for package_id in target_packages {
+        if shared.contains(&package_id) {
+            retained_package_ids.push(package_id);
+        } else {
+            controller
+                .remove_installed(package_id.clone())
+                .await
+                .map_err(ApiError::from_inventory)?;
+            removed_package_ids.push(package_id);
+        }
+    }
+    if !removed_package_ids.is_empty() {
+        state.invalidate_resources([
+            InferenceResourceTopic::Models,
+            InferenceResourceTopic::Packages,
+        ]);
+    }
+    Ok(Json(UninstallModelResponse {
+        model_id: request.model_id,
+        removed_package_ids,
+        retained_package_ids,
+    }))
+}
+
+#[utoipa::path(delete, path = "/api/v1/packages/{package_id}", operation_id = "removeInstalledModel", tag = "models",
     params(("package_id" = String, Path, description = "Canonical model package identity")),
     responses(
         (status = 200, description = "Installed package removal result", body = RemoveInstalledModelPackageResponse),
+        (status = 400, description = "Invalid package identity or request", body = ErrorResponse),
         (status = 404, description = "Installed package not found", body = ErrorResponse),
+        (status = 409, description = "Package deletion is currently unsafe", body = ErrorResponse),
+        (status = 422, description = "Installed package failed integrity validation", body = ErrorResponse),
         (status = 500, description = "Installed package removal failed", body = ErrorResponse)
     )
 )]
@@ -1531,39 +2042,27 @@ async fn remove_installed_model(
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    controller
+    let response = controller
         .remove_installed(ModelPackageId(package_id))
         .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
+        .map_err(ApiError::from_inventory)?;
+    if response.removed {
+        state.invalidate_resources([
+            InferenceResourceTopic::Models,
+            InferenceResourceTopic::Packages,
+        ]);
+    }
+    Ok(Json(response))
 }
 
-#[utoipa::path(get, path = "/v1/models/catalog", operation_id = "getRecommendableModelCatalog", tag = "models",
-    responses(
-        (status = 200, description = "Resolved recommendable model catalog", body = RecommendableModelCatalog),
-        (status = 500, description = "Catalog publication failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.catalog", skip_all, err(Debug))]
-async fn recommendable_model_catalog(
-    State(state): State<AppState>,
-) -> Result<Json<RecommendableModelCatalog>, ApiError> {
-    let catalog = state
-        .recommendable_catalog
-        .as_ref()
-        .ok_or_else(|| ApiError::server("recommendable model catalog is not configured"))?;
-    catalog
-        .catalog()
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(post, path = "/v1/models/assess", operation_id = "assessModels", tag = "models",
+#[utoipa::path(post, path = "/api/v1/models/assess", operation_id = "assessModels", tag = "models",
     request_body(content = AssessModelsRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Exact target and profile assessments", body = AssessModelsResponse),
+        (status = 400, description = "Invalid assessment request", body = ErrorResponse),
+        (status = 404, description = "Assessment target not found", body = ErrorResponse),
         (status = 409, description = "Model assessment could not be completed", body = ErrorResponse),
+        (status = 422, description = "Assessment target failed integrity validation", body = ErrorResponse),
         (status = 500, description = "Assessment operation failed", body = ErrorResponse)
     )
 )]
@@ -1583,30 +2082,7 @@ async fn assess_models(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/downloads", operation_id = "startModelDownload", tag = "models",
-    request_body(content = StartModelDownloadRequest, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Authoritative model-download admission", body = StartModelDownloadResponse),
-        (status = 500, description = "Download could not start", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.downloads.start", skip_all, err(Debug))]
-async fn start_model_download(
-    State(state): State<AppState>,
-    Json(request): Json<StartModelDownloadRequest>,
-) -> Result<Json<StartModelDownloadResponse>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .start(request)
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(get, path = "/v1/models/downloads", operation_id = "listModelDownloads", tag = "models",
+#[utoipa::path(get, path = "/api/v1/downloads", operation_id = "listModelDownloads", tag = "models",
     responses(
         (status = 200, description = "Retained model downloads and internal package attempts", body = ModelDownloadsResponse),
         (status = 500, description = "Model downloads unavailable", body = ErrorResponse)
@@ -1627,11 +2103,40 @@ async fn model_downloads(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
+#[utoipa::path(get, path = "/api/v1/downloads/{download_id}", operation_id = "getModelDownload", tag = "models",
+    params(("download_id" = String, Path, description = "Model download ID")),
+    responses(
+        (status = 200, description = "Exact model download", body = ModelDownload),
+        (status = 404, description = "Model download not found", body = ErrorResponse),
+        (status = 500, description = "Model downloads unavailable", body = ErrorResponse)
+    )
+)]
+async fn model_download(
+    State(state): State<AppState>,
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    downloads
+        .list()
+        .await
+        .map_err(ApiError::from_inventory)?
+        .downloads
+        .into_iter()
+        .find(|download| download.id.0 == download_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(download_id)))
+}
+
+#[utoipa::path(post, path = "/api/v1/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
     params(("download_id" = String, Path, description = "Model download ID")),
     responses(
         (status = 200, description = "Cancelled or terminal model download", body = ModelDownload),
-        (status = 404, description = "Model download not found", body = ErrorResponse)
+        (status = 400, description = "Model download cannot be cancelled", body = ErrorResponse),
+        (status = 404, description = "Model download not found", body = ErrorResponse),
+        (status = 500, description = "Model download cancellation failed", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(name = "icn.models.downloads.cancel", skip_all, err(Debug))]
@@ -1650,12 +2155,13 @@ async fn cancel_model_download(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/v1/models/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
+#[utoipa::path(post, path = "/api/v1/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
     params(("download_id" = String, Path, description = "Failed model download ID")),
     responses(
         (status = 200, description = "Acknowledged failed model download", body = ModelDownload),
         (status = 400, description = "Model download has not failed", body = ErrorResponse),
-        (status = 404, description = "Model download not found", body = ErrorResponse)
+        (status = 404, description = "Model download not found", body = ErrorResponse),
+        (status = 500, description = "Model download acknowledgement failed", body = ErrorResponse)
     )
 )]
 #[tracing::instrument(
@@ -1678,8 +2184,13 @@ async fn acknowledge_model_download_failure(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/v1/props", operation_id = "getModelProperties", tag = "models", responses(
+#[utoipa::path(post, path = "/api/v1/models/{model_id}/properties", operation_id = "getModelProperties", tag = "models",
+    params(("model_id" = String, Path, description = "Canonical model ID")), responses(
     (status = 200, description = "Loaded model and active template properties", body = PropsResponse),
+    (status = 400, description = "Invalid model identity or request", body = ErrorResponse),
+    (status = 404, description = "Model is not installed", body = ErrorResponse),
+    (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
+    (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
     (status = 500, description = "Properties unavailable", body = ErrorResponse)
 ))]
 #[tracing::instrument(
@@ -1688,8 +2199,18 @@ async fn acknowledge_model_download_failure(
     fields(model.id = tracing::field::Empty),
     err(Debug)
 )]
-async fn props(State(state): State<AppState>) -> Result<Json<PropsResponse>, ApiError> {
-    let lease = lease_ready_instance(&state).await?;
+async fn props(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<PropsResponse>, ApiError> {
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let lease = controller
+        .acquire_for_inference(model_id, None)
+        .await
+        .map_err(ApiError::from_inventory)?;
     tracing::Span::current().record("model.id", lease.model_id());
     let properties = lease
         .backend()
@@ -1698,11 +2219,14 @@ async fn props(State(state): State<AppState>) -> Result<Json<PropsResponse>, Api
     Ok(Json(props_response(properties)))
 }
 
-#[utoipa::path(post, path = "/v1/apply-template", operation_id = "applyChatTemplate", tag = "chat",
+#[utoipa::path(post, path = "/api/v1/chat/templates/apply", operation_id = "applyChatTemplate", tag = "chat",
     request_body = ApplyTemplateRequest,
     responses(
         (status = 200, description = "Prepared native chat prompt and constraints", body = ApplyTemplateResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model is not installed", body = ErrorResponse),
+        (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
+        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
         (status = 500, description = "Template preparation failed", body = ErrorResponse)
     )
 )]
@@ -1716,7 +2240,7 @@ async fn apply_template(
     State(state): State<AppState>,
     Json(request): Json<ApplyTemplateRequest>,
 ) -> Result<Json<ApplyTemplateResponse>, ApiError> {
-    let configuration_id = request
+    let model_id = request
         .model
         .as_ref()
         .filter(|model| !model.is_empty())
@@ -1727,10 +2251,7 @@ async fn apply_template(
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     let lease = controller
-        .lease(
-            ModelInstanceId(request.model_instance_id.clone()),
-            ModelServingConfigurationId(configuration_id),
-        )
+        .acquire_for_inference(model_id, None)
         .await
         .map_err(ApiError::from_inventory)?;
     tracing::Span::current().record("model.id", lease.model_id());
@@ -1750,8 +2271,592 @@ async fn apply_template(
     Ok(Json(apply_template_response(prepared)))
 }
 
+fn response_input_messages(
+    input: JsonValue,
+    instructions: Option<String>,
+) -> Result<Vec<JsonValue>, ApiError> {
+    let mut messages = instructions
+        .map(|content| vec![serde_json::json!({ "role": "system", "content": content })])
+        .unwrap_or_default();
+    match input {
+        JsonValue::String(content) => {
+            messages.push(serde_json::json!({ "role": "user", "content": content }));
+        }
+        JsonValue::Array(items) => {
+            for mut item in items {
+                let object = item
+                    .as_object_mut()
+                    .ok_or_else(|| ApiError::invalid("Responses input items must be objects"))?;
+                if object.get("type").and_then(JsonValue::as_str) == Some("function_call_output") {
+                    let call_id = object
+                        .get("call_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| {
+                            ApiError::invalid("function_call_output requires call_id")
+                        })?;
+                    let output = object
+                        .get("output")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| {
+                            ApiError::invalid("function_call_output requires string output")
+                        })?;
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output,
+                    }));
+                    continue;
+                }
+                let role = object
+                    .get("role")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| ApiError::invalid("Responses message input requires role"))?;
+                let content = object
+                    .remove("content")
+                    .ok_or_else(|| ApiError::invalid("Responses message input requires content"))?;
+                let content = match content {
+                    JsonValue::String(text) => JsonValue::String(text),
+                    JsonValue::Array(parts) => JsonValue::Array(
+                        parts
+                            .into_iter()
+                            .map(|part| {
+                                let Some(mut part) = part.as_object().cloned() else {
+                                    return part;
+                                };
+                                match part.get("type").and_then(JsonValue::as_str) {
+                                    Some("input_text") => {
+                                        part.insert(
+                                            "type".to_owned(),
+                                            JsonValue::String("text".to_owned()),
+                                        );
+                                    }
+                                    Some("input_image") => {
+                                        if let Some(url) = part.remove("image_url") {
+                                            part.insert(
+                                                "type".to_owned(),
+                                                JsonValue::String("image_url".to_owned()),
+                                            );
+                                            part.insert(
+                                                "image_url".to_owned(),
+                                                serde_json::json!({ "url": url }),
+                                            );
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                JsonValue::Object(part)
+                            })
+                            .collect(),
+                    ),
+                    _ => return Err(ApiError::invalid("Responses message content is invalid")),
+                };
+                messages.push(serde_json::json!({ "role": role, "content": content }));
+            }
+        }
+        _ => {
+            return Err(ApiError::invalid(
+                "Responses input must be a string or input array",
+            ));
+        }
+    }
+    Ok(messages)
+}
+
+fn response_tools(tools: Option<Vec<JsonValue>>) -> Result<Option<Vec<JsonValue>>, ApiError> {
+    tools
+        .map(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| {
+                    let object = tool
+                        .as_object()
+                        .ok_or_else(|| ApiError::invalid("Responses tools must be objects"))?;
+                    if object.get("type").and_then(JsonValue::as_str) != Some("function") {
+                        return Err(ApiError::invalid(
+                            "ICN Responses currently supports function tools only",
+                        ));
+                    }
+                    Ok(serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": object.get("name"),
+                            "description": object.get("description"),
+                            "parameters": object.get("parameters"),
+                            "strict": object.get("strict"),
+                        }
+                    }))
+                })
+                .collect::<Result<Vec<_>, ApiError>>()
+        })
+        .transpose()
+}
+
+fn response_tool_choice(choice: Option<JsonValue>) -> Option<JsonValue> {
+    choice.map(|choice| match choice {
+        JsonValue::Object(object)
+            if object.get("type").and_then(JsonValue::as_str) == Some("function") =>
+        {
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": object.get("name") },
+            })
+        }
+        choice => choice,
+    })
+}
+
+fn response_chat_request(
+    request: ResponseCreateRequest,
+) -> Result<ChatCompletionRequest, ApiError> {
+    if !request.stream {
+        return Err(ApiError::invalid(
+            "ICN's Responses endpoint currently requires stream: true",
+        ));
+    }
+    let reasoning_effort = request
+        .reasoning
+        .as_ref()
+        .and_then(JsonValue::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .cloned();
+    serde_json::from_value(serde_json::json!({
+        "model": request.model,
+        "messages": response_input_messages(request.input, request.instructions)?,
+        "max_completion_tokens": request.max_output_tokens,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "tools": response_tools(request.tools)?,
+        "tool_choice": response_tool_choice(request.tool_choice),
+        "parallel_tool_calls": request.parallel_tool_calls,
+        "reasoning_effort": reasoning_effort,
+        "stream": true,
+    }))
+    .map_err(|error| ApiError::invalid(format!("Responses request is invalid: {error}")))
+}
+
+fn send_response_event(
+    sender: &mpsc::Sender<Result<Event, Infallible>>,
+    sequence: &AtomicU64,
+    event_type: &'static str,
+    mut data: serde_json::Map<String, JsonValue>,
+) -> bool {
+    data.insert("type".to_owned(), JsonValue::String(event_type.to_owned()));
+    data.insert(
+        "sequence_number".to_owned(),
+        JsonValue::from(sequence.fetch_add(1, Ordering::Relaxed)),
+    );
+    serde_json::to_string(&data)
+        .ok()
+        .and_then(|data| {
+            sender
+                .blocking_send(Ok(Event::default().event(event_type).data(data)))
+                .ok()
+        })
+        .is_some()
+}
+
+async fn send_response_event_async(
+    sender: &mpsc::Sender<Result<Event, Infallible>>,
+    sequence: &AtomicU64,
+    event_type: &'static str,
+    mut data: serde_json::Map<String, JsonValue>,
+) -> bool {
+    data.insert("type".to_owned(), JsonValue::String(event_type.to_owned()));
+    data.insert(
+        "sequence_number".to_owned(),
+        JsonValue::from(sequence.fetch_add(1, Ordering::Relaxed)),
+    );
+    let Ok(data) = serde_json::to_string(&data) else {
+        return false;
+    };
+    sender
+        .send(Ok(Event::default().event(event_type).data(data)))
+        .await
+        .is_ok()
+}
+
+fn response_base(
+    id: &str,
+    created_at: u64,
+    model: &str,
+    status: &str,
+    output: JsonValue,
+) -> JsonValue {
+    serde_json::json!({
+        "id": id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": { "effort": null, "summary": null },
+        "store": false,
+        "temperature": null,
+        "text": { "format": { "type": "text" } },
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": null,
+        "truncation": "disabled",
+        "usage": null,
+        "metadata": {},
+    })
+}
+
+#[utoipa::path(post, path = "/v1/responses", operation_id = "createResponse", tag = "inference",
+    request_body(content = ResponseCreateRequest, content_type = "application/json"),
+    params(
+        ("Magnitude-Include-Progress" = Option<bool>, Header, nullable = false, description = "Include Magnitude loading and inference progress events")
+    ),
+    responses(
+        (status = 200, description = "OpenAI-compatible Responses event stream", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid Responses request", body = ErrorResponse),
+        (status = 404, description = "Requested model is unavailable", body = ErrorResponse),
+        (status = 409, description = "Model unavailable", body = ErrorResponse),
+        (status = 422, description = "Runtime target failed validation", body = ErrorResponse),
+        (status = 500, description = "Inference failed", body = ErrorResponse)
+    )
+)]
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ResponseCreateRequest>,
+) -> Result<Response, ApiError> {
+    let request = validate_request(response_chat_request(request)?)?;
+    let model = request
+        .model
+        .clone()
+        .ok_or_else(|| ApiError::invalid("model is required"))?;
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let id = format!("resp_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
+    let message_id = format!("msg_{}", &id[5..]);
+    let created_at = unix_timestamp();
+    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(32);
+    let sequence = Arc::new(AtomicU64::new(0));
+    let include_progress = headers
+        .get("Magnitude-Include-Progress")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let progress = include_progress.then(|| {
+        let sender = sender.clone();
+        let sequence = Arc::clone(&sequence);
+        let response_id = id.clone();
+        Arc::new(move |fraction| {
+            let data = serde_json::json!({
+                "type": "response.magnitude_progress",
+                "sequence_number": sequence.fetch_add(1, Ordering::Relaxed),
+                "response_id": response_id,
+                "progress": { "phase": "model_loading", "fraction": fraction },
+            });
+            if let Ok(data) = serde_json::to_string(&data) {
+                let _ = sender.try_send(Ok(Event::default()
+                    .event("response.magnitude_progress")
+                    .data(data)));
+            }
+        }) as ModelLoadingObserver
+    });
+    let admitted_lease = if include_progress {
+        None
+    } else {
+        Some(
+            controller
+                .acquire_for_inference(model.clone(), None)
+                .await
+                .map_err(ApiError::from_inventory)?,
+        )
+    };
+    let controller = Arc::clone(controller);
+    tokio::spawn(async move {
+        let in_progress = response_base(
+            &id,
+            created_at,
+            &model,
+            "in_progress",
+            serde_json::json!([]),
+        );
+        if !send_response_event_async(
+            &sender,
+            &sequence,
+            "response.created",
+            serde_json::json!({ "response": in_progress.clone() })
+                .as_object()
+                .expect("response event object")
+                .clone(),
+        )
+        .await
+        {
+            return;
+        }
+        let lease_result = match admitted_lease {
+            Some(lease) => Ok(lease),
+            None => tokio::select! {
+                result = controller.acquire_for_inference(model.clone(), progress) => result,
+                _ = sender.closed() => return,
+            },
+        };
+        let lease = match lease_result {
+            Ok(lease) => lease,
+            Err(error) => {
+                let error = ApiError::from_inventory(error);
+                let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
+                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
+                    "error": error.body.error,
+                }).as_object().expect("response event object").clone()).await;
+                return;
+            }
+        };
+        if let Err(error) = validate_model_selection(request.model.as_deref(), &lease) {
+            let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
+                "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
+                "error": error.body.error,
+            }).as_object().expect("response event object").clone()).await;
+            return;
+        }
+        let properties = match lease.backend().properties() {
+            Ok(properties) => properties,
+            Err(error) => {
+                let error = ApiError::from_inference(error);
+                let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
+                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
+                    "error": error.body.error,
+                }).as_object().expect("response event object").clone()).await;
+                return;
+            }
+        };
+        let request = match finalize_request(request, &properties.reasoning) {
+            Ok((request, _)) => request,
+            Err(error) => {
+                let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
+                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
+                    "error": error.body.error,
+                }).as_object().expect("response event object").clone()).await;
+                return;
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+        if !send_response_event(
+            &sender,
+            &sequence,
+            "response.in_progress",
+            serde_json::json!({ "response": in_progress })
+                .as_object()
+                .expect("response event object")
+                .clone(),
+        ) {
+            return;
+        }
+        let item = serde_json::json!({
+            "id": message_id,
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        });
+        if !send_response_event(
+            &sender,
+            &sequence,
+            "response.output_item.added",
+            serde_json::json!({
+                "output_index": 0, "item": item,
+            })
+            .as_object()
+            .expect("response event object")
+            .clone(),
+        ) {
+            return;
+        }
+        if !send_response_event(
+            &sender,
+            &sequence,
+            "response.content_part.added",
+            serde_json::json!({
+                "item_id": message_id, "output_index": 0, "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] },
+            })
+            .as_object()
+            .expect("response event object")
+            .clone(),
+        ) {
+            return;
+        }
+        let mut text = String::new();
+        let mut tool_calls = BTreeMap::<usize, (String, String, String, String)>::new();
+        let mut callback = |event: InferenceStreamEvent| {
+            match event.delta {
+                InferenceEvent::Progress(progress) => {
+                    if include_progress {
+                        let progress = match progress {
+                            InferenceProgress::Queued => serde_json::json!({ "phase": "queued" }),
+                            InferenceProgress::Preparing => serde_json::json!({ "phase": "preparing" }),
+                            InferenceProgress::Prefill { completed_tokens, total_tokens, cached_tokens } =>
+                                serde_json::json!({ "phase": "prefill", "completed_tokens": completed_tokens, "total_tokens": total_tokens, "cached_tokens": cached_tokens }),
+                            InferenceProgress::Generating => serde_json::json!({ "phase": "generating" }),
+                        };
+                        if !send_response_event(&sender, &sequence, "response.magnitude_progress", serde_json::json!({
+                            "response_id": id, "progress": progress,
+                        }).as_object().expect("response event object").clone()) {
+                            return Err(InferenceError::Callback("stream consumer disconnected".into()));
+                        }
+                    }
+                }
+                InferenceEvent::ContentDelta { text: delta } => {
+                    text.push_str(&delta);
+                    if !send_response_event(&sender, &sequence, "response.output_text.delta", serde_json::json!({
+                        "item_id": message_id, "output_index": 0, "content_index": 0, "delta": delta,
+                    }).as_object().expect("response event object").clone()) {
+                        return Err(InferenceError::Callback("stream consumer disconnected".into()));
+                    }
+                }
+                InferenceEvent::ReasoningDelta { text: delta } => {
+                    if !send_response_event(&sender, &sequence, "response.reasoning_text.delta", serde_json::json!({
+                        "item_id": message_id, "output_index": 0, "content_index": 0, "delta": delta,
+                    }).as_object().expect("response event object").clone()) {
+                        return Err(InferenceError::Callback("stream consumer disconnected".into()));
+                    }
+                }
+                InferenceEvent::ToolCallDelta { index, id: call_id, name, arguments } => {
+                    if !tool_calls.contains_key(&index) {
+                        let item_id = format!("fc_{}_{}", id, index);
+                        let call_id = call_id.clone().unwrap_or_else(|| format!("call_{}_{}", id, index));
+                        let function_name = name.clone().unwrap_or_default();
+                        tool_calls.insert(index, (
+                            item_id.clone(), call_id.clone(), function_name.clone(), String::new(),
+                        ));
+                        if !send_response_event(&sender, &sequence, "response.output_item.added", serde_json::json!({
+                            "output_index": index + 1,
+                            "item": { "id": item_id, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": function_name, "arguments": "" },
+                        }).as_object().expect("response event object").clone()) {
+                            return Err(InferenceError::Callback("stream consumer disconnected".into()));
+                        }
+                    }
+                    let entry = tool_calls.get_mut(&index).expect("tool call was inserted");
+                    if let Some(name) = name { entry.2 = name; }
+                    if !arguments.is_empty() {
+                        entry.3.push_str(&arguments);
+                        if !send_response_event(&sender, &sequence, "response.function_call_arguments.delta", serde_json::json!({
+                            "item_id": entry.0, "output_index": index + 1, "delta": arguments,
+                        }).as_object().expect("response event object").clone()) {
+                            return Err(InferenceError::Callback("stream consumer disconnected".into()));
+                        }
+                    }
+                }
+                InferenceEvent::StreamStart => {}
+            }
+            Ok(())
+        };
+        let generation = match lease.backend().complete(request, &mut callback) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = send_response_event(&sender, &sequence, "response.failed", serde_json::json!({
+                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
+                    "error": inference_error_body(&error),
+                }).as_object().expect("response event object").clone());
+                return;
+            }
+        };
+        let content =
+            serde_json::json!([{ "type": "output_text", "text": text, "annotations": [] }]);
+        let completed_item = serde_json::json!({
+            "id": message_id, "type": "message", "status": "completed", "role": "assistant", "content": content,
+        });
+        for (event_type, data) in [
+            (
+                "response.output_text.done",
+                serde_json::json!({ "item_id": message_id, "output_index": 0, "content_index": 0, "text": text }),
+            ),
+            (
+                "response.content_part.done",
+                serde_json::json!({ "item_id": message_id, "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text, "annotations": [] } }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({ "output_index": 0, "item": completed_item }),
+            ),
+        ] {
+            if !send_response_event(
+                &sender,
+                &sequence,
+                event_type,
+                data.as_object().expect("response event object").clone(),
+            ) {
+                return;
+            }
+        }
+        let mut output = vec![completed_item];
+        for (index, (item_id, call_id, name, arguments)) in tool_calls {
+            let item = serde_json::json!({
+                "id": item_id, "type": "function_call", "status": "completed",
+                "call_id": call_id, "name": name, "arguments": arguments,
+            });
+            for (event_type, data) in [
+                (
+                    "response.function_call_arguments.done",
+                    serde_json::json!({
+                        "item_id": item_id.clone(), "output_index": index + 1, "arguments": arguments.clone(),
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    serde_json::json!({ "output_index": index + 1, "item": item.clone() }),
+                ),
+            ] {
+                if !send_response_event(
+                    &sender,
+                    &sequence,
+                    event_type,
+                    data.as_object().expect("response event object").clone(),
+                ) {
+                    return;
+                }
+            }
+            output.push(item);
+        }
+        let mut completed = response_base(
+            &id,
+            created_at,
+            &model,
+            "completed",
+            JsonValue::Array(output),
+        );
+        completed["usage"] = serde_json::json!({
+            "input_tokens": generation.prompt_tokens,
+            "input_tokens_details": { "cached_tokens": generation.cached_prompt_tokens },
+            "output_tokens": generation.generated_tokens,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": generation.prompt_tokens.saturating_add(generation.generated_tokens),
+        });
+        let _ = send_response_event(
+            &sender,
+            &sequence,
+            "response.completed",
+            serde_json::json!({
+                "response": completed,
+            })
+            .as_object()
+            .expect("response event object")
+            .clone(),
+        );
+        }).await.ok();
+    });
+    Ok(Sse::new(ReceiverStream::new(receiver))
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
 #[utoipa::path(post, path = "/v1/chat/completions", operation_id = "createChatCompletion", tag = "chat",
     request_body = ChatCompletionRequest,
+    params(
+        ("Magnitude-Include-Progress" = Option<bool>, Header, nullable = false, description = "Include Magnitude loading and inference progress events")
+    ),
     responses(
         (status = 200, description = "OpenAI-compatible server-sent events", body = String, content_type = "text/event-stream"),
         (status = 400, description = "Invalid request", body = ErrorResponse),
@@ -1769,6 +2874,7 @@ async fn apply_template(
 )]
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let request = validate_request(request)?;
@@ -1781,11 +2887,61 @@ async fn chat_completions(
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let include_progress = headers
+        .get("Magnitude-Include-Progress")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if include_progress {
+        let id = format!(
+            "chatcmpl-icn-{}",
+            state.next_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let created = unix_timestamp();
+        let model = model_id.clone();
+        let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
+        let progress_sender = sender.clone();
+        let progress_id = id.clone();
+        let progress_model = model.clone();
+        let progress: ModelLoadingObserver = Arc::new(move |fraction| {
+            let chunk = loading_progress_chunk(&progress_id, created, &progress_model, fraction);
+            if let Ok(data) = serde_json::to_string(&chunk) {
+                let _ = progress_sender.try_send(Ok(Event::default().data(data)));
+            }
+        });
+        let controller = Arc::clone(controller);
+        let span = tracing::Span::current();
+        tokio::spawn(async move {
+            let acquisition = tokio::select! {
+                result = controller.acquire_for_inference(model_id, Some(progress)) => result,
+                _ = sender.closed() => return,
+            };
+            let result = match acquisition {
+                Ok(lease) => start_chat_completion(
+                    request,
+                    lease,
+                    id.clone(),
+                    created,
+                    sender.clone(),
+                    span,
+                    true,
+                ),
+                Err(error) => Err(ApiError::from_inventory(error)),
+            };
+            if let Err(error) = result {
+                if let Ok(data) =
+                    serde_json::to_string(&error_chunk(&id, created, &model, error.body.error))
+                {
+                    let _ = sender.send(Ok(Event::default().data(data))).await;
+                }
+                let _ = sender.send(Ok(Event::default().data("[DONE]"))).await;
+            }
+        });
+        return Ok(Sse::new(ReceiverStream::new(receiver))
+            .keep_alive(KeepAlive::default())
+            .into_response());
+    }
     let lease = controller
-        .lease(
-            request.model_instance_id.clone(),
-            ModelServingConfigurationId(model_id),
-        )
+        .acquire_for_inference(model_id, None)
         .await
         .map_err(ApiError::from_inventory)?;
     chat_completion_with_lease(state, request, lease).await
@@ -1796,22 +2952,47 @@ async fn chat_completion_with_lease(
     request: ValidatedChatRequest,
     lease: ModelInstanceLease,
 ) -> Result<Response, ApiError> {
-    validate_model_selection(request.model.as_deref(), &lease)?;
-    let properties = lease
-        .backend()
-        .properties()
-        .map_err(ApiError::from_inference)?;
-    let (request, include_usage) = finalize_request(request, &properties.reasoning)?;
     let id = format!(
         "chatcmpl-icn-{}",
         state.next_id.fetch_add(1, Ordering::Relaxed)
     );
     let created = unix_timestamp();
-    let model = lease.model_id().to_owned();
-    let current_span = tracing::Span::current();
+    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
+    start_chat_completion(
+        request,
+        lease,
+        id,
+        created,
+        sender,
+        tracing::Span::current(),
+        false,
+    )?;
+    Ok(Sse::new(ReceiverStream::new(receiver))
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+fn start_chat_completion(
+    request: ValidatedChatRequest,
+    lease: ModelInstanceLease,
+    id: String,
+    created: u64,
+    sender: mpsc::Sender<Result<Event, Infallible>>,
+    current_span: tracing::Span,
+    include_progress: bool,
+) -> Result<(), ApiError> {
+    validate_model_selection(request.model.as_deref(), &lease)?;
+    let properties = lease
+        .backend()
+        .properties()
+        .map_err(ApiError::from_inference)?;
+    let model = request
+        .model
+        .clone()
+        .unwrap_or_else(|| lease.model_id().to_owned());
+    let (request, include_usage) = finalize_request(request, &properties.reasoning)?;
     current_span.record("completion.id", id.as_str());
     current_span.record("model.id", model.as_str());
-    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
 
     let span = current_span;
     tokio::task::spawn_blocking(move || {
@@ -1823,6 +3004,7 @@ async fn chat_completion_with_lease(
                 } = event;
                 let timings = timings.map(|snapshot| snapshot_timings(&snapshot));
                 let chunk = match event {
+                    InferenceEvent::Progress(_) if !include_progress => return Ok(()),
                     InferenceEvent::Progress(progress) => {
                         progress_chunk(&id, created, &model, progress)
                     }
@@ -1890,9 +3072,7 @@ async fn chat_completion_with_lease(
             emit_done(&sender);
         });
     });
-    Ok(Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response())
+    Ok(())
 }
 
 fn choice_chunk(
@@ -1989,6 +3169,27 @@ fn progress_chunk(
         model: model.into(),
         choices: Vec::new(),
         progress: Some(progress),
+        usage: None,
+        timings: None,
+        error: None,
+    }
+}
+
+fn loading_progress_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    fraction: f32,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.into(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.into(),
+        choices: Vec::new(),
+        progress: Some(ChatCompletionProgress::ModelLoading {
+            fraction: fraction.clamp(0.0, 1.0),
+        }),
         usage: None,
         timings: None,
         error: None,
@@ -2132,24 +3333,6 @@ fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
     }
 }
 
-async fn lease_ready_instance(state: &AppState) -> Result<ModelInstanceLease, ApiError> {
-    let controller = state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let instance = controller
-        .instances()
-        .await
-        .instances
-        .into_iter()
-        .find(|instance| matches!(instance.lifecycle, ModelInstanceLifecycle::Ready { .. }))
-        .ok_or_else(|| ApiError::conflict("model_not_loaded", "no model instance is ready"))?;
-    controller
-        .lease(instance.id, instance.configuration_id)
-        .await
-        .map_err(ApiError::from_inventory)
-}
-
 fn validate_model_selection(
     requested: Option<&str>,
     lease: &ModelInstanceLease,
@@ -2168,7 +3351,6 @@ fn validate_apply_template_request(
     reasoning_profile: &icn_contracts::ReasoningProfile,
 ) -> Result<ChatTemplateRequest, ApiError> {
     let validated = validate_request(ChatCompletionRequest {
-        model_instance_id: request.model_instance_id,
         model: request.model,
         messages: request.messages,
         max_tokens: None,
@@ -2323,7 +3505,6 @@ fn apply_template_response(prepared: PreparedChatInfo) -> ApplyTemplateResponse 
 }
 
 struct ValidatedChatRequest {
-    model_instance_id: ModelInstanceId,
     model: Option<String>,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
@@ -2355,9 +3536,6 @@ fn validate_request(request: ChatCompletionRequest) -> Result<ValidatedChatReque
     }
     if request.model.as_deref().is_some_and(str::is_empty) {
         return Err(ApiError::invalid("model must not be empty"));
-    }
-    if request.model_instance_id.is_empty() {
-        return Err(ApiError::invalid("model_instance_id must not be empty"));
     }
     if request.max_tokens.is_some() && request.max_completion_tokens.is_some() {
         return Err(ApiError::invalid(
@@ -2399,7 +3577,6 @@ fn validate_request(request: ChatCompletionRequest) -> Result<ValidatedChatReque
     let response_format = response_format(request.response_format)?;
     let stop = stops(request.stop)?;
     Ok(ValidatedChatRequest {
-        model_instance_id: ModelInstanceId(request.model_instance_id),
         model: request.model,
         messages,
         tools,
@@ -2706,9 +3883,7 @@ fn reasoning_control(
                 ));
             }
             let effort = profile.default_effort.clone().ok_or_else(|| {
-                ApiError::invalid(
-                    "thinking_budget_tokens requires a classified reasoning default",
-                )
+                ApiError::invalid("thinking_budget_tokens requires a classified reasoning default")
             })?;
             return Ok(ReasoningControl::Resolved {
                 effort,
@@ -2823,53 +3998,59 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         health,
         hardware,
         models,
-        reconcile_catalog_model,
+        model,
+        standard_models,
+        install_model,
+        uninstall_model,
         search_hugging_face_models,
         resolve_hugging_face_repository,
         installed_models,
+        installed_model,
         remove_installed_model,
-        recommendable_model_catalog,
         assess_models,
-        start_model_download,
         model_downloads,
+        model_download,
         cancel_model_download,
         acknowledge_model_download_failure,
         preview_model_load,
-        load_model_instance,
+        ensure_model_instance,
         model_instances,
-        watch_model_instances,
+        model_instance,
+        watch_inference_events,
         stop_model_instance,
+        model_residency_policy,
         set_model_residency_policy,
         props,
         apply_template,
-        chat_completions
+        chat_completions,
+        responses
     ),
     components(schemas(
         HealthResponse,
         SetModelResidencyPolicyRequest,
+        ModelResidencyPolicyResponse,
         HardwareSnapshot,
         ModelsResponse,
-        ReconcileCatalogModelRequest,
-        ReconcileCatalogModelResponse,
+        ModelIdentityRequest,
+        UninstallModelResponse,
+        EnsureModelInstanceRequest,
+        OpenAiModel,
+        OpenAiModelsResponse,
+        InstallModelResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
         HuggingFaceRepositoryRequest,
         HuggingFaceRepositorySnapshot,
         InstalledModelPackagesResponse,
         RemoveInstalledModelPackageResponse,
-        RecommendableModelCatalog,
         AssessModelsRequest,
         AssessModelsResponse,
-        StartModelDownloadRequest,
-        StartModelDownloadResponse,
         ModelDownloadsResponse,
         ModelDownload,
-        LoadModelRequest,
-        PreviewModelLoadRequest,
         ModelLoadPlan,
-        ModelLoadEvent,
         ModelInstancesSnapshot,
         ModelInstancesInvalidation,
+        InferenceResourceInvalidation,
         PropsResponse,
         ExecutionConfigResponse,
         ExecutionSettingsResponse,
@@ -2884,6 +4065,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         ApplyTemplateResponse,
         GrammarTriggerResponse,
         ChatCompletionRequest,
+        ResponseCreateRequest,
         ChatMessageRequest,
         ChatContentRequest,
         ChatContentPartRequest,
@@ -2954,7 +4136,6 @@ enum StreamTermination {
 #[allow(dead_code)]
 enum StreamReconnect {
     None,
-    LastEventId,
 }
 
 #[derive(Debug, Serialize)]
@@ -3009,10 +4190,10 @@ impl StreamContract for ChatCompletionStream {
     }
 }
 
-struct ModelLoadStream;
+struct ResponsesStream;
 
-impl StreamContract for ModelLoadStream {
-    type Event = ModelLoadEvent;
+impl StreamContract for ResponsesStream {
+    type Event = ResponseStreamEvent;
     const RESPONSE_STATUS: u16 = 200;
 
     fn metadata() -> StreamMetadata {
@@ -3032,10 +4213,10 @@ impl StreamContract for ModelLoadStream {
     }
 }
 
-struct ModelInstancesWatchStream;
+struct InferenceEventsStream;
 
-impl StreamContract for ModelInstancesWatchStream {
-    type Event = ModelInstancesInvalidation;
+impl StreamContract for InferenceEventsStream {
+    type Event = InferenceResourceInvalidation;
     const RESPONSE_STATUS: u16 = 200;
 
     fn metadata() -> StreamMetadata {
@@ -3050,7 +4231,7 @@ impl StreamContract for ModelInstancesWatchStream {
                 },
             },
             termination: StreamTermination::LongLived,
-            reconnect: StreamReconnect::LastEventId,
+            reconnect: StreamReconnect::None,
         }
     }
 }
@@ -3081,14 +4262,14 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
         "createChatCompletion",
         "text/event-stream",
     )?;
-    attach_stream_contract::<ModelLoadStream>(
+    attach_stream_contract::<ResponsesStream>(
         &mut document,
-        "loadModelInstance",
+        "createResponse",
         "text/event-stream",
     )?;
-    attach_stream_contract::<ModelInstancesWatchStream>(
+    attach_stream_contract::<InferenceEventsStream>(
         &mut document,
-        "watchModelInstances",
+        "watchInferenceEvents",
         "text/event-stream",
     )?;
     Ok(document)
@@ -3312,7 +4493,36 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn direct_resource_invalidations_are_published_with_monotonic_revisions() {
+        let state = AppState::model_free();
+        let mut changes = state.resource_changes.subscribe();
+
+        state.invalidate_resources([
+            InferenceResourceTopic::Models,
+            InferenceResourceTopic::Packages,
+        ]);
+
+        let models = changes.recv().await.expect("models invalidation");
+        let packages = changes.recv().await.expect("packages invalidation");
+        assert_eq!(models.topic, InferenceResourceTopic::Models);
+        assert_eq!(packages.topic, InferenceResourceTopic::Packages);
+        assert!(packages.revision > models.revision);
+    }
+
+    #[tokio::test]
+    async fn invalid_inference_event_topics_are_rejected_before_opening_a_stream() {
+        for target in ["/api/v1/events?topics=unknown", "/api/v1/events?topics="] {
+            let response = app(AppState::model_free())
+                .oneshot(Request::get(target).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
 
     struct StubHardware;
 
@@ -3425,7 +4635,11 @@ mod tests {
         let response =
             app(AppState::new(FakeBackend::new("test-model", ""))
                 .with_hardware(Arc::new(StubHardware)))
-            .oneshot(Request::get("/v1/hardware").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/v1/hardware")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3441,7 +4655,7 @@ mod tests {
         let state = AppState::new(FakeBackend::new("test-model", ""));
         let accepted = app(state.clone())
             .oneshot(
-                Request::post("/v1/models/residency-policy")
+                Request::put("/api/v1/residency-policy")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({ "generation": 1, "idleTimeoutSeconds": 600 }).to_string(),
@@ -3454,7 +4668,7 @@ mod tests {
 
         let rejected = app(state)
             .oneshot(
-                Request::post("/v1/models/residency-policy")
+                Request::put("/api/v1/residency-policy")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({ "generation": 2, "idleTimeoutSeconds": 0 }).to_string(),
@@ -3472,7 +4686,7 @@ mod tests {
             .with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog));
         let search = app(state.clone())
             .oneshot(
-                Request::post("/v1/hugging-face/models/search")
+                Request::post("/api/v1/sources/hugging-face/search")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({ "query": "model", "limit": 5 }).to_string(),
@@ -3489,7 +4703,7 @@ mod tests {
 
         let resolve = app(state)
             .oneshot(
-                Request::post("/v1/hugging-face/models/resolve")
+                Request::post("/api/v1/sources/hugging-face/resolve")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({ "repository": "owner/model", "revision": "main" }).to_string(),
@@ -3512,7 +4726,6 @@ mod tests {
 
     fn minimal_request() -> Value {
         json!({
-            "model_instance_id": StaticModelInstanceController::INSTANCE_ID,
             "model": "test-model",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
@@ -3537,15 +4750,7 @@ mod tests {
             .collect()
     }
 
-    async fn post_chat(
-        backend: impl CompletionBackend,
-        mut request: Value,
-    ) -> (StatusCode, String) {
-        if let Some(request) = request.as_object_mut() {
-            request.entry("model_instance_id").or_insert_with(|| {
-                Value::String(StaticModelInstanceController::INSTANCE_ID.to_owned())
-            });
-        }
+    async fn post_chat(backend: impl CompletionBackend, request: Value) -> (StatusCode, String) {
         let response = app(AppState::new(backend))
             .oneshot(
                 Request::post("/v1/chat/completions")
@@ -3560,12 +4765,113 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    #[tokio::test]
+    async fn responses_stream_uses_the_same_model_pipeline() {
+        let response = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "input": "hi",
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("event: response.completed"));
+        assert!(body.contains("\"sequence_number\":0"));
+    }
+
+    #[tokio::test]
+    async fn chat_progress_is_present_only_when_explicitly_requested() {
+        let backend = || ScriptedBackend {
+            events: vec![
+                stream_event(InferenceEvent::Progress(InferenceProgress::Queued)),
+                stream_event(InferenceEvent::ContentDelta {
+                    text: "hello".into(),
+                }),
+            ],
+            fail: false,
+        };
+        let (status, body) = post_chat(backend(), minimal_request()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            stream_json(&body)
+                .iter()
+                .all(|chunk| chunk.get("progress").is_none())
+        );
+
+        let response = app(AppState::new(backend()))
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("Magnitude-Include-Progress", "true")
+                    .body(Body::from(minimal_request().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(stream_json(&body).iter().any(|chunk| {
+            chunk["progress"]["phase"] == "queued" && chunk["choices"] == json!([])
+        }));
+    }
+
     struct StubModelInstanceController {
         backend: Arc<dyn CompletionBackend>,
         leases: Arc<AtomicU64>,
+        pending_acquisition_dropped: Option<Arc<AtomicBool>>,
+    }
+
+    struct PendingAcquisitionDrop(Arc<AtomicBool>);
+
+    impl Drop for PendingAcquisitionDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
     }
 
     impl ModelInstanceController for StubModelInstanceController {
+        fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError> {
+            Ok(ModelResidencyPolicyResponse {
+                generation: 0,
+                idle_timeout_seconds: 600,
+            })
+        }
+
+        fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation> {
+            Box::pin(futures_util::stream::once(async {
+                ModelResidencyPolicyInvalidation { revision: 0 }
+            }))
+        }
+
         fn set_residency_policy(
             &self,
             _generation: u64,
@@ -3576,7 +4882,7 @@ mod tests {
 
         fn preview_load(
             &self,
-            _request: PreviewModelLoadRequest,
+            _model_id: String,
         ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
             Box::pin(async {
                 Err(InventoryError::Unsupported(
@@ -3585,18 +4891,21 @@ mod tests {
             })
         }
 
-        fn load_instance(&self, _request: LoadModelRequest) -> BoxStream<'static, ModelLoadEvent> {
-            Box::pin(futures_util::stream::once(async {
-                ModelLoadEvent::Failed {
-                    failure: icn_contracts::models::ModelFailure {
-                        code: "unsupported".to_owned(),
-                        message: "exact configuration loading is unavailable in the stub model controller"
-                            .to_owned(),
-                        retryable: false,
-                    }
-                    .into(),
-                }
-            }))
+        fn ensure_resident(
+            &self,
+            model_id: String,
+        ) -> BoxFuture<'_, Result<ModelInstance, InventoryError>> {
+            Box::pin(async move {
+                let lease = self.acquire_for_inference(model_id, None).await?;
+                self.instances()
+                    .await
+                    .instances
+                    .into_iter()
+                    .find(|instance| instance.id == lease.instance_id)
+                    .ok_or_else(|| {
+                        InventoryError::NotReady("model instance is not ready".to_owned())
+                    })
+            })
         }
 
         fn stop_instance(
@@ -3612,7 +4921,7 @@ mod tests {
                     revision: 0,
                     instances: vec![ModelInstance {
                         id: ModelInstanceId("test-instance".to_owned()),
-                        configuration_id: ModelServingConfigurationId("test-model".to_owned()),
+                        model_id: "test-model".to_owned(),
                         lifecycle: ModelInstanceLifecycle::Ready {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,
@@ -3645,11 +4954,10 @@ mod tests {
         fn lease(
             &self,
             instance_id: ModelInstanceId,
-            configuration_id: ModelServingConfigurationId,
         ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
             let backend = Arc::clone(&self.backend);
             Box::pin(async move {
-                if instance_id.0 != "test-instance" || configuration_id.0 != "test-model" {
+                if instance_id.0 != "test-instance" {
                     return Err(InventoryError::NotReady(
                         "test model instance unavailable".to_owned(),
                     ));
@@ -3658,10 +4966,27 @@ mod tests {
                 Ok(ModelInstanceLease::new(
                     backend,
                     instance_id,
-                    configuration_id,
                     Arc::new(BTreeSet::new()),
                     || {},
                 ))
+            })
+        }
+
+        fn acquire_for_inference(
+            &self,
+            model_id: String,
+            _progress: Option<ModelLoadingObserver>,
+        ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
+            if let Some(dropped) = self.pending_acquisition_dropped.clone() {
+                return Box::pin(async move {
+                    let _drop = PendingAcquisitionDrop(dropped);
+                    std::future::pending().await
+                });
+            }
+            Box::pin(async move {
+                self.lease(ModelInstanceId("test-instance".to_owned()))
+                    .await
+                    .map(|lease| lease.with_model_alias(model_id))
             })
         }
     }
@@ -3671,10 +4996,11 @@ mod tests {
         let controller = Arc::new(StubModelInstanceController {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::new(AtomicU64::new(0)),
+            pending_acquisition_dropped: None,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
-                Request::get("/v1/models/instances")
+                Request::get("/api/v1/instances")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3696,6 +5022,7 @@ mod tests {
         let controller = Arc::new(StubModelInstanceController {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
+            pending_acquisition_dropped: None,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -3703,7 +5030,6 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model_instance_id": "test-instance",
                             "model": "test-model",
                             "messages": [{"role": "user", "content": "hi"}],
                             "stream": true
@@ -3727,6 +5053,7 @@ mod tests {
         let controller = Arc::new(StubModelInstanceController {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
+            pending_acquisition_dropped: None,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -3734,7 +5061,6 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model_instance_id": "test-instance",
                             "model": "test-model",
                             "messages": [{"role": "assistant", "content": null}],
                             "stream": true
@@ -3747,6 +5073,40 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(leases.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn progress_stream_disconnect_detaches_pending_inference_acquisition() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(StubModelInstanceController {
+            backend: Arc::new(FakeBackend::new("test-model", "ready")),
+            leases: Arc::new(AtomicU64::new(0)),
+            pending_acquisition_dropped: Some(Arc::clone(&dropped)),
+        });
+        let response = app(AppState::model_free().with_model_controller(controller))
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("Magnitude-Include-Progress", "true")
+                    .body(Body::from(minimal_request().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Poll the response body once, as a real HTTP connection does before
+        // disconnecting, so the streaming body owns the receiver it will drop.
+        let mut body = response.into_body();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(10), body.frame()).await;
+        drop(body);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the SSE body must cancel only its pending waiter");
     }
 
     struct ScriptedBackend {
@@ -3888,13 +5248,41 @@ mod tests {
     }
 
     #[test]
+    fn exported_invalidation_stream_requires_snapshot_refresh_after_reconnect() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        let contract = &value["paths"]["/api/v1/events"]["get"][STREAM_EXTENSION];
+        assert_eq!(contract["termination"]["type"], "long-lived");
+        assert_eq!(contract["reconnect"]["type"], "none");
+    }
+
+    #[test]
     fn exported_assessment_operation_declares_conflict_response() {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
         assert_eq!(
-            value["paths"]["/v1/models/assess"]["post"]["responses"]["409"]["content"]["application/json"]
+            value["paths"]["/api/v1/models/assess"]["post"]["responses"]["409"]["content"]["application/json"]
                 ["schema"]["$ref"],
             "#/components/schemas/ErrorResponse"
         );
+    }
+
+    #[test]
+    fn exported_model_admission_operations_declare_every_inventory_error_status() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        for (path, method) in [
+            ("/api/v1/instances", "post"),
+            ("/api/v1/models/{model_id}/properties", "post"),
+            ("/api/v1/chat/templates/apply", "post"),
+            ("/v1/chat/completions", "post"),
+            ("/v1/responses", "post"),
+        ] {
+            let responses = &value["paths"][path][method]["responses"];
+            for status in ["400", "404", "409", "422", "500"] {
+                assert!(
+                    responses[status].is_object(),
+                    "{method} {path} must declare inventory error status {status}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -3930,16 +5318,21 @@ mod tests {
 
         let denied = service
             .clone()
-            .oneshot(Request::get("/v1/props").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post("/api/v1/models/test-model/properties")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
         let allowed = service
             .oneshot(
-                Request::get("/v1/props")
+                Request::post("/api/v1/models/test-model/properties")
                     .header("authorization", "Bearer private-capability")
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"test-model"}"#))
                     .unwrap(),
             )
             .await
@@ -3952,7 +5345,12 @@ mod tests {
         let service = app(AppState::new(FakeBackend::new("test-model", "ok")));
         let properties = service
             .clone()
-            .oneshot(Request::get("/v1/props").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post("/api/v1/models/test-model/properties")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"test-model"}"#))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(properties.status(), StatusCode::OK);
@@ -3969,11 +5367,10 @@ mod tests {
 
         let response = service
             .oneshot(
-                Request::post("/v1/apply-template")
+                Request::post("/api/v1/chat/templates/apply")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model_instance_id": StaticModelInstanceController::INSTANCE_ID,
                             "model": "test-model",
                             "messages": [
                                 {"role": "system", "content": "system"},
@@ -4014,7 +5411,13 @@ mod tests {
     async fn accepts_the_loaded_model_id_and_configured_aliases() {
         let state =
             AppState::new(FakeBackend::new("test-model", "ok")).with_model_alias("friendly-name");
-        let lease = lease_ready_instance(&state).await.expect("instance lease");
+        let lease = state
+            .model_controller
+            .as_ref()
+            .expect("model controller")
+            .acquire_for_inference("friendly-name".to_owned(), None)
+            .await
+            .expect("instance lease");
 
         assert!(validate_model_selection(Some("test-model"), &lease).is_ok());
         assert!(validate_model_selection(Some("friendly-name"), &lease).is_ok());
@@ -4024,7 +5427,6 @@ mod tests {
     #[test]
     fn maps_the_complete_chat_request_contract() {
         let request = request_from_json(json!({
-            "model_instance_id": StaticModelInstanceController::INSTANCE_ID,
             "model": "test-model",
             "messages": [
                 {"role": "system", "content": "system"},
@@ -4327,7 +5729,7 @@ mod tests {
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model_instance_id":"static-instance","model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                        r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
                     ))
                     .unwrap(),
             )

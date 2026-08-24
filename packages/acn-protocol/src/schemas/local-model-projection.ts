@@ -6,7 +6,6 @@ import type {
   LocalModel,
   LocalModelsState,
   ModelCapabilities,
-  ModelServingConfigurationId,
 } from "./model-state"
 
 /**
@@ -19,17 +18,6 @@ export const localModelCapabilities = (
 ): Option.Option<ModelCapabilities> => model.servingState._tag === "Assessed"
   ? Option.some(model.servingState.capabilities)
   : Option.none()
-
-export const localModelConfigurationId = (
-  model: LocalModel,
-): Option.Option<ModelServingConfigurationId> => {
-  const servingState = model.servingState
-  if (servingState._tag === "Resolving") return Option.none()
-  if (servingState._tag === "Failed") {
-    return Option.map(servingState.configuration, ({ id }) => id)
-  }
-  return Option.some(servingState.configuration.id)
-}
 
 export const localModelProviderModelId = (
   model: LocalModel,
@@ -50,11 +38,10 @@ export const localModelCatalogIdentity = (
   })
   : Option.none()
 
-export const findLocalModelByConfigurationId = (
+export const findLocalModelById = (
   models: readonly LocalModel[],
-  configurationId: ModelServingConfigurationId,
-): Option.Option<LocalModel> => Option.fromNullable(models.find((model) =>
-  Option.contains(localModelConfigurationId(model), configurationId)))
+  modelId: ProviderModelId,
+): Option.Option<LocalModel> => Option.fromNullable(models.find((model) => model.modelId === modelId))
 
 export const findLocalModelByCatalogIdentity = (
   models: readonly LocalModel[],
@@ -84,13 +71,13 @@ const admissionIsVisibleOn = (
     && model.upgradeState.downloadId === admission.downloadId
 }
 
-/** The admitted reconciliation is visible on the model identified by configuration. */
+/** The admitted reconciliation is visible on the canonical model. */
 export const installationAdmissionIsVisible = (
   state: LocalModelsState,
-  configurationId: ModelServingConfigurationId,
+  modelId: ProviderModelId,
   admission: CatalogModelReconciliationAdmission,
 ): boolean => Option.exists(
-  findLocalModelByConfigurationId(state.models, configurationId),
+  findLocalModelById(state.models, modelId),
   (model) => admissionIsVisibleOn(model, admission),
 )
 

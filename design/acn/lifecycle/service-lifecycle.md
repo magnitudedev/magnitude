@@ -5,6 +5,7 @@ applies_to:
   - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
+  - cli/src/commands/server.ts
   - packages/acn-protocol/src/schemas/acn-health.ts
 ---
 
@@ -36,8 +37,8 @@ owner row still equals the row it admitted. A confirmed missing or changed row b
 `Stopping(ownership-lost)`. Any surfaced owner-store failure means ownership can no longer be
 proven and fails closed through `Stopping(fatal)`. A manager prepares a successor before asking a
 lower-revision live owner to stop, then proves the predecessor ACN process group absent before the
-successor may commit ownership. Retirement otherwise begins through exact explicit shutdown, idle
-policy, ownership loss, the ACN's own terminal failure, or process signals.
+successor may commit ownership. Retirement otherwise begins through exact explicit shutdown,
+ownership loss, the ACN's own terminal failure, or process signals.
 
 ## Readiness and admission
 
@@ -55,16 +56,28 @@ ceiling and separately bounds loss of observable health. ACN independently owns 
 absolute application-startup ceiling that never restarts. Expiry commits
 `Stopping(startup-failed)`.
 
-## Client presence and idleness
+## Per-user service and client presence
 
-ACN stops after thirty minutes with no connected client. The first idle period begins only after
-readiness. The first client-presence transition cancels it; the final absence transition starts a
-fresh full interval. Revision-fenced timers cannot retire a newer presence state.
+ACN is installed as a per-user login service and, after owner admission, binds the stable public
+loopback endpoint `127.0.0.1:10100`. Its cross-version health, shutdown, and RPC coordination
+listener remains on the independently bindable endpoint published in the owner record. Keeping
+these listeners distinct preserves concurrent candidate admission and fenced takeover while giving
+saved harness configuration one stable endpoint. Both listeners belong to the same ACN process,
+lifecycle, release, and authority. The platform service manager owns login startup and restart. The
+service remains alive without an RPC client so a saved third-party harness endpoint continues to
+work.
+
+Fatal, ICN-loss, and startup-failure termination exit unsuccessfully so the
+platform manager restarts the service. Administrative stop, fenced replacement, ownership loss,
+and a rejected pre-admission candidate exit successfully and are not restarted; this prevents an
+old installed service definition from fighting a newer admitted release.
 
 RPCs, subscriptions, session work, inference, status/file watches, display streams, ICN
 observation, telemetry, and introspection do not participate in process idleness. They remain
-bounded by their own caller, operation, session, model, and application scopes. Client leases are
-the only process-presence authority.
+bounded by their own caller, operation, session, model, and application scopes. Client leases still
+report interactive application presence and may inform application policy, but they do not
+determine process lifetime. Inference request leases independently protect a resident Instance
+while a harness request is active.
 
 ## Shutdown
 
@@ -92,12 +105,12 @@ belongs to manager-side owner and exact-process revalidation, not a required end
 
 ## Guarantees
 
-- One lifecycle value governs health, readiness, RPC dispatch, client-presence idleness, and shutdown.
+- One lifecycle value governs health, readiness, RPC dispatch, and shutdown.
 - No application or ICN work starts before atomic exact-owner admission.
 - Losing owner acquisition cannot initialize expensive resources.
 - No application work is admitted outside the exact admitted `Ready` ACN.
 - A confirmed missing or changed owner row stops the admitted ACN, and any store failure fails
   closed rather than leaving an unfenced service alive.
-- Only connected-client presence retains ACN; operation duration and observation do not.
+- Client absence does not retire the per-user service.
 - The stopping transition is single-flight; cooperative teardown and external exact-process-group escalation
   are independently bounded.

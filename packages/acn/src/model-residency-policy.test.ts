@@ -12,12 +12,15 @@ describe("ModelResidencyPolicy", () => {
       readonly generation: number
       readonly idleTimeoutSeconds: number
     }> = []
+    let current = { generation: 40, idleTimeoutSeconds: 600 }
     const client = {
       models: {
+        getModelResidencyPolicy: () => Effect.succeed(current),
         setModelResidencyPolicy: ({ payload }: {
           payload: { generation: number; idleTimeoutSeconds: number }
         }) => Effect.sync(() => {
           requests.push(payload)
+          if (payload.generation > current.generation) current = payload
         }),
       },
     } as unknown as IcnClientService
@@ -32,8 +35,8 @@ describe("ModelResidencyPolicy", () => {
     ))
 
     expect(requests).toEqual([
-      { generation: 1, idleTimeoutSeconds: 60 * 60 },
-      { generation: 2, idleTimeoutSeconds: 10 * 60 },
+      { generation: 41, idleTimeoutSeconds: 60 * 60 },
+      { generation: 42, idleTimeoutSeconds: 10 * 60 },
     ])
   })
 })

@@ -26,7 +26,6 @@ use crate::cache::ModelBlobKind;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
     inspected_package_from_resolved, servable_model_bundle_key_for_bundle,
-    serving_configuration_id, serving_configuration_identity_is_valid,
 };
 use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
 use crate::preview::PreparedPreview;
@@ -581,11 +580,6 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         .iter()
         .map(|model| (model.model_id.clone(), model.variant_id.clone()))
         .collect::<BTreeSet<_>>();
-    let configuration_ids = catalog
-        .models
-        .iter()
-        .map(|model| model.configuration.id.clone())
-        .collect::<BTreeSet<_>>();
     let target_packages = catalog
         .models
         .iter()
@@ -607,7 +601,6 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         .count();
     if catalog.models.is_empty()
         || model_ids.len() != catalog.models.len()
-        || configuration_ids.len() != catalog.models.len()
         || target_package_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
             let (target, method) = match &model.configuration.bundle {
@@ -621,8 +614,7 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                 .iter()
                 .filter(|file| file.role == ModelFileRole::Projector)
                 .count();
-            !serving_configuration_identity_is_valid(&model.configuration)
-                || model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
+            model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
                 || projector_count > 1
                 || model.capabilities.vision != (projector_count == 1)
                 || (model.capabilities.vision && method == Some(&SpeculativeMethod::Mtp))
@@ -640,10 +632,9 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         })
     {
         return Err(InventoryError::Integrity(format!(
-            "release catalog has missing or duplicate exact identities (models={}, model_ids={}, configurations={}, target_packages={}, complete_intrinsic_targets={})",
+            "release catalog has missing or duplicate exact identities (models={}, model_ids={}, target_packages={}, complete_intrinsic_targets={})",
             catalog.models.len(),
             model_ids.len(),
-            configuration_ids.len(),
             target_package_ids.len(),
             complete_intrinsic_targets,
         )));
@@ -1240,18 +1231,13 @@ fn recommendable_model(
             declaration.id
         )));
     }
-    let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
     let profile = ServingProfile {
         context_length: declaration.context_length,
     };
     Ok(RecommendableModel {
         model_id: CatalogModelId(declaration.id.clone()),
         variant_id: CatalogVariantId(variant.variant_id.clone()),
-        configuration: ModelServingConfiguration {
-            id: serving_configuration_id(&bundle_key, &profile),
-            bundle,
-            profile,
-        },
+        configuration: ModelServingConfiguration { bundle, profile },
         display_name: declaration.display_name.clone(),
         variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),

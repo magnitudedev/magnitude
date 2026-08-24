@@ -7,7 +7,6 @@ import { makeAgentBoundModel, type AgentBoundModel } from './agent-model'
 import { TurnContextTag } from '../engine/turn-context'
 import { ModelRequestActivityAmbient } from './model-request-activity'
 import type { ModelRequestProgress } from '@magnitudedev/ai'
-import type { PrepareModelRequest } from './model-request-preparation'
 import { MAX_TOOL_CALLS_PER_TURN } from '../constants'
 
 export type { AgentBoundModel } from './agent-model'
@@ -44,7 +43,6 @@ export interface ReasoningEffortFallbackInput {
 export const AgentModelResolverLive = (
   debug?: boolean,
   applyReasoningEffortFallback: (input: ReasoningEffortFallbackInput) => Effect.Effect<void, unknown> = () => Effect.void,
-  prepareModelRequest: PrepareModelRequest = () => Effect.void,
 ) =>
   Layer.effect(
     AgentModelResolver,
@@ -109,16 +107,6 @@ export const AgentModelResolverLive = (
 
           return makeAgentBoundModel({
             rawModel,
-            prepareRequest: prepareModelRequest({
-              slotId,
-              providerId,
-              providerModelId,
-              reportProgress,
-            }),
-            clearRequestProgress: reportProgress({
-              phase: 'cleared',
-              requestId: null,
-            }),
             modelSource: { slotId: slotConfig.slotId },
             modelId: slotConfig.providerModelId,
             modelDisplayName: slotConfig.modelDisplayName,

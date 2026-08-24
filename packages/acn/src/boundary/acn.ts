@@ -1,12 +1,9 @@
 import {
   AcnBoundary,
   AcnRpc,
-  LocalModelMutationFailed,
+  Configuration,
   SessionOperationFailed,
-  ModelSlotMutationRejected,
   type DisplayViewShape,
-  type ModelServingConfigurationId,
-  ModelDownloadIdSchema,
   type SessionError,
 } from "@magnitudedev/acn-protocol";
 import { Cause, Chunk, Effect, Option, Stream } from "effect";
@@ -28,15 +25,9 @@ import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
 import { createId } from "@magnitudedev/generate-id";
 import { Onboarding } from "../onboarding";
 import { AcnChanges } from "../changes";
-import { LocalInferenceHardware } from "../local-inference-hardware";
-import { LocalModelPackages } from "../local-model-packages";
 import { LocalModels } from "../local-models";
-import { servableModelBundlePackageIds } from "@magnitudedev/acn-protocol";
+import { LocalModelRecommendations } from "../local-model-recommendations";
 import { ClientLeaseManager } from "../client-lease-manager";
-import { LocalModelConfigurationCoordinator } from "../local-model-configuration-coordinator";
-import { LocalModelConfigurationResolver } from "../local-model-configuration-resolver";
-import { localCatalogProviderModelId } from "../local-provider-model-id";
-import { IcnModels } from "@magnitudedev/icn";
 import { FileMentionSearcher } from "../file-mention-searcher";
 import { FileSystemManager } from "../file-system-manager";
 import { GitInspector } from "../git-inspector";
@@ -75,15 +66,18 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
     const displayStreams = yield* DisplayViewStreams;
     const onboarding = yield* Onboarding;
     const changes = yield* AcnChanges;
-    const localHardware = yield* LocalInferenceHardware;
-    const localModelPackages = yield* LocalModelPackages;
     const localModels = yield* LocalModels;
-    const icnModels = yield* IcnModels;
-    const localModelConfigurations = yield* LocalModelConfigurationResolver;
-    const modelConfigurationCoordinator = yield* LocalModelConfigurationCoordinator;
+    const localModelRecommendations = yield* LocalModelRecommendations;
     const clientLeases = yield* ClientLeaseManager;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
+    );
+    yield* localModelRecommendations.changes.pipe(
+      Stream.runForEach(({ revision }) => changes.publish({
+        query: Configuration.GetLocalModelRecommendations.name,
+        revision,
+      })),
+      Effect.forkScoped,
     );
     // Observe programming defects without changing the Cause. Expected domain
     // failures stay typed, defects stay defects, and interruption is preserved.
@@ -142,76 +136,6 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
           );
         },
       });
-
-    const deleteLocalModel = (configurationId: ModelServingConfigurationId) =>
-      modelConfigurationCoordinator.exclusive(Effect.gen(function* () {
-      const configuration = yield* localModelConfigurations.resolve(configurationId);
-      if (Option.isNone(configuration)) {
-        return yield* new LocalModelMutationFailed({
-          code: "local_model_not_found",
-          message: `Local model configuration ${configurationId} was not found`,
-          retryable: false,
-        });
-      }
-      const catalogIdentity = Option.map(
-        configuration.value.catalogModel,
-        ({ modelId, variantId }) => ({ modelId, variantId }),
-      );
-      const providerModelId = Option.match(catalogIdentity, {
-        onNone: () => configuration.value.servingConfiguration.id,
-        onSome: localCatalogProviderModelId,
-      });
-      const slots = (yield* modelSlots.snapshot).state.slots;
-      for (const slot of [slots.primary, slots.secondary]) {
-        if (slot._tag === "ConfiguredLocal"
-          && String(slot.selection.providerModelId) === String(providerModelId)
-          && (slot.residency._tag === "Loading"
-            || slot.residency._tag === "Stopping")) {
-          return yield* new ModelSlotMutationRejected({
-            slotId: slot.slotId,
-            message: "The local model cannot be deleted while loading or unloading",
-          });
-        }
-        if (slot._tag === "ConfiguredLocal"
-          && String(slot.selection.providerModelId) === String(providerModelId)
-          && slot.residency._tag === "Ready") {
-          yield* modelSlots.stopModel(slot.slotId);
-        }
-      }
-      const installedPackageIds = yield* localModelPackages.installedPackageIds;
-      const referencedPackageIds = new Set(
-        [...(yield* localModelConfigurations.get).values()]
-          .map(({ servingConfiguration }) => servingConfiguration)
-          .filter((candidate) => candidate.id !== configurationId)
-          .filter((candidate) => servableModelBundlePackageIds(candidate.bundle)
-            .every((packageId) => installedPackageIds.has(packageId)))
-          .flatMap((candidate) => servableModelBundlePackageIds(candidate.bundle)),
-      );
-      yield* localModelPackages.removeBundlePackages(
-        configuration.value.servingConfiguration.bundle,
-        referencedPackageIds,
-      );
-      if (Option.isSome(catalogIdentity)) {
-        const packageState = (yield* localModelPackages.snapshot).state;
-        const activePackageIds = new Set(
-          servableModelBundlePackageIds(configuration.value.servingConfiguration.bundle),
-        );
-        for (const entry of packageState.entries) {
-          if (entry.localState._tag !== "Installed"
-            || entry.catalogAttribution._tag !== "Attributed"
-            || entry.catalogAttribution.modelId !== catalogIdentity.value.modelId
-            || entry.catalogAttribution.variantId !== catalogIdentity.value.variantId
-            || activePackageIds.has(entry.package.id)) {
-            continue;
-          }
-          yield* localModelPackages.removeBundlePackages(
-            { _tag: "Standalone", package: entry.package },
-            referencedPackageIds,
-          );
-        }
-      }
-      return {};
-      }));
 
     return {
       // Connection
@@ -398,7 +322,13 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
         ),
 
       GetModelSlots: () =>
-        observeRpcDefects("GetModelSlots", modelSlots.snapshot),
+        observeRpcDefects("GetModelSlots", modelSlots.selectionSnapshot),
+
+      GetLocalModelRecommendations: () =>
+        observeRpcDefects("GetLocalModelRecommendations", localModelRecommendations.publicSnapshot),
+
+      GetLocalModels: () =>
+        observeRpcDefects("GetLocalModels", localModels.snapshot),
 
       AssignSlot: ({ slotId, selection }) =>
         observeRpcDefects(
@@ -426,81 +356,6 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
             ...(payload.days !== undefined ? { days: payload.days } : {}),
             ...(payload.tz !== undefined ? { tz: payload.tz } : {}),
           })
-        ),
-
-      GetLocalInferenceHardware: () =>
-        observeRpcDefects("GetLocalInferenceHardware", localHardware.snapshot),
-
-      GetLocalModels: () =>
-        observeRpcDefects("GetLocalModels", localModels.snapshot),
-
-      StreamChanges: () => observeRpcStreamDefects("StreamChanges", changes.stream),
-
-      ReconcileCatalogModel: ({ modelId, variantId }) =>
-        observeRpcDefects(
-          "ReconcileCatalogModel",
-          icnModels.reconcileCatalogModel(modelId, variantId).pipe(
-            Effect.mapError((error) => new LocalModelMutationFailed({
-              code: "catalog_model_reconciliation_failed",
-              message: String(error),
-              retryable: true,
-            })),
-            Effect.map((admission) => {
-              const providerModelId = localCatalogProviderModelId({ modelId, variantId });
-              return admission._tag === "Current"
-                ? { _tag: "Current" as const, providerModelId }
-                : {
-                    _tag: "DownloadAdmitted" as const,
-                    providerModelId,
-                    downloadId: ModelDownloadIdSchema.make(admission.downloadId),
-                  };
-            }),
-            Effect.tap(() => localModels.refresh),
-          ),
-        ),
-
-      CancelModelDownload: ({ downloadId }) =>
-        observeRpcDefects(
-          "CancelModelDownload",
-          localModelPackages.cancelDownload(downloadId).pipe(
-            Effect.zipRight(localModels.refresh),
-            Effect.as({}),
-          ),
-        ),
-
-      DismissModelDownloadFailure: ({ downloadId }) =>
-        observeRpcDefects(
-          "DismissModelDownloadFailure",
-          localModelPackages.acknowledgeFailure(downloadId).pipe(
-            Effect.zipRight(localModels.refresh),
-            Effect.as({}),
-          ),
-        ),
-
-      DeleteLocalModel: ({ configurationId }) =>
-        observeRpcDefects(
-          "DeleteLocalModel",
-          deleteLocalModel(configurationId).pipe(
-            Effect.tap(() => localModels.refresh),
-          ),
-        ),
-
-      LoadModel: ({ slotId }) =>
-        observeRpcDefects(
-          "LoadModel",
-          modelSlots.loadModel(slotId).pipe(Effect.as({})),
-        ),
-
-      PreviewModelLoad: ({ slotId }) =>
-        observeRpcDefects(
-          "PreviewModelLoad",
-          modelSlots.previewModelLoad(slotId),
-        ),
-
-      StopModel: ({ slotId }) =>
-        observeRpcDefects(
-          "StopModel",
-          modelSlots.stopModel(slotId).pipe(Effect.as({})),
         ),
 
       GetOnboardingState: () =>
@@ -643,6 +498,8 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
         ),
 
       // Streams
+      StreamChanges: () => observeRpcStreamDefects("StreamChanges", changes.stream),
+
       StreamDisplayView: ({ sessionId, shape }) =>
         observeRpcStreamDefects(
           "StreamDisplayView",

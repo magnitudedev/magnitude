@@ -21,7 +21,7 @@ const makeHarness = (leaseTimeout: Duration.DurationInput = Duration.seconds(35)
     const policy: ModelResidencyPolicyService = {
       setConnected: (connected) => Ref.update(transitions, (current) => [...current, connected]),
     }
-    const lifecycle = yield* makeAcnServiceLifecycle(Duration.minutes(30))
+    const lifecycle = yield* makeAcnServiceLifecycle()
     yield* lifecycle.becomeReady(Effect.die("unused RPC"))
     const manager = yield* makeClientLeaseManager(leaseTimeout).pipe(
       Effect.provideService(AcnServiceLifecycle, lifecycle),
@@ -67,20 +67,15 @@ describe("ClientLeaseManager", () => {
     )
   })
 
-  it("retains ACN while connected and starts a fresh 30-minute interval on final release", async () => {
+  it("does not stop ACN when the final RPC client lease is released", async () => {
     await run(
       Effect.scoped(
         Effect.gen(function* () {
           const harness = yield* makeHarness(Duration.minutes(31))
           yield* harness.manager.renew(clientA)
-          yield* TestClock.adjust(Duration.minutes(30))
-          expect((yield* harness.lifecycle.state)._tag).toBe("Ready")
-
           yield* harness.manager.release(clientA)
-          yield* TestClock.adjust(Duration.minutes(30).pipe(Duration.subtract(Duration.millis(1))))
+          yield* TestClock.adjust(Duration.hours(1))
           expect((yield* harness.lifecycle.state)._tag).toBe("Ready")
-          yield* TestClock.adjust(Duration.millis(1))
-          expect((yield* harness.lifecycle.awaitStopping).reason).toBe("idle")
         })
       )
     )
@@ -109,7 +104,7 @@ describe("ClientLeaseManager", () => {
     await run(
       Effect.scoped(
         Effect.gen(function* () {
-          const lifecycle = yield* makeAcnServiceLifecycle(Duration.minutes(30))
+          const lifecycle = yield* makeAcnServiceLifecycle()
           yield* lifecycle.becomeReady(Effect.die("unused RPC"))
           const manager = yield* makeClientLeaseManager().pipe(
             Effect.provideService(AcnServiceLifecycle, lifecycle),
@@ -137,7 +132,7 @@ describe("ClientLeaseManager", () => {
     await run(
       Effect.scoped(
         Effect.gen(function* () {
-          const lifecycle = yield* makeAcnServiceLifecycle(Duration.minutes(30))
+          const lifecycle = yield* makeAcnServiceLifecycle()
           yield* lifecycle.becomeReady(Effect.die("unused RPC"))
           const manager = yield* makeClientLeaseManager().pipe(
             Effect.provideService(AcnServiceLifecycle, lifecycle),
@@ -173,7 +168,7 @@ describe("ClientLeaseManager", () => {
         Effect.gen(function* () {
           const policyEntered = yield* Deferred.make<void>()
           const acknowledgePolicy = yield* Deferred.make<void>()
-          const lifecycle = yield* makeAcnServiceLifecycle(Duration.minutes(30))
+          const lifecycle = yield* makeAcnServiceLifecycle()
           yield* lifecycle.becomeReady(Effect.die("unused RPC"))
           const manager = yield* makeClientLeaseManager().pipe(
             Effect.provideService(AcnServiceLifecycle, lifecycle),

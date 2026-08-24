@@ -3,8 +3,12 @@ applies_to:
   - inference/crates/icn-contracts/src/models.rs
   - inference/crates/icn-models/**
   - packages/icn/src/models/**
+  - packages/icn/src/events/**
+  - packages/icn/src/downloads/**
+  - packages/icn/src/installed/**
+  - packages/icn/src/instances/**
   - packages/acn/src/local-model-**
-  - packages/acn-protocol/src/boundary/local-inference.ts
+  - packages/acn-protocol/src/schemas/inference-projection.ts
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/**
   - cli/src/features/local-inference/**
@@ -18,10 +22,10 @@ projection.
 
 ## ICN model boundary
 
-ICN publishes one `Models` snapshot. It contains every catalog model with its desired
-configuration and current local state, plus every independently servable installed target not
-attributed to a catalog model. ACN does not reconstruct catalog products by joining a catalog list
-to a separate installed-package list.
+ICN publishes one `Models` snapshot. It contains every catalog-defined callable model with one
+canonical `id`, its desired configuration, and current local state. Installed artifacts are read
+from the separate Packages resource; a package is not promoted to a callable Model merely because
+it exists on disk. ACN does not reconstruct catalog products from a second public catalog endpoint.
 
 A catalog model is identified by one `CatalogIdentity`. Its local state is:
 
@@ -33,7 +37,9 @@ A catalog model is identified by one `CatalogIdentity`. Its local state is:
 
 The filesystem is the presence authority. An attributed target makes its catalog model installed
 and visible even when desired dependencies are missing or the exact desired bundle has changed.
-An unattributed or attribution-failed target remains visible as a standalone installed model.
+An unattributed or attribution-failed target remains visible in Packages and in Magnitude's
+product projection, but is not advertised by the standard inference model list until ICN can
+resolve it to a canonical callable model.
 
 ## Exact desired/current comparison
 
@@ -88,7 +94,8 @@ derived and never persisted.
 
 ## Conformance
 
-- Every active catalog model and independently servable installed target is represented.
+- Every active catalog model is represented in Models; every installed artifact is represented in
+  Packages.
 - One catalog identity produces one row across target, dependency, repository, and drafter changes.
 - A prior target stays runnable until the desired bundle is complete.
 - Any exact desired/current package difference produces update availability.

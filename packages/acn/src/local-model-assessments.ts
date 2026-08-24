@@ -167,7 +167,6 @@ const modelAssessment = (
     assessment: FitsModelAssessmentSchema.make({
       _tag: "Fits",
       profile: configuration.profile,
-      configurationId: configuration.id,
       assessmentId: ModelAssessmentIdSchema.make(assessment.assessmentId),
       environmentId,
       memory: assessment.memory.map(memoryAssessmentFromIcn),

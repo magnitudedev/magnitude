@@ -95,13 +95,14 @@ pub fn inspect_templates(
     };
 
     let shapes = probe_shapes();
-    let profile = inspect_profile(templates, &shapes, &fingerprint, &capabilities).unwrap_or_else(
-        |_| ReasoningProfile {
-            default_effort: None,
-            mappings: Vec::new(),
-            template_fingerprint: fingerprint.clone(),
-        },
-    );
+    let profile =
+        inspect_profile(templates, &shapes, &fingerprint, &capabilities).unwrap_or_else(|_| {
+            ReasoningProfile {
+                default_effort: None,
+                mappings: Vec::new(),
+                template_fingerprint: fingerprint.clone(),
+            }
+        });
     let default_controls = profile
         .default_effort
         .as_ref()
@@ -824,16 +825,16 @@ mod tests {
     #[test]
     fn verified_none_is_retained_when_it_renders_like_low() {
         assert_eq!(efforts(EFFORT_NONE_MATCHES_LOW), ["none", "low", "high"]);
-        assert_eq!(default_effort(EFFORT_NONE_MATCHES_LOW).as_deref(), Some("high"));
+        assert_eq!(
+            default_effort(EFFORT_NONE_MATCHES_LOW).as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
     fn bounded_probe_reports_only_a_closed_effort_domain() {
         assert_eq!(efforts(CLOSED_EFFORT), ["none", "low", "medium", "high"]);
-        assert_eq!(
-            default_effort(CLOSED_EFFORT).as_deref(),
-            Some("high")
-        );
+        assert_eq!(default_effort(CLOSED_EFFORT).as_deref(), Some("high"));
     }
 
     #[test]
@@ -894,7 +895,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["low", "medium", "high"]
         );
-        assert_eq!(default_effort(REVERSE_EFFORT_ALIAS).as_deref(), Some("high"));
+        assert_eq!(
+            default_effort(REVERSE_EFFORT_ALIAS).as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -967,5 +971,4 @@ mod tests {
             ))
         );
     }
-
 }

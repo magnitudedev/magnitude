@@ -3,7 +3,7 @@ import { Cause, Effect, Layer, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
-  AcnBoundary,
+  MagnitudeBoundary,
   AssessmentEnvironmentIdSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
@@ -12,7 +12,6 @@ import {
   ModelInstanceIdSchema,
   ModelPackageIdSchema,
   ModelReleaseDateSchema,
-  ModelServingConfigurationIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
   ModelVariantLabelSchema,
@@ -40,7 +39,6 @@ import {
   type OnboardingModelSetupState,
 } from "./setup-state"
 
-const configurationId = ModelServingConfigurationIdSchema.make("setup-configuration")
 const providerModelId = ProviderModelIdSchema.make("setup-model:gguf:q4")
 const instanceId = ModelInstanceIdSchema.make("setup-instance")
 const downloadId = ModelDownloadIdSchema.make("setup-attempt")
@@ -73,6 +71,7 @@ const makeModel = (installed: boolean): LocalModel => {
     },
   }
   return {
+    modelId: providerModelId,
     bundle,
     presentation: {
       displayName: "Setup Model",
@@ -111,7 +110,7 @@ const makeModel = (installed: boolean): LocalModel => {
         structuredOutput: true,
         reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
       },
-      configuration: { id: configurationId, bundle, profile: { contextLength: 32_768 } },
+      configuration: { bundle, profile: { contextLength: 32_768 } },
       assessment: {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
@@ -160,7 +159,6 @@ const unassignedSlots = (): ModelSlotsState => ({
 const configuredSlots = (
   lifecycle: "None" | "Loading" | "Ready" | "Stopped",
   id = instanceId,
-  activeConfigurationId = configurationId,
 ): ModelSlotsState => ({
   ...unassignedSlots(),
   slots: {
@@ -178,11 +176,10 @@ const configuredSlots = (
       residency: lifecycle === "None" || lifecycle === "Stopped"
         ? { _tag: "Unloaded" }
         : lifecycle === "Ready"
-          ? { _tag: "Ready", instanceId: id, configurationId: activeConfigurationId, allocation }
+          ? { _tag: "Ready", instanceId: id, allocation }
           : {
               _tag: "Loading",
               instanceId: id,
-              configurationId: activeConfigurationId,
               stage: "loading",
               progress: Option.none(),
               plannedAllocation: Option.none(),
@@ -193,7 +190,7 @@ const configuredSlots = (
 })
 
 describe("projectOnboardingModelSetupContent", () => {
-  it("does not report a different serving configuration as ready", () => {
+  it("reports the selected model's ready instance", () => {
     const model = makeModel(true)
     const option = localModelOptions({
       inventoryState: { _tag: "Ready" },
@@ -204,7 +201,7 @@ describe("projectOnboardingModelSetupContent", () => {
       Option.some({
         _tag: "Loading",
         option,
-        configurationId,
+        modelId: providerModelId,
         providerModelId,
         selection,
         cancelling: false,
@@ -214,15 +211,11 @@ describe("projectOnboardingModelSetupContent", () => {
         models: [model],
         discoveryState: { _tag: "Ready", progress: [] },
       },
-      configuredSlots(
-        "Ready",
-        instanceId,
-        ModelServingConfigurationIdSchema.make("replacement-configuration"),
-      ),
+      configuredSlots("Ready", instanceId),
     )
 
     expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
-      .toMatchObject({ _tag: "Loading", phase: "Loading" })
+      .toMatchObject({ _tag: "Loading", phase: "Ready" })
   })
 
   it("does not let discovery refresh mask an active invocation", () => {
@@ -236,7 +229,7 @@ describe("projectOnboardingModelSetupContent", () => {
       Option.some({
         _tag: "Loading",
         option,
-        configurationId,
+        modelId: providerModelId,
         providerModelId,
         selection,
         cancelling: false,
@@ -264,7 +257,7 @@ describe("projectOnboardingModelSetupContent", () => {
       Option.some({
         _tag: "Loading",
         option,
-        configurationId,
+        modelId: providerModelId,
         providerModelId,
         selection,
         cancelling: false,
@@ -302,7 +295,7 @@ describe("installationAdmissionIsVisible", () => {
       discoveryState: { _tag: "Ready", progress: [] },
     }
 
-    expect(installationAdmissionIsVisible(state, configurationId, {
+    expect(installationAdmissionIsVisible(state, providerModelId, {
       _tag: "DownloadAdmitted",
       providerModelId,
       downloadId,
@@ -328,7 +321,7 @@ describe("installationAdmissionIsVisible", () => {
       discoveryState: { _tag: "Ready", progress: [] },
     }
 
-    expect(installationAdmissionIsVisible(state, configurationId, {
+    expect(installationAdmissionIsVisible(state, providerModelId, {
       _tag: "DownloadAdmitted",
       providerModelId,
       downloadId,
@@ -349,7 +342,7 @@ describe("installationAdmissionIsVisible", () => {
       inventoryState: { _tag: "Ready" },
       models: [publishing],
       discoveryState: { _tag: "Ready", progress: [] },
-    }, configurationId, {
+    }, providerModelId, {
       _tag: "Current",
       providerModelId,
     })).toBe(true)
@@ -370,7 +363,7 @@ describe("installationAdmissionIsVisible", () => {
       discoveryState: { _tag: "Ready" as const, progress: [] },
     }
     const admission = { _tag: "DownloadAdmitted" as const, providerModelId, downloadId }
-    expect(installationAdmissionIsVisible(state, configurationId, admission)).toBe(false)
+    expect(installationAdmissionIsVisible(state, providerModelId, admission)).toBe(false)
     expect(installationAdmissionIsVisible({
       ...state,
       models: [{
@@ -384,7 +377,7 @@ describe("installationAdmissionIsVisible", () => {
           bytesPerSecond: Option.none(),
         },
       }],
-    }, configurationId, admission)).toBe(true)
+    }, providerModelId, admission)).toBe(true)
   })
 })
 
@@ -395,7 +388,6 @@ interface HarnessOptions {
   readonly initiallyDownloading?: boolean
   readonly ready?: boolean
   readonly keepLoading?: boolean
-  readonly keepLoadRequest?: boolean
   readonly keepDownloading?: boolean
   readonly failAssign?: boolean
   readonly keepCompleting?: boolean
@@ -409,6 +401,7 @@ interface HarnessOptions {
 
 const makeHarness = (options: HarnessOptions) => {
   let model = makeModel(options.installed)
+  let admittedDownload = options.initiallyDownloading === true
   if (options.initiallyDownloading && model.servingState._tag === "Assessed") {
     model = {
       ...model,
@@ -437,6 +430,140 @@ const makeHarness = (options: HarnessOptions) => {
   const calls: string[] = []
   const stoppedInstances: unknown[] = []
   const cancelledDownloads: unknown[] = []
+  const slotIntent = () => ({
+    slots: {
+      primary: slots.slots.primary._tag === "Unassigned"
+        ? Option.none<SlotSelection>()
+        : Option.some(slots.slots.primary.selection),
+      secondary: Option.none<SlotSelection>(),
+    },
+    recentModels: { primary: [], secondary: [] },
+    favoriteModels: [],
+  })
+  const nativeModel = () => ({
+    id: providerModelId,
+    modelId: "setup-model",
+    variantId: "gguf:q4",
+    desiredConfiguration: model.servingState._tag === "Assessed"
+      ? model.servingState.configuration
+      : { bundle: model.bundle, profile: { contextLength: 32_768 } },
+    displayName: model.presentation.displayName,
+    variantLabel: model.presentation.variantLabel,
+    description: model.presentation.description,
+    releaseDate: "2026-01-01",
+    license: "test",
+    capabilities: model.servingState._tag === "Assessed"
+      ? model.servingState.capabilities
+      : { vision: false, tools: true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } },
+    parameterization: { architecture: "dense" as const, totalParameters: 1 },
+    qualityScore: 1,
+    qualityScoreProvenance: "test",
+    fidelityRank: 1,
+    quantizationAware: false,
+    qualityEvidence: [],
+    localState: model.acquisitionState._tag === "Installed"
+      ? {
+          _tag: "Installed" as const,
+          installation: {
+            effectiveConfiguration: {
+              _tag: "Runnable" as const,
+              configuration: model.servingState._tag === "Assessed"
+                ? model.servingState.configuration
+                : { bundle: model.bundle, profile: { contextLength: 32_768 } },
+            },
+            packages: [],
+          },
+          updateState: { _tag: "Current" as const },
+        }
+      : { _tag: "NotInstalled" as const },
+  })
+  const providerCatalog = () => ({
+    revision: revision++,
+    state: {
+      _tag: "Ready" as const,
+      providers: [{
+        providerId: localProviderId,
+        displayName: "Local",
+        kind: "Local" as const,
+        authentication: "NotRequired" as const,
+        availability: { _tag: "Available" as const },
+      }],
+      models: [{
+        providerId: localProviderId,
+        providerModelId,
+        modelFamilyId: Option.none(),
+        displayName: "Setup Model",
+        variantLabel: Option.some(ModelVariantLabelSchema.make("Q4")),
+        supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+        contextWindow: 32_768,
+        maxOutputTokens: 32_768,
+        memory: Option.none(),
+        capabilities: nativeModel().capabilities,
+        availability: model.acquisitionState._tag === "Installed"
+          ? { _tag: "Available" as const }
+          : { _tag: "Disabled" as const, reason: "installation_unavailable" as const },
+        pricing: Option.none(),
+      }],
+    },
+  })
+  const nativeInstances = () => {
+    const primary = slots.slots.primary
+    if (primary._tag !== "ConfiguredLocal" || primary.residency._tag === "Unloaded"
+      || primary.residency._tag === "Failed") {
+      return { revision: revision++, instances: [] }
+    }
+    const lifecycle = primary.residency._tag === "Ready"
+      ? { _tag: "Ready" as const, allocation }
+      : primary.residency._tag === "Loading"
+        ? {
+            _tag: "Loading" as const,
+            stage: primary.residency.stage,
+            progress: primary.residency.progress,
+            plannedAllocation: primary.residency.plannedAllocation,
+          }
+        : {
+            _tag: "Stopping" as const,
+            reason: "user_stop" as const,
+            allocation: { _tag: "Planned" as const, allocation: Option.none() },
+          }
+    return {
+      revision: revision++,
+      instances: [{ id: instanceId, modelId: providerModelId, lifecycle }],
+    }
+  }
+  const nativeDownloads = () => ({
+    downloads: model.acquisitionState._tag === "Downloading"
+      || model.acquisitionState._tag === "Failed"
+      || model.acquisitionState._tag === "Cancelled"
+      ? [{
+          id: model.acquisitionState.downloadId,
+          bundle: model.bundle,
+          state: model.acquisitionState._tag === "Downloading"
+            ? {
+                _tag: "Downloading" as const,
+                stage: model.acquisitionState.stage,
+                completedBytes: model.acquisitionState.completedBytes,
+                totalBytes: model.acquisitionState.totalBytes,
+                bytesPerSecond: model.acquisitionState.bytesPerSecond,
+              }
+            : model.acquisitionState._tag === "Failed"
+              ? {
+                  _tag: "Failed" as const,
+                  completedBytes: model.acquisitionState.completedBytes,
+                  totalBytes: model.acquisitionState.totalBytes,
+                  failure: model.acquisitionState.failure,
+                  acknowledged: false,
+                }
+              : {
+                  _tag: "Cancelled" as const,
+                  completedBytes: model.acquisitionState.completedBytes,
+                  totalBytes: model.acquisitionState.totalBytes,
+                },
+        }]
+      : admittedDownload && model.acquisitionState._tag === "Installed"
+        ? [{ id: downloadId, bundle: model.bundle, state: { _tag: "Completed" as const } }]
+        : [],
+  })
   const rpc = ((name: string, payload: any) => Effect.suspend<unknown, unknown, never>(() => {
     calls.push(name)
     switch (name) {
@@ -452,8 +579,23 @@ const makeHarness = (options: HarnessOptions) => {
           && calls.filter((call) => call === "GetModelSlots").length === 1) {
           return Effect.fail({ _tag: "ModelSlotsQueryFailed", message: "temporarily unavailable" })
         }
-        return Effect.succeed({ revision: revision++, state: slots })
+        return Effect.succeed({ revision: revision++, state: slotIntent() })
       }
+      case "GetProviderModelCatalog": return Effect.succeed(providerCatalog())
+      case "GetInferenceModels": return Effect.succeed({
+        revision: revision++,
+        reconciliationComplete: true,
+        models: [nativeModel()],
+        diagnostics: [],
+      })
+      case "GetInferenceInstances": return Effect.succeed(nativeInstances())
+      case "GetInferenceInstance": return Effect.succeed(
+        nativeInstances().instances.find((instance) => instance.id === payload.instanceId),
+      )
+      case "GetInferenceDownloads": return Effect.succeed(nativeDownloads())
+      case "GetInferenceDownload": return Effect.succeed(
+        nativeDownloads().downloads.find((download) => download.id === payload.downloadId),
+      )
       case "GetOnboardingState": {
         if (options.failInitialOnboardingRead
           && calls.filter((call) => call === "GetOnboardingState").length === 1) {
@@ -468,7 +610,8 @@ const makeHarness = (options: HarnessOptions) => {
           state: { completed: onboardingCompleted },
         })
       }
-      case "ReconcileCatalogModel": {
+      case "InstallInferenceModel": {
+        admittedDownload = true
         model = options.downloadFailure !== undefined
           ? (() => {
               const uninstalled = makeModel(false)
@@ -506,7 +649,6 @@ const makeHarness = (options: HarnessOptions) => {
         models = { ...models, models: [model] }
         return Effect.succeed({
           _tag: "DownloadAdmitted",
-          providerModelId,
           downloadId,
         })
       }
@@ -519,7 +661,7 @@ const makeHarness = (options: HarnessOptions) => {
         slots = configuredSlots("None")
         return Effect.succeed({})
       }
-      case "LoadModel":
+      case "EnsureInferenceInstance":
         if (options.replaceSelectionBeforeLoad) {
           slots = configuredSlots("None")
           return Effect.fail({
@@ -532,12 +674,17 @@ const makeHarness = (options: HarnessOptions) => {
           options.keepLoading ? "Loading" : "Ready",
           instanceId,
         )
-        return options.keepLoadRequest ? Effect.never : Effect.succeed({})
-      case "StopModel":
+        // The ICN ensure operation owns acquisition and does not return until
+        // the instance is ready. Cancelling this client wait must only detach
+        // from the request; the shared ICN acquisition continues.
+        return options.keepLoading
+          ? Effect.never
+          : Effect.succeed(nativeInstances().instances[0])
+      case "StopInferenceInstance":
         stoppedInstances.push(instanceId)
         slots = configuredSlots("Stopped", instanceId)
-        return Effect.succeed({})
-      case "CancelModelDownload":
+        return Effect.succeed(undefined)
+      case "CancelInferenceDownload":
         cancelledDownloads.push(payload.downloadId)
         models = {
           ...models,
@@ -551,7 +698,11 @@ const makeHarness = (options: HarnessOptions) => {
             },
           }],
         }
-        return Effect.succeed({})
+        return Effect.succeed({
+          id: downloadId,
+          bundle: model.bundle,
+          state: { _tag: "Cancelled", completedBytes: 0, totalBytes: 1 },
+        })
       case "CompleteOnboarding":
         if (options.keepCompleting) return Effect.never
         if (options.failCompletion) return Effect.fail({
@@ -564,8 +715,8 @@ const makeHarness = (options: HarnessOptions) => {
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
   }))
-  const effectQuery = EffectQueryClient.make<typeof AcnBoundary, AcnClientRequirements, never, ClientServices, never>(
-    AcnBoundary,
+  const effectQuery = EffectQueryClient.make<typeof MagnitudeBoundary, AcnClientRequirements, never, ClientServices, never>(
+    MagnitudeBoundary,
     fakeAcnImplementationsLayer(rpc),
     (client) => clientServicesLayer(client, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,
@@ -586,7 +737,7 @@ const makeHarness = (options: HarnessOptions) => {
       () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.open),
       { concurrent: true },
     ),
-    select: effectQuery.runtime.fn<typeof configurationId>()(
+    select: effectQuery.runtime.fn<typeof providerModelId>()(
       (input) => Effect.flatMap(OnboardingModelSetup, (setup) => setup.select(input)),
       { concurrent: true },
     ),
@@ -717,11 +868,11 @@ describe("OnboardingModelSetup", () => {
     secondUnmount()
 
     expect(harness.calls.filter((call) => [
-      "ReconcileCatalogModel",
+      "InstallInferenceModel",
       "AssignSlot",
-      "LoadModel",
-      "StopModel",
-      "CancelModelDownload",
+      "EnsureInferenceInstance",
+      "StopInferenceInstance",
+      "CancelInferenceDownload",
       "CompleteOnboarding",
     ].includes(call))).toEqual([])
     harness.registry.dispose()
@@ -732,21 +883,21 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
     await Effect.runPromise(waitForCall(harness.calls, "CompleteOnboarding"))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     expect(harness.onboardingCompleted()).toBe(true)
-    expect(harness.calls).not.toContain("ReconcileCatalogModel")
+    expect(harness.calls).not.toContain("InstallInferenceModel")
     expect(harness.calls).not.toContain("AssignSlot")
-    expect(harness.calls).not.toContain("LoadModel")
+    expect(harness.calls).not.toContain("EnsureInferenceInstance")
     harness.registry.dispose()
   })
 
   it("reopens completed onboarding at a fresh requested choice without completing it again", async () => {
     const harness = makeHarness({ installed: true, ready: true })
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
     const completionCalls = () => harness.calls.filter((call) => call === "CompleteOnboarding").length
 
@@ -766,7 +917,7 @@ describe("OnboardingModelSetup", () => {
     expect(completionCalls()).toBe(1)
 
     harness.registry.set(harness.service.select, Atom.Reset)
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
     expect(Option.getOrThrow(Result.value(harness.registry.get(harness.service.view))))
       .toEqual({ _tag: "Closed" })
@@ -816,7 +967,7 @@ describe("OnboardingModelSetup", () => {
     const start = await Effect.runPromiseExit(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
 
     expect(start._tag).toBe("Failure")
@@ -824,9 +975,9 @@ describe("OnboardingModelSetup", () => {
       expect(Cause.pretty(start.cause)).toContain("OnboardingModelSetupNotOpen")
     }
     expect(harness.calls.filter((call) => [
-      "ReconcileCatalogModel",
+      "InstallInferenceModel",
       "AssignSlot",
-      "LoadModel",
+      "EnsureInferenceInstance",
       "CompleteOnboarding",
     ].includes(call))).toEqual([])
     harness.registry.dispose()
@@ -925,7 +1076,7 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
     await Effect.runPromise(waitForCall(harness.calls, "CompleteOnboarding"))
 
@@ -943,34 +1094,34 @@ describe("OnboardingModelSetup", () => {
 
   it("assigns, loads, awaits, and completes an installed non-ready choice", async () => {
     const harness = makeHarness({ installed: true })
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     const mutations = harness.calls.filter((call) => [
-      "ReconcileCatalogModel",
+      "InstallInferenceModel",
       "AssignSlot",
-      "LoadModel",
+      "EnsureInferenceInstance",
       "CompleteOnboarding",
     ].includes(call))
-    expect(mutations).toEqual(["AssignSlot", "LoadModel", "CompleteOnboarding"])
+    expect(mutations).toEqual(["AssignSlot", "EnsureInferenceInstance", "CompleteOnboarding"])
     harness.registry.dispose()
   })
 
   it("installs before assignment for an uninstalled choice", async () => {
     const harness = makeHarness({ installed: false })
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     const mutations = harness.calls.filter((call) => [
-      "ReconcileCatalogModel",
+      "InstallInferenceModel",
       "AssignSlot",
-      "LoadModel",
+      "EnsureInferenceInstance",
       "CompleteOnboarding",
     ].includes(call))
     expect(mutations).toEqual([
-      "ReconcileCatalogModel",
+      "InstallInferenceModel",
       "AssignSlot",
-      "LoadModel",
+      "EnsureInferenceInstance",
       "CompleteOnboarding",
     ])
     harness.registry.dispose()
@@ -986,7 +1137,7 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
 
     const state = await Effect.runPromise(waitForView(
@@ -1000,17 +1151,17 @@ describe("OnboardingModelSetup", () => {
     }
     expect(Option.getOrThrow(state.notice)).toEqual(failure)
     expect(harness.calls).not.toContain("AssignSlot")
-    expect(harness.calls).not.toContain("LoadModel")
+    expect(harness.calls).not.toContain("EnsureInferenceInstance")
     harness.registry.dispose()
   })
 
   it("does not mistake a pre-existing download provider identity for installation", async () => {
     const harness = makeHarness({ installed: false, initiallyDownloading: true })
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
-    expect(harness.calls.indexOf("ReconcileCatalogModel")).toBeGreaterThanOrEqual(0)
-    expect(harness.calls.indexOf("ReconcileCatalogModel")).toBeLessThan(harness.calls.indexOf("AssignSlot"))
+    expect(harness.calls.indexOf("InstallInferenceModel")).toBeGreaterThanOrEqual(0)
+    expect(harness.calls.indexOf("InstallInferenceModel")).toBeLessThan(harness.calls.indexOf("AssignSlot"))
     harness.registry.dispose()
   })
 
@@ -1019,7 +1170,7 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
 
     await Effect.runPromise(waitForView(
@@ -1029,7 +1180,7 @@ describe("OnboardingModelSetup", () => {
         && Option.isSome(view.notice),
     ))
     expect(harness.calls).toContain("AssignSlot")
-    expect(harness.calls).not.toContain("LoadModel")
+    expect(harness.calls).not.toContain("EnsureInferenceInstance")
     expect(harness.calls).not.toContain("CompleteOnboarding")
     harness.registry.dispose()
   })
@@ -1039,7 +1190,7 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
 
     await Effect.runPromise(waitForView(
@@ -1048,7 +1199,7 @@ describe("OnboardingModelSetup", () => {
         && view.content._tag === "Chooser"
         && Option.isSome(view.notice),
     ))
-    expect(harness.calls).toContain("LoadModel")
+    expect(harness.calls).toContain("EnsureInferenceInstance")
     expect(harness.calls).not.toContain("CompleteOnboarding")
     expect(harness.onboardingCompleted()).toBe(false)
     harness.registry.dispose()
@@ -1059,26 +1210,26 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(
       harness.registry,
       harness.service.select,
-      configurationId,
+      providerModelId,
     ))
-    await Effect.runPromise(waitForCall(harness.calls, "ReconcileCatalogModel"))
+    await Effect.runPromise(waitForCall(harness.calls, "InstallInferenceModel"))
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
     expect(harness.cancelledDownloads).toEqual([downloadId])
     expect(harness.calls).not.toContain("AssignSlot")
-    expect(harness.calls).not.toContain("LoadModel")
+    expect(harness.calls).not.toContain("EnsureInferenceInstance")
     harness.registry.dispose()
   })
 
-  it("sends stop while the load request is still pending", async () => {
-    const harness = makeHarness({ installed: true, keepLoading: true, keepLoadRequest: true })
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
-    await Effect.runPromise(waitForCall(harness.calls, "LoadModel"))
+  it("detaches from an admitted load without stopping the shared instance", async () => {
+    const harness = makeHarness({ installed: true, keepLoading: true })
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForCall(harness.calls, "EnsureInferenceInstance"))
 
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
-    expect(harness.calls.indexOf("StopModel")).toBeGreaterThan(harness.calls.indexOf("LoadModel"))
-    expect(harness.stoppedInstances).toEqual([instanceId])
+    expect(harness.calls).not.toContain("StopInferenceInstance")
+    expect(harness.stoppedInstances).toEqual([])
     expect(harness.onboardingCompleted()).toBe(false)
     harness.registry.dispose()
   })
@@ -1090,11 +1241,11 @@ describe("OnboardingModelSetup", () => {
 
     expect(harness.onboardingCompleted()).toBe(true)
     expect(harness.calls.filter((call) => [
-      "ReconcileCatalogModel",
+      "InstallInferenceModel",
       "AssignSlot",
-      "LoadModel",
-      "StopModel",
-      "CancelModelDownload",
+      "EnsureInferenceInstance",
+      "StopInferenceInstance",
+      "CancelInferenceDownload",
     ].includes(call))).toEqual([])
     harness.registry.dispose()
   })
@@ -1102,14 +1253,14 @@ describe("OnboardingModelSetup", () => {
   it("keeps active setup alive when its React-style observer unmounts", async () => {
     const harness = makeHarness({ installed: true, keepLoading: true })
     const unmount = harness.registry.mount(harness.service.view)
-    await Effect.runPromise(execute(harness.registry, harness.service.select, configurationId))
-    await Effect.runPromise(waitForCall(harness.calls, "LoadModel"))
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForCall(harness.calls, "EnsureInferenceInstance"))
     unmount()
     await Effect.runPromise(Effect.sleep("5 millis"))
 
     expect(harness.calls).not.toContain("CompleteOnboarding")
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
-    expect(harness.stoppedInstances).toEqual([instanceId])
+    expect(harness.stoppedInstances).toEqual([])
     harness.registry.dispose()
   })
 

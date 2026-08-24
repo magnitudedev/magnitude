@@ -116,9 +116,20 @@ export interface AcnServerOptions {
   readonly parentBound?: boolean
   readonly debug?: boolean
   readonly dataDir?: string
+  readonly port?: number
 }
 
+export const ACN_PUBLIC_PORT = 10_100
+
 class AcnBootstrapRejected extends Data.TaggedError("AcnBootstrapRejected")<{
+  readonly reason: string
+}> {}
+
+class InferenceProxyFailed extends Data.TaggedError("InferenceProxyFailed")<{
+  readonly cause: unknown
+}> {}
+
+class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
   readonly reason: string
 }> {}
 
@@ -193,9 +204,10 @@ const acnServerUrl = (address: HttpServer.Address): string => {
 }
 
 const CORS_ALLOWED_HEADERS =
-  "Content-Type, Content-Length, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
+  "Accept, Authorization, Content-Type, Content-Length, Magnitude-Include-Progress, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
 const LOCAL_HTTP_ORIGIN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
+const LOCAL_HTTP_HOST = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
 
 const closeApplication = (scope: Scope.CloseableScope) =>
   Scope.close(scope, Exit.void).pipe(
@@ -227,7 +239,7 @@ function corsHeadersFor(
 
   return {
     "access-control-allow-origin": origin,
-    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
     "access-control-allow-headers": CORS_ALLOWED_HEADERS,
     "access-control-max-age": "86400",
     vary: "Origin",
@@ -304,18 +316,19 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
     }
     const sigintHandler = () => requestSignalShutdown("SIGINT")
     const sigtermHandler = () => requestSignalShutdown("SIGTERM")
+    const processEvents = process as unknown as NodeJS.EventEmitter
 
-    process.on("uncaughtException", uncaughtExceptionHandler)
-    process.on("unhandledRejection", unhandledRejectionHandler)
-    process.on("SIGINT", sigintHandler)
-    process.on("SIGTERM", sigtermHandler)
+    processEvents.on("uncaughtException", uncaughtExceptionHandler)
+    processEvents.on("unhandledRejection", unhandledRejectionHandler)
+    processEvents.on("SIGINT", sigintHandler)
+    processEvents.on("SIGTERM", sigtermHandler)
 
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
-        process.off("uncaughtException", uncaughtExceptionHandler)
-        process.off("unhandledRejection", unhandledRejectionHandler)
-        process.off("SIGINT", sigintHandler)
-        process.off("SIGTERM", sigtermHandler)
+        processEvents.removeListener("uncaughtException", uncaughtExceptionHandler)
+        processEvents.removeListener("unhandledRejection", unhandledRejectionHandler)
+        processEvents.removeListener("SIGINT", sigintHandler)
+        processEvents.removeListener("SIGTERM", sigtermHandler)
       })
     )
   })
@@ -501,12 +514,31 @@ const makeAcnInfrastructure = (
     // download or loading. Bun counts an in-flight handler that has not yet
     // emitted response bytes as idle, so any non-zero server timeout would
     // turn operation duration into a connection reset.
-    BunHttpServer.layer({ port: 0, hostname: "127.0.0.1", idleTimeout: 0 }),
+    BunHttpServer.layer({
+      // Candidate coordination endpoints must remain independently bindable so
+      // concurrent candidates can reach atomic owner admission. The admitted
+      // process opens the stable public inference listener separately.
+      port: options.port ?? 0,
+      hostname: "127.0.0.1",
+      idleTimeout: 0,
+    }),
     HttpLayerRouter.layer,
     RpcSerialization.layerNdjson,
     TracingLayer
   )
 }
+
+const makePublicInferenceInfrastructure = (lifecycle: AcnServiceLifecycleApi) =>
+  Layer.mergeAll(
+    Layer.succeed(AcnServiceLifecycle, lifecycle),
+    BunHttpServer.layer({
+      port: ACN_PUBLIC_PORT,
+      hostname: "127.0.0.1",
+      idleTimeout: 0,
+    }),
+    HttpLayerRouter.layer,
+    TracingLayer,
+  )
 
 /**
  * Runs one ACN process until its lifecycle enters Stopping. Scope
@@ -519,6 +551,95 @@ const rejectCoordinationFailure = <A>(
     ? error
     : new AcnBootstrapRejected({ reason: `${error._tag}: ${error.message}` })),
 )
+
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+] as const
+
+interface InferenceProxyTarget {
+  readonly origin: URL
+  readonly clientOptions: {
+    readonly headers?: Readonly<Record<string, string>>
+  }
+}
+
+export const proxyInferenceWebRequest = async (
+  source: Request,
+  icn: InferenceProxyTarget,
+  fetchTarget: typeof fetch = fetch,
+  signal: AbortSignal = source.signal,
+): Promise<Response> => {
+    const incoming = new URL(source.url)
+    const targetPath = incoming.pathname.slice("/inference".length) || "/"
+    const target = new URL(`${targetPath}${incoming.search}`, icn.origin)
+    const headers = new Headers(source.headers)
+    headers.delete("host")
+    headers.delete("authorization")
+    headers.delete("x-magnitude-acn-id")
+    for (const header of HOP_BY_HOP_HEADERS) headers.delete(header)
+    const privateAuthorization = icn.clientOptions.headers?.authorization
+    if (privateAuthorization !== undefined) {
+      headers.set("authorization", privateAuthorization)
+    }
+
+    const response = await fetchTarget(target, {
+      method: source.method,
+      headers,
+      body: source.body,
+      signal,
+      redirect: "manual",
+    })
+    const responseHeaders = new Headers(response.headers)
+    for (const header of HOP_BY_HOP_HEADERS) responseHeaders.delete(header)
+
+    if (targetPath === "/openapi.json" && response.ok) {
+      try {
+        const document = await response.json() as Record<string, unknown>
+        // The representation changes when the public server base is injected;
+        // representation metadata from the private response is no longer valid.
+        responseHeaders.delete("content-length")
+        responseHeaders.delete("content-encoding")
+        responseHeaders.delete("content-md5")
+        responseHeaders.delete("etag")
+        return Response.json({
+          ...document,
+          servers: [{ url: "/inference" }],
+        }, { status: response.status, headers: responseHeaders })
+      } catch {
+        return new Response("Invalid ICN OpenAPI document", { status: 502 })
+      }
+    }
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+    })
+}
+
+const makeInferenceProxy = (icn: Context.Tag.Service<typeof IcnProcess>) =>
+  (request: HttpServerRequest.HttpServerRequest) => Effect.gen(function* () {
+    // The wildcard proxy route is also the most specific OPTIONS route. Handle
+    // browser preflight locally instead of forwarding it to an ICN operation.
+    if (request.method === "OPTIONS") return yield* OptionsRouteHandler(request)
+    const source = request.source
+    if (!(source instanceof Request)) {
+      return HttpServerResponse.text("Unsupported request transport", { status: 500 })
+    }
+    const response = yield* Effect.tryPromise({
+      try: (signal) => proxyInferenceWebRequest(source, icn, fetch, signal),
+      catch: (cause) => new InferenceProxyFailed({ cause }),
+    }).pipe(Effect.option)
+    return Option.isNone(response)
+      ? HttpServerResponse.text("Local inference service unavailable", { status: 502 })
+      : HttpServerResponse.fromWeb(response.value)
+  })
 
 const predecessorAbsent = (
   owner: Option.Option<{ readonly pid: number; readonly processStartIdentity: ExactProcess["processStartIdentity"] }>,
@@ -563,9 +684,13 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
 
     yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest
+      const host = request.headers.host
+      if (host === undefined || !LOCAL_HTTP_HOST.test(host)) {
+        return HttpServerResponse.text("Invalid Host header", { status: 421 })
+      }
       return withCors(yield* responseEffect, request)
     }))
-    yield* router.add("OPTIONS", "*", OptionsRouteHandler)
+    yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
     yield* router.add("GET", "/health", lifecycle.state.pipe(
       Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
         Effect.flatMap((body) => HttpServerResponse.json(body, {
@@ -646,10 +771,36 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       if (Option.isSome(builtServices.introspector)) {
         yield* installAcnIntrospectionRoutes(router, builtServices.introspector.value)
       }
+      const icn = Context.get(applicationContext, IcnProcess)
+      const publicInfrastructure = yield* Layer.buildWithScope(
+        makePublicInferenceInfrastructure(lifecycle),
+        applicationScope,
+      )
+      const publicRouter = Context.get(publicInfrastructure, HttpLayerRouter.HttpRouter)
+      const publicServer = Context.get(publicInfrastructure, HttpServer.HttpServer)
+      yield* publicRouter.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest
+        const host = request.headers.host
+        if (host === undefined || !LOCAL_HTTP_HOST.test(host)) {
+          return HttpServerResponse.text("Invalid Host header", { status: 421 })
+        }
+        return withCors(yield* responseEffect, request)
+      }))
+      yield* publicRouter.add("OPTIONS", "/*", OptionsRouteHandler)
+      yield* publicRouter.add("GET", "/health", lifecycle.state.pipe(
+        Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
+          Effect.flatMap((body) => HttpServerResponse.json(body, {
+            status: state._tag === "Ready" ? 200 : 503,
+          })),
+        )),
+        Effect.orDie,
+      ))
+      yield* publicRouter.prefixed("/inference").add("*", "/*", makeInferenceProxy(icn))
+      yield* publicServer.serve(publicRouter.asHttpEffect()).pipe(Effect.provide(publicInfrastructure))
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {
         subscriptions: Context.get(applicationContext, AcnSubscriptions),
-        icn: Context.get(applicationContext, IcnProcess),
+        icn,
       }
     })
 
@@ -677,6 +828,11 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
     yield* boundedShutdownStep(subscriptions.terminate)
     yield* closeApplicationScope
     yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))
+    if (request.reason === "fatal"
+      || request.reason === "icn-exited"
+      || request.reason === "startup-failed") {
+      return yield* new AcnRestartRequired({ reason: request.reason })
+    }
   })).pipe(
     Effect.provideService(ProcessGroupController, ProcessGroupControllerLive),
     Effect.provide(BunSqliteDriverLayer),

@@ -1,4 +1,4 @@
-import { Context, Effect, Exit, Option, type Scope } from 'effect'
+import { Context, Effect, Option } from 'effect'
 import {
   TraceListener,
   type BoundModel,
@@ -19,10 +19,7 @@ import {
 import { TurnContextTag } from '../engine/turn-context'
 import type { RoleId } from '../agents/role-validation'
 import { createId } from '../util/id'
-import type {
-  AgentModelStartFailure,
-  ModelRequestPreparationError,
-} from './model-request-preparation'
+import type { AgentModelStartFailure } from './model-request-preparation'
 
 const { ForkContext } = Fork
 
@@ -77,8 +74,6 @@ export interface AgentBoundModel {
 
 export interface AgentBoundModelConfig {
   readonly rawModel: BoundModel<BaseCallOptions>
-  readonly prepareRequest?: Effect.Effect<void, ModelRequestPreparationError, Scope.Scope>
-  readonly clearRequestProgress?: Effect.Effect<void>
   readonly modelId: string
   readonly modelDisplayName: string
   readonly modelSource: ModelSource
@@ -167,19 +162,6 @@ function defaultOperationKind(callType: AgentCallType): AgentModelOperationKind 
   }
 }
 
-const isPreStreamModelNotReady = (failure: AgentModelStartFailure): boolean => {
-  if (failure._tag !== "StreamStartProviderRejection"
-    || failure.response.status !== 409) return false
-  try {
-    const body = JSON.parse(failure.response.body) as {
-      readonly error?: { readonly code?: unknown }
-    }
-    return body.error?.code === "model_not_ready"
-  } catch {
-    return false
-  }
-}
-
 function deriveActor(input: {
   readonly config: Pick<AgentBoundModelConfig, 'agentId' | 'roleId'>
   readonly turnForkId: string | null | undefined
@@ -242,27 +224,12 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           onSome: (gc) => ({ ...callOptions, toolChoice: gc }),
           onNone: () => callOptions,
         })
-        const start = () => Effect.scoped(
-          (config.prepareRequest ?? Effect.void).pipe(
-            Effect.zipRight(config.rawModel.stream(prompt, tools, effectiveOptions)),
-          ),
-        )
-        const streamEffect = start().pipe(
-          Effect.catchIf(isPreStreamModelNotReady, () => start()),
-        )
-        const clearFailedStart = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-          effect.pipe(
-            Effect.onExit((exit) =>
-              Exit.isFailure(exit)
-                ? (config.clearRequestProgress ?? Effect.void)
-                : Effect.void
-            ),
-          )
+        const streamEffect = config.rawModel.stream(prompt, tools, effectiveOptions)
 
-        if (!config.debug) return yield* clearFailedStart(streamEffect)
+        if (!config.debug) return yield* streamEffect
 
         const sessionId = getTraceSessionId()
-        if (sessionId === null) return yield* clearFailedStart(streamEffect)
+        if (sessionId === null) return yield* streamEffect
 
         const turnOption = yield* Effect.serviceOption(TurnContextTag)
         const forkOption = yield* Effect.serviceOption(ForkContext)
@@ -280,7 +247,7 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
         })
         const scope = deriveScope({ callType, turn, operation })
 
-        return yield* clearFailedStart(streamEffect.pipe(
+        return yield* streamEffect.pipe(
           Effect.provideService(TraceListener, {
             onTrace: (trace) => {
               writeTrace({
@@ -293,7 +260,7 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
               })
             },
           }),
-        ))
+        )
       }),
   }
 

@@ -178,10 +178,11 @@ const dashboard = Command.make("dashboard", {}, () => operation(Effect.gen(funct
   )
   let interrupted = false
   const onInterrupt = () => { interrupted = true }
+  const processEvents = process as unknown as NodeJS.EventEmitter
   const code = yield* Effect.acquireUseRelease(
-    Effect.sync(() => process.on("SIGINT", onInterrupt)),
+    Effect.sync(() => processEvents.on("SIGINT", onInterrupt)),
     () => PlatformCommand.exitCode(child),
-    () => Effect.sync(() => process.off("SIGINT", onInterrupt)),
+    () => Effect.sync(() => processEvents.removeListener("SIGINT", onInterrupt)),
   )
   if (code !== 0 && !interrupted) return yield* new CliError({ message: `dashboard exited with ${code}` })
 }))).pipe(Command.withDescription("Start the local benchmark dashboard"))

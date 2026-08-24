@@ -1964,7 +1964,7 @@ mod tests {
         CatalogModelId, CatalogVariantId, InstalledModelPackages, ModelCapabilities, ModelFile,
         ModelFileId, ModelFileRole, ModelPackageInspection, ModelPackageProperties,
         ModelReasoningCapabilities, ModelReleaseDate, ModelServingConfiguration,
-        ModelServingConfigurationId, RecommendableModel, ServableModelBundle, ServingProfile,
+        RecommendableModel, ServableModelBundle, ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
@@ -1972,7 +1972,6 @@ mod tests {
             model_id: CatalogModelId("catalog".to_owned()),
             variant_id: CatalogVariantId("gguf:q4".to_owned()),
             configuration: ModelServingConfiguration {
-                id: ModelServingConfigurationId("catalog-configuration".to_owned()),
                 bundle: ServableModelBundle::Standalone { package },
                 profile: ServingProfile {
                     context_length: 4_096,
