@@ -9,13 +9,14 @@ import type { ModelSpec, ModelStreamResult } from "./model-spec"
 export interface BoundModel<
   TCallOptions,
   TStartFailure = StreamStartFailure,
+  TPreparation = never,
 > {
   readonly stream: (
     prompt: Prompt,
     tools: readonly ToolDefinition[],
     options?: TCallOptions & { generateToolCallId?: () => ToolCallId },
   ) => Effect.Effect<
-    ModelStreamResult,
+    ModelStreamResult<TPreparation>,
     TStartFailure,
     HttpClient.HttpClient
   >

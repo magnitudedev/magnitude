@@ -4,7 +4,7 @@ import { FetchHttpClient } from '@effect/platform'
 import { ModelFamilyIdSchema, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/ai'
 import { AmbientServiceTag, Fork, type AmbientService } from '@magnitudedev/event-core'
 import {
-  ModelStreamTerminal,
+  ModelRequestTerminal,
   Prompt,
   type BoundModel,
   type Message,
@@ -90,7 +90,7 @@ function eventsFor(text: string): readonly ResponseStreamEvent[] {
     { _tag: 'message_end' },
     {
       _tag: 'stream_end',
-      terminal: ModelStreamTerminal.StreamCompleted({
+      terminal: ModelRequestTerminal.StreamCompleted({
         call: { provider: 'test', model: 'test', method: 'POST', url: 'http://test' },
         response: { status: 200, headers: [], requestId: null },
         finishReason: 'stop',

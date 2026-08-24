@@ -24,7 +24,8 @@ import {
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
   type GenerationPerformance,
-  type ModelRequestProgress,
+  type ModelStreamEvent,
+  ModelRequestTerminal,
   type ProviderModelBindOptions,
   type ProviderId,
   type ProviderModelId,
@@ -42,6 +43,7 @@ import {
   type GeneratedClientError,
 } from "@magnitudedev/openapi-effect/client-runtime"
 import type { LocalProviderSource } from "./provider.js"
+import type { IcnModelPreparation } from "./contract.js"
 
 const icnRequestOptions = {
   maxTokens: NativeChatCompletions.options.maxTokens,
@@ -192,7 +194,6 @@ const bindIcnModel = (
     const maxTokens = Option.fromNullable(requestOptions?.maxTokens ?? defaults?.maxTokens)
     const toolChoice = Option.fromNullable(requestOptions?.toolChoice ?? defaults?.toolChoice)
     const reasoningEffort = Option.fromNullable(requestOptions?.reasoningEffort ?? defaults?.reasoningEffort)
-    const requestProgress = bindOptions?.requestAttribution?.requestProgress
     return NativeChatCompletions.buildRequest(
       {
         call,
@@ -225,34 +226,25 @@ const bindIcnModel = (
           Effect.flatMap(({ status, headers, events }) => Effect.gen(function* () {
               const response = acceptedHttpResponse(status, headers)
               const performance = yield* Ref.make(Option.none<GenerationPerformance>())
-              let progressRequestId: string | null = null
-              let semanticStarted = false
+              let acceptingPreparation = true
+              const pendingActivity: Array<Exclude<
+                ModelStreamEvent<IcnModelPreparation>,
+                ResponseStreamEvent
+              >> = []
               const reportProgress = (
                 requestId: string,
                 progress: Generated.ChatCompletionProgress,
-              ): Effect.Effect<void> => {
-                if (!requestProgress) return Effect.void
-                progressRequestId = requestId
-                const update: ModelRequestProgress = (() => {
-                  switch (progress.phase) {
-                    case "model_loading": return {
-                      phase: "model_loading",
-                      requestId,
-                      fraction: progress.fraction,
-                    }
-                    case "queued": return { phase: "queued", requestId }
-                    case "preparing": return { phase: "preparing", requestId }
-                    case "prefill": return {
-                      phase: "prefill",
-                      requestId,
-                      completedTokens: progress.completed_tokens,
-                      totalTokens: progress.total_tokens,
-                      cachedTokens: progress.cached_tokens,
-                    }
-                    case "generating": return { phase: "generating", requestId }
-                  }
-                })()
-                return requestProgress(update)
+              ): void => {
+                if (progress.phase === "generating") {
+                  acceptingPreparation = false
+                  return
+                }
+                if (!acceptingPreparation) return
+                pendingActivity.push({
+                  _tag: "preparation_update",
+                  preparation: progress,
+                  requestId,
+                })
               }
               const sourceEvents = events.pipe(
                 Stream.tap((chunk) => Option.match(chunk.timings, {
@@ -265,30 +257,12 @@ const bindIcnModel = (
                   })),
                 })),
                 Stream.tap((chunk) => Option.match(chunk.progress, {
-                  onSome: (progress) => {
-                    if (progress.phase === "generating") semanticStarted = true
-                    return reportProgress(chunk.id, progress)
-                  },
+                  onSome: (progress) => Effect.sync(() => reportProgress(chunk.id, progress)),
                   onNone: () => {
-                    if (!requestProgress || semanticStarted || chunk.choices.length === 0) {
-                      return Effect.void
-                    }
-                    semanticStarted = true
-                    progressRequestId = chunk.id
-                    return requestProgress({
-                      phase: "generating",
-                      requestId: chunk.id,
-                    })
+                    if (chunk.choices.length === 0) return Effect.void
+                    return Effect.sync(() => { acceptingPreparation = false })
                   },
                 })),
-                Stream.ensuring(
-                  requestProgress
-                    ? Effect.suspend(() => requestProgress({
-                        phase: "cleared",
-                        requestId: progressRequestId,
-                      }))
-                    : Effect.void,
-                ),
               )
               const chunks = sourceEvents.pipe(
                 Stream.filter((chunk) => Option.isNone(chunk.progress)),
@@ -311,16 +285,32 @@ const bindIcnModel = (
                 streamContext: { call, response, responseHeaders: new Headers(headers) },
                 ...(requestOptions?.generateToolCallId ? { generateToolCallId: requestOptions.generateToolCallId } : {}),
                 toStreamFailure: (cause) => generatedBodyFailure(call, response, cause),
+                classifyProviderError: (error) => {
+                  if (
+                    Option.getOrNull(error.type) !== "model_error"
+                    || Option.getOrNull(error.retryable) !== false
+                  ) {
+                    return Option.none()
+                  }
+                  return Option.getOrNull(error.code) === "model_instance_stopped"
+                    ? Option.some(ModelRequestTerminal.ModelInstanceStopped())
+                    : Option.none()
+                },
               })
               const decodedEvents = decoded.events.pipe(
                 Stream.mapEffect((event): Effect.Effect<ResponseStreamEvent> => {
-                  if (event._tag !== "stream_end" || event.terminal._tag !== "StreamCompleted") {
+                  if (event._tag !== "stream_end") {
                     return Effect.succeed(event)
                   }
+                  if (event.terminal._tag !== "StreamCompleted") return Effect.succeed(event)
                   return Ref.get(performance).pipe(Effect.map(Option.match({
                     onNone: () => event,
                     onSome: (measurement) => ({ ...event, performance: measurement }),
                   })))
+                }),
+                Stream.mapConcat((event) => {
+                  const activity = pendingActivity.splice(0)
+                  return [...activity, event]
                 }),
               )
               return {
@@ -329,10 +319,6 @@ const bindIcnModel = (
                 requestId: response.requestId,
               }
           })),
-          Effect.tapError(() => requestProgress?.({
-            phase: "cleared",
-            requestId: null,
-          }) ?? Effect.void),
         )),
     )
   },

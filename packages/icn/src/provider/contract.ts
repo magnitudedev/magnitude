@@ -15,3 +15,6 @@ export const LocalModelInfoSchema = Schema.Struct({
 }, { message: () => "Discovered reasoning efforts must contain defaultReasoningEffort" }))
 
 export type LocalModelInfo = Schema.Schema.Type<typeof LocalModelInfoSchema>
+
+/** ICN-owned detail carried by the generic AI Preparing phase. */
+export type { IcnModelPreparation } from "@magnitudedev/icn-protocol/model-request"

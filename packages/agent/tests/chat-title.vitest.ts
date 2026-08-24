@@ -3,7 +3,7 @@ import { Effect, Layer, Stream } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { EventEngine } from '@magnitudedev/event-core'
 import {
-  ModelStreamTerminal,
+  ModelRequestTerminal,
   StreamClientCorrectnessViolation,
   type BaseCallOptions,
   type ModelStreamResult,
@@ -115,7 +115,7 @@ function makeTitleModel(title: string | null, options?: { failAfterOutput?: bool
   if (options?.failAfterOutput) {
     events.push({
       _tag: 'stream_end',
-      terminal: ModelStreamTerminal.StreamFailed({
+      terminal: ModelRequestTerminal.StreamFailed({
         cause: new StreamClientCorrectnessViolation({
           call: { provider: 'test', model: 'local-primary', method: 'POST', url: 'http://test' },
           response: { status: 200, headers: [], requestId: null },

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest"
 import { Stream, Effect, Chunk, Option, Schema } from "effect"
 import { decode } from "../decode"
-import { acceptedHttpResponse, type StreamFailureContext } from "../../../errors/failure"
+import { acceptedHttpResponse, ModelRequestTerminal, type StreamFailureContext } from "../../../errors/failure"
 import { ChatCompletionsStreamChunk } from "../../../wire/chat-completions"
 import { normalizeChatCompletionsChunk } from "../chunk"
 import type { ResponseStreamEvent } from "../../../response/events"
@@ -112,6 +112,31 @@ describe("decode — mid-stream error envelope", () => {
         expect(cause.providerError.code).toBe("upstream_unavailable")
       }
     }
+  })
+
+  it("lets the provider adapter classify a known error before generic failure construction", async () => {
+    const chunks = Stream.make(
+      errorChunk("model instance was stopped", "model_error", "model_instance_stopped"),
+    )
+
+    const { events } = decode(chunks, {
+      streamContext,
+      toStreamFailure: (e) => e,
+      classifyProviderError: (error) => Option.match(error.code, {
+        onNone: () => Option.none(),
+        onSome: (code) => code === "model_instance_stopped"
+          ? Option.some(ModelRequestTerminal.ModelInstanceStopped())
+          : Option.none(),
+      }),
+    })
+
+    const result = await collectEvents(events)
+    expect(result).toEqual([{
+      _tag: "stream_end",
+      terminal: { _tag: "ModelInstanceStopped" },
+      rawInput: undefined,
+      rawOutput: undefined,
+    }])
   })
 
   it("transitions to DONE phase and ignores subsequent chunks", async () => {

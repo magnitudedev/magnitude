@@ -14,6 +14,7 @@ import type {
   ProviderModelId,
   ProviderRejection,
   RequestAttribution,
+  StreamStartFailure,
   UsageQuery,
   WebSearchResult,
 } from "@magnitudedev/ai"
@@ -38,6 +39,8 @@ import {
   type ProviderCatalogOutcome,
 } from "@magnitudedev/providers"
 import type { ProviderInfo as RegistryProviderInfo } from "@magnitudedev/providers"
+import type { IcnModelPreparation } from "@magnitudedev/icn-protocol/model-request"
+export type { IcnModelPreparation } from "@magnitudedev/icn-protocol/model-request"
 
 // =============================================================================
 // Re-exported types with provider-agnostic names
@@ -82,8 +85,8 @@ export type ProviderClientError = MagnitudeClientError
 export type ProviderRegistryInfo = RegistryProviderInfo
 export type { ProviderCatalogOutcome } from "@magnitudedev/providers"
 
-export interface ProviderClientConfig extends MagnitudeClientConfig {
-  readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
+export interface ProviderClientConfig<TPreparation = IcnModelPreparation> extends MagnitudeClientConfig {
+  readonly discoverableProviders?: readonly DiscoverableProviderInstance<TPreparation>[]
   readonly exaApiKey?: string
   readonly exaEndpoint?: string
 }
@@ -141,7 +144,7 @@ export type WebSearchSource = typeof WebSearchSourceSchema.Type
  * The provider client boundary. ONE method to resolve any model from any
  * registered provider. No per-provider methods, no qualified ID parsing.
  */
-export interface ProviderClientShape {
+export interface ProviderClientShape<TPreparation = IcnModelPreparation> {
   readonly catalog: ModelCatalog<ProviderModel>
   readonly catalogs: {
     readonly list: Effect.Effect<readonly ProviderCatalogOutcome[], never, HttpClient.HttpClient>
@@ -153,7 +156,7 @@ export interface ProviderClientShape {
     providerId: ProviderId,
     providerModelId: ProviderModelId,
     options?: ProviderModelBindOptions,
-  ) => Effect.Effect<BoundModel<BaseCallOptions>, never, never>
+  ) => Effect.Effect<BoundModel<BaseCallOptions, StreamStartFailure, TPreparation>, never, never>
   readonly discoverModelProperties: (
     providerId: ProviderId,
     request: ModelPropertyDiscoveryRequest,
@@ -181,15 +184,15 @@ export interface ProviderClientShape {
 /** @effect-expect-leaking HttpClient */
 export class ProviderClient extends Context.Tag("ProviderClient")<
   ProviderClient,
-  ProviderClientShape
+  ProviderClientShape<IcnModelPreparation>
 >() {}
 
 // =============================================================================
 // Factory
 // =============================================================================
 
-export function createProviderClient(config?: ProviderClientConfig): ProviderClientShape {
-  const magnitudeInstance: MagnitudeProviderInstance = createMagnitudeProvider(config)
+export function createProviderClient<TPreparation = IcnModelPreparation>(config?: ProviderClientConfig<TPreparation>): ProviderClientShape<TPreparation> {
+  const magnitudeInstance: MagnitudeProviderInstance<TPreparation> = createMagnitudeProvider<TPreparation>(config)
   const exaInstance = createExaWebSearch({
     ...(config?.exaApiKey === undefined ? {} : { apiKey: config.exaApiKey }),
     ...(config?.exaEndpoint === undefined ? {} : { endpoint: config.exaEndpoint }),
@@ -208,7 +211,7 @@ export function createProviderClient(config?: ProviderClientConfig): ProviderCli
   //     ? exaInstance.webSearch
   //     : () => Effect.fail(new WebSearchNotConfigured())
 
-  const registry = makeProviderRegistry({
+  const registry = makeProviderRegistry<TPreparation>({
     // magnitude: magnitudeInstance,
     magnitude: null,
     discoverableProviders: config?.discoverableProviders ?? [],

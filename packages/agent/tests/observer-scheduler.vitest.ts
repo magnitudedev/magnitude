@@ -4,7 +4,7 @@ import { FetchHttpClient } from '@effect/platform'
 import { EventEngine } from '@magnitudedev/event-core'
 import {
   createStreamingFieldParser,
-  ModelStreamTerminal,
+  ModelRequestTerminal,
   type BoundModel,
   type ModelSpec,
   type ModelStreamResult,
@@ -175,7 +175,7 @@ function observerReportEvents(args: {
     },
     {
       _tag: 'stream_end',
-      terminal: ModelStreamTerminal.StreamCompleted({
+      terminal: ModelRequestTerminal.StreamCompleted({
         call: { provider: 'test', model: 'test', method: 'POST', url: 'http://test' },
         response: { status: 200, headers: [], requestId: null },
         finishReason: 'tool_calls',

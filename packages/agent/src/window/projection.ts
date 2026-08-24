@@ -6,7 +6,7 @@
  */
 
 import { Projection, Signal } from '@magnitudedev/event-core'
-import { outcomeWillChainContinue, type AppEvent, type StrategyId } from '../events'
+import { cancellationRequiresUserInput, outcomeWillChainContinue, type AppEvent, type StrategyId } from '../events'
 import { present } from '../errors'
 import { getAgentByForkId, AgentLifecycleProjection, hasActiveWorkers } from '../projections/agent-lifecycle'
 import { WorkerActivityProjection } from '../projections/worker-activity'
@@ -609,8 +609,9 @@ export const WindowProjection = Projection.defineForked<AppEvent>()({
       if (event.forkId === null && !outcomeWillChainContinue(event.outcome)) {
         const goalState = read(GoalProjection)
         const agentStatus = read(AgentLifecycleProjection)
-        const isUserInterrupt = event.outcome._tag === 'Cancelled' && event.outcome.reason._tag === 'UserInterrupt'
-        if (goalState.active && !isUserInterrupt && !hasActiveWorkers(agentStatus)) {
+        const waitsForUser = event.outcome._tag === 'Cancelled'
+          && cancellationRequiresUserInput(event.outcome.reason)
+        if (goalState.active && !waitsForUser && !hasActiveWorkers(agentStatus)) {
           const entry = makeGoalInjectionEntry(renderGoalEarlyStopInjection(goalState.active.objective))
           goalInjectionTokens = entry.estimatedTokens
           newMessages.push(entry)

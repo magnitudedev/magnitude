@@ -70,7 +70,9 @@ then validates the result through the generated ICN request contract. The reques
 Instance ID or serving configuration: ICN resolves the Model and automatically acquires residency
 before execution. First-party callers may request Magnitude progress chunks with
 `Magnitude-Include-Progress: true`; the provider adapter consumes those chunks before ordinary
-provider-neutral response decoding. The inference benchmark is a
+provider-neutral response decoding. Those chunks drive the optional generic model-request
+activity events interleaved in the same ordered model stream; their concrete payload remains
+ICN-owned and never enters `ResponseStreamEvent`. The inference benchmark is a
 direct wire client: it may add benchmark-owned JSON extensions, but validates and canonicalizes the
 complete request through the native request Schema before fetch.
 
@@ -90,3 +92,4 @@ Downstream response normalization does not carry wire-level nullability.
 - Provider-specific JSON extensions survive final encoding without weakening standard fields.
 - Composition cannot bypass request validation or escape the typed failure contract.
 - Nullable response fields preserve missing/null wire acceptance and expose decoded absence as `Option`.
+- Provider-specific preparation observations never enter provider-neutral response events.

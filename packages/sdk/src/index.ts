@@ -146,6 +146,7 @@ export {
   createProviderClient,
   type ProviderClientShape,
   type ProviderClientConfig,
+  type IcnModelPreparation,
   type ProviderRegistryInfo,
   type ProviderRuntimeConfig,
   type ProviderCatalogOutcome,

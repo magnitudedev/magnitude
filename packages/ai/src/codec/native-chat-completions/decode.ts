@@ -8,10 +8,11 @@ import {
   type StreamFailure,
   type StreamFailureContext,
   type StreamProgress,
+  type ModelInstanceStoppedTerminal,
   type AcceptedHttpResponse,
   type ProviderCall,
   payloadSample,
-  ModelStreamTerminal,
+  ModelRequestTerminal,
   StreamClientCorrectnessViolation,
   StreamOperationalFailure,
   StreamProviderCorrectnessViolation,
@@ -22,6 +23,7 @@ import {
 } from "../../errors/failure"
 import type { ToolDefinition } from "../../tools/tool-definition"
 import type { NormalizedChatCompletionsStreamChunk } from "./chunk"
+import type { ChatCompletionProviderError } from "./chunk"
 import type { FieldEvent } from "../../streaming/types"
 import type { TokenLogprob } from "../../trace"
 import type { RawInputToken, RawOutputToken } from "../../response/events"
@@ -57,12 +59,12 @@ function buildTerminal(
   response: AcceptedHttpResponse,
   progress: StreamProgress,
   usage: Option.Option<ResponseUsage>,
-): ModelStreamTerminal {
+): ModelRequestTerminal {
   const usageAt = usageAtTermination(usage, "usage_chunk_never_arrived")
 
   switch (pending._tag) {
     case "completed":
-      return ModelStreamTerminal.StreamCompleted({
+      return ModelRequestTerminal.StreamCompleted({
         call,
         response,
         finishReason: pending.finishReason,
@@ -70,7 +72,7 @@ function buildTerminal(
         usage: usageAt,
       })
     case "validation_failure":
-      return ModelStreamTerminal.StreamFailed({
+      return ModelRequestTerminal.StreamFailed({
         cause: new StreamProviderCorrectnessViolation({
           call,
           response,
@@ -94,9 +96,9 @@ function buildTerminal(
 function makeTerminatedStreamTerminal(
   failure: StreamFailure,
   usage: Option.Option<ResponseUsage>,
-): ModelStreamTerminal {
+): ModelRequestTerminal {
   const usageAt = usageAtTermination(usage, "stream_failed_before_usage")
-  return ModelStreamTerminal.StreamFailed({
+  return ModelRequestTerminal.StreamFailed({
     cause: failure,
     usage: usageAt,
   })
@@ -188,6 +190,9 @@ function processChunk(
   generateToolCallId: () => ToolCallId,
   streamContext: StreamFailureContext,
   progress: StreamProgress,
+  classifyProviderError: (
+    error: ChatCompletionProviderError,
+  ) => Option.Option<ModelInstanceStoppedTerminal>,
 ): readonly [DecoderState, readonly ResponseStreamEvent[]] {
   const events: ResponseStreamEvent[] = []
   let nextState = state
@@ -207,6 +212,16 @@ function processChunk(
   // ── Server-side error envelope: terminate the stream with a typed error ────
   if (Option.isSome(chunk.error)) {
     const error = chunk.error.value
+    const stopped = classifyProviderError(error)
+    if (Option.isSome(stopped)) {
+      events.push({
+        _tag: "stream_end",
+        terminal: stopped.value,
+        rawInput: Option.getOrUndefined(nextState.rawInput),
+        rawOutput: Option.getOrUndefined(nextState.rawOutput),
+      })
+      return [{ ...nextState, phase: { _tag: 'done' } }, events]
+    }
     const failure = new StreamProviderError({
       call: streamContext.call,
       response: streamContext.response,
@@ -455,6 +470,9 @@ export function decode<E>(
     streamContext: StreamFailureContext
     generateToolCallId?: () => ToolCallId
     toStreamFailure: (error: E) => StreamFailure
+    classifyProviderError?: (
+      error: ChatCompletionProviderError,
+    ) => Option.Option<ModelInstanceStoppedTerminal>
   },
 ): {
   readonly events: Stream.Stream<ResponseStreamEvent, never>
@@ -464,6 +482,8 @@ export function decode<E>(
   const generateToolCallId = options.generateToolCallId ?? createToolCallId
   const parsers = new Map<ToolCallId, StreamingFieldParser>()
   const logprobs: TokenLogprob[] = []
+  const classifyProviderError = options.classifyProviderError
+    ?? (() => Option.none<ModelInstanceStoppedTerminal>())
   let chunksObserved = 0
   let modelEventsEmitted = 0
 
@@ -481,6 +501,7 @@ export function decode<E>(
         generateToolCallId,
         options.streamContext,
         decoderProgress(chunksObserved, modelEventsEmitted),
+        classifyProviderError,
       )
       lastState = result[0]
       modelEventsEmitted += result[1].length

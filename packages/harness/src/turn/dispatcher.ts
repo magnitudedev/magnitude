@@ -1,7 +1,7 @@
 import { Effect, Cause, Data, Layer, Stream, Schema, Option } from "effect"
 import { JsonValueSchema, type JsonValue } from "@magnitudedev/utils/schema"
 import type { ProviderToolCallId, ResponseStreamEvent, ToolCallId, StreamingFieldParser, FinishReason, ValidationIssue } from "@magnitudedev/ai"
-import { formatStreamFailureMessage, formatValidationIssue, type ModelStreamTerminal } from "@magnitudedev/ai"
+import { formatStreamFailureMessage, formatValidationIssue, type ModelRequestTerminal } from "@magnitudedev/ai"
 import type { HarnessEvent, ToolError, ToolResult, TurnOutcome } from "../events"
 import type { HarnessHooks, ExecuteHookContext } from "../hooks"
 import type { Toolkit } from "../tool/toolkit"
@@ -308,7 +308,7 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
 
   // ── Terminal handling ─────────────────────────────────────────────
 
-  function terminalToOutcome(terminal: ModelStreamTerminal): TurnOutcome {
+  function terminalToOutcome(terminal: ModelRequestTerminal): TurnOutcome {
     switch (terminal._tag) {
       case "StreamCompleted":
         return mapFinishReasonToOutcome(terminal.finishReason, toolCallCount, config.requestId)
@@ -318,6 +318,11 @@ export function dispatch<TDenial extends JsonValue = JsonValue>(config: Dispatch
           _tag: "StreamFailed",
           message: formatStreamFailureMessage(terminal.cause),
           terminal,
+        })
+
+      case "ModelInstanceStopped":
+        return withRequestId({
+          _tag: "ModelInstanceStopped",
         })
     }
   }

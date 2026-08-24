@@ -7,7 +7,7 @@
 
 import { Effect, Schema, Stream } from 'effect'
 import * as HttpClient from '@effect/platform/HttpClient'
-import { formatStreamFailureMessage, type FinishReason, type ModelStreamResult, type ModelStreamTerminal, type StreamFailure } from '@magnitudedev/ai'
+import { formatStreamFailureMessage, type FinishReason, type ModelStreamResult, type ModelRequestTerminal, type StreamFailure } from '@magnitudedev/ai'
 import { advisorPrompt } from '@magnitudedev/roles'
 import { AgentModelResolver } from '../model/model-resolver'
 import { getAgentByForkId, type AgentLifecycleState } from '../projections/agent-lifecycle'
@@ -65,12 +65,14 @@ export function streamErrorMessage(failure: StreamFailure): string {
   return formatStreamFailureMessage(failure)
 }
 
-function streamTerminalErrorMessage(terminal: ModelStreamTerminal): string | null {
+function streamTerminalErrorMessage(terminal: ModelRequestTerminal): string | null {
   switch (terminal._tag) {
     case 'StreamCompleted':
       return null
     case 'StreamFailed':
       return streamErrorMessage(terminal.cause)
+    case 'ModelInstanceStopped':
+      return 'Model instance was stopped'
   }
 }
 
@@ -85,8 +87,8 @@ export function callerLabel(args: {
   return `${agent.agentId} (${agent.role})`
 }
 
-export function collectAdvisorText(
-  streamResult: ModelStreamResult,
+export function collectAdvisorText<TPreparation>(
+  streamResult: ModelStreamResult<TPreparation>,
 ): Effect.Effect<{
   readonly text: string
   readonly finishReason: FinishReason | null
@@ -185,4 +187,3 @@ export function executeMessageAdvisor(input: { readonly message: string }) {
     return result.text
   })
 }
-

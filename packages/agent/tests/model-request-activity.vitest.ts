@@ -11,12 +11,20 @@ describe('model request activity', () => {
       initialModelRequestActivityState(),
       {
         turn,
-        progress: { phase: 'preparing', requestId: null },
+        activity: {
+          _tag: 'Preparing',
+          preparation: { phase: 'preparing' },
+          requestId: null,
+        },
       },
     )
     const queuedState = reduceModelRequestActivity(preparingState, {
       turn,
-      progress: { phase: 'queued', requestId: 'request-1' },
+      activity: {
+        _tag: 'Preparing',
+        preparation: { phase: 'queued' },
+        requestId: 'request-1',
+      },
     })
     const active = {
       preparing: preparingState.requests.get('root'),
@@ -34,15 +42,15 @@ describe('model request activity', () => {
     const turn = { turnId: 'turn-1', chainId: 'chain-1', forkId: null }
     const first = reduceModelRequestActivity(initialModelRequestActivityState(), {
       turn,
-      progress: { phase: 'queued', requestId: 'request-1' },
+      activity: { _tag: 'Preparing', preparation: { phase: 'queued' }, requestId: 'request-1' },
     })
     const second = reduceModelRequestActivity(first, {
       turn,
-      progress: { phase: 'queued', requestId: 'request-2' },
+      activity: { _tag: 'Preparing', preparation: { phase: 'queued' }, requestId: 'request-2' },
     })
     const active = reduceModelRequestActivity(second, {
       turn,
-      progress: { phase: 'cleared', requestId: 'request-1' },
+      activity: { _tag: 'Ended', requestId: 'request-1' },
     }).requests
 
     expect(active.get('root')).toMatchObject({ requestId: 'request-2' })
@@ -54,19 +62,22 @@ describe('model request activity', () => {
       initialModelRequestActivityState(),
       {
         turn,
-        progress: {
-          phase: 'prefill',
+        activity: {
+          _tag: 'Preparing',
+          preparation: {
+            phase: 'prefill',
+            completed_tokens: 9_400,
+            total_tokens: 14_300,
+            cached_tokens: 0,
+          },
           requestId: 'request-1',
-          completedTokens: 9_400,
-          totalTokens: 14_300,
-          cachedTokens: 0,
         },
       },
     )
     const result = reduceModelRequestActivity(prefill, {
       turn,
-      progress: {
-        phase: 'generating',
+      activity: {
+        _tag: 'Streaming',
         requestId: 'request-1',
       },
     })

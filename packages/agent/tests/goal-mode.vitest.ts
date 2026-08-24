@@ -123,6 +123,21 @@ function stopped(turnId: string): TurnOutcomeEvent {
   } as any
 }
 
+function modelStopped(
+  turnId: string,
+  reason: 'ModelInstanceStopped',
+): TurnOutcomeEvent {
+  return {
+    ...stopped(turnId),
+    outcome: {
+      _tag: 'Cancelled',
+      reason: { _tag: reason },
+      requestId: 'request-1',
+    },
+    commitPolicy: { _tag: 'discardPartialAssistant' },
+  }
+}
+
 async function rootAfter(events: readonly AppEvent[]): Promise<ForkTurnState> {
   const program = Effect.gen(function* () {
     const bus = yield* ProjectionBusTag<AppEvent>()
@@ -182,6 +197,20 @@ describe('goal mode turn guard', () => {
 
     expect(state._tag).toBe('idle')
     expect(state.triggers).toHaveLength(0)
+  })
+
+  it('returns to user wait without retrying or waking an active goal after model stop', async () => {
+    for (const reason of ['ModelInstanceStopped'] as const) {
+      const state = await rootAfter([
+        goalStarted(),
+        turnStarted('turn-1'),
+        modelStopped('turn-1', reason),
+      ])
+
+      expect(state._tag).toBe('waiting_for_user')
+      expect(state.triggers).toHaveLength(0)
+      expect(state.connectionRetryCount).toBe(0)
+    }
   })
 
   it('does not queue a wake trigger after the active goal is finished', async () => {

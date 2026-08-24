@@ -1,11 +1,14 @@
-import { Context, Effect, Option } from 'effect'
+import { Context, Effect, Option, Stream } from 'effect'
 import {
   TraceListener,
   type BoundModel,
   type BaseCallOptions,
   type ToolCallId,
   type ToolDefinition,
+  type StreamStartFailure,
 } from '@magnitudedev/ai'
+import type { IcnModelPreparation } from '@magnitudedev/sdk'
+import type { ModelRequestActivity } from './model-request-activity'
 import type { SlotId } from '@magnitudedev/roles'
 import { buildMaxToolCallsGrammar } from './tool-call-grammar'
 import { Fork } from '@magnitudedev/event-core'
@@ -54,7 +57,7 @@ export type ModelSource = { readonly slotId: SlotId }
  * and grammar wrapping on top, operating on universal `BaseCallOptions`.
  */
 export interface AgentBoundModel {
-  readonly model: BoundModel<BaseCallOptions, AgentModelStartFailure>
+  readonly model: BoundModel<BaseCallOptions, AgentModelStartFailure, IcnModelPreparation>
   readonly modelSource: ModelSource
   readonly modelId: string
   readonly modelDisplayName: string
@@ -73,7 +76,8 @@ export interface AgentBoundModel {
 }
 
 export interface AgentBoundModelConfig {
-  readonly rawModel: BoundModel<BaseCallOptions>
+  readonly rawModel: BoundModel<BaseCallOptions, StreamStartFailure, IcnModelPreparation>
+  readonly reportActivity?: (activity: ModelRequestActivity) => Effect.Effect<void>
   readonly modelId: string
   readonly modelDisplayName: string
   readonly modelSource: ModelSource
@@ -211,7 +215,7 @@ function deriveScope(input: {
 // =============================================================================
 
 export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundModel {
-  const model: BoundModel<BaseCallOptions, AgentModelStartFailure> = {
+  const model: BoundModel<BaseCallOptions, AgentModelStartFailure, IcnModelPreparation> = {
     stream: (prompt, tools, options) =>
       Effect.gen(function* () {
         const callOptions = options as CallOptionsWithToolIds | undefined
@@ -224,7 +228,42 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           onSome: (gc) => ({ ...callOptions, toolChoice: gc }),
           onNone: () => callOptions,
         })
-        const streamEffect = config.rawModel.stream(prompt, tools, effectiveOptions)
+        const streamEffect = Effect.gen(function* () {
+          let requestId: string | null = null
+          yield* (config.reportActivity?.({ _tag: 'Starting', requestId }) ?? Effect.void)
+          let accepted = false
+          const streamResult = yield* config.rawModel.stream(prompt, tools, effectiveOptions).pipe(
+            Effect.tap((result) => Effect.sync(() => {
+              accepted = true
+              requestId = result.requestId
+            })),
+            Effect.ensuring(Effect.suspend(() =>
+              accepted
+                ? Effect.void
+                : config.reportActivity?.({ _tag: 'Ended', requestId }) ?? Effect.void)),
+          )
+          let reportedStreaming = false
+          const events = streamResult.events.pipe(
+            Stream.tap((event) => {
+              switch (event._tag) {
+                case 'preparation_update':
+                  if (event.requestId !== null) requestId = event.requestId
+                  return config.reportActivity?.({
+                    _tag: 'Preparing',
+                    preparation: event.preparation,
+                    requestId,
+                  }) ?? Effect.void
+                default:
+                  if (event._tag === 'stream_end' || reportedStreaming) return Effect.void
+                  reportedStreaming = true
+                  return config.reportActivity?.({ _tag: 'Streaming', requestId }) ?? Effect.void
+              }
+            }),
+            Stream.ensuring(Effect.suspend(() =>
+              config.reportActivity?.({ _tag: 'Ended', requestId }) ?? Effect.void)),
+          )
+          return { ...streamResult, events }
+        })
 
         if (!config.debug) return yield* streamEffect
 

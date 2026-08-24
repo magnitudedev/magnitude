@@ -2758,6 +2758,7 @@ fn clone_inference_error(error: &InferenceError) -> InferenceError {
         InferenceError::InvalidConfig(message) => InferenceError::InvalidConfig(message.clone()),
         InferenceError::Backend(message) => InferenceError::Backend(message.clone()),
         InferenceError::Cancelled => InferenceError::Cancelled,
+        InferenceError::ModelInstanceStopped => InferenceError::ModelInstanceStopped,
         InferenceError::Overloaded => InferenceError::Overloaded,
         InferenceError::ExecutorStopped => InferenceError::ExecutorStopped,
         InferenceError::Callback(message) => InferenceError::Callback(message.clone()),

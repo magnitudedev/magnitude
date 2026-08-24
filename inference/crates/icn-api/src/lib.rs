@@ -1302,6 +1302,12 @@ impl ApiError {
     fn from_inference(error: InferenceError) -> Self {
         match error {
             InferenceError::InvalidConfig(message) => Self::invalid(message),
+            InferenceError::ModelInstanceStopped => Self {
+                status: StatusCode::CONFLICT,
+                body: ErrorResponse {
+                    error: inference_error_body(&InferenceError::ModelInstanceStopped),
+                },
+            },
             error => Self::server(error.to_string()),
         }
     }
@@ -3321,6 +3327,7 @@ fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
         InferenceError::InvalidConfig(_) => ("invalid_request_error", "invalid_request", false),
         InferenceError::Backend(_) => ("server_error", "backend_error", true),
         InferenceError::Cancelled => ("cancelled", "request_cancelled", true),
+        InferenceError::ModelInstanceStopped => ("model_error", "model_instance_stopped", false),
         InferenceError::Overloaded => ("server_error", "overloaded", true),
         InferenceError::ExecutorStopped => ("server_error", "executor_stopped", true),
         InferenceError::Callback(_) => ("server_error", "stream_callback_error", true),
@@ -4750,6 +4757,14 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn stopped_model_instance_has_a_non_retryable_error_contract() {
+        let error = inference_error_body(&InferenceError::ModelInstanceStopped);
+        assert_eq!(error.r#type, "model_error");
+        assert_eq!(error.code, "model_instance_stopped");
+        assert!(!error.retryable);
+    }
+
     async fn post_chat(backend: impl CompletionBackend, request: Value) -> (StatusCode, String) {
         let response = app(AppState::new(backend))
             .oneshot(
@@ -4848,6 +4863,7 @@ mod tests {
         backend: Arc<dyn CompletionBackend>,
         leases: Arc<AtomicU64>,
         pending_acquisition_dropped: Option<Arc<AtomicBool>>,
+        stop_preparation: bool,
     }
 
     struct PendingAcquisitionDrop(Arc<AtomicBool>);
@@ -4977,6 +4993,15 @@ mod tests {
             model_id: String,
             _progress: Option<ModelLoadingObserver>,
         ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
+            if self.stop_preparation {
+                return Box::pin(async {
+                    Err(InventoryError::ModelOperation {
+                        code: "model_instance_stopped".to_owned(),
+                        message: "model instance was stopped".to_owned(),
+                        retryable: false,
+                    })
+                });
+            }
             if let Some(dropped) = self.pending_acquisition_dropped.clone() {
                 return Box::pin(async move {
                     let _drop = PendingAcquisitionDrop(dropped);
@@ -4997,6 +5022,7 @@ mod tests {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::new(AtomicU64::new(0)),
             pending_acquisition_dropped: None,
+            stop_preparation: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -5023,6 +5049,7 @@ mod tests {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
             pending_acquisition_dropped: None,
+            stop_preparation: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -5048,12 +5075,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn progress_chat_reports_stopped_model_instance_as_a_terminal_sse_error() {
+        let controller = Arc::new(StubModelInstanceController {
+            backend: Arc::new(FakeBackend::new("test-model", "unused")),
+            leases: Arc::new(AtomicU64::new(0)),
+            pending_acquisition_dropped: None,
+            stop_preparation: true,
+        });
+        let response = app(AppState::model_free().with_model_controller(controller))
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("Magnitude-Include-Progress", "true")
+                    .body(Body::from(minimal_request().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let chunks = stream_json(&body);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["error"]["type"], "model_error");
+        assert_eq!(chunks[0]["error"]["code"], "model_instance_stopped");
+        assert_eq!(chunks[0]["error"]["retryable"], false);
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
     async fn invalid_chat_is_rejected_before_model_lease() {
         let leases = Arc::new(AtomicU64::new(0));
         let controller = Arc::new(StubModelInstanceController {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
             pending_acquisition_dropped: None,
+            stop_preparation: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -5082,6 +5148,7 @@ mod tests {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::new(AtomicU64::new(0)),
             pending_acquisition_dropped: Some(Arc::clone(&dropped)),
+            stop_preparation: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(

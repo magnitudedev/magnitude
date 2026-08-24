@@ -5,7 +5,6 @@ import {
   Prompt,
   ProviderModelIdSchema,
   defineTool,
-  type ModelRequestProgress,
 } from "@magnitudedev/ai"
 import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
@@ -13,6 +12,7 @@ import { IcnClient } from "../client.js"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
 import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { IcnProvider, IcnProviderModelResolver, makeIcnProvider } from "./source.js"
+import type { IcnModelPreparation } from "./contract.js"
 
 const TEST_BASE_URL = "http://icn.test"
 
@@ -169,6 +169,7 @@ describe("ICN local provider", () => {
     const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
       { ...chunk, choices: [], progress: { phase: "queued" } },
       { ...chunk, choices: [], progress: { phase: "generating" } },
+      { ...chunk, choices: [], progress: { phase: "prefill", completed_tokens: 1, total_tokens: 2, cached_tokens: 0 } },
       {
         ...chunk,
         choices: [{
@@ -212,24 +213,23 @@ describe("ICN local provider", () => {
         },
       },
     ])))
-    const progress: ModelRequestProgress[] = []
-
     const output = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId, {
         requestAttribution: {
           key: "test",
           requestStarted: Effect.void,
-          requestProgress: (update) => Effect.sync(() => {
-            progress.push(update)
-          }),
         },
       })
-      const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+      const result = yield* bound.stream(
+        PromptBuilder.empty().user("hello").build(),
+        [],
+      )
       return yield* Stream.runCollect(result.events)
     }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
 
     expect(Array.from(output).map((event) => event._tag)).toEqual([
+      "preparation_update",
       "message_start",
       "message_delta",
       "message_end",
@@ -243,14 +243,12 @@ describe("ICN local provider", () => {
         timeToFirstTokenMs: 6,
       },
     })
-    expect(progress).toEqual([
-      { phase: "queued", requestId: "request-1" },
-      { phase: "generating", requestId: "request-1" },
-      { phase: "cleared", requestId: "request-1" },
+    expect(Array.from(output).slice(0, 1)).toEqual([
+      { _tag: "preparation_update", preparation: { phase: "queued" }, requestId: "request-1" },
     ])
   })
 
-  it("clears request activity when the inference request fails before streaming", async () => {
+  it("reports attribution without fabricating lifecycle phases for a rejected request", async () => {
     const modelId = ProviderModelIdSchema.make("mdl_test")
     const http = HttpClient.make((request) => Effect.succeed(jsonResponse(
       request,
@@ -272,16 +270,121 @@ describe("ICN local provider", () => {
         requestAttribution: {
           key: "test",
           requestStarted: Effect.sync(() => lifecycle.push("started")),
-          requestProgress: (update) => Effect.sync(() => {
-            lifecycle.push(update.phase)
-          }),
         },
       })
       return yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
     }).pipe(Effect.provide(makeTestLayer(http, modelId))))
 
     expect(Exit.isFailure(result)).toBe(true)
-    expect(lifecycle).toEqual(["started", "cleared"])
+    expect(lifecycle).toEqual(["started"])
+  })
+
+  it("maps an explicit instance stop before streaming to ModelInstanceStopped", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
+      {
+        id: "request-1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: modelId,
+        choices: [],
+        progress: { phase: "queued" },
+      },
+      {
+        id: "request-1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: modelId,
+        choices: [],
+        error: {
+          code: "model_instance_stopped",
+          message: "model instance was stopped",
+          retryable: false,
+          type: "model_error",
+        },
+      },
+    ])))
+
+    const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+      return Array.from(yield* Stream.runCollect(result.events))
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    expect(events.at(-1)).toMatchObject({
+      _tag: "stream_end",
+      terminal: {
+        _tag: "ModelInstanceStopped",
+      },
+    })
+  })
+
+  it("maps an explicit instance stop after streaming begins to the same terminal", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    const base = {
+      id: "request-1",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: modelId,
+      choices: [],
+    }
+    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
+      { ...base, progress: { phase: "generating" } },
+      {
+        ...base,
+        error: {
+          code: "model_instance_stopped",
+          message: "model instance was stopped",
+          retryable: false,
+          type: "model_error",
+        },
+      },
+    ])))
+
+    const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+      return Array.from(yield* Stream.runCollect(result.events))
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    expect(events.at(-1)).toMatchObject({
+      _tag: "stream_end",
+      terminal: { _tag: "ModelInstanceStopped" },
+    })
+  })
+
+  it("does not classify a retryable stopped-code error as an explicit request stop", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [{
+      id: "request-1",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: modelId,
+      choices: [],
+      error: {
+        code: "model_instance_stopped",
+        message: "temporary admission failure",
+        retryable: true,
+        type: "model_error",
+      },
+    }])))
+
+    const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+      return Array.from(yield* Stream.runCollect(result.events))
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    expect(events.at(-1)).toMatchObject({
+      _tag: "stream_end",
+      terminal: {
+        _tag: "StreamFailed",
+        cause: { _tag: "StreamProviderError" },
+      },
+    })
   })
 
   it("preserves ICN retry hints on in-stream model admission failures", async () => {

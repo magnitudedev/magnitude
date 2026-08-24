@@ -714,6 +714,8 @@ pub enum InferenceError {
     Backend(String),
     #[error("inference request was cancelled")]
     Cancelled,
+    #[error("model instance was stopped")]
+    ModelInstanceStopped,
     #[error("inference executor is overloaded")]
     Overloaded,
     #[error("inference executor stopped")]

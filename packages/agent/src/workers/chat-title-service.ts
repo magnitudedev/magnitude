@@ -13,7 +13,7 @@
 import { Cause, Context, Duration, Effect, Layer, Stream } from 'effect'
 import * as HttpClient from '@effect/platform/HttpClient'
 import { formatStreamFailureMessage, Prompt } from '@magnitudedev/ai'
-import type { ModelStreamTerminal } from '@magnitudedev/ai'
+import type { ModelRequestTerminal } from '@magnitudedev/ai'
 import { logger } from '@magnitudedev/logger'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import { AgentModelResolver } from '../model/model-resolver'
@@ -45,12 +45,14 @@ export class ChatTitleServiceTag extends Context.Tag('ChatTitleService')<
 // Helpers
 // =============================================================================
 
-function streamTerminalErrorMessage(terminal: ModelStreamTerminal): string | null {
+function streamTerminalErrorMessage(terminal: ModelRequestTerminal): string | null {
   switch (terminal._tag) {
     case 'StreamCompleted':
       return null
     case 'StreamFailed':
       return formatStreamFailureMessage(terminal.cause)
+    case 'ModelInstanceStopped':
+      return 'Model instance was stopped'
   }
 }
 

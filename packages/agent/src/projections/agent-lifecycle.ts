@@ -836,7 +836,15 @@ export const AgentLifecycleProjection = Projection.define<AppEvent>()(({
       if (value === null || value.turn.forkId !== null) return state
       if (value.turn.turnId !== state.rootWork._currentTurn?.turnId) return state
       if (value.turn.chainId !== state.rootWork._currentChainId) return state
-      if (value.progress.phase !== 'prefill' && value.progress.phase !== 'generating') {
+      const activity = value.activity
+      const startsModelActivity = (
+        activity._tag === 'Streaming'
+        || (
+          activity._tag === 'Preparing'
+          && activity.preparation.phase === 'prefill'
+        )
+      )
+      if (!startsModelActivity) {
         return state
       }
       const rootWork = markRootModelActivityStarted(state.rootWork)

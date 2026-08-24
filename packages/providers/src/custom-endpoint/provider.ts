@@ -21,6 +21,7 @@ import {
   type ProviderModelBindOptions,
   type RejectedHttpResponse,
   type ProviderCall,
+  type StreamStartFailure,
 } from "@magnitudedev/ai"
 import type {
   CustomEndpointDeclaration,
@@ -140,11 +141,11 @@ const toProviderModels = (
   })
 }
 
-export const createCustomEndpointProvider = (
+export const createCustomEndpointProvider = <TPreparation = never>(
   name: CustomEndpointName,
   declaration: CustomEndpointDeclaration,
   environment: Readonly<Record<string, string | undefined>> = process.env,
-): DiscoverableProviderInstance => {
+): DiscoverableProviderInstance<TPreparation> => {
   const providerId = customEndpointProviderId(name)
   const models = toProviderModels(name, declaration)
   const auth = resolveAuthentication(declaration, environment)
@@ -159,7 +160,7 @@ export const createCustomEndpointProvider = (
         : Effect.succeed(model)
     },
   }
-  const provider: Provider = {
+  const provider: Provider<ProviderModel, TPreparation> = {
     id: providerId,
     displayName: declaration.displayName,
     catalog,
@@ -170,7 +171,7 @@ export const createCustomEndpointProvider = (
     bindModel: (
       providerModelId,
       options?: ProviderModelBindOptions,
-    ): Effect.Effect<BoundModel<BaseCallOptions>> => Effect.sync(() => {
+    ): Effect.Effect<BoundModel<BaseCallOptions, StreamStartFailure, TPreparation>> => Effect.sync(() => {
       const declaredModel = Object.entries(declaration.models).find(
         ([modelName]) => modelName === providerModelId,
       )?.[1]

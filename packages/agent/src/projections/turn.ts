@@ -10,7 +10,7 @@ import { FSM } from '@magnitudedev/utils'
 const { defineFSM } = FSM
 import { Schema, Option } from 'effect'
 import { logger } from '@magnitudedev/logger'
-import { outcomeWillChainContinue } from '../events'
+import { cancellationRequiresUserInput, outcomeWillChainContinue } from '../events'
 import type { AppEvent, TurnOutcomeEvent } from '../events'
 import { computeDelayMs, getRetryAfterHint } from '../util/retry-backoff'
 import { JsonValueSchema } from '@magnitudedev/ai'
@@ -95,7 +95,7 @@ export class TurnWaitingForUser extends Schema.TaggedClass<TurnWaitingForUser>()
 
 export const TurnLifecycle = defineFSM(
   { idle: TurnIdle, active: TurnActive, interrupting: TurnInterrupting, waiting_for_user: TurnWaitingForUser },
-  { idle: ['active', 'waiting_for_user'], active: ['idle', 'interrupting'], interrupting: ['idle', 'waiting_for_user'], waiting_for_user: ['idle'] }
+  { idle: ['active', 'waiting_for_user'], active: ['idle', 'interrupting', 'waiting_for_user'], interrupting: ['idle', 'waiting_for_user'], waiting_for_user: ['idle'] }
 )
 
 export const TurnLifecycleStateSchema = Schema.Union(TurnIdle, TurnActive, TurnInterrupting, TurnWaitingForUser)
@@ -294,11 +294,12 @@ export const TurnProjection = Projection.defineForked<AppEvent>()({
       if (fork.turnId !== event.turnId) return fork
 
       const isRoot = event.forkId === null
-      const isUserInterruptedRoot =
-        isRoot &&
-        fork._tag === 'interrupting' &&
+      const waitsForUser =
         event.outcome._tag === 'Cancelled' &&
-        event.outcome.reason._tag === 'UserInterrupt'
+        cancellationRequiresUserInput(event.outcome.reason)
+      const shouldWaitForUser =
+        isRoot &&
+        waitsForUser
 
       const shouldEnqueueContinue = outcomeWillChainContinue(event.outcome)
       const isConnectionFailure = event.outcome._tag === 'ConnectionFailure'
@@ -318,11 +319,10 @@ export const TurnProjection = Projection.defineForked<AppEvent>()({
 
       const goalState = isRoot ? read(GoalProjection) : null
       const agentStatus = isRoot ? read(AgentLifecycleProjection) : null
-      const isUserInterrupt = event.outcome._tag === 'Cancelled' && event.outcome.reason._tag === 'UserInterrupt'
       const shouldEnqueueGoalReminder =
         isRoot &&
         !shouldEnqueueContinue &&
-        !isUserInterrupt &&
+        !waitsForUser &&
         goalState?.active != null &&
         agentStatus !== null &&
         !hasActiveWorkers(agentStatus)
@@ -343,10 +343,10 @@ export const TurnProjection = Projection.defineForked<AppEvent>()({
               ? 'completed'
               : 'error',
         result: event.outcome,
-        triggersQueued: isUserInterruptedRoot ? false : nextTriggers.length > 0,
+        triggersQueued: shouldWaitForUser ? false : nextTriggers.length > 0,
       })
 
-      if (isUserInterruptedRoot) {
+      if (shouldWaitForUser) {
         return TurnLifecycle.transition(fork, 'waiting_for_user', {
           completedTurns: fork.completedTurns + 1,
           triggers: [],

@@ -4,6 +4,7 @@ import * as HttpClient from '@effect/platform/HttpClient'
 import { Fork } from '@magnitudedev/event-core'
 import {
   Prompt,
+  ModelRequestTerminal,
   TraceListener,
   type BoundModel,
   type ModelCallTrace,
@@ -14,6 +15,7 @@ import {
 } from '@magnitudedev/ai'
 import type { AgentModelStartFailure } from '../src/model/model-request-preparation'
 import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/sdk'
+import type { IcnModelPreparation } from '@magnitudedev/sdk'
 
 const traceMock = vi.hoisted(() => ({
   sessionId: 'session-1' as string | null,
@@ -206,5 +208,79 @@ describe('makeAgentBoundModel tracing', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]?.hadTraceListener).toBe(false)
     expect(traceMock.traces).toEqual([])
+  })
+
+  it('projects model-stream activity without a lifecycle callback on the model API', async () => {
+    const rawModel: BoundModel<BaseCallOptions, StreamStartFailure, IcnModelPreparation> = {
+      stream: () => Effect.succeed({
+        events: Stream.make(
+          {
+            _tag: 'preparation_update' as const,
+            preparation: { phase: 'queued' as const },
+            requestId: 'request-1',
+          },
+          { _tag: 'message_start' as const },
+        ),
+        parsers: new Map(),
+        logprobs: [],
+        requestId: 'request-1',
+      }),
+    }
+    const activities: unknown[] = []
+    const wrapped = makeAgentBoundModel({
+      rawModel,
+      reportActivity: (activity) => Effect.sync(() => { activities.push(activity) }),
+      modelSource: { slotId: 'primary' },
+      modelId: 'role/leader',
+      modelDisplayName: 'Leader',
+      providerId: 'magnitude',
+      profile,
+      debug: false,
+      agentId: 'agent-1',
+    })
+
+    const result = await run(wrapped.model.stream(prompt, []))
+    await Effect.runPromise(Stream.runDrain(result.events))
+
+    expect(activities).toEqual([
+      { _tag: 'Starting', requestId: null },
+      { _tag: 'Preparing', preparation: { phase: 'queued' }, requestId: 'request-1' },
+      { _tag: 'Streaming', requestId: 'request-1' },
+      { _tag: 'Ended', requestId: 'request-1' },
+    ])
+  })
+
+  it('does not report Streaming when the first response event is terminal', async () => {
+    const rawModel: BoundModel<BaseCallOptions, StreamStartFailure, IcnModelPreparation> = {
+      stream: () => Effect.succeed({
+        events: Stream.make({
+          _tag: 'stream_end' as const,
+          terminal: ModelRequestTerminal.ModelInstanceStopped(),
+        }),
+        parsers: new Map(),
+        logprobs: [],
+        requestId: 'request-1',
+      }),
+    }
+    const activities: unknown[] = []
+    const wrapped = makeAgentBoundModel({
+      rawModel,
+      reportActivity: (activity) => Effect.sync(() => { activities.push(activity) }),
+      modelSource: { slotId: 'primary' },
+      modelId: 'role/leader',
+      modelDisplayName: 'Leader',
+      providerId: 'magnitude',
+      profile,
+      debug: false,
+      agentId: 'agent-1',
+    })
+
+    const result = await run(wrapped.model.stream(prompt, []))
+    await Effect.runPromise(Stream.runDrain(result.events))
+
+    expect(activities).toEqual([
+      { _tag: 'Starting', requestId: null },
+      { _tag: 'Ended', requestId: 'request-1' },
+    ])
   })
 })

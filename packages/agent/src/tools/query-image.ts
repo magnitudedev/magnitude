@@ -11,7 +11,7 @@ import { defineHarnessTool, StreamValidationError } from '@magnitudedev/harness'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 import { readImageFileForModel } from '../util/read-image-file'
 import { Fs, resolveFsPath } from '../services/fs'
-import { formatStreamFailureMessage, Prompt, type ModelStreamTerminal } from '@magnitudedev/ai'
+import { formatStreamFailureMessage, Prompt, type ModelRequestTerminal } from '@magnitudedev/ai'
 import { AgentModelResolver } from '../model/model-resolver'
 import { IMAGE_DESCRIPTION_PROMPT } from '../util/image-prompts'
 import type { SlotConfig } from '../ambient/config-ambient'
@@ -35,12 +35,14 @@ function imageError(message: string): ImageQueryError {
   return { _tag: 'ImageQueryError', message }
 }
 
-function streamTerminalErrorMessage(terminal: ModelStreamTerminal): Option.Option<string> {
+function streamTerminalErrorMessage(terminal: ModelRequestTerminal): Option.Option<string> {
   switch (terminal._tag) {
     case 'StreamCompleted':
       return Option.none()
     case 'StreamFailed':
       return Option.some(formatStreamFailureMessage(terminal.cause))
+    case 'ModelInstanceStopped':
+      return Option.some('Model instance was stopped')
   }
 }
 

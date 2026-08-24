@@ -417,6 +417,16 @@ export function createHarnessAdapter(config: HarnessAdapterConfig): HarnessAdapt
               break
             }
 
+            case 'ModelInstanceStopped': {
+              executionResult = {
+                _tag: 'Cancelled',
+                reason: { _tag: 'ModelInstanceStopped' },
+                requestId,
+              }
+              commitPolicy = { _tag: 'discardPartialAssistant' }
+              break
+            }
+
             case 'OutputTruncated': {
               executionResult = { _tag: 'OutputTruncated', requestId }
               break

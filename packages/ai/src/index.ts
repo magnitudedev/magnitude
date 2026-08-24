@@ -8,7 +8,7 @@ export { Option } from "./options/option"
 
 // Core types
 export type { ProviderModelCapabilities, ImagePlaceholderConfig } from "./model/capabilities"
-export type { ModelSpec, ModelStreamResult } from "./model/model-spec"
+export type { ModelSpec, ModelStreamEvent, ModelStreamResult } from "./model/model-spec"
 export type { BoundModel } from "./model/bound-model"
 export type { OptionDef, InferCallOptions } from "./options/option"
 
@@ -88,7 +88,7 @@ export {
   StreamStartProviderRejection,
 } from "./errors/failure"
 export {
-  ModelStreamTerminal,
+  ModelRequestTerminal,
 } from "./errors/failure"
 export type {
   AcceptedHttpResponse,
@@ -105,7 +105,7 @@ export type {
   StreamStartProviderCorrectnessViolationReason,
   LastStreamActivity,
   ModelAttemptFailure,
-  ModelStreamTerminal as ModelStreamTerminalType,
+  ModelRequestTerminal as ModelRequestTerminalType,
   PayloadSample,
   ProviderCall,
   ProviderErrorEnvelope,

@@ -2,7 +2,7 @@ import { Context, Data, Effect, Layer, Option } from "effect"
 import {
   StreamStartFailure,
   StreamFailure,
-  ModelStreamTerminal,
+  ModelRequestTerminal,
   ProviderRejection,
   type ProviderErrorEnvelope,
 } from "./failure"
@@ -118,7 +118,7 @@ export interface AiRetryPolicyService {
    * rules, model configuration, and route configuration.
    */
   upstreamRetryability: (
-    failure: StreamStartFailure | StreamFailure | ModelStreamTerminal,
+    failure: StreamStartFailure | StreamFailure | ModelRequestTerminal,
   ) => Effect.Effect<UpstreamRetryability, never, AiRetryPolicy>
 }
 
@@ -133,7 +133,7 @@ export class AiRetryPolicy extends Context.Tag("AiRetryPolicy")<
 
 export interface AiBillingPolicyService {
   billingDisposition: (
-    terminal: ModelStreamTerminal,
+    terminal: ModelRequestTerminal,
   ) => Effect.Effect<BillingDisposition, never, AiBillingPolicy>
 }
 
@@ -147,13 +147,15 @@ export class AiBillingPolicy extends Context.Tag("AiBillingPolicy")<
 // ---------------------------------------------------------------------------
 
 function retryabilityForTerminal(
-  terminal: ModelStreamTerminal,
+  terminal: ModelRequestTerminal,
 ): UpstreamRetryability {
   switch (terminal._tag) {
     case "StreamCompleted":
       return UpstreamRetryability.UpstreamNotRetryable({ reason: "non_retryable_terminal" })
     case "StreamFailed":
       return retryabilityForStreamFailure(terminal.cause)
+    case "ModelInstanceStopped":
+      return UpstreamRetryability.UpstreamNotRetryable({ reason: "non_retryable_terminal" })
   }
 }
 
@@ -259,11 +261,12 @@ function providerErrorRetryable(
  * {@link AiRetryPolicy} service when you want to allow override.
  */
 export function defaultRetryabilityForFailure(
-  failure: StreamStartFailure | StreamFailure | ModelStreamTerminal,
+  failure: StreamStartFailure | StreamFailure | ModelRequestTerminal,
 ): UpstreamRetryability {
   switch (failure._tag) {
     case "StreamCompleted":
     case "StreamFailed":
+    case "ModelInstanceStopped":
       return retryabilityForTerminal(failure)
     default:
       return retryabilityForStreamFailure(failure)

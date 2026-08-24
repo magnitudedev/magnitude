@@ -113,6 +113,7 @@ enum WireInferenceError {
     InvalidConfig(String),
     Backend(String),
     Cancelled,
+    ModelInstanceStopped,
     Overloaded,
     ExecutorStopped,
     Callback(String),
@@ -124,6 +125,7 @@ impl From<InferenceError> for WireInferenceError {
             InferenceError::InvalidConfig(message) => Self::InvalidConfig(message),
             InferenceError::Backend(message) => Self::Backend(message),
             InferenceError::Cancelled => Self::Cancelled,
+            InferenceError::ModelInstanceStopped => Self::ModelInstanceStopped,
             InferenceError::Overloaded => Self::Overloaded,
             InferenceError::ExecutorStopped => Self::ExecutorStopped,
             InferenceError::Callback(message) => Self::Callback(message),
@@ -137,6 +139,7 @@ impl From<WireInferenceError> for InferenceError {
             WireInferenceError::InvalidConfig(message) => Self::InvalidConfig(message),
             WireInferenceError::Backend(message) => Self::Backend(message),
             WireInferenceError::Cancelled => Self::Cancelled,
+            WireInferenceError::ModelInstanceStopped => Self::ModelInstanceStopped,
             WireInferenceError::Overloaded => Self::Overloaded,
             WireInferenceError::ExecutorStopped => Self::ExecutorStopped,
             WireInferenceError::Callback(message) => Self::Callback(message),
@@ -244,6 +247,23 @@ impl ClientInner {
                 let _ = sender.try_send(RequestReply::Failed(WireInferenceError::Backend(
                     reason.clone(),
                 )));
+            }
+        }
+    }
+
+    fn stop_all_executions(&self) {
+        if self.failed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.load_events.try_send(LoadEvent::Lost {
+            code: "model_instance_stopped".to_owned(),
+            message: "model instance was stopped".to_owned(),
+        });
+        if let Ok(mut pending) = self.pending.lock() {
+            for (_, sender) in pending.drain() {
+                let _ = sender.try_send(RequestReply::Failed(
+                    WireInferenceError::ModelInstanceStopped,
+                ));
             }
         }
     }
@@ -624,6 +644,11 @@ impl InferenceWorker {
 
     pub(crate) fn terminate(&self, code: &str, reason: &str) {
         self.client.inner.fail_all(code, reason.to_owned());
+        self.process.terminate();
+    }
+
+    pub(crate) fn stop_all_executions(&self) {
+        self.client.inner.stop_all_executions();
         self.process.terminate();
     }
 
@@ -1090,5 +1115,34 @@ mod tests {
         let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
         bytes.extend_from_slice(&payload);
         assert!(read_frame::<HostMessage>(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn explicit_worker_stop_terminalizes_active_requests_as_model_instance_stopped() {
+        let (commands, _command_receiver) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+        let (load_events, _load_receiver) = tokio::sync::mpsc::channel(LOAD_EVENT_CAPACITY);
+        let inner = Arc::new(ClientInner {
+            commands,
+            next_request_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            load_events,
+            failed: AtomicBool::new(false),
+        });
+        let client = ClientHandle {
+            inner: Arc::clone(&inner),
+        };
+        let waiter = client
+            .request(|request_id| HostMessage::Cancel { request_id })
+            .expect("request must be admitted");
+
+        inner.stop_all_executions();
+
+        assert!(matches!(
+            waiter.receiver.recv(),
+            Ok(RequestReply::Failed(
+                WireInferenceError::ModelInstanceStopped
+            ))
+        ));
+        assert!(inner.failed.load(Ordering::Acquire));
     }
 }
