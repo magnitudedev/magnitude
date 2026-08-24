@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 
-export const WebSearchProviderSchema = Schema.Literal("magnitude", "exa")
+export const WebSearchProviderSchema = Schema.Literal("magnitude", "exa", "crw")
 export type WebSearchProvider = typeof WebSearchProviderSchema.Type
 
 const PayloadSampleSchema = Schema.Struct({
@@ -65,8 +65,16 @@ export class WebSearchInvalidResponse extends Schema.TaggedError<WebSearchInvali
   },
 ) {}
 
+export class WebSearchStructuredOutputUnsupported extends Schema.TaggedError<WebSearchStructuredOutputUnsupported>()(
+  "WebSearchStructuredOutputUnsupported",
+  {
+    provider: WebSearchProviderSchema,
+  },
+) {}
+
 export type WebSearchError =
   | WebSearchNotConfigured
+  | WebSearchStructuredOutputUnsupported
   | WebSearchRequestEncodingFailed
   | WebSearchRequestFailed
   | WebSearchTimedOut
@@ -74,13 +82,21 @@ export type WebSearchError =
   | WebSearchResponseReadFailed
   | WebSearchInvalidResponse
 
+const PROVIDER_NAMES: Record<WebSearchProvider, string> = {
+  magnitude: "Magnitude Cloud",
+  exa: "Exa",
+  crw: "fastCRW",
+}
+
 const providerName = (provider: WebSearchProvider): string =>
-  provider === "magnitude" ? "Magnitude Cloud" : "Exa"
+  PROVIDER_NAMES[provider] ?? provider
 
 export function formatWebSearchError(error: WebSearchError): string {
   switch (error._tag) {
     case "WebSearchNotConfigured":
       return "Web search is not configured"
+    case "WebSearchStructuredOutputUnsupported":
+      return `${providerName(error.provider)} web search cannot extract structured data; retry without a schema`
     case "WebSearchRequestEncodingFailed":
       return `${providerName(error.provider)} web search request could not be encoded: ${error.reason}`
     case "WebSearchRequestFailed":

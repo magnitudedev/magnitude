@@ -155,6 +155,8 @@ export {
   type WebSearchError,
   type WebSearchSource,
   WebSearchSourceSchema,
+  type WebSearchProvider,
+  WebSearchProviderSchema,
   formatWebSearchError,
   type UsageQuery,
   type CloudUsageResponse,
