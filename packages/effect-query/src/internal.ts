@@ -68,6 +68,11 @@ export interface SubscriptionEntryCarrier<Event> {
 export const subscriptionEntry = <Event>(carrier: SubscriptionEntryCarrier<Event>): SubscriptionEntry<Event> =>
   carrier[SubscriptionEntryTypeId]
 
+/** Exact completion of one started or joined fetch, including any sanctioned replacement chain. */
+export interface QueryFetch<Data> {
+  readonly await: Effect.Effect<Data, unknown>
+}
+
 export interface ErasedQueryEntry {
   readonly stateAtom: Atom.Atom<QueryEntryState>
   readonly definition: QueryDefinition
@@ -75,16 +80,22 @@ export interface ErasedQueryEntry {
   readonly key: QueryKey
   readonly keyHash: number
   readonly state: (registry: AtomRegistry.Registry) => QueryEntryState
-  readonly failureCause: (registry: AtomRegistry.Registry) => Option.Option<Cause.Cause<unknown>>
   readonly start: (
     registry: AtomRegistry.Registry,
     options?: { readonly cancelRefetch?: boolean }
-  ) => void
-  readonly cancel: (registry: AtomRegistry.Registry) => void
+  ) => QueryFetch<unknown>
+  /** Join the generation currently represented by the entry without starting another. */
+  readonly join: (registry: AtomRegistry.Registry) => QueryFetch<unknown>
+  readonly cancel: (registry: AtomRegistry.Registry) => Effect.Effect<void>
   readonly invalidate: (registry: AtomRegistry.Registry) => void
 }
 
 export interface QueryEntry<Data> extends ErasedQueryEntry {
+  readonly start: (
+    registry: AtomRegistry.Registry,
+    options?: { readonly cancelRefetch?: boolean }
+  ) => QueryFetch<Data>
+  readonly join: (registry: AtomRegistry.Registry) => QueryFetch<Data>
   readonly setData: (
     registry: AtomRegistry.Registry,
     update: (current: Option.Option<Data>) => Data

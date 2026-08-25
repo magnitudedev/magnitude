@@ -319,6 +319,135 @@ describe("Query", () => {
     registry.dispose()
   })
 
+  it("does not complete refetch before the replacement fetch settles", async () => {
+    const registry = Registry.make()
+    const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
+    const replacement = Effect.runSync(Deferred.make<number>())
+    const replacementStarted = Effect.runSync(Deferred.make<void>())
+    let calls = 0
+    const query = Query.make("CausalRefetch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => calls++ === 0
+        ? Effect.succeed(1)
+        : Deferred.succeed(replacementStarted, undefined).pipe(Effect.zipRight(Deferred.await(replacement))),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = effectQuery.query(query, undefined)
+
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    const refetch = Effect.runFork(client.refetch(query.match()))
+    await Effect.runPromise(Deferred.await(replacementStarted))
+
+    expect(calls).toBe(2)
+    expect(Option.isNone(await Effect.runPromise(Fiber.poll(refetch)))).toBe(true)
+
+    await Effect.runPromise(Deferred.succeed(replacement, 2))
+    await Effect.runPromise(Fiber.join(refetch))
+    expect(AtomResult.value(registry.get(atom).result)).toEqual(Option.some(2))
+    registry.dispose()
+  })
+
+  it("terminalizes a refetch waiter when its fetch is cancelled", async () => {
+    const registry = Registry.make()
+    const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
+    const replacement = Effect.runSync(Deferred.make<number>())
+    const replacementStarted = Effect.runSync(Deferred.make<void>())
+    let calls = 0
+    const query = Query.make("CancelledRefetch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => calls++ === 0
+        ? Effect.succeed(1)
+        : Deferred.succeed(replacementStarted, undefined).pipe(Effect.zipRight(Deferred.await(replacement))),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = effectQuery.query(query, undefined)
+
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    const refetch = Effect.runFork(client.refetch(query.match()))
+    await Effect.runPromise(Deferred.await(replacementStarted))
+    expect(calls).toBe(2)
+
+    await Effect.runPromise(client.cancel(query.match()))
+    await Effect.runPromise(Fiber.await(refetch))
+    registry.dispose()
+  })
+
+  it("terminalizes a refetch waiter when its query is removed", async () => {
+    const registry = Registry.make()
+    const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
+    const replacement = Effect.runSync(Deferred.make<number>())
+    const replacementStarted = Effect.runSync(Deferred.make<void>())
+    let calls = 0
+    const query = Query.make("RemovedRefetch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => calls++ === 0
+        ? Effect.succeed(1)
+        : Deferred.succeed(replacementStarted, undefined).pipe(Effect.zipRight(Deferred.await(replacement))),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const atom = effectQuery.query(query, undefined)
+
+    expect(await Effect.runPromise(client.fetch(atom))).toBe(1)
+    const refetch = Effect.runFork(client.refetch(query.match()))
+    await Effect.runPromise(Deferred.await(replacementStarted))
+    expect(calls).toBe(2)
+
+    await Effect.runPromise(client.remove(query.match()))
+    await Effect.runPromise(Fiber.await(refetch))
+    registry.dispose()
+  })
+
+  it("starts every matching refetch before awaiting any result", async () => {
+    const registry = Registry.make()
+    const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
+    const replacements = new Map([
+      ["first", Effect.runSync(Deferred.make<string>())],
+      ["second", Effect.runSync(Deferred.make<string>())]
+    ])
+    const replacementStarts = new Map([
+      ["first", Effect.runSync(Deferred.make<void>())],
+      ["second", Effect.runSync(Deferred.make<void>())]
+    ])
+    const calls = new Map<string, number>()
+    const query = Query.make("ConcurrentRefetch", {
+      key: (id: string) => Data.tuple(id),
+      effect: (id) => {
+        const call = (calls.get(id) ?? 0) + 1
+        calls.set(id, call)
+        return call === 1
+          ? Effect.succeed(id)
+          : Deferred.succeed(replacementStarts.get(id)!, undefined).pipe(
+            Effect.zipRight(Deferred.await(replacements.get(id)!))
+          )
+      },
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const first = effectQuery.query(query, "first")
+    const second = effectQuery.query(query, "second")
+
+    await Effect.runPromise(Effect.all([client.fetch(first), client.fetch(second)], { concurrency: "unbounded" }))
+    const refetch = Effect.runFork(client.refetch(query.match()))
+    await Effect.runPromise(Effect.all(
+      [...replacementStarts.values()].map(Deferred.await),
+      { concurrency: "unbounded" }
+    ))
+
+    expect(calls.get("first")).toBe(2)
+    expect(calls.get("second")).toBe(2)
+
+    await Effect.runPromise(Effect.forEach(replacements, ([id, deferred]) => Deferred.succeed(deferred, id)))
+    await Effect.runPromise(Fiber.join(refetch))
+    registry.dispose()
+  })
+
   it("uses the definition retry schedule without widening errors", async () => {
     const registry = Registry.make()
     const effectQuery = Client.make(Layer.empty)

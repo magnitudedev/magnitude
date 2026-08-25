@@ -17,6 +17,7 @@ import {
   QueryCacheTypeId,
   QueryClient,
   type QueryCache,
+  type QueryFetch,
   queryEntry,
   queryMatches,
   subscriptionMatches,
@@ -77,46 +78,15 @@ export interface Service {
   readonly events: Stream.Stream<QueryClientEvent>
 }
 
-const isSettled = <Data, Error>(state: QueryState<Data, Error>): boolean =>
-  state.result._tag !== "Initial" && !state.result.waiting
-
-/** Resolve with the query's next settled result, or interrupt if the entry is removed first. */
-const awaitQuery = <Input, Data, Error, Requirements>(
-  registry: AtomRegistry.Registry,
+/** Await the exact fetch ticket while the query remains in this cache. */
+const awaitFetch = <Data>(
   cache: QueryCache,
-  query: QueryAtom<Input, Data, Error, Requirements>
-): Effect.Effect<Data, Error> => {
-  const settled = AtomRegistry.toStream(registry, query).pipe(
-    Stream.filter(isSettled),
-    Stream.runHead,
-    Effect.flatMap(Option.match({
-      onNone: () => Effect.dieMessage(`Query ${query.definition.name}: observation ended before it settled`),
-      onSome: Effect.succeed
-    }))
-  )
-  const removed = cache.awaitRemoval(queryEntry(query)).pipe(Effect.zipRight(Effect.interrupt))
-  return Effect.raceFirst(settled, removed).pipe(
-    Effect.flatMap((state) => state.result._tag === "Success"
-      ? Effect.succeed(state.result.value)
-      : state.result._tag === "Failure"
-        ? Effect.failCause(state.result.cause)
-        : Effect.interrupt)
-  )
-}
-
-/** Resolve once the entry's fetch is idle again, failing with the entry's failure cause if any. */
-const awaitErased = (
-  registry: AtomRegistry.Registry,
-  entry: ErasedQueryEntry
-): Effect.Effect<void, unknown> =>
-  AtomRegistry.toStream(registry, entry.stateAtom).pipe(
-    Stream.filter((state) => state.fetchStatus === "idle"),
-    Stream.runHead,
-    Effect.flatMap(() => Option.match(entry.failureCause(registry), {
-      onNone: () => Effect.void,
-      onSome: Effect.failCause
-    }))
-  )
+  entry: ErasedQueryEntry,
+  fetch: QueryFetch<Data>
+): Effect.Effect<Data, unknown> => Effect.raceFirst(
+  fetch.await,
+  cache.awaitRemoval(entry).pipe(Effect.zipRight(Effect.interrupt))
+)
 
 const makeService = (
   registry: AtomRegistry.Registry,
@@ -146,26 +116,36 @@ const makeService = (
   ): Effect.Effect<Data, Error> => Effect.gen(function*() {
     const [entry, existed] = yield* entryFor(query)
     const state = entry.state(registry)
-    if (existed && state.fetchStatus !== "paused" && entry.hasData(registry) && !state.isStale) {
+    if (state.fetchStatus !== "paused" && entry.hasData(registry) && !state.isStale) {
       return Option.getOrThrow(entry.getData(registry))
     }
-    if ((existed || state.fetchStatus === "paused") && state.fetchStatus !== "fetching") entry.start(registry)
-    return yield* awaitQuery(registry, cache, query)
+    const fetch = !existed && state.fetchStatus !== "paused"
+      ? entry.join(registry)
+      : entry.start(registry)
+    return yield* awaitFetch(cache, entry, fetch) as Effect.Effect<Data, Error>
+  })
+
+  const ensureQuery = <Input, Data, Error, Requirements>(
+    query: QueryAtom<Input, Data, Error, Requirements>
+  ): Effect.Effect<Data, Error> => Effect.gen(function*() {
+    const [entry, existed] = yield* entryFor(query)
+    if (entry.hasData(registry)) {
+      if (existed && entry.state(registry).isStale && entry.state(registry).fetchStatus !== "fetching") {
+        entry.start(registry)
+      }
+      return Option.getOrThrow(entry.getData(registry))
+    }
+    const fetch = !existed && entry.state(registry).fetchStatus !== "paused"
+      ? entry.join(registry)
+      : entry.start(registry)
+    return yield* awaitFetch(cache, entry, fetch) as Effect.Effect<Data, Error>
   })
 
   return {
     [QueryCacheTypeId]: cache,
     resolve,
     fetch: fetchQuery,
-    ensure: (query) => Effect.gen(function*() {
-      const [entry] = yield* entryFor(query)
-      if (entry.hasData(registry)) {
-        if (entry.state(registry).isStale && entry.state(registry).fetchStatus !== "fetching") entry.start(registry)
-        return Option.getOrThrow(entry.getData(registry))
-      }
-      if (entry.state(registry).fetchStatus !== "fetching") entry.start(registry)
-      return yield* awaitQuery(registry, cache, query)
-    }),
+    ensure: ensureQuery,
     prefetch: (query) => Effect.ignore(fetchQuery(query)),
     invalidate: (filter, options) => Effect.gen(function*() {
       for (const entry of yield* entries(filter)) {
@@ -175,21 +155,27 @@ const makeService = (
       }
     }),
     refetch: (filter) => Effect.gen(function*() {
-      const failures: Array<QueryBatchFailure> = []
-      for (const entry of yield* entries(filter)) {
-        entry.start(registry, { cancelRefetch: true })
-        const state = yield* Effect.exit(awaitErased(registry, entry))
-        if (state._tag === "Failure") failures.push({ name: entry.name, keyHash: entry.keyHash, cause: state.cause })
-      }
+      const started = (yield* entries(filter)).map((entry) => ({
+        entry,
+        fetch: entry.start(registry, { cancelRefetch: true })
+      }))
+      const exits = yield* Effect.forEach(
+        started,
+        ({ entry, fetch }) => Effect.exit(awaitFetch(cache, entry, fetch)),
+        { concurrency: "unbounded" }
+      )
+      const failures: Array<QueryBatchFailure> = exits.flatMap((exit, index) => exit._tag === "Failure"
+        ? [{ name: started[index]!.entry.name, keyHash: started[index]!.entry.keyHash, cause: exit.cause }]
+        : [])
       if (failures.length > 0) return yield* new QueryBatchError({ failures })
     }),
     cancel: (filter) => Effect.gen(function*() {
-      for (const entry of yield* entries(filter)) entry.cancel(registry)
+      for (const entry of yield* entries(filter)) yield* entry.cancel(registry)
     }),
     remove: (filter) => Effect.gen(function*() {
       for (const entry of yield* entries(filter)) {
         yield* cache.removeQuery(entry)
-        entry.cancel(registry)
+        yield* entry.cancel(registry)
       }
     }),
     getState: (query) => Effect.map(SubscriptionRef.get(cache.queries), (current) =>

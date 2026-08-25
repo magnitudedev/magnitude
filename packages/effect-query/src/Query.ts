@@ -4,6 +4,7 @@ import * as AtomResult from "@effect-atom/atom/Result"
 import type * as Reactivity from "@effect/experimental/Reactivity"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as EffectData from "effect/Data"
 import * as Effect from "effect/Effect"
@@ -183,8 +184,14 @@ type FetchEvent<Data, Error> =
     readonly data: Data
     readonly invalidation: number
     readonly updatedAt: number
+    readonly terminal: boolean
   }
-  | { readonly _tag: "Failed"; readonly sequence: Sequence; readonly cause: Cause.Cause<Error> }
+  | {
+    readonly _tag: "Failed"
+    readonly sequence: Sequence
+    readonly cause: Cause.Cause<Error>
+    readonly terminal: boolean
+  }
 
 interface Override<Data> {
   readonly data: Data
@@ -198,8 +205,15 @@ interface Control<Data> {
   readonly cancelled: boolean
   /** Generation started as a replacement while a fetch was active; later cancel-refetch starts coalesce into it. */
   readonly replacement: Option.Option<number>
+  readonly cancellation: Deferred.Deferred<never, FetchCancelled>
   readonly override: Option.Option<Override<Data>>
 }
+
+interface FetchCancelled {
+  readonly _tag: "FetchCancelled"
+}
+
+const fetchCancelled: FetchCancelled = { _tag: "FetchCancelled" }
 
 interface Accepted<Data> {
   readonly sequence: Sequence
@@ -378,6 +392,7 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
       invalidation: 0,
       cancelled: false,
       replacement: Option.none(),
+      cancellation: Deferred.unsafeMake<never, FetchCancelled>(FiberId.none),
       override: Option.none()
     }))
     /** Explicitly started fetch generation; bumping it reopens the fetch stream. */
@@ -405,17 +420,19 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
         yield* cache.emit({ _tag: "FetchStarted", name, keyHash })
         const exit = yield* Effect.exit(run)
         yield* cache.emit({ _tag: "FetchSettled", name, keyHash, success: Exit.isSuccess(exit) })
+        const current = registry.get(control)
+        const needsTrailing = !current.cancelled && current.invalidation > capturedInvalidation
         const event: Event = Exit.isSuccess(exit)
           ? {
             _tag: "Settled",
             sequence,
             data: exit.value,
             invalidation: capturedInvalidation,
-            updatedAt: yield* Clock.currentTimeMillis
+            updatedAt: yield* Clock.currentTimeMillis,
+            terminal: !needsTrailing
           }
-          : { _tag: "Failed", sequence, cause: exit.cause }
-        const current = registry.get(control)
-        const trailing = !current.cancelled && current.invalidation > capturedInvalidation
+          : { _tag: "Failed", sequence, cause: exit.cause, terminal: !needsTrailing }
+        const trailing = needsTrailing
           ? loadEffect(
             registry,
             effect,
@@ -423,8 +440,10 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
             { generation: sequence.generation, attempt: sequence.attempt + 1 },
             current.invalidation
           )
-          : Stream.empty
-        return Stream.concat(Stream.make(event), trailing)
+          : undefined
+        return trailing === undefined
+          ? Stream.make(event)
+          : Stream.concat(Stream.make(event), trailing)
       }))
       return Stream.concat(Stream.make(started), outcome)
     }
@@ -454,13 +473,25 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
             const next = step(previous)
             return [Option.some(next), next]
           }),
-          Stream.mapEffect((data) => Effect.map(Clock.currentTimeMillis, (updatedAt): Event => {
+          Stream.mapEffect((data) => Effect.map(Clock.currentTimeMillis, (updatedAt): Extract<Event, { _tag: "Settled" }> => {
             produced = true
-            return { _tag: "Settled", sequence, data, invalidation: capturedInvalidation, updatedAt }
+            return {
+              _tag: "Settled",
+              sequence,
+              data,
+              invalidation: capturedInvalidation,
+              updatedAt,
+              terminal: registry.get(control).invalidation <= capturedInvalidation
+            }
           })),
           Stream.catchAllCause((cause): Stream.Stream<Event> => {
             if (Cause.isInterruptedOnly(cause)) return Stream.empty
-            const failed: Event = { _tag: "Failed", sequence, cause }
+            const failed: Event = {
+              _tag: "Failed",
+              sequence,
+              cause,
+              terminal: true
+            }
             return Stream.succeed(failed)
           })
         )
@@ -470,7 +501,8 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
             const failed: Event = {
               _tag: "Failed",
               sequence,
-              cause: Cause.die(new Error(`Query ${name}: stream completed before producing data`))
+              cause: Cause.die(new Error(`Query ${name}: stream completed before producing data`)),
+              terminal: true
             }
             return Stream.make(failed)
           }
@@ -506,7 +538,60 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
         : loadFold(registry, source.fold, source.reconnect, sequence, captured.invalidation)
     }))
 
+    /** Await a concrete fetch generation and its sanctioned replacements, never presentation state. */
+    const awaitGeneration = (
+      registry: AtomRegistry.Registry,
+      target: number,
+      cancellation: Deferred.Deferred<never, FetchCancelled>
+    ): Effect.Effect<Data, unknown> => {
+      const completed = AtomRegistry.toStream(registry, fetched).pipe(
+        Stream.filterMap((result): Option.Option<Exit.Exit<Data, unknown>> => {
+          if (result._tag === "Failure") return Option.some(Exit.failCause(result.cause))
+          const event = AtomResult.value(result)
+          if (Option.isNone(event)) return Option.none()
+          if (event.value.sequence.generation < target) return Option.none()
+          switch (event.value._tag) {
+            case "Started":
+              return Option.none()
+            case "Settled":
+              return event.value.terminal
+                ? Option.some(Exit.succeed(event.value.data))
+                : Option.none()
+            case "Failed":
+              return event.value.terminal
+                ? Option.some(Exit.failCause(event.value.cause))
+                : Option.none()
+          }
+        }),
+        Stream.runHead,
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.dieMessage(`Query ${name}: fetch generation ended before completion`),
+          onSome: (exit) => Exit.match(exit, {
+            onFailure: (cause) => Effect.failCause(cause),
+            onSuccess: (data) => Effect.succeed(data)
+          })
+        }))
+      )
+      return Effect.raceFirst(completed, Deferred.await(cancellation)).pipe(
+        Effect.catchAll((error) => error === fetchCancelled ? Effect.interrupt : Effect.fail(error))
+      )
+    }
+
     const latestEvent = (get: Atom.Context): Option.Option<Event> => AtomResult.value(get(fetched))
+
+    const ticket = (
+      registry: AtomRegistry.Registry,
+      target: number,
+      cancellation: Deferred.Deferred<never, FetchCancelled>
+    ): import("./internal.js").QueryFetch<Data> => ({
+      await: awaitGeneration(registry, target, cancellation).pipe(
+        // Query state is a lazy projection. Crossing the imperative fetch
+        // boundary materializes the accepted terminal event before return.
+        Effect.ensuring(Effect.sync(() => {
+          registry.get(atom)
+        }))
+      )
+    })
 
     /** The most recent settled data; remembered across later attempts and generations. */
     const accepted = retain(Atom.readable<Option.Option<Accepted<Data>>>((get) => {
@@ -642,14 +727,11 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
         const state = registry.get(atom)
         return { fetchStatus: state.fetchStatus, isStale: state.isStale }
       },
-      failureCause: (registry) => {
-        const result = registry.get(atom).result
-        return result._tag === "Failure" ? Option.some(result.cause) : Option.none()
-      },
       start: (registry, options) => {
         const status = entry.state(registry).fetchStatus
         const currentGeneration = registry.get(generation)
         let shouldStart = status !== "fetching"
+        let cancellation = registry.get(control).cancellation
         registry.update(control, (current) => {
           if (
             status === "fetching"
@@ -658,20 +740,31 @@ export const makeAtomFamily = <Provided, RuntimeError, Input, Data, Error, Requi
           ) {
             shouldStart = true
           }
+          if (shouldStart && status !== "fetching") {
+            cancellation = Deferred.unsafeMake<never, FetchCancelled>(FiberId.none)
+          }
           return {
             ...current,
             cancelled: false,
+            cancellation,
             replacement: shouldStart && status === "fetching"
               ? Option.some(currentGeneration + 1)
-              : current.replacement
+              : shouldStart ? Option.none() : current.replacement
           }
         })
-        if (shouldStart) registry.update(generation, () => currentGeneration + 1)
+        const target = shouldStart ? currentGeneration + 1 : currentGeneration
+        if (shouldStart) registry.update(generation, () => target)
+        return ticket(registry, target, cancellation)
       },
-      cancel: (registry) => {
+      join: (registry) => {
+        const current = registry.get(control)
+        return ticket(registry, registry.get(generation), current.cancellation)
+      },
+      cancel: (registry) => Effect.sync(() => {
+        Deferred.unsafeDone(registry.get(control).cancellation, Effect.fail(fetchCancelled))
         registry.update(control, (current) => ({ ...current, cancelled: true }))
         registry.update(generation, (value) => value + 1)
-      },
+      }),
       invalidate: (registry) => {
         registry.update(control, (current) => ({ ...current, invalidation: current.invalidation + 1 }))
       },

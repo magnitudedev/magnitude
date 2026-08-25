@@ -197,6 +197,18 @@ work, and execute only for missing or stale state. Refetch is the explicit opera
 new observational work. A mutation that changes query authority invalidates the affected query
 before fetching the synchronized snapshot.
 
+An imperative fetch operation awaits an internal ticket for the fetch generation it joined or
+started. It does not infer completion from public presentation state such as `idle`, `paused`, or
+the presence of retained data: those states deliberately collapse multiple execution histories and
+cannot identify the work being acknowledged. A sanctioned invalidation replacement carries the
+ticket forward until a result accepted for the latest invalidation settles. Explicit cancellation,
+removal, and runtime termination terminalize the ticket. Invalidation generations and tickets are
+private cache mechanics; consumers see only result, fetch status, and freshness.
+
+A batch refetch admits all matching fetches before awaiting their tickets concurrently. This keeps
+one slow query from preventing unrelated matching queries from starting and makes the batch result
+the collection of the exact work admitted by that call.
+
 ```text
 mount / read / refetch / watch
               X
