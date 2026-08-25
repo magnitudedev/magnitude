@@ -359,7 +359,7 @@ function updateChildCount(state: AgentLifecycleState, timestamp: number): AgentL
   const childCount = countWorkingChildren(state, null)
   const rootWork = state.rootWork
   const shouldClockFollowWorkers = isRootWorkActive(rootWork)
-    && rootWork._currentTurn === null
+    && (rootWork._currentTurn === null || !rootWork._currentTurn.modelActivityStarted)
   const nextRootWork = shouldClockFollowWorkers
     ? childCount > 0
       ? {

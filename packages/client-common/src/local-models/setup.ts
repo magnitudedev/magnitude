@@ -210,16 +210,19 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         get(slots.state),
         "model-slots",
       )
-      return Result.map(Result.all({ models, slotResponse }), ({ models, slotResponse }) => ({
-        _tag: "Open" as const,
-        exitKind,
-        notice: current._tag === "Resting" ? current.notice : Option.none(),
-        content: projectOnboardingModelSetupContent(
-          current._tag === "Selecting" ? Option.some(current.execution) : Option.none(),
-          models,
-          slotResponse.state,
-        ),
-      }))
+      return Result.flatMap(models, (modelState) => Result.map(
+        slotResponse,
+        ({ state: slotState }) => ({
+          _tag: "Open" as const,
+          exitKind,
+          notice: current._tag === "Resting" ? current.notice : Option.none(),
+          content: projectOnboardingModelSetupContent(
+            current._tag === "Selecting" ? Option.some(current.execution) : Option.none(),
+            modelState,
+            slotState,
+          ),
+        }),
+      ))
     })
   })
 

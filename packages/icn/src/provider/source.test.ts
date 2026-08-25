@@ -168,8 +168,8 @@ describe("ICN local provider", () => {
     }
     const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
       { ...chunk, choices: [], progress: { phase: "queued" } },
-      { ...chunk, choices: [], progress: { phase: "generating" } },
       { ...chunk, choices: [], progress: { phase: "prefill", completed_tokens: 1, total_tokens: 2, cached_tokens: 0 } },
+      { ...chunk, choices: [], progress: { phase: "generating" } },
       {
         ...chunk,
         choices: [{
@@ -213,6 +213,7 @@ describe("ICN local provider", () => {
         },
       },
     ])))
+    const preparation: unknown[] = []
     const output = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId, {
@@ -224,12 +225,13 @@ describe("ICN local provider", () => {
       const result = yield* bound.stream(
         PromptBuilder.empty().user("hello").build(),
         [],
+        undefined,
+        (update) => Effect.sync(() => { preparation.push(update) }),
       )
       return yield* Stream.runCollect(result.events)
     }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
 
     expect(Array.from(output).map((event) => event._tag)).toEqual([
-      "preparation_update",
       "message_start",
       "message_delta",
       "message_end",
@@ -243,8 +245,17 @@ describe("ICN local provider", () => {
         timeToFirstTokenMs: 6,
       },
     })
-    expect(Array.from(output).slice(0, 1)).toEqual([
-      { _tag: "preparation_update", preparation: { phase: "queued" }, requestId: "request-1" },
+    expect(preparation).toEqual([
+      { preparation: { phase: "queued" }, requestId: "request-1" },
+      {
+        preparation: {
+          phase: "prefill",
+          completed_tokens: 1,
+          total_tokens: 2,
+          cached_tokens: 0,
+        },
+        requestId: "request-1",
+      },
     ])
   })
 

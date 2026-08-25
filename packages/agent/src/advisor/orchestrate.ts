@@ -87,8 +87,8 @@ export function callerLabel(args: {
   return `${agent.agentId} (${agent.role})`
 }
 
-export function collectAdvisorText<TPreparation>(
-  streamResult: ModelStreamResult<TPreparation>,
+export function collectAdvisorText(
+  streamResult: ModelStreamResult,
 ): Effect.Effect<{
   readonly text: string
   readonly finishReason: FinishReason | null

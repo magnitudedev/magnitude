@@ -8,7 +8,12 @@ export { Option } from "./options/option"
 
 // Core types
 export type { ProviderModelCapabilities, ImagePlaceholderConfig } from "./model/capabilities"
-export type { ModelSpec, ModelStreamEvent, ModelStreamResult } from "./model/model-spec"
+export type {
+  ModelSpec,
+  ModelPreparationObserver,
+  ModelPreparationUpdate,
+  ModelStreamResult,
+} from "./model/model-spec"
 export type { BoundModel } from "./model/bound-model"
 export type { OptionDef, InferCallOptions } from "./options/option"
 

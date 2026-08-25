@@ -24,7 +24,7 @@ import {
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
   type GenerationPerformance,
-  type ModelStreamEvent,
+  type ModelPreparationObserver,
   ModelRequestTerminal,
   type ProviderModelBindOptions,
   type ProviderId,
@@ -183,7 +183,12 @@ const bindIcnModel = (
   providerModelId: ProviderModelId,
   bindOptions?: ProviderModelBindOptions,
 ) => Effect.succeed({
-  stream: (prompt: Prompt, tools: readonly ToolDefinition[], requestOptions?: BaseCallOptions & { generateToolCallId?: () => ToolCallId }) => {
+  stream: (
+    prompt: Prompt,
+    tools: readonly ToolDefinition[],
+    requestOptions?: BaseCallOptions & { generateToolCallId?: () => ToolCallId },
+    onPreparation?: ModelPreparationObserver<IcnModelPreparation>,
+  ) => {
     const call = {
       provider: "local",
       model: providerModelId,
@@ -227,21 +232,16 @@ const bindIcnModel = (
               const response = acceptedHttpResponse(status, headers)
               const performance = yield* Ref.make(Option.none<GenerationPerformance>())
               let acceptingPreparation = true
-              const pendingActivity: Array<Exclude<
-                ModelStreamEvent<IcnModelPreparation>,
-                ResponseStreamEvent
-              >> = []
               const reportProgress = (
                 requestId: string,
                 progress: Generated.ChatCompletionProgress,
-              ): void => {
+              ): Effect.Effect<void> => {
                 if (progress.phase === "generating") {
                   acceptingPreparation = false
-                  return
+                  return Effect.void
                 }
-                if (!acceptingPreparation) return
-                pendingActivity.push({
-                  _tag: "preparation_update",
+                if (!acceptingPreparation || onPreparation === undefined) return Effect.void
+                return onPreparation({
                   preparation: progress,
                   requestId,
                 })
@@ -257,7 +257,7 @@ const bindIcnModel = (
                   })),
                 })),
                 Stream.tap((chunk) => Option.match(chunk.progress, {
-                  onSome: (progress) => Effect.sync(() => reportProgress(chunk.id, progress)),
+                  onSome: (progress) => reportProgress(chunk.id, progress),
                   onNone: () => {
                     if (chunk.choices.length === 0) return Effect.void
                     return Effect.sync(() => { acceptingPreparation = false })
@@ -307,10 +307,6 @@ const bindIcnModel = (
                     onNone: () => event,
                     onSome: (measurement) => ({ ...event, performance: measurement }),
                   })))
-                }),
-                Stream.mapConcat((event) => {
-                  const activity = pendingActivity.splice(0)
-                  return [...activity, event]
                 }),
               )
               return {
