@@ -32,16 +32,17 @@ import {
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import {
   ReasoningEffortSchema,
+  projectInferenceResidency,
   type ProviderId,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
+import { IcnInstances } from "@magnitudedev/icn"
 import { ModelSelection } from "./model-selection"
 import { AcnChanges } from "./changes"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
-import { ModelInstances } from "./model-instances"
 import {
   localModelSlotAvailability,
   selectableModelCapabilities,
@@ -119,14 +120,14 @@ export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
   ModelSelection | MagnitudeStorage | LocalModelPackages | LocalProviderOfferings
-    | ProviderModelCatalog | ModelInstances | AcnChanges
+    | ProviderModelCatalog | IcnInstances | AcnChanges
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
   const modelSelection = yield* ModelSelection
   const storage = yield* MagnitudeStorage
   const localPackages = yield* LocalModelPackages
   const localOfferings = yield* LocalProviderOfferings
   const catalog = yield* ProviderModelCatalog
-  const instances = yield* ModelInstances
+  const instances = yield* IcnInstances
   const changes = yield* AcnChanges
   const scope = yield* Scope.Scope
   const stateLock = yield* Effect.makeSemaphore(1)
@@ -257,7 +258,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     const previousAggregate = yield* SubscriptionRef.get(aggregate)
     const previous = previousAggregate.state
     const offerings = yield* localOfferings.list.pipe(Effect.orElseSucceed(() => []))
-    const instanceState = yield* instances.state
+    const instanceState = yield* instances.get
 
     const buildSlot = (slotId: SlotId, selection: Option.Option<SlotSelection>): ModelSlot =>
       Option.match(selection, {
@@ -313,7 +314,9 @@ export const ModelSlotControllerLive: Layer.Layer<
           })
           const instance = instanceState.instances.findLast((candidate) =>
             candidate.modelId === selected.providerModelId)
-          const residency = instance?.residency ?? { _tag: "Unloaded" as const }
+          const residency = instance === undefined
+            ? { _tag: "Unloaded" as const }
+            : projectInferenceResidency(instance)
           const props = {
             slotId,
             selection: selected,

@@ -6,7 +6,6 @@ import {
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelPackageIdSchema,
-  ModelInstanceIdSchema,
   ModelAssessmentIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
@@ -144,8 +143,8 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
       _tag: "Installed",
       installedBytes: 16 * GIB,
       packages: [firstInstalledPackage, ...remainingInstalledPackages],
+      residencyState: { _tag: "Unloaded" },
     },
-    upgradeState: { _tag: "NotApplicable" },
     servingState: {
       _tag: "Assessed",
       capabilities,
@@ -201,8 +200,7 @@ export const makeCatalogOnlyModel = (
         qualityNotes: ["Test quantization notes"],
       },
     },
-    acquisitionState: { _tag: "NotInstalled", completedBytes: 0, totalBytes: model.downloadBytes },
-    upgradeState: { _tag: "NotApplicable" },
+    acquisitionState: { _tag: "NotInstalled" },
     servingState: {
       ...model.servingState,
       availabilityState: { _tag: "Installable" },
@@ -362,7 +360,6 @@ export const makeView = (options: {
               availability: { _tag: "Available" },
               residency: {
                 _tag: "Ready",
-                instanceId: ModelInstanceIdSchema.make("test-instance"),
                 allocation: options.allocation ?? {
                   contextWindowTokens: 32_768,
                   parallelSequences: 1,

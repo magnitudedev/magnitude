@@ -4,6 +4,7 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ReasoningEffortSchema,
+  installedAcquisition,
   type CatalogModelReconciliationAdmission,
   type LocalModelsState,
   type ModelSlotsState,
@@ -264,7 +265,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         }) }
       }
       const acquisition = model.acquisitionState
-      if (acquisition._tag === "Installed") {
+      if (installedAcquisition(acquisition) !== undefined) {
         const serving = model.servingState
         if (serving._tag !== "Assessed") return { _tag: "Waiting" }
         const availability = serving.availabilityState
@@ -290,21 +291,16 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           value: { ...prepared, providerModelId: admission.providerModelId },
         }
       }
-      if (admission._tag === "Current"
-        || acquisition._tag === "NotInstalled"
-        || acquisition.downloadId !== admission.downloadId) {
-        return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-          modelId: prepared.modelId,
-          resource: "installation",
-        }) }
+      if (admission._tag === "DownloadAdmitted" && acquisition._tag === "Installing") {
+        return { _tag: "Waiting" }
       }
-      if (acquisition._tag === "Downloading") return { _tag: "Waiting" }
-      return acquisition._tag === "Failed"
-        ? { _tag: "Failed", failure: acquisition.failure }
-        : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-            modelId: prepared.modelId,
-            resource: "installation",
-          }) }
+      if (acquisition._tag === "InstallFailed") {
+        return { _tag: "Failed", failure: acquisition.failure }
+      }
+      return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+        modelId: prepared.modelId,
+        resource: "installation",
+      }) }
     }
     return awaitTerminalFact(registry, localModels.state, project)
   }
@@ -334,7 +330,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
               })
             : Effect.void
           const cancel = admission._tag === "DownloadAdmitted"
-            ? localModels.cancelDownload(admission.downloadId)
+            ? localModels.cancelDownload(resolved.prepared.modelId)
             : Effect.void
           return publish.pipe(
             Effect.zipRight(cancelled(invocation)),

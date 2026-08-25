@@ -40,6 +40,7 @@ import {
   ProviderIdSchema,
   ProviderModelCatalogLifecycle,
   ReasoningEffortSchema,
+  installedAcquisition,
   servableModelBundlePackages,
   type LocalModel,
   type ModelSlotsState,
@@ -222,9 +223,12 @@ const installedOriginStatus = (
 
 export const localModelInstalledStatus = (
   model: LocalModel,
-): string => model.acquisitionState._tag === "Installed"
-  ? installedOriginStatus(model.acquisitionState.packages.map(({ origin }) => origin))
-  : "Installed"
+): string => {
+  const acquisition = installedAcquisition(model.acquisitionState)
+  return acquisition === undefined
+    ? "Installed"
+    : installedOriginStatus(acquisition.packages.map(({ origin }) => origin))
+}
 
 export const localModelReadinessStatus = (
   model: LocalModel,
@@ -236,9 +240,9 @@ export const localModelReadinessStatus = (
   const assessment = model.servingState.assessment
   if (assessment._tag === "Incompatible") return "Error"
   if (assessment._tag === "DoesNotFit") return "Doesn’t fit"
-  if (model.upgradeState._tag === "Available") return "Update available"
-  if (model.upgradeState._tag === "Upgrading") return "Updating"
-  if (model.upgradeState._tag === "Failed") return "Update error"
+  if (model.acquisitionState._tag === "UpdateAvailable") return "Update available"
+  if (model.acquisitionState._tag === "Updating") return "Updating"
+  if (model.acquisitionState._tag === "UpdateFailed") return "Update error"
   return model.acquisitionState._tag === "Installed"
     ? localModelInstalledStatus(model)
     : "Available"
@@ -383,7 +387,7 @@ export const buildModelsMenuEntries = (
 ): readonly ModelsMenuEntry[] => {
   return [
     ...localModels.flatMap((model): readonly ModelsMenuEntry[] => {
-      if (model.acquisitionState._tag !== "Installed") return []
+      if (installedAcquisition(model.acquisitionState) === undefined) return []
       const bundleKey = localModelBundleKey(model)
       return [{
         _tag: model.servingState._tag === "Assessed"
@@ -1219,8 +1223,8 @@ export const catalogStatus = (
   if (reconciliationState._tag === "RemoveFailed") return "Remove failed"
   if (reconciliationState._tag === "Transferring") {
     const verb = reconciliationState.operation === "Update" ? "Updating" : "Downloading"
-    return `${verb} ${Math.round(reconciliationState.completedBytes
-      / Math.max(1, reconciliationState.totalBytes) * 100)}%`
+    return `${verb} ${Math.round(reconciliationState.progress.completedBytes
+      / Math.max(1, reconciliationState.progress.totalBytes) * 100)}%`
   }
   if (reconciliationState._tag === "Starting") {
     return reconciliationState.operation === "Update" ? "Starting update…" : "Starting download…"
@@ -1229,11 +1233,10 @@ export const catalogStatus = (
     return reconciliationState.operation === "Update" ? "Update failed" : "Download failed"
   }
   const acquisitionState = model.acquisitionState
-  if (model.upgradeState._tag === "Available") return "Update available"
-  if (model.upgradeState._tag === "Failed") return "Update failed"
-  if (acquisitionState._tag === "NotInstalled"
-    || acquisitionState._tag === "Cancelled") return "Available"
-  if (acquisitionState._tag === "Failed") return "Download failed"
+  if (acquisitionState._tag === "UpdateAvailable") return "Update available"
+  if (acquisitionState._tag === "UpdateFailed") return "Update failed"
+  if (acquisitionState._tag === "NotInstalled") return "Available"
+  if (acquisitionState._tag === "InstallFailed") return "Download failed"
   if (model.servingState._tag === "Assessed"
     && model.servingState.availabilityState._tag === "Unavailable") {
     return model.servingState.availabilityState.failure.message
@@ -1274,14 +1277,14 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
     : catalogStatus(model, reconciliationState)
   const statusColor = pendingDelete
     ? theme.status.warning
-    : model.acquisitionState._tag === "Failed"
+    : model.acquisitionState._tag === "InstallFailed"
       || reconciliationState._tag === "Failed"
       || reconciliationState._tag === "RemoveFailed"
       ? theme.status.failure
       : reconciliationState._tag === "Starting"
         || reconciliationState._tag === "Transferring"
         || reconciliationState._tag === "Removing"
-        || model.acquisitionState._tag === "Downloading"
+        || model.acquisitionState._tag === "Installing"
         || model.acquisitionState._tag === "Installed"
         ? theme.accent
         : theme.text.metadata
@@ -1375,10 +1378,10 @@ export const catalogInspectorActions = (
 ): readonly CatalogInspectorActionId[] => {
   if (reconciliationState._tag === "Removing") return []
   if (reconciliationState._tag === "Transferring"
-    || model.acquisitionState._tag === "Downloading"
-    || model.upgradeState._tag === "Upgrading") return ["cancel"]
+    || model.acquisitionState._tag === "Installing"
+    || model.acquisitionState._tag === "Updating") return ["cancel"]
   if (reconciliationState._tag === "Starting") return []
-  if (model.acquisitionState._tag !== "Installed") return ["primary"]
+  if (installedAcquisition(model.acquisitionState) === undefined) return ["primary"]
 
   const actions: CatalogInspectorActionId[] = []
   if (!selected) {
@@ -1388,8 +1391,8 @@ export const catalogInspectorActions = (
     if (selectedSlot.actions.some((action) => action === "Load" || action === "RetryLoad")) actions.push("load")
     else if (selectedSlot.actions.includes("Stop")) actions.push("stop")
   }
-  if (model.upgradeState._tag === "Available"
-    || model.upgradeState._tag === "Failed") actions.push("primary")
+  if (model.acquisitionState._tag === "UpdateAvailable"
+    || model.acquisitionState._tag === "UpdateFailed") actions.push("primary")
   actions.push("uninstall")
   return actions
 }
@@ -1406,16 +1409,16 @@ export const catalogInspectorActionLabel = (
       if (reconciliationState._tag === "Failed" && reconciliationState.operation === "Update") {
         return "Retry update"
       }
-      if (model.upgradeState._tag === "Available") return "Update"
-      if (model.upgradeState._tag === "Failed") return "Retry update"
-      const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "Failed"
+      if (model.acquisitionState._tag === "UpdateAvailable") return "Update"
+      if (model.acquisitionState._tag === "UpdateFailed") return "Retry update"
+      const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "InstallFailed"
         ? "Retry download"
         : "Download"
       return verb
     }
     case "cancel": return reconciliationState._tag === "Transferring"
       ? reconciliationState.operation === "Update" ? "Cancel update" : "Cancel download"
-      : model.upgradeState._tag === "Upgrading" ? "Cancel update" : "Cancel download"
+      : model.acquisitionState._tag === "Updating" ? "Cancel update" : "Cancel download"
     case "load": return selectedSlot?._tag === "ConfiguredLocal"
       && selectedSlot.actions.includes("RetryLoad") ? "Retry loading" : "Load model"
     case "stop": return selectedSlot?._tag === "ConfiguredLocal"
@@ -1438,23 +1441,25 @@ const catalogInspectorStatus = (
   if (reconciliationState._tag === "RemoveFailed") return "REMOVE FAILED"
   if (reconciliationState._tag === "Transferring") {
     const label = reconciliationState.operation === "Update" ? "UPDATING" : "DOWNLOADING"
-    return `${label} ${Math.round(reconciliationState.completedBytes / Math.max(1, reconciliationState.totalBytes) * 100)}%`
+    return `${label} ${Math.round(reconciliationState.progress.completedBytes / Math.max(1, reconciliationState.progress.totalBytes) * 100)}%`
   }
   if (reconciliationState._tag === "Starting") return reconciliationState.operation === "Update"
     ? "STARTING UPDATE…" : "STARTING DOWNLOAD…"
   if (reconciliationState._tag === "Failed") return reconciliationState.operation === "Update"
     ? "UPDATE FAILED" : "DOWNLOAD FAILED"
-  if (model.acquisitionState._tag === "Downloading") {
-    return `DOWNLOADING ${Math.round(model.acquisitionState.completedBytes / Math.max(1, model.acquisitionState.totalBytes) * 100)}%`
+  if (model.acquisitionState._tag === "Installing") {
+    const progress = model.acquisitionState.progress
+    return `DOWNLOADING ${Math.round(progress.completedBytes / Math.max(1, progress.totalBytes) * 100)}%`
   }
-  if (model.upgradeState._tag === "Upgrading") {
-    return `UPDATING ${Math.round(model.upgradeState.completedBytes / Math.max(1, model.upgradeState.totalBytes) * 100)}%`
+  if (model.acquisitionState._tag === "Updating") {
+    const progress = model.acquisitionState.progress
+    return `UPDATING ${Math.round(progress.completedBytes / Math.max(1, progress.totalBytes) * 100)}%`
   }
-  if (model.acquisitionState._tag === "Failed") return "DOWNLOAD FAILED"
+  if (model.acquisitionState._tag === "InstallFailed") return "DOWNLOAD FAILED"
   if (selected) {
-    const updateSuffix = model.upgradeState._tag === "Available"
+    const updateSuffix = model.acquisitionState._tag === "UpdateAvailable"
       ? " · UPDATE AVAILABLE"
-      : model.upgradeState._tag === "Failed" ? " · UPDATE FAILED" : ""
+      : model.acquisitionState._tag === "UpdateFailed" ? " · UPDATE FAILED" : ""
     if (selectedSlot?._tag === "ConfiguredLocal") {
       const residency = selectedSlot.residency
       if (residency._tag === "Requested") return `LOADING 0%${updateSuffix}`
@@ -1525,7 +1530,7 @@ const CatalogInspector = memo(function CatalogInspector({
           </text>
           <text style={{ fg: reconciliationState._tag === "Failed"
             || reconciliationState._tag === "RemoveFailed"
-            || model.upgradeState._tag === "Failed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
+            || model.acquisitionState._tag === "UpdateFailed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
         </box>
         <text style={{ fg: theme.text.supporting }} wrapMode="none">
           {releaseRecency !== null && (
@@ -1632,8 +1637,8 @@ const CatalogMenu = memo(function CatalogMenu({
       ? model.servingState.assessment.memory.totalRequiredBytes
       : undefined
   const candidates = catalogModels.map(({ model }) => model).sort((left, right) => {
-    const leftInstalled = left.acquisitionState._tag === "Installed"
-    const rightInstalled = right.acquisitionState._tag === "Installed"
+    const leftInstalled = installedAcquisition(left.acquisitionState) !== undefined
+    const rightInstalled = installedAcquisition(right.acquisitionState) !== undefined
     return (leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1)
       || left.presentation.displayName.localeCompare(right.presentation.displayName)
       || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
@@ -1707,10 +1712,9 @@ const CatalogMenu = memo(function CatalogMenu({
 
   const primaryAction = useCallback((model: LocalModel) => {
     const modelId = modelIdFor(model)
-    if (model.acquisitionState._tag === "Downloading"
-      || (model.acquisitionState._tag === "Installed"
-        && model.upgradeState._tag !== "Available"
-        && model.upgradeState._tag !== "Failed")
+    if (model.acquisitionState._tag === "Installing"
+      || model.acquisitionState._tag === "Updating"
+      || model.acquisitionState._tag === "Installed"
       || reconciliationStateFor(model)._tag === "Starting") return
     modelActions.install(modelId)
   }, [modelActions, catalogModels])
@@ -1746,12 +1750,10 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "cancel") {
-      if (inspectedReconciliationState._tag === "Transferring") {
-        modelActions.cancel(inspectedReconciliationState.downloadId)
-      } else if (inspected.acquisitionState._tag === "Downloading") {
-        modelActions.cancel(inspected.acquisitionState.downloadId)
-      } else if (inspected.upgradeState._tag === "Upgrading") {
-        modelActions.cancel(inspected.upgradeState.downloadId)
+      if (inspectedReconciliationState._tag === "Transferring"
+        || inspected.acquisitionState._tag === "Installing"
+        || inspected.acquisitionState._tag === "Updating") {
+        modelActions.cancel(modelIdFor(inspected))
       }
       return
     }
@@ -1763,7 +1765,7 @@ const CatalogMenu = memo(function CatalogMenu({
       void slotActions.stop(PRIMARY_SLOT_ID)
       return
     }
-    if (action === "uninstall" && inspected.acquisitionState._tag === "Installed") {
+    if (action === "uninstall" && installedAcquisition(inspected.acquisitionState) !== undefined) {
       setPendingDeleteId(modelIdFor(inspected))
     }
   }, [inspected, inspectedReconciliationState, inspectedSlot, modelActions, primaryAction, selectCandidate, slotActions])
@@ -1773,7 +1775,7 @@ const CatalogMenu = memo(function CatalogMenu({
     if (confirmingUninstall && pendingDeleteId !== null) {
       if (key.name === "return" || key.name === "enter") {
         const model = candidates.find((candidate) => modelIdFor(candidate) === pendingDeleteId)
-        if (model?.acquisitionState._tag === "Installed") {
+        if (model !== undefined && installedAcquisition(model.acquisitionState) !== undefined) {
           modelActions.delete(model.modelId)
         }
         setPendingDeleteId(null)
@@ -1815,7 +1817,7 @@ const CatalogMenu = memo(function CatalogMenu({
       const confirmsDelete = key.name === "return" || key.name === "enter"
       if (confirmsDelete) {
         const model = candidates.find((candidate) => modelIdFor(candidate) === pendingDeleteId)
-        if (model?.acquisitionState._tag === "Installed") {
+        if (model !== undefined && installedAcquisition(model.acquisitionState) !== undefined) {
           modelActions.delete(model.modelId)
         }
         setPendingDeleteId(null)
@@ -1848,13 +1850,11 @@ const CatalogMenu = memo(function CatalogMenu({
       key.preventDefault()
       selectCandidate(cursor)
     } else if (key.name === "backspace" && cursor) {
-      if (cursor.acquisitionState._tag === "Downloading") {
-        modelActions.cancel(cursor.acquisitionState.downloadId)
+      if (cursor.acquisitionState._tag === "Installing"
+        || cursor.acquisitionState._tag === "Updating") {
+        modelActions.cancel(modelIdFor(cursor))
         key.preventDefault()
-      } else if (cursor.upgradeState._tag === "Upgrading") {
-        modelActions.cancel(cursor.upgradeState.downloadId)
-        key.preventDefault()
-      } else if (cursor.acquisitionState._tag === "Installed") {
+      } else if (installedAcquisition(cursor.acquisitionState) !== undefined) {
         setPendingDeleteId(modelIdFor(cursor))
         key.preventDefault()
       }

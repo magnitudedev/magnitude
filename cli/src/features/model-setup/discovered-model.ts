@@ -1,15 +1,16 @@
 import { homedir } from "node:os"
-import type { LocalModel } from "@magnitudedev/sdk"
+import { installedAcquisition, type LocalModel } from "@magnitudedev/sdk"
 
 const targetPackage = (model: LocalModel) =>
   model.bundle._tag === "Standalone" ? model.bundle.package : model.bundle.target
 
 export const discoveredModelLocation = (model: LocalModel): string => {
-  if (model.acquisitionState._tag !== "Installed") {
+  const acquisition = installedAcquisition(model.acquisitionState)
+  if (acquisition === undefined) {
     throw new Error("Discovered model summary requires an installed model")
   }
   const targetId = targetPackage(model).id
-  const installed = model.acquisitionState.packages.find(({ packageId }) => packageId === targetId)
+  const installed = acquisition.packages.find(({ packageId }) => packageId === targetId)
   if (installed === undefined) {
     throw new Error(`Installed model is missing target package location ${targetId}`)
   }

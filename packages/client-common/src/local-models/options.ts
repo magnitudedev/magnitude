@@ -82,8 +82,8 @@ export const localModelOptions = (
       || model.servingState._tag !== "Assessed"
       || model.servingState.assessment._tag !== "Fits") return []
     const recommendations = orderedRecommendations(model.servingState.recommendations)
-    const acquisitionActive = model.acquisitionState._tag === "Downloading"
-      || model.acquisitionState._tag === "Failed"
+    const acquisitionActive = model.acquisitionState._tag === "Installing"
+      || model.acquisitionState._tag === "InstallFailed"
     if (recommendations.length === 0 && !acquisitionActive) return []
     return [{
       id: recommendations.length === 0

@@ -7,7 +7,6 @@ import { TextAttributes } from '@opentui/core'
 import { defaultCliThemes } from '../../utils/theme'
 import type { ComposerProps } from './types'
 import {
-  ModelDownloadIdSchema,
   PRIMARY_SLOT_ID,
   ReasoningEffortSchema,
   type TaskDisplayRow,
@@ -327,12 +326,13 @@ test('shows active model downloads in the persistent footer and links to the cat
   const openCatalog = vi.fn()
   const localInferenceState = makeView({
     models: [makeAcquiringModel({
-        _tag: 'Downloading',
-        downloadId: ModelDownloadIdSchema.make('download-1'),
-        stage: 'downloading',
-        completedBytes: GIB,
-        totalBytes: 16 * GIB,
-        bytesPerSecond: Option.none(),
+        _tag: 'Installing',
+        progress: {
+          stage: 'downloading',
+          completedBytes: GIB,
+          totalBytes: 16 * GIB,
+          bytesPerSecond: Option.none(),
+        },
     })],
   })
   const notificationState = deriveModelDownloadNotificationState(

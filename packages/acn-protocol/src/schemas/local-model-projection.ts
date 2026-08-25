@@ -1,11 +1,12 @@
 import { Option } from "effect"
 import type { ProviderModelId } from "@magnitudedev/ai/provider/model"
-import type {
-  CatalogIdentity,
-  CatalogModelReconciliationAdmission,
-  LocalModel,
-  LocalModelsState,
-  ModelCapabilities,
+import {
+  installedAcquisition,
+  type CatalogIdentity,
+  type CatalogModelReconciliationAdmission,
+  type LocalModel,
+  type LocalModelsState,
+  type ModelCapabilities,
 } from "./model-state"
 
 /**
@@ -53,7 +54,7 @@ export const findLocalModelByCatalogIdentity = (
 export const installedLocalModels = (
   state: LocalModelsState,
 ): readonly LocalModel[] =>
-  state.models.filter((model) => model.acquisitionState._tag === "Installed"
+  state.models.filter((model) => installedAcquisition(model.acquisitionState) !== undefined
     && model.servingState._tag === "Assessed"
     && model.servingState.assessment._tag === "Fits")
 
@@ -62,13 +63,10 @@ const admissionIsVisibleOn = (
   admission: CatalogModelReconciliationAdmission,
 ): boolean => {
   const acquisition = model.acquisitionState
-  const isCurrent = acquisition._tag === "Installed" && model.upgradeState._tag === "Current"
-  if (admission._tag === "Current" || isCurrent) return isCurrent
-  if (acquisition._tag !== "NotInstalled"
-    && acquisition._tag !== "Installed"
-    && acquisition.downloadId === admission.downloadId) return true
-  return model.upgradeState._tag === "Upgrading"
-    && model.upgradeState.downloadId === admission.downloadId
+  if (admission._tag === "Current") return acquisition._tag === "Installed"
+  return acquisition._tag === "Installing"
+    || acquisition._tag === "Updating"
+    || acquisition._tag === "Installed"
 }
 
 /** The admitted reconciliation is visible on the canonical model. */

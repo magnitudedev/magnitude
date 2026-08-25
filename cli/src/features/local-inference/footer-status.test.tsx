@@ -2,7 +2,6 @@ import { Option } from "effect"
 import { expect, test } from "vitest"
 import {
   ModelSlotConfiguredLocal,
-  ModelInstanceIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   SECONDARY_SLOT_ID,
@@ -18,7 +17,6 @@ import {
 } from "./test-fixtures"
 
 const { deriveLocalInferenceFooterView } = await import("./footer-status")
-const instanceId = ModelInstanceIdSchema.make("test-instance")
 const selection = {
   providerId: LOCAL_PROVIDER_ID,
   providerModelId: TEST_MODEL_ID,
@@ -44,7 +42,6 @@ const localSlot = (
 })
 const loadingResidency = (progress: number) => ({
   _tag: "Loading" as const,
-  instanceId,
   stage: "loading" as const,
   progress: Option.some(progress),
   plannedAllocation: Option.none(),

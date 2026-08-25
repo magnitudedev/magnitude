@@ -133,7 +133,7 @@ export const deriveModelDownloadNotificationState = (
 ): NotificationState | null => {
   if (modelsState === null) return null
   const count = modelsState.models.filter(({ acquisitionState }) =>
-    acquisitionState._tag === "Downloading").length
+    acquisitionState._tag === "Installing" || acquisitionState._tag === "Updating").length
   if (count === 0) return null
   return persistentNotificationState(
     "local-model-download",

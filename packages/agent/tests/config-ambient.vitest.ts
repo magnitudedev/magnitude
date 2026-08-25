@@ -1,7 +1,6 @@
 import { Option } from 'effect'
 import { describe, expect, it } from 'vitest'
 import {
-  ModelInstanceIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotConfiguredRemote,
   ModelSlotUnassigned,
@@ -18,7 +17,6 @@ import {
 import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 
 describe('agent model configuration boundary', () => {
-  const instanceId = ModelInstanceIdSchema.make("test-instance")
 
   it('preserves pending slot availability', () => {
     const reasoningEffort = ReasoningEffortSchema.make('none')
@@ -55,14 +53,12 @@ describe('agent model configuration boundary', () => {
     ['not loaded', { _tag: 'Unloaded' as const }],
     ['loading', {
       _tag: 'Loading' as const,
-      instanceId,
       stage: 'loading' as const,
       progress: Option.some(0.42),
       plannedAllocation: Option.none(),
     }],
     ['stopping', {
       _tag: 'Stopping' as const,
-      instanceId,
       reason: 'user_stop' as const,
       allocation: { _tag: 'Planned' as const, allocation: Option.none() },
     }],

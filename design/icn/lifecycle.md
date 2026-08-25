@@ -389,10 +389,11 @@ grant occur under the same transition authority, so idle release, Stop, or repla
 create a pre-stream not-ready race. Chat Completions, Responses, and explicit warm load share this
 coordinator; ACN performs no preparation or load-before-inference step.
 
-`ModelInstancesSnapshot` is authoritative lifecycle. ACN does not mirror Instances into Slots;
-first-party clients join Slot selection to native Models and Instances by canonical model ID.
-Explicit Stop and autonomous ICN release therefore appear through the same native invalidation
-path regardless of whether demand came from the agent, CLI, Python, or a third-party harness.
+`ModelInstancesSnapshot` is authoritative lifecycle. ACN observes it privately and projects
+per-model residency into its catalog rows and resolved Slot states; first-party clients read
+those ACN resources and never see native instance identities. Explicit Stop and autonomous ICN
+release therefore appear through the same native observation path regardless of whether demand
+came from the agent, CLI, Python, or a third-party harness.
 
 Replacing a model must not claim the new model is ready until its backend is usable. Failure leaves
 the model instance in an explicitly reported state and must not make requests route to a
@@ -491,9 +492,10 @@ The lifecycle conforms when:
   ordinary generated chat client rather than an endpoint URL adapter;
 - chat and Responses resolve a canonical model ID, join or admit residency, and lease the exact
   Ready Instance through one ICN-owned coordinator;
-- explicit warm load uses that same coordinator; explicit stopping uses only the exact Instance ID;
-- `ModelInstancesSnapshot` owns lifecycle and clients join it to Slot selection without an ACN
-  residency mirror;
+- explicit warm load uses that same coordinator; explicit stopping resolves the exact Instance ID
+  inside ACN from slot-addressed commands;
+- `ModelInstancesSnapshot` owns lifecycle; ACN projects it into catalog-row and Slot residency
+  without becoming the authority for the native resource;
 - loading one local model terminalizes the prior instance before the replacement becomes Ready;
 - a resident model remains loaded until its current idle-residency policy expires, explicit
   replacement, exact-instance Stop, memory-pressure eviction, inference-worker loss, or ICN

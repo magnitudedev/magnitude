@@ -82,15 +82,21 @@ inspection states into its serving stages, and the provider publishes only inspe
 The resolver likewise carries the assessment state directly: absence before an assessment result is
 represented by `Assessing`, not by an optional assessment beside the state machine.
 
-`acquisitionState` describes first acquisition. `upgradeState` is `NotApplicable`, `Current`,
-`Available`, `Upgrading`, or `Failed`. An installed model may remain selectable while its upgrade
-state is `Available` or `Upgrading`. Installed acquisition carries the exact package identity,
-filesystem path, and installation origin for every package in the effective bundle. An installed
-product row without a complete, non-empty set of package locations is invalid.
+`acquisitionState` is one flat union covering the model's whole materialization lifecycle:
+`NotInstalled`, `Installing`, `InstallFailed`, `Installed`, `UpdateAvailable`, `Updating`, and
+`UpdateFailed`. Every variant is a reachable product state, and each payload exists only under the
+state it belongs to: transfer progress on `Installing`/`Updating`, an unacknowledged transfer
+failure on the failed states, and — on every installed-family variant — the exact package
+identity, filesystem path, and installation origin for every installed package plus the model's
+runtime `residencyState`. An installed model remains selectable while an update is available,
+transferring, or failed; the prior version's packages stay on the row until the update lands.
+Native occurrence identities (download and instance IDs) never appear in the projection;
+cancellation and failure acknowledgement are model-addressed commands that ACN resolves to the
+native occurrence.
 
 Catalog membership carries structured branded identity components. Only the local provider adapter
-serializes them into a provider-model identity. Configurations, product rows, and upgrade state are
-derived and never persisted.
+serializes them into a provider-model identity. Configurations and product rows are derived and
+never persisted.
 
 ## Conformance
 

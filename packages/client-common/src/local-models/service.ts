@@ -6,11 +6,12 @@ import {
   Models,
   CatalogIdentitySchema,
   findLocalModelById,
+  installedAcquisition,
   localModelCatalogIdentity,
   type CatalogIdentity,
-  type ModelDownloadId,
   type LocalModelsState,
   type LocalModel,
+  type ModelTransferProgress,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
@@ -28,8 +29,11 @@ export type CatalogModelReconciliationKind = "Install" | "Update"
 export type CatalogModelReconciliationState =
   | { readonly _tag: "Idle" }
   | { readonly _tag: "Starting"; readonly operation: CatalogModelReconciliationKind }
-  | ({ readonly _tag: "Transferring"; readonly operation: CatalogModelReconciliationKind }
-    & Omit<Extract<LocalModel["acquisitionState"], { readonly _tag: "Downloading" }>, "_tag">)
+  | {
+      readonly _tag: "Transferring"
+      readonly operation: CatalogModelReconciliationKind
+      readonly progress: ModelTransferProgress
+    }
   | { readonly _tag: "Failed"; readonly operation: CatalogModelReconciliationKind }
   | { readonly _tag: "Removing" }
   | { readonly _tag: "RemoveFailed" }
@@ -80,7 +84,7 @@ export const projectCatalogModelsView = (
     models: state.models.flatMap((model): readonly CatalogModelView[] => {
       if (model.catalogMembershipState._tag !== "InCatalog") return []
       const acquisition = model.acquisitionState
-      const upgrade = model.upgradeState
+      const installedFamily = installedAcquisition(acquisition) !== undefined
       const identity = localModelCatalogIdentity(model)
       const invocation = Option.isSome(identity)
         ? invocations.findLast((candidate) => sameCatalogIdentity(candidate.identity, identity.value))
@@ -90,23 +94,23 @@ export const projectCatalogModelsView = (
         : undefined
       const reconciliationState: CatalogModelReconciliationState = deletion?.waiting
         ? { _tag: "Removing" }
-        : acquisition._tag === "Downloading"
-        ? { ...acquisition, _tag: "Transferring", operation: "Install" }
-        : upgrade._tag === "Upgrading"
-          ? { ...upgrade, _tag: "Transferring", operation: "Update" }
+        : acquisition._tag === "Installing"
+        ? { _tag: "Transferring", operation: "Install", progress: acquisition.progress }
+        : acquisition._tag === "Updating"
+          ? { _tag: "Transferring", operation: "Update", progress: acquisition.progress }
           : invocation?.waiting
             ? {
                 _tag: "Starting",
-                operation: acquisition._tag === "Installed" ? "Update" : "Install",
+                operation: installedFamily ? "Update" : "Install",
               }
-            : acquisition._tag === "Failed"
+            : acquisition._tag === "InstallFailed"
               ? { _tag: "Failed", operation: "Install" }
-              : upgrade._tag === "Failed"
+              : acquisition._tag === "UpdateFailed"
                 ? { _tag: "Failed", operation: "Update" }
                 : invocation?.failed
                   ? {
                       _tag: "Failed",
-                      operation: acquisition._tag === "Installed" ? "Update" : "Install",
+                      operation: installedFamily ? "Update" : "Install",
                     }
                   : deletion?.failed
                     ? { _tag: "RemoveFailed" }
@@ -193,12 +197,12 @@ const makeLocalModels = Effect.gen(function* () {
     latestInstallationFailed,
     retry: queryClient.invalidate(Models.GetCatalog.match()),
     install: installModel,
-    cancelDownload: (downloadId: ModelDownloadId) =>
-      Mutation.execute(cancelDownload, { downloadId }).pipe(
+    cancelDownload: (modelId: ProviderModelId) =>
+      Mutation.execute(cancelDownload, { modelId }).pipe(
         provideRegistry,
       ),
-    dismissDownloadFailure: (downloadId: ModelDownloadId) =>
-      Mutation.execute(dismissDownloadFailure, { downloadId }).pipe(
+    dismissDownloadFailure: (modelId: ProviderModelId) =>
+      Mutation.execute(dismissDownloadFailure, { modelId }).pipe(
         provideRegistry,
       ),
     delete: deleteModel,
@@ -224,12 +228,12 @@ export function useLocalModelMutations() {
   ), [client])
   const downloadAction = useMemo(() => client.runtime.fn<{
     readonly operation: "cancel" | "dismiss"
-    readonly downloadId: ModelDownloadId
-  }>()(({ operation, downloadId }) => Effect.flatMap(
+    readonly modelId: ProviderModelId
+  }>()(({ operation, modelId }) => Effect.flatMap(
     LocalModels,
     (models) => operation === "cancel"
-      ? models.cancelDownload(downloadId)
-      : models.dismissDownloadFailure(downloadId),
+      ? models.cancelDownload(modelId)
+      : models.dismissDownloadFailure(modelId),
   )), [client])
   const deleteAction = useMemo(() => client.runtime.fn<ProviderModelId>()(
     (modelId) => Effect.flatMap(LocalModels, (models) => models.delete(modelId)),
@@ -245,11 +249,11 @@ export function useLocalModelMutations() {
     install: useCallback((modelId: ProviderModelId) => {
       install(modelId)
     }, [install]),
-    cancel: useCallback((downloadId: ModelDownloadId) => {
-      download({ operation: "cancel", downloadId })
+    cancel: useCallback((modelId: ProviderModelId) => {
+      download({ operation: "cancel", modelId })
     }, [download]),
-    dismissFailure: useCallback((downloadId: ModelDownloadId) => {
-      download({ operation: "dismiss", downloadId })
+    dismissFailure: useCallback((modelId: ProviderModelId) => {
+      download({ operation: "dismiss", modelId })
     }, [download]),
     delete: useCallback((modelId: ProviderModelId) => {
       deleteModel(modelId)

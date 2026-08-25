@@ -62,7 +62,10 @@ export const deriveLocalInferenceFooterView = (
       && model.servingState.availabilityState.providerModelId === slot.selection.providerModelId)
     : undefined
   const download = models?.models.find(({ acquisitionState }) =>
-    acquisitionState._tag === "Downloading" || acquisitionState._tag === "Failed")
+    acquisitionState._tag === "Installing"
+    || acquisitionState._tag === "InstallFailed"
+    || acquisitionState._tag === "Updating"
+    || acquisitionState._tag === "UpdateFailed")
   const currentResidency = slot?._tag === "ConfiguredLocal"
     ? slot.residency
     : undefined

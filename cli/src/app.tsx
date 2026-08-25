@@ -393,7 +393,7 @@ function CliAppContent(
           case "Preparing": {
             const acquisition = operation.model.acquisitionState;
             if (acquisition._tag !== "Installed") {
-              const starting = acquisition._tag !== "Downloading";
+              const starting = acquisition._tag !== "Installing";
               return chooser({
                 _tag: "Downloading",
                 model: operation.model,

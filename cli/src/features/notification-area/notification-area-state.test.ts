@@ -1,6 +1,5 @@
 import { describe, expect, test } from "vitest"
 import { Option } from "effect"
-import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   deriveModelDownloadNotificationState,
   deriveSelectedModelLowMemoryNotificationState,
@@ -11,12 +10,13 @@ describe("notification area model projections", () => {
   test("derives download activity directly from local model state", () => {
     const view = makeView({
       models: [makeAcquiringModel({
-        _tag: "Downloading",
-        downloadId: ModelDownloadIdSchema.make("download-1"),
-        stage: "downloading",
-        completedBytes: 1,
-        totalBytes: 2,
-        bytesPerSecond: Option.none(),
+        _tag: "Installing",
+        progress: {
+          stage: "downloading",
+          completedBytes: 1,
+          totalBytes: 2,
+          bytesPerSecond: Option.none(),
+        },
       })],
     })
 
